@@ -140,6 +140,7 @@ pub struct AgentRuntime {
     records: RwLock<BTreeMap<String, AgentRunRecord>>,
     graph_agent_ids: RwLock<BTreeMap<String, BTreeSet<String>>>,
     backends: RwLock<BTreeMap<AgentBackendKind, RegisteredAgentBackend>>,
+    process_jsonl_adapter: RwLock<Option<Arc<crate::ProcessJsonlAdapter>>>,
     services: RwLock<Option<Weak<RuntimeServices>>>,
     pending_cancellations: Mutex<BTreeSet<String>>,
     run_locks: Mutex<BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>,
@@ -159,6 +160,7 @@ impl AgentRuntime {
             records: RwLock::new(BTreeMap::new()),
             graph_agent_ids: RwLock::new(BTreeMap::new()),
             backends: RwLock::new(BTreeMap::new()),
+            process_jsonl_adapter: RwLock::new(None),
             services: RwLock::new(None),
             pending_cancellations: Mutex::new(BTreeSet::new()),
             run_locks: Mutex::new(BTreeMap::new()),
@@ -275,6 +277,36 @@ impl AgentRuntime {
                     observation_authority: true,
                 },
             );
+    }
+
+    /// Install the one Runtime-owned ProcessJsonl bridge. Its command
+    /// manifests are keyed by immutable `command_ref` plus digest, not by a
+    /// mutable Agent instance id.
+    pub(crate) fn register_runtime_process_jsonl_backend(
+        &self,
+        adapter: Arc<crate::ProcessJsonlAdapter>,
+    ) {
+        self.register_observation_authority_backend(adapter.clone());
+        *self
+            .process_jsonl_adapter
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(adapter);
+    }
+
+    pub(crate) fn register_process_jsonl_command(
+        &self,
+        spec: crate::ProcessJsonlSpec,
+    ) -> Result<(), String> {
+        let adapter = self
+            .process_jsonl_adapter
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| {
+                "ProcessJsonl Runtime bridge is not installed for this RuntimeServices instance"
+                    .to_string()
+            })?;
+        adapter.register_command(spec)
     }
 
     #[must_use]
@@ -401,18 +433,33 @@ impl AgentRuntime {
             .map(|_| ())
     }
 
-    /// Convert replayed runs whose backend may already have started into a
-    /// durable blocked state. A `Prepared` run has not crossed backend
-    /// admission and is intentionally left reclaimable: the scheduler can
-    /// re-submit the same packet after restart without guessing about an
-    /// external effect. Any later lifecycle state is ambiguous without a
-    /// reattached handle and must not be silently replayed.
+    /// Reconcile replayed runs according to their backend's recovery contract.
+    ///
+    /// Native runs are Runtime-owned: their graph/effect idempotency keys are
+    /// durable, so a lost in-memory future is returned to `Prepared` and the
+    /// owning graph may resume it after its Session resolver is rebound.
+    /// ProcessJsonl runs cross a process boundary and currently expose no
+    /// resume handle, so an admitted process run remains explicitly blocked
+    /// for effect reconciliation instead of being silently re-executed.
     pub fn block_unrecoverable_replayed_runs(&self) -> Result<Vec<String>, String> {
         let snapshots = self.list();
         let mut blocked = Vec::new();
         for mut snapshot in snapshots.into_iter().filter(|snapshot| {
             !snapshot.status.is_terminal() && snapshot.status != AgentStatus::Prepared
         }) {
+            if snapshot.backend == AgentBackendKind::InProcess {
+                snapshot.status = AgentStatus::Prepared;
+                snapshot.updated_at_ms = now_ms();
+                snapshot.failure = None;
+                self.persist_snapshot(
+                    snapshot,
+                    "agent.requeued_recovery",
+                    "Runtime-owned backend will resume from the durable graph binding",
+                    None,
+                    None,
+                )?;
+                continue;
+            }
             snapshot.status = AgentStatus::Blocked;
             snapshot.updated_at_ms = now_ms();
             snapshot.failure = Some("backend handle is unavailable after runtime restart".into());
@@ -613,8 +660,18 @@ impl AgentRuntime {
         }
         let packet = self.attach_predecessor_context(packet).await?;
         let packet = self.ensure_runtime_binding(packet)?;
-        let backend_kind = backend_from_packet(&packet);
+        let backend_kind = backend_from_packet(&packet)?;
         ensure_team_backend_trusted(&packet, backend_kind)?;
+        if backend_kind == AgentBackendKind::ProcessJsonl {
+            if let Some(adapter) = self
+                .process_jsonl_adapter
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+            {
+                adapter.validate_packet_command(&packet)?;
+            }
+        }
         if self
             .pending_cancellations
             .lock()
@@ -654,46 +711,61 @@ impl AgentRuntime {
             )?;
             return Ok(returned);
         }
-        let selection = match self.selector.select(nonempty(&packet.model_lease)) {
-            Ok(selection) => selection,
-            Err(error) => {
-                let failure = error.to_string();
-                let returned = blocked_return(&packet, failure.clone());
-                self.persist_snapshot(
-                    AgentRunSnapshot {
-                        execution_identity: packet.assignment.execution_identity.clone(),
-                        run_id: packet.run_id().to_string(),
-                        agent_id: packet.agent_id().to_string(),
-                        task_id: packet.task_id().to_string(),
-                        root_task_id: packet.assignment.root_task_id.clone(),
-                        session_id: packet.session_id().to_string(),
-                        graph_id: packet.graph_id().to_string(),
-                        node_id: packet.node_id().to_string(),
-                        attempt: packet.attempt,
-                        expected_graph_revision: packet.expected_graph_revision,
-                        backend: backend_kind,
-                        status: AgentStatus::Blocked,
-                        revision: 0,
-                        model: None,
-                        provider: None,
-                        binding: packet.binding.clone(),
-                        started_at_ms: now_ms(),
-                        updated_at_ms: now_ms(),
-                        failure: Some(failure.clone()),
-                    },
-                    "agent.blocked",
-                    &failure,
-                    None,
-                    Some(returned.clone()),
-                )?;
-                return Ok(returned);
-            }
-        };
         let binding = packet
             .binding
             .as_ref()
             .ok_or_else(|| "Runtime failed to materialize Agent Binding".to_string())?;
-        if !binding.model_policy.allowed_models.is_empty()
+        // ProcessJsonl owns its external model lifecycle. Requiring a local
+        // ProviderRegistry entry here would silently make a configured
+        // process Agent unusable; it is not a safe model fallback. Runtime
+        // records the frozen profile as a configuration identity and labels
+        // the provider honestly as external_process.
+        let selection = match backend_kind {
+            AgentBackendKind::ProcessJsonl => AgentModelSelection {
+                model: binding.model_policy.profile.clone(),
+                provider: "external_process".to_string(),
+                registry_revision: 0,
+            },
+            AgentBackendKind::InProcess => {
+                match self.selector.select(nonempty(&packet.model_lease)) {
+                    Ok(selection) => selection,
+                    Err(error) => {
+                        let failure = error.to_string();
+                        let returned = blocked_return(&packet, failure.clone());
+                        self.persist_snapshot(
+                            AgentRunSnapshot {
+                                execution_identity: packet.assignment.execution_identity.clone(),
+                                run_id: packet.run_id().to_string(),
+                                agent_id: packet.agent_id().to_string(),
+                                task_id: packet.task_id().to_string(),
+                                root_task_id: packet.assignment.root_task_id.clone(),
+                                session_id: packet.session_id().to_string(),
+                                graph_id: packet.graph_id().to_string(),
+                                node_id: packet.node_id().to_string(),
+                                attempt: packet.attempt,
+                                expected_graph_revision: packet.expected_graph_revision,
+                                backend: backend_kind,
+                                status: AgentStatus::Blocked,
+                                revision: 0,
+                                model: None,
+                                provider: None,
+                                binding: packet.binding.clone(),
+                                started_at_ms: now_ms(),
+                                updated_at_ms: now_ms(),
+                                failure: Some(failure.clone()),
+                            },
+                            "agent.blocked",
+                            &failure,
+                            None,
+                            Some(returned.clone()),
+                        )?;
+                        return Ok(returned);
+                    }
+                }
+            }
+        };
+        if backend_kind != AgentBackendKind::ProcessJsonl
+            && !binding.model_policy.allowed_models.is_empty()
             && !binding
                 .model_policy
                 .allowed_models
@@ -2123,12 +2195,22 @@ fn validate_legacy_record(record: &LegacyAgentStateRecord) -> Result<(), String>
     Ok(())
 }
 
-fn backend_from_packet(packet: &AgentTaskPacket) -> AgentBackendKind {
-    match packet.binding.as_ref().map(|binding| &binding.executor) {
-        Some(harness_contract::agent::AgentExecutorPolicy::ProcessJsonl { .. }) => {
-            AgentBackendKind::ProcessJsonl
+fn backend_from_packet(packet: &AgentTaskPacket) -> Result<AgentBackendKind, String> {
+    let binding = packet.binding.as_ref().ok_or_else(|| {
+        "AgentTaskPacket has no Runtime-compiled Binding; backend selection is undefined"
+            .to_string()
+    })?;
+    match &binding.executor {
+        harness_contract::agent::AgentExecutorPolicy::CowdNative => Ok(AgentBackendKind::InProcess),
+        harness_contract::agent::AgentExecutorPolicy::ProcessJsonl { .. } => {
+            Ok(AgentBackendKind::ProcessJsonl)
         }
-        _ => AgentBackendKind::InProcess,
+        harness_contract::agent::AgentExecutorPolicy::McpBacked { .. } => Err(
+            "McpBacked Agent definitions have no Runtime AgentTask backend; route their tools through a Cowd-native Agent instead".to_string(),
+        ),
+        harness_contract::agent::AgentExecutorPolicy::ManualReview => Err(
+            "ManualReview Agent definitions require the approval workflow and cannot execute as an AgentTask backend".to_string(),
+        ),
     }
 }
 
@@ -2136,14 +2218,15 @@ fn ensure_team_backend_trusted(
     packet: &AgentTaskPacket,
     backend_kind: AgentBackendKind,
 ) -> Result<(), String> {
-    if packet.team_id().is_some() && backend_kind != AgentBackendKind::InProcess {
-        Err(
-            "Team acceptance/evidence/change receipts require the Cowd-native in-process Runtime backend"
-                .to_string(),
+    if packet.team_id().is_some()
+        && !matches!(
+            backend_kind,
+            AgentBackendKind::InProcess | AgentBackendKind::ProcessJsonl
         )
-    } else {
-        Ok(())
+    {
+        return Err("Team Agent execution requires a Runtime-owned backend".to_string());
     }
+    Ok(())
 }
 
 fn verify_binding_against_definition(
@@ -2319,6 +2402,8 @@ fn return_packet(
         unresolved: Vec::new(),
         input_tokens: 0,
         output_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
         cached_tokens: 0,
         model: String::new(),
         provider: String::new(),
@@ -2362,16 +2447,19 @@ mod tests {
         assert_eq!(section.chars().count(), outcome.chars().count() + 26);
     }
 
-    struct CompletedBackend;
+    struct CompletedBackend(AgentBackendKind);
 
     #[async_trait]
     impl AgentRuntimeBackend for CompletedBackend {
         fn kind(&self) -> AgentBackendKind {
-            AgentBackendKind::InProcess
+            self.0
         }
 
         fn capabilities(&self) -> AgentBackendCapabilities {
-            AgentBackendCapabilities::in_process()
+            match self.0 {
+                AgentBackendKind::InProcess => AgentBackendCapabilities::in_process(),
+                AgentBackendKind::ProcessJsonl => AgentBackendCapabilities::process_jsonl(),
+            }
         }
 
         async fn execute(
@@ -2407,6 +2495,8 @@ mod tests {
                 unresolved: Vec::new(),
                 input_tokens: 3,
                 output_tokens: 2,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
                 cached_tokens: 0,
                 model: selection.model,
                 provider: selection.provider,
@@ -2511,7 +2601,6 @@ mod tests {
             objective: "verify lifecycle".into(),
             required_acceptance: Default::default(),
             output_acceptance: Vec::new(),
-            requires_managed_collaboration_escalation: false,
             acceptance: vec!["verified".into()],
             cohort_prompt_package: None,
             constraints: Vec::new(),
@@ -2534,6 +2623,7 @@ mod tests {
             binding: Some(binding),
             managed_invocation: None,
             idempotency_key: format!("idempotency-{agent_id}"),
+            agentic_binding: None,
         }
     }
 
@@ -2558,23 +2648,62 @@ mod tests {
     }
 
     #[test]
-    fn process_backend_cannot_mint_team_acceptance_or_change_receipts() {
+    fn process_backend_uses_the_explicit_runtime_bridge_kind() {
         let mut packet = team_task("external-team", "team-1");
         packet.binding.as_mut().expect("binding").executor =
             harness_contract::agent::AgentExecutorPolicy::ProcessJsonl {
                 command_ref: "external/worker".to_string(),
+                command_digest: "a".repeat(64),
             };
 
-        let backend = backend_from_packet(&packet);
+        let backend = backend_from_packet(&packet).expect("bound ProcessJsonl backend");
         assert_eq!(backend, AgentBackendKind::ProcessJsonl);
-        assert!(ensure_team_backend_trusted(&packet, backend).is_err());
+        assert!(ensure_team_backend_trusted(&packet, backend).is_ok());
+    }
+
+    #[tokio::test]
+    async fn process_agent_does_not_require_a_local_provider_model() {
+        let store = Arc::new(RuntimeEventStore::for_test());
+        let runtime = AgentRuntime::new(store, Arc::new(ProviderRegistry::empty()));
+        runtime.register_observation_authority_backend(Arc::new(CompletedBackend(
+            AgentBackendKind::ProcessJsonl,
+        )));
+        let mut packet = team_task("external-process", "team-1");
+        let binding = packet.binding.as_mut().expect("binding");
+        binding.executor = harness_contract::agent::AgentExecutorPolicy::ProcessJsonl {
+            command_ref: "external/worker".to_string(),
+            command_digest: "a".repeat(64),
+        };
+        binding.model_policy.profile = "external-model-profile".to_string();
+        binding.model_policy.allowed_models = vec!["external-model-profile".to_string()];
+        packet.model_lease = "not-registered-locally".to_string();
+
+        let returned = runtime.execute_task(packet.clone()).await.expect("run");
+
+        assert_eq!(
+            returned.status,
+            AgentTerminalStatus::Failed,
+            "the fake Process backend has no ToolHost receipts, so Runtime must reject its claimed acceptance: {returned:#?}"
+        );
+        assert_eq!(returned.model, "external-model-profile");
+        assert_eq!(returned.provider, "external_process");
+        assert!(returned
+            .failure
+            .as_deref()
+            .is_some_and(|failure| failure.contains("non-satisfied Runtime acceptance")));
+        assert_eq!(
+            runtime.get(packet.agent_id()).expect("projection").status,
+            AgentStatus::Failed
+        );
     }
 
     #[tokio::test]
     async fn graph_cancel_before_agent_poll_persists_terminal_cancelled_without_backend_work() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("store"));
+        let store = Arc::new(RuntimeEventStore::for_test());
         let runtime = AgentRuntime::new(store, configured_registry());
-        runtime.register_observation_authority_backend(Arc::new(CompletedBackend));
+        runtime.register_observation_authority_backend(Arc::new(CompletedBackend(
+            AgentBackendKind::InProcess,
+        )));
         let packet = task("cancel-before-poll");
 
         AgentTaskBackend::cancel(&runtime, &packet)
@@ -2601,9 +2730,9 @@ mod tests {
 
     #[tokio::test]
     async fn public_backend_registration_cannot_self_promote_observation_truth() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("store"));
+        let store = Arc::new(RuntimeEventStore::for_test());
         let runtime = AgentRuntime::new(store, configured_registry());
-        runtime.register_backend(Arc::new(CompletedBackend));
+        runtime.register_backend(Arc::new(CompletedBackend(AgentBackendKind::InProcess)));
 
         let returned = runtime
             .execute_task(task("untrusted-observation"))
@@ -2620,9 +2749,11 @@ mod tests {
 
     #[tokio::test]
     async fn rejected_backend_result_persists_a_terminal_failed_projection() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("store"));
+        let store = Arc::new(RuntimeEventStore::for_test());
         let runtime = AgentRuntime::new(store, configured_registry());
-        runtime.register_observation_authority_backend(Arc::new(CompletedBackend));
+        runtime.register_observation_authority_backend(Arc::new(CompletedBackend(
+            AgentBackendKind::InProcess,
+        )));
         let mut packet = team_task("invalid-acceptance", "team-1");
         packet.acceptance = vec!["evidence".to_string()];
         packet.output_acceptance = vec![harness_contract::agent::OutputAcceptanceRequirement {
@@ -2672,7 +2803,7 @@ mod tests {
 
     #[test]
     fn stale_prepare_or_running_snapshot_cannot_overwrite_terminal_cancellation() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("store"));
+        let store = Arc::new(RuntimeEventStore::for_test());
         let runtime = AgentRuntime::new(store, configured_registry());
         let packet = task("cancel-cas");
         let prepared = legacy_snapshot(&packet, AgentStatus::Prepared);
@@ -2723,7 +2854,7 @@ mod tests {
 
     #[test]
     fn graph_scoped_agent_lookup_uses_replayable_index() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("store"));
+        let store = Arc::new(RuntimeEventStore::for_test());
         let runtime = AgentRuntime::new(store, configured_registry());
         let packet = task("graph-indexed");
         runtime
@@ -2745,7 +2876,7 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_import_is_atomic_idempotent_and_blocks_unrecoverable_active_runs() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("store"));
+        let store = Arc::new(RuntimeEventStore::for_test());
         let runtime = AgentRuntime::new(Arc::clone(&store), configured_registry());
         let active = task("legacy-active");
         let completed = task("legacy-completed");
@@ -2810,7 +2941,7 @@ mod tests {
 
     #[test]
     fn legacy_import_rejects_unbound_records_without_partial_writes() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("store"));
+        let store = Arc::new(RuntimeEventStore::for_test());
         let runtime = AgentRuntime::new(Arc::clone(&store), configured_registry());
         let valid = task("legacy-valid");
         let mut invalid_snapshot = legacy_snapshot(&task("legacy-invalid"), AgentStatus::Running);
@@ -2841,9 +2972,11 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_lifecycle_replays_from_the_event_store() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("store"));
+        let store = Arc::new(RuntimeEventStore::for_test());
         let runtime = AgentRuntime::new(Arc::clone(&store), configured_registry());
-        runtime.register_observation_authority_backend(Arc::new(CompletedBackend));
+        runtime.register_observation_authority_backend(Arc::new(CompletedBackend(
+            AgentBackendKind::InProcess,
+        )));
         let packet = task("agent-replay");
 
         let returned = runtime.execute_task(packet.clone()).await.expect("run");
@@ -2968,10 +3101,12 @@ mod tests {
     #[tokio::test]
     async fn command_receipt_is_revisioned_and_idempotent() {
         let runtime = AgentRuntime::new(
-            Arc::new(RuntimeEventStore::try_open_in_memory().expect("store")),
+            Arc::new(RuntimeEventStore::for_test()),
             configured_registry(),
         );
-        runtime.register_observation_authority_backend(Arc::new(CompletedBackend));
+        runtime.register_observation_authority_backend(Arc::new(CompletedBackend(
+            AgentBackendKind::InProcess,
+        )));
         let packet = task("agent-command");
         runtime
             .restore_verified_run(AgentRunSnapshot {
@@ -3014,7 +3149,7 @@ mod tests {
     #[test]
     fn progress_markers_preserve_running_lifecycle_without_becoming_terminal() {
         let runtime = AgentRuntime::new(
-            Arc::new(RuntimeEventStore::try_open_in_memory().expect("store")),
+            Arc::new(RuntimeEventStore::for_test()),
             configured_registry(),
         );
         let packet = task("agent-progress");
@@ -3045,7 +3180,7 @@ mod tests {
     #[tokio::test]
     async fn unavailable_model_is_recorded_as_blocked_not_running() {
         let runtime = AgentRuntime::new(
-            Arc::new(RuntimeEventStore::try_open_in_memory().expect("store")),
+            Arc::new(RuntimeEventStore::for_test()),
             Arc::new(ProviderRegistry::empty()),
         );
         let packet = task("agent-blocked");
@@ -3063,7 +3198,7 @@ mod tests {
     #[tokio::test]
     async fn agent_locks_are_keyed_and_reclaimed_after_the_last_holder() {
         let runtime = AgentRuntime::new(
-            Arc::new(RuntimeEventStore::try_open_in_memory().expect("store")),
+            Arc::new(RuntimeEventStore::for_test()),
             configured_registry(),
         );
 
@@ -3101,7 +3236,7 @@ mod tests {
     #[test]
     fn restart_recovery_blocks_runs_without_a_recovered_handle() {
         let runtime = AgentRuntime::new(
-            Arc::new(RuntimeEventStore::try_open_in_memory().expect("store")),
+            Arc::new(RuntimeEventStore::for_test()),
             configured_registry(),
         );
         let packet = task("agent-recovery");
@@ -3145,7 +3280,7 @@ mod tests {
     #[test]
     fn restart_recovery_leaves_prepared_runs_reclaimable() {
         let runtime = AgentRuntime::new(
-            Arc::new(RuntimeEventStore::try_open_in_memory().expect("store")),
+            Arc::new(RuntimeEventStore::for_test()),
             configured_registry(),
         );
         let packet = task("agent-prepared-recovery");
@@ -3181,5 +3316,45 @@ mod tests {
             runtime.get(packet.agent_id()).expect("prepared run").status,
             AgentStatus::Prepared
         );
+    }
+
+    #[test]
+    fn restart_recovery_requeues_runtime_owned_runs() {
+        let runtime = AgentRuntime::new(
+            Arc::new(RuntimeEventStore::for_test()),
+            configured_registry(),
+        );
+        let packet = task("agent-native-recovery");
+        runtime
+            .restore_verified_run(AgentRunSnapshot {
+                execution_identity: packet.assignment.execution_identity.clone(),
+                run_id: packet.run_id().to_string(),
+                agent_id: packet.agent_id().to_string(),
+                task_id: packet.task_id().to_string(),
+                root_task_id: packet.assignment.root_task_id.clone(),
+                session_id: packet.session_id().to_string(),
+                graph_id: packet.graph_id().to_string(),
+                node_id: packet.node_id().to_string(),
+                attempt: packet.attempt,
+                expected_graph_revision: packet.expected_graph_revision,
+                backend: AgentBackendKind::InProcess,
+                status: AgentStatus::Running,
+                revision: 0,
+                model: Some("fast".into()),
+                provider: Some("test".into()),
+                binding: None,
+                started_at_ms: 1,
+                updated_at_ms: 1,
+                failure: Some("stale transient error".into()),
+            })
+            .expect("restore");
+
+        assert!(runtime
+            .block_unrecoverable_replayed_runs()
+            .expect("recovery sweep")
+            .is_empty());
+        let snapshot = runtime.get(packet.agent_id()).expect("requeued run");
+        assert_eq!(snapshot.status, AgentStatus::Prepared);
+        assert_eq!(snapshot.failure, None);
     }
 }

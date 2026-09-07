@@ -35,10 +35,6 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             get(agent_self_models_handler),
         )
         .route(
-            surface::gateway_api::paths::API_TEAM_TEMPLATES.template(),
-            get(team_templates_handler),
-        )
-        .route(
             surface::gateway_api::paths::API_AGENTS_EXECUTION_GRAPHS.template(),
             get(execution_graphs_handler),
         )
@@ -141,24 +137,6 @@ async fn agent_self_models_handler(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let runtime = runtime_services(&state)?;
     Ok(Json(state.services.agent.self_models(&runtime)))
-}
-
-/// Read-only Team Template projection. Template creation and release decisions
-/// remain Runtime commands; Gateway never rebuilds a team definition from
-/// workspace files or a browser payload.
-async fn team_templates_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let runtime = runtime_services(&state)?;
-    let templates = runtime
-        .definition_registry()
-        .runnable_team_catalog()
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "kind": "team_templates",
-        "templates": templates,
-        "source": "runtime.definition_catalog",
-    })))
 }
 
 async fn execution_graphs_handler(

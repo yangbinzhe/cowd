@@ -156,7 +156,7 @@ pub(in crate::api_routes) async fn get_runtime_control_plane(
         |selected| {
             serde_json::json!({
                 "backend": selected.backend_label(),
-                "postgres": selected.postgres_executor.as_ref().map(storage::PostgresExecutor::health),
+                "postgres": selected.postgres_executor.health(),
                 "session_execution": selected.session_store.execution_stats(),
             })
         },

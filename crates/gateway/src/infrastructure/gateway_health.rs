@@ -1,7 +1,5 @@
 use serde::Serialize;
-use storage::{
-    SqlitePragmaConfig, StorageBackendKind, StorageHealth, StorageLockDiagnostics, StorageRegistry,
-};
+use storage::{StorageBackendKind, StorageHealth, StorageRegistry};
 
 use crate::api_routes::AppState;
 use crate::gateway_static::StaticWebUiSource;
@@ -50,10 +48,6 @@ pub(crate) struct GatewayHealthSnapshot {
 pub(crate) struct StorageGatewaySnapshot {
     pub(crate) registry: StorageHealth,
     pub(crate) effective_backend: String,
-    pub(crate) fallback_reason: Option<String>,
-    pub(crate) migrations: Vec<storage::StorageMigration>,
-    pub(crate) locks: Vec<StorageLockDiagnostics>,
-    pub(crate) executors: Vec<storage::SqliteExecutorHealth>,
     pub(crate) postgres: Option<storage::PostgresExecutorHealth>,
     pub(crate) session_execution: Option<session::StorageExecutionPlaneStats>,
     pub(crate) artifacts: Option<runtime::ArtifactStoreStats>,
@@ -110,44 +104,26 @@ pub(crate) async fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSn
     };
     let storage_registry = state.services.selected_storage.as_ref().map_or_else(
         || {
-            StorageRegistry::default_for_config_home(&state.config_home)
-                .with_workspace(&state.workspace_root)
-                .and_then(StorageRegistry::with_surface_messages)
+            StorageRegistry::postgres_for_config_home(&state.config_home)
+                .with_postgres_workspace(&state.workspace_root)
                 .unwrap_or_else(|error| {
                     tracing::error!(%error, "gateway health storage inventory is incomplete");
-                    StorageRegistry::default_for_config_home(&state.config_home)
+                    StorageRegistry::postgres_for_config_home(&state.config_home)
                 })
         },
         |selected| selected.registry.clone(),
     );
-    let pragma = SqlitePragmaConfig::default();
     let storage = StorageGatewaySnapshot {
         registry: storage_registry.health(),
         effective_backend: state.services.selected_storage.as_ref().map_or_else(
             || "unknown".to_string(),
             |selected| selected.backend_label().to_string(),
         ),
-        fallback_reason: state
-            .services
-            .selected_storage
-            .as_ref()
-            .and_then(|selected| selected.fallback_reason.clone()),
-        migrations: storage::MigrationRunner::from_registry(&storage_registry).status(),
-        locks: storage_registry
-            .endpoints
-            .iter()
-            .filter(|endpoint| matches!(endpoint.backend, storage::StorageBackendKind::Sqlite))
-            .map(|endpoint| {
-                StorageLockDiagnostics::for_handle(&endpoint.as_handle(), pragma.busy_timeout_ms)
-            })
-            .collect(),
-        executors: storage::StorageRuntime::global().sqlite_health(),
         postgres: state
             .services
             .selected_storage
             .as_ref()
-            .and_then(|selected| selected.postgres_executor.as_ref())
-            .map(storage::PostgresExecutor::health),
+            .map(|selected| selected.postgres_executor.health()),
         session_execution: state
             .services
             .selected_storage
@@ -216,9 +192,6 @@ pub(crate) async fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSn
 pub(crate) async fn gateway_readiness_snapshot(state: &AppState) -> GatewayReadinessSnapshot {
     let health = gateway_health_snapshot(state).await;
     let mut degraded = Vec::new();
-    if health.storage.fallback_reason.is_some() {
-        degraded.push("storage.fallback_active".to_string());
-    }
     if !health.runtime.session_repository {
         degraded.push("runtime.session_repository_unavailable".to_string());
     }
@@ -317,7 +290,11 @@ fn storage_endpoint_ready(
 fn session_workers_healthy(health: &crate::session_runtime_bridge::SessionWorkerHealth) -> bool {
     health.accepting
         && health.recovery_completed_at_ms > 0
+        && health.recovery_state
+            == crate::session_runtime_bridge::SessionStartupRecoveryState::Completed
         && health.recovery.failed == 0
+        && health.recovery.failed_session_ids.is_empty()
+        && health.recovery.global_failures == 0
         && crate::session_runtime_bridge::REQUIRED_SESSION_WORKERS
             .iter()
             .all(|name| {
@@ -383,6 +360,7 @@ mod tests {
             claim_lease_lost: 0,
             workers,
             recovery: Default::default(),
+            recovery_state: crate::session_runtime_bridge::SessionStartupRecoveryState::Completed,
             recovery_completed_at_ms: 1,
             reconciliation: [
                 "lifecycle_reconciliation",
@@ -412,6 +390,18 @@ mod tests {
     fn empty_worker_map_is_never_healthy() {
         let mut health = complete_worker_health();
         health.workers.clear();
+        assert!(!session_workers_healthy(&health));
+    }
+
+    #[test]
+    fn session_local_recovery_failure_is_never_ready() {
+        let mut health = complete_worker_health();
+        health.recovery.failed = 1;
+        health
+            .recovery
+            .failed_session_ids
+            .insert("bad-session".to_string());
+        health.recovery_state = crate::session_runtime_bridge::SessionStartupRecoveryState::Failed;
         assert!(!session_workers_healthy(&health));
     }
 

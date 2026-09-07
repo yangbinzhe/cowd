@@ -378,7 +378,6 @@ mod tests {
     fn test_memory_config(sqlite_path: &std::path::Path) -> MemoryConfig {
         MemoryConfig {
             store: StoreConfig {
-                sqlite_path: sqlite_path.to_path_buf(),
                 blob_dir: sqlite_path.parent().unwrap().join("blobs"),
                 ..Default::default()
             },
@@ -441,17 +440,40 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let config_home = root.path().to_path_buf();
         std::fs::create_dir_all(config_home.join("storage")).unwrap();
-        let store = Arc::new(runtime::RuntimeEventStore::try_open_in_memory().unwrap());
-        let growth = GrowthService::new_for_config_home(&config_home);
+        let workspace = config_home.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let topology = Arc::new(
+            crate::selected_storage::SelectedStorageTopology::compose_for_test(
+                &config_home,
+                &workspace,
+            )
+            .expect("isolated PostgreSQL topology"),
+        );
+        let store = Arc::clone(&topology.runtime_event_store);
+        let growth = GrowthService::with_ledger(Arc::clone(&topology.fact_ledger));
         let manager = Arc::new(
-            CognitiveContextManager::new(test_memory_config(
-                &config_home.join("storage/memory.sqlite"),
-            ))
+            CognitiveContextManager::new_with_selected_store_and_auxiliaries(
+                test_memory_config(&config_home.join("storage/memory-index")),
+                Some(workspace),
+                None,
+                Arc::clone(&topology.memory_store),
+                Some(topology.memory_maintenance_queue.clone()),
+            )
             .await
             .unwrap(),
         );
-        let memory = MemoryService::with_manager(Some(manager));
-        let matrix = MatrixService::new();
+        let memory = MemoryService::with_manager_and_knowledge(
+            Some(manager),
+            topology.knowledge_fabric.clone(),
+        );
+        let matrix = MatrixService::with_store(
+            Arc::clone(&topology.matrix_store),
+            topology
+                .registry
+                .endpoint(&storage::StorageDomainId::Matrix)
+                .expect("matrix endpoint")
+                .clone(),
+        );
         let event = rich_event();
         store
             .append(runtime::RuntimeEventInput {
@@ -526,7 +548,7 @@ mod tests {
     async fn infrastructure_failure_never_advances_growth_checkpoint() {
         let root = tempfile::tempdir().unwrap();
         let config_home = root.path().to_path_buf();
-        let store = Arc::new(runtime::RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(runtime::RuntimeEventStore::for_test());
         let growth = GrowthService::with_ledger(Arc::new(fact_kernel::UnavailableFactLedger::new(
             "injected Growth ledger outage",
         )));
@@ -586,16 +608,15 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn slow_fact_projection_does_not_block_tokio_heartbeat() {
         let root = tempfile::tempdir().unwrap();
-        let registry = storage::StorageRegistry::default_for_config_home(root.path());
-        let fact_endpoint = registry.endpoint(&storage::StorageDomainId::Fact).unwrap();
-        let growth_endpoint = registry
-            .endpoint(&storage::StorageDomainId::Growth)
-            .unwrap();
-        let ledger =
-            fact_sqlite::SqliteFactLedger::open_with_legacy_growth(fact_endpoint, growth_endpoint)
-                .unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let topology = crate::selected_storage::SelectedStorageTopology::compose_for_test(
+            root.path(),
+            &workspace,
+        )
+        .expect("isolated PostgreSQL topology");
         let growth = GrowthService::with_ledger(Arc::new(SlowFactLedger {
-            inner: Arc::new(ledger),
+            inner: topology.fact_ledger.clone(),
             delay: Duration::from_millis(150),
         }));
         let config_home = root.path().to_path_buf();

@@ -1335,11 +1335,6 @@ pub(crate) const GATEWAY_ROUTE_BINDINGS: &[GatewayRouteBinding] = &[
         handler: "mission_organization_handler",
     },
     GatewayRouteBinding {
-        route: routes::GET_API_TEAM_TEMPLATES,
-        source: "agent_routes.rs",
-        handler: "team_templates_handler",
-    },
-    GatewayRouteBinding {
         route: routes::GET_API_TOOLS,
         source: "system_routes.rs",
         handler: "tools_handler",

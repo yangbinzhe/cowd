@@ -1481,8 +1481,7 @@ mod tests {
     fn scoped_mission_service_with_runtime() -> (MissionService, Arc<runtime::RuntimeServices>) {
         let runtime_services =
             runtime::RuntimeServices::in_memory().expect("workspace-scoped runtime services");
-        let store =
-            Arc::new(session::UnifiedSessionStore::open_in_memory().expect("Session store"));
+        let store = Arc::new(crate::pg_test_support::session_store());
         let repository = Arc::new(
             crate::services::session_service::repository::SessionRepository::new(
                 Arc::new(crate::active_session::ActiveSessionDirectory::new()),

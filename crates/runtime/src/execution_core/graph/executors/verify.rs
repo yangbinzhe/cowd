@@ -509,7 +509,7 @@ mod tests {
 
     #[tokio::test]
     async fn verification_reads_committed_predecessor_evidence() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let state = ExecutionGraphStateStore::new(Arc::clone(&store));
         let commit = ExecutionCommitService::new(store);
         let executor = VerifyNodeExecutor::new(state.clone());
@@ -602,7 +602,7 @@ mod tests {
 
     #[tokio::test]
     async fn finally_verifier_preserves_terminal_failure_as_non_retryable_verdict() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let state = ExecutionGraphStateStore::new(Arc::clone(&store));
         let commit = ExecutionCommitService::new(store);
         let executor = VerifyNodeExecutor::new(state.clone());

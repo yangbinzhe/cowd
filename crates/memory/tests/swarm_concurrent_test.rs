@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use memory::config::MemoryConfig;
-use memory::store::{sqlite::SqliteStore, MemoryStore};
+use memory::store::{EphemeralMemoryStore, MemoryStore};
 use memory::{
     AgentVisibility, MemoryCategory, MemoryEntry, MemoryLayer, MemoryOrchestrator, MemoryScope,
     MemorySource, Priority,
@@ -63,9 +63,7 @@ fn make_entry(agent_id: &str, idx: u32, content: &str, scope: MemoryScope) -> Me
 
 #[tokio::test]
 async fn test_swarm_5_agents_concurrent_writes_no_data_loss() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("swarm_nodataloss.db");
-    let store: Arc<dyn MemoryStore> = Arc::new(SqliteStore::open_path(&db_path).unwrap());
+    let store: Arc<dyn MemoryStore> = Arc::new(EphemeralMemoryStore::new());
 
     let orch =
         Arc::new(MemoryOrchestrator::from_store(test_config(), Arc::clone(&store), None).unwrap());
@@ -125,9 +123,7 @@ async fn test_swarm_5_agents_concurrent_writes_no_data_loss() {
 
 #[tokio::test]
 async fn test_swarm_source_agent_tracking() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("swarm_agent_tracking.db");
-    let store: Arc<dyn MemoryStore> = Arc::new(SqliteStore::open_path(&db_path).unwrap());
+    let store: Arc<dyn MemoryStore> = Arc::new(EphemeralMemoryStore::new());
 
     let orch =
         Arc::new(MemoryOrchestrator::from_store(test_config(), Arc::clone(&store), None).unwrap());
@@ -188,9 +184,7 @@ async fn test_swarm_source_agent_tracking() {
 
 #[tokio::test]
 async fn test_swarm_cross_agent_conflict_detection() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("swarm_conflict.db");
-    let store: Arc<dyn MemoryStore> = Arc::new(SqliteStore::open_path(&db_path).unwrap());
+    let store: Arc<dyn MemoryStore> = Arc::new(EphemeralMemoryStore::new());
 
     let orch = MemoryOrchestrator::from_store(test_config(), Arc::clone(&store), None).unwrap();
 
@@ -276,9 +270,7 @@ async fn test_swarm_cross_agent_conflict_detection() {
 
 #[tokio::test]
 async fn test_swarm_scope_isolation() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("swarm_scope.db");
-    let store: Arc<dyn MemoryStore> = Arc::new(SqliteStore::open_path(&db_path).unwrap());
+    let store: Arc<dyn MemoryStore> = Arc::new(EphemeralMemoryStore::new());
 
     let orch = MemoryOrchestrator::from_store(test_config(), Arc::clone(&store), None).unwrap();
 

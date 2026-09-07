@@ -9,11 +9,7 @@ use harness_contract::context::{
     ContextAlignmentReport, ContextAuthority, ContextBudget, ContextEpoch, ContextEpochBuilder,
     ContextIdentity, ContextItem, ContextMode, ContextRole, ContextSourceKind, PromptAssemblyPlan,
 };
-use harness_contract::core::{ExecutionModifier, ExecutionPattern};
-use harness_contract::execution_graph::{
-    validate_execution_graph, ExecutionEdge, ExecutionEdgeKind, ExecutionGraph,
-    ExecutionGraphQualityReport, ExecutionNodeKind, ExecutionNodeSpec, ExecutionNodeStatus,
-};
+use harness_contract::core::ExecutionPattern;
 use harness_contract::growth::{
     GrowthEvent, GrowthEventInput, GrowthEvidenceRef, GrowthInput, GrowthSeverity, GrowthSignal,
     GrowthSignalKind, LearningRecord,
@@ -32,16 +28,14 @@ use harness_contract::verification::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::collaboration_template::{CollaborationDecision, CollaborationTemplateMatcher};
 use crate::context_runtime::ContextProfile;
 use crate::execution_core::{
-    RuntimeCompileTarget, RuntimeExecutionDecision, StrategyDecisionEngine, StrategyResourceHealth,
+    RuntimeExecutionDecision, StrategyDecisionEngine, StrategyResourceHealth,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeAiKernelTrace {
     pub execution_decision: RuntimeExecutionDecision,
-    pub collaboration_decision: CollaborationDecision,
     pub context_epoch: ContextEpoch,
     pub context_envelope_id: Option<String>,
     pub context_alignment: Option<ContextAlignmentReport>,
@@ -55,8 +49,6 @@ pub struct RuntimeAiKernelTrace {
     pub regression_gate: RegressionGateVerdict,
     pub learning_record: LearningRecord,
     pub growth_event: GrowthEvent,
-    pub execution_graph: Option<ExecutionGraph>,
-    pub execution_graph_quality: Option<ExecutionGraphQualityReport>,
     pub harness_receipt: HarnessTurnReceipt,
     pub policy_receipts: Vec<PolicyReceipt>,
     pub behavior_policy: BehaviorPolicyDecision,
@@ -74,10 +66,8 @@ pub struct GovernedToolExecutionSummary {
 pub struct RuntimeAiKernel {
     user_input: String,
     execution_decision: RuntimeExecutionDecision,
-    collaboration_decision: CollaborationDecision,
     context_epoch: ContextEpoch,
     governed_tool_plans: Vec<GovernedToolPlanProjection>,
-    execution_graph: Option<ExecutionGraph>,
     verification: VerificationLedger,
     behavior_policy: BehaviorPolicyDecision,
     context_envelope_id: Option<String>,
@@ -133,19 +123,14 @@ impl RuntimeAiKernel {
         let session_id = session_id.into();
         let user_input = user_input.into();
         let strategy = &execution_decision.strategy;
-        let collaboration_decision = CollaborationTemplateMatcher.decide(&user_input, strategy);
         let behavior_policy = decide_behavior_policy(&user_input, strategy);
         let context_epoch =
             build_context_epoch(&session_id, &user_input, profile, system_prompt, strategy);
-        let execution_graph =
-            build_initial_execution_graph(&user_input, strategy, execution_decision.compile_target);
         Self {
             user_input,
             execution_decision,
-            collaboration_decision,
             context_epoch,
             governed_tool_plans: Vec::new(),
-            execution_graph,
             verification: VerificationLedger::new(),
             behavior_policy,
             context_envelope_id: None,
@@ -320,7 +305,6 @@ impl RuntimeAiKernel {
                 )
             })
         });
-        let execution_graph_quality = self.execution_graph.as_ref().map(execution_graph_quality);
         let agent_spec = harness_contract::agent::AgentSpec::for_turn(
             &self.user_input,
             self.execution_decision.strategy.pattern,
@@ -375,18 +359,6 @@ impl RuntimeAiKernel {
                 );
             }
         }
-        if let Some(quality) = &execution_graph_quality {
-            if !quality.is_dag || !quality.has_verify_node || !quality.has_synthesize_node {
-                learning_record.signals.push(GrowthSignal::new(
-                    GrowthSignalKind::MultiAgentValue,
-                    GrowthSeverity::Improve,
-                    "execution graph quality missed dag/verify/synthesis requirements",
-                ));
-                learning_record
-                    .next_strategy_hints
-                    .push("repair execution graph before synthesizing complex tasks".to_string());
-            }
-        }
         if self.behavior_policy.has_overengineering_risk() {
             learning_record.signals.push(GrowthSignal::new(
                 GrowthSignalKind::StrategyFit,
@@ -405,11 +377,11 @@ impl RuntimeAiKernel {
                 "Runtime governed tool execution plan",
             ));
         }
-        if let Some(graph) = &self.execution_graph {
+        if let Some(graph_ref) = &self.execution_decision.execution_graph_ref {
             evidence_refs.push(GrowthEvidenceRef::new(
                 "execution_graph",
-                graph.id.clone(),
-                "AI kernel execution graph",
+                graph_ref.clone(),
+                "Runtime-supervised execution graph",
             ));
         }
         let growth_event = GrowthEvent::from_input(GrowthEventInput {
@@ -457,7 +429,6 @@ impl RuntimeAiKernel {
             });
         RuntimeAiKernelTrace {
             execution_decision: self.execution_decision,
-            collaboration_decision: self.collaboration_decision,
             context_epoch: self.context_epoch,
             context_envelope_id: self.context_envelope_id,
             context_alignment,
@@ -471,8 +442,6 @@ impl RuntimeAiKernel {
             regression_gate,
             learning_record,
             growth_event,
-            execution_graph: self.execution_graph,
-            execution_graph_quality,
             harness_receipt,
             policy_receipts,
             behavior_policy: self.behavior_policy,
@@ -541,104 +510,6 @@ fn build_context_epoch(
         })
 }
 
-fn build_initial_execution_graph(
-    user_input: &str,
-    strategy: &StrategyDecision,
-    compile_target: RuntimeCompileTarget,
-) -> Option<ExecutionGraph> {
-    if compile_target == RuntimeCompileTarget::InlineModel
-        && !strategy
-            .modifiers
-            .contains(&ExecutionModifier::WithVerifier)
-    {
-        return None;
-    }
-    let mut graph = ExecutionGraph::new(user_input.to_string());
-    let (first_kind, first_label) = match compile_target {
-        RuntimeCompileTarget::InlineModel => (ExecutionNodeKind::InlineModel, "respond"),
-        RuntimeCompileTarget::EvidenceGraph => (ExecutionNodeKind::ToolBatch, "gather-evidence"),
-        RuntimeCompileTarget::ExecutionGraph => (ExecutionNodeKind::ToolBatch, "execute"),
-    };
-    let mut first = ExecutionNodeSpec::new(first_kind, "runtime", first_label);
-    first.id = first_label.to_string();
-    first.idempotency_key = format!("{}:{first_label}", graph.id);
-    let mut verify = ExecutionNodeSpec::new(
-        ExecutionNodeKind::Verify,
-        "runtime.verify",
-        "verify-final-response",
-    );
-    verify.id = "verify".to_string();
-    verify.idempotency_key = format!("{}:verify", graph.id);
-    let mut synthesize = ExecutionNodeSpec::new(
-        ExecutionNodeKind::Synthesize,
-        "runtime.synthesize",
-        "synthesize-final-response",
-    );
-    synthesize.id = "synthesize".to_string();
-    synthesize.idempotency_key = format!("{}:synthesize", graph.id);
-    graph.nodes = vec![first, verify, synthesize];
-    for id in [first_label, "verify", "synthesize"] {
-        graph
-            .node_statuses
-            .insert(id.to_string(), ExecutionNodeStatus::Planned);
-    }
-    graph.edges = vec![
-        ExecutionEdge {
-            from: first_label.to_string(),
-            to: "verify".to_string(),
-            kind: ExecutionEdgeKind::DependsOn,
-        },
-        ExecutionEdge {
-            from: "verify".to_string(),
-            to: "synthesize".to_string(),
-            kind: ExecutionEdgeKind::DependsOn,
-        },
-    ];
-    validate_execution_graph(&graph).ok()?;
-    Some(graph)
-}
-
-fn execution_graph_quality(graph: &ExecutionGraph) -> ExecutionGraphQualityReport {
-    let validation = validate_execution_graph(graph);
-    ExecutionGraphQualityReport {
-        node_count: graph.nodes.len(),
-        edge_count: graph.edges.len(),
-        ready_count: graph
-            .node_statuses
-            .values()
-            .filter(|status| {
-                matches!(
-                    status,
-                    ExecutionNodeStatus::Ready | ExecutionNodeStatus::Planned
-                )
-            })
-            .count(),
-        blocked_count: graph_nodes_in_status(graph, ExecutionNodeStatus::Blocked),
-        failed_count: graph_nodes_in_status(graph, ExecutionNodeStatus::Failed),
-        has_verify_node: graph
-            .nodes
-            .iter()
-            .any(|node| node.kind == ExecutionNodeKind::Verify),
-        has_synthesize_node: graph
-            .nodes
-            .iter()
-            .any(|node| node.kind == ExecutionNodeKind::Synthesize),
-        is_dag: validation.is_ok(),
-        warnings: validation
-            .err()
-            .map(|error| vec![error.to_string()])
-            .unwrap_or_default(),
-    }
-}
-
-fn graph_nodes_in_status(graph: &ExecutionGraph, expected: ExecutionNodeStatus) -> usize {
-    graph
-        .node_statuses
-        .values()
-        .filter(|status| **status == expected)
-        .count()
-}
-
 fn context_mode_for_profile(profile: ContextProfile) -> ContextMode {
     match profile {
         ContextProfile::AutonomousGoal | ContextProfile::YoloGoal => ContextMode::Goal,
@@ -668,7 +539,6 @@ fn bench_kind_for_mode(mode: ExecutionPattern) -> BenchCaseKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collaboration_template::CollaborationTemplateId;
 
     #[test]
     fn runtime_kernel_builds_trace_for_simple_turn() {
@@ -691,45 +561,37 @@ mod tests {
             trace.growth_event.source_event_kind,
             "runtime.harness_contract.trace"
         );
-        assert_eq!(
-            trace.collaboration_decision.template_id,
-            CollaborationTemplateId::DirectExecutor
-        );
+        assert!(trace.execution_decision.execution_graph_ref.is_none());
     }
 
     #[test]
     fn runtime_kernel_consumes_the_leased_decision_without_reclassifying() {
         let prompts = [
-            ("解释这个函数", RuntimeCompileTarget::InlineModel, None),
+            ("解释这个函数", crate::RuntimeCompileTarget::InlineModel),
             (
                 "调研当前架构并并行汇总证据",
-                RuntimeCompileTarget::EvidenceGraph,
-                Some("gather-evidence"),
+                crate::RuntimeCompileTarget::EvidenceGraph,
             ),
             (
                 "实现这个明确的重构并验证",
-                RuntimeCompileTarget::ExecutionGraph,
-                Some("execute"),
+                crate::RuntimeCompileTarget::ExecutionGraph,
             ),
             (
                 "权衡两个架构方案并解决冲突",
-                RuntimeCompileTarget::EvidenceGraph,
-                Some("gather-evidence"),
+                crate::RuntimeCompileTarget::EvidenceGraph,
             ),
             (
                 "使用多 Agent 并行审查 runtime gateway memory",
-                RuntimeCompileTarget::ExecutionGraph,
-                Some("execute"),
+                crate::RuntimeCompileTarget::ExecutionGraph,
             ),
             (
                 "后台持续推进这项长期 mission 任务",
-                RuntimeCompileTarget::EvidenceGraph,
-                Some("gather-evidence"),
+                crate::RuntimeCompileTarget::EvidenceGraph,
             ),
         ];
 
-        for (prompt, target, expected_first_label) in prompts {
-            let decision = StrategyDecisionEngine.decide(prompt, None);
+        for (prompt, target) in prompts {
+            let mut decision = StrategyDecisionEngine.decide(prompt, None);
             assert_eq!(decision.compile_target, target, "prompt: {prompt}");
             if prompt.contains("多 Agent") {
                 assert!(!decision.strategy.understanding.requires_write);
@@ -738,6 +600,7 @@ mod tests {
                     .contains(&harness_contract::core::ExecutionModifier::WithGuardrails));
             }
             let lease_id = decision.lease.lease_id.clone();
+            decision.execution_graph_ref = Some("execution-graph-authoritative".to_string());
             let kernel = RuntimeAiKernel::begin_turn_with_execution_decision(
                 "session-strategy-lease",
                 prompt,
@@ -748,18 +611,11 @@ mod tests {
             assert_eq!(kernel.execution_decision().lease.lease_id, lease_id);
             let trace = kernel.finalize("done", 0, 0);
             assert_eq!(trace.execution_decision.compile_target, target);
-            match expected_first_label {
-                Some(label) => assert_eq!(
-                    trace
-                        .execution_graph
-                        .as_ref()
-                        .and_then(|graph| graph.nodes.first())
-                        .map(|node| node.id.as_str()),
-                    Some(label),
-                    "prompt: {prompt}"
-                ),
-                None => assert!(trace.execution_graph.is_none(), "prompt: {prompt}"),
-            }
+            assert_eq!(
+                trace.execution_decision.execution_graph_ref.as_deref(),
+                Some("execution-graph-authoritative"),
+                "prompt: {prompt}"
+            );
         }
     }
 
@@ -826,45 +682,5 @@ mod tests {
         assert!(trace.verification_blocked);
         assert!(!trace.regression_gate.allowed);
         assert!(trace.learning_record.has_blocker());
-    }
-
-    #[test]
-    fn runtime_kernel_reports_execution_graph_quality_for_complex_turn() {
-        let kernel = RuntimeAiKernel::begin_turn(
-            "session-1",
-            "全面规划 runtime gateway service crate 的复杂架构演进",
-            ContextProfile::MainTurn,
-            &[],
-        );
-
-        let trace = kernel.finalize("planned", 0, 0);
-        let quality = trace
-            .execution_graph_quality
-            .expect("execution graph quality report");
-
-        assert!(quality.is_dag);
-        assert!(quality.has_verify_node);
-        assert!(quality.has_synthesize_node);
-        assert_eq!(
-            trace.collaboration_decision.template_id,
-            CollaborationTemplateId::LongRunningWorkstreams
-        );
-    }
-
-    #[test]
-    fn runtime_kernel_selects_debate_template_for_tradeoff_turn() {
-        let kernel = RuntimeAiKernel::begin_turn(
-            "session-1",
-            "分析这个架构选择的利弊，是否应该拆 crate",
-            ContextProfile::MainTurn,
-            &[],
-        );
-
-        let trace = kernel.finalize("decided", 0, 0);
-
-        assert_eq!(
-            trace.collaboration_decision.template_id,
-            CollaborationTemplateId::DebateCriticArbiter
-        );
     }
 }

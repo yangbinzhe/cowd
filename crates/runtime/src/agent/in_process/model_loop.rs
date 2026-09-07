@@ -91,11 +91,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
-        let bounded_resource_lease = packet.team_id().is_some()
-            || packet
-                .context_refs
-                .iter()
-                .any(|reference| reference.starts_with("agentic_program:"));
+        let bounded_resource_lease = packet.team_id().is_some() || packet.agentic_binding.is_some();
         let requested_tool_names = packet_allowed_tools.iter().cloned().collect::<Vec<_>>();
         let tool_definitions = host.delegated_tool_definitions(&requested_tool_names);
         let allowed_tools = tool_definitions
@@ -249,25 +245,24 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         // Agent-first topic observations are the sole collaboration inbox.
         // They are fenced by the immutable Program member/execution binding;
         // a retired collaboration board is never consulted by a model.
-        let initial_program_id = packet
-            .context_refs
-            .iter()
-            .find_map(|reference| reference.strip_prefix("agentic_program:"));
-        let initial_member_id = packet
-            .context_refs
-            .iter()
-            .find_map(|reference| reference.strip_prefix("agentic_member:"));
+        let initial_agentic_binding = packet.agentic_binding.as_ref();
         let mut initial_agentic_topic_ack = None;
-        let external_context_items = match (initial_program_id, initial_member_id) {
-            (Some(program_id), Some(member_id)) => services
+        let external_context_items = match initial_agentic_binding {
+            Some(binding) => services
                 .agent_action_service()
-                .topic_observations(program_id, member_id, packet.graph_id(), 32, 64 * 1024)
+                .topic_observations(
+                    &binding.program_id,
+                    &binding.agent_id,
+                    packet.graph_id(),
+                    32,
+                    64 * 1024,
+                )
                 .map_err(|error| format!("load initial Agent-first topic observations: {error}"))?
                 .filter(|page| !page.entries.is_empty())
                 .map(|page| {
                     let to_revision = page.to_revision;
                     initial_agentic_topic_ack = Some(crate::agentic::AgenticTopicObservationAck {
-                        program_id: program_id.to_string(),
+                        program_id: binding.program_id.clone(),
                         execution_id: packet.graph_id().to_string(),
                         through_revision: to_revision,
                         expected_cursor_revision: page.cursor_revision,
@@ -280,21 +275,21 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                     }))
                     .unwrap_or_else(|_| "{}".to_string());
                     let mut item = crate::ContextItem::new(
-                        format!("agentic-topic:{program_id}"),
+                        format!("agentic-topic:{}", binding.program_id),
                         crate::ContextSourceKind::AgentPeer,
                         crate::ContextRole::Evidence,
                         summary,
                     );
                     item.authority = crate::ContextAuthority::Tool;
-                    item.evidence = vec![format!("agentic-topic:{program_id}:{to_revision}")];
+                    item.evidence = vec![format!(
+                        "agentic-topic:{}:{to_revision}",
+                        binding.program_id
+                    )];
                     item
                 })
                 .into_iter()
                 .collect(),
-            (Some(_), None) => {
-                return Err("Agent-first packet has no immutable Program member binding".to_string())
-            }
-            (None, _) => Vec::new(),
+            None => Vec::new(),
         };
         let program_dossier_fragment = crate::TaskRuntimePort::new(services.as_ref())
             .get(&packet.assignment.root_task_id)
@@ -583,7 +578,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             Err(error) => {
                 let error = format!("in-process agent turn failed: {error}");
                 settle_failed_agentic_attempt(&services, &packet, &error).await;
-                services.fail_live_execution(packet.run_id(), error.clone());
+                services.fail_agent_live_execution(packet.run_id(), error.clone());
                 drop(runtime);
                 drop(child_execution_scope);
                 drop(active_run_cleanup);
@@ -715,7 +710,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         );
         let (acceptance, runtime_change_receipts) = derive_receipt_backed_satisfied_criteria(
             &packet,
-            &summary,
+            &summary.final_answer,
             &evidence_refs,
             &tool_executor,
             &observed_evidence,
@@ -827,13 +822,13 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         .await;
         let terminal_ref = format!("agent-terminal:{}", packet.run_id());
         match status {
-            AgentTerminalStatus::Completed => services.complete_live_execution(
+            AgentTerminalStatus::Completed => services.complete_agent_live_execution(
                 packet.run_id(),
                 &summary.context_turn_report,
                 &runtime_write_attempt_paths,
                 terminal_ref,
             ),
-            AgentTerminalStatus::Blocked => services.block_live_execution(
+            AgentTerminalStatus::Blocked => services.block_agent_live_execution(
                 packet.run_id(),
                 &summary.context_turn_report,
                 &runtime_write_attempt_paths,
@@ -842,13 +837,13 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                     .clone()
                     .unwrap_or_else(|| "delegated Agent was blocked".to_string()),
             ),
-            AgentTerminalStatus::Cancelled => services.cancel_live_execution(
+            AgentTerminalStatus::Cancelled => services.cancel_agent_live_execution(
                 packet.run_id(),
                 failure
                     .clone()
                     .unwrap_or_else(|| "delegated Agent was cancelled".to_string()),
             ),
-            AgentTerminalStatus::Failed => services.fail_live_execution(
+            AgentTerminalStatus::Failed => services.fail_agent_live_execution(
                 packet.run_id(),
                 failure
                     .clone()
@@ -881,10 +876,9 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             unresolved: Vec::new(),
             input_tokens: u64::from(summary.usage.input_tokens),
             output_tokens: u64::from(summary.usage.output_tokens),
-            cached_tokens: summary
-                .model_telemetry
-                .cache_create_tokens
-                .saturating_add(summary.model_telemetry.cache_read_tokens),
+            cache_creation_input_tokens: summary.model_telemetry.cache_create_tokens,
+            cache_read_input_tokens: summary.model_telemetry.cache_read_tokens,
+            cached_tokens: summary.model_telemetry.cache_read_tokens,
             // Keep the model that actually completed the child turn. The
             // selector value remains the requested lease and may differ after
             // a configured provider fallback.

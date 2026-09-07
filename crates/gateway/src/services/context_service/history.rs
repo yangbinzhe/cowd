@@ -558,7 +558,7 @@ mod tests {
     async fn artifact_backed_context_envelope_is_hydrated_only_on_demand() {
         let root = tempfile::tempdir().expect("artifact tempdir");
         let store: Arc<runtime::ArtifactStore> = Arc::new(
-            runtime::ArtifactStore::sqlite(root.path(), runtime::ArtifactStoreConfig::default())
+            runtime::ArtifactStore::for_test(root.path(), runtime::ArtifactStoreConfig::default())
                 .expect("artifact store"),
         );
         let persisted = serde_json::json!({

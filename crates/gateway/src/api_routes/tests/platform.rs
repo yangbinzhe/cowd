@@ -708,7 +708,7 @@
 
     #[tokio::test]
     async fn runtime_timeline_preserves_runtime_run_context_refs() {
-        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::pg_test_support::session_store());
         let session_id = "runtime-context-ref-timeline";
         store
             .create_session(&new_api_session_record(
@@ -852,7 +852,7 @@
 
     #[tokio::test]
     async fn evidence_resolver_reads_tool_events_by_ref() {
-        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::pg_test_support::session_store());
         let session_id = "evidence-tool-session";
         store
             .create_session(&new_api_session_record(
@@ -1063,7 +1063,7 @@
 
     #[tokio::test]
     async fn task_api_records_phase_artifacts_and_review() {
-        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::pg_test_support::session_store());
         let state = test_state_with_store(store);
         let source_session_id = "session-task-phase";
         publish_test_session_policy(&state.services, source_session_id);
@@ -1302,7 +1302,7 @@
             std::env::temp_dir().join(format!("cowd-api-maintenance-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let manager = Arc::new(
-            CognitiveContextManager::new(test_memory_config(&dir.join("memory.db")))
+            crate::pg_test_support::memory_manager(test_memory_config(&dir.join("memory.db")))
                 .await
                 .unwrap(),
         );
@@ -1405,7 +1405,7 @@
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let manager = Arc::new(
-            CognitiveContextManager::new(test_memory_config(&dir.join("memory.db")))
+            crate::pg_test_support::memory_manager(test_memory_config(&dir.join("memory.db")))
                 .await
                 .unwrap(),
         );
@@ -1428,7 +1428,7 @@
         let tmp = std::env::temp_dir().join(format!("cowd-api-memory-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let manager = Arc::new(
-            CognitiveContextManager::new(test_memory_config(&tmp.join("memory.db")))
+            crate::pg_test_support::memory_manager(test_memory_config(&tmp.join("memory.db")))
                 .await
                 .unwrap(),
         );
@@ -1479,7 +1479,7 @@
             std::env::temp_dir().join(format!("cowd-api-memory-packet-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let manager = Arc::new(
-            CognitiveContextManager::new(test_memory_config(&tmp.join("memory.db")))
+            crate::pg_test_support::memory_manager(test_memory_config(&tmp.join("memory.db")))
                 .await
                 .unwrap(),
         );
@@ -1532,7 +1532,7 @@
             std::env::temp_dir().join(format!("cowd-api-memory-links-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let manager = Arc::new(
-            CognitiveContextManager::new(test_memory_config(&tmp.join("memory.db")))
+            crate::pg_test_support::memory_manager(test_memory_config(&tmp.join("memory.db")))
                 .await
                 .unwrap(),
         );
@@ -1601,7 +1601,7 @@
         let tmp = std::env::temp_dir().join(format!("cowd-api-memory-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let manager = Arc::new(
-            CognitiveContextManager::new(test_memory_config(&tmp.join("memory.db")))
+            crate::pg_test_support::memory_manager(test_memory_config(&tmp.join("memory.db")))
                 .await
                 .unwrap(),
         );
@@ -1804,7 +1804,7 @@
             std::env::temp_dir().join(format!("cowd-api-memory-update-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let manager = Arc::new(
-            CognitiveContextManager::new(test_memory_config(&tmp.join("memory.db")))
+            crate::pg_test_support::memory_manager(test_memory_config(&tmp.join("memory.db")))
                 .await
                 .unwrap(),
         );
@@ -1889,7 +1889,7 @@
         let tmp = std::env::temp_dir().join(format!("cowd-api-audit-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let manager = Arc::new(
-            CognitiveContextManager::new(test_memory_config(&tmp.join("memory.db")))
+            crate::pg_test_support::memory_manager(test_memory_config(&tmp.join("memory.db")))
                 .await
                 .unwrap(),
         );
@@ -1952,7 +1952,7 @@
             std::env::temp_dir().join(format!("cowd-api-symbol-links-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let manager = Arc::new(
-            CognitiveContextManager::new(test_memory_config(&tmp.join("memory.db")))
+            crate::pg_test_support::memory_manager(test_memory_config(&tmp.join("memory.db")))
                 .await
                 .unwrap(),
         );

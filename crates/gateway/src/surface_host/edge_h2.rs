@@ -18,7 +18,7 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 use surface::SurfaceMessageLedger;
 
 #[cfg(test)]
-use super::SqliteSurfaceMessageStore;
+use super::EphemeralSurfaceMessageLedger;
 
 const AUTH_HEADER: &str = "x-cowd-edge-token";
 const MAX_RESPONSE_BODY: usize = 2 * 1024 * 1024;
@@ -672,7 +672,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let socket = root.join("edge.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let store = Arc::new(SqliteSurfaceMessageStore::new(root.join("messages")));
+        let store = Arc::new(EphemeralSurfaceMessageLedger::new());
         let acked = Arc::new(Notify::new());
         let persisted_before_ack = Arc::new(AtomicBool::new(false));
         let server_store = store.clone();

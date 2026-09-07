@@ -309,8 +309,17 @@ pub(crate) struct SessionWorkerHealth {
     pub(crate) claim_lease_lost: u64,
     pub(crate) workers: BTreeMap<String, SessionWorkerObservation>,
     pub(crate) recovery: crate::services::session_service::activation::SessionRecoverySummary,
+    pub(crate) recovery_state: SessionStartupRecoveryState,
     pub(crate) recovery_completed_at_ms: u64,
     pub(crate) reconciliation: BTreeMap<String, SessionReconciliationProgress>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SessionStartupRecoveryState {
+    InProgress,
+    Completed,
+    Failed,
 }
 
 pub(crate) const REQUIRED_SESSION_WORKERS: [&str; 5] = [
@@ -903,6 +912,7 @@ fn record_reconciliation_scan_failure(
 async fn run_session_cleanup_worker(
     session_service: Arc<SessionService>,
     reporter: WorkerBackendReporter,
+    mut producer_admission: watch::Receiver<bool>,
     mut shutdown: watch::Receiver<bool>,
     ready: oneshot::Sender<Result<(), String>>,
 ) -> Result<(), String> {
@@ -922,6 +932,10 @@ async fn run_session_cleanup_worker(
             .oldest_runnable_created_at_ms
             .map(|created_at| now_ms().saturating_sub(created_at)),
     );
+    signal_worker_ready(ready)?;
+    if !await_session_producer_admission(&mut producer_admission, &mut shutdown).await {
+        return Ok(());
+    }
     let initial_unloaded = match session_service.run_resource_cleanup().await {
         Ok(unloaded) => {
             reporter.success(None);
@@ -929,7 +943,6 @@ async fn run_session_cleanup_worker(
         }
         Err(error) => {
             reporter.failure(error.clone());
-            let _ = ready.send(Err(error.clone()));
             return Err(error);
         }
     };
@@ -939,7 +952,6 @@ async fn run_session_cleanup_worker(
             "initial session resource cleanup completed"
         );
     }
-    signal_worker_ready(ready)?;
     ticker.reset();
     loop {
         tokio::select! {
@@ -975,13 +987,23 @@ async fn run_lifecycle_reconciliation_worker(
     event_bus: Option<Arc<SessionProjectionHub>>,
     progress: Arc<Mutex<BTreeMap<String, SessionReconciliationProgress>>>,
     reporter: WorkerBackendReporter,
+    mut producer_admission: watch::Receiver<bool>,
     mut shutdown: watch::Receiver<bool>,
     ready: oneshot::Sender<Result<(), String>>,
 ) -> Result<(), String> {
     const WORKER_NAME: &str = "lifecycle_reconciliation";
     let wake = session_service.lifecycle_work_wake();
-    let mut ready = Some(ready);
+    if let Err(error) = session_service.list_pending_lifecycle_operations(1).await {
+        reporter.failure(error.clone());
+        record_reconciliation_scan_failure(&progress, WORKER_NAME, &error, now_ms());
+        let _ = ready.send(Err(error.clone()));
+        return Err(error);
+    }
+    signal_worker_ready(ready)?;
     loop {
+        if !await_session_producer_admission(&mut producer_admission, &mut shutdown).await {
+            return Ok(());
+        }
         let scanned_at_ms = now_ms();
         if let Some(services) = runtime_services.as_ref() {
             if let Some(runtime_service) = runtime_service.as_ref() {
@@ -1029,9 +1051,6 @@ async fn run_lifecycle_reconciliation_worker(
             Err(error) => {
                 reporter.failure(error.clone());
                 record_reconciliation_scan_failure(&progress, WORKER_NAME, &error, scanned_at_ms);
-                if let Some(ready) = ready.take() {
-                    let _ = ready.send(Err(error.clone()));
-                }
                 return Err(error);
             }
         };
@@ -1045,9 +1064,6 @@ async fn run_lifecycle_reconciliation_worker(
             oldest_pending_at_ms,
             scanned_at_ms,
         );
-        if let Some(ready) = ready.take() {
-            signal_worker_ready(ready)?;
-        }
         pending.truncate(WORKER_BATCH);
         let had_work = !pending.is_empty();
         let mut scan_succeeded = true;
@@ -1102,13 +1118,23 @@ async fn run_branch_activation_reconciliation_worker(
     session_service: Arc<SessionService>,
     progress: Arc<Mutex<BTreeMap<String, SessionReconciliationProgress>>>,
     reporter: WorkerBackendReporter,
+    mut producer_admission: watch::Receiver<bool>,
     mut shutdown: watch::Receiver<bool>,
     ready: oneshot::Sender<Result<(), String>>,
 ) -> Result<(), String> {
     const WORKER_NAME: &str = "branch_activation_reconciliation";
     let wake = session_service.branch_work_wake();
-    let mut ready = Some(ready);
+    if let Err(error) = session_service.list_pending_branch_activations(1).await {
+        reporter.failure(error.clone());
+        record_reconciliation_scan_failure(&progress, WORKER_NAME, &error, now_ms());
+        let _ = ready.send(Err(error.clone()));
+        return Err(error);
+    }
+    signal_worker_ready(ready)?;
     loop {
+        if !await_session_producer_admission(&mut producer_admission, &mut shutdown).await {
+            return Ok(());
+        }
         let scanned_at_ms = now_ms();
         let mut pending = match session_service
             .list_pending_branch_activations(WORKER_BATCH.saturating_add(1))
@@ -1118,9 +1144,6 @@ async fn run_branch_activation_reconciliation_worker(
             Err(error) => {
                 reporter.failure(error.clone());
                 record_reconciliation_scan_failure(&progress, WORKER_NAME, &error, scanned_at_ms);
-                if let Some(ready) = ready.take() {
-                    let _ = ready.send(Err(error.clone()));
-                }
                 return Err(error);
             }
         };
@@ -1137,9 +1160,6 @@ async fn run_branch_activation_reconciliation_worker(
             oldest_pending_at_ms,
             scanned_at_ms,
         );
-        if let Some(ready) = ready.take() {
-            signal_worker_ready(ready)?;
-        }
         pending.truncate(WORKER_BATCH);
         let had_work = !pending.is_empty();
         let mut scan_succeeded = true;
@@ -1211,6 +1231,7 @@ async fn run_ingress_worker(
     executor: GatewaySessionIngressExecutor,
     wake: Arc<Notify>,
     reporter: WorkerBackendReporter,
+    mut producer_admission: watch::Receiver<bool>,
     mut shutdown: watch::Receiver<bool>,
     ready: oneshot::Sender<Result<(), String>>,
 ) -> Result<(), String> {
@@ -1232,6 +1253,9 @@ async fn run_ingress_worker(
     );
     signal_worker_ready(ready)?;
     loop {
+        if !await_session_producer_admission(&mut producer_admission, &mut shutdown).await {
+            break;
+        }
         if *shutdown.borrow() {
             break;
         }
@@ -1345,6 +1369,35 @@ async fn run_ingress_worker(
         }
     }
     Ok(())
+}
+
+/// Wait until ordered Runtime restoration releases durable business-state
+/// producers. Readiness probes run before this fence, but no claim,
+/// cancellation reconciliation, or branch activation may cross it.
+async fn await_session_producer_admission(
+    producer_admission: &mut watch::Receiver<bool>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> bool {
+    loop {
+        if *shutdown.borrow() {
+            return false;
+        }
+        if *producer_admission.borrow() {
+            return true;
+        }
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return false;
+                }
+            }
+            changed = producer_admission.changed() => {
+                if changed.is_err() {
+                    return false;
+                }
+            }
+        }
+    }
 }
 
 async fn requeue_claimed_without_execution(
@@ -2082,6 +2135,7 @@ async fn run_delivery_worker(
     event_bus: Arc<SessionProjectionHub>,
     runtime_services: Option<Arc<runtime::RuntimeServices>>,
     reporter: WorkerBackendReporter,
+    mut producer_admission: watch::Receiver<bool>,
     mut shutdown: watch::Receiver<bool>,
     ready: oneshot::Sender<Result<(), String>>,
 ) -> Result<(), String> {
@@ -2096,6 +2150,9 @@ async fn run_delivery_worker(
     reporter.success(None);
     signal_worker_ready(ready)?;
     loop {
+        if !await_session_producer_admission(&mut producer_admission, &mut shutdown).await {
+            break;
+        }
         if *shutdown.borrow() {
             break;
         }
@@ -2163,64 +2220,7 @@ async fn deliver_terminal(
 ) -> Result<bool, String> {
     let outcome = match load_terminal_payload(artifacts, &record).await {
         Ok(payload) => {
-            if let (Some(services), Some(execution_id)) =
-                (runtime_services, record.execution_id.as_deref())
-            {
-                let terminal_status = match payload.goal_completion {
-                    harness_contract::goal::GoalCompletion::Satisfied => {
-                        harness_contract::projection::ExecutionLiveStatus::Complete
-                    }
-                    harness_contract::goal::GoalCompletion::Cancelled => {
-                        harness_contract::projection::ExecutionLiveStatus::Cancelled
-                    }
-                    harness_contract::goal::GoalCompletion::Partial
-                    | harness_contract::goal::GoalCompletion::Open
-                    | harness_contract::goal::GoalCompletion::WaitingExternalDecision
-                    | harness_contract::goal::GoalCompletion::Blocked
-                    | harness_contract::goal::GoalCompletion::Failed => {
-                        harness_contract::projection::ExecutionLiveStatus::Error
-                    }
-                };
-                match services.claim_live_terminal_fence(
-                    execution_id,
-                    record.terminal_id.clone(),
-                    terminal_status,
-                ) {
-                    Ok(
-                        runtime::execution_live::TerminalFenceClaim::Claimed
-                        | runtime::execution_live::TerminalFenceClaim::SameWinner,
-                    ) => {}
-                    Ok(runtime::execution_live::TerminalFenceClaim::ConflictingWinner) => {
-                        let event_store = event_store.clone();
-                        let terminal_id = record.terminal_id.clone();
-                        let worker = worker_id.to_string();
-                        let revision = record.revision;
-                        tokio::task::spawn_blocking(move || {
-                            event_store.suppress(
-                                &terminal_id,
-                                &worker,
-                                revision,
-                                "durable execution terminal fence was won by cancellation or another terminal",
-                                now_ms(),
-                            )
-                        })
-                        .await
-                        .map_err(|error| error.to_string())?
-                        .map_err(|error| error.to_string())?;
-                        return Ok(false);
-                    }
-                    Ok(runtime::execution_live::TerminalFenceClaim::MissingExecution) => {
-                        return Err(format!(
-                            "terminal fence execution `{execution_id}` is not yet recoverable"
-                        ));
-                    }
-                    Err(error) => {
-                        return Err(format!(
-                            "terminal fence persistence failed for `{execution_id}`: {error}"
-                        ));
-                    }
-                }
-            }
+            let terminal_status = live_terminal_status(payload.goal_completion);
             let terminal_presentation = payload.terminal_presentation.clone();
             let mut transcript = payload.transcript.unwrap_or_else(|| {
                 vec![DecodedTerminalTranscriptMessage {
@@ -2329,6 +2329,87 @@ async fn deliver_terminal(
                     record.terminal_id
                 ))),
             };
+            let live_claim = match (
+                terminal_commit.as_ref().ok(),
+                runtime_services,
+                record.execution_id.as_deref(),
+                record.turn_id.as_deref(),
+                record.session_generation,
+            ) {
+                (Some(_), Some(services), Some(execution_id), Some(turn_id), Some(generation)) => {
+                    // This is a reversible projection claim only. It blocks a
+                    // concurrent cancellation winner but does not expose a
+                    // terminal live state before the canonical Session
+                    // transaction commits.
+                    services.record_live_execution(
+                        &record.session_id,
+                        execution_id.to_string(),
+                        turn_id.to_string(),
+                    );
+                    match services.claim_live_terminal_fence(
+                        execution_id,
+                        record.terminal_id.clone(),
+                        terminal_status,
+                        generation,
+                    ) {
+                        Ok(
+                            runtime::execution_live::TerminalFenceClaim::Claimed
+                            | runtime::execution_live::TerminalFenceClaim::SamePending,
+                        ) => Some((services, execution_id, generation)),
+                        Ok(runtime::execution_live::TerminalFenceClaim::SameTerminal) => None,
+                        Ok(runtime::execution_live::TerminalFenceClaim::ConflictingPending) => {
+                            return record_delivery_failure(
+                                event_store,
+                                worker_id,
+                                &record,
+                                runtime::RuntimeSessionOutboxFailureClass::Retryable,
+                                "another reversible terminal claim is still pending".to_string(),
+                            )
+                            .await;
+                        }
+                        Ok(runtime::execution_live::TerminalFenceClaim::ConflictingTerminal) => {
+                            let event_store = event_store.clone();
+                            let terminal_id = record.terminal_id.clone();
+                            let worker = worker_id.to_string();
+                            let revision = record.revision;
+                            tokio::task::spawn_blocking(move || {
+                                event_store.suppress(
+                                    &terminal_id,
+                                    &worker,
+                                    revision,
+                                    "durable execution terminal fence winner conflicts with this Session terminal",
+                                    now_ms(),
+                                )
+                            })
+                            .await
+                            .map_err(|error| error.to_string())?
+                            .map_err(|error| error.to_string())?;
+                            return Ok(false);
+                        }
+                        Ok(runtime::execution_live::TerminalFenceClaim::MissingExecution) => {
+                            return record_delivery_failure(
+                                event_store,
+                                worker_id,
+                                &record,
+                                runtime::RuntimeSessionOutboxFailureClass::Retryable,
+                                format!("terminal execution `{execution_id}` is not recoverable"),
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            return record_delivery_failure(
+                                event_store,
+                                worker_id,
+                                &record,
+                                runtime::RuntimeSessionOutboxFailureClass::Retryable,
+                                format!("terminal claim persistence failed: {error}"),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                _ => None,
+            };
             let write = match terminal_commit {
                 Ok(commit) => session_service
                     .commit_terminal_transcript(&commit)
@@ -2338,6 +2419,43 @@ async fn deliver_terminal(
             };
             match write {
                 Ok((messages, inserted)) => {
+                    if let Some((services, execution_id, generation)) = live_claim {
+                        match services.finalize_live_terminal_fence(
+                            execution_id,
+                            &record.terminal_id,
+                            terminal_status,
+                            generation,
+                        ) {
+                            Ok(
+                                runtime::execution_live::TerminalFenceClaim::Claimed
+                                | runtime::execution_live::TerminalFenceClaim::SameTerminal,
+                            ) => {}
+                            Ok(other) => {
+                                return record_delivery_failure(
+                                    event_store,
+                                    worker_id,
+                                    &record,
+                                    runtime::RuntimeSessionOutboxFailureClass::Retryable,
+                                    format!(
+                                        "Session terminal committed but live finalization returned {other:?}"
+                                    ),
+                                )
+                                .await;
+                            }
+                            Err(error) => {
+                                return record_delivery_failure(
+                                    event_store,
+                                    worker_id,
+                                    &record,
+                                    runtime::RuntimeSessionOutboxFailureClass::Retryable,
+                                    format!(
+                                        "Session terminal committed but live finalization failed: {error}"
+                                    ),
+                                )
+                                .await;
+                            }
+                        }
+                    }
                     if inserted {
                         session_service.schedule_context_index_reconciliation(&record.session_id);
                     }
@@ -2357,14 +2475,41 @@ async fn deliver_terminal(
                         )
                     })
                 }
-                Err(session::SessionError::StaleExecutionFence(error)) => Err((
-                    runtime::RuntimeSessionOutboxFailureClass::Permanent,
-                    format!("stale terminal fence: {error}"),
-                )),
-                Err(error) => Err((
-                    runtime::RuntimeSessionOutboxFailureClass::Permanent,
-                    error.to_string(),
-                )),
+                Err(error) => {
+                    let class = classify_terminal_session_error(&error);
+                    if class == runtime::RuntimeSessionOutboxFailureClass::Permanent {
+                        // A previous attempt may have persisted this exact
+                        // pending claim and then observed an unknown DB
+                        // outcome. If a later retry proves the Session fence
+                        // stale before reacquiring the claim, still release
+                        // that old reversible slot by exact identity.
+                        if let (Some(services), Some(execution_id), Some(generation)) = (
+                            runtime_services,
+                            record.execution_id.as_deref(),
+                            record.session_generation,
+                        ) {
+                            if let Err(abort_error) = services.abort_live_terminal_fence(
+                                execution_id,
+                                &record.terminal_id,
+                                generation,
+                            ) {
+                                tracing::error!(
+                                    %execution_id,
+                                    terminal_id = %record.terminal_id,
+                                    %abort_error,
+                                    "deterministic Session terminal failure could not abort its reversible live claim"
+                                );
+                            }
+                        }
+                    }
+                    let error = match error {
+                        session::SessionError::StaleExecutionFence(error) => {
+                            format!("stale terminal fence: {error}")
+                        }
+                        error => error.to_string(),
+                    };
+                    Err((class, error))
+                }
             }
         }
         Err(error) => Err(error),
@@ -2437,33 +2582,98 @@ async fn deliver_terminal(
             Ok(inserted)
         }
         Err((class, error)) => {
-            let delivery_error = error.clone();
-            let event_store = event_store.clone();
-            let terminal_id = record.terminal_id.clone();
-            let worker = worker_id.to_string();
-            let revision = record.revision;
-            let retry_at = now_ms().saturating_add(retry_delay_ms(record.attempts));
-            let failure_record = tokio::task::spawn_blocking(move || {
-                event_store.fail(
-                    &terminal_id,
-                    &worker,
-                    revision,
-                    class,
-                    &error,
-                    retry_at,
-                    MAX_ATTEMPTS,
-                    now_ms(),
-                )
-            })
-            .await
-            .map_err(|error| error.to_string())
-            .and_then(|result| result.map_err(|error| error.to_string()));
-            if let Err(failure) = failure_record {
-                tracing::error!(terminal_id = %record.terminal_id, error = %failure, "terminal failure state could not be recorded");
-            }
-            Err(delivery_error)
+            record_delivery_failure(event_store, worker_id, &record, class, error).await
         }
     }
+}
+
+pub(crate) const fn live_terminal_status(
+    completion: harness_contract::goal::GoalCompletion,
+) -> harness_contract::projection::ExecutionLiveStatus {
+    match completion {
+        harness_contract::goal::GoalCompletion::Satisfied => {
+            harness_contract::projection::ExecutionLiveStatus::Complete
+        }
+        harness_contract::goal::GoalCompletion::Cancelled => {
+            harness_contract::projection::ExecutionLiveStatus::Cancelled
+        }
+        harness_contract::goal::GoalCompletion::Partial
+        | harness_contract::goal::GoalCompletion::Open
+        | harness_contract::goal::GoalCompletion::WaitingExternalDecision
+        | harness_contract::goal::GoalCompletion::Blocked
+        | harness_contract::goal::GoalCompletion::Failed => {
+            harness_contract::projection::ExecutionLiveStatus::Error
+        }
+    }
+}
+
+const fn classify_terminal_session_error(
+    error: &session::SessionError,
+) -> runtime::RuntimeSessionOutboxFailureClass {
+    match error {
+        session::SessionError::StaleExecutionFence(_)
+        | session::SessionError::InvalidArgument(_)
+        | session::SessionError::NotFound(_)
+        | session::SessionError::Serialization(_)
+        | session::SessionError::IdempotencyConflict { .. } => {
+            runtime::RuntimeSessionOutboxFailureClass::Permanent
+        }
+        // These failures either state that execution never reached the DB or
+        // explicitly leave its outcome unknown. Stable terminal/message IDs
+        // make a retry an idempotent outcome query rather than a duplicate
+        // business write.
+        session::SessionError::Store(_)
+        | session::SessionError::Other(_)
+        | session::SessionError::StorageQueueFull { .. }
+        | session::SessionError::StoragePlaneShutdown
+        | session::SessionError::StorageWorkerPanic
+        | session::SessionError::StorageWorkerJoin(_)
+        | session::SessionError::StorageDrainTimeout { .. } => {
+            runtime::RuntimeSessionOutboxFailureClass::Retryable
+        }
+    }
+}
+
+async fn record_delivery_failure(
+    event_store: &runtime::SessionTerminalDeliveryPort,
+    worker_id: &str,
+    record: &runtime::RuntimeSessionOutboxRecord,
+    class: runtime::RuntimeSessionOutboxFailureClass,
+    error: String,
+) -> Result<bool, String> {
+    let delivery_error = error.clone();
+    let event_store = event_store.clone();
+    let terminal_id = record.terminal_id.clone();
+    let worker = worker_id.to_string();
+    let revision = record.revision;
+    let retry_at = now_ms().saturating_add(retry_delay_ms(record.attempts));
+    let max_attempts = if class == runtime::RuntimeSessionOutboxFailureClass::Retryable {
+        // Unknown DB outcomes must remain queryable/retryable. Stable terminal
+        // and message identities turn every retry into an idempotent lookup;
+        // exhausting a small delivery budget would strand a committed answer.
+        u32::MAX
+    } else {
+        MAX_ATTEMPTS
+    };
+    let failure_record = tokio::task::spawn_blocking(move || {
+        event_store.fail(
+            &terminal_id,
+            &worker,
+            revision,
+            class,
+            &error,
+            retry_at,
+            max_attempts,
+            now_ms(),
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())
+    .and_then(|result| result.map_err(|error| error.to_string()));
+    if let Err(failure) = failure_record {
+        tracing::error!(terminal_id = %record.terminal_id, error = %failure, "terminal failure state could not be recorded");
+    }
+    Err(delivery_error)
 }
 
 fn retry_delay_ms(attempt: u32) -> u64 {

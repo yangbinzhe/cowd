@@ -126,7 +126,7 @@ impl ConnectorService {
         Self {
             label: "connector",
             owner: "0.9.315 Connector service boundary",
-            resource_directory_factory: Arc::new(connector::SqliteResourceDirectoryFactory),
+            resource_directory_factory: Arc::new(connector::UnavailableResourceDirectoryFactory),
             resource_directory_handle: None,
         }
     }
@@ -487,22 +487,11 @@ impl GrowthService {
     }
 
     pub(crate) fn new_for_config_home(config_home: impl AsRef<Path>) -> Self {
-        let registry = storage::StorageRegistry::default_for_config_home(config_home);
-        let ledger = registry
-            .endpoint(&storage::StorageDomainId::Fact)
-            .map_err(|error| error.to_string())
-            .and_then(|fact_endpoint| {
-                let growth_endpoint = registry
-                    .endpoint(&storage::StorageDomainId::Growth)
-                    .map_err(|error| error.to_string())?;
-                fact_sqlite::SqliteFactLedger::open_with_legacy_growth(fact_endpoint, growth_endpoint)
-                    .map_err(|error| error.to_string())
-            })
-            .map(|ledger| Arc::new(ledger) as Arc<dyn fact_kernel::FactLedger>)
-            .unwrap_or_else(|error| {
-                tracing::error!(%error, "fact/growth ledger unavailable; growth operations will fail closed");
-                Arc::new(fact_kernel::UnavailableFactLedger::new(error))
-            });
+        let _ = config_home.as_ref();
+        let ledger: Arc<dyn fact_kernel::FactLedger> =
+            Arc::new(fact_kernel::UnavailableFactLedger::new(
+                "GrowthService requires the process-selected PostgreSQL topology",
+            ));
         Self {
             label: "growth",
             owner: "0.9.380 Growth service boundary",
@@ -1003,7 +992,24 @@ mod tests {
             "cowd-growth-pipeline-test-{}",
             uuid::Uuid::new_v4()
         ));
-        let services = GatewayServices::baseline_with_config_home(&config_home);
+        let workspace = config_home.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let topology = crate::selected_storage::SelectedStorageTopology::compose_for_test(
+            &config_home,
+            &workspace,
+        )
+        .expect("isolated PostgreSQL topology");
+        let growth = GrowthService::with_ledger(Arc::clone(&topology.fact_ledger));
+        let memory =
+            MemoryService::with_manager_and_knowledge(None, topology.knowledge_fabric.clone());
+        let matrix = MatrixService::with_store(
+            Arc::clone(&topology.matrix_store),
+            topology
+                .registry
+                .endpoint(&storage::StorageDomainId::Matrix)
+                .expect("matrix endpoint")
+                .clone(),
+        );
         let record = LearningRecord::from_input(GrowthInput {
             selected_pattern: ExecutionPattern::Execute,
             complexity: TaskComplexity::Complex,
@@ -1026,14 +1032,8 @@ mod tests {
             )],
         });
 
-        let receipt = services
-            .growth
-            .ingest_growth_event(
-                &config_home,
-                &services.memory,
-                &services.matrix,
-                event.clone(),
-            )
+        let receipt = growth
+            .ingest_growth_event(&config_home, &memory, &matrix, event.clone())
             .await;
 
         assert!(receipt.durable, "{receipt:#?}");
@@ -1054,39 +1054,24 @@ mod tests {
             .promotions
             .iter()
             .any(|item| item.target == "memory.entry" && item.status == "held"));
-        assert_eq!(
-            services
-                .growth
-                .durable_event_log()
-                .expect("durable events")
-                .len(),
-            1
-        );
-        assert!(!services
-            .growth
+        assert_eq!(growth.durable_event_log().expect("durable events").len(), 1);
+        assert!(!growth
             .durable_promotion_log()
             .expect("durable promotions")
             .is_empty());
-        assert!(!services
-            .matrix
+        assert!(!matrix
             .list_facts(&config_home, 10)
             .expect("matrix facts")
             .is_empty());
 
-        let fact_count_before_replay = services
-            .growth
-            .list_fact_records()
-            .expect("durable facts")
-            .len();
-        let replay = services
-            .growth
-            .ingest_growth_event(&config_home, &services.memory, &services.matrix, event)
+        let fact_count_before_replay = growth.list_fact_records().expect("durable facts").len();
+        let replay = growth
+            .ingest_growth_event(&config_home, &memory, &matrix, event)
             .await;
         assert!(replay.durable, "{replay:#?}");
         assert!(replay.errors.is_empty(), "{replay:#?}");
         assert_eq!(
-            services
-                .growth
+            growth
                 .durable_event_log()
                 .expect("replayed durable events")
                 .len(),
@@ -1094,8 +1079,7 @@ mod tests {
             "same event id must not create a second Growth event"
         );
         assert_eq!(
-            services
-                .growth
+            growth
                 .list_fact_records()
                 .expect("replayed durable facts")
                 .len(),

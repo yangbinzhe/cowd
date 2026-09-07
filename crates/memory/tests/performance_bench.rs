@@ -20,7 +20,6 @@ use std::time::Instant;
 fn bench_config(sqlite_path: &std::path::Path) -> MemoryConfig {
     MemoryConfig {
         store: StoreConfig {
-            sqlite_path: sqlite_path.to_path_buf(),
             blob_dir: sqlite_path.parent().unwrap().join("blobs"),
             enable_vector_index: false,
             cache_capacity: 1024,
@@ -79,7 +78,9 @@ fn test_entry(content: &str) -> MemoryEntry {
 async fn bench_recall_latency_1k_entries() {
     let tmp = tempfile::TempDir::new().unwrap();
     let config = bench_config(&tmp.path().join("bench.db"));
-    let mgr = CognitiveContextManager::new(config).await.unwrap();
+    let mgr = CognitiveContextManager::new_ephemeral(config)
+        .await
+        .unwrap();
 
     let n = 1_000;
     let start = Instant::now();
@@ -120,7 +121,9 @@ async fn bench_recall_latency_1k_entries() {
 async fn bench_get_entry_latency() {
     let tmp = tempfile::TempDir::new().unwrap();
     let config = bench_config(&tmp.path().join("bench.db"));
-    let mgr = CognitiveContextManager::new(config).await.unwrap();
+    let mgr = CognitiveContextManager::new_ephemeral(config)
+        .await
+        .unwrap();
 
     let n = 100;
     let mut ids = Vec::new();
@@ -161,7 +164,9 @@ async fn bench_get_entry_latency() {
 async fn bench_prepare_context_cached_p95_under_300ms() {
     let tmp = tempfile::TempDir::new().unwrap();
     let config = cached_prepare_config(&tmp.path().join("bench.db"));
-    let mgr = CognitiveContextManager::new(config).await.unwrap();
+    let mgr = CognitiveContextManager::new_ephemeral(config)
+        .await
+        .unwrap();
     assert_eq!(mgr.search_mode_label(), "keyword");
 
     for i in 0..300 {

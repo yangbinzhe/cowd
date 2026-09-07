@@ -13,14 +13,14 @@
 
 use memory::config::{BudgetConfig, StoreConfig};
 use memory::{
-    CognitiveContextManager, MemoryCategory, MemoryConfig, MemoryEntry, MemoryLayer, MemoryScope,
-    MemorySource, Priority,
+    CognitiveContextManager, EphemeralMemoryStore, MemoryCategory, MemoryConfig, MemoryEntry,
+    MemoryLayer, MemoryScope, MemorySource, MemoryStore, Priority,
 };
+use std::sync::Arc;
 
 fn test_config(sqlite_path: &std::path::Path) -> MemoryConfig {
     MemoryConfig {
         store: StoreConfig {
-            sqlite_path: sqlite_path.to_path_buf(),
             blob_dir: sqlite_path.parent().unwrap().join("blobs"),
             enable_vector_index: false,
             cache_capacity: 256,
@@ -68,12 +68,18 @@ async fn memory_entries_across_layers_survive_manager_reopen() {
 
     let n_entries = 20;
     let entry_ids: Vec<uuid::Uuid>;
+    let store: Arc<dyn MemoryStore> = Arc::new(EphemeralMemoryStore::new());
 
     // ===== Phase 1: Write entries across all layers =====
     {
-        let mgr = CognitiveContextManager::new(test_config(&db_path))
-            .await
-            .unwrap();
+        let mgr = CognitiveContextManager::new_with_selected_store(
+            test_config(&db_path),
+            None,
+            None,
+            Arc::clone(&store),
+        )
+        .await
+        .unwrap();
 
         // Write entries to each layer
         let layers = [
@@ -108,13 +114,18 @@ async fn memory_entries_across_layers_survive_manager_reopen() {
             "Entry should be retrievable immediately"
         );
     }
-    // mgr dropped - data should persist in SQLite
+    // The manager is dropped while the explicitly host-owned store survives.
 
     // ===== Phase 2: Restart and verify persistence =====
     {
-        let mgr = CognitiveContextManager::new(test_config(&db_path))
-            .await
-            .unwrap();
+        let mgr = CognitiveContextManager::new_with_selected_store(
+            test_config(&db_path),
+            None,
+            None,
+            Arc::clone(&store),
+        )
+        .await
+        .unwrap();
 
         // Verify entries survive restart via layer listing
         let layer_info = mgr.list_layers().await;

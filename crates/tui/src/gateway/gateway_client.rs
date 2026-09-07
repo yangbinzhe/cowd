@@ -2270,12 +2270,6 @@ impl GatewayApiClient {
         .await
     }
 
-    /// Read the Runtime-owned catalog of runnable Team template revisions.
-    pub async fn team_templates(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(surface::gateway_api::paths::API_TEAM_TEMPLATES.template())
-            .await
-    }
-
     pub async fn decide_mission_approval(
         &self,
         approval_id: &str,

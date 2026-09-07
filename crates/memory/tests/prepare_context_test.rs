@@ -21,7 +21,6 @@ use memory::{
 fn test_basic_config(sqlite_path: &std::path::Path) -> MemoryConfig {
     MemoryConfig {
         store: StoreConfig {
-            sqlite_path: sqlite_path.to_path_buf(),
             blob_dir: sqlite_path.parent().unwrap().join("blobs"),
             enable_vector_index: false,
             cache_capacity: 128,
@@ -77,7 +76,9 @@ fn test_entry(layer: MemoryLayer, title: &str, content: &str) -> MemoryEntry {
 async fn test_recall_semantic_bridge_finds_related_memory_without_keyword_overlap() {
     let tmp = tempfile::TempDir::new().unwrap();
     let config = test_basic_config(&tmp.path().join("test.db"));
-    let mgr = CognitiveContextManager::new(config).await.unwrap();
+    let mgr = CognitiveContextManager::new_ephemeral(config)
+        .await
+        .unwrap();
 
     // Create a tag to identify this entry
     let tag = format!("sem-test-{}", uuid::Uuid::new_v4().as_simple());
@@ -139,7 +140,9 @@ async fn test_recall_semantic_bridge_finds_related_memory_without_keyword_overla
 async fn test_prepare_context_cache_invalidates_after_memory_write() {
     let tmp = tempfile::TempDir::new().unwrap();
     let config = cached_test_config(&tmp.path().join("test.db"));
-    let mgr = CognitiveContextManager::new(config).await.unwrap();
+    let mgr = CognitiveContextManager::new_ephemeral(config)
+        .await
+        .unwrap();
 
     let query = "COWD_PREPARE_CACHE_INVALIDATE_ALPHA";
     let before = mgr.prepare_context(query, &[], None).await.unwrap();

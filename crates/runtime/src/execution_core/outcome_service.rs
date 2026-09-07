@@ -596,7 +596,7 @@ mod tests {
 
     #[test]
     fn all_execution_candidates_record_without_graph_ref_and_retry_idempotently() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let build = RuntimeBuildIdentity::new("0.9.687", "a".repeat(40), true);
         let service = OutcomeService::with_build_identity(Arc::clone(&store), build.clone());
         for candidate in [
@@ -640,7 +640,7 @@ mod tests {
 
     #[test]
     fn duplicate_identity_with_different_payload_is_rejected() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let service = OutcomeService::new(store);
         let original = outcome(ExecutionCandidateKind::Direct);
         service.record_terminal(&original).unwrap();
@@ -654,7 +654,7 @@ mod tests {
 
     #[test]
     fn paired_calibration_import_is_explicit_validated_and_idempotent() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let service = OutcomeService::new(Arc::clone(&store));
         let mut calibrated = outcome(ExecutionCandidateKind::Direct);
         calibrated.identity.paired_sample_id = Some("pair-1".to_string());
@@ -707,7 +707,7 @@ mod tests {
 
     #[test]
     fn scoped_feedback_rejects_invalid_environment_and_workload_shape() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let service = OutcomeService::new(store);
         let mut invalid = outcome(ExecutionCandidateKind::Direct);
         invalid.strategy_feedback.workload = Some(
@@ -739,7 +739,7 @@ mod tests {
 
     #[test]
     fn scope_identity_fence_rejects_ambiguous_team_and_legacy_outcomes() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let service = OutcomeService::new(store);
         let mut team_without_id = outcome(ExecutionCandidateKind::Direct);
         team_without_id.identity.execution_scope =

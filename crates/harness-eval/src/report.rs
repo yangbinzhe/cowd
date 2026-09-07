@@ -657,10 +657,25 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
                 .then(|| fallback_read.saturating_mul(10_000) / cache_prompt_tokens)
                 .unwrap_or(0)
         });
-    let cache_usage_known = cache
-        .get("usage_known")
+    let cache_dimensions_declared_known = cache
+        .get("cache_dimensions_known")
         .and_then(Value::as_bool)
-        .unwrap_or(cache_prompt_tokens > 0);
+        .unwrap_or(false);
+    let cache_physical_attempts = cache
+        .get("physical_provider_attempts")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let cache_dimensions_unknown_attempts = cache
+        .get("cache_dimensions_unknown_attempts")
+        .and_then(Value::as_u64)
+        .unwrap_or(cache_physical_attempts);
+    let cache_provider_rounds = cache
+        .get("provider_rounds")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| runtime_provider_rounds(trace));
+    let cache_usage_known = cache_dimensions_declared_known
+        && cache_dimensions_unknown_attempts == 0
+        && cache_physical_attempts >= cache_provider_rounds;
     let structural_prompt_bytes = cache
         .get("model_visible_prompt_bytes")
         .and_then(Value::as_u64)
@@ -873,7 +888,7 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
         !real_model_claimed || cache_usage_known,
         true,
         format!(
-            "real_model_claimed={real_model_claimed}, prompt_tokens={cache_prompt_tokens}, usage_known={cache_usage_known}"
+            "real_model_claimed={real_model_claimed}, prompt_tokens={cache_prompt_tokens}, physical_attempts={cache_physical_attempts}, unknown_cache_attempts={cache_dimensions_unknown_attempts}, cache_dimensions_known={cache_usage_known}"
         ),
         "persist canonical hit/miss usage for every real Provider run",
     ));
@@ -1452,7 +1467,11 @@ mod gate_tests {
             "provider_cache": {
                 "provider_prompt_tokens": 100,
                 "cache_hit_ratio_bp": 9000,
+                "provider_rounds": 3,
+                "physical_provider_attempts": 3,
                 "usage_known": true,
+                "cache_dimensions_known": true,
+                "cache_dimensions_unknown_attempts": 0,
                 "model_visible_prompt_bytes": 10000,
                 "structural_reuse_ratio_bp": 9500,
                 "warm_provider_prompt_tokens": 80,
@@ -1471,6 +1490,18 @@ mod gate_tests {
         assert_eq!(
             gate_item(&failed, "real_provider_cache_cold_inclusive_90pct").status,
             "failed"
+        );
+
+        report["execution_trace"]["provider_rounds"] = json!(0);
+        report["execution_trace"]["provider_cache"]["provider_rounds"] = json!(0);
+        report["execution_trace"]["provider_cache"]["physical_provider_attempts"] = json!(1);
+        report["execution_trace"]["provider_cache"]["cache_dimensions_unknown_attempts"] = json!(1);
+        report["execution_trace"]["provider_cache"]["cache_dimensions_known"] = json!(true);
+        let unknown_cache = evaluate_report_gate(&report);
+        assert_eq!(
+            gate_item(&unknown_cache, "real_provider_cache_usage_known").status,
+            "failed",
+            "a declared known flag must not override an unknown physical attempt"
         );
     }
 

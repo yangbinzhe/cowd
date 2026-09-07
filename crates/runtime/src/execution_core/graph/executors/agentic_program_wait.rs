@@ -282,7 +282,10 @@ pub async fn resolve_agentic_program_wait(
     let mut resolved = 0usize;
     const MAX_GRAPH_CAS_ATTEMPTS: usize = 8;
     for attempt in 0..MAX_GRAPH_CAS_ATTEMPTS {
-        let graph = match state_store.load_async(root_execution_id.to_string()).await {
+        let graph = match state_store
+            .load_current_async(root_execution_id.to_string())
+            .await
+        {
             Ok(graph) => graph,
             Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound(_)) => {
                 return Ok(resolved);
@@ -362,7 +365,7 @@ pub async fn reconcile_agentic_program_wait_for_settled_graph(
     state_store: &ExecutionGraphStateStore,
     supervisor: &crate::RuntimeExecutionSupervisor,
 ) -> Result<usize, String> {
-    let graph = match state_store.load_async(graph_id.to_string()).await {
+    let graph = match state_store.load_current_async(graph_id.to_string()).await {
         Ok(graph) => graph,
         Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound(_)) => return Ok(0),
         Err(error) => return Err(error.to_string()),
@@ -451,7 +454,7 @@ async fn active_agentic_child_graphs(
     let mut active = Vec::new();
     for link in links {
         let graph = match state_store
-            .load_async(link.child_execution_id.clone())
+            .load_current_async(link.child_execution_id.clone())
             .await
         {
             Ok(graph) => graph,
@@ -612,6 +615,11 @@ mod tests {
                 acceptance: "the claimed child eventually submits evidence".to_string(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
+
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
             }),
         );
         let published = services
@@ -634,6 +642,11 @@ mod tests {
                 role: "Executor".to_string(),
                 mission: "claim the already-published work".to_string(),
                 required_capabilities: vec!["read".to_string()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
             }),
         );
         register_agent_child(

@@ -946,7 +946,7 @@ impl Drop for RunningGuard<'_> {
 mod tests {
     use super::*;
     use crate::config::ExtractorConfig;
-    use crate::store::sqlite::SqliteStore;
+    use crate::store::EphemeralMemoryStore;
     use crate::types::{Message, MessageRole};
     use std::sync::Mutex;
 
@@ -1209,7 +1209,7 @@ mod tests {
 
     #[tokio::test]
     async fn poll_persists_entries_from_live_source() {
-        let store: Arc<dyn MemoryStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let store: Arc<dyn MemoryStore> = Arc::new(EphemeralMemoryStore::new());
         let source = Arc::new(TestExtractionSource::new(
             make_messages(),
             Arc::clone(&store),

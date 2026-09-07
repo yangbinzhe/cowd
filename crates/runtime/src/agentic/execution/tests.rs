@@ -1,3 +1,4 @@
+use super::helpers::deterministic_graph_id;
 use super::*;
 use harness_contract::agent_action::{
     AgentActorBinding, AgentActorKind, AgentInviteInput, ArtifactCommitInput, TaskClaimInput,
@@ -44,6 +45,11 @@ async fn heartbeat_waits_for_the_agents_real_claim_and_stops_at_graph_terminal()
                 role: "Worker".to_string(),
                 mission: "claim autonomously".to_string(),
                 required_capabilities: vec!["read".to_string()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
             }),
         ))
         .expect("agent")
@@ -59,6 +65,11 @@ async fn heartbeat_waits_for_the_agents_real_claim_and_stops_at_graph_terminal()
                 acceptance: "claim is fenced to the Agent execution".to_string(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
+
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
             }),
         ))
         .expect("task")
@@ -84,7 +95,12 @@ async fn heartbeat_waits_for_the_agents_real_claim_and_stops_at_graph_terminal()
         .register_graph(graph)
         .expect("register graph");
     let projection = actions.project("program-dispatch").expect("projection");
-    let actor = agentic_claim_actor(&projection, &projection.agents[&member], execution_id);
+    let actor = agentic_claim_actor(
+        &projection,
+        &projection.agents[&member],
+        &task,
+        execution_id,
+    );
     assert_eq!(
         agentic_claim_heartbeat_state(
             Arc::downgrade(services.as_ref()),
@@ -370,6 +386,11 @@ async fn task_publish_admits_real_agent_graph_with_human_display_identity() {
                 role: "Researcher".to_string(),
                 mission: "collect evidence".to_string(),
                 required_capabilities: vec!["web-research".to_string()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
             }),
         )))
         .expect("agent")
@@ -384,6 +405,11 @@ async fn task_publish_admits_real_agent_graph_with_human_display_identity() {
             acceptance: "cite evidence".to_string(),
             required_capabilities: vec!["python".to_string(), "verification".to_string()],
             depends_on: Vec::new(),
+
+            obligation_refs: Vec::new(),
+            purpose: Default::default(),
+            execution_requirements: Vec::new(),
+            expertise_hints: Vec::new(),
         }),
     ));
     let task_ref = action_service.apply(&task).expect("task").changed_refs[0].clone();
@@ -529,7 +555,7 @@ async fn task_publish_admits_real_agent_graph_with_human_display_identity() {
     action_service
         .apply(&AgentActionEnvelope {
             action_id: "model-agent-claim".to_string(),
-            actor,
+            actor: actor.clone(),
             expected_revision: None,
             action: AgentAction::TaskClaim(TaskClaimInput {
                 task_ref: task_ref.clone(),
@@ -558,6 +584,8 @@ async fn task_publish_admits_real_agent_graph_with_human_display_identity() {
         AgentAction::StateInspect(harness_contract::agent_action::StateInspectInput {
             scope_ref: None,
             after_revision: None,
+            page_cursor: None,
+            entry_ref: None,
         }),
     ));
     let before = services
@@ -587,6 +615,234 @@ async fn task_publish_admits_real_agent_graph_with_human_display_identity() {
             .expect("active graphs"),
         before,
         "state_inspect must never admit provider work"
+    );
+
+    // Continue real admission through the Objective and experience writers;
+    // never manufacture an episode/pattern event in this integration fixture.
+    let content = services
+        .artifact_store()
+        .write_bytes(
+            harness_contract::context::ArtifactWriteDescriptor {
+                media_type: "text/markdown".into(),
+                visibility_scope: "session:session-dispatch".into(),
+                expected_bytes: None,
+                original_name: Some("result.md".into()),
+            },
+            b"Source-backed findings for independent review",
+        )
+        .await
+        .expect("persist content");
+    let apply_author = |id: &str, action: AgentAction| {
+        action_service
+            .apply(&AgentActionEnvelope {
+                action_id: id.into(),
+                actor: actor.clone(),
+                expected_revision: None,
+                action,
+            })
+            .expect("author action")
+    };
+    let artifact = apply_author(
+        "experience-artifact",
+        AgentAction::ArtifactCommit(ArtifactCommitInput {
+            content_ref: content.selector.clone(),
+            kind: "report".into(),
+            title: "Findings".into(),
+            relates_to: vec![],
+        }),
+    )
+    .changed_refs[0]
+        .clone();
+    let reviewer = action_service
+        .apply(&bind_root(root(
+            "experience-reviewer",
+            AgentAction::AgentInvite(AgentInviteInput {
+                team_ref: team_ref.clone(),
+                role: "Verifier".into(),
+                mission: "Inspect evidence".into(),
+                required_capabilities: vec!["read".into()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
+            }),
+        )))
+        .expect("invite verifier")
+        .changed_refs[0]
+        .clone();
+    let submit = AgentActionEnvelope {
+        action_id: "experience-submit".into(),
+        actor: actor.clone(),
+        expected_revision: None,
+        action: AgentAction::TaskSubmit(TaskSubmitInput {
+            task_ref: task_ref.clone(),
+            artifact_refs: vec![artifact.clone()],
+            evidence_refs: vec![content.selector.clone()],
+            unresolved: vec![],
+        }),
+    };
+    assert_eq!(
+        action_service.apply(&submit).unwrap().status,
+        harness_contract::agent_action::AgentActionStatus::Applied
+    );
+    let review_dispatch = services
+        .dispatch_agentic_followups(
+            &submit,
+            AgenticDispatchContext {
+                session_id: "session-dispatch".into(),
+                turn_id: "turn-dispatch".into(),
+                model_lease: "test".into(),
+                permission_ceiling: PermissionMode::ReadOnly,
+                resource_scopes: vec![],
+            },
+        )
+        .await
+        .expect("physical reviewer admission");
+    assert_eq!(review_dispatch.len(), 1);
+    assert_eq!(review_dispatch[0].agent_ref, reviewer);
+    let review_graph = services
+        .graph_state_store()
+        .load(&review_dispatch[0].graph_id)
+        .unwrap();
+    let reviewer_actor = services
+        .resolve_agent_action_actor(
+            &ExecutionParentBinding {
+                execution_id: review_graph.id.clone(),
+                node_id: review_graph.nodes[0].id.clone(),
+            },
+            None,
+        )
+        .await
+        .expect("reviewer binding");
+    let reviewed = action_service
+        .apply(&AgentActionEnvelope {
+            action_id: "experience-review".into(),
+            actor: reviewer_actor,
+            expected_revision: None,
+            action: AgentAction::TaskReview(TaskReviewInput {
+                task_ref: task_ref.clone(),
+                decision: TaskReviewDecision::Accept,
+                reason: "Read and checked the persisted artifact".into(),
+                evidence_refs: vec![content.selector.clone()],
+            }),
+        })
+        .unwrap();
+    assert_eq!(
+        reviewed.status,
+        harness_contract::agent_action::AgentActionStatus::Applied,
+        "{reviewed:?}"
+    );
+    use harness_contract::goal::{GoalCompletion, GoalContract};
+    services
+        .goal_store()
+        .create(GoalContract {
+            id: "goal:root-agentic-execution".into(),
+            session_id: "session-dispatch".into(),
+            objective: "dispatch objective".into(),
+            criteria: vec![harness_contract::goal::AcceptanceCriterion {
+                id: "reviewed-delivery".into(),
+                statement: "Deliver independently reviewed source-backed work".into(),
+                statement_ref: None,
+                source_refs: Vec::new(),
+                required_evidence: vec!["execution_graph:root-agentic-execution".into()],
+                status: harness_contract::goal::AcceptanceStatus::Open,
+                waiver: None,
+            }],
+            constraints: vec![],
+            phase: "execution".into(),
+            evidence_refs: vec![],
+            unresolved: vec![],
+            blockers: vec![],
+            scope: harness_contract::goal::GoalScope::UserObjective,
+            user_intent_criterion_id: Some("reviewed-delivery".into()),
+            source_intent_ref: Some("session_message:dispatch".into()),
+            execution_binding: Some(harness_contract::goal::GoalExecutionBinding {
+                objective_id: "objective-dispatch".into(),
+                session_id: "session-dispatch".into(),
+                turn_id: "turn-dispatch".into(),
+                root_execution_id: "root-agentic-execution".into(),
+                agentic_program_id: "program-dispatch".into(),
+            }),
+            spec_revision: 1,
+            spec_digest: "dispatch-test".into(),
+            review_refs: vec![],
+            waiting: None,
+            participation_requirement: None,
+            obligations: vec![],
+            recovery: None,
+            terminal: None,
+            completion: GoalCompletion::Open,
+            revision: 1,
+            user_sequence: 1,
+            reviews: Vec::new(),
+        })
+        .expect("Objective creation");
+    let completion = action_service
+        .apply(&bind_root(root(
+            "experience-complete",
+            AgentAction::ObjectiveCompleteRequest(
+                harness_contract::agent_action::ObjectiveCompleteRequestInput {
+                    result_refs: vec![artifact],
+                    evidence_refs: vec![content.selector],
+                    unresolved: vec![],
+                },
+            ),
+        )))
+        .unwrap();
+    assert_eq!(
+        completion.status,
+        harness_contract::agent_action::AgentActionStatus::Applied,
+        "{completion:?}"
+    );
+    let objective_supervisor =
+        crate::execution_core::goal::ObjectiveSupervisor::new(Arc::clone(services.goal_store()));
+    crate::agentic::supervision::reconcile_completion_request(
+        &action_service,
+        &objective_supervisor,
+        "program-dispatch",
+    )
+    .expect("verified Objective");
+    let projector =
+        crate::evolution::collaboration_experience::CollaborationExperienceProjector::new(
+            Arc::clone(services.event_store()),
+            services.graph_state_store().clone(),
+            "test-workspace".into(),
+        );
+    loop {
+        let pass = projector
+            .project_available(64)
+            .expect("production episode projection");
+        if !pass.backlog {
+            break;
+        }
+    }
+    let episodes = services
+        .collaboration_experience_episodes(10)
+        .expect("public experience read model");
+    assert_eq!(episodes.len(), 1);
+    assert!(episodes[0].is_pattern_eligible(), "{:#?}", episodes[0]);
+    assert!(episodes[0]
+        .resource_summary
+        .context_reservation_tokens
+        .is_none());
+    assert!(!serde_json::to_string(&episodes[0])
+        .unwrap()
+        .contains("Source-backed findings"));
+    assert!(
+        services
+            .collaboration_semantic_patterns(10)
+            .unwrap()
+            .is_empty(),
+        "one Turn is not a reusable pattern"
+    );
+    projector.project_available(64).expect("idempotent replay");
+    assert_eq!(
+        services
+            .collaboration_experience_episodes(10)
+            .unwrap()
+            .len(),
+        1
     );
 }
 
@@ -704,6 +960,11 @@ fn semantic_capability_hints_translate_without_becoming_physical_authority() {
                     "python".to_string(),
                     "verification".to_string(),
                 ],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
             }),
         ))
         .expect("the semantic action contract must not own the capability catalog");
@@ -716,6 +977,11 @@ fn semantic_capability_hints_translate_without_becoming_physical_authority() {
             acceptance: "a least-privilege physical capability set is derived".to_string(),
             required_capabilities: vec!["evidence-gathering".to_string()],
             depends_on: Vec::new(),
+
+            obligation_refs: Vec::new(),
+            purpose: Default::default(),
+            execution_requirements: Vec::new(),
+            expertise_hints: Vec::new(),
         }),
     );
     let task_ref = actions.apply(&task).expect("task").changed_refs[0].clone();
@@ -760,6 +1026,11 @@ fn dispatch_rank_spreads_independent_tasks_to_idle_members() {
                 role: "Manifest inspector".to_string(),
                 mission: "inspect package manifests".to_string(),
                 required_capabilities: vec!["read".to_string()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
             }),
         ))
         .expect("busy agent")
@@ -773,6 +1044,11 @@ fn dispatch_rank_spreads_independent_tasks_to_idle_members() {
                 role: "Exclude verifier".to_string(),
                 mission: "verify exclusion rules".to_string(),
                 required_capabilities: vec!["read".to_string()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
             }),
         ))
         .expect("idle agent")
@@ -788,6 +1064,11 @@ fn dispatch_rank_spreads_independent_tasks_to_idle_members() {
                 acceptance: "report evidence".to_string(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
+
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
             }),
         ))
         .expect("first task")
@@ -803,6 +1084,11 @@ fn dispatch_rank_spreads_independent_tasks_to_idle_members() {
                 acceptance: "report evidence".to_string(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
+
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
             }),
         ))
         .expect("second task")
@@ -873,6 +1159,11 @@ async fn startup_reconcile_admits_committed_unstarted_work_once() {
                 role: "Recovery worker".to_string(),
                 mission: "resume durable work".to_string(),
                 required_capabilities: vec!["read".to_string()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
             }),
         ))
         .expect("agent");
@@ -886,6 +1177,11 @@ async fn startup_reconcile_admits_committed_unstarted_work_once() {
                 acceptance: "a real graph is admitted".to_string(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
+
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
             }),
         ))
         .expect("task");
@@ -914,6 +1210,258 @@ async fn startup_reconcile_admits_committed_unstarted_work_once() {
         second.is_empty(),
         "active graph must suppress duplicate paid work"
     );
+}
+
+#[tokio::test]
+async fn startup_reconcile_fails_closed_after_partial_dispatch_without_duplicating_admitted_work() {
+    let services = Arc::new(RuntimeServices::in_memory().expect("runtime"));
+    services.publish_session_execution_policy(
+        "session-dispatch",
+        crate::permissions::SessionExecutionPolicyControl::from_policy(
+            harness_contract::policy::SessionExecutionPolicy::from_profile(
+                harness_contract::policy::AutonomyProfileId::Autonomous,
+                1,
+                harness_contract::policy::SessionExecutionPolicyOrigin::ConfigDefault,
+            ),
+        ),
+    );
+    let actions = services.agent_action_service();
+    let team = actions
+        .apply(&root(
+            "partial-recovery-team",
+            AgentAction::TeamCreate(TeamCreateInput {
+                name: "Partial recovery".to_string(),
+                mission: "prove startup admission remains closed on one failed Task".to_string(),
+                objective: None,
+            }),
+        ))
+        .expect("team")
+        .changed_refs[0]
+        .clone();
+    let member = actions
+        .apply(&root(
+            "partial-recovery-agent",
+            AgentAction::AgentInvite(AgentInviteInput {
+                team_ref: team.clone(),
+                role: "Recovery worker".to_string(),
+                mission: "run every admissible task".to_string(),
+                required_capabilities: vec!["read".to_string()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
+            }),
+        ))
+        .expect("agent")
+        .changed_refs[0]
+        .clone();
+    let valid_task = actions
+        .apply(&root(
+            "partial-recovery-valid-task",
+            AgentAction::TaskPublish(TaskPublishInput {
+                team_ref: team.clone(),
+                title: "Admissible read".to_string(),
+                objective: "admit one idempotent graph".to_string(),
+                acceptance: "the graph exists once".to_string(),
+                required_capabilities: vec!["read".to_string()],
+                depends_on: Vec::new(),
+
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
+            }),
+        ))
+        .expect("valid task")
+        .changed_refs[0]
+        .clone();
+    let invalid_task = actions
+        .apply(&root(
+            "partial-recovery-invalid-task",
+            AgentAction::TaskPublish(TaskPublishInput {
+                team_ref: team,
+                title: "Unavailable connector action".to_string(),
+                objective: "remain durable until a matching Agent definition exists".to_string(),
+                acceptance: "startup must stay closed".to_string(),
+                required_capabilities: vec!["connector_action".to_string()],
+                depends_on: Vec::new(),
+
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
+            }),
+        ))
+        .expect("durable invalid task")
+        .changed_refs[0]
+        .clone();
+
+    let first_error = services
+        .recover_agentic_programs_on_startup()
+        .await
+        .expect_err("one failed Task must fail the whole startup reconciliation pass");
+    assert!(first_error.contains("startup dispatch reconciliation failed"));
+    assert!(first_error.contains(&invalid_task));
+    assert!(first_error.contains("after 1 idempotent dispatch receipt(s)"));
+
+    let projection = actions.project("program-dispatch").expect("projection");
+    let valid_graph_id = deterministic_graph_id(
+        &projection.program_id,
+        &valid_task,
+        &member,
+        DispatchMode::Execute,
+        projection.tasks[&valid_task].claim_generation,
+    );
+    let before_retry = services
+        .graph_state_store()
+        .load(&valid_graph_id)
+        .expect("the independent valid Task was durably admitted");
+
+    let retry_error = services
+        .recover_agentic_programs_on_startup()
+        .await
+        .expect_err("the unresolved Task must keep startup admission closed");
+    assert!(retry_error.contains(&invalid_task));
+    let after_retry = services
+        .graph_state_store()
+        .load(&valid_graph_id)
+        .expect("the admitted graph remains available");
+    assert_eq!(
+        after_retry.id, before_retry.id,
+        "retry must retain the deterministic graph identity"
+    );
+    assert_eq!(
+        services
+            .event_reader()
+            .list_stream(&valid_graph_id)
+            .expect("deterministic graph event stream")
+            .iter()
+            .filter(|event| event.kind == "execution_graph.planned")
+            .count(),
+        1,
+        "retry must not register a second graph or duplicate paid work"
+    );
+}
+
+#[tokio::test]
+async fn action_followups_surface_partial_dispatch_failure_without_duplicating_admitted_work() {
+    let services = Arc::new(RuntimeServices::in_memory().expect("runtime"));
+    services.publish_session_execution_policy(
+        "session-dispatch",
+        crate::permissions::SessionExecutionPolicyControl::from_policy(
+            harness_contract::policy::SessionExecutionPolicy::from_profile(
+                harness_contract::policy::AutonomyProfileId::Autonomous,
+                1,
+                harness_contract::policy::SessionExecutionPolicyOrigin::ConfigDefault,
+            ),
+        ),
+    );
+    let actions = services.agent_action_service();
+    let team = actions
+        .apply(&root(
+            "partial-action-team",
+            AgentAction::TeamCreate(TeamCreateInput {
+                name: "Partial action".to_string(),
+                mission: "surface every post-commit dispatch failure".to_string(),
+                objective: None,
+            }),
+        ))
+        .expect("team")
+        .changed_refs[0]
+        .clone();
+    let valid_task = actions
+        .apply(&root(
+            "partial-action-valid-task",
+            AgentAction::TaskPublish(TaskPublishInput {
+                team_ref: team.clone(),
+                title: "Admissible read".to_string(),
+                objective: "admit one deterministic graph".to_string(),
+                acceptance: "the graph exists once".to_string(),
+                required_capabilities: vec!["read".to_string()],
+                depends_on: Vec::new(),
+
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
+            }),
+        ))
+        .expect("valid task")
+        .changed_refs[0]
+        .clone();
+    let invalid_task = actions
+        .apply(&root(
+            "partial-action-invalid-task",
+            AgentAction::TaskPublish(TaskPublishInput {
+                team_ref: team.clone(),
+                title: "Unavailable connector action".to_string(),
+                objective: "remain durable until a matching Agent definition exists".to_string(),
+                acceptance: "the caller observes the deferred dispatch".to_string(),
+                required_capabilities: vec!["connector_action".to_string()],
+                depends_on: Vec::new(),
+
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
+            }),
+        ))
+        .expect("durable invalid task")
+        .changed_refs[0]
+        .clone();
+    let invite = root(
+        "partial-action-agent",
+        AgentAction::AgentInvite(AgentInviteInput {
+            team_ref: team,
+            role: "Read worker".to_string(),
+            mission: "run admissible work".to_string(),
+            required_capabilities: vec!["read".to_string()],
+            existing_agent_ref: None,
+            definition_ref: None,
+            model_profile_ref: None,
+            expertise_hints: Vec::new(),
+            execution_requirements: Vec::new(),
+        }),
+    );
+    let member = actions.apply(&invite).expect("agent").changed_refs[0].clone();
+    let context = AgenticDispatchContext {
+        session_id: "session-dispatch".to_string(),
+        turn_id: "turn-dispatch".to_string(),
+        model_lease: "test".to_string(),
+        permission_ceiling: PermissionMode::ReadOnly,
+        resource_scopes: Vec::new(),
+    };
+
+    let error = services
+        .dispatch_agentic_followups(&invite, context.clone())
+        .await
+        .expect_err("one failed followup must be visible even when independent work was admitted");
+    assert!(error.contains(&invalid_task));
+    assert!(error.contains("1 idempotent dispatch receipt(s)"));
+
+    let projection = actions.project("program-dispatch").expect("projection");
+    let graph_id = deterministic_graph_id(
+        &projection.program_id,
+        &valid_task,
+        &member,
+        DispatchMode::Execute,
+        projection.tasks[&valid_task].claim_generation,
+    );
+    let before_retry = services
+        .graph_state_store()
+        .load(&graph_id)
+        .expect("valid Task graph");
+    let retry_error = services
+        .dispatch_agentic_followups(&invite, context)
+        .await
+        .expect_err("the unresolved followup remains visible on retry");
+    assert!(retry_error.contains(&invalid_task));
+    let after_retry = services
+        .graph_state_store()
+        .load(&graph_id)
+        .expect("valid Task graph after retry");
+    assert_eq!(after_retry.revision, before_retry.revision);
 }
 
 #[tokio::test]
@@ -950,6 +1498,11 @@ async fn startup_reconcile_releases_missing_graph_claim_without_waiting_for_leas
                 role: "Recovery worker".to_string(),
                 mission: "resume immediately".to_string(),
                 required_capabilities: vec!["read".to_string()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
             }),
         ))
         .expect("agent")
@@ -965,6 +1518,11 @@ async fn startup_reconcile_releases_missing_graph_claim_without_waiting_for_leas
                 acceptance: "new graph admitted".to_string(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
+
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
             }),
         ))
         .expect("task")
@@ -1046,6 +1604,11 @@ async fn cross_team_reviewer_resolves_own_identity_and_can_accept() {
                 role: "Author".to_string(),
                 mission: "produce evidence".to_string(),
                 required_capabilities: vec!["read".to_string()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
             }),
         ))
         .expect("author")
@@ -1059,6 +1622,11 @@ async fn cross_team_reviewer_resolves_own_identity_and_can_accept() {
                 role: "Reviewer".to_string(),
                 mission: "verify another team".to_string(),
                 required_capabilities: vec!["read".to_string()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
             }),
         ))
         .expect("reviewer")
@@ -1074,6 +1642,11 @@ async fn cross_team_reviewer_resolves_own_identity_and_can_accept() {
                 acceptance: "independent review".to_string(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
+
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
             }),
         ))
         .expect("task")
@@ -1155,12 +1728,17 @@ async fn cross_team_reviewer_resolves_own_identity_and_can_accept() {
         .expect("review graph");
     let packet: AgentTaskPacket =
         serde_json::from_str(&graph.nodes[0].payload_ref).expect("packet");
-    assert!(packet
-        .context_refs
-        .contains(&format!("agentic_team:{review_team}")));
-    assert!(packet
-        .context_refs
-        .contains(&format!("agentic_task_team:{author_team}")));
+    let agentic = packet
+        .agentic_binding
+        .as_ref()
+        .expect("typed Agentic execution binding");
+    assert_eq!(agentic.team_id, review_team);
+    assert_eq!(agentic.task_team_id, author_team);
+    assert!(matches!(
+        &agentic.focus,
+        harness_contract::agent::AgenticExecutionFocus::TaskReview { task_ref: bound_task_ref }
+            if bound_task_ref == &task
+    ));
     let binding = ExecutionParentBinding {
         execution_id: graph.id.clone(),
         node_id: graph.nodes[0].id.clone(),

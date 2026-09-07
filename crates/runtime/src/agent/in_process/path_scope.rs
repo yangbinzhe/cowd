@@ -539,32 +539,22 @@ pub(super) async fn settle_failed_agentic_attempt(
     packet: &AgentTaskPacket,
     reason: &str,
 ) {
-    let program_id = packet
-        .context_refs
-        .iter()
-        .find_map(|reference| reference.strip_prefix("agentic_program:"));
-    let task_ref = packet
-        .context_refs
-        .iter()
-        .find_map(|reference| reference.strip_prefix("agentic_task:"));
-    let agent_id = packet
-        .context_refs
-        .iter()
-        .find_map(|reference| reference.strip_prefix("agentic_member:"));
-    let attempt_mode = packet.context_refs.iter().find_map(|reference| {
-        reference
-            .strip_prefix("agentic_mode:")
-            .and_then(|mode| match mode {
-                "execute" => Some(harness_contract::agent_action::AgentAttemptMode::Execute),
-                "review" => Some(harness_contract::agent_action::AgentAttemptMode::Review),
-                _ => None,
-            })
-    });
-    let (Some(program_id), Some(task_ref), Some(agent_id), Some(attempt_mode)) =
-        (program_id, task_ref, agent_id, attempt_mode)
-    else {
+    let Some(agentic) = packet.agentic_binding.as_ref() else {
         return;
     };
+    let (task_ref, attempt_mode) = match &agentic.focus {
+        harness_contract::agent::AgenticExecutionFocus::TaskExecute { task_ref } => (
+            task_ref.as_str(),
+            harness_contract::agent_action::AgentAttemptMode::Execute,
+        ),
+        harness_contract::agent::AgenticExecutionFocus::TaskReview { task_ref } => (
+            task_ref.as_str(),
+            harness_contract::agent_action::AgentAttemptMode::Review,
+        ),
+        _ => return,
+    };
+    let program_id = agentic.program_id.as_str();
+    let agent_id = agentic.agent_id.as_str();
     let service = services.agent_action_service();
     let Ok(projection) = service.project(program_id) else {
         return;
@@ -585,10 +575,10 @@ pub(super) async fn settle_failed_agentic_attempt(
     if !attempt_is_current {
         return;
     }
-    let Some(member) = projection.agents.get(agent_id) else {
+    if !projection.agents.contains_key(agent_id) {
         return;
-    };
-    let team_id = member.team_id.clone();
+    }
+    let team_id = task.team_id.clone();
     let context = crate::AgenticDispatchContext {
         session_id: projection.session_id.clone(),
         turn_id: projection.turn_id.clone(),
@@ -626,7 +616,7 @@ pub(super) async fn settle_failed_agentic_attempt(
             },
         ),
     };
-    match service.apply(&envelope) {
+    match services.submit_agent_action(&envelope).await {
         Ok(observation)
             if observation.status == harness_contract::agent_action::AgentActionStatus::Applied =>
         {

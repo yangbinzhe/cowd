@@ -398,7 +398,11 @@ fn gateway_openapi_document_from_contract(
             "coverage": contract.coverage
         },
         "x-cowd-route-catalog-digest": surface::gateway_api::gateway_route_catalog_digest(),
-        "x-cowd-projection-v3-golden": projection_v3_golden()
+        // This extension is deliberately not versioned in its name. The
+        // corpus itself carries the schema and reducer versions, so a Surface
+        // generator derives those values rather than remaining coupled to the
+        // version that happened to exist when its script was written.
+        "x-cowd-execution-projection-golden": execution_projection_golden()
     })
 }
 
@@ -479,7 +483,7 @@ fn insert_runtime_contract_schemas(schemas: &mut Map<String, Value>) {
     );
 }
 
-fn projection_v3_golden() -> Value {
+fn execution_projection_golden() -> Value {
     serde_json::from_str(include_str!(
         "../../../harness-contract/tests/fixtures/projection-v3/materialization.json"
     ))
@@ -2864,7 +2868,7 @@ mod tests {
             &delta_schema["properties"]["operations"],
             "#/components/schemas/ProjectionOperation"
         ));
-        let golden = &document["x-cowd-projection-v3-golden"];
+        let golden = &document["x-cowd-execution-projection-golden"];
         assert_eq!(
             golden["delta"]["schema_version"],
             harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION
@@ -2995,9 +2999,25 @@ mod tests {
             first["x-cowd-route-catalog-digest"],
             authority["x-cowd-route-catalog-digest"]
         );
+        let expected = gateway_route_manifest_for_apps()
+            .into_iter()
+            .map(|route| (openapi_path(&route.path), route.method.to_ascii_lowercase()))
+            .collect::<BTreeSet<_>>();
+        let actual = first["paths"]
+            .as_object()
+            .expect("OpenAPI paths")
+            .iter()
+            .flat_map(|(path, operations)| {
+                operations
+                    .as_object()
+                    .expect("path operations")
+                    .keys()
+                    .map(move |method| (path.clone(), method.clone()))
+            })
+            .collect::<BTreeSet<_>>();
         assert_eq!(
-            first["paths"].as_object().map(|paths| paths.len()),
-            Some(435)
+            actual, expected,
+            "OpenAPI must expose every current route method exactly"
         );
     }
 

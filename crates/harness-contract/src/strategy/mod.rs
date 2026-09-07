@@ -10,7 +10,7 @@ use crate::core::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +42,12 @@ pub struct TaskUnderstanding {
     pub domain: TaskDomain,
     pub complexity: TaskComplexity,
     pub risk: TaskRisk,
+    /// Whether the user explicitly prohibited workspace mutation. This is an
+    /// authorization constraint, intentionally distinct from
+    /// `requires_write`: the latter is a fallible planning prediction and
+    /// must never turn an otherwise authorized tool call into a hard deny.
+    #[serde(default)]
+    pub forbids_workspace_write: bool,
     pub requires_write: bool,
     pub requires_external_facts: bool,
     #[serde(default)]
@@ -58,11 +64,6 @@ pub struct TaskUnderstanding {
     /// cardinality parsing is only the ingress fallback used to populate it.
     #[serde(default)]
     pub required_team_count: u8,
-    /// Explicit user contract requiring a managed Agent to invoke Runtime's
-    /// follow-up collaboration escalation tool.  This is ingress authority,
-    /// not an optional model-planning preference.
-    #[serde(default)]
-    pub requires_managed_collaboration_escalation: bool,
     #[serde(default)]
     pub forbids_team: bool,
     pub requests_deep_plan: bool,
@@ -79,75 +80,34 @@ pub struct TaskUnderstanding {
     pub collaboration_reference: CollaborationReference,
 }
 
-/// Why a selected Team strategy owns an executable collaboration obligation.
-///
-/// This is deliberately distinct from `requests_multi_agent`: the latter is
-/// normalized user intent, while this enum records the admitted Runtime
-/// authority that every downstream enforcement point must consume.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CollaborationObligationSource {
-    ExplicitRequest,
-    AutomaticStrategy,
-}
-
-/// Canonical, durable Team execution requirement for one admitted turn.
+/// Canonical, durable Team execution requirement created only from an
+/// explicit user constraint for one admitted root turn.
 ///
 /// Strategy selection freezes this contract before provider exposure. Runtime
 /// may ask the model to author the semantic topology, but a final answer cannot
 /// weaken or bypass the minimum encoded here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollaborationExecutionObligation {
-    pub source: CollaborationObligationSource,
     pub minimum_team_count: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exact_team_count: Option<u8>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub required_focus_ids: Vec<String>,
-    pub proposal_required: bool,
 }
 
 impl CollaborationExecutionObligation {
-    pub fn for_selected_team(
-        understanding: &TaskUnderstanding,
-        automatic_minimum_team_count: u8,
-        focus_ids: impl IntoIterator<Item = String>,
-    ) -> Result<Self, String> {
+    pub fn for_explicit_request(understanding: &TaskUnderstanding) -> Result<Self, String> {
         if understanding.forbids_team {
             return Err("a forbidden Team cannot own a collaboration obligation".to_string());
         }
-        let required_focus_ids = focus_ids
-            .into_iter()
-            .filter(|focus_id| !focus_id.trim().is_empty())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let (source, minimum_team_count, exact_team_count) =
-            if understanding.required_team_count > 0 {
-                (
-                    CollaborationObligationSource::ExplicitRequest,
-                    understanding.required_team_count,
-                    Some(understanding.required_team_count),
-                )
-            } else if understanding.requests_multi_agent {
-                (
-                    CollaborationObligationSource::ExplicitRequest,
-                    automatic_minimum_team_count,
-                    None,
-                )
-            } else {
-                (
-                    CollaborationObligationSource::AutomaticStrategy,
-                    automatic_minimum_team_count,
-                    None,
-                )
-            };
+        if understanding.required_team_count == 0 {
+            return Err(
+                "a collaboration obligation requires an explicit user Team constraint".to_string(),
+            );
+        }
+        let minimum_team_count = understanding.required_team_count;
+        let exact_team_count = Some(understanding.required_team_count);
         let obligation = Self {
-            source,
             minimum_team_count,
             exact_team_count,
-            required_focus_ids,
-            proposal_required: true,
         };
         obligation.validate()?;
         Ok(obligation)
@@ -162,25 +122,6 @@ impl CollaborationExecutionObligation {
             .is_some_and(|count| count != self.minimum_team_count)
         {
             return Err("an exact Team count must equal the frozen minimum Team count".to_string());
-        }
-        if matches!(
-            self.source,
-            CollaborationObligationSource::AutomaticStrategy
-        ) && self.required_focus_ids.is_empty()
-        {
-            return Err(
-                "an automatic Team obligation requires at least one frozen focus".to_string(),
-            );
-        }
-        if !self.proposal_required {
-            return Err("a Team execution obligation must require a typed proposal".to_string());
-        }
-        if self
-            .required_focus_ids
-            .windows(2)
-            .any(|ids| ids[0] >= ids[1])
-        {
-            return Err("required focus ids must be sorted and unique".to_string());
         }
         Ok(())
     }
@@ -209,7 +150,6 @@ pub struct StrategyProposal {
     pub pattern: ExecutionPattern,
     #[serde(default)]
     pub modifiers: Vec<ExecutionModifier>,
-    pub template: Option<String>,
     pub confidence: u8,
     pub rationale: String,
 }
@@ -1925,7 +1865,6 @@ impl StrategyRouter {
                     .to_string(),
             );
         }
-        let structural_team_obligation = automatic_team_is_structurally_required(&understanding);
         if !understanding.requests_multi_agent
             && candidate_estimates.iter().any(|estimate| {
                 estimate.candidate == ExecutionCandidateKind::Team
@@ -1934,13 +1873,10 @@ impl StrategyRouter {
                         || !estimate.quality_optimization_ready())
             })
         {
-            reasons.push(if structural_team_obligation {
-                "automatic Team is required by independently verifiable responsibility domains; historical calibration may tune capacity but cannot erase the current objective's ownership obligations"
-                    .to_string()
-            } else {
-                "automatic Team requires calibrated or observed topology evidence when the current objective does not itself require independent ownership"
-                    .to_string()
-            });
+            reasons.push(
+                "automatic Team requires calibrated or observed topology evidence; Runtime does not turn inferred workstreams into a business topology obligation"
+                    .to_string(),
+            );
         }
         let selected_candidate = if matches!(source, StrategyDecisionSource::ExperienceAdapted) {
             candidate_for_pattern(pattern).unwrap_or_else(|| {
@@ -2317,21 +2253,7 @@ fn select_execution_candidate(
                 estimate.candidate
             });
     }
-    // A current objective can itself require independent ownership.  In that
-    // case historical calibration may tune capacity, but it cannot erase the
-    // need to materialize the accountable workstreams.  This remains a
-    // semantic, data-derived decision: no Team name, template name, provider
-    // family, or price estimate participates in the predicate.
-    if automatic_team_is_structurally_required(understanding) {
-        if let Some(team) = estimates
-            .iter()
-            .find(|estimate| estimate.candidate == ExecutionCandidateKind::Team)
-            .filter(|estimate| estimate.eligible && estimate.expected_quality_lift_bp > 0)
-        {
-            return team.candidate;
-        }
-    }
-    // Otherwise automatic Team selection requires a genuinely multi-domain
+    // Automatic Team selection requires a genuinely multi-domain
     // topology and calibrated evidence. Duration and quality remain separate
     // dimensions; neither is converted into a synthetic cross-unit score.
     if (matches!(
@@ -2391,27 +2313,6 @@ fn select_execution_candidate(
         .map_or(ExecutionCandidateKind::Direct, |estimate| {
             estimate.candidate
         })
-}
-
-/// A task with three or more independently verifiable responsibility domains
-/// cannot be truthfully reduced to one owner merely because this exact shape
-/// has not appeared in a historical benchmark.  The condition deliberately
-/// relies on normalized task semantics, not repository/product role names.
-/// Return whether the current objective itself requires independently
-/// accountable Team work, regardless of the availability of historical
-/// calibration samples.
-///
-/// This is deliberately part of the normalized strategy contract rather than
-/// a Router-local heuristic: every downstream decision that selects a Team
-/// template must consume this exact semantic predicate.  Otherwise a Team
-/// can be selected for independent evidence work and subsequently compiled
-/// with a topology that does not own those responsibilities.
-#[must_use]
-pub fn automatic_team_is_structurally_required(understanding: &TaskUnderstanding) -> bool {
-    !understanding.forbids_team
-        && understanding.required_team_count == 0
-        && understanding.independent_workstreams >= 3
-        && understanding.requires_tool_evidence
 }
 
 fn candidate_for_pattern(pattern: ExecutionPattern) -> Option<ExecutionCandidateKind> {
@@ -2537,8 +2438,6 @@ pub fn understand(input: &StrategyInput) -> TaskUnderstanding {
     let requests_multi_agent = (contains_any(&affirmative_collaboration, MULTI_AGENT_TERMS)
         || required_team_count > 0)
         && !forbids_team;
-    let requires_managed_collaboration_escalation =
-        explicit_managed_collaboration_escalation_required(&normalized) && !forbids_team;
     let collaboration_reference = if contains_any(
         &normalized,
         &[
@@ -2584,6 +2483,7 @@ pub fn understand(input: &StrategyInput) -> TaskUnderstanding {
         domain,
         complexity,
         risk,
+        forbids_workspace_write,
         requires_write,
         requires_external_facts,
         requires_tool_evidence,
@@ -2591,7 +2491,6 @@ pub fn understand(input: &StrategyInput) -> TaskUnderstanding {
         requests_parallelism,
         requests_multi_agent,
         required_team_count,
-        requires_managed_collaboration_escalation,
         forbids_team,
         requests_deep_plan,
         requests_deliberation,
@@ -2665,16 +2564,16 @@ fn explicitly_forbids_collaboration(normalized: &str) -> bool {
 
 /// Remove clauses that mention collaboration vocabulary only to forbid the
 /// model from inventing or preselecting a topology. These are not requests to
-/// disable Runtime-owned collaboration: they merely leave topology selection
-/// to the framework. Keeping this clause-local prevents an unrelated `必须`
+/// disable collaboration: they leave topology selection to the model.
+/// Keeping this clause-local prevents an unrelated `必须`
 /// elsewhere in the prompt from combining with `Team` into a false singular
 /// execution obligation.
 fn affirmative_collaboration_text(normalized: &str) -> String {
     normalized
-        .split(['。', '；', ';', '！', '!', '？', '?', '\n'])
+        .split(['。', '.', '；', ';', '！', '!', '？', '?', '\n'])
         .filter(|clause| !is_non_prescriptive_topology_clause(clause))
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(";")
 }
 
 fn is_non_prescriptive_topology_clause(clause: &str) -> bool {
@@ -3095,8 +2994,8 @@ fn independent_workstreams(normalized: &str) -> u8 {
 
 fn requests_persisted_artifact(normalized: &str) -> bool {
     const ACTIONS: &[&str] = &[
-        "生成", "创建", "制作", "产出", "形成", "保存", "写入", "落盘", "放到", "存入", "build",
-        "create", "generate", "save", "write",
+        "生成", "创建", "制作", "产出", "形成", "保存", "写入", "落盘", "放到", "存入", "编写",
+        "新建", "build", "create", "generate", "save", "write", "author",
     ];
     const ARTIFACTS: &[&str] = &[
         "html",
@@ -3106,8 +3005,15 @@ fn requests_persisted_artifact(normalized: &str) -> bool {
         "代码",
         "页面",
         "项目",
+        "目录",
+        "文件夹",
+        "脚本",
+        "readme",
         "artifact",
         "file",
+        "directory",
+        "folder",
+        "script",
         "website",
         "webpage",
         "source code",
@@ -3170,8 +3076,8 @@ pub fn explicit_team_owns_persisted_artifact(prompt: &str) -> bool {
     }
 
     const ARTIFACT_ACTIONS: &[&str] = &[
-        "生成", "创建", "制作", "产出", "形成", "保存", "写入", "落盘", "放到", "存入", "build",
-        "create", "generate", "save", "write",
+        "生成", "创建", "制作", "产出", "形成", "保存", "写入", "落盘", "放到", "存入", "编写",
+        "新建", "build", "create", "generate", "save", "write", "author",
     ];
     const ARTIFACTS: &[&str] = &[
         "html",
@@ -3181,8 +3087,15 @@ pub fn explicit_team_owns_persisted_artifact(prompt: &str) -> bool {
         "代码",
         "页面",
         "项目",
+        "目录",
+        "文件夹",
+        "脚本",
+        "readme",
         "artifact",
         "file",
+        "directory",
+        "folder",
+        "script",
         "website",
         "webpage",
         "source code",
@@ -3394,10 +3307,8 @@ pub fn explicit_team_count(prompt: &str) -> u8 {
     // delimiters are presentation only. Normalize those delimiters before
     // matching so `两个** required Team` means the same as `两个 required Team`.
     let markdown_stripped = prompt.to_ascii_lowercase().replace(['*', '`'], " ");
-    let normalized = markdown_stripped
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let affirmative = affirmative_collaboration_text(&markdown_stripped);
+    let normalized = affirmative.split_whitespace().collect::<Vec<_>>().join(" ");
     let normalized = affirmative_collaboration_text(&normalized);
     const COUNTS: &[(&str, &str, u8)] = &[
         ("一", "one", 1),
@@ -3590,49 +3501,44 @@ pub fn explicit_team_fan_in_required(prompt: &str) -> bool {
 #[must_use]
 pub fn explicit_team_execution_required(prompt: &str) -> bool {
     let normalized = affirmative_collaboration_text(&prompt.to_ascii_lowercase());
-    let mentions_team = [
-        "团队",
-        "协作",
-        "多agent",
-        "多 agent",
-        "多智能体",
-        "组队",
-        "team",
-        "multi-agent",
-        "multi agent",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker));
-    let requires_execution = [
-        "实际启动",
-        "启动",
-        "创建",
-        "组建",
-        "发起",
-        "拉起",
-        "用一个团队",
-        "使用一个团队",
-        "交给团队",
-        "由团队",
-        "必须",
-        "必须要",
-        "must",
-        "actually",
-        "launch",
-        "start",
-        "create",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker));
-    mentions_team && requires_execution && !explicitly_forbids_collaboration(&normalized)
-}
-
-/// Legacy strategy bit retained only for serialized strategy compatibility.
-/// Agent-first Team creation is an ordinary small action and no longer needs
-/// a separate escalation obligation or tool-shaped prompt heuristic.
-#[must_use]
-pub const fn explicit_managed_collaboration_escalation_required(_prompt: &str) -> bool {
-    false
+    // An execution verb and its collaboration object must occur in the same
+    // clause. Joining unrelated clauses can turn "discuss Teams, do not start
+    // execution" or "create a file; explain Teams" into a hard obligation.
+    normalized
+        .split(['，', ',', '。', '.', '；', ';', '！', '!', '？', '?', '\n'])
+        .any(|clause| {
+            let mentions_team = [
+                "团队",
+                "协作",
+                "多agent",
+                "多 agent",
+                "多智能体",
+                "组队",
+                "team",
+                "multi-agent",
+                "multi agent",
+            ]
+            .iter()
+            .any(|marker| clause.contains(marker));
+            let requires_execution = [
+                "实际启动",
+                "启动",
+                "创建",
+                "组建",
+                "发起",
+                "拉起",
+                "用一个团队",
+                "使用一个团队",
+                "交给团队",
+                "由团队",
+                "launch",
+                "start",
+                "create",
+            ]
+            .iter()
+            .any(|marker| clause.contains(marker));
+            mentions_team && requires_execution && !explicitly_forbids_collaboration(clause)
+        })
 }
 
 fn explicit_team_ordinal_count(normalized: &str) -> u8 {
@@ -3665,6 +3571,14 @@ fn explicit_team_ordinal_count(normalized: &str) -> u8 {
         .unwrap_or_default()
 }
 
+fn breaks_counted_role_phrase(character: char) -> bool {
+    (character.is_ascii_punctuation() && !matches!(character, '-' | '_'))
+        || matches!(
+            character,
+            '，' | '。' | '；' | '：' | '、' | '！' | '？' | '\n' | '\r'
+        )
+}
+
 fn counted_role_phrase(normalized: &str, count: &str, role: &str, english: bool) -> bool {
     normalized.match_indices(count).any(|(offset, _)| {
         let tail = &normalized[offset + count.len()..];
@@ -3672,12 +3586,7 @@ fn counted_role_phrase(normalized: &str, count: &str, role: &str, english: bool)
             return false;
         };
         let separator = &tail[..role_offset];
-        if separator.chars().count() > 10
-            || separator.chars().any(|character| {
-                character.is_ascii_punctuation() && !matches!(character, '-' | '_' | ' ')
-                    || matches!(character, '，' | '。' | '；' | '：' | '、' | '！' | '？')
-            })
-        {
+        if separator.chars().count() > 10 || separator.chars().any(breaks_counted_role_phrase) {
             return false;
         }
         if english {
@@ -3711,9 +3620,7 @@ fn qualified_chinese_team_phrase(normalized: &str, count: &str) -> bool {
                 .collect::<String>();
             compact.starts_with('个')
                 && compact.chars().count() <= 48
-                && !qualifier.chars().any(|character| {
-                    matches!(character, '，' | '。' | '；' | '：' | '、' | '！' | '？')
-                })
+                && !qualifier.chars().any(breaks_counted_role_phrase)
         })
     })
 }

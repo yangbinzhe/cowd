@@ -311,6 +311,7 @@ impl AgentBindingCompiler {
     ) -> Result<CompiledAgentBinding, AgentBindingError> {
         let mut compiled = self.compile_resolved(request, resolved, None)?;
         compiled.snapshot.evaluation = Some(evaluation);
+        compiled.snapshot.binding_digest.clear();
         compiled.snapshot.binding_digest = digest(
             &serde_json::to_string(&compiled.snapshot)
                 .map_err(|error| AgentBindingError::InvalidBinding(error.to_string()))?,

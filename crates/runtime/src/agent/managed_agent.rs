@@ -6,7 +6,7 @@
 //! model process: every accepted invocation is later compiled by
 //! `RuntimeServices` into a fresh Agent Binding or Team graph.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -232,11 +232,7 @@ impl ManagedAgentDispatcher {
     /// control-plane event-store write handle.
     pub fn in_memory() -> Result<Self, String> {
         Self::event_sourced(
-            Arc::new(
-                RuntimeEventStore::try_open_in_memory().map_err(|error| {
-                    format!("open managed Agent in-memory event store: {error}")
-                })?,
-            ),
+            Arc::new(RuntimeEventStore::for_test()),
             "managed-agent-in-memory",
         )
     }
@@ -1136,9 +1132,21 @@ impl ManagedAgentDispatcher {
         now_ms: u64,
         dispositions: &BTreeMap<String, ManagedAgentRestartDisposition>,
     ) -> Result<Vec<ManagedAgentInvocation>, String> {
+        self.recover_with_dispositions_excluding(now_ms, dispositions, &BTreeSet::new())
+    }
+
+    pub(crate) fn recover_with_dispositions_excluding(
+        &self,
+        now_ms: u64,
+        dispositions: &BTreeMap<String, ManagedAgentRestartDisposition>,
+        excluded_invocation_ids: &BTreeSet<String>,
+    ) -> Result<Vec<ManagedAgentInvocation>, String> {
         self.mutate("managed_agent.dispatcher.recovered.v1", |state| {
             let mut affected = Vec::new();
             for invocation in state.invocations.values_mut() {
+                if excluded_invocation_ids.contains(&invocation.invocation_id) {
+                    continue;
+                }
                 match invocation.status {
                     ManagedAgentInvocationStatus::Claimed => {
                         if invocation.graph_registration_intent_ref.is_some() {
@@ -1218,6 +1226,9 @@ impl ManagedAgentDispatcher {
                 }
             }
             for effect in state.outbox.values_mut() {
+                if excluded_invocation_ids.contains(&effect.invocation_id) {
+                    continue;
+                }
                 if effect.status == FencedEffectStatus::Claimed {
                     effect.status = FencedEffectStatus::ReconciliationRequired;
                     effect.error = Some(
@@ -1711,7 +1722,7 @@ mod tests {
 
     fn dispatcher() -> ManagedAgentDispatcher {
         ManagedAgentDispatcher::event_sourced(
-            Arc::new(RuntimeEventStore::try_open_in_memory().expect("store")),
+            Arc::new(RuntimeEventStore::for_test()),
             "workspace-test",
         )
         .expect("dispatcher")
@@ -1719,7 +1730,7 @@ mod tests {
 
     #[test]
     fn stale_local_projection_refreshes_before_a_cross_process_write() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("store"));
+        let store = Arc::new(RuntimeEventStore::for_test());
         let first = ManagedAgentDispatcher::event_sourced(Arc::clone(&store), "shared-workspace")
             .expect("first dispatcher");
         let second = ManagedAgentDispatcher::event_sourced(store, "shared-workspace")
@@ -2088,5 +2099,70 @@ mod tests {
             blocked[0].error.as_deref(),
             Some("external effect outcome is uncertain")
         );
+    }
+
+    #[test]
+    fn startup_recovery_exclusion_leaves_managed_invocation_unchanged() {
+        let dispatcher = dispatcher();
+        dispatcher
+            .register_definition(definition(ManagedAgentTrigger::Manual), 1)
+            .expect("definition");
+        let invocation = dispatcher
+            .trigger_manual("workspace/cowd/research-watch", "excluded-restart", 2)
+            .expect("manual");
+        let claim = dispatcher
+            .claim_ready("dispatcher-a", 3, 100, 1)
+            .expect("claim")
+            .pop()
+            .expect("claimed invocation");
+        materialize_and_start(&dispatcher, &claim, "dispatcher-a", "graph:excluded", 4);
+        dispatcher
+            .enqueue_effect(
+                &invocation.invocation_id,
+                "dispatcher-a",
+                claim.fence_generation,
+                "excluded-effect",
+                "channel_send".to_string(),
+                "excluded-effect-key".to_string(),
+                "request:excluded-effect".to_string(),
+                4,
+            )
+            .expect("effect");
+        dispatcher
+            .claim_effect(
+                &invocation.invocation_id,
+                "excluded-effect",
+                claim.fence_generation,
+                "dispatcher-a",
+            )
+            .expect("claim effect");
+        let before = dispatcher
+            .invocations()
+            .expect("before")
+            .into_iter()
+            .find(|candidate| candidate.invocation_id == invocation.invocation_id)
+            .unwrap();
+        let before_effect = dispatcher.outbox().expect("before outbox")[0].clone();
+
+        let affected = dispatcher
+            .recover_with_dispositions_excluding(
+                5,
+                &BTreeMap::from([(
+                    invocation.invocation_id.clone(),
+                    ManagedAgentRestartDisposition::RetrySafe,
+                )]),
+                &BTreeSet::from([invocation.invocation_id.clone()]),
+            )
+            .expect("partitioned recovery");
+
+        assert!(affected.is_empty());
+        let after = dispatcher
+            .invocations()
+            .expect("after")
+            .into_iter()
+            .find(|candidate| candidate.invocation_id == invocation.invocation_id)
+            .unwrap();
+        assert_eq!(after, before);
+        assert_eq!(dispatcher.outbox().expect("after outbox")[0], before_effect);
     }
 }

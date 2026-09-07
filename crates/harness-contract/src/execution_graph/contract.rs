@@ -226,17 +226,6 @@ pub struct ExecutionCompletionContract {
     pub allow_unresolved_conflicts: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct ExecutionOrchestrationMetadata {
-    pub mutation_id: String,
-    #[serde(default)]
-    pub applied_mutation_ids: Vec<String>,
-    pub semantic_revision: u64,
-    #[serde(default)]
-    pub source_generation: u64,
-    pub completion: ExecutionCompletionContract,
-}
-
 /// Canonical business lineage attached before an execution graph is admitted.
 /// Graph planning may happen before this identity is known, but a graph must
 /// carry this scope before Runtime commits any activity or side effect.
@@ -423,6 +412,15 @@ pub struct ExecutionUsage {
     pub model: Option<String>,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Provider-reported cache population tokens. These are not cache hits.
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+    /// Provider-reported prompt tokens served from cache.
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    /// Deprecated presentation alias for cache-read tokens only. New code
+    /// must use the two explicit dimensions above.
+    #[serde(default)]
     pub cached_tokens: u64,
     pub duration_ms: u64,
     pub tool_calls: u64,
@@ -530,8 +528,6 @@ pub struct ExecutionGraph {
     pub parent_execution: Option<ExecutionParentBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lineage: Option<ExecutionGraphLineage>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub orchestration: Option<ExecutionOrchestrationMetadata>,
     /// Immutable, authorization-checked source binding for a root that
     /// continues a completed collaboration.  It is graph truth rather than
     /// a prompt reconstruction: retries and recovery retain the exact
@@ -561,7 +557,6 @@ impl ExecutionGraph {
             service_class: ExecutionServiceClass::Interactive,
             parent_execution: None,
             lineage: None,
-            orchestration: None,
             continuation_binding: None,
             nodes: Vec::new(),
             edges: Vec::new(),

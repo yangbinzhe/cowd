@@ -680,6 +680,7 @@ struct StreamState {
     finished: bool,
     stop_reason: Option<String>,
     usage: Option<Usage>,
+    cache_dimensions_observed: bool,
     tool_calls: BTreeMap<u32, ToolCallState>,
     exposed_tool_names: BTreeSet<String>,
     // Hold only a possible provider tool-frame prefix for ordinary text. Once
@@ -708,6 +709,7 @@ impl StreamState {
             finished: false,
             stop_reason: None,
             usage: None,
+            cache_dimensions_observed: false,
             tool_calls: BTreeMap::new(),
             exposed_tool_names: tools.iter().map(|tool| tool.name.clone()).collect(),
             dsml_prefix: String::new(),
@@ -734,18 +736,22 @@ impl StreamState {
                         cache_read_input_tokens: 0,
                         output_tokens: 0,
                     },
+                    usage_observed: false,
+                    cache_dimensions_observed: false,
                     request_id: None,
                 },
             }));
         }
 
         if let Some(usage) = chunk.usage {
-            self.usage = Some(Usage {
+            self.cache_dimensions_observed |= usage.cache_dimensions_observed();
+            let observed = Usage {
                 input_tokens: usage.normalized_input_tokens(),
                 cache_creation_input_tokens: usage.normalized_cache_creation_tokens(),
                 cache_read_input_tokens: usage.normalized_cache_read_tokens(),
                 output_tokens: usage.normalized_output_tokens(),
-            });
+            };
+            self.usage = Some(merge_stream_usage_max(self.usage.take(), observed));
         }
 
         for choice in chunk.choices {
@@ -967,6 +973,7 @@ impl StreamState {
         }
 
         if self.message_started {
+            let usage_observed = self.usage.is_some();
             events.push(StreamEvent::MessageDelta(MessageDeltaEvent {
                 delta: MessageDelta {
                     stop_reason: Some(
@@ -976,12 +983,9 @@ impl StreamState {
                     ),
                     stop_sequence: None,
                 },
-                usage: self.usage.clone().unwrap_or(Usage {
-                    input_tokens: 0,
-                    cache_creation_input_tokens: 0,
-                    cache_read_input_tokens: 0,
-                    output_tokens: 0,
-                }),
+                usage: self.usage.clone().unwrap_or_default(),
+                usage_observed,
+                cache_dimensions_observed: self.cache_dimensions_observed,
             }));
             events.push(StreamEvent::MessageStop(MessageStopEvent {}));
         }
@@ -1126,6 +1130,20 @@ impl StreamState {
     }
 }
 
+fn merge_stream_usage_max(current: Option<Usage>, next: Usage) -> Usage {
+    let current = current.unwrap_or_default();
+    Usage {
+        input_tokens: current.input_tokens.max(next.input_tokens),
+        cache_creation_input_tokens: current
+            .cache_creation_input_tokens
+            .max(next.cache_creation_input_tokens),
+        cache_read_input_tokens: current
+            .cache_read_input_tokens
+            .max(next.cache_read_input_tokens),
+        output_tokens: current.output_tokens.max(next.output_tokens),
+    }
+}
+
 #[derive(Debug)]
 struct ToolCallState {
     openai_index: u32,
@@ -1251,70 +1269,100 @@ struct ResponseToolFunction {
 #[derive(Debug, Deserialize)]
 struct OpenAiUsage {
     #[serde(default)]
-    prompt_tokens: u32,
+    prompt_tokens: Option<u32>,
     #[serde(default)]
-    completion_tokens: u32,
+    completion_tokens: Option<u32>,
     #[serde(default)]
-    input_tokens: u32,
+    input_tokens: Option<u32>,
     #[serde(default)]
-    output_tokens: u32,
+    output_tokens: Option<u32>,
     // DeepSeek-style cache split: prompt_tokens = hit + miss.
     #[serde(default)]
-    prompt_cache_hit_tokens: u32,
+    prompt_cache_hit_tokens: Option<u32>,
     #[serde(default)]
-    prompt_cache_miss_tokens: u32,
+    prompt_cache_miss_tokens: Option<u32>,
     // OpenAI Responses-style cache split.
     #[serde(default)]
-    cached_input_tokens: u32,
+    cached_input_tokens: Option<u32>,
     #[serde(default)]
-    cache_creation_input_tokens: u32,
+    cache_creation_input_tokens: Option<u32>,
+    // OpenAI Responses API: input_tokens includes the cached portion.
+    #[serde(default)]
+    input_tokens_details: Option<CachedTokensDetails>,
     // OpenAI Chat Completions style: prompt_tokens_details.cached_tokens.
     #[serde(default)]
-    prompt_tokens_details: Option<PromptTokensDetails>,
+    prompt_tokens_details: Option<CachedTokensDetails>,
 }
 
 impl OpenAiUsage {
+    fn cache_dimensions_observed(&self) -> bool {
+        self.prompt_cache_hit_tokens.is_some()
+            || self.prompt_cache_miss_tokens.is_some()
+            || self.cached_input_tokens.is_some()
+            || self
+                .input_tokens_details
+                .as_ref()
+                .is_some_and(|details| details.cached_tokens.is_some())
+            || self
+                .prompt_tokens_details
+                .as_ref()
+                .is_some_and(|details| details.cached_tokens.is_some())
+    }
+
     fn normalized_input_tokens(&self) -> u32 {
-        if self.input_tokens > 0 {
-            // OpenAI Responses: input_tokens already excludes cached tokens.
+        if self.prompt_cache_hit_tokens.is_some() || self.prompt_cache_miss_tokens.is_some() {
+            // DeepSeek reports prompt_tokens as hit + miss. Field presence is
+            // authoritative: a zero miss is a valid 100%-cache-hit response,
+            // not a signal to fall back to the inclusive prompt total.
+            self.prompt_cache_miss_tokens.unwrap_or_else(|| {
+                self.prompt_tokens
+                    .unwrap_or_default()
+                    .saturating_sub(self.prompt_cache_hit_tokens.unwrap_or_default())
+            })
+        } else if let Some(details) = &self.input_tokens_details {
+            // OpenAI Responses reports an inclusive input total and its cached
+            // subset in input_tokens_details.
             self.input_tokens
-        } else if self.prompt_cache_miss_tokens > 0 {
-            self.prompt_cache_miss_tokens
+                .unwrap_or_default()
+                .saturating_sub(details.cached_tokens.unwrap_or_default())
+        } else if self.cached_input_tokens.is_some() {
+            // Legacy OpenAI-compatible Responses payloads use input_tokens for
+            // the already-normalized miss and expose the read separately.
+            self.input_tokens.unwrap_or_default()
+        } else if let Some(input_tokens) = self.input_tokens {
+            input_tokens
         } else if let Some(details) = &self.prompt_tokens_details {
             // OpenAI Chat Completions: prompt_tokens includes cached tokens.
-            self.prompt_tokens.saturating_sub(details.cached_tokens)
-        } else {
             self.prompt_tokens
+                .unwrap_or_default()
+                .saturating_sub(details.cached_tokens.unwrap_or_default())
+        } else {
+            self.prompt_tokens.unwrap_or_default()
         }
     }
 
-    const fn normalized_output_tokens(&self) -> u32 {
-        if self.output_tokens > 0 {
-            self.output_tokens
-        } else {
-            self.completion_tokens
-        }
+    fn normalized_output_tokens(&self) -> u32 {
+        self.output_tokens
+            .or(self.completion_tokens)
+            .unwrap_or_default()
     }
 
     fn normalized_cache_creation_tokens(&self) -> u32 {
-        // OpenAI-compatible providers bill cache writes at the miss rate and
-        // already exclude cached tokens from `input_tokens`. Only an explicit
-        // separate cache-write field is reported here; deriving it from the
-        // miss would double-count the same tokens.
-        if self.cache_creation_input_tokens > 0 {
-            self.cache_creation_input_tokens
-        } else {
-            0
-        }
+        // Only an explicit separate cache-write field is reported here.
+        // Deriving cache creation from the normalized miss would double-count
+        // the same tokens for providers that bill writes at the miss rate.
+        self.cache_creation_input_tokens.unwrap_or_default()
     }
 
     fn normalized_cache_read_tokens(&self) -> u32 {
-        if self.prompt_cache_hit_tokens > 0 {
-            self.prompt_cache_hit_tokens
-        } else if self.cached_input_tokens > 0 {
-            self.cached_input_tokens
+        if self.prompt_cache_hit_tokens.is_some() || self.prompt_cache_miss_tokens.is_some() {
+            self.prompt_cache_hit_tokens.unwrap_or_default()
+        } else if let Some(details) = &self.input_tokens_details {
+            details.cached_tokens.unwrap_or_default()
+        } else if let Some(cached_input_tokens) = self.cached_input_tokens {
+            cached_input_tokens
         } else if let Some(details) = &self.prompt_tokens_details {
-            details.cached_tokens
+            details.cached_tokens.unwrap_or_default()
         } else {
             0
         }
@@ -1322,9 +1370,9 @@ impl OpenAiUsage {
 }
 
 #[derive(Debug, Deserialize)]
-struct PromptTokensDetails {
+struct CachedTokensDetails {
     #[serde(default)]
-    cached_tokens: u32,
+    cached_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2137,6 +2185,11 @@ fn normalize_chat_completion_response(
         });
     }
 
+    let usage_observed = response.usage.is_some();
+    let cache_dimensions_observed = response
+        .usage
+        .as_ref()
+        .is_some_and(OpenAiUsage::cache_dimensions_observed);
     Ok(MessageResponse {
         id: response.id,
         kind: "message".to_string(),
@@ -2165,11 +2218,18 @@ fn normalize_chat_completion_response(
                 .as_ref()
                 .map_or(0, OpenAiUsage::normalized_output_tokens),
         },
+        usage_observed,
+        cache_dimensions_observed,
         request_id: None,
     })
 }
 
 fn normalize_responses_response(model: &str, response: ResponsesApiResponse) -> MessageResponse {
+    let usage_observed = response.usage.is_some();
+    let cache_dimensions_observed = response
+        .usage
+        .as_ref()
+        .is_some_and(OpenAiUsage::cache_dimensions_observed);
     let mut content = Vec::new();
     let mut has_tool_call = false;
     for item in response.output {
@@ -2229,6 +2289,8 @@ fn normalize_responses_response(model: &str, response: ResponsesApiResponse) -> 
                 cache_read_input_tokens: usage.normalized_cache_read_tokens(),
                 output_tokens: usage.normalized_output_tokens(),
             }),
+        usage_observed,
+        cache_dimensions_observed,
         request_id: None,
     }
 }
@@ -2888,14 +2950,14 @@ mod tests {
         build_chat_completion_request, build_responses_request, chat_completions_endpoint,
         is_reasoning_model, normalize_finish_reason, openai_tool_choice, parse_compat_tool_calls,
         parse_dsml_tool_calls, parse_responses_sse_frame, parse_tool_arguments, responses_endpoint,
-        retry_after_from_headers, ChatCompletionChunk, OpenAiCompatClient, OpenAiCompatConfig,
-        OpenAiSseParser, OpenAiUsage, OpenAiWireProtocol, StreamState,
+        retry_after_from_headers, ChatCompletionChunk, ChunkChoice, ChunkDelta, OpenAiCompatClient,
+        OpenAiCompatConfig, OpenAiSseParser, OpenAiUsage, OpenAiWireProtocol, StreamState,
     };
     use crate::error::{ApiError, CompatibilityToolProtocolFailure};
     use crate::types::{
         ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ImageSource,
         InputContentBlock, InputMessage, MessageRequest, OutputContentBlock, StreamEvent,
-        ToolChoice, ToolDefinition, ToolResultContentBlock,
+        ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
     };
     use serde_json::json;
     use std::sync::{Mutex, OnceLock};
@@ -3216,14 +3278,38 @@ mod tests {
 
     #[test]
     fn openai_usage_parses_cache_split_without_double_counting() {
-        let deepseek: OpenAiUsage = serde_json::from_str(
+        let deepseek_mixed: OpenAiUsage = serde_json::from_str(
             r#"{"prompt_tokens":1000,"prompt_cache_hit_tokens":800,"prompt_cache_miss_tokens":200,"completion_tokens":50}"#,
         )
         .expect("deepseek usage");
-        assert_eq!(deepseek.normalized_input_tokens(), 200);
-        assert_eq!(deepseek.normalized_cache_creation_tokens(), 0);
-        assert_eq!(deepseek.normalized_cache_read_tokens(), 800);
-        assert_eq!(deepseek.normalized_output_tokens(), 50);
+        assert_eq!(deepseek_mixed.normalized_input_tokens(), 200);
+        assert_eq!(deepseek_mixed.normalized_cache_creation_tokens(), 0);
+        assert_eq!(deepseek_mixed.normalized_cache_read_tokens(), 800);
+        assert_eq!(deepseek_mixed.normalized_output_tokens(), 50);
+        assert!(deepseek_mixed.cache_dimensions_observed());
+
+        let deepseek_all_hit: OpenAiUsage = serde_json::from_str(
+            r#"{"prompt_tokens":1000,"prompt_cache_hit_tokens":1000,"prompt_cache_miss_tokens":0,"completion_tokens":0}"#,
+        )
+        .expect("deepseek all-hit usage");
+        assert_eq!(deepseek_all_hit.normalized_input_tokens(), 0);
+        assert_eq!(deepseek_all_hit.normalized_cache_read_tokens(), 1000);
+        assert_eq!(deepseek_all_hit.normalized_output_tokens(), 0);
+        assert!(deepseek_all_hit.cache_dimensions_observed());
+
+        let deepseek_no_hit: OpenAiUsage = serde_json::from_str(
+            r#"{"prompt_tokens":1000,"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":1000,"completion_tokens":50}"#,
+        )
+        .expect("deepseek no-hit usage");
+        assert_eq!(deepseek_no_hit.normalized_input_tokens(), 1000);
+        assert_eq!(deepseek_no_hit.normalized_cache_read_tokens(), 0);
+
+        let deepseek_hit_only: OpenAiUsage = serde_json::from_str(
+            r#"{"prompt_tokens":1000,"prompt_cache_hit_tokens":800,"completion_tokens":50}"#,
+        )
+        .expect("deepseek hit-only usage");
+        assert_eq!(deepseek_hit_only.normalized_input_tokens(), 200);
+        assert_eq!(deepseek_hit_only.normalized_cache_read_tokens(), 800);
 
         let chat_completions: OpenAiUsage = serde_json::from_str(
             r#"{"prompt_tokens":1000,"prompt_tokens_details":{"cached_tokens":700},"completion_tokens":50}"#,
@@ -3234,13 +3320,89 @@ mod tests {
         assert_eq!(chat_completions.normalized_cache_read_tokens(), 700);
 
         let responses: OpenAiUsage = serde_json::from_str(
-            r#"{"input_tokens":300,"cached_input_tokens":700,"output_tokens":50}"#,
+            r#"{"input_tokens":1000,"input_tokens_details":{"cached_tokens":700},"output_tokens":50}"#,
         )
         .expect("responses usage");
         assert_eq!(responses.normalized_input_tokens(), 300);
         assert_eq!(responses.normalized_cache_creation_tokens(), 0);
         assert_eq!(responses.normalized_cache_read_tokens(), 700);
         assert_eq!(responses.normalized_output_tokens(), 50);
+
+        let legacy_responses: OpenAiUsage = serde_json::from_str(
+            r#"{"input_tokens":300,"cached_input_tokens":700,"output_tokens":50}"#,
+        )
+        .expect("legacy responses usage");
+        assert_eq!(legacy_responses.normalized_input_tokens(), 300);
+        assert_eq!(legacy_responses.normalized_cache_creation_tokens(), 0);
+        assert_eq!(legacy_responses.normalized_cache_read_tokens(), 700);
+        assert_eq!(legacy_responses.normalized_output_tokens(), 50);
+
+        let cache_absent: OpenAiUsage =
+            serde_json::from_str(r#"{"prompt_tokens":1000,"completion_tokens":50}"#)
+                .expect("usage without cache dimensions");
+        assert!(!cache_absent.cache_dimensions_observed());
+
+        let creation_only: OpenAiUsage = serde_json::from_str(
+            r#"{"input_tokens":1000,"cache_creation_input_tokens":1000,"output_tokens":50}"#,
+        )
+        .expect("usage with no cache-read dimension");
+        assert!(!creation_only.cache_dimensions_observed());
+    }
+
+    #[test]
+    fn streaming_usage_chunks_merge_by_dimension_and_emit_one_terminal_usage() {
+        let mut state = StreamState::new("deepseek-v4-flash".to_string(), &[]);
+        let start_usage = serde_json::from_str(
+            r#"{"prompt_tokens":100,"prompt_cache_hit_tokens":80,"prompt_cache_miss_tokens":20,"completion_tokens":0}"#,
+        )
+        .expect("start usage");
+        let output_usage =
+            serde_json::from_str(r#"{"completion_tokens":7}"#).expect("output usage");
+
+        let first = state
+            .ingest_chunk(ChatCompletionChunk {
+                id: "stream-usage".to_string(),
+                model: Some("deepseek-v4-flash".to_string()),
+                choices: Vec::new(),
+                usage: Some(start_usage),
+            })
+            .expect("first usage chunk");
+        let second = state
+            .ingest_chunk(ChatCompletionChunk {
+                id: "stream-usage".to_string(),
+                model: Some("deepseek-v4-flash".to_string()),
+                choices: vec![ChunkChoice {
+                    delta: ChunkDelta::default(),
+                    finish_reason: Some("stop".to_string()),
+                }],
+                usage: Some(output_usage),
+            })
+            .expect("output usage chunk");
+        assert!(first
+            .iter()
+            .chain(&second)
+            .all(|event| !matches!(event, StreamEvent::MessageDelta(_))));
+
+        let terminal = state.finish().expect("terminal events");
+        let deltas = terminal
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::MessageDelta(delta) => Some(delta),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(
+            deltas[0].usage,
+            Usage {
+                input_tokens: 20,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 80,
+                output_tokens: 7,
+            }
+        );
+        assert!(deltas[0].usage_observed);
+        assert!(deltas[0].cache_dimensions_observed);
     }
 
     #[test]
@@ -3971,7 +4133,9 @@ mod tests {
         let terminal = state.finish().expect("stream finish");
         assert!(terminal.iter().any(|event| matches!(
             event,
-            StreamEvent::MessageDelta(delta) if delta.delta.stop_reason.as_deref() == Some("end_turn")
+            StreamEvent::MessageDelta(delta)
+                if !delta.usage_observed
+                    && delta.delta.stop_reason.as_deref() == Some("end_turn")
         )));
     }
 

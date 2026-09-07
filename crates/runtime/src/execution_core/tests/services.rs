@@ -21,6 +21,35 @@ use session::SessionRecord;
 
 struct ReadinessOnlyEvolutionEvalRunner;
 
+struct TestRuntimeBackends {
+    events: Arc<crate::RuntimeEventStore>,
+    artifacts: Arc<crate::ArtifactStore>,
+    tasks: Arc<crate::TaskAggregateService>,
+}
+
+impl TestRuntimeBackends {
+    fn new(root: &std::path::Path) -> Self {
+        Self {
+            events: Arc::new(crate::RuntimeEventStore::for_test()),
+            artifacts: Arc::new(crate::ArtifactStore::for_test_default(
+                root.join("test-artifacts"),
+            )),
+            tasks: Arc::new(crate::TaskAggregateService::for_test()),
+        }
+    }
+
+    fn builder(
+        &self,
+        cowd_home: impl Into<std::path::PathBuf>,
+        workspace: impl Into<std::path::PathBuf>,
+    ) -> RuntimeServicesBuilder {
+        RuntimeServices::builder(cowd_home, workspace)
+            .runtime_event_store(Arc::clone(&self.events))
+            .artifact_store(Arc::clone(&self.artifacts))
+            .task_aggregate_service(Arc::clone(&self.tasks))
+    }
+}
+
 fn publish_agent_test_policy(services: &RuntimeServices, session_id: &str) {
     services.publish_session_execution_policy(
         session_id,
@@ -119,8 +148,8 @@ fn append_episode_baseline_fixture(
         latency_ms: 1,
         resource_summary: harness_contract::evolution::CollaborationResourceSummary {
             parallel_demand: 1,
-            context_reservation_tokens: 1,
-            output_reservation_tokens: 1,
+            context_reservation_tokens: Some(1),
+            output_reservation_tokens: Some(1),
         },
         completed_at_ms: 1,
     };
@@ -137,6 +166,64 @@ fn append_episode_baseline_fixture(
         })
         .expect("episode fixture");
     episode_id
+}
+
+fn append_episode_pattern_fixture(
+    services: &RuntimeServices,
+    episode_ids: &[String],
+    turn_refs: &[String],
+) {
+    let signature = episode_baseline_signature();
+    let signature_digest = signature.digest();
+    let pattern_id = harness_contract::evolution::CollaborationSemanticPattern::deterministic_id(
+        &signature_digest,
+    );
+    let pattern = harness_contract::evolution::CollaborationSemanticPattern {
+        schema_version: harness_contract::evolution::COLLABORATION_PATTERN_SCHEMA_VERSION,
+        pattern_id: pattern_id.clone(),
+        pattern_revision: 1,
+        signature_digest,
+        semantic_suggestion: harness_contract::evolution::SemanticCollaborationSuggestion {
+            required_capability_ids: signature.required_capability_ids.clone(),
+            required_skill_ids: signature.required_skill_ids.clone(),
+            required_tool_capabilities: signature.required_tool_capabilities.clone(),
+            dependency_shapes: signature.dependency_shapes.clone(),
+            acceptance_kinds: signature.acceptance_kinds.clone(),
+            result_field_shapes: signature.result_field_shapes.clone(),
+        },
+        semantic_signature: signature,
+        evidence_summary: harness_contract::evolution::PatternEvidenceSummary {
+            eligible_episode_count: episode_ids.len() as u32,
+            distinct_turn_count: turn_refs.len() as u32,
+            evidence_ref_count: episode_ids.len() as u32,
+            coverage_basis_points: 10_000,
+        },
+        lifecycle: harness_contract::evolution::SemanticPatternLifecycle::Advisory,
+        qualifying_episode_ids: episode_ids.to_vec(),
+        distinct_turn_ref_hashes: turn_refs.to_vec(),
+        support_count: episode_ids.len() as u32,
+        latest_completed_at_ms: 1,
+    };
+    assert!(pattern.is_actionable());
+    services
+        .event_store()
+        .append(crate::RuntimeEventInput {
+            stream_id: format!("evolution:pattern:{pattern_id}"),
+            scope: crate::RuntimeEventScope::Evolution,
+            kind: "evolution.collaboration_pattern.projected.v1".to_string(),
+            status: Some("projected".to_string()),
+            actor: Some("test".to_string()),
+            refs: Vec::new(),
+            payload: serde_json::json!({"pattern": pattern}),
+        })
+        .expect("pattern fixture");
+}
+
+fn evaluation_digest(value: &impl serde::Serialize) -> String {
+    format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(value).expect("evaluation fixture serializes"))
+    )
 }
 
 #[test]
@@ -156,6 +243,28 @@ fn builder_rejects_a_clean_but_unaddressable_build_identity() {
     assert!(
         matches!(error, RuntimeServicesError::Invariant(message) if message.contains("Git SHA"))
     );
+}
+
+#[test]
+fn builder_rejects_conflicting_process_command_manifests_before_runtime_recovery() {
+    let temp = tempfile::tempdir().expect("temporary roots");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let first = crate::ProcessJsonlSpec::new("command:worker", "worker-a", Vec::new());
+    let second = crate::ProcessJsonlSpec::new("command:worker", "worker-b", Vec::new());
+
+    let result = RuntimeServices::test_builder(temp.path().join("home"), &workspace)
+        .process_jsonl_commands([first, second])
+        .build();
+    let error = match result {
+        Ok(_) => panic!("one command reference cannot select two executable manifests"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        RuntimeServicesError::AgentRuntime(message)
+            if message.contains("already registered with a different digest")
+    ));
 }
 
 #[test]
@@ -218,12 +327,16 @@ fn episode_baseline_cannot_bypass_an_active_stable_release() {
             candidate_id: "candidate-episode-stable-bypass".to_string(),
             proposal_id,
             subject: crate::EvolutionCandidateSubject::AgentDefinition {
-                revision_ref: published.definition_ref,
+                revision_ref: published.definition_ref.clone(),
             },
             evaluation_baseline: crate::EvolutionEvaluationBaseline::EpisodeSet {
                 semantic_signature_digest: signature_digest,
                 episode_ids,
                 aggregate_digest,
+                executable_baseline_ref: published.definition_ref,
+                executable_baseline_content_digest: "sha256:baseline".to_string(),
+                replay_manifest_ref: "replay:stable-bypass".to_string(),
+                replay_manifest_digest: "sha256:replay".to_string(),
             },
             source_evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
                 "test",
@@ -269,11 +382,17 @@ fn episode_baseline_requires_three_distinct_durable_turns() {
         .register_evolution_candidate(crate::EvolutionCandidateIntent {
             candidate_id: "candidate-episode-duplicate-turns".to_string(),
             proposal_id,
-            subject: crate::EvolutionCandidateSubject::AgentDefinition { revision_ref },
+            subject: crate::EvolutionCandidateSubject::AgentDefinition {
+                revision_ref: revision_ref.clone(),
+            },
             evaluation_baseline: crate::EvolutionEvaluationBaseline::EpisodeSet {
                 semantic_signature_digest: signature_digest,
                 episode_ids,
                 aggregate_digest,
+                executable_baseline_ref: revision_ref,
+                executable_baseline_content_digest: "sha256:baseline".to_string(),
+                replay_manifest_ref: "replay:duplicate-turns".to_string(),
+                replay_manifest_digest: "sha256:replay".to_string(),
             },
             source_evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
                 "test",
@@ -289,13 +408,249 @@ fn episode_baseline_requires_three_distinct_durable_turns() {
     ));
 }
 
+#[tokio::test]
+async fn generalized_episode_set_executable_baseline() {
+    let temp = tempfile::tempdir().expect("temporary root");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let providers = crate::config::ProvidersConfig {
+        providers: std::collections::HashMap::from([(
+            "test".into(),
+            crate::config::ProviderConfig {
+                name: "test".into(),
+                base_url: "https://example.test/v1".into(),
+                api_key: "test".into(),
+                models: vec!["fast".into()],
+                protocol: Some("responses".into()),
+                parallel_tool_calls: Default::default(),
+                early_tool_start: Default::default(),
+            },
+        )]),
+    };
+    let services = RuntimeServices::test_builder(temp.path().join("home"), &workspace)
+        .provider_registry(Arc::new(
+            crate::ProviderRegistry::new(providers).expect("providers"),
+        ))
+        .evolution_eval_runner(Arc::new(ReadinessOnlyEvolutionEvalRunner))
+        .build()
+        .expect("runtime services");
+    let captured_packets = Arc::new(Mutex::new(Vec::new()));
+    services
+        .agent_runtime()
+        .register_observation_authority_backend(Arc::new(CapturingAgentBackend {
+            packets: Arc::clone(&captured_packets),
+        }));
+
+    let definition_id = AgentDefinitionId::new(
+        DefinitionScope::Workspace,
+        "cowd/episode-executable-baseline",
+    )
+    .expect("definition id");
+    let scenario_ref = "episode/replay";
+    let instructions = "# Evaluated Agent\n\nReturn evidence-backed output.\n";
+    let manifest = |revision| AgentDefinitionManifest {
+        api_version: "cowd.agent/v1".to_string(),
+        definition_id: definition_id.clone(),
+        revision,
+        name: format!("Evaluated Agent {revision}"),
+        description: "EpisodeSet executable baseline fixture".to_string(),
+        lifecycle: RevisionLifecycle::Published,
+        executor: AgentExecutorPolicy::CowdNative,
+        model_policy: AgentModelPolicy {
+            profile: "test".to_string(),
+            allowed_models: vec!["fast".to_string()],
+            fallback_allowed: false,
+        },
+        cognitive_policy: AgentCognitivePolicy {
+            context_profile: "sub_agent".to_string(),
+            read_scopes: vec![CognitiveReadScope::Session],
+            write_mode: CognitiveWriteMode::CandidateOnly,
+        },
+        capability_contract: AgentCapabilityContract {
+            capability_ceiling: vec![AgentCapability::Read],
+            skill_refs: Vec::new(),
+            approval_required_for: Vec::new(),
+        },
+        output_contract: AgentOutputContract::reviewable(),
+        evaluation: AgentEvaluationContract::single_release_gate(scenario_ref, "evidence"),
+        instructions_digest: format!("{:x}", Sha256::digest(instructions.as_bytes())),
+    };
+    let baseline = services
+        .definition_registry()
+        .agents()
+        .store_revision(manifest(1), instructions)
+        .expect("baseline revision");
+    let candidate_revision = services
+        .definition_registry()
+        .agents()
+        .store_revision(manifest(2), instructions)
+        .expect("candidate revision");
+
+    let turn_refs = vec![
+        "sha256:turn-one".to_string(),
+        "sha256:turn-two".to_string(),
+        "sha256:turn-three".to_string(),
+    ];
+    let episode_ids = turn_refs
+        .iter()
+        .enumerate()
+        .map(|(index, turn_ref)| {
+            append_episode_baseline_fixture(
+                &services,
+                &format!("program-executable-{index}"),
+                turn_ref,
+            )
+        })
+        .collect::<Vec<_>>();
+    append_episode_pattern_fixture(&services, &episode_ids, &turn_refs);
+    let signature_digest = episode_baseline_signature().digest();
+    let aggregate_digest = harness_contract::evolution::collaboration_episode_set_digest(
+        &signature_digest,
+        &episode_ids,
+    );
+
+    let acceptance = vec!["completed".to_string()];
+    let objective = "execute the frozen paired evaluation workload".to_string();
+    let environment_fingerprint = evaluation_digest(&serde_json::json!({
+        "provider": "test",
+        "model": "fast",
+        "permission_ceiling": harness_contract::policy::PermissionMode::ReadOnly,
+        "allowed_tools": Vec::<String>::new(),
+        "allowed_skills": Vec::<String>::new(),
+        "resource_scopes": Vec::<String>::new(),
+    }));
+    let replay = harness_contract::evaluation::FrozenEvaluationReplayManifest {
+        manifest_ref: "replay:episode-executable".to_string(),
+        source_episode_set_digest: aggregate_digest.clone(),
+        input_digest: evaluation_digest(&objective),
+        attachment_refs: Vec::new(),
+        environment_fingerprint,
+        rubric_digest: evaluation_digest(&acceptance),
+    };
+    let scenario = harness_contract::evaluation::EvaluationScenarioSpec {
+        scenario_ref: scenario_ref.to_string(),
+        objective,
+        acceptance,
+        allowed_tools: Vec::new(),
+        allowed_skills: Vec::new(),
+        resource_scopes: Vec::new(),
+        permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+        model_lease: "fast".to_string(),
+        replay_manifest: Some(replay.clone()),
+    };
+    scenario.validate().expect("valid replay scenario");
+
+    let proposal_id = approved_evolution_proposal(&services, "executable-pair");
+    let candidate = services
+        .register_evolution_candidate(crate::EvolutionCandidateIntent {
+            candidate_id: "candidate-episode-executable".to_string(),
+            proposal_id,
+            subject: crate::EvolutionCandidateSubject::AgentDefinition {
+                revision_ref: candidate_revision.revision.revision_ref.clone(),
+            },
+            evaluation_baseline: crate::EvolutionEvaluationBaseline::EpisodeSet {
+                semantic_signature_digest: signature_digest,
+                episode_ids,
+                aggregate_digest,
+                executable_baseline_ref: baseline.revision.revision_ref.clone(),
+                executable_baseline_content_digest: baseline.revision.content_digest.clone(),
+                replay_manifest_ref: replay.manifest_ref,
+                replay_manifest_digest: scenario.executable_replay_digest(),
+            },
+            source_evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
+                "test",
+                "episode-executable-pair",
+            )],
+            canary_policy: Default::default(),
+        })
+        .expect("candidate registered without a Stable release");
+    for side in ["baseline", "candidate"] {
+        publish_agent_test_policy(
+            &services,
+            &format!("evolution-eval:{}:{side}:0", candidate.candidate_id),
+        );
+    }
+    let (baseline_observation, candidate_observation) = services
+        .execute_evolution_agent_scenario(&candidate.candidate_id, &scenario, 0)
+        .await
+        .expect("both revisions execute from the frozen EpisodeSet replay");
+    assert_eq!(baseline_observation.definition_revision, 1);
+    assert_eq!(candidate_observation.definition_revision, 2);
+    assert!(baseline_observation.succeeded && candidate_observation.succeeded);
+    assert_ne!(baseline_observation.run_ref, candidate_observation.run_ref);
+    assert_eq!(
+        baseline_observation.environment_fingerprint,
+        candidate_observation.environment_fingerprint
+    );
+    let packets = captured_packets
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(packets.len(), 2);
+    assert_ne!(packets[0].session_id(), packets[1].session_id());
+    let isolated_output = |packet: &AgentTaskPacket| {
+        packet
+            .resource_scopes
+            .iter()
+            .find(|scope| scope.starts_with("write:.cowd/evaluation/"))
+            .cloned()
+            .expect("Runtime-issued isolated output lease")
+    };
+    assert_ne!(isolated_output(&packets[0]), isolated_output(&packets[1]));
+}
+
+#[test]
+fn generalized_paired_write_skill_isolation() {
+    let scenario = |resource_scopes: Vec<String>, allowed_skills: Vec<String>| {
+        harness_contract::evaluation::EvaluationScenarioSpec {
+            scenario_ref: "episode/isolation".to_string(),
+            objective: "exercise a paired workload".to_string(),
+            acceptance: vec!["reviewable evidence".to_string()],
+            allowed_tools: Vec::new(),
+            allowed_skills,
+            resource_scopes,
+            permission_ceiling: harness_contract::policy::PermissionMode::WorkspaceWrite,
+            model_lease: "fast".to_string(),
+            replay_manifest: None,
+        }
+    };
+    let catalog = crate::RuntimeSkillCatalog::new(Vec::new(), Vec::new());
+    let shared_write = validate_evolution_scenario_isolation(
+        &scenario(vec!["write:shared-output".to_string()], Vec::new()),
+        None,
+        &catalog,
+    )
+    .expect_err("caller-provided shared writes must be rejected before execution");
+    assert!(matches!(
+        shared_write,
+        RuntimeServicesError::Invariant(message)
+            if message.contains("cannot share writable input scopes")
+    ));
+
+    let missing_skill = validate_evolution_scenario_isolation(
+        &scenario(Vec::new(), vec!["skill:not-installed".to_string()]),
+        None,
+        &catalog,
+    )
+    .expect_err("an unavailable Skill must fail before provider admission");
+    assert!(matches!(
+        missing_skill,
+        RuntimeServicesError::Invariant(message)
+            if message.contains("unavailable Skills")
+    ));
+
+    validate_evolution_scenario_isolation(&scenario(Vec::new(), Vec::new()), None, &catalog)
+        .expect("read-only inputs with Runtime-issued output scopes are isolated");
+}
+
 #[test]
 fn startup_recovers_task_outbox_without_mutating_mission_membership() {
     let root = tempfile::tempdir().expect("runtime root");
     let home = root.path().join("home");
     let workspace = root.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
-    let first = RuntimeServices::builder(&home, &workspace)
+    let backends = TestRuntimeBackends::new(root.path());
+    let first = backends
+        .builder(&home, &workspace)
         .build()
         .expect("first runtime");
     publish_agent_test_policy(&first, "session-startup-recovery");
@@ -344,7 +699,8 @@ fn startup_recovers_task_outbox_without_mutating_mission_membership() {
     );
     drop(first);
 
-    let recovered = RuntimeServices::builder(&home, &workspace)
+    let recovered = backends
+        .builder(&home, &workspace)
         .build()
         .expect("recovered runtime");
     assert_eq!(
@@ -798,6 +1154,33 @@ struct ServiceScopedBackend {
 
 struct CompletedAgentBackend;
 
+struct CapturingAgentBackend {
+    packets: Arc<Mutex<Vec<AgentTaskPacket>>>,
+}
+
+#[async_trait::async_trait]
+impl crate::AgentRuntimeBackend for CapturingAgentBackend {
+    fn kind(&self) -> crate::AgentBackendKind {
+        crate::AgentBackendKind::InProcess
+    }
+
+    fn capabilities(&self) -> crate::AgentBackendCapabilities {
+        crate::AgentBackendCapabilities::in_process()
+    }
+
+    async fn execute(
+        &self,
+        packet: AgentTaskPacket,
+        selection: crate::AgentModelSelection,
+    ) -> Result<AgentReturnPacket, String> {
+        self.packets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(packet.clone());
+        CompletedAgentBackend.execute(packet, selection).await
+    }
+}
+
 struct ParallelTrackingAgentBackend {
     active: Arc<AtomicUsize>,
     max_active: Arc<AtomicUsize>,
@@ -964,6 +1347,8 @@ impl crate::AgentRuntimeBackend for CompletedAgentBackend {
             unresolved: Vec::new(),
             input_tokens: 5,
             output_tokens: 3,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
             cached_tokens: 0,
             model: selection.model,
             provider: selection.provider,
@@ -1042,6 +1427,8 @@ impl crate::AgentRuntimeBackend for ParallelTrackingAgentBackend {
             unresolved: Vec::new(),
             input_tokens: 5,
             output_tokens: 3,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
             cached_tokens: 0,
             model: selection.model,
             provider: selection.provider,
@@ -1142,7 +1529,7 @@ fn definition_catalog_refresh_only_exposes_active_stable_revisions() {
     let temp = tempfile::tempdir().expect("temporary root");
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
-    let services = RuntimeServices::builder(temp.path().join("home"), &workspace)
+    let services = RuntimeServices::test_builder(temp.path().join("home"), &workspace)
         .build()
         .expect("runtime services");
     let definition_id =
@@ -1237,7 +1624,7 @@ fn active_canary_routes_new_bindings_and_stop_reverts_to_stable() {
     let temp = tempfile::tempdir().expect("temporary root");
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
-    let services = RuntimeServices::builder(temp.path().join("home"), &workspace)
+    let services = RuntimeServices::test_builder(temp.path().join("home"), &workspace)
         .evolution_eval_runner(Arc::new(ReadinessOnlyEvolutionEvalRunner))
         .build()
         .expect("runtime services");
@@ -1515,7 +1902,7 @@ fn explicit_toml_import_is_runtime_owned_and_never_enters_runnable_catalog() {
     let temp = tempfile::tempdir().expect("temporary root");
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
-    let services = RuntimeServices::builder(temp.path().join("home"), &workspace)
+    let services = RuntimeServices::test_builder(temp.path().join("home"), &workspace)
         .build()
         .expect("runtime services");
     let definition_id = AgentDefinitionId::new(DefinitionScope::Workspace, "external/reviewer")
@@ -1546,7 +1933,7 @@ fn explicit_toml_import_is_runtime_owned_and_never_enters_runnable_catalog() {
 #[test]
 fn builder_rejects_partial_session_port_sets() {
     let temp = tempfile::tempdir().unwrap();
-    let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+    let store = Arc::new(crate::test_support::session_store());
     let ports = crate::session_runtime_port::TestSessionPortAdapter::new(store);
     let mut builder = RuntimeServices::builder(temp.path(), temp.path().join("partial"));
     builder.session_query_port = Some(ports);
@@ -1558,6 +1945,121 @@ fn builder_rejects_partial_session_port_sets() {
     ));
 }
 
+#[tokio::test]
+async fn session_integrated_runtime_holds_all_autonomous_producers_until_recovery_release() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("producer-gate");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let store = Arc::new(crate::test_support::session_store());
+    let ports = crate::session_runtime_port::TestSessionPortAdapter::new(store);
+    let services = RuntimeServices::test_builder(temp.path(), workspace)
+        .session_ports(ports.clone(), ports.clone(), ports.clone(), ports)
+        .build()
+        .expect("session-integrated Runtime");
+    assert!(matches!(
+        services
+            .execution_supervisor()
+            .admit_owned("must-wait-for-recovery", Box::pin(async { Ok(()) }))
+            .await,
+        Err(crate::execution_core::ExecutionRunnerError::SupervisorUnavailable(_))
+    ));
+    let mut graph = ExecutionGraph::new("recovery-gated graph");
+    graph.id = "recovery-gated-graph".to_string();
+    crate::test_support::attach_execution_graph_lineage(&mut graph);
+    graph.nodes.push(ExecutionNodeSpec::new(
+        ExecutionNodeKind::ToolBatch,
+        "tool_batch",
+        "{}",
+    ));
+    let receipt = services
+        .execution_supervisor()
+        .submit(
+            graph,
+            ExecutionGraphCommand::Start {
+                expected_revision: 0,
+            },
+        )
+        .await
+        .expect("durably admit graph behind recovery gate");
+    let gated = services
+        .graph_state_store()
+        .load(&receipt.graph_id)
+        .expect("gated graph");
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert_eq!(
+        services
+            .graph_state_store()
+            .load(&receipt.graph_id)
+            .expect("still gated")
+            .revision,
+        gated.revision,
+        "a submitted graph must not start before ordered recovery releases it"
+    );
+
+    assert!(
+        services
+            .event_reactor_health()
+            .expect("reactor health")
+            .lanes
+            .iter()
+            .all(|lane| !lane.worker_running),
+        "event reactor lanes must remain closed before ordered recovery"
+    );
+    assert!(
+        !services.approval_queue().deadline_scheduler_running(),
+        "expired approval deadlines must not advance graphs before ordered recovery"
+    );
+
+    services
+        .release_recovered_producers()
+        .await
+        .expect("release recovered producers");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if services
+                .event_reactor_health()
+                .expect("reactor health")
+                .lanes
+                .iter()
+                .all(|lane| lane.worker_running)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all reactor lanes start after release");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if services
+                .graph_state_store()
+                .load(&receipt.graph_id)
+                .expect("released graph")
+                .revision
+                > gated.revision
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("deferred graph starts exactly after release");
+    assert!(services.approval_queue().deadline_scheduler_running());
+    services
+        .execution_supervisor()
+        .admit_owned("released-owned-work", Box::pin(async { Ok(()) }))
+        .await
+        .expect("owned work starts only after release");
+
+    services
+        .release_recovered_producers()
+        .await
+        .expect("release is idempotent");
+    assert!(services.approval_queue().deadline_scheduler_running());
+}
+
 #[test]
 fn workspace_builders_isolate_provider_tool_host_and_session_router() {
     let temp = tempfile::tempdir().unwrap();
@@ -1565,8 +2067,8 @@ fn workspace_builders_isolate_provider_tool_host_and_session_router() {
     let right_provider = Arc::new(crate::ProviderRegistry::empty());
     let left_tool: Arc<dyn crate::RuntimeExecutionHost> = Arc::new(TestExecutionHost);
     let right_tool: Arc<dyn crate::RuntimeExecutionHost> = Arc::new(TestExecutionHost);
-    let left_store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
-    let right_store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+    let left_store = Arc::new(crate::test_support::session_store());
+    let right_store = Arc::new(crate::test_support::session_store());
     std::fs::create_dir_all(temp.path().join("left")).unwrap();
     std::fs::create_dir_all(temp.path().join("right")).unwrap();
 
@@ -1574,7 +2076,7 @@ fn workspace_builders_isolate_provider_tool_host_and_session_router() {
         crate::session_runtime_port::TestSessionPortAdapter::new(Arc::clone(&left_store));
     let right_ports =
         crate::session_runtime_port::TestSessionPortAdapter::new(Arc::clone(&right_store));
-    let left = RuntimeServices::builder(temp.path(), temp.path().join("left"))
+    let left = RuntimeServices::test_builder(temp.path(), temp.path().join("left"))
         .provider_registry(Arc::clone(&left_provider))
         .tool_execution_host(Arc::clone(&left_tool))
         .session_ports(
@@ -1585,7 +2087,7 @@ fn workspace_builders_isolate_provider_tool_host_and_session_router() {
         )
         .build()
         .unwrap();
-    let right = RuntimeServices::builder(temp.path(), temp.path().join("right"))
+    let right = RuntimeServices::test_builder(temp.path(), temp.path().join("right"))
         .provider_registry(Arc::clone(&right_provider))
         .tool_execution_host(Arc::clone(&right_tool))
         .session_ports(
@@ -1628,7 +2130,7 @@ fn workspace_builders_isolate_provider_tool_host_and_session_router() {
 
 #[tokio::test]
 async fn due_schedule_submits_one_durable_handoff_graph_and_never_duplicates_it() {
-    let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+    let store = Arc::new(crate::test_support::session_store());
     let timestamp = chrono::Utc::now().to_rfc3339();
     store
         .create_session(&SessionRecord {
@@ -1771,13 +2273,13 @@ async fn same_workspace_services_coordinate_with_persistent_resources() {
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     std::fs::create_dir_all(temp.path().join("other")).unwrap();
-    let first = RuntimeServices::builder(temp.path(), &workspace)
+    let first = RuntimeServices::test_builder(temp.path(), &workspace)
         .build()
         .unwrap();
-    let second = RuntimeServices::builder(temp.path(), &workspace)
+    let second = RuntimeServices::test_builder(temp.path(), &workspace)
         .build()
         .unwrap();
-    let isolated = RuntimeServices::builder(temp.path(), temp.path().join("other"))
+    let isolated = RuntimeServices::test_builder(temp.path(), temp.path().join("other"))
         .build()
         .unwrap();
 
@@ -1832,10 +2334,10 @@ fn canonical_workspace_identity_shares_resources_across_home_and_symlink_aliases
     #[cfg(not(unix))]
     std::fs::create_dir_all(&alias).unwrap();
 
-    let first = RuntimeServices::builder(temp.path().join("home-a"), &workspace)
+    let first = RuntimeServices::test_builder(temp.path().join("home-a"), &workspace)
         .build()
         .unwrap();
-    let second = RuntimeServices::builder(temp.path().join("home-b"), &alias)
+    let second = RuntimeServices::test_builder(temp.path().join("home-b"), &alias)
         .build()
         .unwrap();
 
@@ -1855,7 +2357,7 @@ async fn recovery_marker_blocks_runner_start_run_and_command_entries() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
-    let services = RuntimeServices::builder(temp.path(), &workspace)
+    let services = RuntimeServices::test_builder(temp.path(), &workspace)
         .build()
         .unwrap();
     let importer = crate::upgrade::LegacyExecutionImporter::new(
@@ -1925,11 +2427,10 @@ async fn startup_recovery_rehydrates_and_advances_persistent_execution_graphs() 
     let cowd_home = temp.path().join("home");
     std::fs::create_dir_all(&workspace).unwrap();
     std::fs::create_dir_all(&cowd_home).unwrap();
+    let backends = TestRuntimeBackends::new(temp.path());
 
     let graph_id = {
-        let services = RuntimeServices::builder(&cowd_home, &workspace)
-            .build()
-            .unwrap();
+        let services = backends.builder(&cowd_home, &workspace).build().unwrap();
         let mut graph = harness_contract::execution_graph::ExecutionGraph::new(
             "startup recovery production path",
         );
@@ -1972,9 +2473,7 @@ async fn startup_recovery_rehydrates_and_advances_persistent_execution_graphs() 
         graph.id
     };
 
-    let restarted = RuntimeServices::builder(&cowd_home, &workspace)
-        .build()
-        .unwrap();
+    let restarted = backends.builder(&cowd_home, &workspace).build().unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     restarted
         .tool_batch_executor()
@@ -2007,6 +2506,406 @@ async fn startup_recovery_rehydrates_and_advances_persistent_execution_graphs() 
 }
 
 #[tokio::test]
+async fn startup_recovery_defers_turn_scoped_graph_until_exact_resolver_is_bound() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    let cowd_home = temp.path().join("home");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&cowd_home).unwrap();
+    let backends = TestRuntimeBackends::new(temp.path());
+    let graph_id = {
+        let services = backends.builder(&cowd_home, &workspace).build().unwrap();
+        let mut graph = ExecutionGraph::new("defer until Session binding");
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
+        let mut node = ExecutionNodeSpec::new(
+            ExecutionNodeKind::ToolBatch,
+            "tool_batch",
+            "payload:late-session-binding",
+        );
+        node.id = "late-session-node".to_string();
+        node.idempotency_key = "idempotency:late-session-node".to_string();
+        graph.nodes.push(node);
+        let graph = services
+            .commit_service()
+            .register_graph(graph)
+            .unwrap()
+            .graph;
+        let graph = services
+            .commit_service()
+            .transition_node(
+                &graph,
+                "late-session-node",
+                ExecutionNodeStatus::Ready,
+                None,
+                Vec::new(),
+            )
+            .unwrap()
+            .graph;
+        services
+            .commit_service()
+            .transition_node(
+                &graph,
+                "late-session-node",
+                ExecutionNodeStatus::Running,
+                None,
+                Vec::new(),
+            )
+            .unwrap()
+            .graph
+            .id
+    };
+
+    let restarted = backends.builder(&cowd_home, &workspace).build().unwrap();
+    let report = restarted
+        .recover_execution_graphs_on_startup()
+        .await
+        .expect("startup recovery");
+    assert_eq!(report.recovered_graphs, 1);
+    assert_eq!(report.notified_graphs, 0);
+    assert_eq!(report.deferred_graphs, 1);
+    assert!(report.records.iter().any(|record| {
+        record.graph_id == graph_id && record.action == "deferred_turn_scoped_executor_binding"
+    }));
+    assert_eq!(
+        restarted
+            .graph_state_store()
+            .load(&graph_id)
+            .unwrap()
+            .node_statuses["late-session-node"],
+        ExecutionNodeStatus::Ready
+    );
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    restarted
+        .tool_batch_executor()
+        .install_resolver(Arc::new(ServiceScopedResolver {
+            payload_ref: "payload:late-session-binding".to_string(),
+            backend: Arc::new(ServiceScopedBackend {
+                calls: Arc::clone(&calls),
+            }),
+        }));
+    restarted
+        .execution_supervisor()
+        .notify_graph(&graph_id)
+        .await
+        .expect("Session-bound recovery wake");
+    restarted
+        .execution_supervisor()
+        .wait_for_quiescence(&graph_id)
+        .await
+        .expect("rebound graph completes");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn startup_recovery_quarantines_one_failed_session_without_blocking_healthy_graphs() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    let cowd_home = temp.path().join("home");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&cowd_home).unwrap();
+    let backends = TestRuntimeBackends::new(temp.path());
+
+    let (healthy_graph_id, quarantined_graph_id, quarantined_revision) = {
+        let services = backends.builder(&cowd_home, &workspace).build().unwrap();
+        let mut persisted = Vec::new();
+        for (graph_id, session_id, node_id) in [
+            ("healthy-graph", "healthy-session", "healthy-node"),
+            ("quarantined-graph", "failed-session", "quarantined-node"),
+        ] {
+            let mut graph = harness_contract::execution_graph::ExecutionGraph::new(
+                "partitioned startup recovery",
+            );
+            graph.id = graph_id.to_string();
+            crate::test_support::attach_execution_graph_lineage(&mut graph);
+            graph.lineage.as_mut().unwrap().session_id = session_id.to_string();
+            let mut node = harness_contract::execution_graph::ExecutionNodeSpec::new(
+                harness_contract::execution_graph::ExecutionNodeKind::ToolBatch,
+                "tool_batch",
+                "payload:partitioned-recovery",
+            );
+            node.id = node_id.to_string();
+            node.idempotency_key = format!("idempotency:{node_id}");
+            graph.nodes.push(node);
+            let graph = services
+                .commit_service()
+                .register_graph(graph)
+                .unwrap()
+                .graph;
+            let graph = services
+                .commit_service()
+                .transition_node(
+                    &graph,
+                    node_id,
+                    ExecutionNodeStatus::Ready,
+                    None,
+                    Vec::new(),
+                )
+                .unwrap()
+                .graph;
+            let graph = services
+                .commit_service()
+                .transition_node(
+                    &graph,
+                    node_id,
+                    ExecutionNodeStatus::Running,
+                    None,
+                    Vec::new(),
+                )
+                .unwrap()
+                .graph;
+            persisted.push((graph.id, graph.revision));
+        }
+        (
+            persisted[0].0.clone(),
+            persisted[1].0.clone(),
+            persisted[1].1,
+        )
+    };
+
+    let restarted = backends.builder(&cowd_home, &workspace).build().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    restarted
+        .tool_batch_executor()
+        .install_resolver(Arc::new(ServiceScopedResolver {
+            payload_ref: "payload:partitioned-recovery".to_string(),
+            backend: Arc::new(ServiceScopedBackend {
+                calls: Arc::clone(&calls),
+            }),
+        }));
+    let excluded_sessions = BTreeSet::from(["failed-session".to_string()]);
+
+    let report = restarted
+        .recover_execution_graphs_on_startup_excluding_sessions(&excluded_sessions)
+        .await
+        .expect("partitioned startup recovery");
+
+    assert_eq!(report.examined_graphs, 2);
+    assert_eq!(report.deferred_graphs, 1);
+    assert_eq!(report.recovered_graphs, 1);
+    assert_eq!(report.notified_graphs, 1);
+    assert!(report.errors.is_empty());
+    assert!(report.records.iter().any(|record| {
+        record.graph_id == quarantined_graph_id && record.action == "deferred_session_hydration"
+    }));
+    restarted
+        .execution_supervisor()
+        .wait_for_quiescence(&healthy_graph_id)
+        .await
+        .expect("healthy Session graph reaches quiescence");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let quarantined = restarted
+        .graph_state_store()
+        .load(&quarantined_graph_id)
+        .unwrap();
+    assert_eq!(quarantined.revision, quarantined_revision);
+    assert_eq!(
+        quarantined.node_statuses["quarantined-node"],
+        ExecutionNodeStatus::Running
+    );
+}
+
+#[tokio::test]
+async fn startup_recovery_rejects_missing_lineage_before_any_durable_mutation() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    let cowd_home = temp.path().join("home");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&cowd_home).unwrap();
+    let services = RuntimeServices::test_builder(&cowd_home, &workspace)
+        .build()
+        .unwrap();
+    let mut graph = ExecutionGraph::new("corrupt unscoped recovery graph");
+    graph.id = "missing-lineage-recovery".to_string();
+    graph.revision = 1;
+    let mut node = ExecutionNodeSpec::new(
+        ExecutionNodeKind::ToolBatch,
+        "tool_batch",
+        "payload:must-not-run",
+    );
+    node.id = "unscoped-node".to_string();
+    graph.nodes.push(node);
+    graph
+        .node_statuses
+        .insert("unscoped-node".to_string(), ExecutionNodeStatus::Ready);
+    services
+        .event_store()
+        .append(crate::RuntimeEventInput {
+            stream_id: graph.id.clone(),
+            scope: crate::RuntimeEventScope::ExecutionGraph,
+            kind: "execution_graph.planned".to_string(),
+            status: Some("ready".to_string()),
+            actor: Some("corruption-fixture".to_string()),
+            refs: Vec::new(),
+            payload: serde_json::json!({"event": "planned", "graph": graph}),
+        })
+        .unwrap();
+    let before_revision = services
+        .event_store()
+        .stream_revision("missing-lineage-recovery")
+        .unwrap();
+
+    let report = services
+        .recover_execution_graphs_on_startup()
+        .await
+        .expect("invalid lineage is reported, not executed");
+
+    assert_eq!(report.errors.len(), 1);
+    assert_eq!(report.records.len(), 1);
+    assert_eq!(report.records[0].action, "invalid_lineage");
+    assert_eq!(report.notified_graphs, 0);
+    assert_eq!(
+        services
+            .event_store()
+            .stream_revision("missing-lineage-recovery")
+            .unwrap(),
+        before_revision,
+        "lineage validation must run before any recovery mutation"
+    );
+}
+
+#[tokio::test]
+async fn startup_recovery_does_not_resolve_handoff_for_an_excluded_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    let cowd_home = temp.path().join("home");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&cowd_home).unwrap();
+    let services = RuntimeServices::test_builder(&cowd_home, &workspace)
+        .build()
+        .unwrap();
+    services
+        .install_test_session_store(Arc::new(crate::test_support::session_store()))
+        .unwrap();
+    let handoff = harness_contract::turn::SessionHandoff {
+        handoff_id: "excluded-handoff".to_string(),
+        source_session_id: "failed-session".to_string(),
+        target_session_id: "target-session".to_string(),
+        objective: "return a durable result".to_string(),
+        acceptance: Vec::new(),
+        scope: Vec::new(),
+        context_lens: Vec::new(),
+        evidence_refs: Vec::new(),
+        context_budget_lease: None,
+        permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+        deadline_at_ms: None,
+        priority: 128,
+        correlation_id: "excluded-correlation".to_string(),
+        result_contract: "result".to_string(),
+        task_route_hint: None,
+    };
+    let command = harness_contract::turn::SessionDispatchCommand {
+        command_id: "excluded-command".to_string(),
+        action: harness_contract::turn::SessionDispatchAction::Enqueue,
+        handoff: handoff.clone(),
+        expected_target_revision: 0,
+    };
+    let mut source = ExecutionGraph::new("excluded handoff source");
+    source.id = "excluded-handoff-source".to_string();
+    crate::test_support::attach_execution_graph_lineage(&mut source);
+    source.lineage.as_mut().unwrap().session_id = "failed-session".to_string();
+    source.revision = 1;
+    let mut node = ExecutionNodeSpec::new(
+        ExecutionNodeKind::SessionDispatch,
+        crate::SESSION_DISPATCH_EXECUTOR,
+        format!(
+            "session_handoff:{}",
+            serde_json::to_string(&command).unwrap()
+        ),
+    );
+    node.id = "excluded-handoff-node".to_string();
+    source.nodes.push(node);
+    source.node_statuses.insert(
+        "excluded-handoff-node".to_string(),
+        ExecutionNodeStatus::WaitingExternal,
+    );
+    services
+        .event_store()
+        .append(crate::RuntimeEventInput {
+            stream_id: source.id.clone(),
+            scope: crate::RuntimeEventScope::ExecutionGraph,
+            kind: "execution_graph.planned".to_string(),
+            status: Some("waiting".to_string()),
+            actor: Some("handoff-recovery-fixture".to_string()),
+            refs: Vec::new(),
+            payload: serde_json::json!({"event": "planned", "graph": source}),
+        })
+        .unwrap();
+    services
+        .event_store()
+        .append(crate::RuntimeEventInput {
+            stream_id: "session-handoff-target:excluded-request".to_string(),
+            scope: crate::RuntimeEventScope::SessionInput,
+            kind: "session.handoff.accepted.v1".to_string(),
+            status: Some("accepted".to_string()),
+            actor: Some("handoff-recovery-fixture".to_string()),
+            refs: Vec::new(),
+            payload: serde_json::json!({
+                "handoff": handoff,
+                "request_id": "excluded-request",
+                "receipt": {
+                    "command_id": "excluded-command",
+                    "source_node_id": "excluded-handoff-node",
+                    "target_session_id": "target-session",
+                    "target_turn_id": "target-turn",
+                    "accepted_revision": 1,
+                    "status": "accepted"
+                },
+                "source_graph_id": "excluded-handoff-source",
+                "source_node_id": "excluded-handoff-node"
+            }),
+        })
+        .unwrap();
+    services
+        .event_store()
+        .append(crate::RuntimeEventInput {
+            stream_id: "session-handoff-correlation:excluded-correlation".to_string(),
+            scope: crate::RuntimeEventScope::SessionInput,
+            kind: "session.handoff.result.v1".to_string(),
+            status: Some("completed".to_string()),
+            actor: Some("handoff-recovery-fixture".to_string()),
+            refs: Vec::new(),
+            payload: serde_json::json!({
+                "correlation_id": "excluded-correlation",
+                "source_session_id": "failed-session",
+                "target_session_id": "target-session",
+                "result_ref": "artifact:target-result",
+                "evidence_refs": [],
+                "unresolved": [],
+                "conflict_refs": [],
+                "input_tokens": 1,
+                "output_tokens": 1
+            }),
+        })
+        .unwrap();
+    let before_revision = services
+        .event_store()
+        .stream_revision("excluded-handoff-source")
+        .unwrap();
+
+    let report = services
+        .recover_execution_graphs_on_startup_excluding_sessions(&BTreeSet::from([
+            "failed-session".to_string()
+        ]))
+        .await
+        .expect("partitioned handoff recovery");
+
+    assert_eq!(report.resolved_handoff_results, 0);
+    assert_eq!(report.deferred_graphs, 1);
+    assert!(report.errors.is_empty());
+    let source = services
+        .graph_state_store()
+        .load("excluded-handoff-source")
+        .unwrap();
+    assert_eq!(source.revision, before_revision);
+    assert_eq!(
+        source.node_statuses["excluded-handoff-node"],
+        ExecutionNodeStatus::WaitingExternal
+    );
+}
+
+#[tokio::test]
 async fn canonical_agent_task_flows_through_runner_and_commits_once() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("workspace");
@@ -2025,7 +2924,7 @@ async fn canonical_agent_task_flows_through_runner_and_commits_once() {
             },
         )]),
     };
-    let services = RuntimeServices::builder(temp.path(), &workspace)
+    let services = RuntimeServices::test_builder(temp.path(), &workspace)
         .provider_registry(Arc::new(crate::ProviderRegistry::new(providers).unwrap()))
         .build()
         .unwrap();
@@ -2076,7 +2975,6 @@ async fn canonical_agent_task_flows_through_runner_and_commits_once() {
             evidence_obligations: Vec::new(),
         },
         output_acceptance: Vec::new(),
-        requires_managed_collaboration_escalation: false,
         acceptance: vec!["completed".into()],
         constraints: Vec::new(),
         context_refs: Vec::new(),
@@ -2097,6 +2995,7 @@ async fn canonical_agent_task_flows_through_runner_and_commits_once() {
         deadline_at_ms: u64::MAX,
         managed_invocation: None,
         idempotency_key: "agent-runtime-idempotency".into(),
+        agentic_binding: None,
     };
     let mut node = ExecutionNodeSpec::new(
         ExecutionNodeKind::AgentTask,
@@ -2164,7 +3063,7 @@ async fn one_definition_can_drive_eight_isolated_runtime_instances() {
             },
         )]),
     };
-    let services = RuntimeServices::builder(temp.path(), &workspace)
+    let services = RuntimeServices::test_builder(temp.path(), &workspace)
         .provider_registry(Arc::new(
             crate::ProviderRegistry::new(providers).expect("provider"),
         ))
@@ -2249,7 +3148,6 @@ async fn one_definition_can_drive_eight_isolated_runtime_instances() {
                     scopes: vec![format!("read:binding-domain-{index}")],
                 },
             }],
-            requires_managed_collaboration_escalation: false,
             acceptance: vec!["evidence".to_string()],
             constraints: Vec::new(),
             context_refs: Vec::new(),
@@ -2270,6 +3168,7 @@ async fn one_definition_can_drive_eight_isolated_runtime_instances() {
             deadline_at_ms: u64::MAX,
             managed_invocation: None,
             idempotency_key: format!("binding-agent-{index}"),
+            agentic_binding: None,
         };
         let mut node = ExecutionNodeSpec::new(
             ExecutionNodeKind::AgentTask,
@@ -2584,8 +3483,7 @@ async fn session_cancellation_terminalizes_descendants_of_an_already_terminal_ro
 
 #[test]
 fn runtime_timeline_position_never_skips_events_inside_one_transaction() {
-    let store =
-        Arc::new(crate::RuntimeEventStore::try_open_in_memory().expect("runtime event store"));
+    let store = Arc::new(crate::RuntimeEventStore::for_test());
     store
         .append_transaction(crate::AppendTransactionRequest {
             transaction_id: "timeline-transaction".to_string(),
@@ -2641,9 +3539,8 @@ fn cancellation_receipt_is_durable_idempotent_and_conflict_checked() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
-    let services = RuntimeServices::builder(temp.path(), &workspace)
-        .build()
-        .unwrap();
+    let backends = TestRuntimeBackends::new(temp.path());
+    let services = backends.builder(temp.path(), &workspace).build().unwrap();
     let requested = harness_contract::turn::CancellationReceipt {
         cancellation_id: "cancel-1".to_string(),
         session_id: "session-1".to_string(),
@@ -2670,9 +3567,7 @@ fn cancellation_receipt_is_durable_idempotent_and_conflict_checked() {
     // records the winner. Reopening the services must recover that intent
     // and permit exactly one final transition.
     drop(services);
-    let services = RuntimeServices::builder(temp.path(), &workspace)
-        .build()
-        .unwrap();
+    let services = backends.builder(temp.path(), &workspace).build().unwrap();
     assert_eq!(
         services.cancellation_receipt("cancel-1").unwrap(),
         Some(intent.clone())
@@ -2710,7 +3605,7 @@ fn concurrent_cancellation_finalizers_converge_on_one_durable_winner() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
-    let services = RuntimeServices::builder(temp.path(), &workspace)
+    let services = RuntimeServices::test_builder(temp.path(), &workspace)
         .build()
         .unwrap();
     services.record_live_execution(
@@ -2787,5 +3682,163 @@ fn concurrent_cancellation_finalizers_converge_on_one_durable_winner() {
             .len(),
         2,
         "one Requested and one final winner are the complete saga"
+    );
+}
+
+#[test]
+fn committed_cancellation_replays_live_finalization_after_crash() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let backends = TestRuntimeBackends::new(temp.path());
+    let services = backends.builder(temp.path(), &workspace).build().unwrap();
+    services.record_live_execution(
+        "cancel-recovery-session",
+        "cancel-recovery-execution".to_string(),
+        "cancel-recovery-turn".to_string(),
+    );
+    let requested = services
+        .commit_cancellation_receipt(harness_contract::turn::CancellationReceipt {
+            cancellation_id: "cancel-recovery".to_string(),
+            session_id: "cancel-recovery-session".to_string(),
+            turn_id: "cancel-recovery-turn".to_string(),
+            execution_id: "cancel-recovery-execution".to_string(),
+            actor_id: "principal:local-human".to_string(),
+            cause: harness_contract::turn::CancellationCause::UserRequested,
+            reason: Some("recover committed cancellation".to_string()),
+            requested_at_ms: 100,
+            effective_at_ms: None,
+            status: harness_contract::turn::CancellationStatus::Requested,
+            journal_sequence: 0,
+            projection_revision: 0,
+        })
+        .unwrap();
+    assert_eq!(
+        services
+            .claim_live_terminal_fence(
+                &requested.execution_id,
+                "cancellation:cancel-recovery".to_string(),
+                harness_contract::projection::ExecutionLiveStatus::Cancelled,
+                requested.requested_at_ms,
+            )
+            .unwrap(),
+        crate::execution_live::TerminalFenceClaim::Claimed
+    );
+    let mut committed = requested;
+    committed.status = harness_contract::turn::CancellationStatus::Cancelled;
+    committed.effective_at_ms = Some(101);
+    let committed = services.commit_cancellation_receipt(committed).unwrap();
+
+    // Simulate process loss after the canonical receipt commits but before
+    // its derived live projection is finalized.
+    drop(services);
+    let recovered = backends.builder(temp.path(), &workspace).build().unwrap();
+    assert_eq!(
+        recovered
+            .resolve_requested_cancellation("cancel-recovery")
+            .unwrap(),
+        Some(committed)
+    );
+    let live = recovered
+        .execution_live("cancel-recovery-execution")
+        .expect("committed cancellation must rebuild its live projection");
+    assert_eq!(
+        live.status,
+        harness_contract::projection::ExecutionLiveStatus::Cancelled
+    );
+    assert_eq!(
+        live.terminal_ref.as_deref(),
+        Some("cancellation:cancel-recovery")
+    );
+    drop(recovered);
+
+    let second_restart = backends.builder(temp.path(), &workspace).build().unwrap();
+    assert_eq!(
+        second_restart
+            .execution_live("cancel-recovery-execution")
+            .expect("finalized cancellation checkpoint remains recoverable")
+            .status,
+        harness_contract::projection::ExecutionLiveStatus::Cancelled
+    );
+}
+
+#[test]
+fn prepared_session_terminal_defers_cancellation_until_terminal_winner_commits() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let services = RuntimeServices::test_builder(temp.path(), &workspace)
+        .build()
+        .unwrap();
+    let execution_id = "completion-wins-execution";
+    services.record_live_execution(
+        "completion-wins-session",
+        execution_id.to_string(),
+        "completion-wins-turn".to_string(),
+    );
+    assert_eq!(
+        services
+            .claim_live_terminal_fence(
+                execution_id,
+                "completion-wins-terminal".to_string(),
+                harness_contract::projection::ExecutionLiveStatus::Complete,
+                7,
+            )
+            .unwrap(),
+        crate::execution_live::TerminalFenceClaim::Claimed
+    );
+    services
+        .commit_cancellation_receipt(harness_contract::turn::CancellationReceipt {
+            cancellation_id: "completion-wins-cancellation".to_string(),
+            session_id: "completion-wins-session".to_string(),
+            turn_id: "completion-wins-turn".to_string(),
+            execution_id: execution_id.to_string(),
+            actor_id: "principal:local-human".to_string(),
+            cause: harness_contract::turn::CancellationCause::UserRequested,
+            reason: Some("raced terminal delivery".to_string()),
+            requested_at_ms: 200,
+            effective_at_ms: None,
+            status: harness_contract::turn::CancellationStatus::Requested,
+            journal_sequence: 0,
+            projection_revision: 0,
+        })
+        .unwrap();
+    assert!(services
+        .resolve_requested_cancellation("completion-wins-cancellation")
+        .unwrap()
+        .is_none());
+    assert!(!services
+        .execution_live(execution_id)
+        .unwrap()
+        .status
+        .is_terminal());
+
+    assert_eq!(
+        services
+            .finalize_live_terminal_fence(
+                execution_id,
+                "completion-wins-terminal",
+                harness_contract::projection::ExecutionLiveStatus::Complete,
+                7,
+            )
+            .unwrap(),
+        crate::execution_live::TerminalFenceClaim::Claimed
+    );
+    let cancellation = services
+        .resolve_requested_cancellation("completion-wins-cancellation")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        cancellation.status,
+        harness_contract::turn::CancellationStatus::AlreadyTerminal
+    );
+    let live = services.execution_live(execution_id).unwrap();
+    assert_eq!(
+        live.status,
+        harness_contract::projection::ExecutionLiveStatus::Complete
+    );
+    assert_eq!(
+        live.terminal_ref.as_deref(),
+        Some("completion-wins-terminal")
     );
 }

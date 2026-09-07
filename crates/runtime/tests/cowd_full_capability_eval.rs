@@ -25,11 +25,34 @@ use runtime::{
 };
 use session::{SessionRecord, UnifiedSessionStore};
 use std::sync::Arc;
+use storage::{PostgresConnectionConfig, PostgresExecutor, StaticSecretRefResolver};
+
+fn postgres_session_store() -> UnifiedSessionStore {
+    let url = std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
+    let resolver = StaticSecretRefResolver::new([("runtime.eval.pg".to_string(), url)]);
+    let executor = PostgresExecutor::connect(
+        PostgresConnectionConfig::new("runtime-eval", "runtime.eval.pg", "cowd-runtime-eval"),
+        &resolver,
+    )
+    .expect("PostgreSQL test executor");
+    let schema = format!("cowdeval_{}", uuid::Uuid::new_v4().simple());
+    executor
+        .checkout_critical()
+        .expect("PostgreSQL test connection")
+        .batch_execute(&format!("CREATE SCHEMA \"{schema}\""))
+        .expect("create isolated test schema");
+    let backend = session_postgres::PostgresSessionStore::new(
+        executor
+            .scoped_namespace(&schema)
+            .expect("scope test schema"),
+    )
+    .expect("Session PostgreSQL adapter");
+    UnifiedSessionStore::from_backend(Arc::new(backend))
+}
 
 fn memory_config(sqlite_path: &std::path::Path) -> MemoryConfig {
     MemoryConfig {
         store: memory::config::StoreConfig {
-            sqlite_path: sqlite_path.to_path_buf(),
             blob_dir: sqlite_path.parent().unwrap().join("blobs"),
             enable_vector_index: false,
             cache_capacity: 256,
@@ -140,7 +163,7 @@ async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_an
             .await
             .expect("memory manager opens"),
     );
-    let sessions = UnifiedSessionStore::open_in_memory().expect("session store opens");
+    let sessions = postgres_session_store();
     sessions
         .create_session(&session_record(session_id))
         .await
@@ -238,8 +261,7 @@ async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_an
         "comment": "All evidence, memory, session, and structured checks are connected."
     });
 
-    let execution_events =
-        Arc::new(RuntimeEventStore::open_in_memory().expect("runtime event store opens"));
+    let execution_events = Arc::new(RuntimeEventStore::for_test());
     for evidence in &agent_evidence {
         execution_events
             .append(RuntimeEventInput {

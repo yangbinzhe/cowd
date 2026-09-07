@@ -211,7 +211,28 @@ mod tests {
                 && entry.handler == "route_manifest_handler"
                 && entry.source == "public_routes.rs"
         }));
-        assert_eq!(GATEWAY_ROUTE_BINDINGS.len(), 476);
+        let expected = surface::gateway_api::gateway_routes()
+            .iter()
+            .map(|route| {
+                (
+                    route.method().as_str().to_string(),
+                    route.path().template().to_string(),
+                )
+            })
+            .chain(
+                typed_route_metadata()
+                    .into_iter()
+                    .map(|route| (route.method.to_string(), route.path)),
+            )
+            .collect::<BTreeSet<_>>();
+        let actual = unique
+            .into_iter()
+            .map(|(method, path)| (method.to_string(), path.to_string()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            actual, expected,
+            "manifest must expose exactly the canonical route inventory"
+        );
     }
 
     #[test]

@@ -41,9 +41,10 @@ pub(crate) fn completion_gap(
             incomplete_teams.join(",")
         ));
     }
-    if !projection.artifacts.contains_key(&input.final_artifact_ref) {
-        return Some("final_artifact_not_committed".to_string());
-    }
+    let primary_artifact = input
+        .result_refs
+        .iter()
+        .find(|reference| projection.artifacts.contains_key(*reference));
     if !input.unresolved.is_empty() {
         return Some("completion_has_unresolved_items".to_string());
     }
@@ -63,29 +64,28 @@ pub(crate) fn completion_gap(
     if !incomplete.is_empty() {
         return Some(format!("tasks_not_accepted:{}", incomplete.join(",")));
     }
-    if !projection.tasks.values().any(|task| {
-        task.status == AgenticTaskStatus::Accepted
-            && task.artifact_refs.contains(&input.final_artifact_ref)
-    }) {
-        return Some("final_artifact_not_accepted_by_task_review".to_string());
+    // A collaboration Program can only close through a registered Artifact
+    // that an independently reviewed Task actually submitted.  Accepting an
+    // arbitrary external result reference here would let a root model bypass
+    // the same dependency lineage that the Objective supervisor later relies
+    // on to prove multi-Team integration.
+    if !projection.tasks.is_empty() && primary_artifact.is_none() {
+        return Some("completion_result_artifact_not_registered".to_string());
     }
-    let integrated_tasks = integrated_accepted_tasks(projection, &input.final_artifact_ref);
-    let uncovered_teams = projection
-        .teams
-        .values()
-        .filter(|team| {
-            !team
-                .task_ids
-                .iter()
-                .any(|task_id| integrated_tasks.contains(task_id))
-        })
-        .map(|team| team.team_id.clone())
-        .collect::<Vec<_>>();
-    if !uncovered_teams.is_empty() {
-        return Some(format!(
-            "final_artifact_does_not_integrate_required_teams:{}",
-            uncovered_teams.join(",")
-        ));
+    if let Some(primary_artifact) = primary_artifact {
+        if !projection.tasks.values().any(|task| {
+            task.status == AgenticTaskStatus::Accepted
+                && task.artifact_refs.contains(primary_artifact)
+        }) {
+            return Some("result_artifact_not_accepted_by_task_review".to_string());
+        }
+        let uncovered_teams = uncovered_delivery_teams(projection, primary_artifact);
+        if !uncovered_teams.is_empty() {
+            return Some(format!(
+                "result_artifact_does_not_integrate_required_teams:{}",
+                uncovered_teams.join(",")
+            ));
+        }
     }
     let unverified = projection
         .tasks
@@ -118,6 +118,59 @@ pub(crate) fn completion_gap(
         return Some("completion_has_no_evidence".to_string());
     }
     None
+}
+
+/// Return final Artifact references that can truthfully close this Program.
+///
+/// This is deliberately derived from Runtime projections rather than model
+/// labels: every non-superseded Task must be accepted, and a candidate
+/// Artifact must belong to an accepted Task whose real dependency lineage
+/// reaches work from every active Team.  The root model still chooses the
+/// synthesis Team, author, Task semantics, evidence and final presentation;
+/// the kernel merely exposes whether a requested terminal is mechanically
+/// admissible.
+pub(crate) fn completion_ready_result_artifact_refs(
+    projection: &AgenticProgramProjection,
+) -> Vec<String> {
+    if projection.teams.len() < usize::from(projection.required_team_count)
+        || projection.tasks.is_empty()
+        || projection.tasks.values().any(|task| {
+            task.status != AgenticTaskStatus::Superseded
+                && task.status != AgenticTaskStatus::Accepted
+        })
+    {
+        return Vec::new();
+    }
+
+    projection
+        .artifacts
+        .keys()
+        .filter(|artifact_ref| {
+            projection.tasks.values().any(|task| {
+                task.status == AgenticTaskStatus::Accepted
+                    && task.artifact_refs.contains(*artifact_ref)
+            }) && uncovered_delivery_teams(projection, artifact_ref).is_empty()
+        })
+        .cloned()
+        .collect()
+}
+
+fn uncovered_delivery_teams(
+    projection: &AgenticProgramProjection,
+    final_artifact_ref: &str,
+) -> Vec<String> {
+    let integrated_tasks = integrated_accepted_tasks(projection, final_artifact_ref);
+    projection
+        .teams
+        .values()
+        .filter(|team| {
+            !team
+                .task_ids
+                .iter()
+                .any(|task_id| integrated_tasks.contains(task_id))
+        })
+        .map(|team| team.team_id.clone())
+        .collect()
 }
 
 /// Resolve the accepted Task lineage represented by a final artifact.
@@ -195,6 +248,7 @@ mod tests {
             claim_execution_id: Some("graph:author".to_string()),
             claimed_at_ms: Some(1),
             lease_expires_at_ms: Some(2),
+            active_attempts: Default::default(),
             artifact_refs: artifact_refs.into_iter().map(str::to_string).collect(),
             evidence_refs: vec!["evidence:review".to_string()],
             unresolved: Vec::new(),
@@ -208,6 +262,14 @@ mod tests {
             supersede_evidence_refs: Vec::new(),
             superseded_reason: None,
             superseded_by: None,
+            obligation_refs: Vec::new(),
+            purpose: Default::default(),
+            execution_requirements: Vec::new(),
+            expertise_hints: Vec::new(),
+            cancel_requested_by: None,
+            cancel_reason_ref: None,
+            cancel_evidence_refs: Vec::new(),
+            pending_retirement: None,
         }
     }
 
@@ -250,6 +312,8 @@ mod tests {
                 title: "Final report".to_string(),
                 relates_to: vec!["task:synthesis".to_string()],
                 committed_by: "agent:author".to_string(),
+                claim_execution_id: None,
+                claim_generation: None,
             },
         );
 
@@ -260,6 +324,129 @@ mod tests {
                 "task:research".to_string(),
                 "task:synthesis".to_string(),
             ])
+        );
+    }
+
+    #[test]
+    fn completion_ready_artifacts_require_a_real_multi_team_synthesis_lineage() {
+        let mut projection = AgenticProgramProjection::empty("program", "objective");
+        projection.required_team_count = 2;
+        for (team_id, task_id) in [
+            ("team:research", "task:research"),
+            ("team:analysis", "task:analysis"),
+        ] {
+            projection.teams.insert(
+                team_id.to_string(),
+                crate::agentic::program::AgenticTeamProjection {
+                    team_id: team_id.to_string(),
+                    name: team_id.to_string(),
+                    mission: team_id.to_string(),
+                    objective: Some(team_id.to_string()),
+                    topic_ref: format!("topic:{team_id}"),
+                    created_by: "root".to_string(),
+                    member_ids: vec![format!("agent:{team_id}")],
+                    task_ids: vec![task_id.to_string()],
+                    lifecycle: Default::default(),
+                },
+            );
+        }
+        projection.tasks.insert(
+            "task:research".to_string(),
+            accepted_task(
+                "task:research",
+                "team:research",
+                Vec::new(),
+                vec!["artifact:research"],
+            ),
+        );
+        projection.tasks.insert(
+            "task:analysis".to_string(),
+            accepted_task(
+                "task:analysis",
+                "team:analysis",
+                Vec::new(),
+                vec!["artifact:analysis"],
+            ),
+        );
+        for artifact_ref in ["artifact:research", "artifact:analysis"] {
+            projection.artifacts.insert(
+                artifact_ref.to_string(),
+                AgenticArtifactProjection {
+                    artifact_ref: artifact_ref.to_string(),
+                    content_ref: format!("workspace://{artifact_ref}.md"),
+                    kind: "delivery".to_string(),
+                    title: artifact_ref.to_string(),
+                    relates_to: Vec::new(),
+                    committed_by: "agent:author".to_string(),
+                    claim_execution_id: None,
+                    claim_generation: None,
+                },
+            );
+        }
+
+        assert!(completion_ready_result_artifact_refs(&projection).is_empty());
+
+        projection.teams.insert(
+            "team:integration".to_string(),
+            crate::agentic::program::AgenticTeamProjection {
+                team_id: "team:integration".to_string(),
+                name: "Integration".to_string(),
+                mission: "Integrate accepted work".to_string(),
+                objective: Some("Integrate accepted work".to_string()),
+                topic_ref: "topic:integration".to_string(),
+                created_by: "root".to_string(),
+                member_ids: vec!["agent:integration".to_string()],
+                task_ids: vec!["task:synthesis".to_string()],
+                lifecycle: Default::default(),
+            },
+        );
+        projection.tasks.insert(
+            "task:synthesis".to_string(),
+            accepted_task(
+                "task:synthesis",
+                "team:integration",
+                vec!["task:research", "task:analysis"],
+                vec!["artifact:final"],
+            ),
+        );
+        projection.artifacts.insert(
+            "artifact:final".to_string(),
+            AgenticArtifactProjection {
+                artifact_ref: "artifact:final".to_string(),
+                content_ref: "workspace://final.md".to_string(),
+                kind: "final-report".to_string(),
+                title: "Final report".to_string(),
+                relates_to: Vec::new(),
+                committed_by: "agent:integration".to_string(),
+                claim_execution_id: None,
+                claim_generation: None,
+            },
+        );
+
+        assert_eq!(
+            completion_ready_result_artifact_refs(&projection),
+            vec!["artifact:final".to_string()]
+        );
+    }
+
+    #[test]
+    fn completion_cannot_bypass_task_review_with_an_unregistered_result_ref() {
+        let mut projection = AgenticProgramProjection::empty("program", "objective");
+        projection.tasks.insert(
+            "task:delivery".to_string(),
+            accepted_task("task:delivery", "team:delivery", Vec::new(), Vec::new()),
+        );
+
+        assert_eq!(
+            completion_gap(
+                &projection,
+                &ObjectiveCompleteRequestInput {
+                    result_refs: vec!["workspace://unregistered.md".to_string()],
+                    evidence_refs: vec!["tool://verified".to_string()],
+                    unresolved: Vec::new(),
+                },
+            ),
+            Some("completion_result_artifact_not_registered".to_string())
         );
     }
 
@@ -303,6 +490,8 @@ mod tests {
                 title: "Final report".to_string(),
                 relates_to: vec!["task:synthesis".to_string()],
                 committed_by: "agent:author".to_string(),
+                claim_execution_id: None,
+                claim_generation: None,
             },
         );
 
@@ -327,6 +516,7 @@ mod tests {
                 created_by: "root".to_string(),
                 member_ids: vec!["agent:research".to_string()],
                 task_ids: vec!["task:source".to_string(), "task:replacement".to_string()],
+                lifecycle: Default::default(),
             },
         );
         projection.teams.insert(
@@ -340,6 +530,7 @@ mod tests {
                 created_by: "root".to_string(),
                 member_ids: vec!["agent:integration".to_string()],
                 task_ids: vec!["task:synthesis".to_string()],
+                lifecycle: Default::default(),
             },
         );
         let mut superseded = accepted_task("task:source", "team:research", Vec::new(), Vec::new());
@@ -377,10 +568,12 @@ mod tests {
                 title: "Final report".to_string(),
                 relates_to: Vec::new(),
                 committed_by: "agent:integration".to_string(),
+                claim_execution_id: None,
+                claim_generation: None,
             },
         );
         let request = ObjectiveCompleteRequestInput {
-            final_artifact_ref: "artifact:final".to_string(),
+            result_refs: vec!["artifact:final".to_string()],
             evidence_refs: vec!["tool://verified".to_string()],
             unresolved: Vec::new(),
         };
@@ -411,6 +604,7 @@ mod tests {
                     "task:second".to_string(),
                     "task:other".to_string(),
                 ],
+                lifecycle: Default::default(),
             },
         );
         projection.teams.insert(
@@ -424,6 +618,7 @@ mod tests {
                 created_by: "root".to_string(),
                 member_ids: vec!["agent:integration".to_string()],
                 task_ids: vec!["task:synthesis".to_string()],
+                lifecycle: Default::default(),
             },
         );
         let mut first = accepted_task("task:first", "team:a", Vec::new(), Vec::new());
@@ -456,6 +651,8 @@ mod tests {
                 title: "Final report".to_string(),
                 relates_to: Vec::new(),
                 committed_by: "agent:integration".to_string(),
+                claim_execution_id: None,
+                claim_generation: None,
             },
         );
 
@@ -467,12 +664,12 @@ mod tests {
             completion_gap(
                 &projection,
                 &ObjectiveCompleteRequestInput {
-                    final_artifact_ref: "artifact:final".to_string(),
+                    result_refs: vec!["artifact:final".to_string()],
                     evidence_refs: vec!["tool://verified".to_string()],
                     unresolved: Vec::new(),
                 },
             ),
-            Some("final_artifact_does_not_integrate_required_teams:team:a".to_string())
+            Some("result_artifact_does_not_integrate_required_teams:team:a".to_string())
         );
     }
 
@@ -506,6 +703,8 @@ mod tests {
                 title: "Final report".to_string(),
                 relates_to: vec!["task:unrelated".to_string()],
                 committed_by: "agent:author".to_string(),
+                claim_execution_id: None,
+                claim_generation: None,
             },
         );
 
@@ -524,13 +723,21 @@ pub(crate) fn apply_completion_request(
     revision: u64,
 ) {
     projection.status = AgenticProgramStatus::CompletionRequested;
-    projection.final_artifact_ref = Some(input.final_artifact_ref.clone());
+    let primary_artifact_ref = input
+        .result_refs
+        .iter()
+        .find(|reference| projection.artifacts.contains_key(*reference))
+        .cloned();
+    projection
+        .final_artifact_ref
+        .clone_from(&primary_artifact_ref);
     projection.unresolved.clone_from(&input.unresolved);
     projection.completion_request = Some(AgenticCompletionRequestProjection {
         action_id: envelope.action_id.clone(),
         requested_by: envelope.actor.actor_id.clone(),
         program_revision: revision,
-        final_artifact_ref: input.final_artifact_ref.clone(),
+        result_refs: input.result_refs.clone(),
+        primary_artifact_ref,
         evidence_refs: input.evidence_refs.clone(),
         unresolved: input.unresolved.clone(),
     });

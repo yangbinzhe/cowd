@@ -28,6 +28,23 @@ pub(super) fn resolve_agentic_execution_admission(
         task,
         &required,
     )?;
+    if let Some(required_profile) = member.model_profile_ref.as_deref() {
+        let resolved = services
+            .definition_registry()
+            .resolve_agent(
+                &catalog_entry.definition_ref.definition_id,
+                harness_contract::agent::RevisionSelector::ExactApprovedRevision {
+                    revision: catalog_entry.definition_ref.revision,
+                },
+            )
+            .map_err(|error| format!("required Agent Definition is not resolvable: {error}"))?;
+        if resolved.revision.manifest.model_policy.profile != required_profile {
+            return Err(format!(
+                "selected Agent Definition model profile `{}` does not satisfy required profile `{required_profile}`",
+                resolved.revision.manifest.model_policy.profile
+            ));
+        }
+    }
     let effective_capabilities = required
         .iter()
         .map(|capability| {
@@ -84,6 +101,8 @@ pub(super) fn required_capabilities(
         .required_capabilities
         .iter()
         .chain(task.required_capabilities.iter())
+        .chain(member.execution_requirements.iter())
+        .chain(task.execution_requirements.iter())
         .map(|capability| normalize_capability(capability))
         .filter(|capability| !capability.is_empty())
         .collect::<Vec<_>>();
@@ -140,11 +159,29 @@ pub(super) fn select_catalog_entry(
 ) -> Result<AgentCatalogEntry, String> {
     let required = required.iter().cloned().collect::<BTreeSet<_>>();
     let demand_terms = semantic_terms(&format!(
-        "{} {} {} {} {}",
-        member.role, member.mission, task.title, task.objective, task.acceptance
+        "{} {} {} {} {} {} {} {}",
+        member.role,
+        member.mission,
+        member.expertise_hints.join(" "),
+        task.title,
+        task.objective,
+        task.acceptance,
+        task.expertise_hints.join(" "),
+        task.execution_requirements.join(" "),
     ));
     catalog
         .iter()
+        .filter(|entry| {
+            member.definition_ref.as_ref().is_none_or(|required_ref| {
+                required_ref == entry.definition_ref.definition_id.as_str()
+                    || required_ref
+                        == &format!(
+                            "{}@{}",
+                            entry.definition_ref.definition_id.as_str(),
+                            entry.definition_ref.revision
+                        )
+            })
+        })
         .filter_map(|entry| {
             let capabilities = entry
                 .capabilities
@@ -172,8 +209,13 @@ pub(super) fn select_catalog_entry(
         .min_by(|left, right| left.0.cmp(&right.0))
         .map(|(_, entry)| entry)
         .ok_or_else(|| {
+            let requested_definition = member
+                .definition_ref
+                .as_deref()
+                .map(|value| format!(" for required Definition {value}"))
+                .unwrap_or_default();
             format!(
-                "no Agent Definition satisfies required physical capabilities: {}",
+                "no Agent Definition{requested_definition} satisfies required physical capabilities: {}",
                 required.into_iter().collect::<Vec<_>>().join(",")
             )
         })

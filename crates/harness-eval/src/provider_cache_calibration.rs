@@ -141,6 +141,8 @@ pub fn run_provider_cache_calibration(
             budget: budget.clone(),
             provider_evidence_context: Some(runtime::ProviderRequestEvidenceContext {
                 session_id: session_id.clone(),
+                execution_id: format!("{session_id}:execution"),
+                turn_id: format!("{session_id}:turn"),
                 request_sequence: sequence,
                 request_compiler_cache_hit: sequence > 1,
                 budget,

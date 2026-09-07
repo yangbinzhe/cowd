@@ -1995,10 +1995,6 @@ impl TuiState {
         if key.kind != crossterm::event::KeyEventKind::Press {
             return false;
         }
-        if key.code == KeyCode::Char('n') {
-            self.workbench.agent_team_panel.select_next_team_template();
-            return true;
-        }
         let action = match key.code {
             KeyCode::Char('i') => "input",
             KeyCode::Char('!') => "interrupt",
@@ -3596,21 +3592,6 @@ impl TuiState {
             }
             Action::ToggleAgentPanel => {
                 self.workbench.agent_team_panel.toggle();
-                if self.workbench.agent_team_panel.visible {
-                    self.queue_gateway_api(
-                        move |client| async move { client.team_templates().await },
-                        |state, result| match result {
-                            Ok(payload) => state
-                                .workbench
-                                .agent_team_panel
-                                .set_team_templates(&payload),
-                            Err(error) => state
-                                .workbench
-                                .agent_team_panel
-                                .record_action_result("team.templates", Err(error)),
-                        },
-                    );
-                }
             }
             Action::TogglePerformanceDashboard => {
                 self.overlay.performance_dashboard.toggle();

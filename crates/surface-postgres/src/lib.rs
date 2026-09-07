@@ -5,8 +5,7 @@
 //! state. `surface` owns the DTOs and behaviour contract; neither it nor
 //! Gateway needs a PostgreSQL driver dependency.
 
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use postgres::Row;
 use serde_json::Value;
@@ -17,9 +16,8 @@ use storage::{
 };
 use surface::{
     normalize_surface_id, SurfaceDeliveryEvent, SurfaceFrame, SurfaceInboxReceipt,
-    SurfaceInboxRecord, SurfaceIngressClaim, SurfaceIngressFrameRecord, SurfaceMessageLedger,
-    SurfaceMessageLedgerMigrationSnapshot, SurfaceMessageSnapshot, SurfaceOperationResult,
-    SurfaceOutboxRecord, SurfaceSendRequest, SurfaceSessionProjectionDraft,
+    SurfaceInboxRecord, SurfaceIngressClaim, SurfaceMessageLedger, SurfaceMessageSnapshot,
+    SurfaceOperationResult, SurfaceOutboxRecord, SurfaceSendRequest, SurfaceSessionProjectionDraft,
     SurfaceTriggerEventReceipt, SurfaceTriggerEventRecord, SurfaceTurnCorrelation,
 };
 
@@ -1070,85 +1068,6 @@ impl SurfaceMessageLedger for PostgresSurfaceMessageLedger {
             archived_outbox,
         })
     }
-    fn export_migration_snapshot(&self) -> Result<SurfaceMessageLedgerMigrationSnapshot, String> {
-        let mut c = self.executor.checkout_background().map_err(stringify)?;
-        let ingress = load_ingress(&mut c)?;
-        let snapshot = SurfaceMessageLedgerMigrationSnapshot {
-            inbox: rows_json(
-                c.query(
-                    "SELECT record_json FROM surface_inbox ORDER BY record_key",
-                    &[],
-                )
-                .map_err(stringify)?,
-            )?,
-            outbox: rows_json(
-                c.query(
-                    "SELECT record_json FROM surface_outbox ORDER BY record_key",
-                    &[],
-                )
-                .map_err(stringify)?,
-            )?,
-            trigger_events: rows_json(
-                c.query(
-                    "SELECT record_json FROM surface_trigger_event ORDER BY record_key",
-                    &[],
-                )
-                .map_err(stringify)?,
-            )?,
-            delivery_events: rows_json(
-                c.query(
-                    "SELECT record_json FROM surface_delivery_event ORDER BY record_key",
-                    &[],
-                )
-                .map_err(stringify)?,
-            )?,
-            ingress_frames: ingress,
-        };
-        snapshot.validate()?;
-        Ok(snapshot)
-    }
-    fn import_migration_snapshot(
-        &self,
-        snapshot: &SurfaceMessageLedgerMigrationSnapshot,
-    ) -> Result<(), String> {
-        snapshot.validate()?;
-        let mut c = self.executor.checkout_background().map_err(stringify)?;
-        let mut tx = c.transaction().map_err(stringify)?;
-        for table in [
-            "surface_inbox",
-            "surface_outbox",
-            "surface_trigger_event",
-            "surface_delivery_event",
-            "surface_ingress_frame",
-        ] {
-            let count: i64 = tx
-                .query_one(&format!("SELECT COUNT(*) FROM {table}"), &[])
-                .map_err(stringify)?
-                .try_get(0)
-                .map_err(stringify)?;
-            if count != 0 {
-                return Err(format!(
-                    "surface migration target table `{table}` is not empty"
-                ));
-            }
-        }
-        for r in &snapshot.inbox {
-            store_inbox(&mut tx, r)?
-        }
-        for r in &snapshot.outbox {
-            insert_outbox(&mut tx, r)?
-        }
-        for r in &snapshot.trigger_events {
-            store_trigger(&mut tx, r)?
-        }
-        for r in &snapshot.delivery_events {
-            insert_event(&mut tx, r)?
-        }
-        for r in &snapshot.ingress_frames {
-            insert_ingress(&mut tx, r)?
-        }
-        tx.commit().map_err(stringify)
-    }
 }
 
 fn stringify(error: impl std::fmt::Display) -> String {
@@ -1376,16 +1295,6 @@ fn insert_outbox_if_absent<C: PostgresClient>(
     let json = serde_json::to_value(r).map_err(stringify)?;
     Ok(db.execute("INSERT INTO surface_outbox(record_key,delivery_id,surface,status,next_retry_at_ms,lease_until_ms,updated_at_ms,record_json) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(record_key) DO NOTHING", &[&r.idempotency_key,&r.delivery_id,&r.surface,&r.status,&r.next_retry_at_ms,&r.lease_until_ms,&r.updated_at_ms,&json]).map_err(stringify)?==1)
 }
-fn insert_outbox<C: PostgresClient>(db: &mut C, r: &SurfaceOutboxRecord) -> Result<(), String> {
-    let inserted = insert_outbox_if_absent(db, r)?;
-    if !inserted {
-        return Err(format!(
-            "duplicate surface outbox `{}` during migration",
-            r.idempotency_key
-        ));
-    }
-    Ok(())
-}
 fn store_outbox<C: PostgresClient>(db: &mut C, r: &SurfaceOutboxRecord) -> Result<(), String> {
     let json = serde_json::to_value(r).map_err(stringify)?;
     db.execute("UPDATE surface_outbox SET surface=$1,status=$2,next_retry_at_ms=$3,lease_until_ms=$4,updated_at_ms=$5,record_json=$6 WHERE delivery_id=$7", &[&r.surface,&r.status,&r.next_retry_at_ms,&r.lease_until_ms,&r.updated_at_ms,&json,&r.delivery_id]).map_err(stringify)?;
@@ -1431,68 +1340,6 @@ fn outbox_event(r: &SurfaceOutboxRecord, kind: &str, detail: Value) -> SurfaceDe
         detail_json: detail,
         created_at_ms: now_ms(),
     }
-}
-fn load_ingress<C: PostgresClient>(db: &mut C) -> Result<Vec<SurfaceIngressFrameRecord>, String> {
-    db.query("SELECT record_key,surface,session_id,status,attempts,max_attempts,next_retry_at_ms,claim_owner,lease_until_ms,created_at_ms,updated_at_ms,frame_json,last_error FROM surface_ingress_frame ORDER BY record_key",&[]).map_err(stringify)?.iter().map(|r|Ok(SurfaceIngressFrameRecord{record_key:r.try_get(0).map_err(stringify)?,surface:r.try_get(1).map_err(stringify)?,session_id:r.try_get(2).map_err(stringify)?,status:r.try_get(3).map_err(stringify)?,attempts:as_u32(r.try_get(4).map_err(stringify)?,"attempts")?,max_attempts:as_u32(r.try_get(5).map_err(stringify)?,"max_attempts")?,next_retry_at_ms:r.try_get(6).map_err(stringify)?,claim_owner:r.try_get(7).map_err(stringify)?,lease_until_ms:r.try_get(8).map_err(stringify)?,created_at_ms:r.try_get(9).map_err(stringify)?,updated_at_ms:r.try_get(10).map_err(stringify)?,frame:row_json(r,11)?,last_error:r.try_get(12).map_err(stringify)?})).collect()
-}
-fn insert_ingress<C: PostgresClient>(
-    db: &mut C,
-    r: &SurfaceIngressFrameRecord,
-) -> Result<(), String> {
-    let frame = serde_json::to_value(&r.frame).map_err(stringify)?;
-    db.execute("INSERT INTO surface_ingress_frame(record_key,surface,session_id,status,attempts,max_attempts,next_retry_at_ms,claim_owner,lease_until_ms,created_at_ms,updated_at_ms,frame_json,last_error) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)", &[&r.record_key,&r.surface,&r.session_id,&r.status,&as_i64(r.attempts),&as_i64(r.max_attempts),&r.next_retry_at_ms,&r.claim_owner,&r.lease_until_ms,&r.created_at_ms,&r.updated_at_ms,&frame,&r.last_error]).map_err(stringify)?;
-    Ok(())
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct SurfaceMessageMigrationManifest {
-    pub domain: String,
-    pub source_digest: String,
-    pub target_digest: String,
-    pub inbox_count: usize,
-    pub outbox_count: usize,
-    pub trigger_event_count: usize,
-    pub delivery_event_count: usize,
-    pub ingress_frame_count: usize,
-}
-pub fn copy_quiesced_surface_message_ledger(
-    source: &dyn SurfaceMessageLedger,
-    target: &dyn SurfaceMessageLedger,
-    manifest_path: impl AsRef<Path>,
-) -> Result<SurfaceMessageMigrationManifest, String> {
-    let snapshot = source.export_migration_snapshot()?;
-    snapshot.validate()?;
-    let source_digest = snapshot.canonical_digest()?;
-    target.import_migration_snapshot(&snapshot)?;
-    let target_digest = target.export_migration_snapshot()?.canonical_digest()?;
-    if source_digest != target_digest {
-        return Err("surface message migration digest mismatch".into());
-    }
-    let manifest = SurfaceMessageMigrationManifest {
-        domain: DOMAIN.into(),
-        source_digest,
-        target_digest,
-        inbox_count: snapshot.inbox.len(),
-        outbox_count: snapshot.outbox.len(),
-        trigger_event_count: snapshot.trigger_events.len(),
-        delivery_event_count: snapshot.delivery_events.len(),
-        ingress_frame_count: snapshot.ingress_frames.len(),
-    };
-    if let Some(parent) = manifest_path.as_ref().parent() {
-        fs::create_dir_all(parent).map_err(stringify)?
-    }
-    let tmp = PathBuf::from(format!(
-        "{}.{}.tmp",
-        manifest_path.as_ref().display(),
-        uuid::Uuid::new_v4()
-    ));
-    fs::write(
-        &tmp,
-        serde_json::to_vec_pretty(&manifest).map_err(stringify)?,
-    )
-    .map_err(stringify)?;
-    fs::rename(tmp, manifest_path).map_err(stringify)?;
-    Ok(manifest)
 }
 
 #[cfg(test)]
@@ -1785,81 +1632,5 @@ mod tests {
             .unwrap()
             .iter()
             .any(|event| event.kind == "outbox.sent" && event.status == "sent"));
-        let snapshot = contract.export_migration_snapshot().unwrap();
-        assert_eq!(
-            snapshot.canonical_digest().unwrap(),
-            contract
-                .export_migration_snapshot()
-                .unwrap()
-                .canonical_digest()
-                .unwrap()
-        );
-    }
-
-    #[test]
-    #[ignore = "requires isolated COWD_TEST_POSTGRES_URL and COWD_TEST_POSTGRES_TARGET_URL"]
-    fn real_postgres_to_postgres_quiesced_copy_is_digest_exact_and_target_only() {
-        let source = ledger_from_url(
-            std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required"),
-            "surface-postgres-copy-source",
-        );
-        let target = ledger_from_url(
-            std::env::var("COWD_TEST_POSTGRES_TARGET_URL")
-                .expect("COWD_TEST_POSTGRES_TARGET_URL is required"),
-            "surface-postgres-copy-target",
-        );
-        clear(&source);
-        clear(&target);
-        source
-            .persist_ingress_frame(&SurfaceFrame::Event {
-                surface: "feishu".to_string(),
-                event: "message.received".to_string(),
-                payload: serde_json::json!({"session_id":"copy-session", "message_id":"copy-message"}),
-            })
-            .unwrap();
-        source
-            .record_inbox_received(
-                "feishu",
-                "copy-message",
-                &serde_json::json!({"text":"copy"}),
-                "copy-session",
-                None,
-                None,
-                &[],
-            )
-            .unwrap();
-        source
-            .record_trigger_event_received(
-                "feishu",
-                "message.received",
-                &trigger_event("copy"),
-                &serde_json::json!({"copy":true}),
-            )
-            .unwrap();
-        source
-            .queue_outbox(
-                &send_request("copy-delivery"),
-                Some("copy-session".to_string()),
-                None,
-            )
-            .unwrap();
-
-        let directory = tempfile::tempdir().unwrap();
-        let manifest = copy_quiesced_surface_message_ledger(
-            &*source,
-            &*target,
-            directory
-                .path()
-                .join("surface-message-migration-manifest.json"),
-        )
-        .unwrap();
-        assert_eq!(manifest.source_digest, manifest.target_digest);
-        assert_eq!(manifest.inbox_count, 1);
-        assert_eq!(manifest.outbox_count, 1);
-        assert_eq!(manifest.trigger_event_count, 1);
-        assert_eq!(manifest.ingress_frame_count, 1);
-        assert!(target
-            .import_migration_snapshot(&source.export_migration_snapshot().unwrap())
-            .is_err());
     }
 }

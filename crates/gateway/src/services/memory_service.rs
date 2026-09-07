@@ -124,22 +124,6 @@ impl MemoryService {
                 .and_then(serde_json::Value::as_str)
                 .map(ToOwned::to_owned);
             let vector_count = mgr.vector_index_count();
-            let scope_migrations = mgr
-                .legacy_scope_migration_reports()
-                .await
-                .map(|reports| {
-                    serde_json::json!({
-                        "held_count": reports.len(),
-                        "reports": reports,
-                    })
-                })
-                .unwrap_or_else(|error| {
-                    serde_json::json!({
-                        "held_count": null,
-                        "reports": [],
-                        "error": error.to_string(),
-                    })
-                });
             let search_mode = mgr.search_mode_label();
             let semantic_supported = mgr.embedding_capability().supports_semantic();
             let (automatic_governance, automatic_governance_error) =
@@ -168,7 +152,6 @@ impl MemoryService {
                 "session_store": true,
                 "context_health": context_health_json(mgr.ctx_health()),
                 "kernel_health": kernel_health,
-                "scope_migration": scope_migrations,
                 "runtime": {
                     "total_entries": layers.iter()
                         .filter_map(|layer| layer.get("retained_count").and_then(serde_json::Value::as_u64))
@@ -837,7 +820,7 @@ fn memory_capabilities_json(
         "vector_semantic": capability_probe_json(vector_status, vector_reason),
         "knowledge_fabric": capability_probe_json(
             RealityCapabilityStatus::EnabledAndWired,
-            "KnowledgeFabric uses durable storage/knowledge.sqlite and feeds activation evidence through runtime context assembly"
+            "KnowledgeFabric uses the canonical PostgreSQL knowledge store and feeds activation evidence through runtime context assembly"
         ),
         "context_envelope": capability_probe_json(
             RealityCapabilityStatus::EnabledAndWired,

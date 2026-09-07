@@ -36,12 +36,6 @@ impl KnowledgeActivationRuntime {
         Self { fabric }
     }
 
-    pub fn for_config_home(config_home: impl AsRef<std::path::Path>) -> Result<Self, String> {
-        memory::durable_knowledge_fabric_for_config_home(config_home)
-            .map(Self::with_fabric)
-            .map_err(|error| error.to_string())
-    }
-
     #[must_use]
     pub fn activate_from_packet_for_project(
         &self,

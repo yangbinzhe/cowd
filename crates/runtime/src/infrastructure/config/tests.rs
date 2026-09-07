@@ -1494,6 +1494,59 @@ fn redacted_json_removes_nested_credential_and_transport_values() {
 }
 
 #[test]
+fn process_executor_manifests_are_loaded_only_from_the_operator_config_layer() {
+    let root = temp_dir();
+    let cwd = root.join("workspace");
+    let home = root.join("operator-config");
+    fs::create_dir_all(&cwd).expect("workspace");
+    fs::create_dir_all(&home).expect("operator config");
+    fs::write(
+        home.join("config.yaml"),
+        r#"
+agent_executor_commands:
+  local-worker:
+    executable: .cowd/workers/jsonl-worker
+    args: [--serve, jsonl]
+    working_directory: .
+    environment_refs:
+      LANG: env:LANG
+    sandbox_profile: isolated_read_only
+"#,
+    )
+    .expect("write operator config");
+
+    let loaded = ConfigLoader::new(&cwd, &home)
+        .load()
+        .expect("trusted manifest");
+    let commands = loaded.agent_executor_commands();
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].command_ref, "local-worker");
+    assert_eq!(commands[0].executable, ".cowd/workers/jsonl-worker");
+    assert_eq!(
+        commands[0].sandbox_profile,
+        super::AgentExecutorSandboxProfile::IsolatedReadOnly
+    );
+    assert_eq!(commands[0].manifest_digest.len(), 64);
+    assert_eq!(
+        commands[0].environment_refs.get("LANG").map(String::as_str),
+        Some("env:LANG")
+    );
+
+    let project_config = cwd.join(".cowd");
+    fs::create_dir_all(&project_config).expect("project config");
+    fs::write(
+        project_config.join("config.yaml"),
+        "agent_executor_commands:\n  injected:\n    executable: ./worker\n",
+    )
+    .expect("write untrusted config");
+    let error = ConfigLoader::new(&cwd, &home)
+        .load()
+        .expect_err("project config may not introduce an executable command");
+    assert!(error.to_string().contains("operator-owned"));
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
 fn gateway_webui_dir_reads_configured_static_asset_dir() {
     let root = temp_dir();
     let cwd = root.join("project");
@@ -1829,18 +1882,16 @@ fn routing_mode_is_pinned_by_default_and_rejects_unknown_values() {
 }
 
 #[test]
-fn storage_topology_defaults_to_sqlite_and_postgres_is_strict() {
+fn storage_topology_is_postgres_only_and_strict() {
     let defaults = parse_optional_storage_config(&JsonValue::parse("{}").unwrap()).unwrap();
-    assert_eq!(defaults.backend, StorageBackendSelection::Auto);
-    assert_eq!(defaults.preferred, StorageBackendSelection::Postgres);
-    assert_eq!(defaults.fallback, StorageBackendSelection::Sqlite);
+    assert_eq!(defaults.backend, StorageBackendSelection::Postgres);
     assert!(defaults.postgres.is_none());
     assert!(defaults.session_execution.workers > 0);
     assert!(defaults.session_execution.queue_capacity > 0);
     assert_eq!(defaults.artifacts, crate::ArtifactStorageConfig::default());
 
     let artifact_override = JsonValue::parse(
-            r#"{"storage":{"artifacts":{"compactThresholdBytes":1024,"maxObjectBytes":2048,"totalQuotaBytes":8192,"gcHighWaterBytes":6144,"gcLowWaterBytes":4096,"orphanGraceMs":250}}}"#,
+            r#"{"storage":{"postgres":{"logicalIdentity":"cowd-test","secretRef":"env:COWD_TEST_POSTGRES_URL"},"artifacts":{"compactThresholdBytes":1024,"maxObjectBytes":2048,"totalQuotaBytes":8192,"gcHighWaterBytes":6144,"gcLowWaterBytes":4096,"orphanGraceMs":250}}}"#,
         )
         .unwrap();
     let selected = parse_optional_storage_config(&artifact_override).unwrap();
@@ -1886,20 +1937,18 @@ fn storage_topology_defaults_to_sqlite_and_postgres_is_strict() {
 }
 
 #[test]
-fn auto_storage_backend_parses_with_postgres_preference() {
+fn pg_only_configuration_rejects_fallback() {
     let root = JsonValue::parse(
             r#"{"storage":{"backend":"auto","preferred":"postgres","fallback":"sqlite","fallbackProbeTimeoutMs":5000}}"#,
         )
         .unwrap();
-    let selected = parse_optional_storage_config(&root).expect("auto storage config");
-    assert_eq!(selected.backend, StorageBackendSelection::Auto);
-    assert_eq!(selected.preferred, StorageBackendSelection::Postgres);
-    assert_eq!(selected.fallback, StorageBackendSelection::Sqlite);
-    assert_eq!(selected.fallback_probe_timeout_ms, 5_000);
+    assert!(parse_optional_storage_config(&root).is_err());
 
     let invalid =
         JsonValue::parse(r#"{"storage":{"backend":"auto","preferred":"sqlite"}}"#).unwrap();
     assert!(parse_optional_storage_config(&invalid).is_err());
+    let sqlite = JsonValue::parse(r#"{"storage":{"backend":"sqlite"}}"#).unwrap();
+    assert!(parse_optional_storage_config(&sqlite).is_err());
 }
 
 #[test]

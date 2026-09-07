@@ -552,7 +552,7 @@ mod tests {
         let manifest = temp.path().join("clean-shutdown.json");
         let inventory = inventory(temp.path());
         fs::write(&manifest, serde_json::to_vec_pretty(&inventory).unwrap()).unwrap();
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let importer =
             LegacyExecutionImporter::new(Arc::clone(&store), "workspace", temp.path(), "0.9.472");
 
@@ -594,7 +594,7 @@ mod tests {
         });
         inventory.content_hash = inventory_content_hash(&inventory).unwrap();
         fs::write(&manifest, serde_json::to_vec_pretty(&inventory).unwrap()).unwrap();
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let importer =
             LegacyExecutionImporter::new(Arc::clone(&store), "workspace", temp.path(), "0.9.472");
 
@@ -614,7 +614,7 @@ mod tests {
         let mut inventory = inventory(temp.path());
         inventory.active_count = 2;
         fs::write(&manifest, serde_json::to_vec_pretty(&inventory).unwrap()).unwrap();
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let importer =
             LegacyExecutionImporter::new(Arc::clone(&store), "workspace", temp.path(), "0.9.472");
 

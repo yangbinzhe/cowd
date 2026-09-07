@@ -951,10 +951,50 @@ pub mod test_support {
                     };
                     match tokio_runtime.block_on(
                         crate::session_runtime_bridge::SessionWorkerSupervisor::start(
-                            runtime, session, event_bus,
+                            Arc::clone(&runtime),
+                            Arc::clone(&session),
+                            event_bus,
                         ),
                     ) {
                         Ok(supervisor) => {
+                            // The black-box router must exercise the same
+                            // sealed-startup contract as the production host.
+                            // A test-only router which exposes HTTP before
+                            // Session/Graph/Program recovery can make route
+                            // tests pass while every real ingress remains
+                            // fenced.
+                            if let Err(error) = session.install_supervisor(Arc::clone(&supervisor))
+                            {
+                                let _ = ready_tx.send(Err(format!(
+                                    "failed to install Gateway test worker supervisor: {error}"
+                                )));
+                                tokio_runtime.block_on(supervisor.shutdown());
+                                return;
+                            }
+                            let runtime_services = runtime.runtime_services();
+                            if let Err(error) = tokio_runtime.block_on(
+                                crate::runtime_host::restore_runtime_before_admission(
+                                    &session,
+                                    &supervisor,
+                                    &runtime_services,
+                                ),
+                            ) {
+                                let _ = ready_tx.send(Err(format!(
+                                    "Gateway test ordered recovery failed: {error}"
+                                )));
+                                tokio_runtime.block_on(supervisor.shutdown());
+                                return;
+                            }
+                            if let Err(error) = tokio_runtime
+                                .block_on(runtime_services.release_recovered_producers())
+                            {
+                                let _ = ready_tx.send(Err(format!(
+                                    "Gateway test Runtime producer release failed: {error}"
+                                )));
+                                tokio_runtime.block_on(supervisor.shutdown());
+                                return;
+                            }
+                            supervisor.release_recovered_producers();
                             if ready_tx.send(Ok(Arc::clone(&supervisor))).is_err() {
                                 tokio_runtime.block_on(supervisor.shutdown());
                                 return;
@@ -1111,7 +1151,6 @@ pub mod test_support {
                 Arc::clone(&session_service),
                 Arc::clone(&event_bus),
             )?;
-            session_service.install_supervisor(Arc::clone(&session_supervisor))?;
             let growth_projection_services = crate::services::GrowthProjectionServices::selected(
                 None,
                 selected_storage.as_ref(),

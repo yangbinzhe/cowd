@@ -333,6 +333,8 @@ mod tests {
             criteria: vec![AcceptanceCriterion {
                 id: "terminal".to_string(),
                 statement: "one terminal result".to_string(),
+                statement_ref: None,
+                source_refs: Vec::new(),
                 required_evidence: vec!["evidence:terminal".to_string()],
                 status: AcceptanceStatus::Open,
                 waiver: None,
@@ -342,13 +344,22 @@ mod tests {
             evidence_refs: Vec::new(),
             unresolved: Vec::new(),
             blockers: Vec::new(),
+            scope: harness_contract::goal::GoalScope::Internal,
+            user_intent_criterion_id: Some("terminal".to_string()),
+            source_intent_ref: Some("session_message:test".to_string()),
+            execution_binding: None,
+            spec_revision: 1,
+            spec_digest: "test".to_string(),
+            review_refs: Vec::new(),
+            waiting: None,
+            participation_requirement: None,
             obligations: Vec::new(),
-            program_ref: None,
             recovery: None,
             terminal: None,
             completion: GoalCompletion::Open,
             revision: 1,
             user_sequence: 1,
+            reviews: Vec::new(),
         }
     }
 

@@ -174,7 +174,7 @@ impl ScopedRuntimeToolExecutor {
             // tool-free Judge surface. The exact Team resource ceiling above
             // remains the business-effect sandbox. This checkpoint is a
             // Runtime-owned guard and is deliberately not an Agent effect.
-            evaluation_isolated: false,
+            evaluation_isolated: self.evaluation_isolated(),
             managed_invocation: None,
             tool_progress: crate::ToolProgressSink::default(),
         };
@@ -239,7 +239,7 @@ impl ScopedRuntimeToolExecutor {
             }),
             parent_execution_attempt: Some(self.attempt),
             execution_decision: None,
-            evaluation_isolated: false,
+            evaluation_isolated: self.evaluation_isolated(),
             managed_invocation: None,
             tool_progress: crate::ToolProgressSink::default(),
         };
@@ -266,6 +266,14 @@ impl ScopedRuntimeToolExecutor {
             scopes.push(session_scope);
         }
         scopes
+    }
+
+    fn evaluation_isolated(&self) -> bool {
+        self.resource_scopes.as_ref().is_some_and(|scopes| {
+            scopes
+                .iter()
+                .any(|scope| scope.starts_with("write:.cowd/evaluation/"))
+        })
     }
 
     pub(super) fn enforce_resource_ceiling(
@@ -486,10 +494,7 @@ impl ScopedRuntimeToolExecutor {
             }),
             parent_execution_attempt: Some(self.attempt),
             execution_decision: None,
-            // Candidate-evaluation provenance does not make the child a
-            // Judge. ScopedRuntimeToolExecutor already enforces the exact
-            // Runtime-compiled resource ceiling for every business effect.
-            evaluation_isolated: false,
+            evaluation_isolated: self.evaluation_isolated(),
             managed_invocation: self.managed_invocation.clone(),
             tool_progress: crate::ToolProgressSink::default(),
         };

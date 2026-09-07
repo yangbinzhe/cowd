@@ -69,7 +69,6 @@ fn binding_compiler_intersects_capabilities_and_freezes_data_leases_into_a_snaps
                     evidence_obligations: Vec::new(),
                 },
                 output_acceptance: Vec::new(),
-                requires_managed_collaboration_escalation: false,
                 acceptance: vec!["evidence".to_string()],
                 constraints: Vec::new(),
                 context_refs: Vec::new(),
@@ -90,6 +89,7 @@ fn binding_compiler_intersects_capabilities_and_freezes_data_leases_into_a_snaps
                 deadline_at_ms: u64::MAX,
                 managed_invocation: None,
                 idempotency_key: "binding-test:1".to_string(),
+                agentic_binding: None,
             },
             {
                 let graph_identity =

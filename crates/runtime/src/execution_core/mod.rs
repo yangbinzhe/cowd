@@ -1,9 +1,9 @@
 //! Runtime execution core.
 //!
 //! This module turns the existing harness contracts, evidence planner, tool
-//! scheduler, collaboration templates, and turn supervisor into model-visible
-//! execution capabilities. Gateway can expose these capabilities, but runtime
-//! remains the owner of mode selection and orchestration semantics.
+//! scheduler, and turn supervisor into model-visible execution capabilities.
+//! Gateway can expose these capabilities, while the model retains semantic
+//! control and Runtime owns environment admission and execution safety.
 
 pub mod budget;
 pub mod cross_plane;
@@ -96,11 +96,9 @@ pub use services::{
     SessionTerminalDeliveryPort,
 };
 pub use strategy_decision::{
-    action_selection_report_for_decision, build_runtime_action_selection_report,
-    build_runtime_execution_decision, RuntimeActionSelectionReport, RuntimeExecutionActionHint,
-    RuntimeExecutionDecision, RuntimeExecutionPatternCandidate, StrategyDecisionEngine,
-    StrategyLease, StrategyResourceHealth, TurnStrategyActualOutcome, TurnStrategyDecisionState,
-    TurnStrategyDecisionStatus,
+    build_runtime_execution_decision, RuntimeExecutionDecision, RuntimeExecutionPatternCandidate,
+    StrategyDecisionEngine, StrategyLease, StrategyResourceHealth, TurnStrategyActualOutcome,
+    TurnStrategyDecisionState, TurnStrategyDecisionStatus,
 };
 pub use supervisor::{
     RuntimeExecutionHealth, RuntimeExecutionOwnerReport, RuntimeExecutionShutdownReport,

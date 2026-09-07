@@ -1,9 +1,7 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -164,7 +162,6 @@ pub trait MaintenanceQueueBackend: std::fmt::Debug + Send + Sync {
 #[derive(Debug, Clone, Default)]
 pub struct MaintenanceQueue {
     candidates: Arc<Mutex<BTreeMap<String, MaintenanceCandidate>>>,
-    sqlite_path: Option<Arc<PathBuf>>,
     backend: Option<Arc<dyn MaintenanceQueueBackend>>,
 }
 
@@ -175,43 +172,20 @@ impl MaintenanceQueue {
 
     #[must_use]
     pub fn is_durable(&self) -> bool {
-        self.sqlite_path.is_some() || self.backend.is_some()
+        self.backend.is_some()
     }
 
     #[must_use]
     pub fn from_backend(backend: Arc<dyn MaintenanceQueueBackend>) -> Self {
         Self {
             candidates: Arc::new(Mutex::new(BTreeMap::new())),
-            sqlite_path: None,
             backend: Some(backend),
         }
-    }
-
-    pub fn open_sqlite(path: impl AsRef<Path>) -> Result<Self, MemoryError> {
-        let path = path.as_ref().to_path_buf();
-        let queue = Self {
-            candidates: Arc::new(Mutex::new(BTreeMap::new())),
-            sqlite_path: Some(Arc::new(path)),
-            backend: None,
-        };
-        queue.init_durable_schema()?;
-        Ok(queue)
     }
 
     pub fn upsert_many(&self, candidates: Vec<MaintenanceCandidate>) -> Result<usize, MemoryError> {
         if let Some(backend) = &self.backend {
             return backend.upsert_many(&candidates);
-        }
-        if self.sqlite_path.is_some() {
-            let inserted = self.upsert_many_durable(&candidates)?;
-            let mut guard = self
-                .candidates
-                .lock()
-                .map_err(|_| MemoryError::Store("maintenance queue lock poisoned".to_string()))?;
-            for candidate in candidates {
-                guard.insert(candidate.id.clone(), candidate);
-            }
-            return Ok(inserted);
         }
         let mut guard = self
             .candidates
@@ -236,9 +210,6 @@ impl MaintenanceQueue {
     ) -> Result<Vec<MaintenanceCandidate>, MemoryError> {
         if let Some(backend) = &self.backend {
             return backend.list(filter);
-        }
-        if self.sqlite_path.is_some() {
-            return self.list_durable(filter);
         }
         let guard = self
             .candidates
@@ -273,16 +244,6 @@ impl MaintenanceQueue {
         if let Some(backend) = &self.backend {
             return backend.transition(id, status);
         }
-        if self.sqlite_path.is_some() {
-            let updated = self.transition_durable(id, status)?;
-            if let Some(candidate) = &updated {
-                let mut guard = self.candidates.lock().map_err(|_| {
-                    MemoryError::Store("maintenance queue lock poisoned".to_string())
-                })?;
-                guard.insert(candidate.id.clone(), candidate.clone());
-            }
-            return Ok(updated);
-        }
         let mut guard = self
             .candidates
             .lock()
@@ -294,186 +255,6 @@ impl MaintenanceQueue {
         candidate.updated_at = Utc::now();
         Ok(Some(candidate.clone()))
     }
-
-    fn conn(&self) -> Result<Connection, MemoryError> {
-        let Some(path) = &self.sqlite_path else {
-            return Err(MemoryError::Store(
-                "durable maintenance queue not configured".to_string(),
-            ));
-        };
-        Connection::open(path.as_ref()).map_err(sqlite_err)
-    }
-
-    fn init_durable_schema(&self) -> Result<(), MemoryError> {
-        let conn = self.conn()?;
-        conn.execute_batch(
-            r"
-            CREATE TABLE IF NOT EXISTS memory_maintenance_candidates (
-                id TEXT PRIMARY KEY,
-                kind TEXT NOT NULL,
-                status TEXT NOT NULL,
-                entry_ids_json TEXT NOT NULL,
-                summary TEXT NOT NULL,
-                reason TEXT NOT NULL,
-                confidence REAL NOT NULL,
-                source TEXT,
-                source_ref TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_memory_maintenance_status
-                ON memory_maintenance_candidates(status, updated_at);
-            CREATE INDEX IF NOT EXISTS idx_memory_maintenance_kind
-                ON memory_maintenance_candidates(kind, updated_at);
-            CREATE INDEX IF NOT EXISTS idx_memory_maintenance_source
-                ON memory_maintenance_candidates(source, updated_at);
-            ",
-        )
-        .map_err(sqlite_err)
-    }
-
-    fn upsert_many_durable(
-        &self,
-        candidates: &[MaintenanceCandidate],
-    ) -> Result<usize, MemoryError> {
-        let mut conn = self.conn()?;
-        let tx = conn.transaction().map_err(sqlite_err)?;
-        let mut inserted = 0usize;
-        for candidate in candidates {
-            let existed = tx
-                .query_row(
-                    "SELECT 1 FROM memory_maintenance_candidates WHERE id = ?1",
-                    params![candidate.id],
-                    |_| Ok(()),
-                )
-                .optional()
-                .map_err(sqlite_err)?
-                .is_some();
-            if !existed {
-                inserted += 1;
-            }
-            let entry_ids_json =
-                serde_json::to_string(&candidate.entry_ids).map_err(MemoryError::Serialisation)?;
-            tx.execute(
-                r"INSERT INTO memory_maintenance_candidates
-                  (id, kind, status, entry_ids_json, summary, reason, confidence,
-                   source, source_ref, created_at, updated_at)
-                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-                  ON CONFLICT(id) DO UPDATE SET
-                    kind = excluded.kind,
-                    entry_ids_json = excluded.entry_ids_json,
-                    summary = excluded.summary,
-                    reason = excluded.reason,
-                    confidence = excluded.confidence,
-                    source = excluded.source,
-                    source_ref = excluded.source_ref,
-                    updated_at = excluded.updated_at",
-                params![
-                    candidate.id,
-                    candidate.kind.as_str(),
-                    candidate.status.as_str(),
-                    entry_ids_json,
-                    candidate.summary,
-                    candidate.reason,
-                    candidate.confidence,
-                    candidate.source,
-                    candidate.source_ref,
-                    candidate.created_at.to_rfc3339(),
-                    candidate.updated_at.to_rfc3339(),
-                ],
-            )
-            .map_err(sqlite_err)?;
-        }
-        tx.commit().map_err(sqlite_err)?;
-        Ok(inserted)
-    }
-
-    fn list_durable(
-        &self,
-        filter: MaintenanceCandidateFilter,
-    ) -> Result<Vec<MaintenanceCandidate>, MemoryError> {
-        let conn = self.conn()?;
-        let limit = filter.limit.unwrap_or(128).min(500) as i64;
-        let status = filter.status.map(|value| value.as_str().to_string());
-        let kind = filter.kind.map(|value| value.as_str().to_string());
-        let source = filter.source;
-        let mut candidates = Vec::new();
-        let mut stmt = conn
-            .prepare(
-                r"SELECT id, kind, status, entry_ids_json, summary, reason, confidence,
-                         source, source_ref, created_at, updated_at
-                    FROM memory_maintenance_candidates
-                   WHERE (?1 IS NULL OR status = ?1)
-                     AND (?2 IS NULL OR kind = ?2)
-                     AND (?3 IS NULL OR source = ?3)
-                   ORDER BY datetime(created_at) DESC
-                   LIMIT ?4",
-            )
-            .map_err(sqlite_err)?;
-        let rows = stmt
-            .query_map(params![status, kind, source, limit], row_to_candidate)
-            .map_err(sqlite_err)?;
-        for row in rows {
-            candidates.push(row.map_err(sqlite_err)?);
-        }
-        Ok(candidates)
-    }
-
-    fn transition_durable(
-        &self,
-        id: &str,
-        status: MaintenanceCandidateStatus,
-    ) -> Result<Option<MaintenanceCandidate>, MemoryError> {
-        let conn = self.conn()?;
-        let now = Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE memory_maintenance_candidates SET status = ?1, updated_at = ?2 WHERE id = ?3",
-            params![status.as_str(), now, id],
-        )
-        .map_err(sqlite_err)?;
-        let mut stmt = conn
-            .prepare(
-                r"SELECT id, kind, status, entry_ids_json, summary, reason, confidence,
-                         source, source_ref, created_at, updated_at
-                    FROM memory_maintenance_candidates
-                   WHERE id = ?1",
-            )
-            .map_err(sqlite_err)?;
-        stmt.query_row(params![id], row_to_candidate)
-            .optional()
-            .map_err(sqlite_err)
-    }
-}
-
-fn row_to_candidate(row: &rusqlite::Row<'_>) -> rusqlite::Result<MaintenanceCandidate> {
-    let kind_raw: String = row.get(1)?;
-    let status_raw: String = row.get(2)?;
-    let entry_ids_json: String = row.get(3)?;
-    let created_at_raw: String = row.get(9)?;
-    let updated_at_raw: String = row.get(10)?;
-    Ok(MaintenanceCandidate {
-        id: row.get(0)?,
-        kind: MaintenanceCandidateKind::parse(&kind_raw)
-            .unwrap_or(MaintenanceCandidateKind::RelationshipRefresh),
-        status: MaintenanceCandidateStatus::parse(&status_raw)
-            .unwrap_or(MaintenanceCandidateStatus::Open),
-        entry_ids: serde_json::from_str(&entry_ids_json).unwrap_or_default(),
-        summary: row.get(4)?,
-        reason: row.get(5)?,
-        confidence: row.get::<_, f32>(6)?.clamp(0.0, 1.0),
-        source: row.get(7)?,
-        source_ref: row.get(8)?,
-        created_at: DateTime::parse_from_rfc3339(&created_at_raw)
-            .map(|value| value.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now()),
-        updated_at: DateTime::parse_from_rfc3339(&updated_at_raw)
-            .map(|value| value.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now()),
-    })
-}
-
-fn sqlite_err(err: rusqlite::Error) -> MemoryError {
-    MemoryError::Store(format!("maintenance sqlite error: {err}"))
 }
 
 pub fn scan_maintenance_candidates(
@@ -845,43 +626,6 @@ mod tests {
                 .len(),
             1
         );
-    }
-
-    #[test]
-    fn durable_queue_persists_candidates_and_status_after_reopen() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db = tmp.path().join("maintenance.db");
-        let queue = MaintenanceQueue::open_sqlite(&db).unwrap();
-        let mut candidate = new_candidate(
-            MaintenanceCandidateKind::Conflict,
-            Vec::new(),
-            "Review conflict".to_string(),
-            "agents disagree".to_string(),
-            0.81,
-        );
-        candidate.source = Some("collaboration_board".to_string());
-        candidate.source_ref = Some("board-1".to_string());
-        let id = candidate.id.clone();
-
-        assert_eq!(queue.upsert_many(vec![candidate]).unwrap(), 1);
-        let updated = queue
-            .transition(&id, MaintenanceCandidateStatus::Acknowledged)
-            .unwrap()
-            .unwrap();
-        assert_eq!(updated.status, MaintenanceCandidateStatus::Acknowledged);
-
-        let reopened = MaintenanceQueue::open_sqlite(&db).unwrap();
-        let candidates = reopened
-            .list(MaintenanceCandidateFilter {
-                status: Some(MaintenanceCandidateStatus::Acknowledged),
-                source: Some("collaboration_board".to_string()),
-                ..MaintenanceCandidateFilter::default()
-            })
-            .unwrap();
-
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].id, id);
-        assert_eq!(candidates[0].source_ref.as_deref(), Some("board-1"));
     }
 
     #[test]

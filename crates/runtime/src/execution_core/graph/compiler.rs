@@ -261,7 +261,6 @@ fn compile_model_work_graph(
     let revision = graph.revision;
     let service_class = graph.service_class;
     let parent_execution = graph.parent_execution.clone();
-    let orchestration = graph.orchestration.clone();
     let node_statuses = graph.node_statuses.clone();
     let node_results = graph.node_results.clone();
     let recovery_cursor = graph.recovery_cursor.clone();
@@ -315,7 +314,6 @@ fn compile_model_work_graph(
     compiled.revision = revision;
     compiled.service_class = service_class;
     compiled.parent_execution = parent_execution;
-    compiled.orchestration = orchestration;
     compiled.node_statuses = node_statuses;
     compiled.node_results = node_results;
     compiled.recovery_cursor = recovery_cursor;

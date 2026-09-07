@@ -272,7 +272,6 @@ mod tests {
                     scopes: vec!["read:src".to_string()],
                 },
             }],
-            requires_managed_collaboration_escalation: false,
             acceptance: vec!["evidence".to_string()],
             cohort_prompt_package: None,
             constraints: Vec::new(),
@@ -295,6 +294,7 @@ mod tests {
             binding: None,
             managed_invocation: None,
             idempotency_key: "team-task".to_string(),
+            agentic_binding: None,
         }
     }
 
@@ -360,6 +360,8 @@ mod tests {
             unresolved: Vec::new(),
             input_tokens: 1,
             output_tokens: 1,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
             cached_tokens: 0,
             model: "model".to_string(),
             provider: "provider".to_string(),

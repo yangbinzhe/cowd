@@ -868,7 +868,6 @@ mod tests {
     fn test_memory_config(sqlite_path: &std::path::Path) -> MemoryConfig {
         MemoryConfig {
             store: StoreConfig {
-                sqlite_path: sqlite_path.to_path_buf(),
                 blob_dir: sqlite_path.parent().unwrap().join("blobs"),
                 ..Default::default()
             },
@@ -912,14 +911,20 @@ mod tests {
             "cowd-growth-storage-registry-test-{}",
             uuid::Uuid::new_v4()
         ));
-        let growth = GrowthService::new_for_config_home(&config_home);
-        let path = storage::StorageRegistry::default_for_config_home(&config_home)
+        let workspace = config_home.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let topology = crate::selected_storage::SelectedStorageTopology::compose_for_test(
+            &config_home,
+            &workspace,
+        )
+        .expect("isolated PostgreSQL topology");
+        let growth = GrowthService::with_ledger(Arc::clone(&topology.fact_ledger));
+        let endpoint = topology
+            .registry
             .endpoint(&storage::StorageDomainId::Fact)
-            .expect("growth endpoint")
-            .as_handle()
-            .path;
-        assert!(path.ends_with("storage/fact.sqlite"));
-        assert!(path.exists());
+            .expect("growth endpoint");
+        assert_eq!(endpoint.backend, storage::StorageBackendKind::Postgres);
+        assert!(!config_home.join("storage/fact.sqlite").exists());
         assert!(growth.durable_event_log().is_ok());
         assert!(growth.durable_promotion_log().is_ok());
         let _ = std::fs::remove_dir_all(config_home);
@@ -927,7 +932,7 @@ mod tests {
 
     #[tokio::test]
     async fn memory_promotion_governance_suppresses_duplicate_growth_candidates() {
-        let (config_home, _manager, memory, matrix, growth) =
+        let (_topology, config_home, _manager, memory, matrix, growth) =
             growth_memory_test_services("duplicate").await;
         let event = single_candidate_event(
             "growth-governance-session",
@@ -962,7 +967,7 @@ mod tests {
 
     #[tokio::test]
     async fn memory_promotion_governance_holds_low_confidence_candidates() {
-        let (config_home, _manager, memory, matrix, growth) =
+        let (_topology, config_home, _manager, memory, matrix, growth) =
             growth_memory_test_services("low-confidence").await;
         let event = single_candidate_event(
             "growth-low-confidence-session",
@@ -985,7 +990,7 @@ mod tests {
 
     #[tokio::test]
     async fn memory_promotion_governance_holds_conflicting_growth_assertions() {
-        let (config_home, _manager, memory, matrix, growth) =
+        let (_topology, config_home, _manager, memory, matrix, growth) =
             growth_memory_test_services("conflict").await;
         let first_event = single_candidate_event(
             "growth-conflict-session",
@@ -1025,7 +1030,7 @@ mod tests {
 
     #[tokio::test]
     async fn memory_promotion_governance_allows_same_slot_non_conflicting_assertions() {
-        let (config_home, _manager, memory, matrix, growth) =
+        let (_topology, config_home, _manager, memory, matrix, growth) =
             growth_memory_test_services("same-slot").await;
         let first_event = single_candidate_event(
             "growth-same-slot-session",
@@ -1060,7 +1065,7 @@ mod tests {
 
     #[tokio::test]
     async fn memory_promotion_governance_refreshes_stale_duplicates() {
-        let (config_home, manager, memory, matrix, growth) =
+        let (_topology, config_home, manager, memory, matrix, growth) =
             growth_memory_test_services("refresh").await;
         let event = single_candidate_event(
             "growth-refresh-session",
@@ -1115,6 +1120,7 @@ mod tests {
     async fn growth_memory_test_services(
         label: &str,
     ) -> (
+        Arc<crate::selected_storage::SelectedStorageTopology>,
         std::path::PathBuf,
         Arc<CognitiveContextManager>,
         MemoryService,
@@ -1126,17 +1132,38 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(config_home.join("storage")).expect("storage dir");
+        let workspace = config_home.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        let topology = Arc::new(
+            crate::selected_storage::SelectedStorageTopology::compose_for_test(
+                &config_home,
+                &workspace,
+            )
+            .expect("isolated PostgreSQL topology"),
+        );
         let manager = Arc::new(
-            CognitiveContextManager::new(test_memory_config(
-                &config_home.join("storage").join("memory.sqlite"),
-            ))
+            CognitiveContextManager::new_with_selected_store_and_auxiliaries(
+                test_memory_config(&config_home.join("storage").join("memory-index")),
+                Some(workspace),
+                None,
+                Arc::clone(&topology.memory_store),
+                Some(topology.memory_maintenance_queue.clone()),
+            )
             .await
             .expect("memory manager"),
         );
-        let memory = MemoryService::with_manager(Some(Arc::clone(&manager)));
-        let matrix = MatrixService::new();
-        let growth = GrowthService::new_for_config_home(&config_home);
-        (config_home, manager, memory, matrix, growth)
+        let memory = MemoryService::with_manager_and_knowledge(
+            Some(Arc::clone(&manager)),
+            topology.knowledge_fabric.clone(),
+        );
+        let matrix_endpoint = topology
+            .registry
+            .endpoint(&storage::StorageDomainId::Matrix)
+            .expect("matrix endpoint")
+            .clone();
+        let matrix = MatrixService::with_store(Arc::clone(&topology.matrix_store), matrix_endpoint);
+        let growth = GrowthService::with_ledger(Arc::clone(&topology.fact_ledger));
+        (topology, config_home, manager, memory, matrix, growth)
     }
 
     fn single_candidate_event(

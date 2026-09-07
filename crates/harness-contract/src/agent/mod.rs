@@ -25,10 +25,10 @@ pub use definition::{
     AgentBindingSnapshot, AgentCapability, AgentCapabilityContract, AgentCognitivePolicy,
     AgentDataLease, AgentDefinitionId, AgentDefinitionManifest, AgentDefinitionRevision,
     AgentDefinitionRevisionRef, AgentEvaluationBinding, AgentEvaluationContract,
-    AgentExecutorPolicy, AgentInstanceRef, AgentModelPolicy, AgentReleaseBinding,
-    CognitiveReadScope, CognitiveWriteMode, DefaultPointer, DefinitionScope, ReleaseAssignment,
-    ReleaseAssignmentStatus, ReleaseAuthorization, ReleaseChannel, RevisionLifecycle,
-    RevisionSelector, ValidationError,
+    AgentEvaluationRole, AgentExecutorPolicy, AgentInstanceRef, AgentModelPolicy,
+    AgentReleaseBinding, CognitiveReadScope, CognitiveWriteMode, DefaultPointer, DefinitionScope,
+    ReleaseAssignment, ReleaseAssignmentStatus, ReleaseAuthorization, ReleaseChannel,
+    RevisionLifecycle, RevisionSelector, ValidationError,
 };
 
 /// Default hard wall-time for Runtime-compiled delegated work when the
@@ -271,14 +271,14 @@ pub struct AgentTaskIntent {
     /// newly planned work.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub output_acceptance: Vec<crate::agent::OutputAcceptanceRequirement>,
-    /// Runtime-selected requirement for this exact managed Team Agent to
-    /// submit one collaboration escalation after source evidence exists.
-    /// The Agent never receives Program identity or revision authority.
-    #[serde(default)]
-    pub requires_managed_collaboration_escalation: bool,
     pub acceptance: Vec<String>,
     pub constraints: Vec<String>,
     pub context_refs: Vec<String>,
+    /// Immutable Program membership and focus for Agent-first work.  This is
+    /// deliberately separate from generic context references: Runtime must
+    /// never recover execution identity by parsing model-visible strings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agentic_binding: Option<AgenticExecutionBinding>,
     pub evidence_refs: Vec<EvidenceAccessRef>,
     /// Runtime-cropped filesystem/network scopes carried into the executable
     /// worker. Empty means no workspace resource authority, never "all".
@@ -300,6 +300,74 @@ pub struct AgentTaskIntent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_invocation: Option<crate::managed_agent::ManagedAgentInvocationFence>,
     pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgenticExecutionBinding {
+    pub program_id: String,
+    pub agent_id: String,
+    pub membership_id: String,
+    pub team_id: String,
+    pub task_team_id: String,
+    pub source_spec_revision: u64,
+    pub focus: AgenticExecutionFocus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgenticExecutionFocus {
+    TaskExecute { task_ref: String },
+    TaskReview { task_ref: String },
+    Coordination { wake_ref: String },
+    ObjectiveReview { criterion_refs: Vec<String> },
+}
+
+impl AgenticExecutionBinding {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        for (field, value) in [
+            ("agentic_binding.program_id", self.program_id.as_str()),
+            ("agentic_binding.agent_id", self.agent_id.as_str()),
+            ("agentic_binding.membership_id", self.membership_id.as_str()),
+            ("agentic_binding.team_id", self.team_id.as_str()),
+            ("agentic_binding.task_team_id", self.task_team_id.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(ValidationError::MissingField {
+                    field: field.to_string(),
+                });
+            }
+        }
+        match &self.focus {
+            AgenticExecutionFocus::TaskExecute { task_ref }
+            | AgenticExecutionFocus::TaskReview { task_ref } => {
+                if task_ref.trim().is_empty() {
+                    return Err(ValidationError::MissingField {
+                        field: "agentic_binding.focus.task_ref".to_string(),
+                    });
+                }
+            }
+            AgenticExecutionFocus::Coordination { wake_ref } => {
+                if wake_ref.trim().is_empty() {
+                    return Err(ValidationError::MissingField {
+                        field: "agentic_binding.focus.wake_ref".to_string(),
+                    });
+                }
+            }
+            AgenticExecutionFocus::ObjectiveReview { criterion_refs } => {
+                if criterion_refs.is_empty()
+                    || criterion_refs
+                        .iter()
+                        .any(|criterion| criterion.trim().is_empty())
+                {
+                    return Err(ValidationError::InvalidContract {
+                        message: "agentic Objective review focus has no criterion references"
+                            .to_string(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// An executable, immutable Agent command prepared by Runtime.  Planning
@@ -447,8 +515,6 @@ pub struct AgentTaskPacket {
     /// migrated fail-closed at the Runtime boundary.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub output_acceptance: Vec<crate::agent::OutputAcceptanceRequirement>,
-    #[serde(default)]
-    pub requires_managed_collaboration_escalation: bool,
     /// Immutable Agentic Program/Team-shared user-role context. It is absent
     /// for direct-Agent packets; when present Runtime validates its exact
     /// Session/Program/Team scope before provider execution.
@@ -457,6 +523,8 @@ pub struct AgentTaskPacket {
     pub acceptance: Vec<String>,
     pub constraints: Vec<String>,
     pub context_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agentic_binding: Option<AgenticExecutionBinding>,
     pub evidence_refs: Vec<EvidenceAccessRef>,
     /// Exact resource ceiling compiled from the parent graph node. The
     /// in-process worker enforces it again at every tool boundary.
@@ -501,14 +569,9 @@ impl AgentTaskPacket {
                 program_id,
                 team_id,
             } if session_id == &self.assignment.session_id
-                && self
-                    .context_refs
-                    .iter()
-                    .any(|reference| reference == &format!("agentic_program:{program_id}"))
-                && self
-                    .context_refs
-                    .iter()
-                    .any(|reference| reference == &format!("agentic_team:{team_id}")) =>
+                && self.agentic_binding.as_ref().is_some_and(|binding| {
+                    binding.program_id == *program_id && binding.team_id == *team_id
+                }) =>
             {
                 Ok(())
             }
@@ -605,6 +668,11 @@ pub struct AgentReturnPacket {
     pub unresolved: Vec<String>,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    /// Deprecated alias for cache-read tokens only.
     #[serde(default)]
     pub cached_tokens: u64,
     pub model: String,

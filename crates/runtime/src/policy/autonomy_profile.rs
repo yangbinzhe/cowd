@@ -8,7 +8,7 @@ use harness_contract::core::TaskRisk;
 pub use harness_contract::policy::{AutonomyProfileId, InterruptionPolicy, SandboxPosture};
 use serde::{Deserialize, Serialize};
 
-use crate::{CollaborationTemplateId, PermissionMode};
+use crate::PermissionMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -40,7 +40,6 @@ pub struct AutonomyProfileSpec {
     pub tool_scope: Vec<String>,
     pub reporting_cadence: String,
     pub human_escalation_rules: Vec<String>,
-    pub compatible_collaboration_templates: Vec<CollaborationTemplateId>,
     pub sandbox_posture: SandboxPosture,
 }
 
@@ -49,7 +48,6 @@ pub struct AutonomyDecisionInput {
     pub profile_id: AutonomyProfileId,
     pub requested_risk: TaskRisk,
     pub requested_tool: Option<String>,
-    pub template_id: Option<CollaborationTemplateId>,
     pub requires_write: bool,
     pub is_critical_operation: bool,
 }
@@ -129,27 +127,6 @@ impl AutonomyProfileSpec {
             format!("interruption_policy={:?}", self.interruption_policy),
             "execution_budget=runtime_parent_contract".to_string(),
         ];
-        if let Some(template_id) = input.template_id {
-            evidence.push(format!("template={}", template_id.as_str()));
-            if !self
-                .compatible_collaboration_templates
-                .contains(&template_id)
-            {
-                return AutonomyDecision {
-                    profile_id: self.profile_id,
-                    decision: AutonomyDecisionKind::RequireApproval,
-                    reason: format!(
-                        "profile {} is not declared compatible with template {}",
-                        self.profile_id.as_str(),
-                        template_id.as_str()
-                    ),
-                    evidence,
-                    requested_risk: input.requested_risk,
-                    policy_basis,
-                    permission_mode: self.permission_mode,
-                };
-            }
-        }
         if let Some(tool) = &input.requested_tool {
             evidence.push(format!("tool={tool}"));
             if !self
@@ -229,10 +206,6 @@ fn built_in_profiles() -> Vec<AutonomyProfileSpec> {
             &["read_file", "grep_search", "glob_search"],
             "after every action",
             &["any write", "external side effect", "medium or higher risk"],
-            &[
-                CollaborationTemplateId::DirectExecutor,
-                CollaborationTemplateId::DebateCriticArbiter,
-            ],
         ),
         profile(
             AutonomyProfileId::Supervised,
@@ -253,13 +226,6 @@ fn built_in_profiles() -> Vec<AutonomyProfileSpec> {
                 "destructive command",
                 "external side effect",
             ],
-            &[
-                CollaborationTemplateId::DirectExecutor,
-                CollaborationTemplateId::PlannerExecutorVerifier,
-                CollaborationTemplateId::ImplementationReviewFix,
-                CollaborationTemplateId::DebateCriticArbiter,
-                CollaborationTemplateId::ParallelResearchSynthesis,
-            ],
         ),
         profile(
             AutonomyProfileId::Autonomous,
@@ -273,15 +239,6 @@ fn built_in_profiles() -> Vec<AutonomyProfileSpec> {
                 "credential exposure",
                 "release publish",
             ],
-            &[
-                CollaborationTemplateId::DirectExecutor,
-                CollaborationTemplateId::PlannerExecutorVerifier,
-                CollaborationTemplateId::ImplementationReviewFix,
-                CollaborationTemplateId::DebateCriticArbiter,
-                CollaborationTemplateId::ParallelResearchSynthesis,
-                CollaborationTemplateId::LongRunningWorkstreams,
-                CollaborationTemplateId::IncidentResponse,
-            ],
         ),
         profile(
             AutonomyProfileId::Yolo,
@@ -291,15 +248,6 @@ fn built_in_profiles() -> Vec<AutonomyProfileSpec> {
             &["*"],
             "continuous audit without interruption",
             &["audit every action", "no human interruption"],
-            &[
-                CollaborationTemplateId::DirectExecutor,
-                CollaborationTemplateId::PlannerExecutorVerifier,
-                CollaborationTemplateId::ImplementationReviewFix,
-                CollaborationTemplateId::DebateCriticArbiter,
-                CollaborationTemplateId::ParallelResearchSynthesis,
-                CollaborationTemplateId::LongRunningWorkstreams,
-                CollaborationTemplateId::IncidentResponse,
-            ],
         ),
         profile(
             AutonomyProfileId::Stewarded,
@@ -316,14 +264,6 @@ fn built_in_profiles() -> Vec<AutonomyProfileSpec> {
             ],
             "periodic steward report and every delegated approval",
             &["high risk action", "policy conflict", "budget pressure"],
-            &[
-                CollaborationTemplateId::DirectExecutor,
-                CollaborationTemplateId::PlannerExecutorVerifier,
-                CollaborationTemplateId::ImplementationReviewFix,
-                CollaborationTemplateId::DebateCriticArbiter,
-                CollaborationTemplateId::ParallelResearchSynthesis,
-                CollaborationTemplateId::LongRunningWorkstreams,
-            ],
         ),
     ]
 }
@@ -336,7 +276,6 @@ fn profile(
     tool_scope: &[&str],
     reporting_cadence: &str,
     human_escalation_rules: &[&str],
-    compatible_collaboration_templates: &[CollaborationTemplateId],
 ) -> AutonomyProfileSpec {
     let permission_mode = harness_contract::policy::permission_mode_for(profile_id);
     let interruption_policy = harness_contract::policy::interruption_policy_for(profile_id);
@@ -354,7 +293,6 @@ fn profile(
             .iter()
             .map(|item| (*item).to_string())
             .collect(),
-        compatible_collaboration_templates: compatible_collaboration_templates.to_vec(),
         sandbox_posture,
     }
 }
@@ -455,7 +393,6 @@ mod tests {
                 profile_id: AutonomyProfileId::Yolo,
                 requested_risk: TaskRisk::Low,
                 requested_tool: None,
-                template_id: None,
                 requires_write: false,
                 is_critical_operation: false,
             })
@@ -500,7 +437,6 @@ mod tests {
             profile_id: AutonomyProfileId::Supervised,
             requested_risk: TaskRisk::Medium,
             requested_tool: Some("apply_patch".to_string()),
-            template_id: Some(CollaborationTemplateId::ImplementationReviewFix),
             requires_write: true,
             is_critical_operation: false,
         });
@@ -516,7 +452,6 @@ mod tests {
             profile_id: AutonomyProfileId::Yolo,
             requested_risk: TaskRisk::Critical,
             requested_tool: Some("bash".to_string()),
-            template_id: Some(CollaborationTemplateId::IncidentResponse),
             requires_write: true,
             is_critical_operation: true,
         });
@@ -530,7 +465,6 @@ mod tests {
             profile_id: AutonomyProfileId::Autonomous,
             requested_risk: TaskRisk::Critical,
             requested_tool: Some("bash".to_string()),
-            template_id: Some(CollaborationTemplateId::IncidentResponse),
             requires_write: true,
             is_critical_operation: true,
         });
@@ -544,7 +478,6 @@ mod tests {
             profile_id: AutonomyProfileId::Stewarded,
             requested_risk: TaskRisk::Low,
             requested_tool: Some("read_file".to_string()),
-            template_id: Some(CollaborationTemplateId::PlannerExecutorVerifier),
             requires_write: false,
             is_critical_operation: false,
         });
@@ -562,7 +495,6 @@ mod tests {
             profile_id: AutonomyProfileId::Cautious,
             requested_risk: TaskRisk::Low,
             requested_tool: Some("bash".to_string()),
-            template_id: Some(CollaborationTemplateId::DirectExecutor),
             requires_write: false,
             is_critical_operation: false,
         });

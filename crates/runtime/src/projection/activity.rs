@@ -2550,7 +2550,6 @@ mod tests {
             service_class: Default::default(),
             parent_execution: None,
             lineage: None,
-            orchestration: None,
             nodes,
             edges: Vec::new(),
             commit_cursor: 1,
@@ -2616,6 +2615,7 @@ mod tests {
             approvals: Vec::new(),
             interventions: Vec::new(),
             child_executions: Vec::new(),
+            agentic_collaboration: Default::default(),
             descendant_graphs: Vec::new(),
         };
 
@@ -3192,6 +3192,7 @@ mod tests {
             approvals: Vec::new(),
             interventions: Vec::new(),
             child_executions: Vec::new(),
+            agentic_collaboration: Default::default(),
             descendant_graphs: Vec::new(),
         };
         let root_id = execution_activity_id("execution-1");

@@ -335,6 +335,191 @@ impl FactLedger for UnavailableFactLedger {
     }
 }
 
+/// Explicit non-durable Fact port for pure selection/reducer tests.
+///
+/// This adapter is never a persistence or recovery acceptance target and is
+/// absent from normal production builds. Database semantics must be verified
+/// against the PostgreSQL adapter.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Default)]
+pub struct EphemeralFactLedger {
+    snapshot: std::sync::Mutex<FactLedgerSnapshot>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl EphemeralFactLedger {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl FactLedger for EphemeralFactLedger {
+    fn upsert_fact(&self, fact: FactRecord) -> FactLedgerResult<FactRecord> {
+        let mut state = self
+            .snapshot
+            .lock()
+            .map_err(|error| FactLedgerError::backend(error.to_string()))?;
+        if let Some(existing) = state.facts.iter_mut().find(|item| item.id == fact.id) {
+            *existing = fact.clone();
+        } else {
+            state.facts.push(fact.clone());
+        }
+        Ok(fact)
+    }
+
+    fn get_fact(&self, fact_id: &str) -> FactLedgerResult<Option<FactRecord>> {
+        Ok(self
+            .snapshot
+            .lock()
+            .map_err(|error| FactLedgerError::backend(error.to_string()))?
+            .facts
+            .iter()
+            .find(|item| item.id.as_str() == fact_id)
+            .cloned())
+    }
+
+    fn list_facts(&self) -> FactLedgerResult<Vec<FactRecord>> {
+        Ok(self
+            .snapshot
+            .lock()
+            .map_err(|error| FactLedgerError::backend(error.to_string()))?
+            .facts
+            .clone())
+    }
+
+    fn recall_facts(&self, query: &FactRecallQuery) -> FactLedgerResult<Vec<FactRecord>> {
+        if !query.is_authorized() {
+            return Ok(Vec::new());
+        }
+        let mut facts = self
+            .list_facts()?
+            .into_iter()
+            .filter(|fact| {
+                query
+                    .authorized_fact_ids
+                    .iter()
+                    .any(|id| id == fact.id.as_str())
+                    || (fact
+                        .scope_key
+                        .as_ref()
+                        .is_some_and(|scope| query.authorized_scope_keys.contains(scope))
+                        && query
+                            .authorized_boundaries
+                            .iter()
+                            .any(|boundary| boundary == fact.boundary.as_str()))
+            })
+            .filter(|fact| {
+                query.terms.is_empty()
+                    || query
+                        .terms
+                        .iter()
+                        .any(|term| fact.statement.to_lowercase().contains(term))
+            })
+            .collect::<Vec<_>>();
+        facts.sort_by(|left, right| {
+            right
+                .confidence
+                .basis_points()
+                .cmp(&left.confidence.basis_points())
+                .then_with(|| right.updated_at.cmp(&left.updated_at))
+                .then_with(|| left.id.as_str().cmp(right.id.as_str()))
+        });
+        facts.truncate(query.limit);
+        Ok(facts)
+    }
+
+    fn upsert_evidence(&self, evidence: EvidencePacket) -> FactLedgerResult<EvidencePacket> {
+        let mut state = self
+            .snapshot
+            .lock()
+            .map_err(|error| FactLedgerError::backend(error.to_string()))?;
+        if let Some(existing) = state
+            .evidence
+            .iter_mut()
+            .find(|item| item.id == evidence.id)
+        {
+            *existing = evidence.clone();
+        } else {
+            state.evidence.push(evidence.clone());
+        }
+        Ok(evidence)
+    }
+
+    fn get_evidence(&self, evidence_id: &str) -> FactLedgerResult<Option<EvidencePacket>> {
+        Ok(self
+            .snapshot
+            .lock()
+            .map_err(|error| FactLedgerError::backend(error.to_string()))?
+            .evidence
+            .iter()
+            .find(|item| item.id.as_str() == evidence_id)
+            .cloned())
+    }
+
+    fn list_evidence(&self) -> FactLedgerResult<Vec<EvidencePacket>> {
+        Ok(self
+            .snapshot
+            .lock()
+            .map_err(|error| FactLedgerError::backend(error.to_string()))?
+            .evidence
+            .clone())
+    }
+
+    fn record_growth_event(&self, event: GrowthEvent) -> FactLedgerResult<()> {
+        let mut state = self
+            .snapshot
+            .lock()
+            .map_err(|error| FactLedgerError::backend(error.to_string()))?;
+        if let Some(existing) = state
+            .growth_events
+            .iter_mut()
+            .find(|item| item.id == event.id)
+        {
+            *existing = event;
+        } else {
+            state.growth_events.push(event);
+        }
+        Ok(())
+    }
+
+    fn list_growth_events(&self) -> FactLedgerResult<Vec<GrowthEvent>> {
+        Ok(self
+            .snapshot
+            .lock()
+            .map_err(|error| FactLedgerError::backend(error.to_string()))?
+            .growth_events
+            .clone())
+    }
+
+    fn record_growth_promotion(&self, record: GrowthPromotionRecord) -> FactLedgerResult<()> {
+        let mut state = self
+            .snapshot
+            .lock()
+            .map_err(|error| FactLedgerError::backend(error.to_string()))?;
+        if let Some(existing) = state
+            .growth_promotions
+            .iter_mut()
+            .find(|item| item.id == record.id)
+        {
+            *existing = record;
+        } else {
+            state.growth_promotions.push(record);
+        }
+        Ok(())
+    }
+
+    fn list_growth_promotions(&self) -> FactLedgerResult<Vec<GrowthPromotionRecord>> {
+        Ok(self
+            .snapshot
+            .lock()
+            .map_err(|error| FactLedgerError::backend(error.to_string()))?
+            .growth_promotions
+            .clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;

@@ -4,15 +4,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::{
-    ChildExecutionProjection, ExecutionActivityProjection, ExecutionActivityRelation,
-    ExecutionConcurrencyProjection, ExecutionLiveState, ExecutionProjection,
-    ProjectionCommandAvailability, ProjectionDetailScope, ProjectionEntity,
+    AgenticCollaborationProjectionV1, ChildExecutionProjection, ExecutionActivityProjection,
+    ExecutionActivityRelation, ExecutionConcurrencyProjection, ExecutionLiveState,
+    ExecutionProjection, ProjectionCommandAvailability, ProjectionDetailScope, ProjectionEntity,
     StrategyDecisionProjection, EXECUTION_PROJECTION_REDUCER_VERSION,
     EXECUTION_PROJECTION_SCHEMA_VERSION,
 };
 use crate::execution_graph::{
-    ExecutionEdgeProjection, ExecutionNodeProjection, ExecutionOrchestrationMetadata,
-    ExecutionParentBinding, ExecutionServiceClass,
+    ExecutionEdgeProjection, ExecutionNodeProjection, ExecutionParentBinding, ExecutionServiceClass,
 };
 use crate::outcome::{DeliveryEnvelope, TerminalPresentation};
 use crate::turn::CancellationReceipt;
@@ -77,12 +76,6 @@ pub enum ProjectionOperation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_execution: Option<ExecutionParentBinding>,
     },
-    /// Replaces the complete immutable Program control/provenance record from
-    /// the same graph revision as the surrounding delta.
-    ReplaceGraphOrchestration {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        orchestration: Option<ExecutionOrchestrationMetadata>,
-    },
     ReplaceGraphTopology {
         node_ids: Vec<String>,
         edges: Vec<ExecutionEdgeProjection>,
@@ -108,6 +101,10 @@ pub enum ProjectionOperation {
     /// different durable cursors.
     ReplaceConcurrency {
         concurrency: ExecutionConcurrencyProjection,
+    },
+    /// Atomically replaces the sole canonical Agentic collaboration aggregate.
+    ReplaceAgenticCollaboration {
+        collaboration: AgenticCollaborationProjectionV1,
     },
     UpsertActivity {
         activity: ExecutionActivityProjection,
@@ -282,9 +279,6 @@ fn apply_operation(
                 .parent_execution
                 .clone_from(parent_execution);
         }
-        ProjectionOperation::ReplaceGraphOrchestration { orchestration } => {
-            projection.graph.orchestration.clone_from(orchestration);
-        }
         ProjectionOperation::ReplaceGraphTopology { node_ids, edges } => {
             let retained = node_ids.iter().collect::<BTreeSet<_>>();
             projection
@@ -323,6 +317,9 @@ fn apply_operation(
         }
         ProjectionOperation::ReplaceConcurrency { concurrency } => {
             projection.concurrency.clone_from(concurrency);
+        }
+        ProjectionOperation::ReplaceAgenticCollaboration { collaboration } => {
+            projection.agentic_collaboration.clone_from(collaboration);
         }
         ProjectionOperation::UpsertActivity { activity } => {
             upsert_by_key(&mut projection.activities, activity.clone(), |value| {
@@ -505,7 +502,7 @@ mod tests {
         serde_json::from_str(include_str!(
             "../../tests/fixtures/projection-v3/materialization.json"
         ))
-        .expect("projection v3 golden corpus")
+        .expect("projection golden corpus")
     }
 
     #[test]

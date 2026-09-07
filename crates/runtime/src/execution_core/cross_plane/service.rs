@@ -706,7 +706,7 @@ mod tests {
     use super::*;
     #[test]
     fn workspace_state_is_isolated_and_durable() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let service = CrossPlaneRuntimeService::open(Arc::clone(&store)).unwrap();
         service
             .upsert_grant(CrossPlaneGrant::persistent("alice", "channel.send"))
@@ -718,18 +718,14 @@ mod tests {
                 .len(),
             1
         );
-        let isolated = CrossPlaneRuntimeService::open(Arc::new(
-            RuntimeEventStore::try_open_in_memory().unwrap(),
-        ))
-        .unwrap();
+        let isolated =
+            CrossPlaneRuntimeService::open(Arc::new(RuntimeEventStore::for_test())).unwrap();
         assert!(isolated.list_grants().is_empty());
     }
     #[test]
     fn commit_compiles_to_execution_graph() {
-        let service = CrossPlaneRuntimeService::open(Arc::new(
-            RuntimeEventStore::try_open_in_memory().unwrap(),
-        ))
-        .unwrap();
+        let service =
+            CrossPlaneRuntimeService::open(Arc::new(RuntimeEventStore::for_test())).unwrap();
         let action = CrossPlaneAction::new("alice", "channel.send");
         let (_, decision, _) =
             service.decide_with_connector_context(action.clone(), None, Utc::now());
@@ -753,10 +749,8 @@ mod tests {
 
     #[test]
     fn execution_receipt_is_idempotent_without_duplicate_audit() {
-        let service = CrossPlaneRuntimeService::open(Arc::new(
-            RuntimeEventStore::try_open_in_memory().unwrap(),
-        ))
-        .unwrap();
+        let service =
+            CrossPlaneRuntimeService::open(Arc::new(RuntimeEventStore::for_test())).unwrap();
         let action = CrossPlaneAction::new("alice", "channel.send");
         let (_, decision, evidence) =
             service.decide_with_connector_context(action.clone(), None, Utc::now());
@@ -791,10 +785,8 @@ mod tests {
 
     #[test]
     fn immutable_audit_timeline_pages_in_the_durable_store() {
-        let service = CrossPlaneRuntimeService::open(Arc::new(
-            RuntimeEventStore::try_open_in_memory().unwrap(),
-        ))
-        .unwrap();
+        let service =
+            CrossPlaneRuntimeService::open(Arc::new(RuntimeEventStore::for_test())).unwrap();
         for index in 0..3 {
             let action = CrossPlaneAction::new("alice", format!("channel.send.{index}"));
             let (_, decision, evidence) =
@@ -830,7 +822,7 @@ mod tests {
 
     #[test]
     fn legacy_snapshot_audit_is_backfilled_once_into_immutable_stream() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let action = CrossPlaneAction::new("alice", "channel.send");
         let decision = crate::CrossPlanePolicyEngine::new(crate::CrossPlanePolicyConfig::default())
             .decide(&action, Utc::now());
@@ -867,10 +859,8 @@ mod tests {
 
     #[test]
     fn execution_receipt_rejects_a_different_atomic_owner() {
-        let service = CrossPlaneRuntimeService::open(Arc::new(
-            RuntimeEventStore::try_open_in_memory().unwrap(),
-        ))
-        .unwrap();
+        let service =
+            CrossPlaneRuntimeService::open(Arc::new(RuntimeEventStore::for_test())).unwrap();
         let record = |actor: &str, capability: &str| {
             let action = CrossPlaneAction::new(actor, capability);
             let (_, decision, evidence) =
@@ -912,10 +902,8 @@ mod tests {
 
     #[test]
     fn completed_effect_consumes_single_use_grant_once_with_its_receipt() {
-        let service = CrossPlaneRuntimeService::open(Arc::new(
-            RuntimeEventStore::try_open_in_memory().unwrap(),
-        ))
-        .unwrap();
+        let service =
+            CrossPlaneRuntimeService::open(Arc::new(RuntimeEventStore::for_test())).unwrap();
         let mut grant = CrossPlaneGrant::persistent("alice", "channel.send");
         grant.grant_type = crate::GrantType::SingleUse;
         let grant_id = grant.id.clone();
@@ -986,10 +974,7 @@ mod tests {
     #[test]
     fn competing_completed_effects_cannot_reuse_a_single_use_grant() {
         let service = Arc::new(
-            CrossPlaneRuntimeService::open(Arc::new(
-                RuntimeEventStore::try_open_in_memory().unwrap(),
-            ))
-            .unwrap(),
+            CrossPlaneRuntimeService::open(Arc::new(RuntimeEventStore::for_test())).unwrap(),
         );
         let mut grant = CrossPlaneGrant::persistent("alice", "channel.send");
         grant.grant_type = crate::GrantType::SingleUse;
@@ -1053,7 +1038,7 @@ mod tests {
 
     #[test]
     fn dispatch_intent_and_receipt_survive_crash_window_and_restart() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let service = CrossPlaneRuntimeService::open(Arc::clone(&store)).unwrap();
         let target = CrossPlaneDispatchTarget {
             platform: Some("lark".to_string()),

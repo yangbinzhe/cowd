@@ -677,6 +677,7 @@ mod tests {
         ExecutionProjection {
             schema_version: EXECUTION_PROJECTION_SCHEMA_VERSION,
             execution_id: "graph-a".to_string(),
+            agentic_collaboration: Default::default(),
             revision: 1,
             cursor: 10,
             detail_scope: ProjectionDetailScope::Summary,

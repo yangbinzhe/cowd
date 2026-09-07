@@ -56,10 +56,6 @@ mod logging;
 mod matrix_store;
 #[path = "runtime/mcp_serve.rs"]
 mod mcp_serve;
-#[path = "infrastructure/ownership_cutover_contract.rs"]
-mod ownership_cutover_contract;
-#[path = "infrastructure/ownership_cutover_coordinator.rs"]
-pub mod ownership_cutover_coordinator;
 #[path = "static/plugin_static.rs"]
 mod plugin_static;
 #[path = "runtime/runtime_bootstrap.rs"]
@@ -113,26 +109,6 @@ pub fn route_openapi_benchmark(iterations: usize, cached: bool) -> u64 {
 
 /// Operator-only storage cutover entry used by the thin CLI binary.
 pub fn storage_entry(args: &[String]) -> std::process::ExitCode {
-    if args.first().map(String::as_str) == Some("ownership-cutover") {
-        return match ownership_cutover_coordinator::run_operator_command(
-            args.get(1..).unwrap_or_default(),
-        ) {
-            Ok(publication) => match serde_json::to_string_pretty(&publication) {
-                Ok(output) => {
-                    println!("{output}");
-                    std::process::ExitCode::SUCCESS
-                }
-                Err(error) => {
-                    eprintln!("ownership cutover result encoding failed: {error}");
-                    std::process::ExitCode::from(70)
-                }
-            },
-            Err(error) => {
-                eprintln!("ownership cutover failed: {error}");
-                std::process::ExitCode::FAILURE
-            }
-        };
-    }
     match storage_cutover::run(args) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
@@ -150,6 +126,83 @@ pub fn storage_entry(args: &[String]) -> std::process::ExitCode {
 #[doc(hidden)]
 pub fn harness_eval_worker_entry(args: &[String]) -> std::process::ExitCode {
     services::harness_eval_service::worker_process_entry(args)
+}
+
+#[cfg(test)]
+pub(crate) mod pg_test_support {
+    use std::sync::{Arc, OnceLock};
+
+    use session::UnifiedSessionStore;
+    use storage::{PostgresConnectionConfig, PostgresExecutor, StaticSecretRefResolver};
+
+    fn postgres_executor() -> PostgresExecutor {
+        static EXECUTOR: OnceLock<Result<PostgresExecutor, String>> = OnceLock::new();
+        EXECUTOR
+            .get_or_init(|| {
+                let url = std::env::var("COWD_TEST_POSTGRES_URL")
+                    .map_err(|_| "COWD_TEST_POSTGRES_URL is required".to_string())?;
+                let resolver = StaticSecretRefResolver::new([("gateway.test.pg".to_string(), url)]);
+                let mut config = PostgresConnectionConfig::new(
+                    "gateway-test",
+                    "gateway.test.pg",
+                    "cowd-gateway-test",
+                );
+                // Gateway's unit-test binary runs hundreds of isolated-schema
+                // cases concurrently. A tiny shared pool turns unrelated
+                // tests into artificial admission failures and masks the
+                // business invariants they exercise.
+                config.max_connections = 64;
+                config.min_idle_connections = None;
+                PostgresExecutor::connect(config, &resolver).map_err(|error| error.to_string())
+            })
+            .clone()
+            .unwrap_or_else(|error| panic!("isolated PostgreSQL test executor: {error}"))
+    }
+
+    pub(crate) fn session_store() -> UnifiedSessionStore {
+        let executor = postgres_executor();
+        let schema = format!("cowdgw_{}", uuid::Uuid::new_v4().simple());
+        executor
+            .checkout_critical()
+            .expect("PostgreSQL test connection")
+            .batch_execute(&format!("CREATE SCHEMA \"{schema}\""))
+            .expect("create isolated Gateway test schema");
+        let scoped = executor
+            .scoped_namespace(&schema)
+            .expect("scope Gateway test schema");
+        let backend = session_postgres::PostgresSessionStore::new(scoped)
+            .expect("initialize Session PostgreSQL test adapter");
+        UnifiedSessionStore::from_backend(Arc::new(backend))
+    }
+
+    pub(crate) async fn memory_manager(
+        config: memory::MemoryConfig,
+    ) -> Result<memory::CognitiveContextManager, memory::MemoryError> {
+        memory::CognitiveContextManager::new_with_selected_store(
+            config,
+            None,
+            None,
+            Arc::new(memory::EphemeralMemoryStore::new()),
+        )
+        .await
+    }
+
+    pub(crate) fn matrix_store() -> Arc<dyn matrix_repository::MatrixStore> {
+        let executor = postgres_executor();
+        let schema = format!("cowdgw_matrix_{}", uuid::Uuid::new_v4().simple());
+        executor
+            .checkout_critical()
+            .expect("PostgreSQL test connection")
+            .batch_execute(&format!("CREATE SCHEMA \"{schema}\""))
+            .expect("create isolated Matrix test schema");
+        let backend = matrix_repository::PostgresMatrixRepository::new(
+            executor
+                .scoped_namespace(&schema)
+                .expect("scope Matrix test schema"),
+        )
+        .expect("initialize Matrix PostgreSQL test adapter");
+        Arc::new(backend)
+    }
 }
 
 /// Feature-gated black-box integration harness. This intentionally exposes
@@ -471,28 +524,17 @@ fn build_memory_config(
         return None;
     }
     let config_home = runtime::cowd_dirs::config_home_dir();
-    let (sqlite_path, blob_dir) =
-        if let Some(store_path) = src.store_path.as_ref().map(|path| expand_home(path)) {
-            if let Err(error) = std::fs::create_dir_all(&store_path) {
-                tracing::warn!(?store_path, "failed to create memory store dir: {error}");
-            }
-            (store_path.join("memory.db"), store_path.join("blobs"))
-        } else {
-            let layout = storage::StorageLayout::default_for_config_home(&config_home);
-            let sqlite_path = layout
-                .sqlite_path("memory")
-                .map(std::path::Path::to_path_buf)
-                .unwrap_or_else(|| layout.root.join("memory.sqlite"));
-            (sqlite_path, layout.blobs)
-        };
-    let mut mc = memory::MemoryConfig::default();
-    mc.store.sqlite_path = sqlite_path;
-    mc.store.blob_dir = blob_dir;
-    if let Some(parent) = mc.store.sqlite_path.parent() {
-        if let Err(error) = std::fs::create_dir_all(parent) {
-            tracing::warn!(?parent, "failed to create memory sqlite dir: {error}");
+    let blob_dir = if let Some(store_path) = src.store_path.as_ref().map(|path| expand_home(path)) {
+        if let Err(error) = std::fs::create_dir_all(&store_path) {
+            tracing::warn!(?store_path, "failed to create memory store dir: {error}");
         }
-    }
+        store_path.join("blobs")
+    } else {
+        let layout = storage::StorageLayout::default_for_config_home(&config_home);
+        layout.blobs
+    };
+    let mut mc = memory::MemoryConfig::default();
+    mc.store.blob_dir = blob_dir;
     if let Err(error) = std::fs::create_dir_all(&mc.store.blob_dir) {
         tracing::warn!(path = %mc.store.blob_dir.display(), "failed to create memory blob dir: {error}");
     }

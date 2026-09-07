@@ -491,20 +491,25 @@ where
     // This is the sole top-level turn boundary. Runtime-prefetched tool
     // evidence may be created before the first Provider node, so no model-step
     // path may reset these ledgers later in the same turn.
-    runtime.begin_turn_runtime_epoch();
+    runtime.begin_turn_runtime_epoch().await;
+    let recovered_provider_usage = runtime.turn_recovered_provider_usage();
+    let recovered_provider_attempt_count = runtime.turn_recovered_provider_attempt_count();
+    let recovered_cache_dimensions_known = runtime.turn_cache_dimensions_known();
     let session = runtime.session_snapshot().await;
     let evaluation_control = match evaluation_turn_control(content) {
         Ok(control) => control,
         Err(error) => return (runtime, Err(error)),
     };
-    let _evaluation_provider_token_guard = match evaluation_control.as_ref() {
-        Some(control) => match services
+    let _evaluation_provider_token_guard = match evaluation_control.as_ref().and_then(|control| {
+        match (&control.budget_lease_id, control.max_total_tokens) {
+            (Some(lease_id), Some(limit)) => Some((lease_id, limit)),
+            _ => None,
+        }
+    }) {
+        Some((lease_id, limit)) => match services
             .evaluation_provider_token_leases()
-            .install_advisory(
-                &session.session_id,
-                &control.budget_lease_id,
-                control.max_total_tokens,
-            ) {
+            .install_advisory(&session.session_id, lease_id, limit)
+        {
             Ok(guard) => {
                 runtime = runtime.with_evaluation_provider_token_lease(guard.lease());
                 Some(guard)
@@ -569,10 +574,12 @@ where
             assistant_messages: Vec::new(),
             tool_results: Vec::new(),
             iterations: 0,
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_create_tokens: 0,
-            cache_read_tokens: 0,
+            input_tokens: recovered_provider_usage.input_tokens,
+            output_tokens: recovered_provider_usage.output_tokens,
+            cache_create_tokens: recovered_provider_usage.cache_creation_input_tokens,
+            cache_read_tokens: recovered_provider_usage.cache_read_input_tokens,
+            cache_dimensions_known: recovered_cache_dimensions_known,
+            provider_usage_attempt_observed: recovered_provider_attempt_count > 0,
             output_chars: 0,
             output_chunks: 0,
             wall_duration_ms: 0,
@@ -644,6 +651,7 @@ where
             committed_workspace_write_observed: false,
             committed_workspace_write_scopes: BTreeSet::new(),
             committed_workspace_observed_evidence: Vec::new(),
+            workspace_mutation_effect_sequences: BTreeSet::new(),
             required_write_replans: 0,
             max_tool_concurrency_observed: 0,
             parallel_tool_batches: 0,
@@ -679,7 +687,7 @@ where
             provider_profile_fingerprint,
         )?;
         let (
-            mut strategy,
+            strategy,
             context_window,
             context_profile,
             owner_step_limit,
@@ -698,31 +706,6 @@ where
                 runtime.delegated_focus_policy(),
             )
         };
-        if context_profile == ContextProfile::SubAgent
-            && strategy.selected_candidate
-                == harness_contract::strategy::ExecutionCandidateKind::Team
-        {
-            strategy = runtime.lock().await.downgrade_turn_strategy(
-                best_non_team_strategy(&strategy),
-                "delegated Agent roles are leaf executions and cannot recursively materialize a Team",
-            )?;
-        }
-        if strategy.selected_candidate == harness_contract::strategy::ExecutionCandidateKind::Team {
-            let automatic_minimum_team_count = u8::try_from(
-                strategy
-                    .decision
-                    .strategy
-                    .understanding
-                    .required_team_count
-                    .max(strategy.decision.strategy.understanding.independent_workstreams)
-                    .max(1),
-            )
-            .unwrap_or(u8::MAX);
-            strategy = runtime
-                .lock()
-                .await
-                .set_turn_strategy_collaboration_obligation(automatic_minimum_team_count)?;
-        }
         if evaluation_control.is_some() && evaluation_topology_forbids_team() {
             let mut item = ContextItem::new(
                 format!("eval-topology:{}", strategy.decision_id),
@@ -894,9 +877,13 @@ where
                 session_id: session_id.clone(),
                 objective: resolved_objective.clone(),
                 criteria: vec![AcceptanceCriterion {
-                    id: "terminal_synthesis".to_string(),
-                    statement: "produce one durable terminal synthesis for the user objective"
-                        .to_string(),
+                    id: "user_intent".to_string(),
+                    statement: resolved_objective.clone(),
+                    statement_ref: None,
+                    source_refs: vec![ingress.as_ref().map_or_else(
+                        || format!("session:{session_id}:turn:{turn_ref}:input"),
+                        |value| format!("session_message:{}", value.message_id),
+                    )],
                     required_evidence: vec![format!("execution_graph:{}", graph.id)],
                     status: AcceptanceStatus::Open,
                     waiver: None,
@@ -906,13 +893,36 @@ where
                 evidence_refs: Vec::new(),
                 unresolved: Vec::new(),
                 blockers: Vec::new(),
+                scope: harness_contract::goal::GoalScope::UserObjective,
+                user_intent_criterion_id: Some("user_intent".to_string()),
+                source_intent_ref: Some(ingress.as_ref().map_or_else(
+                    || format!("session:{session_id}:turn:{turn_ref}:input"),
+                    |value| format!("session_message:{}", value.message_id),
+                )),
+                execution_binding: Some(harness_contract::goal::GoalExecutionBinding {
+                    objective_id: harness_contract::agent_action::root_objective_id(
+                        &session_id,
+                        &turn_ref,
+                    ),
+                    session_id: session_id.clone(),
+                    turn_id: turn_ref.clone(),
+                    root_execution_id: graph.id.clone(),
+                    agentic_program_id: harness_contract::agent_action::program_id_for_objective(
+                        &harness_contract::agent_action::root_objective_id(&session_id, &turn_ref),
+                    ),
+                }),
+                spec_revision: 1,
+                spec_digest: format!("{:x}", Sha256::digest(resolved_objective.as_bytes())),
+                review_refs: Vec::new(),
+                waiting: None,
+                participation_requirement: None,
                 obligations: Vec::new(),
-                program_ref: Some(graph.id.clone()),
                 recovery: None,
                 terminal: None,
                 completion: GoalCompletion::Open,
                 revision: 1,
                 user_sequence: 1,
+                reviews: Vec::new(),
             })
             .map_err(RuntimeError::new)?;
         // Objective recovery now belongs to the Agentic Program supervisor.
@@ -1343,7 +1353,12 @@ where
             _evaluation_provider_token_guard
                 .as_ref()
                 .and_then(|guard| guard.snapshot().ok())
-                .filter(|snapshot| snapshot.lease_id == control.budget_lease_id)
+                .filter(|snapshot| {
+                    control
+                        .budget_lease_id
+                        .as_deref()
+                        .is_some_and(|lease_id| snapshot.lease_id == lease_id)
+                })
         });
         let (status, outcome) = match &result {
             Ok(summary) => (
@@ -1497,8 +1512,10 @@ struct EvaluationTurnControl {
     temperature_milli: u16,
     #[serde(default)]
     resource_scopes: Vec<String>,
-    budget_lease_id: String,
-    max_total_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    budget_lease_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_total_tokens: Option<u64>,
     prompt: String,
 }
 
@@ -1573,8 +1590,8 @@ mod root_delegation_scope_tests {
             provider_constraint: "normal".to_string(),
             temperature_milli: 0,
             resource_scopes: vec!["write:report.html".to_string()],
-            budget_lease_id: "lease".to_string(),
-            max_total_tokens: 1,
+            budget_lease_id: None,
+            max_total_tokens: None,
             prompt: "write report".to_string(),
         };
         assert_eq!(
@@ -1610,13 +1627,12 @@ fn evaluation_turn_control(content: &str) -> Result<Option<EvaluationTurnControl
             "evaluation turn control corpus or prompt is invalid",
         ));
     }
-    if control.budget_lease_id.trim().is_empty()
-        || control.max_total_tokens == 0
-        || control.max_total_tokens > crate::conversation::MAX_EVALUATION_PROVIDER_TOKEN_LEASE
-    {
-        return Err(RuntimeError::new(
-            "evaluation provider token lease is invalid",
-        ));
+    match (&control.budget_lease_id, control.max_total_tokens) {
+        (None, None) => {}
+        (Some(lease_id), Some(limit)) if !lease_id.trim().is_empty() && limit > 0 => {}
+        _ => return Err(RuntimeError::new(
+            "evaluation provider token telemetry lease must provide both a non-empty id and a positive limit",
+        )),
     }
     if control.temperature_milli != 0
         || std::env::var("COWD_MODEL_TEMPERATURE").as_deref() != Ok("0")
@@ -1955,6 +1971,114 @@ fn root_agentic_program_projection(
     services.agent_action_service().project(&program_id).ok()
 }
 
+/// The root Program has a narrow, factual closure boundary that is distinct
+/// from ordinary model planning.  It exists to keep the action advertised to
+/// the root model consistent with Objective admission: accepted delivery work
+/// without a dependency-backed integration Artifact still needs a synthesis
+/// Task, while a proven integration Artifact needs the completion request.
+///
+/// This does not encode roles, Team assignment, Task contents, or a workflow
+/// template.  Those remain model decisions.  It prevents only the impossible
+/// state where the model is told to request completion before the verifier can
+/// accept any of its result references.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RootAgenticTerminalAction {
+    PublishIntegration { prerequisite_task_refs: Vec<String> },
+    RequestObjectiveCompletion { result_artifact_refs: Vec<String> },
+}
+
+impl RootAgenticTerminalAction {
+    pub(super) fn tool_ids(&self) -> BTreeSet<String> {
+        let tool = match self {
+            Self::PublishIntegration { .. } => harness_contract::agent_action::TASK_PUBLISH_TOOL_ID,
+            Self::RequestObjectiveCompletion { .. } => {
+                harness_contract::agent_action::OBJECTIVE_COMPLETE_REQUEST_TOOL_ID
+            }
+        };
+        [tool.to_string()].into_iter().collect()
+    }
+
+    fn checkpoint_next_actions(&self) -> Vec<&'static str> {
+        match self {
+            Self::PublishIntegration { .. } => vec!["publish_integration_task"],
+            Self::RequestObjectiveCompletion { .. } => vec!["objective_complete_request"],
+        }
+    }
+
+    fn checkpoint_detail(&self) -> serde_json::Value {
+        match self {
+            Self::PublishIntegration {
+                prerequisite_task_refs,
+            } => serde_json::json!({
+                "kind": "publish_integration_task",
+                "prerequisite_task_refs": prerequisite_task_refs,
+                "requirement": "Publish one genuine synthesis Task with depends_on covering these accepted deliveries. Choose its Team, author, objective, acceptance criterion, and evidence semantics yourself; its accepted Artifact must be the final result.",
+            }),
+            Self::RequestObjectiveCompletion {
+                result_artifact_refs,
+            } => serde_json::json!({
+                "kind": "objective_complete_request",
+                "eligible_result_artifact_refs": result_artifact_refs,
+                "requirement": "Request Objective completion using an eligible accepted integration Artifact and real evidence. Do not recommit a root-only Artifact or recreate delivery work.",
+            }),
+        }
+    }
+
+    pub(super) fn continuation_instruction(&self) -> String {
+        match self {
+            Self::PublishIntegration {
+                prerequisite_task_refs,
+            } => format!(
+                "Runtime Agent-first closure boundary: all current delivery Tasks are independently accepted, but no accepted Task Artifact has a real dependency lineage across every required Team. Root-only Artifacts and Artifact.relates_to metadata cannot prove integration. Use task_publish exactly once to create a genuine synthesis Task with depends_on [{}]. You choose the Team, author, title, objective, acceptance criterion, evidence, and substantive synthesis semantics. Do not request Objective completion or recommit a root Artifact before that Task is independently accepted.",
+                prerequisite_task_refs.join(", ")
+            ),
+            Self::RequestObjectiveCompletion {
+                result_artifact_refs,
+            } => format!(
+                "Runtime Agent-first closure boundary: an accepted dependency-backed integration Artifact is ready for Objective admission. Use objective_complete_request once with one eligible result ref [{}] and real evidence. Do not requery, recommit Artifacts, or recreate Tasks; the Objective supervisor owns the resulting verdict.",
+                result_artifact_refs.join(", ")
+            ),
+        }
+    }
+}
+
+pub(super) fn root_agentic_terminal_action(
+    program: &crate::AgenticProgramProjection,
+) -> Option<RootAgenticTerminalAction> {
+    if !matches!(
+        program.status,
+        crate::AgenticProgramStatus::Open | crate::AgenticProgramStatus::Waiting
+    ) {
+        return None;
+    }
+    let prerequisite_task_refs = program
+        .tasks
+        .values()
+        .filter(|task| task.status != crate::AgenticTaskStatus::Superseded)
+        .map(|task| task.task_id.clone())
+        .collect::<Vec<_>>();
+    if prerequisite_task_refs.is_empty()
+        || program.tasks.values().any(|task| {
+            task.status != crate::AgenticTaskStatus::Superseded
+                && task.status != crate::AgenticTaskStatus::Accepted
+        })
+    {
+        return None;
+    }
+
+    let result_artifact_refs =
+        crate::agentic::supervision::completion_ready_result_artifact_refs(program);
+    if result_artifact_refs.is_empty() {
+        Some(RootAgenticTerminalAction::PublishIntegration {
+            prerequisite_task_refs,
+        })
+    } else {
+        Some(RootAgenticTerminalAction::RequestObjectiveCompletion {
+            result_artifact_refs,
+        })
+    }
+}
+
 /// Decide whether the Agent-first Objective supervisor exclusively owns the
 /// root Goal terminal. Presence alone is not sufficient: the durable Program
 /// must attest the exact Session, Turn, Objective, and root execution. A
@@ -2007,7 +2131,7 @@ fn compact_agentic_program_checkpoint(program: &crate::AgenticProgramProjection)
         .map(|agent| {
             serde_json::json!({
                 "agent_ref": agent.agent_id,
-                "team_ref": agent.team_id,
+                "team_refs": program.active_team_ids_for(&agent.agent_id),
                 "role": agent.role,
                 "mission": agent.mission,
             })
@@ -2051,24 +2175,15 @@ fn compact_agentic_program_checkpoint(program: &crate::AgenticProgramProjection)
             })
         })
         .collect::<Vec<_>>();
-    let next_actions = if program.status == crate::AgenticProgramStatus::Verified {
+    let terminal_action = root_agentic_terminal_action(program);
+    let next_actions = if let Some(action) = terminal_action.as_ref() {
+        action.checkpoint_next_actions()
+    } else if program.status == crate::AgenticProgramStatus::Verified {
         vec!["synthesize_user_delivery"]
     } else if program.status == crate::AgenticProgramStatus::Blocked {
         vec!["explain_blocker_or_replan"]
     } else if program.status == crate::AgenticProgramStatus::CompletionRequested {
         vec!["await_objective_supervisor_verdict"]
-    } else if !program.tasks.is_empty()
-        && program
-            .tasks
-            .values()
-            .any(|task| task.status != crate::AgenticTaskStatus::Superseded)
-        && program
-            .tasks
-            .values()
-            .filter(|task| task.status != crate::AgenticTaskStatus::Superseded)
-            .all(|task| task.status == crate::AgenticTaskStatus::Accepted)
-    {
-        vec!["objective_complete_request"]
     } else if program.tasks.values().any(|task| {
         matches!(
             task.status,
@@ -2091,6 +2206,7 @@ fn compact_agentic_program_checkpoint(program: &crate::AgenticProgramProjection)
         "artifacts": artifacts,
         "unresolved": program.unresolved,
         "next_actions": next_actions,
+        "terminal_action": terminal_action.as_ref().map(RootAgenticTerminalAction::checkpoint_detail),
         "instruction": "Use this Runtime projection as current truth. Decide the next semantic action; do not poll unchanged state or recreate committed entities.",
     })
     .to_string()
@@ -2101,11 +2217,8 @@ fn test_collaboration_obligation(
     minimum_team_count: u8,
 ) -> harness_contract::strategy::CollaborationExecutionObligation {
     harness_contract::strategy::CollaborationExecutionObligation {
-        source: harness_contract::strategy::CollaborationObligationSource::AutomaticStrategy,
         minimum_team_count,
         exact_team_count: None,
-        required_focus_ids: Vec::new(),
-        proposal_required: true,
     }
 }
 
@@ -2197,6 +2310,90 @@ fn root_delivery_write_satisfied(
         )
 }
 
+/// Durable observation-reference prefix for a successful Runtime-authorized
+/// workspace mutation whose adapter cannot itself describe the individual
+/// files it changed (for example, a governed shell command). This is a
+/// Runtime fact: it is minted only from the registered effect descriptor and
+/// a successful host receipt, never from model prose or a requested path.
+const WORKSPACE_MUTATION_EFFECT_REF_PREFIX: &str = "workspace_mutation_effect:";
+
+pub(super) fn workspace_mutation_effect_evidence_ref(sequence: u64) -> String {
+    format!("{WORKSPACE_MUTATION_EFFECT_REF_PREFIX}{sequence}")
+}
+
+pub(super) fn workspace_mutation_effect_sequence(reference: &str) -> Option<u64> {
+    reference
+        .strip_prefix(WORKSPACE_MUTATION_EFFECT_REF_PREFIX)
+        .and_then(|sequence| sequence.parse::<u64>().ok())
+        .filter(|sequence| *sequence > 0)
+}
+
+/// Turn a post-mutation exact read into a narrowly typed `WriteEffect` fact.
+///
+/// A direct file adapter can attest a mutation's pre-image and post-image, and
+/// continues to use that stronger receipt. A governed generic workspace effect
+/// (notably a shell command) cannot honestly name every file it changed. It
+/// can still prove the desired final state when all of these are true:
+///
+/// 1. Runtime previously recorded a successful workspace-mutation effect;
+/// 2. the ToolHost later emitted a complete, digest-bearing exact read; and
+/// 3. that read is the exact user-required write target.
+///
+/// The resulting fact is intentionally *postcondition verified*, not a claim
+/// about a pre-image or a model-provided write request. Callers that need a
+/// proven delta must still require a direct mutation receipt with
+/// `workspace_prior_state`.
+pub(super) fn verified_workspace_postcondition_write_evidence(
+    required_scopes: &[String],
+    prior_workspace_mutation_sequences: &BTreeSet<u64>,
+    current_observed_evidence: &[harness_contract::context::ObservedEvidence],
+    resolver: &crate::path_identity::WorkspacePathIdentityResolver,
+) -> Vec<harness_contract::context::ObservedEvidence> {
+    if required_scopes.is_empty() || prior_workspace_mutation_sequences.is_empty() {
+        return Vec::new();
+    }
+
+    let mut verified = Vec::new();
+    for required_scope in required_scopes {
+        let required = resolver.compile_obligation_or_unresolved(required_scope);
+        for observed in current_observed_evidence {
+            if !prior_workspace_mutation_sequences
+                .iter()
+                .any(|sequence| *sequence < observed.observed_at_sequence)
+            {
+                continue;
+            }
+            let mut postcondition = observed.clone();
+            let harness_contract::context::EvidenceTargetIdentity::Workspace { scope } =
+                &mut postcondition.target
+            else {
+                continue;
+            };
+            if scope.access_mode != harness_contract::context::WorkspaceAccessMode::Read
+                || scope.coverage != harness_contract::context::EvidenceCoverageKind::ExactContent
+            {
+                continue;
+            }
+            scope.access_mode = harness_contract::context::WorkspaceAccessMode::Write;
+            scope.coverage = harness_contract::context::EvidenceCoverageKind::WriteEffect;
+            postcondition.obligation_id = format!(
+                "verified_workspace_postcondition:{}:{}",
+                observed.obligation_id, observed.observed_at_sequence
+            );
+            postcondition.tool_name =
+                format!("verified_workspace_postcondition:{}", observed.tool_name);
+            // A complete postcondition read cannot reconstruct the pre-image.
+            postcondition.workspace_prior_state = None;
+            if crate::path_identity::observed_evidence_satisfies(&required, &postcondition)
+                && !verified.contains(&postcondition)
+            {
+                verified.push(postcondition);
+            }
+        }
+    }
+    verified
+}
+
 #[cfg(test)]
 mod write_obligation_probe {
     use super::*;
@@ -2259,6 +2456,71 @@ mod write_obligation_probe {
             false,
             &resolver,
         ));
+    }
+
+    #[test]
+    fn verified_postcondition_closes_exact_write_after_runtime_mutation() {
+        let root = tempfile::tempdir().expect("workspace");
+        std::fs::write(root.path().join("artifact.txt"), "verified artifact")
+            .expect("artifact file");
+        let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
+            .expect("resolver");
+        let read = resolver
+            .observe_trusted_tool_output_file(
+                "read_file",
+                harness_contract::context::WorkspaceAccessMode::Read,
+                "artifact.txt",
+                "9872b6b522ad77e2505908cad164d5c7a5fb6489c1c10b9f31a5d4f07f84c14b",
+                4,
+            )
+            .expect("exact read receipt");
+        let verified = verified_workspace_postcondition_write_evidence(
+            &["write:artifact.txt".to_string()],
+            &BTreeSet::from([3]),
+            &[read],
+            &resolver,
+        );
+        assert_eq!(verified.len(), 1);
+        assert!(write_obligation_satisfied(
+            true,
+            &["write:artifact.txt".to_string()],
+            &verified,
+            false,
+            &resolver,
+        ));
+        assert!(matches!(
+            &verified[0].target,
+            harness_contract::context::EvidenceTargetIdentity::Workspace { scope }
+                if scope.access_mode == harness_contract::context::WorkspaceAccessMode::Write
+                    && scope.coverage
+                        == harness_contract::context::EvidenceCoverageKind::WriteEffect
+        ));
+        assert!(verified[0].workspace_prior_state.is_none());
+    }
+
+    #[test]
+    fn verified_postcondition_rejects_same_or_later_mutation_epoch() {
+        let root = tempfile::tempdir().expect("workspace");
+        std::fs::write(root.path().join("artifact.txt"), "verified artifact")
+            .expect("artifact file");
+        let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
+            .expect("resolver");
+        let read = resolver
+            .observe_trusted_tool_output_file(
+                "read_file",
+                harness_contract::context::WorkspaceAccessMode::Read,
+                "artifact.txt",
+                "9872b6b522ad77e2505908cad164d5c7a5fb6489c1c10b9f31a5d4f07f84c14b",
+                4,
+            )
+            .expect("exact read receipt");
+        assert!(verified_workspace_postcondition_write_evidence(
+            &["write:artifact.txt".to_string()],
+            &BTreeSet::from([4, 5]),
+            &[read],
+            &resolver,
+        )
+        .is_empty());
     }
 
     #[test]
@@ -2352,32 +2614,6 @@ fn parent_merge_actuals(
         merge_cost_ms,
         u8::from(started_at.is_some() && parent_succeeded),
     )
-}
-
-fn best_non_team_strategy(
-    strategy: &crate::execution_core::TurnStrategyDecisionState,
-) -> harness_contract::strategy::ExecutionCandidateKind {
-    strategy
-        .decision
-        .strategy
-        .candidate_estimates
-        .iter()
-        .filter(|estimate| {
-            estimate.eligible
-                && estimate.candidate != harness_contract::strategy::ExecutionCandidateKind::Team
-                && estimate.duration_provenance != harness_contract::MeasureProvenance::Unknown
-        })
-        .min_by_key(|estimate| {
-            (
-                estimate.effective_duration_ms(),
-                estimate.context_duplication_tokens,
-                estimate.candidate,
-            )
-        })
-        .map_or(
-            harness_contract::strategy::ExecutionCandidateKind::Direct,
-            |estimate| estimate.candidate,
-        )
 }
 
 fn compile_retargeted_conversation_graph(
@@ -2502,6 +2738,10 @@ struct TurnGraphState {
     output_tokens: u64,
     cache_create_tokens: u64,
     cache_read_tokens: u64,
+    cache_dimensions_known: bool,
+    /// Distinguishes a fresh turn from a recovered explicit-zero usage
+    /// attempt so cache truth can be AND-reduced across narrator retries.
+    provider_usage_attempt_observed: bool,
     output_chars: u64,
     output_chunks: u64,
     wall_duration_ms: u64,
@@ -2607,6 +2847,13 @@ struct TurnGraphState {
     /// child-Team write paths. These close exact artifact obligations.
     committed_workspace_write_scopes: BTreeSet<String>,
     committed_workspace_observed_evidence: Vec<harness_contract::context::ObservedEvidence>,
+    /// Mutation epochs produced by already-completed ToolBatch nodes in this
+    /// graph turn. The durable Goal observation is still the recovery source,
+    /// but the next node can be scheduled before that observation's event
+    /// transaction becomes visible to a fresh stream read. Keeping this
+    /// Runtime-authored cursor in the turn state preserves the causal edge
+    /// without trusting model claims or weakening the persisted boundary.
+    workspace_mutation_effect_sequences: BTreeSet<u64>,
     required_write_replans: u8,
     max_tool_concurrency_observed: usize,
     parallel_tool_batches: usize,
@@ -2627,10 +2874,235 @@ struct TurnGraphState {
     pending_disposition_inputs: Vec<crate::session_input::SessionInputRecord>,
 }
 
+pub(super) struct RootModelUsageDelta {
+    pub(super) usage: model_protocol::usage::TokenUsage,
+    pub(super) model: Option<String>,
+    pub(super) models_used: Vec<String>,
+    pub(super) first_token_latency_ms: Option<u64>,
+    pub(super) active_stream_duration_ms: Option<u64>,
+    pub(super) wall_duration_ms: u64,
+    pub(super) output_chars: u64,
+    pub(super) output_chunks: u64,
+    pub(super) cache_dimensions_known: bool,
+}
+
+fn add_root_provider_token_usage(
+    input_tokens: &mut u64,
+    output_tokens: &mut u64,
+    cache_create_tokens: &mut u64,
+    cache_read_tokens: &mut u64,
+    usage: model_protocol::usage::TokenUsage,
+) {
+    *input_tokens = input_tokens.saturating_add(u64::from(usage.input_tokens));
+    *output_tokens = output_tokens.saturating_add(u64::from(usage.output_tokens));
+    *cache_create_tokens =
+        cache_create_tokens.saturating_add(u64::from(usage.cache_creation_input_tokens));
+    *cache_read_tokens = cache_read_tokens.saturating_add(u64::from(usage.cache_read_input_tokens));
+}
+
+fn merge_root_cache_dimensions_truth(
+    attempt_observed: &mut bool,
+    all_known: &mut bool,
+    next_attempt_known: bool,
+) {
+    if *attempt_observed {
+        *all_known &= next_attempt_known;
+    } else {
+        *all_known = next_attempt_known;
+        *attempt_observed = true;
+    }
+}
+
+impl TurnGraphState {
+    pub(super) fn record_root_model_usage(&mut self, delta: RootModelUsageDelta) {
+        add_root_provider_token_usage(
+            &mut self.input_tokens,
+            &mut self.output_tokens,
+            &mut self.cache_create_tokens,
+            &mut self.cache_read_tokens,
+            delta.usage,
+        );
+        merge_root_cache_dimensions_truth(
+            &mut self.provider_usage_attempt_observed,
+            &mut self.cache_dimensions_known,
+            delta.cache_dimensions_known,
+        );
+        self.output_chars = self.output_chars.saturating_add(delta.output_chars);
+        self.output_chunks = self.output_chunks.saturating_add(delta.output_chunks);
+        self.wall_duration_ms = self.wall_duration_ms.saturating_add(delta.wall_duration_ms);
+        if delta.model.is_some() {
+            self.model = delta.model;
+        }
+        for model in delta.models_used {
+            if !self.models_used.contains(&model) {
+                self.models_used.push(model);
+            }
+        }
+        if self.first_token_latency_ms.is_none() {
+            self.first_token_latency_ms = delta.first_token_latency_ms;
+        }
+        self.active_stream_duration_ms = self
+            .active_stream_duration_ms
+            .saturating_add(delta.active_stream_duration_ms.unwrap_or_default());
+    }
+
+    pub(super) fn root_model_telemetry(&self) -> crate::RunModelTelemetry {
+        let rate = |value: u64, duration_ms: u64| {
+            (duration_ms > 0).then(|| value as f64 * 1_000.0 / duration_ms as f64)
+        };
+        crate::RunModelTelemetry {
+            model: self.model.clone(),
+            models_used: self.models_used.clone(),
+            first_token_latency_ms: self.first_token_latency_ms,
+            active_stream_duration_ms: Some(self.active_stream_duration_ms.max(1)),
+            wall_duration_ms: self.wall_duration_ms.max(1),
+            output_chars: self.output_chars,
+            output_chunks: self.output_chunks,
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cache_create_tokens: self.cache_create_tokens,
+            cache_read_tokens: self.cache_read_tokens,
+            cache_dimensions_known: self.cache_dimensions_known,
+            total_tokens: self
+                .input_tokens
+                .saturating_add(self.output_tokens)
+                .saturating_add(self.cache_create_tokens)
+                .saturating_add(self.cache_read_tokens),
+            usage_source: "provider".to_string(),
+            wall_chars_per_second: rate(self.output_chars, self.wall_duration_ms),
+            wall_tokens_per_second: rate(self.output_tokens, self.wall_duration_ms),
+            active_chars_per_second: rate(self.output_chars, self.active_stream_duration_ms),
+            active_tokens_per_second: rate(self.output_tokens, self.active_stream_duration_ms),
+            chars_per_second: rate(self.output_chars, self.wall_duration_ms),
+            tokens_per_second: rate(self.output_tokens, self.wall_duration_ms),
+        }
+    }
+}
+
+#[cfg(test)]
+mod root_model_usage_tests {
+    use super::*;
+    use model_protocol::usage::TokenUsage;
+
+    fn usage(input: u32, output: u32, cache_create: u32, cache_read: u32) -> TokenUsage {
+        TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_creation_input_tokens: cache_create,
+            cache_read_input_tokens: cache_read,
+        }
+    }
+
+    fn accumulate(usages: &[TokenUsage]) -> (u64, u64, u64, u64) {
+        let (mut input, mut output, mut cache_create, mut cache_read) = (0, 0, 0, 0);
+        for usage in usages {
+            add_root_provider_token_usage(
+                &mut input,
+                &mut output,
+                &mut cache_create,
+                &mut cache_read,
+                *usage,
+            );
+        }
+        (input, output, cache_create, cache_read)
+    }
+
+    #[test]
+    fn normal_team_synthesis_is_added_to_the_cumulative_root_bill() {
+        assert_eq!(accumulate(&[usage(100, 20, 30, 50)]), (100, 20, 30, 50));
+    }
+
+    #[test]
+    fn every_hierarchical_team_synthesis_call_is_added_once() {
+        assert_eq!(
+            accumulate(&[
+                usage(100, 10, 20, 30),
+                usage(110, 11, 21, 31),
+                usage(120, 12, 22, 32),
+            ]),
+            (330, 33, 63, 93)
+        );
+    }
+
+    #[test]
+    fn failed_terminal_narrator_usage_remains_in_fallback_bill() {
+        assert_eq!(
+            accumulate(&[usage(90, 0, 15, 45), usage(70, 0, 10, 35)]),
+            (160, 0, 25, 80)
+        );
+    }
+
+    #[test]
+    fn recovered_usage_and_post_restart_narrator_retries_share_one_cumulative_bill() {
+        let recovered = crate::conversation::RecoveredProviderUsage {
+            input_tokens: 300,
+            output_tokens: 30,
+            cache_creation_input_tokens: 40,
+            cache_read_input_tokens: 50,
+        };
+        let (mut input, mut output, mut cache_create, mut cache_read) = (
+            recovered.input_tokens,
+            recovered.output_tokens,
+            recovered.cache_creation_input_tokens,
+            recovered.cache_read_input_tokens,
+        );
+        for retry in [usage(90, 0, 15, 45), usage(70, 7, 10, 35)] {
+            add_root_provider_token_usage(
+                &mut input,
+                &mut output,
+                &mut cache_create,
+                &mut cache_read,
+                retry,
+            );
+        }
+        assert_eq!(
+            (input, output, cache_create, cache_read),
+            (460, 37, 65, 130)
+        );
+
+        let mut attempt_observed = true;
+        let mut all_known = true;
+        merge_root_cache_dimensions_truth(&mut attempt_observed, &mut all_known, true);
+        merge_root_cache_dimensions_truth(&mut attempt_observed, &mut all_known, false);
+        assert!(
+            !all_known,
+            "one unknown retry must keep terminal cache truth unknown"
+        );
+    }
+
+    #[test]
+    fn cached_terminal_narration_preserves_provider_attribution() {
+        let cached = TerminalFailureNarration::Provider {
+            answer: "answer".to_string(),
+            model: Some("model-a".to_string()),
+            models_used: vec!["model-a".to_string(), "model-b".to_string()],
+            attempt_id: "attempt-1".to_string(),
+        };
+        let TerminalFailureNarration::Provider {
+            answer,
+            model,
+            models_used,
+            attempt_id,
+        } = cached.clone()
+        else {
+            panic!("provider narration must remain provider-attributed");
+        };
+        assert_eq!(answer, "answer");
+        assert_eq!(model.as_deref(), Some("model-a"));
+        assert_eq!(models_used, ["model-a", "model-b"]);
+        assert_eq!(attempt_id, "attempt-1");
+    }
+}
+
 #[derive(Clone)]
 enum TerminalFailureNarration {
     Local(String),
-    Provider { answer: String, attempt_id: String },
+    Provider {
+        answer: String,
+        model: Option<String>,
+        models_used: Vec<String>,
+        attempt_id: String,
+    },
 }
 
 fn model_context_for_step(
@@ -3995,6 +4467,7 @@ fn collaboration_answer_quality_findings(answer: &str, objective: &str) -> Vec<S
             );
         }
     }
+
     for claim in required_verbatim_claims(objective) {
         if !trimmed.contains(&claim) {
             findings.push(format!(

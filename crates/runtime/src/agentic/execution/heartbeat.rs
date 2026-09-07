@@ -5,8 +5,14 @@ const CLAIM_HEARTBEAT_INTERVAL_MS: u64 = super::super::work_market::CLAIM_LEASE_
 pub(super) fn agentic_claim_actor(
     projection: &AgenticProgramProjection,
     member: &AgentMemberProjection,
+    task_ref: &str,
     execution_id: &str,
 ) -> harness_contract::agent_action::AgentActorBinding {
+    let team_id = projection
+        .tasks
+        .get(task_ref)
+        .map(|task| task.team_id.clone())
+        .unwrap_or_default();
     harness_contract::agent_action::AgentActorBinding {
         objective_id: projection.objective_id.clone(),
         program_id: projection.program_id.clone(),
@@ -21,7 +27,7 @@ pub(super) fn agentic_claim_actor(
         actor_id: member.agent_id.clone(),
         kind: harness_contract::agent_action::AgentActorKind::Agent,
         execution_id: Some(execution_id.to_string()),
-        team_id: Some(member.team_id.clone()),
+        team_id: (!team_id.is_empty()).then_some(team_id),
         agent_id: Some(member.agent_id.clone()),
     }
 }
@@ -112,8 +118,8 @@ pub(super) async fn renew_agentic_claim_if_active(
         "runtime-claim-heartbeat:{execution_id}:{}",
         task.lease_expires_at_ms.unwrap_or_default()
     );
-    action_service
-        .apply(&AgentActionEnvelope {
+    services
+        .submit_agent_action(&AgentActionEnvelope {
             action_id,
             actor: actor.clone(),
             expected_revision: None,
@@ -122,6 +128,7 @@ pub(super) async fn renew_agentic_claim_if_active(
                 reason: Some("physical Agent graph remains active".to_string()),
             }),
         })
+        .await
         .is_ok_and(|observation| {
             observation.status == harness_contract::agent_action::AgentActionStatus::Applied
         })
@@ -144,29 +151,16 @@ pub(crate) fn start_agentic_claim_heartbeat(
     services: Weak<RuntimeServices>,
     packet: &AgentTaskPacket,
 ) -> Result<Option<AgenticClaimHeartbeatGuard>, String> {
-    let mode = packet
-        .context_refs
-        .iter()
-        .find_map(|reference| reference.strip_prefix("agentic_mode:"));
-    if mode != Some("execute") {
+    let Some(agentic) = packet.agentic_binding.as_ref() else {
         return Ok(None);
-    }
-    let program_id = packet
-        .context_refs
-        .iter()
-        .find_map(|reference| reference.strip_prefix("agentic_program:"))
-        .ok_or_else(|| "Agent-first execute packet has no Program binding".to_string())?;
-    let task_ref = packet
-        .context_refs
-        .iter()
-        .find_map(|reference| reference.strip_prefix("agentic_task:"))
-        .ok_or_else(|| "Agent-first execute packet has no Task binding".to_string())?
-        .to_string();
-    let agent_id = packet
-        .context_refs
-        .iter()
-        .find_map(|reference| reference.strip_prefix("agentic_member:"))
-        .ok_or_else(|| "Agent-first execute packet has no member binding".to_string())?;
+    };
+    let harness_contract::agent::AgenticExecutionFocus::TaskExecute { task_ref } = &agentic.focus
+    else {
+        return Ok(None);
+    };
+    let task_ref = task_ref.clone();
+    let program_id = agentic.program_id.as_str();
+    let agent_id = agentic.agent_id.as_str();
     let execution_id = packet.graph_id().to_string();
     let Some(runtime) = services.upgrade() else {
         return Ok(None);
@@ -179,7 +173,15 @@ pub(crate) fn start_agentic_claim_heartbeat(
         .agents
         .get(agent_id)
         .ok_or_else(|| format!("Agent-first Program has no bound member `{agent_id}`"))?;
-    let actor = agentic_claim_actor(&projection, member, &execution_id);
+    if projection
+        .membership_for(agent_id, &agentic.team_id)
+        .is_none_or(|membership| membership.membership_id != agentic.membership_id)
+    {
+        return Err(
+            "Agent-first heartbeat packet membership no longer matches Program".to_string(),
+        );
+    }
+    let actor = agentic_claim_actor(&projection, member, &task_ref, &execution_id);
     let commits = runtime.event_store().subscribe_commits();
     drop(runtime);
     let task = tokio::spawn(async move {

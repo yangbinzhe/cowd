@@ -551,6 +551,8 @@ fn agent_execution_usage(
         model: (!returned.model.trim().is_empty()).then(|| returned.model.clone()),
         input_tokens: returned.input_tokens,
         output_tokens: returned.output_tokens,
+        cache_creation_input_tokens: returned.cache_creation_input_tokens,
+        cache_read_input_tokens: returned.cache_read_input_tokens,
         cached_tokens: returned.cached_tokens,
         tool_calls: returned.tool_calls,
         duplicate_tool_calls: returned.duplicate_tool_calls,
@@ -671,7 +673,6 @@ mod tests {
             objective: "inspect".into(),
             required_acceptance: Default::default(),
             output_acceptance: Vec::new(),
-            requires_managed_collaboration_escalation: false,
             acceptance: vec!["reviewed".into()],
             cohort_prompt_package: None,
             constraints: Vec::new(),
@@ -694,6 +695,7 @@ mod tests {
             binding: None,
             managed_invocation: None,
             idempotency_key: "idempotency-1".into(),
+            agentic_binding: None,
         }
     }
 
@@ -732,6 +734,8 @@ mod tests {
             unresolved: Vec::new(),
             input_tokens: 10,
             output_tokens: 5,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
             cached_tokens: 0,
             model: "test".into(),
             provider: "test".into(),

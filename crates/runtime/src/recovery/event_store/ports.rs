@@ -38,7 +38,6 @@ pub enum RuntimeEventScope {
     Team,
     Agent,
     AgentDefinition,
-    TeamTemplate,
     Approval,
     Evolution,
     Knowledge,
@@ -72,7 +71,6 @@ impl RuntimeEventScope {
             Self::Team => "team",
             Self::Agent => "agent",
             Self::AgentDefinition => "agent_definition",
-            Self::TeamTemplate => "team_template",
             Self::Approval => "approval",
             Self::Evolution => "evolution",
             Self::Knowledge => "knowledge",
@@ -103,7 +101,6 @@ impl RuntimeEventScope {
             "team" => Ok(Self::Team),
             "agent" => Ok(Self::Agent),
             "agent_definition" => Ok(Self::AgentDefinition),
-            "team_template" => Ok(Self::TeamTemplate),
             "approval" => Ok(Self::Approval),
             "evolution" => Ok(Self::Evolution),
             "knowledge" => Ok(Self::Knowledge),
@@ -142,8 +139,6 @@ pub enum RuntimeEventStoreError {
     InvalidTransaction(String),
     #[error("decision lease `{lease_id}` has already been consumed")]
     DecisionLeaseAlreadyConsumed { lease_id: String },
-    #[error("runtime event store SQL failure: {0}")]
-    Sql(#[from] rusqlite::Error),
     #[error("runtime event serialization failure: {0}")]
     Serialization(#[from] serde_json::Error),
     #[error("runtime event store I/O failure: {0}")]
@@ -503,91 +498,6 @@ pub struct RuntimeProjectionCheckpoint {
     pub updated_at_ms: u64,
 }
 
-/// One committed Runtime transaction preserved for a backend migration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeEventCommitSnapshot {
-    pub commit_cursor: u64,
-    pub transaction_id: String,
-    pub request_hash: String,
-    pub created_at_ms: u64,
-}
-
-/// A stream revision captured as part of a committed Runtime transaction.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeEventTransactionStreamSnapshot {
-    pub transaction_id: String,
-    pub stream_id: String,
-    pub expected_revision: u64,
-    pub committed_revision: u64,
-}
-
-/// The current revision of one Runtime event stream at migration cutover.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeEventStreamHeadSnapshot {
-    pub stream_id: String,
-    pub revision: u64,
-}
-
-/// The durable replay fence for a verified human decision.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeDecisionLeaseSnapshot {
-    pub lease_id: String,
-    pub principal_id: String,
-    pub review_id: String,
-    pub action: String,
-    pub scope: String,
-    pub evidence_digest: String,
-    pub credential_epoch: u64,
-    pub consumed_at_ms: u64,
-}
-
-/// Complete, ordered RuntimeEvent migration payload. It is domain-owned and
-/// is valid only for a quiesced source and an empty verified target.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct RuntimeEventStoreSnapshot {
-    pub commits: Vec<RuntimeEventCommitSnapshot>,
-    pub events: Vec<DurableRuntimeEvent>,
-    pub transaction_streams: Vec<RuntimeEventTransactionStreamSnapshot>,
-    pub stream_heads: Vec<RuntimeEventStreamHeadSnapshot>,
-    pub session_outbox: Vec<RuntimeSessionOutboxRecord>,
-    pub decision_leases: Vec<RuntimeDecisionLeaseSnapshot>,
-}
-
-impl RuntimeEventStoreSnapshot {
-    /// Stable digest used to prove source/target migration equivalence. The
-    /// digest does not include a database path, URL, pool identity, or secret.
-    pub fn canonical_digest(&self) -> RuntimeEventStoreResult<String> {
-        let mut canonical = self.clone();
-        canonical.canonicalize();
-        Ok(format!(
-            "{:x}",
-            Sha256::digest(serde_json::to_vec(&canonical)?)
-        ))
-    }
-
-    /// Reject malformed cross-table linkages before a target backend accepts a
-    /// copy. Operational source quiescence remains the migration
-    /// coordinator's responsibility.
-    pub fn validate(&self) -> RuntimeEventStoreResult<()> {
-        validate_migration_snapshot(self)
-    }
-
-    pub(super) fn canonicalize(&mut self) {
-        self.commits.sort_by_key(|commit| commit.commit_cursor);
-        self.events
-            .sort_by_key(|event| (event.commit_cursor, event.transaction_index));
-        self.transaction_streams.sort_by(|left, right| {
-            (&left.transaction_id, &left.stream_id).cmp(&(&right.transaction_id, &right.stream_id))
-        });
-        self.stream_heads
-            .sort_by(|left, right| left.stream_id.cmp(&right.stream_id));
-        self.session_outbox
-            .sort_by(|left, right| left.terminal_id.cmp(&right.terminal_id));
-        self.decision_leases
-            .sort_by(|left, right| left.lease_id.cmp(&right.lease_id));
-    }
-}
-
 /// Backend contract for the durable Runtime lifecycle ledger.
 ///
 /// Runtime business callers must use [`RuntimeEventStore`], never this port.
@@ -720,6 +630,36 @@ pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync {
     ) -> RuntimeEventStoreResult<Option<RuntimeEventRecord>>;
     fn stream_revision(&self, stream_id: &str) -> RuntimeEventStoreResult<u64>;
     fn list_stream(&self, stream_id: &str) -> Result<Vec<DurableRuntimeEvent>, String>;
+    /// Read a stable sequence interval without OFFSET. PostgreSQL overrides
+    /// this with an indexed query; simple test backends may use the bounded
+    /// default implementation.
+    fn list_stream_after(
+        &self,
+        stream_id: &str,
+        after_sequence: u64,
+        through_sequence: u64,
+        max_events: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        let mut bytes = 0usize;
+        let mut selected = Vec::new();
+        for event in self
+            .list_stream(stream_id)?
+            .into_iter()
+            .filter(|event| event.sequence > after_sequence && event.sequence <= through_sequence)
+        {
+            let event_bytes = serde_json::to_vec(&event).map_or(0, |value| value.len());
+            if !selected.is_empty()
+                && (selected.len() >= max_events.max(1)
+                    || bytes.saturating_add(event_bytes) > max_bytes.max(1))
+            {
+                break;
+            }
+            bytes = bytes.saturating_add(event_bytes);
+            selected.push(event);
+        }
+        Ok(selected)
+    }
     /// Return one newest-first page without materialising the whole stream.
     ///
     /// Administrative timelines (for example the cross-plane audit ledger)
@@ -898,9 +838,4 @@ pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync {
         max_attempts: u32,
         now_ms: u64,
     ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord>;
-    fn export_migration_snapshot(&self) -> RuntimeEventStoreResult<RuntimeEventStoreSnapshot>;
-    fn import_migration_snapshot(
-        &self,
-        snapshot: &RuntimeEventStoreSnapshot,
-    ) -> RuntimeEventStoreResult<()>;
 }

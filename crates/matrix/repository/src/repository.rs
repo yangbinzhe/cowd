@@ -83,7 +83,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = MatrixRepositoryHandle::from_config_home(dir.path()).unwrap();
 
-        assert_eq!(repo.health_projection().unwrap()["owner"], "matrix");
+        assert_eq!(
+            repo.health_projection().unwrap()["owner"],
+            "cowd-selected-storage"
+        );
         assert_eq!(
             repo.health_projection().unwrap()["storage_domain"]["kind"],
             "matrix"

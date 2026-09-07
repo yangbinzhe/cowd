@@ -8,6 +8,11 @@ use super::*;
 /// ever dropped while the task can continue detached from Gateway ownership.
 pub(crate) struct SessionWorkerSupervisor {
     accepting: std::sync::atomic::AtomicBool,
+    /// Startup/shutdown admission fence for workers that can mutate durable
+    /// business state. Workers are spawned early so backend readiness can be
+    /// verified, but they cannot claim or reconcile work until ordered Runtime
+    /// restoration releases this latch.
+    producer_admission: watch::Sender<bool>,
     pub(super) shutdown: watch::Sender<bool>,
     workers: Mutex<Option<Vec<SupervisedWorker>>>,
     states: Arc<Mutex<BTreeMap<String, SessionWorkerObservation>>>,
@@ -15,6 +20,7 @@ pub(crate) struct SessionWorkerSupervisor {
     forced_aborts: Arc<std::sync::atomic::AtomicU64>,
     claim_lease_lost: Arc<std::sync::atomic::AtomicU64>,
     recovery: Mutex<crate::services::session_service::activation::SessionRecoverySummary>,
+    recovery_state: Mutex<SessionStartupRecoveryState>,
     recovery_completed_at_ms: std::sync::atomic::AtomicU64,
 }
 
@@ -22,6 +28,7 @@ impl SessionWorkerSupervisor {
     #[cfg(test)]
     pub(crate) fn for_tests() -> Arc<Self> {
         let (shutdown, _) = watch::channel(false);
+        let (producer_admission, _) = watch::channel(true);
         let states = REQUIRED_SESSION_WORKERS
             .into_iter()
             .map(|name| {
@@ -44,6 +51,7 @@ impl SessionWorkerSupervisor {
         let reconciliation = reconciliation_progress_map();
         Arc::new(Self {
             accepting: std::sync::atomic::AtomicBool::new(true),
+            producer_admission,
             shutdown,
             workers: Mutex::new(Some(Vec::new())),
             states: Arc::new(Mutex::new(states)),
@@ -51,6 +59,7 @@ impl SessionWorkerSupervisor {
             forced_aborts: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             claim_lease_lost: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             recovery: Mutex::new(Default::default()),
+            recovery_state: Mutex::new(SessionStartupRecoveryState::Completed),
             recovery_completed_at_ms: std::sync::atomic::AtomicU64::new(now_ms()),
         })
     }
@@ -61,6 +70,7 @@ impl SessionWorkerSupervisor {
         event_bus: Arc<SessionProjectionHub>,
     ) -> Result<Arc<Self>, String> {
         let (shutdown, _) = watch::channel(false);
+        let (producer_admission, _) = watch::channel(false);
         let claim_lease_lost = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let ingress_runtime = GatewaySessionIngressExecutor {
             runtime: Arc::clone(&runtime_service),
@@ -74,6 +84,7 @@ impl SessionWorkerSupervisor {
         let reconciliation = Arc::new(Mutex::new(reconciliation_progress_map()));
         let forced_aborts = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let ingress_states = Arc::clone(&states);
+        let ingress_producer_admission = producer_admission.clone();
         let ingress_factory: WorkerFactory = Arc::new(move |shutdown, ready| {
             let session_service = Arc::clone(&ingress_service);
             let executor = ingress_runtime.clone();
@@ -82,9 +93,18 @@ impl SessionWorkerSupervisor {
                 name: "ingress",
                 states: Arc::clone(&ingress_states),
             };
+            let producer_admission = ingress_producer_admission.subscribe();
             Box::pin(async move {
-                run_ingress_worker(session_service, executor, wake, reporter, shutdown, ready)
-                    .await?;
+                run_ingress_worker(
+                    session_service,
+                    executor,
+                    wake,
+                    reporter,
+                    producer_admission,
+                    shutdown,
+                    ready,
+                )
+                .await?;
                 Ok(())
             })
         });
@@ -105,6 +125,7 @@ impl SessionWorkerSupervisor {
         let delivery_runtime_services = delivery_runtime.runtime_services();
         let delivery_session_service = Arc::clone(&session_service);
         let delivery_states = Arc::clone(&states);
+        let delivery_producer_admission = producer_admission.clone();
         let delivery_factory: WorkerFactory = Arc::new(move |shutdown, ready| {
             let delivery_store = delivery_store.clone();
             let session_service = Arc::clone(&delivery_session_service);
@@ -115,6 +136,7 @@ impl SessionWorkerSupervisor {
                 name: "terminal_delivery",
                 states: Arc::clone(&delivery_states),
             };
+            let producer_admission = delivery_producer_admission.subscribe();
             Box::pin(async move {
                 run_delivery_worker(
                     delivery_store,
@@ -123,6 +145,7 @@ impl SessionWorkerSupervisor {
                     event_bus,
                     Some(runtime_services),
                     reporter,
+                    producer_admission,
                     shutdown,
                     ready,
                 )
@@ -140,14 +163,23 @@ impl SessionWorkerSupervisor {
         );
         let cleanup_service = Arc::clone(&session_service);
         let cleanup_states = Arc::clone(&states);
+        let cleanup_producer_admission = producer_admission.clone();
         let cleanup_factory: WorkerFactory = Arc::new(move |shutdown, ready| {
             let session_service = Arc::clone(&cleanup_service);
             let reporter = WorkerBackendReporter {
                 name: "working_set_cleanup",
                 states: Arc::clone(&cleanup_states),
             };
+            let producer_admission = cleanup_producer_admission.subscribe();
             Box::pin(async move {
-                run_session_cleanup_worker(session_service, reporter, shutdown, ready).await?;
+                run_session_cleanup_worker(
+                    session_service,
+                    reporter,
+                    producer_admission,
+                    shutdown,
+                    ready,
+                )
+                .await?;
                 Ok(())
             })
         });
@@ -165,6 +197,7 @@ impl SessionWorkerSupervisor {
         let lifecycle_event_bus = Arc::clone(&event_bus);
         let lifecycle_progress = Arc::clone(&reconciliation);
         let lifecycle_states = Arc::clone(&states);
+        let lifecycle_producer_admission = producer_admission.clone();
         let lifecycle_factory: WorkerFactory = Arc::new(move |shutdown, ready| {
             let session_service = Arc::clone(&lifecycle_service);
             let progress = Arc::clone(&lifecycle_progress);
@@ -175,6 +208,7 @@ impl SessionWorkerSupervisor {
                 name: "lifecycle_reconciliation",
                 states: Arc::clone(&lifecycle_states),
             };
+            let producer_admission = lifecycle_producer_admission.subscribe();
             Box::pin(run_lifecycle_reconciliation_worker(
                 session_service,
                 Some(runtime_service),
@@ -182,6 +216,7 @@ impl SessionWorkerSupervisor {
                 Some(event_bus),
                 progress,
                 reporter,
+                producer_admission,
                 shutdown,
                 ready,
             ))
@@ -197,6 +232,7 @@ impl SessionWorkerSupervisor {
         let branch_service = Arc::clone(&session_service);
         let branch_progress = Arc::clone(&reconciliation);
         let branch_states = Arc::clone(&states);
+        let branch_producer_admission = producer_admission.clone();
         let branch_factory: WorkerFactory = Arc::new(move |shutdown, ready| {
             let session_service = Arc::clone(&branch_service);
             let progress = Arc::clone(&branch_progress);
@@ -204,10 +240,12 @@ impl SessionWorkerSupervisor {
                 name: "branch_activation_reconciliation",
                 states: Arc::clone(&branch_states),
             };
+            let producer_admission = branch_producer_admission.subscribe();
             Box::pin(run_branch_activation_reconciliation_worker(
                 session_service,
                 progress,
                 reporter,
+                producer_admission,
                 shutdown,
                 ready,
             ))
@@ -235,7 +273,8 @@ impl SessionWorkerSupervisor {
             return Err(error);
         }
         Ok(Arc::new(Self {
-            accepting: std::sync::atomic::AtomicBool::new(true),
+            accepting: std::sync::atomic::AtomicBool::new(false),
+            producer_admission,
             shutdown,
             workers: Mutex::new(Some(workers)),
             states,
@@ -243,6 +282,7 @@ impl SessionWorkerSupervisor {
             forced_aborts,
             claim_lease_lost,
             recovery: Mutex::new(Default::default()),
+            recovery_state: Mutex::new(SessionStartupRecoveryState::InProgress),
             recovery_completed_at_ms: std::sync::atomic::AtomicU64::new(0),
         }))
     }
@@ -250,6 +290,7 @@ impl SessionWorkerSupervisor {
     pub(crate) fn record_recovery(
         &self,
         recovery: crate::services::session_service::activation::SessionRecoverySummary,
+        state: SessionStartupRecoveryState,
     ) {
         tracing::info!(
             discovered = recovery.discovered,
@@ -262,8 +303,9 @@ impl SessionWorkerSupervisor {
             metadata_only = recovery.metadata_only,
             model_rebind_required = recovery.model_rebind_required,
             failed = recovery.failed,
+            recovery_state = ?state,
             hot_bytes = recovery.hot_bytes,
-            "Session supervisor startup recovery completed"
+            "Session supervisor startup recovery attempt recorded"
         );
         for failure in &recovery.failures {
             tracing::warn!(error = %failure, "Session startup recovery item failed");
@@ -272,8 +314,18 @@ impl SessionWorkerSupervisor {
             .recovery
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = recovery;
-        self.recovery_completed_at_ms
-            .store(now_ms(), std::sync::atomic::Ordering::Release);
+        *self
+            .recovery_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = state;
+        self.recovery_completed_at_ms.store(
+            if state == SessionStartupRecoveryState::Completed {
+                now_ms()
+            } else {
+                0
+            },
+            std::sync::atomic::Ordering::Release,
+        );
     }
 
     pub(crate) fn health(&self) -> SessionWorkerHealth {
@@ -319,6 +371,10 @@ impl SessionWorkerSupervisor {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone(),
+            recovery_state: *self
+                .recovery_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
             recovery_completed_at_ms: self
                 .recovery_completed_at_ms
                 .load(std::sync::atomic::Ordering::Acquire),
@@ -338,6 +394,15 @@ impl SessionWorkerSupervisor {
     pub(crate) fn stop_accepting(&self) {
         self.accepting
             .store(false, std::sync::atomic::Ordering::Release);
+        self.producer_admission.send_replace(false);
+    }
+
+    /// Release every durable business-state producer after ordered Session,
+    /// graph, Program-dispatch and Program-wait recovery has completed.
+    pub(crate) fn release_recovered_producers(&self) {
+        self.accepting
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.producer_admission.send_replace(true);
     }
 
     pub(crate) async fn shutdown(&self) {

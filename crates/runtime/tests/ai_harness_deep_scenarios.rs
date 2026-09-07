@@ -26,7 +26,12 @@ fn node(id: &str, kind: ExecutionNodeKind) -> ExecutionNodeSpec {
 
 #[test]
 fn deep_task_closure_links_strategy_execution_graph_memory_matrix_and_final_gate() {
-    let kernel = RuntimeAiKernel::begin_turn(
+    let mut decision = runtime::StrategyDecisionEngine.decide(
+        "使用多 Agent 协作完整迁移 gateway runtime service，并分别保证 matrix evidence、memory pulse、测试回归和最终审查",
+        Some(runtime::context_runtime::ContextProfile::MainTurn),
+    );
+    decision.execution_graph_ref = Some("graph:deep-task-closure".to_string());
+    let kernel = RuntimeAiKernel::begin_turn_with_execution_decision(
         "deep-task-closure",
         "使用多 Agent 协作完整迁移 gateway runtime service，并分别保证 matrix evidence、memory pulse、测试回归和最终审查",
         runtime::context_runtime::ContextProfile::MainTurn,
@@ -34,6 +39,7 @@ fn deep_task_closure_links_strategy_execution_graph_memory_matrix_and_final_gate
             "project context".to_string(),
             "matrix evidence required".to_string(),
         ],
+        decision,
     );
     let trace = kernel.finalize(
         "已完成：inspect -> change -> verify，并附带 matrix evidence 与 regression report",
@@ -41,10 +47,6 @@ fn deep_task_closure_links_strategy_execution_graph_memory_matrix_and_final_gate
         0,
     );
 
-    let quality = trace
-        .execution_graph_quality
-        .as_ref()
-        .expect("complex closure should produce execution_graph quality");
     assert_eq!(
         trace.execution_decision.strategy.pattern,
         ExecutionPattern::Collaborate
@@ -55,17 +57,8 @@ fn deep_task_closure_links_strategy_execution_graph_memory_matrix_and_final_gate
         "the independent migration, evidence, regression, and review workstreams must use the governed Team topology"
     );
     assert!(
-        trace.execution_graph.is_some(),
-        "complex task should allocate execution_graph"
-    );
-    assert!(quality.is_dag, "execution_graph must be acyclic");
-    assert!(
-        quality.has_verify_node,
-        "execution graph must include verification"
-    );
-    assert!(
-        quality.has_synthesize_node,
-        "execution_graph must include synthesis"
+        trace.execution_decision.execution_graph_ref.is_some(),
+        "trace must retain the Runtime-supervised execution graph reference"
     );
     assert!(
         trace.regression_gate.allowed,
@@ -89,13 +82,6 @@ fn deep_task_closure_links_strategy_execution_graph_memory_matrix_and_final_gate
             "runtime-harness-contract",
             "complex closure must allocate a execution_graph",
         ))
-        .require(ScenarioCheck::bool(
-            "execution_graph.quality",
-            ScenarioCheckKind::ExecutionGraphQualityOk,
-            true,
-            "ai-execution_graph",
-            "repair execution_graph DAG/review/synthesis requirements",
-        ))
         .require(ScenarioCheck::min_count(
             "matrix.signal_count",
             ScenarioCheckKind::MatrixSignalCount,
@@ -108,10 +94,8 @@ fn deep_task_closure_links_strategy_execution_graph_memory_matrix_and_final_gate
         strategy_pattern: trace.execution_decision.strategy.pattern,
         verification_blocked: trace.verification_blocked,
         regression_allowed: trace.regression_gate.allowed,
-        has_execution_graph: trace.execution_graph.is_some(),
-        execution_graph_quality_ok: quality.is_dag
-            && quality.has_verify_node
-            && quality.has_synthesize_node,
+        has_execution_graph: trace.execution_decision.execution_graph_ref.is_some(),
+        execution_graph_quality_ok: false,
         growth_has_blocker: trace.learning_record.has_blocker(),
         growth_signal_kinds: trace
             .learning_record

@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use super::*;
 
-use harness_contract::agent::AgentCommand;
+use harness_contract::agent::{AgentCommand, AgenticExecutionBinding, AgenticExecutionFocus};
 use harness_contract::agent_action::{
     AgentAction, AgentActionEnvelope, AgentActorBinding, AgentActorKind, AgentInviteInput,
     ArtifactCommitInput, TaskClaimInput, TaskPublishInput, TaskSubmitInput, TeamCreateInput,
@@ -119,7 +119,6 @@ fn test_agent_packet(
         objective: "review".into(),
         required_acceptance: Default::default(),
         output_acceptance: Vec::new(),
-        requires_managed_collaboration_escalation: false,
         acceptance: Vec::new(),
         cohort_prompt_package: None,
         constraints: Vec::new(),
@@ -142,6 +141,7 @@ fn test_agent_packet(
         binding: None,
         managed_invocation: None,
         idempotency_key: "key".into(),
+        agentic_binding: None,
     }
 }
 
@@ -1266,7 +1266,7 @@ fn sandboxed_process_requires_and_accepts_only_a_whole_workspace_read_lease() {
         ),
         scope_locks: Arc::new(ScopeLockManager::new()),
         commit_service: Some(crate::execution_core::graph::ExecutionCommitService::new(
-            Arc::new(crate::RuntimeEventStore::try_open_in_memory().expect("effect ledger")),
+            Arc::new(crate::RuntimeEventStore::for_test()),
         )),
         resource_scopes: Some(scopes),
         managed_invocation: None,
@@ -2052,7 +2052,6 @@ fn durable_audits_are_promoted_to_agent_evidence_refs() {
         objective: "inspect".into(),
         required_acceptance: Default::default(),
         output_acceptance: Vec::new(),
-        requires_managed_collaboration_escalation: false,
         acceptance: Vec::new(),
         cohort_prompt_package: None,
         constraints: Vec::new(),
@@ -2082,6 +2081,7 @@ fn durable_audits_are_promoted_to_agent_evidence_refs() {
         binding: None,
         managed_invocation: None,
         idempotency_key: "key".into(),
+        agentic_binding: None,
     };
     let tool_access = harness_contract::context::EvidenceAccessRef::durable(
         harness_contract::context::EvidenceRef::observed("tool", "tool-1"),
@@ -2381,7 +2381,6 @@ fn delegated_prompt_rejects_simulated_tool_markup() {
         objective: "inspect source".into(),
         required_acceptance: Default::default(),
         output_acceptance: Vec::new(),
-        requires_managed_collaboration_escalation: false,
         acceptance: Vec::new(),
         cohort_prompt_package: None,
         constraints: Vec::new(),
@@ -2404,6 +2403,7 @@ fn delegated_prompt_rejects_simulated_tool_markup() {
         binding: None,
         managed_invocation: None,
         idempotency_key: "key".into(),
+        agentic_binding: None,
     };
     let prompt_segments = system_prompt(&packet, std::path::Path::new("/workspace"), &[]);
     let cohort_boundary = prompt_segments
@@ -2607,6 +2607,11 @@ async fn cross_team_review_checkpoint_is_valid_but_cross_team_execution_is_fence
             role: "Author".to_string(),
             mission: "produce".to_string(),
             required_capabilities: vec!["read".to_string()],
+            existing_agent_ref: None,
+            definition_ref: None,
+            model_profile_ref: None,
+            expertise_hints: Vec::new(),
+            execution_requirements: Vec::new(),
         }),
     )
     .expect("author")
@@ -2619,6 +2624,11 @@ async fn cross_team_review_checkpoint_is_valid_but_cross_team_execution_is_fence
             role: "Reviewer".to_string(),
             mission: "verify independently".to_string(),
             required_capabilities: vec!["read".to_string()],
+            existing_agent_ref: None,
+            definition_ref: None,
+            model_profile_ref: None,
+            expertise_hints: Vec::new(),
+            execution_requirements: Vec::new(),
         }),
     )
     .expect("reviewer")
@@ -2633,6 +2643,11 @@ async fn cross_team_review_checkpoint_is_valid_but_cross_team_execution_is_fence
             acceptance: "independent review".to_string(),
             required_capabilities: vec!["read".to_string()],
             depends_on: Vec::new(),
+
+            obligation_refs: Vec::new(),
+            purpose: Default::default(),
+            execution_requirements: Vec::new(),
+            expertise_hints: Vec::new(),
         }),
     )
     .expect("task")
@@ -2698,21 +2713,43 @@ async fn cross_team_review_checkpoint_is_valid_but_cross_team_execution_is_fence
     .expect("submit");
 
     let mut packet = test_agent_packet(Vec::new());
+    packet.assignment = crate::test_support::agent_assignment(
+        None,
+        &reviewer,
+        "review-checkpoint",
+        &task,
+        "session-checkpoint",
+        "review-checkpoint",
+        Some(&review_team),
+        "review-checkpoint-graph",
+        "review-checkpoint-node",
+    );
     packet.allowed_tools = vec!["task_review".to_string(), "read_file".to_string()];
-    packet.context_refs = vec![
-        "agentic_program:program-checkpoint".to_string(),
-        format!("agentic_member:{reviewer}"),
-        format!("agentic_task:{task}"),
-        "agentic_mode:review".to_string(),
-    ];
+    packet.context_refs = vec![task.clone()];
+    packet.agentic_binding = Some(AgenticExecutionBinding {
+        program_id: "program-checkpoint".to_string(),
+        agent_id: reviewer.clone(),
+        membership_id: format!("membership:{reviewer}:{review_team}"),
+        team_id: review_team,
+        task_team_id: author_team,
+        source_spec_revision: 1,
+        focus: AgenticExecutionFocus::TaskReview {
+            task_ref: task.clone(),
+        },
+    });
     let checkpoint = agent_autonomy_checkpoint(&services, &packet)
         .expect("cross-Team review checkpoint must remain valid")
         .expect("submitted Task requires a review action");
     assert!(checkpoint.prompt.contains("inspect_and_review"));
     assert!(checkpoint.tool_ids.iter().any(|tool| tool == "task_review"));
 
-    packet.context_refs.pop();
-    packet.context_refs.push("agentic_mode:execute".to_string());
+    packet
+        .agentic_binding
+        .as_mut()
+        .expect("test packet has a typed Agent-first binding")
+        .focus = AgenticExecutionFocus::TaskExecute {
+        task_ref: task.clone(),
+    };
     let error = match agent_autonomy_checkpoint(&services, &packet) {
         Err(error) => error,
         Ok(_) => panic!("cross-Team execution must remain fenced"),

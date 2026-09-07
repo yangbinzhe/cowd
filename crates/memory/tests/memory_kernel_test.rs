@@ -24,7 +24,6 @@ use memory::{
 fn test_config(sqlite_path: &std::path::Path) -> MemoryConfig {
     MemoryConfig {
         store: StoreConfig {
-            sqlite_path: sqlite_path.to_path_buf(),
             blob_dir: sqlite_path.parent().unwrap().join("blobs"),
             enable_vector_index: false,
             cache_capacity: 128,
@@ -136,7 +135,7 @@ fn memory_health_reports_degradation_state() {
 async fn memory_kernel_binds_session_agent_scope() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("kernel.db")))
+        CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("kernel.db")))
             .await
             .unwrap(),
     );
@@ -174,7 +173,7 @@ async fn memory_kernel_binds_session_agent_scope() {
 async fn checkpoint_compaction_promotes_only_reviewed_candidates() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("checkpoint.db")))
+        CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("checkpoint.db")))
             .await
             .unwrap(),
     );
@@ -290,7 +289,7 @@ async fn checkpoint_compaction_promotes_only_reviewed_candidates() {
 async fn memory_kernel_health_is_visible_and_non_degraded_on_empty_store() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("health.db")))
+        CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("health.db")))
             .await
             .unwrap(),
     );
@@ -308,7 +307,7 @@ async fn memory_kernel_health_is_visible_and_non_degraded_on_empty_store() {
 async fn memory_kernel_layer_views_project_atoms_read_only() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("views.db")))
+        CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("views.db")))
             .await
             .unwrap(),
     );
@@ -350,7 +349,7 @@ async fn memory_kernel_layer_views_project_atoms_read_only() {
 async fn memory_kernel_remember_binds_session_agent_and_scope() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("remember.db")))
+        CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("remember.db")))
             .await
             .unwrap(),
     );
@@ -386,7 +385,7 @@ async fn memory_kernel_remember_binds_session_agent_and_scope() {
 async fn memory_kernel_remember_replaces_default_project_scope() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("default-scope.db")))
+        CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("default-scope.db")))
             .await
             .unwrap(),
     );
@@ -420,7 +419,7 @@ async fn memory_kernel_remember_replaces_default_project_scope() {
 async fn memory_kernel_records_lifecycle_events() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("lifecycle.db")))
+        CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("lifecycle.db")))
             .await
             .unwrap(),
     );
@@ -451,7 +450,7 @@ async fn memory_kernel_records_lifecycle_events() {
 async fn memory_kernel_layer_view_reflects_lifecycle_state() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("state-view.db")))
+        CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("state-view.db")))
             .await
             .unwrap(),
     );
@@ -478,7 +477,7 @@ async fn memory_kernel_layer_view_reflects_lifecycle_state() {
 async fn superseded_atom_is_hidden_from_active_kernel_entries() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("prepare-state.db")))
+        CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("prepare-state.db")))
             .await
             .unwrap(),
     );
@@ -528,7 +527,7 @@ async fn superseded_atom_is_hidden_from_active_kernel_entries() {
 async fn memory_links_unify_relation_session_agent_and_tag_edges() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("links.db")))
+        CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("links.db")))
             .await
             .unwrap(),
     );
@@ -580,7 +579,7 @@ async fn memory_links_unify_relation_session_agent_and_tag_edges() {
 async fn path_recall_finds_related_decision() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("path.db")))
+        CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("path.db")))
             .await
             .unwrap(),
     );
@@ -622,7 +621,7 @@ async fn path_recall_finds_related_decision() {
 async fn path_recall_caps_expansion_on_dense_graph() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("dense-path.db")))
+        CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("dense-path.db")))
             .await
             .unwrap(),
     );
@@ -650,7 +649,7 @@ async fn path_recall_caps_expansion_on_dense_graph() {
 async fn memory_context_packet_prefers_explainable_orientation() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("packet.db")))
+        CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("packet.db")))
             .await
             .unwrap(),
     );
@@ -682,9 +681,11 @@ async fn memory_context_packet_prefers_explainable_orientation() {
 async fn memory_context_packet_includes_scoped_semantic_checkpoint() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("checkpoint-packet.db")))
-            .await
-            .unwrap(),
+        CognitiveContextManager::new_ephemeral(test_config(
+            &tmp.path().join("checkpoint-packet.db"),
+        ))
+        .await
+        .unwrap(),
     );
     let kernel = MemoryKernel::new(Arc::clone(&manager));
     let ctx = MemoryTurnContext::new("session-checkpoint", "agent-checkpoint");
@@ -716,9 +717,11 @@ async fn memory_context_packet_includes_scoped_semantic_checkpoint() {
 async fn memory_context_packet_omits_unrelated_semantic_checkpoint() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("checkpoint-unrelated.db")))
-            .await
-            .unwrap(),
+        CognitiveContextManager::new_ephemeral(test_config(
+            &tmp.path().join("checkpoint-unrelated.db"),
+        ))
+        .await
+        .unwrap(),
     );
     let kernel = MemoryKernel::new(Arc::clone(&manager));
     let ctx = MemoryTurnContext::new("session-checkpoint-unrelated", "agent-checkpoint");
@@ -750,7 +753,7 @@ async fn memory_context_packet_omits_unrelated_semantic_checkpoint() {
 async fn task_scoped_checkpoint_isolated_between_tasks() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("checkpoint-task.db")))
+        CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("checkpoint-task.db")))
             .await
             .unwrap(),
     );
@@ -794,7 +797,7 @@ async fn task_scoped_checkpoint_isolated_between_tasks() {
 async fn memory_context_packet_stays_bounded_on_large_candidate_set() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("packet-bounded.db")))
+        CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("packet-bounded.db")))
             .await
             .unwrap(),
     );
@@ -832,7 +835,7 @@ async fn runtime_managed_memory_packet_enforces_layer_budget() {
     cfg.budget.l2_project = 12;
     cfg.budget.l3_deep = 1_000;
     cfg.budget.l3_checkpoint = 1_000;
-    let manager = Arc::new(CognitiveContextManager::new(cfg).await.unwrap());
+    let manager = Arc::new(CognitiveContextManager::new_ephemeral(cfg).await.unwrap());
     let kernel = MemoryKernel::new(Arc::clone(&manager));
     let candidates = (0..3)
         .map(|idx| {
@@ -863,7 +866,7 @@ async fn runtime_managed_memory_packet_enforces_layer_budget() {
 async fn l0_requires_user_or_system_write() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("l0-guard.db")))
+        CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("l0-guard.db")))
             .await
             .unwrap(),
     );
@@ -885,7 +888,7 @@ async fn l0_requires_user_or_system_write() {
 async fn archive_hides_memory_without_deleting_evidence() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("archive.db")))
+        CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("archive.db")))
             .await
             .unwrap(),
     );
@@ -922,7 +925,7 @@ async fn archive_hides_memory_without_deleting_evidence() {
 async fn authoritative_memory_supersedes_old_fact() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("authority.db")))
+        CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("authority.db")))
             .await
             .unwrap(),
     );
@@ -965,7 +968,7 @@ async fn authoritative_memory_supersedes_old_fact() {
 async fn equal_authority_conflict_is_visible_for_review() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("conflict.db")))
+        CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("conflict.db")))
             .await
             .unwrap(),
     );
@@ -1007,7 +1010,7 @@ async fn equal_authority_conflict_is_visible_for_review() {
 async fn duplicate_memory_write_is_not_persisted_again() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("duplicate.db")))
+        CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("duplicate.db")))
             .await
             .unwrap(),
     );
@@ -1050,7 +1053,7 @@ async fn duplicate_memory_write_is_not_persisted_again() {
 async fn memory_runtime_clusters_large_documents_without_loading_full_body() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("clusters.db")))
+        CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("clusters.db")))
             .await
             .unwrap(),
     );
@@ -1079,7 +1082,7 @@ async fn memory_runtime_clusters_large_documents_without_loading_full_body() {
 async fn context_usage_feedback_updates_hot_summary_without_validating_memory() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("usage.db")))
+        CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("usage.db")))
             .await
             .unwrap(),
     );
@@ -1116,7 +1119,7 @@ async fn context_usage_feedback_updates_hot_summary_without_validating_memory() 
 async fn context_packet_preview_does_not_record_usage_or_validate_atoms() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("usage-preview.db")))
+        CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("usage-preview.db")))
             .await
             .unwrap(),
     );
@@ -1178,7 +1181,7 @@ async fn context_packet_preview_does_not_record_usage_or_validate_atoms() {
 async fn large_memory_context_packet_stays_bounded() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("large-packet.db")))
+        CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("large-packet.db")))
             .await
             .unwrap(),
     );
@@ -1209,7 +1212,7 @@ async fn large_memory_context_packet_stays_bounded() {
 async fn memory_kernel_post_turn_preserves_turn_success() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("post-turn.db")))
+        CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("post-turn.db")))
             .await
             .unwrap(),
     );
@@ -1245,9 +1248,11 @@ async fn concurrent_agents_do_not_share_memory_turn_context() {
 async fn concurrent_kernel_turns_do_not_cross_write_or_recall_identity() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("concurrent-turns.db")))
-            .await
-            .unwrap(),
+        CognitiveContextManager::new_ephemeral(test_config(
+            &tmp.path().join("concurrent-turns.db"),
+        ))
+        .await
+        .unwrap(),
     );
     let kernel = MemoryKernel::new(Arc::clone(&manager));
     let ctx_a = MemoryTurnContext::new("session-a", "agent-a");

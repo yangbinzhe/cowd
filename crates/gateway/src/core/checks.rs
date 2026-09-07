@@ -204,97 +204,6 @@ pub(crate) fn check_install_source_health() -> DiagnosticCheck {
     ]))
 }
 
-/// P1: PostgreSQL deployments must not keep active SQLite residue under the
-/// config storage directory. The check reports leftover files so operators
-/// can clean them with `cowd storage cleanup` instead of silently running
-/// with a dual-backend state.
-pub(crate) fn check_sqlite_residuals(config: Option<&runtime::RuntimeConfig>) -> DiagnosticCheck {
-    let storage_dir = runtime::cowd_dirs::config_home_dir().join("storage");
-    let live_pools = memory::sqlite_pool_instance_count();
-    let files = sqlite_residuals_below(&storage_dir);
-    let postgres = config.is_some_and(|config| {
-        matches!(
-            config.storage().backend,
-            runtime::StorageBackendSelection::Postgres | runtime::StorageBackendSelection::Auto
-        )
-    });
-    if files.is_empty() {
-        if postgres && live_pools > 0 {
-            DiagnosticCheck::new(
-                "SQLite residuals",
-                DiagnosticLevel::Warn,
-                format!(
-                    "PostgreSQL is active but {live_pools} live SQLite pool(s) exist; run `cowd storage cleanup --sqlite-residuals` after stopping the Gateway"
-                ),
-            )
-        } else {
-            DiagnosticCheck::new(
-                "SQLite residuals",
-                DiagnosticLevel::Ok,
-                format!("no SQLite files under config storage, live SQLite pools={live_pools}"),
-            )
-        }
-    } else if postgres {
-        DiagnosticCheck::new(
-            "SQLite residuals",
-            DiagnosticLevel::Warn,
-            format!(
-                "PostgreSQL is active but SQLite files remain: {}; live SQLite pools={live_pools}; run `cowd storage cleanup --sqlite-residuals` after stopping the Gateway",
-                files.join(", "),
-            ),
-        )
-    } else {
-        DiagnosticCheck::new(
-            "SQLite residuals",
-            DiagnosticLevel::Ok,
-            format!(
-                "SQLite backend files present: {}; live SQLite pools={live_pools}",
-                files.join(", ")
-            ),
-        )
-    }
-}
-
-fn sqlite_residuals_below(storage_dir: &Path) -> Vec<String> {
-    let mut files = Vec::new();
-    let mut directories = vec![storage_dir.to_path_buf()];
-    while let Some(directory) = directories.pop() {
-        let Ok(entries) = std::fs::read_dir(&directory) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if file_type.is_symlink() {
-                continue;
-            }
-            if file_type.is_dir() {
-                if !name.starts_with("sqlite-residuals-trash-") {
-                    directories.push(path);
-                }
-                continue;
-            }
-            if name.ends_with(".sqlite")
-                || name.ends_with(".sqlite3")
-                || name.ends_with("-wal")
-                || name.ends_with("-shm")
-            {
-                files.push(
-                    path.strip_prefix(storage_dir)
-                        .unwrap_or(path.as_path())
-                        .to_string_lossy()
-                        .into_owned(),
-                );
-            }
-        }
-    }
-    files.sort();
-    files
-}
-
 pub(crate) fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
     let in_repo = context.project_root.is_some();
     DiagnosticCheck::new(
@@ -551,15 +460,7 @@ pub(crate) fn check_enterprise_readiness(
             );
 
             let config_home = runtime::cowd_dirs::config_home_dir();
-            let layout = storage::StorageLayout::default_for_config_home(&config_home);
-            let session_db = layout
-                .sqlite_path("session")
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| layout.root.join("session.sqlite"));
-            let session_parent = session_db
-                .parent()
-                .map(|path| path.exists())
-                .unwrap_or(false);
+            let session_parent = config_home.exists();
             push_component(
                 "session",
                 if session_parent {
@@ -577,11 +478,7 @@ pub(crate) fn check_enterprise_readiness(
                         "config_home".to_string(),
                         json!(config_home.display().to_string()),
                     ),
-                    (
-                        "session_db".to_string(),
-                        json!(session_db.display().to_string()),
-                    ),
-                    ("session_db_exists".to_string(), json!(session_db.exists())),
+                    ("backend".to_string(), json!("postgres")),
                 ]),
             );
 
@@ -682,22 +579,6 @@ mod tests {
     use std::fs;
 
     use super::*;
-
-    #[test]
-    fn sqlite_residual_scan_includes_app_subdirectories_and_ignores_trash() {
-        let root = tempfile::tempdir().expect("storage root");
-        let app_dir = root.path().join("apps/mfg");
-        fs::create_dir_all(&app_dir).expect("app storage");
-        fs::write(app_dir.join("primary.sqlite"), []).expect("app residual");
-        let trash = root.path().join("sqlite-residuals-trash-1");
-        fs::create_dir_all(&trash).expect("trash storage");
-        fs::write(trash.join("memory.sqlite"), []).expect("trash residual");
-
-        assert_eq!(
-            sqlite_residuals_below(root.path()),
-            vec!["apps/mfg/primary.sqlite".to_string()]
-        );
-    }
 
     #[test]
     fn enterprise_webui_readiness_uses_the_configured_vite_bundle() {

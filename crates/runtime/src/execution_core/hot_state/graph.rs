@@ -151,33 +151,6 @@ pub(crate) fn estimate_graph_bytes(graph: &ExecutionGraph) -> u64 {
             .saturating_add(parent.execution_id.len())
             .saturating_add(parent.node_id.len());
     }
-    if let Some(orchestration) = &graph.orchestration {
-        bytes = bytes
-            .saturating_add(orchestration.mutation_id.len())
-            .saturating_add(
-                orchestration
-                    .applied_mutation_ids
-                    .iter()
-                    .map(String::len)
-                    .sum::<usize>(),
-            )
-            .saturating_add(
-                orchestration
-                    .completion
-                    .required_node_ids
-                    .iter()
-                    .map(String::len)
-                    .sum::<usize>(),
-            )
-            .saturating_add(
-                orchestration
-                    .completion
-                    .required_artifact_kinds
-                    .iter()
-                    .map(String::len)
-                    .sum::<usize>(),
-            );
-    }
     for node in &graph.nodes {
         bytes = bytes
             .saturating_add(std::mem::size_of_val(node))

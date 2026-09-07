@@ -19,7 +19,6 @@ required-features = ["test-fixtures"]
 cowd-app-protocol = { path = "../app-protocol" }
 harness-contract = { path = "../harness-contract" }
 fact-kernel = { path = "../fact-kernel" }
-fact-sqlite = { path = "../fact-sqlite" }
 matrix-core = { path = "../matrix/core" }
 matrix-repository = { path = "../matrix/repository" }
 model-protocol = { path = "../model-protocol" }
@@ -52,13 +51,12 @@ uuid = { version = "1", features = ["v4"] }
 rand = "0.8"
 ring = "0.17"
 futures = "0.3"
-rusqlite = { version = "0.31", features = ["bundled"] }
 libc = "0.2.186"
 tempfile = "3"
 
 [dev-dependencies]
-r2d2 = "0.8"
-r2d2_sqlite = "0.24"
+fact-kernel = { path = "../fact-kernel", features = ["test-support"] }
+session-postgres = { path = "../session-postgres" }
 tokio = { version = "1", features = ["test-util"] }
 
 [lints.rust]

@@ -5,6 +5,7 @@
 //! facade; callers never receive a host path or adapter-specific key.
 
 use std::{
+    collections::HashMap,
     fs,
     io::{Read, Seek, SeekFrom, Write},
     ops::Range,
@@ -15,7 +16,6 @@ use std::{
 
 use async_trait::async_trait;
 use harness_contract::context::{ArtifactRef, ArtifactWriteDescriptor};
-use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
@@ -138,8 +138,9 @@ impl From<std::io::Error> for ArtifactError {
 
 /// Adapter contract for the selected compact tier and artifact catalogue.
 ///
-/// PostgreSQL implementations live outside Runtime; the SQLite implementation
-/// below is Runtime's default local adapter. Blob bytes always remain behind
+/// Durable PostgreSQL implementations live outside Runtime. The process-local
+/// implementation below is available only through explicitly test-scoped
+/// constructors. Blob bytes always remain behind
 /// the selected `StorageDomainId::Blobs` endpoint.
 pub trait ArtifactMetadataRepository: Send + Sync {
     fn put_object(&self, object: &ArtifactObjectRecord) -> Result<bool, String>;
@@ -213,22 +214,18 @@ impl std::fmt::Debug for ArtifactStore {
 
 impl ArtifactStore {
     #[must_use]
-    pub fn sqlite_default(blob_root: impl Into<PathBuf>) -> Self {
+    pub fn for_test_default(blob_root: impl Into<PathBuf>) -> Self {
         let blob_root = blob_root.into();
-        let repository = Arc::new(SqliteArtifactRepository::new(
-            blob_root.join("artifact-catalog.sqlite3"),
-        ));
+        let repository = Arc::new(EphemeralArtifactRepository::default());
         Self::from_validated(blob_root, repository, ArtifactStoreConfig::default())
     }
 
-    pub fn sqlite(
+    pub fn for_test(
         blob_root: impl Into<PathBuf>,
         config: ArtifactStoreConfig,
     ) -> Result<Self, ArtifactError> {
         let blob_root = blob_root.into();
-        let repository = Arc::new(SqliteArtifactRepository::new(
-            blob_root.join("artifact-catalog.sqlite3"),
-        ));
+        let repository = Arc::new(EphemeralArtifactRepository::default());
         Self::new(blob_root, repository, config)
     }
 
@@ -767,194 +764,80 @@ impl ArtifactWriteSink for LocalArtifactWriter {
     }
 }
 
-#[derive(Debug)]
-pub struct SqliteArtifactRepository {
-    path: PathBuf,
-    connection: Mutex<Option<Connection>>,
+#[derive(Debug, Default)]
+pub struct EphemeralArtifactRepository {
+    state: Mutex<EphemeralArtifactState>,
 }
 
-impl SqliteArtifactRepository {
-    #[must_use]
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self {
-            path: path.into(),
-            connection: Mutex::new(None),
-        }
-    }
-
-    fn with_connection<T>(
-        &self,
-        operation: impl FnOnce(&Connection) -> Result<T, String>,
-    ) -> Result<T, String> {
-        let mut guard = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if guard.is_none() {
-            if let Some(parent) = self.path.parent() {
-                fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-            }
-            let connection = Connection::open(&self.path).map_err(|error| error.to_string())?;
-            connection
-                .query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0))
-                .map_err(|error| error.to_string())?;
-            connection
-                .pragma_update(None, "foreign_keys", true)
-                .map_err(|error| error.to_string())?;
-            connection
-                .execute_batch(
-                    "CREATE TABLE IF NOT EXISTS artifact_objects (
-                    sha256 TEXT PRIMARY KEY,
-                    bytes INTEGER NOT NULL,
-                    tier TEXT NOT NULL,
-                    compact_body BLOB,
-                    created_at_ms INTEGER NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS artifact_records (
-                    artifact_id TEXT PRIMARY KEY,
-                    sha256 TEXT NOT NULL REFERENCES artifact_objects(sha256),
-                    bytes INTEGER NOT NULL,
-                    media_type TEXT NOT NULL,
-                    visibility_scope TEXT NOT NULL,
-                    tier TEXT NOT NULL,
-                    created_at_ms INTEGER NOT NULL,
-                    last_access_at_ms INTEGER NOT NULL
-                 );
-                 CREATE INDEX IF NOT EXISTS idx_artifact_records_hash
-                    ON artifact_records(sha256);
-                 CREATE TABLE IF NOT EXISTS artifact_pins (
-                    artifact_id TEXT NOT NULL REFERENCES artifact_records(artifact_id)
-                        ON DELETE CASCADE,
-                    owner TEXT NOT NULL,
-                    until_ms INTEGER NOT NULL,
-                    PRIMARY KEY(artifact_id, owner)
-                 );",
-                )
-                .map_err(|error| error.to_string())?;
-            *guard = Some(connection);
-        }
-        let connection = guard
-            .as_ref()
-            .ok_or_else(|| "artifact SQLite connection was not initialized".to_string())?;
-        operation(connection)
-    }
+#[derive(Debug, Default)]
+struct EphemeralArtifactState {
+    objects: HashMap<String, ArtifactObjectRecord>,
+    records: HashMap<String, ArtifactRecord>,
+    pins: HashMap<(String, String), u64>,
 }
 
-impl ArtifactMetadataRepository for SqliteArtifactRepository {
+impl ArtifactMetadataRepository for EphemeralArtifactRepository {
     fn put_object(&self, object: &ArtifactObjectRecord) -> Result<bool, String> {
-        self.with_connection(|connection| {
-            connection
-                .execute(
-                    "INSERT OR IGNORE INTO artifact_objects
-                 (sha256, bytes, tier, compact_body, created_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![
-                        object.sha256,
-                        to_i64(object.bytes)?,
-                        tier_name(&object.tier),
-                        object.compact_body,
-                        to_i64(object.created_at_ms)?
-                    ],
-                )
-                .map(|changed| changed == 1)
-                .map_err(|error| error.to_string())
-        })
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if state.objects.contains_key(&object.sha256) {
+            return Ok(false);
+        }
+        state.objects.insert(object.sha256.clone(), object.clone());
+        Ok(true)
     }
 
     fn object(&self, sha256: &str) -> Result<Option<ArtifactObjectRecord>, String> {
-        self.with_connection(|connection| {
-            connection
-                .query_row(
-                    "SELECT sha256, bytes, tier, compact_body, created_at_ms
-                 FROM artifact_objects WHERE sha256=?1",
-                    [sha256],
-                    |row| {
-                        Ok(ArtifactObjectRecord {
-                            sha256: row.get(0)?,
-                            bytes: from_i64(row.get(1)?)?,
-                            tier: parse_tier(row.get::<_, String>(2)?)?,
-                            compact_body: row.get(3)?,
-                            created_at_ms: from_i64(row.get(4)?)?,
-                        })
-                    },
-                )
-                .optional()
-                .map_err(|error| error.to_string())
-        })
+        Ok(self
+            .state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .objects
+            .get(sha256)
+            .cloned())
     }
 
     fn put_record(&self, record: &ArtifactRecord) -> Result<(), String> {
-        self.with_connection(|connection| {
-            connection
-                .execute(
-                    "INSERT INTO artifact_records
-                 (artifact_id, sha256, bytes, media_type, visibility_scope, tier,
-                  created_at_ms, last_access_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    params![
-                        record.artifact_id,
-                        record.sha256,
-                        to_i64(record.bytes)?,
-                        record.media_type,
-                        record.visibility_scope,
-                        tier_name(&record.tier),
-                        to_i64(record.created_at_ms)?,
-                        to_i64(record.last_access_at_ms)?
-                    ],
-                )
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-        })
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if !state.objects.contains_key(&record.sha256) {
+            return Err("artifact object does not exist".to_string());
+        }
+        if state.records.contains_key(&record.artifact_id) {
+            return Err("artifact record already exists".to_string());
+        }
+        state
+            .records
+            .insert(record.artifact_id.clone(), record.clone());
+        Ok(())
     }
 
     fn record(&self, artifact_id: &str) -> Result<Option<ArtifactRecord>, String> {
-        self.with_connection(|connection| {
-            connection
-                .query_row(
-                    "SELECT artifact_id, sha256, bytes, media_type, visibility_scope, tier,
-                        created_at_ms, last_access_at_ms
-                 FROM artifact_records WHERE artifact_id=?1",
-                    [artifact_id],
-                    |row| {
-                        Ok(ArtifactRecord {
-                            artifact_id: row.get(0)?,
-                            sha256: row.get(1)?,
-                            bytes: from_i64(row.get(2)?)?,
-                            media_type: row.get(3)?,
-                            visibility_scope: row.get(4)?,
-                            tier: parse_tier(row.get::<_, String>(5)?)?,
-                            created_at_ms: from_i64(row.get(6)?)?,
-                            last_access_at_ms: from_i64(row.get(7)?)?,
-                        })
-                    },
-                )
-                .optional()
-                .map_err(|error| error.to_string())
-        })
+        Ok(self
+            .state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .records
+            .get(artifact_id)
+            .cloned())
     }
 
     fn touch(&self, artifact_id: &str, at_ms: u64) -> Result<(), String> {
-        self.with_connection(|connection| {
-            connection
-                .execute(
-                    "UPDATE artifact_records SET last_access_at_ms=?2 WHERE artifact_id=?1",
-                    params![artifact_id, to_i64(at_ms)?],
-                )
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-        })
+        if let Some(record) = self
+            .state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .records
+            .get_mut(artifact_id)
+        {
+            record.last_access_at_ms = at_ms;
+        }
+        Ok(())
     }
 
     fn remove_record(&self, artifact_id: &str) -> Result<(), String> {
-        self.with_connection(|connection| {
-            connection
-                .execute(
-                    "DELETE FROM artifact_records WHERE artifact_id=?1",
-                    [artifact_id],
-                )
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-        })
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.records.remove(artifact_id);
+        state.pins.retain(|(id, _), _| id != artifact_id);
+        Ok(())
     }
 
     fn unreferenced_objects_before(
@@ -962,129 +845,88 @@ impl ArtifactMetadataRepository for SqliteArtifactRepository {
         before_ms: u64,
         limit: usize,
     ) -> Result<Vec<ArtifactObjectRecord>, String> {
-        self.with_connection(|connection| {
-            let mut statement = connection
-                .prepare(
-                    "SELECT object.sha256, object.bytes, object.tier, object.compact_body,
-                        object.created_at_ms
-                 FROM artifact_objects object
-                 LEFT JOIN artifact_records record ON record.sha256=object.sha256
-                 WHERE record.artifact_id IS NULL AND object.created_at_ms <= ?1
-                 ORDER BY object.created_at_ms ASC LIMIT ?2",
-                )
-                .map_err(|error| error.to_string())?;
-            let rows = statement
-                .query_map(params![to_i64(before_ms)?, to_i64(limit as u64)?], |row| {
-                    Ok(ArtifactObjectRecord {
-                        sha256: row.get(0)?,
-                        bytes: from_i64(row.get(1)?)?,
-                        tier: parse_tier(row.get::<_, String>(2)?)?,
-                        compact_body: row.get(3)?,
-                        created_at_ms: from_i64(row.get(4)?)?,
-                    })
-                })
-                .map_err(|error| error.to_string())?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|error| error.to_string())
-        })
+        let state = self.state.lock().map_err(|error| error.to_string())?;
+        let mut objects = state
+            .objects
+            .values()
+            .filter(|object| {
+                object.created_at_ms <= before_ms
+                    && !state
+                        .records
+                        .values()
+                        .any(|record| record.sha256 == object.sha256)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        objects.sort_by_key(|object| object.created_at_ms);
+        objects.truncate(limit);
+        Ok(objects)
     }
 
     fn remove_object(&self, sha256: &str) -> Result<(), String> {
-        self.with_connection(|connection| {
-            connection
-                .execute(
-                    "DELETE FROM artifact_objects
-                 WHERE sha256=?1
-                 AND NOT EXISTS (
-                    SELECT 1 FROM artifact_records WHERE artifact_records.sha256=?1
-                 )",
-                    [sha256],
-                )
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-        })
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if !state.records.values().any(|record| record.sha256 == sha256) {
+            state.objects.remove(sha256);
+        }
+        Ok(())
     }
 
     fn pin(&self, artifact_id: &str, owner: &str, until_ms: u64) -> Result<(), String> {
-        self.with_connection(|connection| {
-            connection
-                .execute(
-                    "INSERT INTO artifact_pins (artifact_id, owner, until_ms)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(artifact_id, owner) DO UPDATE SET until_ms=excluded.until_ms",
-                    params![artifact_id, owner, to_i64(until_ms)?],
-                )
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-        })
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if !state.records.contains_key(artifact_id) {
+            return Err("artifact record does not exist".to_string());
+        }
+        state
+            .pins
+            .insert((artifact_id.to_string(), owner.to_string()), until_ms);
+        Ok(())
     }
 
     fn unpin(&self, artifact_id: &str, owner: &str) -> Result<(), String> {
-        self.with_connection(|connection| {
-            connection
-                .execute(
-                    "DELETE FROM artifact_pins WHERE artifact_id=?1 AND owner=?2",
-                    params![artifact_id, owner],
-                )
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-        })
+        self.state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .pins
+            .remove(&(artifact_id.to_string(), owner.to_string()));
+        Ok(())
     }
 
     fn is_pinned(&self, artifact_id: &str, at_ms: u64) -> Result<bool, String> {
-        self.with_connection(|connection| {
-            connection
-                .query_row(
-                    "SELECT EXISTS(
-                    SELECT 1 FROM artifact_pins
-                    WHERE artifact_id=?1 AND until_ms>?2
-                 )",
-                    params![artifact_id, to_i64(at_ms)?],
-                    |row| row.get(0),
-                )
-                .map_err(|error| error.to_string())
-        })
+        Ok(self
+            .state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .pins
+            .iter()
+            .any(|((id, _), until_ms)| id == artifact_id && *until_ms > at_ms))
     }
 
     fn stats(&self, at_ms: u64) -> Result<ArtifactStoreStats, String> {
-        self.with_connection(|connection| {
-            let (objects, physical_bytes, compact_bytes, blob_bytes) = connection
-                .query_row(
-                    "SELECT COUNT(*), COALESCE(SUM(bytes), 0),
-                        COALESCE(SUM(CASE WHEN tier='compact' THEN bytes ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN tier='blob' THEN bytes ELSE 0 END), 0)
-                 FROM artifact_objects",
-                    [],
-                    |row| {
-                        Ok((
-                            from_i64(row.get(0)?)?,
-                            from_i64(row.get(1)?)?,
-                            from_i64(row.get(2)?)?,
-                            from_i64(row.get(3)?)?,
-                        ))
-                    },
-                )
-                .map_err(|error| error.to_string())?;
-            let artifacts = connection
-                .query_row("SELECT COUNT(*) FROM artifact_records", [], |row| {
-                    from_i64(row.get(0)?)
-                })
-                .map_err(|error| error.to_string())?;
-            let pins = connection
-                .query_row(
-                    "SELECT COUNT(*) FROM artifact_pins WHERE until_ms>?1",
-                    [to_i64(at_ms)?],
-                    |row| from_i64(row.get(0)?),
-                )
-                .map_err(|error| error.to_string())?;
-            Ok(ArtifactStoreStats {
-                objects,
-                artifacts,
-                physical_bytes,
-                compact_bytes,
-                blob_bytes,
-                pins,
-            })
+        let state = self.state.lock().map_err(|error| error.to_string())?;
+        let physical_bytes = state.objects.values().map(|object| object.bytes).sum();
+        let compact_bytes = state
+            .objects
+            .values()
+            .filter(|object| object.tier == ArtifactObjectTier::Compact)
+            .map(|object| object.bytes)
+            .sum();
+        let blob_bytes = state
+            .objects
+            .values()
+            .filter(|object| object.tier == ArtifactObjectTier::Blob)
+            .map(|object| object.bytes)
+            .sum();
+        Ok(ArtifactStoreStats {
+            objects: state.objects.len() as u64,
+            artifacts: state.records.len() as u64,
+            physical_bytes,
+            compact_bytes,
+            blob_bytes,
+            pins: state
+                .pins
+                .values()
+                .filter(|until_ms| **until_ms > at_ms)
+                .count() as u64,
         })
     }
 }
@@ -1118,29 +960,6 @@ fn normalize_range(requested: Option<Range<u64>>, bytes: u64) -> Result<Range<u6
     Ok(range)
 }
 
-fn tier_name(tier: &ArtifactObjectTier) -> &'static str {
-    match tier {
-        ArtifactObjectTier::Compact => "compact",
-        ArtifactObjectTier::Blob => "blob",
-    }
-}
-
-fn parse_tier(value: String) -> rusqlite::Result<ArtifactObjectTier> {
-    match value.as_str() {
-        "compact" => Ok(ArtifactObjectTier::Compact),
-        "blob" => Ok(ArtifactObjectTier::Blob),
-        _ => Err(rusqlite::Error::InvalidQuery),
-    }
-}
-
-fn to_i64(value: u64) -> Result<i64, String> {
-    i64::try_from(value).map_err(|_| format!("artifact integer {value} exceeds SQLite i64"))
-}
-
-fn from_i64(value: i64) -> rusqlite::Result<u64> {
-    u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, value))
-}
-
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1163,7 +982,7 @@ mod tests {
             gc_low_water_bytes: 3_000,
             orphan_grace_ms: 0,
         };
-        let store = ArtifactStore::sqlite(temporary.path(), config).expect("artifact store");
+        let store = ArtifactStore::for_test(temporary.path(), config).expect("artifact store");
         let descriptor = |scope: &str| ArtifactWriteDescriptor {
             media_type: "application/octet-stream".to_string(),
             visibility_scope: scope.to_string(),
@@ -1197,7 +1016,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_returns_durable_ref_and_rejects_unknown_or_invalid() {
         let temporary = tempfile::tempdir().unwrap();
-        let store = ArtifactStore::sqlite(temporary.path(), ArtifactStoreConfig::default())
+        let store = ArtifactStore::for_test(temporary.path(), ArtifactStoreConfig::default())
             .expect("artifact store");
         let written = store
             .write_bytes(
@@ -1230,7 +1049,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_content_deduplicates_physical_bytes_and_abort_is_invisible() {
         let temporary = tempfile::tempdir().unwrap();
-        let store = ArtifactStore::sqlite(temporary.path(), ArtifactStoreConfig::default())
+        let store = ArtifactStore::for_test(temporary.path(), ArtifactStoreConfig::default())
             .expect("artifact store");
         let descriptor = ArtifactWriteDescriptor {
             media_type: "text/plain".to_string(),
@@ -1258,7 +1077,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_an_unfinished_writer_removes_staging_bytes() {
         let temporary = tempfile::tempdir().unwrap();
-        let store = ArtifactStore::sqlite(temporary.path(), ArtifactStoreConfig::default())
+        let store = ArtifactStore::for_test(temporary.path(), ArtifactStoreConfig::default())
             .expect("artifact store");
         let staging_root = temporary.path().join("staging");
         let mut writer = store
@@ -1282,7 +1101,7 @@ mod tests {
     #[tokio::test]
     async fn streaming_writer_handles_one_hundred_megabytes_without_whole_object_buffering() {
         let temporary = tempfile::tempdir().unwrap();
-        let store = ArtifactStore::sqlite(
+        let store = ArtifactStore::for_test(
             temporary.path(),
             ArtifactStoreConfig {
                 compact_threshold_bytes: 256 * 1024,
@@ -1326,7 +1145,7 @@ mod tests {
     #[tokio::test]
     async fn quota_pin_and_gc_enforce_lifecycle_contract() {
         let temporary = tempfile::tempdir().unwrap();
-        let store = ArtifactStore::sqlite(
+        let store = ArtifactStore::for_test(
             temporary.path(),
             ArtifactStoreConfig {
                 compact_threshold_bytes: 4,
@@ -1382,7 +1201,7 @@ mod tests {
     #[tokio::test]
     async fn eighty_concurrent_range_reads_are_stable_and_scoped() {
         let temporary = tempfile::tempdir().unwrap();
-        let store = ArtifactStore::sqlite(
+        let store = ArtifactStore::for_test(
             temporary.path(),
             ArtifactStoreConfig {
                 compact_threshold_bytes: 8,

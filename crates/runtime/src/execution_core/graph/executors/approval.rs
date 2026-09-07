@@ -360,7 +360,7 @@ mod tests {
 
     #[tokio::test]
     async fn approval_waits_and_only_completes_after_queue_decision() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let queue = Arc::new(ApprovalQueue::new(store));
         let executor = ApprovalNodeExecutor::new(Arc::clone(&queue));
         let mut graph = ExecutionGraph::new("approval");
@@ -408,7 +408,7 @@ mod tests {
 
     #[tokio::test]
     async fn skipped_approval_completes_node_without_grant() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let queue = Arc::new(ApprovalQueue::new(store));
         let executor = ApprovalNodeExecutor::new(Arc::clone(&queue));
         let mut graph = ExecutionGraph::new("skip approval");
@@ -457,7 +457,7 @@ mod tests {
 
     #[tokio::test]
     async fn parent_terminal_cancels_correlated_pending_approval() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let queue = Arc::new(ApprovalQueue::new(store));
         let executor = ApprovalNodeExecutor::new(Arc::clone(&queue));
         let mut graph = ExecutionGraph::new("cancel pending approval");
@@ -497,7 +497,7 @@ mod tests {
 
     #[tokio::test]
     async fn skipped_approval_blocks_write_capable_node() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let queue = Arc::new(ApprovalQueue::new(store));
         let executor = ApprovalNodeExecutor::new(Arc::clone(&queue));
         let mut graph = ExecutionGraph::new("skip write approval");
@@ -543,7 +543,7 @@ mod tests {
 
     #[tokio::test]
     async fn skipped_approval_blocks_prefix_bypass_capability() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let queue = Arc::new(ApprovalQueue::new(store));
         let executor = ApprovalNodeExecutor::new(Arc::clone(&queue));
         let mut graph = ExecutionGraph::new("skip prefix bypass");
@@ -593,7 +593,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_graph_approval_is_fenced_by_the_live_policy_revision() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let queue = Arc::new(ApprovalQueue::new(store));
         let policy = SessionExecutionPolicy::from_profile(
             crate::AutonomyProfileId::Yolo,
@@ -643,7 +643,7 @@ mod tests {
 
     #[tokio::test]
     async fn autonomous_full_access_is_approval_authority_with_audit() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let queue = Arc::new(ApprovalQueue::new(store));
         let policy = SessionExecutionPolicy::from_profile(
             crate::AutonomyProfileId::Autonomous,

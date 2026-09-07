@@ -335,7 +335,7 @@ pub(crate) fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition
                     "profile": { "type": "string" },
                     "detail": {
                         "type": "string",
-                        "enum": ["summary", "execution_patterns", "team_templates", "agent_catalog", "orchestration_options", "runtime_action_contract", "capability_catalog", "action_selection", "budget_controls", "policy_gates"]
+                        "enum": ["summary", "execution_patterns", "agent_catalog", "orchestration_options", "runtime_action_contract", "capability_catalog", "budget_controls", "policy_gates"]
                     }
                 },
                 "required": ["intent"],
@@ -373,7 +373,7 @@ fn agent_action_tool_definitions() -> Vec<RuntimeToolDefinition> {
     vec![
         agent_action_definition::<action::StateInspectInput>(
             action::STATE_INSPECT_TOOL_ID,
-            "Inspect the current Program, Team, roster, work, topic and artifact facts. Runtime binds the Objective, Program and actor; provide only an optional scope reference and cursor.",
+            "Inspect the current Program, Team, roster, work, topic and artifact facts. Runtime binds the Objective, Program and actor; provide only an optional scope reference and cursor. Optional scope_ref=collaboration_patterns returns evidence-backed structural suggestions from previous completed Turns; they are advice, not execution rules or capability grants.",
         ),
         agent_action_definition::<action::TeamCreateInput>(
             action::TEAM_CREATE_TOOL_ID,
@@ -399,6 +399,10 @@ fn agent_action_tool_definitions() -> Vec<RuntimeToolDefinition> {
             action::TASK_SUPERSEDE_TOOL_ID,
             "Retire failed or challenged work in favor of concrete successor Tasks. Supply one replacement Task reference, or multiple references for a split, plus durable evidence and a reason. Retirement preserves failure history and never counts as accepted work.",
         ),
+        agent_action_definition::<action::TaskWithdrawInput>(
+            action::TASK_WITHDRAW_TOOL_ID,
+            "Withdraw an unproductive or invalid Task with a durable reason and optional evidence. Runtime preserves the original obligation, stops further physical attempts safely, and leaves dependent work waiting until an eligible replacement is accepted; withdrawal never fabricates completion.",
+        ),
         agent_action_definition::<action::TaskSubmitInput>(
             action::TASK_SUBMIT_TOOL_ID,
             "Submit one claimed Task using committed artifact and evidence references. Long result content must be committed separately, never embedded in this action. unresolved carries honest limitations or follow-up disclosures for the independent reviewer; that reviewer decides whether they block Task acceptance.",
@@ -414,6 +418,22 @@ fn agent_action_tool_definitions() -> Vec<RuntimeToolDefinition> {
         agent_action_definition::<action::ArtifactCommitInput>(
             action::ARTIFACT_COMMIT_TOOL_ID,
             "Commit a staged model content part or existing content reference as a versioned artifact. Use content_ref=preceding_content only when ordinary model content immediately precedes this tool call; never put the content body in JSON.",
+        ),
+        agent_action_definition::<action::ObjectiveUpdateInput>(
+            action::OBJECTIVE_UPDATE_TOOL_ID,
+            "Evolve one non-user Objective criterion from durable source material. Add a new criterion, or replace/retire a derived one with a reason and evidence. Runtime protects immutable user intent and rejects a change that would silently remove user obligations.",
+        ),
+        agent_action_definition::<action::ObjectiveReviewInput>(
+            action::OBJECTIVE_REVIEW_TOOL_ID,
+            "Record an evidence-backed review of one Objective criterion as satisfied, gapped, or blocked. Use durable result and evidence references plus a reason; Runtime binds the verdict to the current Objective generation and prevents stale review from finalizing a newer plan.",
+        ),
+        agent_action_definition::<action::MembershipUpdateInput>(
+            action::MEMBERSHIP_UPDATE_TOOL_ID,
+            "Request one Agent join or leave a Team using the stable Agent and Team references. Runtime checks delegation and active work, then preserves or safely transfers in-flight obligations rather than silently discarding them.",
+        ),
+        agent_action_definition::<action::TeamUpdateInput>(
+            action::TEAM_UPDATE_TOOL_ID,
+            "Refine a Team mission from a durable reference or request Team retirement with a reason. Runtime applies roster and active-work safety checks; this action changes organization, not the immutable user goal.",
         ),
         agent_action_definition::<action::ObjectiveCompleteRequestInput>(
             action::OBJECTIVE_COMPLETE_REQUEST_TOOL_ID,

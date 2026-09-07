@@ -5,6 +5,8 @@
 //! a typed handoff reference; same-session candidates are ordered by recency
 //! and a CAS claim guarantees one new root per continuation digest+ingress.
 
+use std::sync::Arc;
+
 use harness_contract::turn::{
     CollaborationContinuationBinding, ContinuationAuthorization, SessionHandoff,
 };
@@ -18,7 +20,6 @@ use crate::{
 };
 
 const CONTINUATION_CAS_STREAM: &str = "continuation-cas";
-const SESSION_HISTORY_PAGE: usize = 64;
 
 /// One eligible continuation source derived from durable history.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,106 +61,92 @@ pub fn compile_continuation_binding(
     Ok(binding)
 }
 
-/// Loads the newest *eligible* collaboration result from the exact Session
-/// strategy stream.  This deliberately reads durable strategy facts, not
-/// user/assistant text or a mutable Team projection.  The current turn is
-/// excluded so a retry cannot accidentally bind a root to itself.
+/// Loads the newest verified Agentic Program from the exact Session. The
+/// continuation authority is the durable Program reducer and its objective
+/// verdict, never a legacy strategy receipt or user/assistant prose. The
+/// current turn is excluded so a retry cannot bind a root to itself.
 pub fn latest_same_session_candidate(
-    store: &RuntimeEventStore,
+    store: &Arc<RuntimeEventStore>,
     session_id: &str,
     current_turn_id: &str,
 ) -> Result<Option<(ContinuationCandidate, u64)>, String> {
     if session_id.trim().is_empty() || current_turn_id.trim().is_empty() {
         return Err("continuation lookup requires a session and turn identity".to_string());
     }
-    let stream_id = format!("session:{session_id}");
-    let page = store.list_stream_page_desc(&stream_id, SESSION_HISTORY_PAGE, 0)?;
-    for event in page {
-        if event.kind != "runtime.strategy.outcome"
-            || event.status.as_deref() != Some("completed")
-            || event
-                .payload
-                .get("session_ref")
-                .and_then(serde_json::Value::as_str)
-                != Some(session_id)
+    let actions = crate::AgentActionService::new(Arc::clone(store));
+    let streams = store
+        .stream_ids_for_scope(RuntimeEventScope::Program)
+        .map_err(|error| error.to_string())?;
+    let mut candidates = Vec::new();
+    for stream_id in streams {
+        let Some(program_id) = stream_id.strip_prefix("agentic-program:") else {
+            continue;
+        };
+        let Some(program) = actions
+            .project_if_exists(program_id)
+            .map_err(|error| error.to_string())?
+        else {
+            continue;
+        };
+        if program.session_id != session_id
+            || program.turn_id == current_turn_id
+            || program.status != crate::AgenticProgramStatus::Verified
         {
             continue;
         }
-        let Some(source_turn_id) = event
-            .payload
-            .get("turn_ref")
-            .and_then(serde_json::Value::as_str)
-            .filter(|turn| !turn.trim().is_empty())
+        let Some(source_root_id) = program
+            .root_execution_id
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+            .cloned()
         else {
             continue;
         };
-        if source_turn_id == current_turn_id {
-            continue;
-        }
-        let Some(source_root_id) = event
-            .payload
-            .get("execution_graph_ref")
-            .and_then(serde_json::Value::as_str)
-            .filter(|graph| !graph.trim().is_empty())
-        else {
-            continue;
-        };
-        let Some(receipt) = event
-            .payload
-            .get("collaboration_receipt")
-            .filter(|receipt| !receipt.is_null())
-        else {
-            continue;
-        };
-        if receipt
-            .get("degraded")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-            || receipt
-                .get("verified_team_executions")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0)
-                == 0
-        {
-            continue;
-        }
-        let Some(team_graph_id) = receipt
-            .pointer("/evidence/graph_id")
-            .or_else(|| receipt.pointer("/execution/graph_id"))
-            .and_then(serde_json::Value::as_str)
-            .filter(|graph| !graph.trim().is_empty())
-        else {
-            continue;
-        };
+        let delivery_revision = store
+            .list_stream_page_desc(&stream_id, 1, 0)?
+            .first()
+            .map_or(program.revision, |event| event.commit_cursor);
         let mut result_refs = vec![
             format!("execution_graph:{source_root_id}"),
-            format!("team_graph:{team_graph_id}"),
+            format!("agentic_program:{program_id}"),
         ];
-        if let Some(envelope_id) = receipt
-            .pointer("/delivery_envelope/envelope_id")
-            .and_then(serde_json::Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-        {
-            result_refs.push(format!("delivery_envelope:{envelope_id}"));
+        if let Some(final_artifact_ref) = program.final_artifact_ref.as_ref() {
+            result_refs.push(final_artifact_ref.clone());
         }
+        for artifact in program.artifacts.values() {
+            result_refs.extend([artifact.artifact_ref.clone(), artifact.content_ref.clone()]);
+        }
+        for task in program.tasks.values() {
+            result_refs.extend(task.artifact_refs.iter().cloned());
+            result_refs.extend(task.evidence_refs.iter().cloned());
+        }
+        for entry in program.topics.values().flatten() {
+            if let Some(content_ref) = entry.content_ref.as_ref() {
+                result_refs.push(content_ref.clone());
+            }
+            result_refs.extend(entry.refs.iter().cloned());
+        }
+        if let Some(completion) = program.completion_request.as_ref() {
+            result_refs.extend(completion.evidence_refs.iter().cloned());
+        }
+        result_refs.retain(|reference| !reference.trim().is_empty());
         result_refs.sort();
         result_refs.dedup();
-        return Ok(Some((
+        candidates.push((
             ContinuationCandidate {
                 source_session_id: session_id.to_string(),
-                source_turn_id: source_turn_id.to_string(),
-                source_root_id: source_root_id.to_string(),
-                team_set_ref: format!("team_graph:{team_graph_id}"),
-                // The Session event is the durable delivery revision.  A
-                // mutable graph revision is intentionally not consulted.
-                delivery_revision: event.sequence,
+                source_turn_id: program.turn_id,
+                source_root_id,
+                team_set_ref: format!("agentic_program:{program_id}"),
+                delivery_revision,
                 result_refs,
                 handoff_id: None,
             },
-            event.sequence,
-        )));
+            delivery_revision,
+        ));
     }
-    Ok(None)
+    candidates.sort_by_key(|(_, revision)| *revision);
+    Ok(candidates.pop())
 }
 
 fn continuation_digest(binding: &CollaborationContinuationBinding) -> Result<String, String> {
@@ -210,6 +197,14 @@ pub(crate) fn graph_continuation_claim_event(
     {
         return Err("continuation graph claim has an incomplete immutable binding".to_string());
     }
+    let (team_set_kind, team_set_id) =
+        if let Some(program_id) = binding.team_set_ref.strip_prefix("agentic_program:") {
+            ("agentic_program", program_id)
+        } else if let Some(handoff_id) = binding.team_set_ref.strip_prefix("session_handoff:") {
+            ("session_handoff", handoff_id)
+        } else {
+            return Err("continuation team_set_ref has no typed authority".to_string());
+        };
     let key = continuation_claim_key(binding);
     Ok(RuntimeTransactionEventInput {
         event: RuntimeEventInput {
@@ -228,11 +223,8 @@ pub(crate) fn graph_continuation_claim_event(
                     id: binding.source_root_id.clone(),
                 },
                 RuntimeEventRef {
-                    kind: "team_graph".to_string(),
-                    id: binding
-                        .team_set_ref
-                        .trim_start_matches("team_graph:")
-                        .to_string(),
+                    kind: team_set_kind.to_string(),
+                    id: team_set_id.to_string(),
                 },
                 RuntimeEventRef {
                     kind: "execution_graph".to_string(),
@@ -371,7 +363,7 @@ mod tests {
             source_session_id: session.to_string(),
             source_turn_id: turn.to_string(),
             source_root_id: root.to_string(),
-            team_set_ref: format!("team-set:{root}"),
+            team_set_ref: format!("agentic_program:program-{root}"),
             delivery_revision: 3,
             result_refs: vec![format!("result:{root}")],
             handoff_id: None,
@@ -419,7 +411,7 @@ mod tests {
 
     #[test]
     fn accepted_cross_session_handoff_is_the_only_cross_session_candidate_source() {
-        let store = RuntimeEventStore::try_open_in_memory().expect("event store");
+        let store = RuntimeEventStore::for_test();
         let handoff = SessionHandoff {
             handoff_id: "handoff-authorized".to_string(),
             source_session_id: "session-source".to_string(),
@@ -477,32 +469,60 @@ mod tests {
             .expect("accepted handoff authorizes cross-session continuation");
     }
 
-    fn append_outcome(
-        store: &RuntimeEventStore,
+    fn append_verified_program(
+        store: &Arc<RuntimeEventStore>,
         session: &str,
         turn: &str,
         root: &str,
-        team_graph: &str,
-        verified_teams: u64,
-        degraded: bool,
+        program_id: &str,
     ) -> Result<(), String> {
+        let actions = crate::AgentActionService::new(Arc::clone(store));
+        actions
+            .apply(&harness_contract::agent_action::AgentActionEnvelope {
+                action_id: format!("open-{program_id}"),
+                actor: harness_contract::agent_action::AgentActorBinding {
+                    objective_id: format!("objective-{program_id}"),
+                    program_id: program_id.to_string(),
+                    session_id: session.to_string(),
+                    turn_id: turn.to_string(),
+                    root_execution_id: Some(root.to_string()),
+                    required_team_count: 1,
+                    objective_summary: format!("verified work for {program_id}"),
+                    model_lease: "test".to_string(),
+                    permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
+                    resource_scopes: Vec::new(),
+                    actor_id: format!("root:{session}"),
+                    kind: harness_contract::agent_action::AgentActorKind::Root,
+                    execution_id: None,
+                    team_id: None,
+                    agent_id: None,
+                },
+                expected_revision: None,
+                action: harness_contract::agent_action::AgentAction::TeamCreate(
+                    harness_contract::agent_action::TeamCreateInput {
+                        name: format!("Team {program_id}"),
+                        mission: "preserve verified context".to_string(),
+                        objective: None,
+                    },
+                ),
+            })
+            .map_err(|error| error.to_string())?;
         store
             .append(RuntimeEventInput {
-                stream_id: format!("session:{session}"),
-                scope: RuntimeEventScope::Session,
-                kind: "runtime.strategy.outcome".to_string(),
-                status: Some("completed".to_string()),
+                stream_id: format!("agentic-program:{program_id}"),
+                scope: RuntimeEventScope::Program,
+                kind: "agentic.objective_verdict_bound".to_string(),
+                status: Some("verified".to_string()),
                 actor: Some("test".to_string()),
                 refs: Vec::new(),
                 payload: json!({
-                    "session_ref": session,
-                    "turn_ref": turn,
-                    "execution_graph_ref": root,
-                    "collaboration_receipt": {
-                        "verified_team_executions": verified_teams,
-                        "degraded": degraded,
-                        "evidence": { "graph_id": team_graph },
-                        "delivery_envelope": { "envelope_id": format!("envelope:{team_graph}") },
+                    "program_id": program_id,
+                    "verdict": {
+                        "goal_id": format!("goal-{program_id}"),
+                        "goal_revision": 2,
+                        "terminal_fence": format!("fence-{program_id}"),
+                        "authority_revision": 2,
+                        "kind": "satisfied",
                     },
                 }),
             })
@@ -510,38 +530,18 @@ mod tests {
     }
 
     #[test]
-    fn same_session_continuation_uses_latest_verified_receipt_and_excludes_current_turn() {
-        let store = RuntimeEventStore::try_open_in_memory().expect("event store");
-        append_outcome(
-            &store,
-            "session-a",
-            "turn-old",
-            "root-old",
-            "team-old",
-            2,
-            false,
-        )
-        .expect("old outcome");
-        append_outcome(
-            &store,
-            "session-a",
-            "turn-degraded",
-            "root-degraded",
-            "team-degraded",
-            2,
-            true,
-        )
-        .expect("degraded outcome");
-        append_outcome(
+    fn same_session_continuation_uses_verified_agentic_program_and_excludes_current_turn() {
+        let store = Arc::new(RuntimeEventStore::for_test());
+        append_verified_program(&store, "session-a", "turn-old", "root-old", "program-old")
+            .expect("old Program");
+        append_verified_program(
             &store,
             "session-a",
             "turn-current",
             "root-current",
-            "team-current",
-            2,
-            false,
+            "program-current",
         )
-        .expect("current outcome");
+        .expect("current Program");
 
         let (candidate, revision) =
             latest_same_session_candidate(&store, "session-a", "turn-current")
@@ -549,12 +549,11 @@ mod tests {
                 .expect("eligible candidate");
         assert_eq!(candidate.source_turn_id, "turn-old");
         assert_eq!(candidate.source_root_id, "root-old");
-        assert_eq!(candidate.team_set_ref, "team_graph:team-old");
+        assert_eq!(candidate.team_set_ref, "agentic_program:program-old");
         assert!(revision > 0);
-        assert_eq!(
-            candidate.result_refs[0],
-            "delivery_envelope:envelope:team-old"
-        );
+        assert!(candidate
+            .result_refs
+            .contains(&"agentic_program:program-old".to_string()));
     }
 
     #[test]

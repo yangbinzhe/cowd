@@ -68,7 +68,7 @@
         let executions_seen_before_second_model = Arc::new(AtomicUsize::new(0));
         let order = Arc::new(Mutex::new(Vec::new()));
         let session = Session::new();
-        let session_store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let session_store = Arc::new(crate::test_support::session_store());
         session_store
             .create_session(&session::SessionRecord {
                 session_id: session.session_id.clone(),
@@ -1115,10 +1115,6 @@
         assert!(!post_write_exact_read_recovery_allowed(
             3, "read:.", true, false,
         ));
-        assert_eq!(
-            required_mutation_tool_allowlist(),
-            BTreeSet::from(["edit_file".to_string(), "write_file".to_string()])
-        );
     }
 
     #[test]

@@ -5,24 +5,17 @@
 //! monotonic commit cursor and never a partially appended multi-stream update.
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex as StdMutex, OnceLock,
 };
 use std::time::{Duration, Instant};
 
-use rusqlite::{
-    params, params_from_iter, types::Value as SqliteValue, Connection, OptionalExtension,
-    Transaction,
-};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use storage::{SqliteConnectionLease, SqliteExecutor, StorageHandle};
 use thiserror::Error;
 
-const STORE_SCHEMA_VERSION: i64 = 10;
 const SCOPE_REPLAY_PAGE_SIZE: usize = 1_024;
 const EVENT_SCHEMA_VERSION: u32 = 1;
 const MAX_TRANSACTION_EVENTS: usize = 10_000;
@@ -33,13 +26,6 @@ const SESSION_TERMINAL_ARTIFACT_REF_PREFIX: &str = "terminal_artifact_v1:";
 /// Gateway consumers accept every positive version through this value so a
 /// writer/reader rollout cannot drift through duplicated numeric literals.
 pub const SESSION_TERMINAL_ARTIFACT_SCHEMA_VERSION: u64 = 3;
-/// Projection lanes share SQLite's single writer with foreground lifecycle
-/// commits.  They must yield quickly under a sustained write load, but an
-/// immediate (0ms) failure turns ordinary writer hand-off into noisy failed
-/// projection passes.  This short bounded wait preserves foreground priority
-/// while allowing WAL's normal writer hand-off to settle before the reactor's
-/// durable retry/backoff policy takes over.
-const BACKGROUND_PROJECTION_BUSY_TIMEOUT_MS: u64 = 250;
 
 thread_local! {
     static PROJECTION_WORK_CLASS: Cell<Option<RuntimeProjectionWorkClass>> =
@@ -57,10 +43,8 @@ pub use domain::{
     validate_fenced_terminal as validate_runtime_fenced_terminal,
     validate_transaction as validate_runtime_event_transaction,
 };
-mod sqlite;
-#[cfg(test)]
-use sqlite::{create_current_tables, table_has_column};
-use sqlite::{validate_migration_snapshot, SqliteRuntimeEventStore};
+mod ephemeral;
+pub use ephemeral::EphemeralRuntimeEventStore;
 
 /// The sole Runtime-facing durable event-store API. Runtime callers depend on
 /// lifecycle semantics rather than a concrete database, path, pragma, or SQL
@@ -84,21 +68,10 @@ pub struct RuntimeEventStore {
 }
 
 impl RuntimeEventStore {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, String> {
-        Self::try_open(path).map_err(|error| error.to_string())
-    }
-
-    pub fn try_open(path: impl AsRef<Path>) -> RuntimeEventStoreResult<Self> {
-        SqliteRuntimeEventStore::try_open(path).map(|store| Self::from_backend(Arc::new(store)))
-    }
-
-    pub fn open_in_memory() -> Result<Self, String> {
-        Self::try_open_in_memory().map_err(|error| error.to_string())
-    }
-
-    pub fn try_open_in_memory() -> RuntimeEventStoreResult<Self> {
-        SqliteRuntimeEventStore::try_open_in_memory()
-            .map(|store| Self::from_backend(Arc::new(store)))
+    /// Construct an explicit process-local test backend.
+    #[must_use]
+    pub fn for_test() -> Self {
+        Self::from_backend(Arc::new(EphemeralRuntimeEventStore::new()))
     }
 
     pub fn run_projection_work<T>(
@@ -143,7 +116,11 @@ impl RuntimeEventStore {
         }
     }
 
-    fn with_stream_locks<T>(&self, stream_ids: &[String], work: impl FnOnce() -> T) -> T {
+    pub(crate) fn with_stream_locks<T>(
+        &self,
+        stream_ids: &[String],
+        work: impl FnOnce() -> T,
+    ) -> T {
         let unique = stream_ids
             .iter()
             .filter(|stream_id| !stream_id.is_empty())
@@ -203,6 +180,23 @@ impl RuntimeEventStore {
             self.with_stream_locks(&stream_ids, || self.backend.append_transaction(request))?;
         self.publish_commit(receipt.commit_cursor);
         Ok(receipt)
+    }
+
+    pub fn list_stream_after(
+        &self,
+        stream_id: &str,
+        after_sequence: u64,
+        through_sequence: u64,
+        max_events: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        self.backend.list_stream_after(
+            stream_id,
+            after_sequence,
+            through_sequence,
+            max_events,
+            max_bytes,
+        )
     }
 
     /// Appends without acquiring the per-stream lock. Only callers that
@@ -812,24 +806,6 @@ impl RuntimeEventStore {
             now_ms,
         )
     }
-
-    /// Export a canonical, read-only migration payload from a quiesced source.
-    pub fn export_migration_snapshot(&self) -> RuntimeEventStoreResult<RuntimeEventStoreSnapshot> {
-        self.backend.export_migration_snapshot()
-    }
-
-    /// Import a migration payload into an empty, already verified target.
-    /// Normal Runtime execution must never call this API.
-    pub fn import_migration_snapshot(
-        &self,
-        snapshot: &RuntimeEventStoreSnapshot,
-    ) -> RuntimeEventStoreResult<()> {
-        self.backend.import_migration_snapshot(snapshot)?;
-        if let Some(commit) = snapshot.commits.last() {
-            self.publish_commit(commit.commit_cursor);
-        }
-        Ok(())
-    }
 }
 
 fn monotonic_elapsed_ms() -> u64 {
@@ -843,7 +819,3 @@ fn monotonic_elapsed_ms() -> u64 {
     .unwrap_or(u64::MAX)
     .saturating_add(1)
 }
-
-#[cfg(test)]
-#[path = "tests.rs"]
-mod tests;

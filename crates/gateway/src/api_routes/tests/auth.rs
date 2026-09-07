@@ -347,11 +347,21 @@ use super::*;
         config_home: PathBuf,
     ) -> Arc<crate::services::GatewayServices> {
         let sessions = Arc::new(ActiveSessionDirectory::new());
-        let runtime_services =
-            runtime::RuntimeServices::in_memory().expect("test runtime services");
-        let runtime_store = session_repository.test_unified_store().unwrap_or_else(|| {
-            Arc::new(UnifiedSessionStore::open_in_memory().expect("test session store"))
-        });
+        let selected_storage = Arc::new(
+            crate::selected_storage::SelectedStorageTopology::compose_for_test(
+                &config_home,
+                &tool_workspace_root,
+            )
+            .expect("isolated PostgreSQL test topology; set COWD_TEST_POSTGRES_URL"),
+        );
+        let runtime_store = session_repository
+            .test_unified_store()
+            .unwrap_or_else(|| Arc::clone(&selected_storage.session_store));
+        let session_repository = Arc::new(SessionRepository::new(
+            session_repository.test_active_sessions(),
+            Some(Arc::clone(&runtime_store)),
+            session_repository.test_event_bus(),
+        ));
         let presence_ledger = Arc::new(
             crate::services::session_service::presence::SessionPresenceLedger::with_store(
                 Arc::clone(&runtime_store),
@@ -359,6 +369,26 @@ use super::*;
         );
         let session_runtime_port =
             crate::session_runtime_data_port::GatewaySessionRuntimePort::new();
+        let runtime_services = runtime::RuntimeServices::builder(&config_home, &tool_workspace_root)
+            .provider_registry(test_provider_registry())
+            .runtime_event_store(Arc::clone(&selected_storage.runtime_event_store))
+            .task_aggregate_service(Arc::clone(&selected_storage.task_service))
+            .artifact_store(Arc::clone(&selected_storage.artifact_store))
+            .reality_recall_port(Arc::new(
+                runtime::RealityRecallPort::with_fact_and_matrix_store(
+                    &config_home,
+                    Arc::clone(&selected_storage.fact_ledger),
+                    Arc::clone(&selected_storage.matrix_store),
+                )
+                .with_workspace_scope(&tool_workspace_root),
+            ))
+            .knowledge_activation(
+                runtime::knowledge_activation::KnowledgeActivationRuntime::with_fabric(
+                    selected_storage.knowledge_fabric.clone(),
+                ),
+            )
+            .build()
+            .expect("PostgreSQL-backed test runtime services");
         runtime_services
             .install_session_ports(
                 session_runtime_port.clone(),
@@ -399,18 +429,22 @@ use super::*;
                 runtime::SessionRecoveryConfig::default(),
             ),
         );
-        let services = Arc::new(crate::services::GatewayServices::new_with_config_home(
+        let services = Arc::new(
+            crate::services::GatewayServices::new_with_session_activation_and_storage(
             runtime,
-            session_activation,
-            crate::session_runtime_bridge::SessionWorkerSupervisor::for_tests(),
             surface_host.unwrap_or_else(|| {
-                Arc::new(
-                    crate::surface_host::SurfaceHost::baseline()
-                        .expect("test Surface message ledger"),
-                )
+                Arc::new(crate::surface_host::SurfaceHost::with_configs_and_message_store(
+                    Vec::new(),
+                    std::collections::BTreeMap::new(),
+                    Arc::clone(&selected_storage.surface_messages),
+                ))
             }),
             None,
+            session_activation,
+            crate::session_runtime_bridge::SessionWorkerSupervisor::for_tests(),
             config_home,
+            runtime::GatewayCapacityConfig::default(),
+            selected_storage,
         ));
         session_runtime_port
             .bind(&services.session)
@@ -422,11 +456,7 @@ use super::*;
         let sessions = Arc::new(ActiveSessionDirectory::new());
         let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionProjectionHub::new(); // returns Arc<Self>
-        let session_store = Arc::new(
-            UnifiedSessionStore::open_in_memory().expect("test session store should open"),
-        );
-        let session_repository =
-            test_session_repository(sessions.clone(), Some(session_store), event_bus.clone());
+        let session_repository = test_session_repository(sessions.clone(), None, event_bus.clone());
         Arc::new(AppState {
             tool_registry: tools,
             config: None,
@@ -568,7 +598,6 @@ use super::*;
     fn test_memory_config(sqlite_path: &std::path::Path) -> memory::MemoryConfig {
         memory::MemoryConfig {
             store: StoreConfig {
-                sqlite_path: sqlite_path.to_path_buf(),
                 blob_dir: sqlite_path.parent().unwrap().join("blobs"),
                 ..Default::default()
             },
@@ -584,7 +613,21 @@ use super::*;
 
     fn test_state_with_memory(memory_manager: Arc<CognitiveContextManager>) -> Arc<AppState> {
         let tools = Arc::new(ToolCatalog::builtin());
-        let task_runtime = runtime::RuntimeServices::in_memory().expect("test task runtime");
+        let sessions = Arc::new(ActiveSessionDirectory::new());
+        let event_bus = SessionProjectionHub::new();
+        let session_repository = test_session_repository(sessions, None, event_bus);
+        let mut services = Arc::try_unwrap(test_services(session_repository, None))
+            .unwrap_or_else(|_| panic!("fresh PostgreSQL test services must be uniquely owned"));
+        let knowledge = services
+            .selected_storage
+            .as_ref()
+            .expect("selected PostgreSQL test topology")
+            .knowledge_fabric
+            .clone();
+        services.memory = crate::services::MemoryService::with_manager_and_knowledge(
+            Some(memory_manager),
+            knowledge,
+        );
         Arc::new(AppState {
             tool_registry: tools,
             config: None,
@@ -594,10 +637,7 @@ use super::*;
             config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            services: Arc::new(
-                crate::services::GatewayServices::with_memory_for_tests(memory_manager)
-                    .with_task_runtime_for_tests(task_runtime),
-            ),
+            services: Arc::new(services),
             session_lease_registry: Some(Arc::new(session::SessionLeaseRegistry::default())),
             live_registry: Arc::new(live_routes::LiveRegistry::new()),
         })
@@ -608,7 +648,25 @@ use super::*;
         workspace_root: PathBuf,
     ) -> Arc<AppState> {
         let tools = Arc::new(ToolCatalog::builtin());
-        let task_runtime = runtime::RuntimeServices::in_memory().expect("test task runtime");
+        let sessions = Arc::new(ActiveSessionDirectory::new());
+        let event_bus = SessionProjectionHub::new();
+        let session_repository = test_session_repository(sessions, None, event_bus);
+        let mut services = Arc::try_unwrap(test_services_for_workspace(
+            session_repository,
+            None,
+            workspace_root.clone(),
+        ))
+        .unwrap_or_else(|_| panic!("fresh PostgreSQL test services must be uniquely owned"));
+        let knowledge = services
+            .selected_storage
+            .as_ref()
+            .expect("selected PostgreSQL test topology")
+            .knowledge_fabric
+            .clone();
+        services.memory = crate::services::MemoryService::with_manager_and_knowledge(
+            Some(memory_manager),
+            knowledge,
+        );
         Arc::new(AppState {
             tool_registry: tools,
             config: None,
@@ -618,10 +676,7 @@ use super::*;
             config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            services: Arc::new(
-                crate::services::GatewayServices::with_memory_for_tests(memory_manager)
-                    .with_task_runtime_for_tests(task_runtime),
-            ),
+            services: Arc::new(services),
             session_lease_registry: Some(Arc::new(session::SessionLeaseRegistry::default())),
             live_registry: Arc::new(live_routes::LiveRegistry::new()),
         })
@@ -631,12 +686,7 @@ use super::*;
         let sessions = Arc::new(ActiveSessionDirectory::new());
         let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionProjectionHub::new();
-        let store = Arc::new(
-            UnifiedSessionStore::open_in_memory()
-                .expect("workspace-backed API tests require the production Session contract"),
-        );
-        let session_repository =
-            test_session_repository(sessions.clone(), Some(store), event_bus.clone());
+        let session_repository = test_session_repository(sessions.clone(), None, event_bus.clone());
         Arc::new(AppState {
             tool_registry: tools,
             config: None,
@@ -675,7 +725,7 @@ use super::*;
 
     #[tokio::test]
     async fn session_service_exposes_session_queries_without_repository_handles() {
-        let state = test_state_with_store(Arc::new(UnifiedSessionStore::open_in_memory().unwrap()));
+        let state = test_state_with_store(Arc::new(crate::pg_test_support::session_store()));
 
         let _projection_hub = state.services.session.event_bus();
         assert!(state.services.session.has_unified_store());
@@ -694,7 +744,7 @@ use super::*;
 
     #[tokio::test]
     async fn session_history_index_is_bounded_typed_and_body_free() {
-        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::pg_test_support::session_store());
         let session_id = "surface-history-index";
         store
             .create_session(&new_api_session_record(
@@ -776,33 +826,8 @@ use super::*;
     }
 
     #[tokio::test]
-    async fn team_template_route_consumes_runtime_definition_projection() {
-        let app = api_router(test_state());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/team-templates")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body");
-        let value: serde_json::Value = serde_json::from_slice(&body).expect("templates json");
-        assert_eq!(value["source"], "runtime.definition_catalog");
-        let templates = value["templates"].as_array().expect("template list");
-        assert!(templates.len() >= 8);
-        assert!(templates.iter().any(|template| {
-            template["revision_ref"]["template_id"] == "builtin/cowd/parallel-research-synthesis"
-        }));
-    }
-
-    #[tokio::test]
     async fn session_execution_and_evidence_routes_use_durable_turn_binding() {
-        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::pg_test_support::session_store());
         let session_id = "durable-execution-route-session";
         let request_id = "durable-execution-route-request";
         let turn_id = "durable-execution-route-turn";
@@ -928,7 +953,7 @@ use super::*;
 
     #[tokio::test]
     async fn session_evidence_projection_preserves_durable_order_for_large_history() {
-        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::pg_test_support::session_store());
         let session_id = "ordered-evidence-history";
         store
             .create_session(&new_api_session_record(session_id, None))
@@ -1027,7 +1052,7 @@ use super::*;
 
     #[tokio::test]
     async fn runtime_outbox_management_reports_poison_and_retries_both_directions() {
-        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::pg_test_support::session_store());
         store
             .create_session(&new_api_session_record("outbox-session", None))
             .await
@@ -1090,13 +1115,88 @@ use super::*;
             .unwrap()
             .runtime_services()
             .session_terminal_delivery();
-        delivery
-            .enqueue(
-                "terminal-poison",
-                "assistant-1",
+        let terminal_request = session::SessionRuntimeOutboxRequest {
+            input_id: "terminal-poison-input".to_string(),
+            request_id: "terminal-poison-request".to_string(),
+            turn_id: "terminal-poison-turn".to_string(),
+            message_id: "terminal-poison-user".to_string(),
+            session_generation,
+            decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
+            target_turn_id: None,
+            classification_json: None,
+            task_route_hint: None,
+            created_at_ms: 3,
+            runtime_options_json: None,
+        };
+        store
+            .append_ingress_with_runtime_outbox(
                 "outbox-session",
-                9,
-                "bad payload",
+                "user",
+                Some("[{\"type\":\"text\",\"text\":\"terminal poison\"}]"),
+                3,
+                &terminal_request,
+            )
+            .await
+            .unwrap();
+        let terminal_ingress_claim = store
+            .claim_session_runtime_outbox("terminal-worker", 3, 10, 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let terminal_running = store
+            .mark_session_runtime_outbox_running(
+                "terminal-poison-request",
+                "terminal-worker",
+                terminal_ingress_claim.session_generation,
+                terminal_ingress_claim
+                    .claim_token
+                    .as_deref()
+                    .expect("terminal ingress claim token"),
+                terminal_ingress_claim.revision,
+                3,
+            )
+            .await
+            .unwrap();
+        state
+            .services
+            .selected_storage
+            .as_ref()
+            .expect("selected PostgreSQL topology")
+            .runtime_event_store
+            .append_transaction_with_terminal(
+                runtime::AppendTransactionRequest {
+                    transaction_id: "terminal-poison-transaction".to_string(),
+                    expected_streams: vec![runtime::ExpectedStreamRevision {
+                        stream_id: "terminal-poison-stream".to_string(),
+                        expected_revision: 0,
+                    }],
+                    events: vec![runtime::RuntimeEventInput {
+                        stream_id: "terminal-poison-stream".to_string(),
+                        scope: runtime::RuntimeEventScope::SessionInput,
+                        kind: "test.terminal_poison_committed".to_string(),
+                        status: Some("completed".to_string()),
+                        actor: Some("test".to_string()),
+                        refs: Vec::new(),
+                        payload: serde_json::json!({"terminal_id": "terminal-poison"}),
+                    }
+                    .into()],
+                },
+                runtime::SessionTerminalInput {
+                    terminal_id: "terminal-poison".to_string(),
+                    message_id: "assistant-1".to_string(),
+                    session_id: "outbox-session".to_string(),
+                    execution_id: Some("terminal-poison-execution".to_string()),
+                    turn_id: Some("terminal-poison-turn".to_string()),
+                    request_id: Some("terminal-poison-request".to_string()),
+                    session_generation: Some(terminal_running.session_generation),
+                    input_sequence: Some(terminal_running.sequence as u64),
+                    input_claim_owner: terminal_running.claim_owner,
+                    input_claim_token: terminal_running.claim_token,
+                    input_claim_revision: terminal_running.claim_fence_epoch,
+                    controlled_recovery_claim_fingerprints: Vec::new(),
+                    payload_ref: "bad payload".to_string(),
+                },
             )
             .unwrap();
         let terminal_claim = delivery
@@ -1516,7 +1616,7 @@ use super::*;
 
     #[tokio::test]
     async fn branch_session_copies_stored_messages_into_new_session() {
-        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::pg_test_support::session_store());
         let source_id = "branch-source";
         let mut source = new_api_session_record(source_id, Some("test-model".into()));
         source.metadata_json = Some(serde_json::json!({"title": "Source Topic"}).to_string());
@@ -1606,15 +1706,21 @@ use super::*;
             .contains("branch-source"));
         let source_events = store.get_events(source_id, 0).await.unwrap();
         assert!(source_events.iter().any(|event| {
+            let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.event_json) else {
+                return false;
+            };
             event.event_type == "SessionBranched"
-                && event.event_json.contains(&branch_id)
-                && event.event_json.contains("\"copied_message_count\":2")
+                && payload["branch_session_id"] == branch_id
+                && payload["copied_message_count"] == 2
         }));
         let branch_events = store.get_events(&branch_id, 0).await.unwrap();
         assert!(branch_events.iter().any(|event| {
+            let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.event_json) else {
+                return false;
+            };
             event.event_type == "BranchCreated"
-                && event.event_json.contains(source_id)
-                && event.event_json.contains("\"copied_message_count\":2")
+                && payload["source_session_id"] == source_id
+                && payload["copied_message_count"] == 2
         }));
 
         store
@@ -2002,23 +2108,13 @@ use super::*;
             .as_str()
             .unwrap()
             .contains("storage"));
-        assert!(json["storage"]["migrations"]
+        assert_eq!(json["storage"]["effective_backend"], "postgres");
+        assert!(json["storage"]["postgres"].is_object());
+        assert!(json["storage"]["registry"]["endpoints"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|item| item["id"] == "storage.matrix.endpoint"));
-        assert!(json["storage"]["migrations"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["id"] == "storage.growth.endpoint"
-                && item["domain"] == "growth"
-                && item["status"].as_str().is_some()));
-        assert!(json["storage"]["locks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["domain"] == "tasks"));
+            .all(|item| item["backend"] != "sqlite"));
     }
 
     #[tokio::test]
@@ -2047,20 +2143,10 @@ use super::*;
             .any(|item| item["domain"]["kind"] == "connector_directory"));
         assert!(endpoints.iter().any(|item| item["id"] == "tasks"));
         assert!(endpoints.iter().all(|item| item["domain"]["kind"] != "app"));
-        assert!(
-            json["storage"]["locks"].as_array().unwrap().len() >= 7,
-            "storage lock list should include all core sqlite domains"
-        );
-        assert!(json["storage"]["migrations"]
+        assert_eq!(json["storage"]["effective_backend"], "postgres");
+        assert!(json["storage"]["postgres"]["lanes"]
             .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["id"] == "storage.tasks.endpoint"));
-        assert!(json["storage"]["migrations"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["id"] == "storage.fact.endpoint"));
+            .is_some_and(|lanes| lanes.len() == 3));
     }
 
     #[tokio::test]
@@ -2087,11 +2173,12 @@ use super::*;
 
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["storage"]["migrations"]
+        assert_eq!(json["storage"]["effective_backend"], "postgres");
+        assert!(json["storage"]["registry"]["endpoints"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|item| item["id"] == "storage.fact.endpoint" && item["domain"] == "fact"));
+            .any(|item| item["domain"]["kind"] == "fact" && item["backend"] == "postgres"));
         let _ = std::fs::remove_dir_all(tmp);
     }
 

@@ -316,9 +316,10 @@ impl AnthropicClient {
         let http_response = self.send_with_retry(&request).await?;
         let request_id = request_id_from_headers(http_response.headers());
         let body = http_response.text().await.map_err(ApiError::from)?;
-        let mut response = serde_json::from_str::<MessageResponse>(&body).map_err(|error| {
-            ApiError::json_deserialize("Anthropic", &request.model, &body, error)
-        })?;
+        let mut response =
+            crate::types::deserialize_provider_message_response(&body).map_err(|error| {
+                ApiError::json_deserialize("Anthropic", &request.model, &body, error)
+            })?;
         if response.request_id.is_none() {
             response.request_id = request_id;
         }

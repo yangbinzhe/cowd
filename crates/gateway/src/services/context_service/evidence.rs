@@ -529,7 +529,7 @@ mod tests {
         },
         reality::EvidenceRef,
     };
-    use session::{SessionDomainEvent, SessionDomainScope, SessionRecord, UnifiedSessionStore};
+    use session::{SessionDomainEvent, SessionDomainScope, SessionRecord};
     use sha2::Digest;
 
     use super::{
@@ -586,7 +586,7 @@ mod tests {
 
     #[tokio::test]
     async fn canonical_domain_events_survive_restart_for_evidence_projection_and_retrieval() {
-        let store = Arc::new(UnifiedSessionStore::open_in_memory().expect("open store"));
+        let store = Arc::new(crate::pg_test_support::session_store());
         let session_id = "evidence-restart-session";
         store
             .create_session(&SessionRecord {
@@ -609,7 +609,7 @@ mod tests {
 
         let raw = "canonical durable output";
         let artifact_store = Arc::new(
-            runtime::ArtifactStore::sqlite(
+            runtime::ArtifactStore::for_test(
                 tempfile::tempdir().expect("artifact tempdir").keep(),
                 runtime::ArtifactStoreConfig::default(),
             )

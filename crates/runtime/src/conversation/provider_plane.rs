@@ -2,8 +2,59 @@
 
 use super::*;
 
+#[derive(Debug, Clone)]
+pub(crate) struct TerminalProviderAnswer {
+    pub text: String,
+    pub model: Option<String>,
+    pub models_used: Vec<String>,
+    pub provider_attempt_id: String,
+    pub usage: TokenUsage,
+    pub first_token_latency_ms: Option<u64>,
+    pub active_stream_duration_ms: Option<u64>,
+    pub wall_duration_ms: u64,
+}
+
+fn add_token_usage(total: &mut TokenUsage, usage: TokenUsage) {
+    total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
+    total.cache_creation_input_tokens = total
+        .cache_creation_input_tokens
+        .saturating_add(usage.cache_creation_input_tokens);
+    total.cache_read_input_tokens = total
+        .cache_read_input_tokens
+        .saturating_add(usage.cache_read_input_tokens);
+}
+
 const INTERACTIVE_PROVIDER_ADMISSION_TIMEOUT_MS: u64 = 30_000;
 const DELEGATED_PROVIDER_ADMISSION_TIMEOUT_MS: u64 = 300_000;
+
+/// Make Runtime's checked receipts legible to the terminal narrator even when
+/// the provider transport represents them only as native tool messages.
+///
+/// Native ToolUse/ToolResult pairs remain the source of truth and are kept in
+/// the request to satisfy strict provider protocols. The duplicate ledger is
+/// deliberate: a zero-tool terminal narrator must not infer that an effect is
+/// absent merely because it did not reconstruct a conclusion from the native
+/// transport representation. This records only already-checked receipt bytes;
+/// it does not infer task success, fabricate a result, or constrain the
+/// model's conclusion beyond prohibiting contradictions of observed facts.
+fn clean_terminal_evidence_instruction(evidence: &str, has_native_history: bool) -> String {
+    let evidence = evidence.trim();
+    match (evidence.is_empty(), has_native_history) {
+        (true, _) => {
+            "No checked tool receipt was available; give an honest bounded answer and name the missing evidence.\n\n"
+                .to_string()
+        }
+        (false, false) => format!(
+            "Runtime-authoritative checked evidence ledger:\n{evidence}\n\n"
+        ),
+        (false, true) => format!(
+            "Runtime-authoritative checked evidence ledger (the exact same receipts also appear as the preceding native ToolResult messages):\n{evidence}\n\n\
+             Treat every completed receipt in this ledger as an observed fact. Do not say that a completed effect, command, or verification is absent or unverified. \
+             Decide what remains unresolved from the objective, but distinguish it from facts that Runtime has already observed.\n\n"
+        ),
+    }
+}
 
 const fn provider_admission_timeout_ms(
     service_class: crate::execution_core::graph::ExecutionServiceClass,
@@ -225,17 +276,8 @@ where
         // providers may spend the terminal budget on private reasoning and
         // produce no user-visible answer after evidence has been committed.
         self.require_next_model_reasoning_effort("none");
-        let evidence_instruction = if evidence_history.is_empty() {
-            let evidence = if evidence.trim().is_empty() {
-                "No checked tool receipt was available; give an honest bounded answer and name the missing evidence."
-            } else {
-                evidence
-            };
-            format!("Checked evidence receipt fallback:\n{evidence}\n\n")
-        } else {
-            "The preceding Runtime-paired native ToolResult messages are the checked evidence receipts.\n\n"
-                .to_string()
-        };
+        let evidence_instruction =
+            clean_terminal_evidence_instruction(evidence, !evidence_history.is_empty());
         let mut messages = evidence_history;
         messages.push(ConversationMessage::user_text(format!(
             "Original objective:\n{objective}\n\n{evidence_instruction}Return the final answer now."
@@ -281,6 +323,7 @@ where
         let mut models_tried = Vec::new();
         let mut presentation_attempt_sequence = 0_u32;
         let mut provider_attempt_sequence = 0_u32;
+        let mut billed_usage = TokenUsage::default();
         let one_shot_reasoning_effort = self
             .next_model_reasoning_effort
             .lock()
@@ -336,8 +379,20 @@ where
                 }
                 let request_sequence = self.session_head().await.message_count;
                 provider_attempt_sequence = provider_attempt_sequence.saturating_add(1);
+                let execution_epoch = self
+                    .cowd_bus
+                    .as_ref()
+                    .and_then(|bus| bus.current_execution_context());
                 request.provider_evidence_context = Some(crate::ProviderRequestEvidenceContext {
                     session_id: self.session_id().to_string(),
+                    execution_id: execution_epoch
+                        .as_ref()
+                        .map(|context| context.execution_id.clone())
+                        .unwrap_or_default(),
+                    turn_id: execution_epoch
+                        .as_ref()
+                        .map(|context| context.turn_id.clone())
+                        .unwrap_or_default(),
                     request_sequence,
                     request_compiler_cache_hit: request.request_compiler_cache_hit,
                     budget: request.budget.clone(),
@@ -441,10 +496,15 @@ where
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(identity);
                 }
-                token_reservations.reconcile(usage)?;
+                add_token_usage(&mut billed_usage, usage);
+                token_reservations
+                    .reconcile(usage)
+                    .map_err(|error| error.with_provider_usage(billed_usage))?;
                 self.reconcile_provider_context_usage(usage);
                 if let Some(error) = stream_run.failure {
-                    let error = error.with_provider_account_key(provider_account_key.clone());
+                    let error = error
+                        .with_provider_account_key(provider_account_key.clone())
+                        .with_provider_usage(billed_usage);
                     if self.cancellation_token.is_cancelled()
                         || error.to_string().to_ascii_lowercase().contains("cancelled")
                     {
@@ -508,7 +568,8 @@ where
                         "terminal provider returned no user-visible text"
                     } else {
                         "terminal provider returned tool protocol in a zero-tool presentation step"
-                    });
+                    })
+                    .with_provider_usage(billed_usage);
                     return Err(error);
                 }
 
@@ -547,7 +608,7 @@ where
                             usage: Some(usage),
                         },
                         preflight_tool_results: Vec::new(),
-                        usage,
+                        usage: billed_usage,
                         model: effective_model,
                         models_used: models_tried.clone(),
                         first_token_latency_ms: first_event_at.map(|first| {
@@ -589,7 +650,7 @@ where
         attempt_id: &str,
         envelope_id: &str,
         envelope_revision: u64,
-    ) -> Result<(String, Option<String>, Vec<String>, String), RuntimeError> {
+    ) -> Result<TerminalProviderAnswer, RuntimeError> {
         let raw_reason = raw_reason.trim();
         let findings = findings.trim();
         let findings_block = if findings.is_empty() {
@@ -635,16 +696,21 @@ where
             })
             .collect::<String>();
         if text.trim().is_empty() {
-            return Err(RuntimeError::new(
-                "failure explanation provider returned no text",
-            ));
+            return Err(
+                RuntimeError::new("failure explanation provider returned no text")
+                    .with_provider_usage(step.usage),
+            );
         }
-        Ok((
+        Ok(TerminalProviderAnswer {
             text,
-            step.model,
-            step.models_used,
-            terminal_attempt_id.unwrap_or_else(|| attempt_id.to_string()),
-        ))
+            model: step.model,
+            models_used: step.models_used,
+            provider_attempt_id: terminal_attempt_id.unwrap_or_else(|| attempt_id.to_string()),
+            usage: step.usage,
+            first_token_latency_ms: step.first_token_latency_ms,
+            active_stream_duration_ms: step.active_stream_duration_ms,
+            wall_duration_ms: step.wall_duration_ms,
+        })
     }
 
     /// Synthesize one root answer from the complete, Runtime-verified results
@@ -663,7 +729,7 @@ where
         attempt_id: &str,
         envelope_id: &str,
         envelope_revision: u64,
-    ) -> Result<(String, Option<String>, Vec<String>, String), RuntimeError> {
+    ) -> Result<TerminalProviderAnswer, RuntimeError> {
         let feedback = if validation_feedback.is_empty() {
             String::new()
         } else {
@@ -727,16 +793,21 @@ where
             })
             .collect::<String>();
         if text.trim().is_empty() {
-            return Err(RuntimeError::new(
-                "collaboration synthesizer returned no text",
-            ));
+            return Err(
+                RuntimeError::new("collaboration synthesizer returned no text")
+                    .with_provider_usage(step.usage),
+            );
         }
-        Ok((
+        Ok(TerminalProviderAnswer {
             text,
-            step.model,
-            step.models_used,
-            terminal_attempt_id.unwrap_or_else(|| attempt_id.to_string()),
-        ))
+            model: step.model,
+            models_used: step.models_used,
+            provider_attempt_id: terminal_attempt_id.unwrap_or_else(|| attempt_id.to_string()),
+            usage: step.usage,
+            first_token_latency_ms: step.first_token_latency_ms,
+            active_stream_duration_ms: step.active_stream_duration_ms,
+            wall_duration_ms: step.wall_duration_ms,
+        })
     }
 
     pub(super) async fn acquire_provider_capacity(
@@ -1002,7 +1073,6 @@ where
                 "collaboration execution obligation activates Agent-first actions".to_string();
             tracing::info!(
                 team_required = true,
-                obligation_source = ?obligation.source,
                 minimum_team_count = obligation.minimum_team_count,
                 active = ?exposure.active,
                 "collaboration execution obligation activated Agent-first actions"
@@ -1173,9 +1243,9 @@ where
             "execution_decision",
             "runtime",
             &format!(
-                "{}: {:?}",
+                "{}: explicit_collaboration_constraint={}",
                 decision.pattern().as_str(),
-                decision.recommended_actions
+                decision.collaboration_obligation.is_some()
             ),
             8,
         );
@@ -1304,8 +1374,20 @@ where
             }
             let request_sequence = self.session_head().await.message_count;
             provider_attempt_sequence = provider_attempt_sequence.saturating_add(1);
+            let execution_epoch = self
+                .cowd_bus
+                .as_ref()
+                .and_then(|bus| bus.current_execution_context());
             request.provider_evidence_context = Some(crate::ProviderRequestEvidenceContext {
                 session_id: self.session_id().to_string(),
+                execution_id: execution_epoch
+                    .as_ref()
+                    .map(|context| context.execution_id.clone())
+                    .unwrap_or_default(),
+                turn_id: execution_epoch
+                    .as_ref()
+                    .map(|context| context.turn_id.clone())
+                    .unwrap_or_default(),
                 request_sequence,
                 request_compiler_cache_hit: request.request_compiler_cache_hit,
                 budget: request.budget.clone(),
@@ -1754,6 +1836,26 @@ where
 #[cfg(test)]
 mod provider_admission_tests {
     use super::*;
+
+    #[test]
+    fn clean_terminal_ledger_is_present_even_with_native_tool_history() {
+        let instruction = clean_terminal_evidence_instruction(
+            "### Receipt 1 · bash · completed\nexit_code: 0",
+            true,
+        );
+
+        assert!(instruction.contains("Runtime-authoritative checked evidence ledger"));
+        assert!(instruction.contains("Receipt 1 · bash · completed"));
+        assert!(instruction.contains("exit_code: 0"));
+        assert!(instruction.contains("Do not say that a completed effect"));
+    }
+
+    #[test]
+    fn clean_terminal_without_receipts_remains_explicitly_bounded() {
+        let instruction = clean_terminal_evidence_instruction("", true);
+        assert!(instruction.contains("No checked tool receipt was available"));
+        assert!(!instruction.contains("Runtime-authoritative checked evidence ledger"));
+    }
 
     #[test]
     fn delegated_provider_waits_cover_slow_parallel_service_without_delaying_interactive_turns() {

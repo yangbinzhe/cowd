@@ -149,6 +149,7 @@ fn execution_projection_owner_rejects_lower_revision_for_same_execution() {
     let projection = |revision: u64, objective: &str| ExecutionProjection {
         schema_version: harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION,
         execution_id: "execution-monotonic".to_string(),
+        agentic_collaboration: Default::default(),
         revision,
         cursor: revision,
         detail_scope: harness_contract::projection::ProjectionDetailScope::Summary,
@@ -239,6 +240,7 @@ fn execution_projection_without_live_facts_cannot_reuse_previous_execution_value
     assert!(app.apply_execution_projection(ExecutionProjection {
         schema_version: harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION,
         execution_id: "execution-new".to_string(),
+        agentic_collaboration: Default::default(),
         revision: 1,
         cursor: 1,
         detail_scope: harness_contract::projection::ProjectionDetailScope::Summary,
@@ -1026,6 +1028,7 @@ fn dropped_abort_then_projection_resync_clears_orphaned_root_preview() {
     assert!(app.apply_execution_projection(ExecutionProjection {
         schema_version: harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION,
         execution_id: "execution-root".to_string(),
+        agentic_collaboration: Default::default(),
         revision: 1,
         cursor: 1,
         detail_scope: harness_contract::projection::ProjectionDetailScope::Summary,

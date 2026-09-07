@@ -255,7 +255,7 @@ async fn execution_projection_routes_use_runtime_snapshot_delta_and_command_cont
     };
 
     let session_id = "projection-route-session";
-    let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+    let store = Arc::new(crate::pg_test_support::session_store());
     store
         .create_session(&new_api_session_record(
             session_id,
@@ -439,7 +439,7 @@ async fn agentic_program_route_returns_only_the_typed_root_program() {
 
     let session_id = "agentic-program-route-session";
     let turn_id = "agentic-program-route-turn";
-    let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+    let store = Arc::new(crate::pg_test_support::session_store());
     store
         .create_session(&new_api_session_record(
             session_id,
@@ -457,8 +457,7 @@ async fn agentic_program_route_returns_only_the_typed_root_program() {
     let objective_id = root_objective_id(session_id, turn_id);
     let program_id = program_id_for_objective(&objective_id);
     let observed = runtime
-        .agent_action_service()
-        .apply(&AgentActionEnvelope {
+        .submit_agent_action(&AgentActionEnvelope {
             action_id: "agentic-program-route-open".to_string(),
             actor: AgentActorBinding {
                 objective_id: objective_id.clone(),
@@ -484,6 +483,7 @@ async fn agentic_program_route_returns_only_the_typed_root_program() {
                 objective: None,
             }),
         })
+        .await
         .expect("Program opens");
     assert_eq!(
         observed.status,
@@ -1676,7 +1676,7 @@ async fn matrix_foundation_ingests_fact_and_builds_evidence_packet() {
         .await
         .unwrap();
     assert_eq!(fetched.status(), StatusCode::OK);
-    assert!(config_home.join("storage").join("matrix.sqlite").exists());
+    assert!(!config_home.join("storage").join("matrix.sqlite").exists());
     let _ = std::fs::remove_dir_all(workspace);
     let _ = std::fs::remove_dir_all(config_home);
 }
@@ -1975,7 +1975,7 @@ async fn matrix_routes_expose_structured_fact_engine() {
         .await
         .unwrap();
     assert_eq!(fetched.status(), StatusCode::OK);
-    assert!(config_home.join("storage").join("matrix.sqlite").exists());
+    assert!(!config_home.join("storage").join("matrix.sqlite").exists());
     let _ = std::fs::remove_dir_all(workspace);
     let _ = std::fs::remove_dir_all(config_home);
 }
@@ -1984,7 +1984,7 @@ async fn matrix_routes_expose_structured_fact_engine() {
 async fn matrix_fact_and_evidence_append_execution_summaries_to_runtime_timeline() {
     let workspace = test_temp_dir("matrix-outcome-timeline");
     let config_home = test_temp_dir("matrix-outcome-config");
-    let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+    let store = Arc::new(crate::pg_test_support::session_store());
     let app = api_router(test_state_with_store_and_workspace(
         store,
         workspace.clone(),

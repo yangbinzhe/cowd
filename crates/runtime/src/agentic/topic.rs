@@ -27,6 +27,8 @@ pub(crate) fn apply_message_publish(
             summary: input.summary.clone(),
             content_ref: input.content_ref.clone(),
             refs: input.refs.clone(),
+            recipients: input.recipients.clone(),
+            intent: input.intent.clone(),
         });
 }
 
@@ -45,7 +47,7 @@ pub(crate) fn apply_artifact_commit(
     // model-authored metadata. Persist it automatically so a correct artifact
     // cannot become orphaned merely because the model omitted a redundant ID
     // and only discover that mistake later at task_submit.
-    if let Some(task_ref) = projection
+    let active_claim = projection
         .tasks
         .values()
         .find(|task| {
@@ -53,9 +55,17 @@ pub(crate) fn apply_artifact_commit(
                 && task.claimant.as_deref() == envelope.actor.agent_id.as_deref()
                 && task.claim_execution_id == envelope.actor.execution_id
         })
-        .map(|task| task.task_id.clone())
-    {
-        relates_to.push(task_ref);
+        .map(|task| {
+            (
+                task.task_id.clone(),
+                task.claim_execution_id.clone(),
+                task.claim_generation,
+            )
+        });
+    if let Some((task_ref, _, _)) = active_claim.as_ref() {
+        // The physical claim relation is Runtime-authored. Model-provided
+        // `relates_to` only augments it and can never replace the fence.
+        relates_to.push(task_ref.clone());
         relates_to.sort();
         relates_to.dedup();
     }
@@ -68,6 +78,10 @@ pub(crate) fn apply_artifact_commit(
             title: input.title.clone(),
             relates_to,
             committed_by: envelope.actor.actor_id.clone(),
+            claim_execution_id: active_claim
+                .as_ref()
+                .and_then(|(_, execution_id, _)| execution_id.clone()),
+            claim_generation: active_claim.map(|(_, _, generation)| generation),
         },
     );
 }

@@ -22,7 +22,6 @@ managed-worker-runtime = { path = "../managed-worker-runtime" }
 auth-broker = { path = "../auth-broker" }
 harness-eval = { path = "../harness-eval" }
 fact-kernel = { path = "../fact-kernel" }
-fact-sqlite = { path = "../fact-sqlite" }
 fact-postgres = { path = "../fact-postgres" }
 model-protocol = { path = "../model-protocol" }
 storage = { path = "../storage", features = ["storage-postgres"] }
@@ -44,9 +43,6 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "server", "http2"] }
 hyper-util = { version = "0.1", features = ["client", "http2", "tokio"] }
 libc = "0.2"
-rusqlite = { version = "0.31", features = ["bundled"] }
-r2d2 = "0.8"
-r2d2_sqlite = "0.24"
 reqwest.workspace = true
 runtime = { path = "../runtime" }
 runtime-postgres = { path = "../runtime-postgres" }
@@ -109,10 +105,6 @@ required-features = ["test-support"]
 
 [[test]]
 name = "surface_trigger_event_routes"
-required-features = ["test-support"]
-
-[[test]]
-name = "team_template_routes"
 required-features = ["test-support"]
 
 [[test]]

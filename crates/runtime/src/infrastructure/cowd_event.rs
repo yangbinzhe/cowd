@@ -70,6 +70,10 @@ pub struct RunModelTelemetry {
     pub output_tokens: u64,
     pub cache_create_tokens: u64,
     pub cache_read_tokens: u64,
+    /// True only when every physical Provider attempt represented by this
+    /// cumulative snapshot durably reported both cache dimensions.
+    #[serde(default)]
+    pub cache_dimensions_known: bool,
     pub total_tokens: u64,
     pub usage_source: String,
     pub wall_chars_per_second: Option<f64>,
@@ -437,7 +441,18 @@ impl CowdEvent {
 struct CowdEventForward {
     tx: broadcast::Sender<CowdEvent>,
     lineage: CowdExecutionLineage,
+    live_telemetry_observer: LiveTelemetryObserverSlot,
 }
+
+type LiveTelemetryObserver = Arc<dyn Fn(&CowdEvent) + Send + Sync>;
+
+#[derive(Clone)]
+struct LiveTelemetryObserverBinding {
+    generation: u64,
+    observer: LiveTelemetryObserver,
+}
+
+type LiveTelemetryObserverSlot = Arc<Mutex<Option<LiveTelemetryObserverBinding>>>;
 
 #[derive(Clone)]
 pub struct CowdEventBus {
@@ -449,6 +464,10 @@ pub struct CowdEventBus {
     causal_sequence: Arc<AtomicU64>,
     latest_model_step_id: Arc<Mutex<Option<String>>>,
     tool_identities: Arc<Mutex<HashMap<String, CausalItemIdentity>>>,
+    /// Synchronous Runtime-owned usage reducer. Provider/tool event delivery
+    /// remains asynchronous, but a terminal seal must not race usage carried
+    /// by the same execution bus.
+    live_telemetry_observer: LiveTelemetryObserverSlot,
 }
 
 /// Clears the bus execution context even when the owning turn future is
@@ -478,6 +497,7 @@ impl CowdEventBus {
             causal_sequence: Arc::new(AtomicU64::new(0)),
             latest_model_step_id: Arc::new(Mutex::new(None)),
             tool_identities: Arc::new(Mutex::new(HashMap::new())),
+            live_telemetry_observer: Arc::new(Mutex::new(None)),
         }
     }
     pub fn subscribe(&self) -> broadcast::Receiver<CowdEvent> {
@@ -523,7 +543,61 @@ impl CowdEventBus {
         forwards.push(CowdEventForward {
             tx: target.tx.clone(),
             lineage,
+            live_telemetry_observer: Arc::clone(&target.live_telemetry_observer),
         });
+    }
+
+    /// Bind the single Runtime projection owner for usage telemetry emitted
+    /// by this root execution and every child bus forwarded into it.
+    pub(crate) fn bind_live_telemetry_observer<F>(&self, generation: u64, observer: F)
+    where
+        F: Fn(&CowdEvent) + Send + Sync + 'static,
+    {
+        *self
+            .live_telemetry_observer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(LiveTelemetryObserverBinding {
+                generation,
+                observer: Arc::new(observer),
+            });
+    }
+
+    /// Remove only the observer installed by the matching execution-bus
+    /// lease. An older lease must never detach a newer recovery binding.
+    pub(crate) fn unbind_live_telemetry_observer(&self, generation: u64) {
+        let mut slot = self
+            .live_telemetry_observer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot
+            .as_ref()
+            .is_some_and(|binding| binding.generation == generation)
+        {
+            *slot = None;
+        }
+    }
+
+    /// Surface relays use this to avoid reducing telemetry a second time.
+    #[must_use]
+    pub fn has_live_telemetry_observer(&self) -> bool {
+        self.live_telemetry_observer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    fn observe_live_telemetry(slot: &LiveTelemetryObserverSlot, event: &CowdEvent) {
+        if !matches!(event.domain_event(), CowdEvent::RunModelTelemetry { .. }) {
+            return;
+        }
+        let observer = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(binding) = observer {
+            (binding.observer)(event);
+        }
     }
 
     #[must_use]
@@ -579,6 +653,7 @@ impl CowdEventBus {
         } else {
             event
         };
+        Self::observe_live_telemetry(&self.live_telemetry_observer, &event);
         let _ = self.tx.send(event.clone());
         let forwards = self
             .forwards
@@ -586,10 +661,12 @@ impl CowdEventBus {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         for forward in forwards {
-            let _ = forward.tx.send(CowdEvent::RelatedExecution {
+            let related = CowdEvent::RelatedExecution {
                 lineage: forward.lineage,
                 event: Box::new(event.clone()),
-            });
+            };
+            Self::observe_live_telemetry(&forward.live_telemetry_observer, &related);
+            let _ = forward.tx.send(related);
         }
     }
 
@@ -1255,5 +1332,56 @@ mod tests {
             super::owned_child_activity_id(&first, "skill", "shared-skill:1"),
             super::owned_child_activity_id(&second, "skill", "shared-skill:1")
         );
+    }
+
+    #[test]
+    fn stale_observer_lease_cannot_unbind_newer_generation() {
+        let bus = CowdEventBus::new();
+        let first_calls = Arc::new(AtomicU64::new(0));
+        let second_calls = Arc::new(AtomicU64::new(0));
+        let first_observer = Arc::clone(&first_calls);
+        bus.bind_live_telemetry_observer(1, move |_event: &CowdEvent| {
+            first_observer.fetch_add(1, Ordering::Relaxed);
+        });
+        let second_observer = Arc::clone(&second_calls);
+        bus.bind_live_telemetry_observer(2, move |_event: &CowdEvent| {
+            second_observer.fetch_add(1, Ordering::Relaxed);
+        });
+        bus.unbind_live_telemetry_observer(1);
+        let _scope = bus.enter_execution(CowdExecutionContext {
+            execution_id: "execution-observer-generation".to_string(),
+            session_id: "session-observer-generation".to_string(),
+            turn_id: "turn-observer-generation".to_string(),
+        });
+        let telemetry = RunModelTelemetry {
+            model: None,
+            models_used: Vec::new(),
+            first_token_latency_ms: None,
+            active_stream_duration_ms: None,
+            wall_duration_ms: 1,
+            output_chars: 0,
+            output_chunks: 0,
+            input_tokens: 1,
+            output_tokens: 0,
+            cache_create_tokens: 0,
+            cache_read_tokens: 0,
+            cache_dimensions_known: true,
+            total_tokens: 1,
+            usage_source: "test".to_string(),
+            wall_chars_per_second: None,
+            wall_tokens_per_second: None,
+            active_chars_per_second: None,
+            active_tokens_per_second: None,
+            chars_per_second: None,
+            tokens_per_second: None,
+        };
+        bus.emit(CowdEvent::RunModelTelemetry {
+            telemetry: telemetry.clone(),
+        });
+        assert_eq!(first_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(second_calls.load(Ordering::Relaxed), 1);
+        bus.unbind_live_telemetry_observer(2);
+        bus.emit(CowdEvent::RunModelTelemetry { telemetry });
+        assert_eq!(second_calls.load(Ordering::Relaxed), 1);
     }
 }

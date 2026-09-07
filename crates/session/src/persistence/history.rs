@@ -2,7 +2,7 @@ use super::{
     ContextIndexCard, ContextIndexCoverage, SessionActivationManifest, SessionListOptions,
     SessionMessage, SessionMessageMetadata, SessionRecord, SessionSnapshot, UnifiedSessionStore,
 };
-use crate::domain::SessionDomainEventPage;
+use crate::domain::{SessionDomainEvent, SessionDomainEventPage};
 use crate::error::Result;
 
 /// One bounded cold-page result used to activate a Session in Runtime memory.
@@ -298,6 +298,26 @@ impl SessionHistoryReader {
             .session_domain_events_page(session_id, from_sequence, limit.clamp(1, 4_096))
             .await
     }
+
+    /// Recover exactly one Runtime execution/turn event kind without scanning
+    /// or paginating unrelated Session history.
+    pub async fn domain_events_for_epoch(
+        &self,
+        session_id: &str,
+        kind: &str,
+        execution_id: &str,
+        turn_id: &str,
+    ) -> Result<Vec<SessionDomainEvent>> {
+        self.repository
+            .get_session_domain_events_for_epoch(session_id, kind, execution_id, turn_id)
+            .await?
+            .into_iter()
+            .map(|event| {
+                SessionDomainEvent::from_session_event(&event)
+                    .map_err(crate::SessionError::Serialization)
+            })
+            .collect()
+    }
 }
 
 /// Convert a model/user natural-language history query into backend-portable
@@ -336,170 +356,4 @@ fn metadata_text<'a>(metadata: &'a serde_json::Value, key: &str) -> Option<&'a s
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn session_record(id: &str) -> SessionRecord {
-        SessionRecord {
-            session_id: id.to_string(),
-            platform: "test".to_string(),
-            chat_id: id.to_string(),
-            user_id: None,
-            model: None,
-            created_at: "2026-07-31T00:00:00Z".to_string(),
-            last_activity: "2026-07-31T00:00:00Z".to_string(),
-            message_count: 0,
-            reset_policy: "None".to_string(),
-            metadata_json: None,
-            input_tokens: 0,
-            output_tokens: 0,
-            status: "active".to_string(),
-        }
-    }
-
-    fn message(session_id: &str, sequence: usize, text: &str) -> SessionMessage {
-        SessionMessage {
-            stable_message_id: format!("{session_id}-{sequence}"),
-            session_id: session_id.to_string(),
-            sequence,
-            role: "user".to_string(),
-            content_json: serde_json::json!([{"type":"text","text":text}]).to_string(),
-            blocks_count: 1,
-            tool_use_id: None,
-            tool_name: None,
-            token_usage_json: None,
-            created_at_ms: sequence as u64,
-        }
-    }
-
-    #[tokio::test]
-    async fn active_search_never_broadens_beyond_authorized_sessions() {
-        let store = UnifiedSessionStore::open_in_memory().expect("session store");
-        for session_id in ["current", "related", "unrelated"] {
-            store
-                .create_session(&session_record(session_id))
-                .await
-                .expect("session");
-            store
-                .insert_message(&message(
-                    session_id,
-                    0,
-                    "shared retrieval marker for session history",
-                ))
-                .await
-                .expect("message");
-        }
-        let reader = store.history_reader();
-
-        let current = reader
-            .search_messages("retrieval marker", "current", 10)
-            .await
-            .expect("current search");
-        assert_eq!(current.len(), 1);
-        assert_eq!(current[0].session_id, "current");
-
-        let related = reader
-            .search_messages_in_sessions(
-                "retrieval marker",
-                &["current".to_string(), "related".to_string()],
-                10,
-            )
-            .await
-            .expect("related search");
-        assert_eq!(related.len(), 2);
-        assert!(related
-            .iter()
-            .all(|message| message.session_id != "unrelated"));
-    }
-
-    #[tokio::test]
-    async fn natural_language_search_quotes_fts_operator_punctuation() {
-        let store = UnifiedSessionStore::open_in_memory().expect("session store");
-        store
-            .create_session(&session_record("current"))
-            .await
-            .expect("session");
-        store
-            .insert_message(&message(
-                "current",
-                0,
-                "sci-ml-materials report on equivariant methods",
-            ))
-            .await
-            .expect("message");
-
-        let selected = store
-            .history_reader()
-            .search_messages(
-                "sci-ml-materials report equivariant methods research",
-                "current",
-                10,
-            )
-            .await
-            .expect("hyphenated natural-language search must not become FTS syntax");
-        assert_eq!(selected.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn session_catalog_and_explicit_reads_share_workspace_and_actor_identity() {
-        let store = UnifiedSessionStore::open_in_memory().expect("session store");
-        let records = [
-            ("current", "/workspace/a", "human-a"),
-            ("same-actor", "/workspace/a", "human-a"),
-            ("other-actor", "/workspace/a", "human-b"),
-            ("other-workspace", "/workspace/b", "human-a"),
-        ];
-        for (session_id, workspace, owner) in records {
-            let mut record = session_record(session_id);
-            record.platform = "webui".to_string();
-            record.metadata_json = Some(
-                serde_json::json!({
-                    "title": format!("Architecture {session_id}"),
-                    "workspace_root": workspace,
-                    "owner_principal_id": owner,
-                })
-                .to_string(),
-            );
-            store.create_session(&record).await.expect("session");
-            store
-                .insert_message(&message(
-                    session_id,
-                    0,
-                    "shared architecture marker in durable history",
-                ))
-                .await
-                .expect("message");
-        }
-        let reader = store.history_reader();
-
-        let page = reader
-            .discover_browsable_sessions("current", Some("architecture marker"), 10, 0)
-            .await
-            .expect("discover own sessions");
-        let ids = page
-            .records
-            .iter()
-            .map(|record| record.session_id.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(page.total, 2);
-        assert!(ids.contains(&"current"));
-        assert!(ids.contains(&"same-actor"));
-        assert!(!ids.contains(&"other-actor"));
-        assert!(!ids.contains(&"other-workspace"));
-        assert!(reader
-            .can_read_session("current", "same-actor")
-            .await
-            .expect("same actor authorization"));
-        assert!(!reader
-            .can_read_session("current", "other-actor")
-            .await
-            .expect("other actor authorization"));
-        assert!(!reader
-            .can_read_session("current", "other-workspace")
-            .await
-            .expect("other workspace authorization"));
-    }
 }

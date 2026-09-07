@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::pattern_catalog::{ExecutionPatternCatalog, RuntimeCompileTarget};
-use crate::collaboration_template::{CollaborationTemplateId, CollaborationTemplateMatcher};
 use crate::context_runtime::ContextProfile;
 use crate::evidence_planner::EvidenceAcquisitionMode;
 
@@ -28,8 +27,6 @@ pub struct RuntimeExecutionDecision {
     pub collaboration_obligation: Option<CollaborationExecutionObligation>,
     pub candidate_patterns: Vec<RuntimeExecutionPatternCandidate>,
     pub evidence_mode: EvidenceAcquisitionMode,
-    pub recommended_template: Option<CollaborationTemplateId>,
-    pub recommended_actions: Vec<RuntimeExecutionActionHint>,
     pub compile_target: RuntimeCompileTarget,
     pub resource_health: StrategyResourceHealth,
     pub lease: StrategyLease,
@@ -162,7 +159,6 @@ pub struct TurnStrategyDecisionState {
     pub session_ref: String,
     pub turn_ref: String,
     pub decision: RuntimeExecutionDecision,
-    pub collaboration_receipt: Option<serde_json::Value>,
     pub outcome: Option<TurnStrategyActualOutcome>,
 }
 
@@ -189,7 +185,6 @@ impl TurnStrategyDecisionState {
             session_ref,
             turn_ref,
             decision,
-            collaboration_receipt: None,
             outcome: None,
         }
     }
@@ -231,6 +226,14 @@ impl TurnStrategyDecisionState {
         status: TurnStrategyDecisionStatus,
         reason: impl Into<String>,
     ) -> Result<(), String> {
+        if self.decision.collaboration_obligation.is_some()
+            && selected_candidate != ExecutionCandidateKind::Team
+        {
+            return Err(
+                "an explicit Team execution obligation cannot be downgraded to a non-Team strategy"
+                    .to_string(),
+            );
+        }
         self.revision = self.revision.saturating_add(1);
         self.selected_candidate = selected_candidate;
         self.status = status;
@@ -243,9 +246,6 @@ impl TurnStrategyDecisionState {
                 spec.compile_target
             });
         self.decision.lease.locked_pattern = pattern;
-        if selected_candidate != ExecutionCandidateKind::Team {
-            self.decision.collaboration_obligation = None;
-        }
         Ok(())
     }
 
@@ -259,6 +259,14 @@ impl TurnStrategyDecisionState {
         status: TurnStrategyDecisionStatus,
         reason: impl Into<String>,
     ) -> Result<(), String> {
+        if self.decision.collaboration_obligation.is_some()
+            && selected_candidate != ExecutionCandidateKind::Team
+        {
+            return Err(
+                "an explicit Team execution obligation cannot be retargeted to a non-Team strategy"
+                    .to_string(),
+            );
+        }
         self.revision = self.revision.saturating_add(1);
         self.selected_candidate = selected_candidate;
         self.status = status;
@@ -278,9 +286,6 @@ impl TurnStrategyDecisionState {
                 spec.compile_target
             });
         self.decision.lease.locked_pattern = effective_pattern;
-        if selected_candidate != ExecutionCandidateKind::Team {
-            self.decision.collaboration_obligation = None;
-        }
         Ok(())
     }
 }
@@ -289,27 +294,6 @@ impl TurnStrategyDecisionState {
 pub struct RuntimeExecutionPatternCandidate {
     pub pattern: ExecutionPattern,
     pub why: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeExecutionActionHint {
-    pub action: String,
-    pub template_hint: Option<String>,
-    pub reason: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RuntimeActionSelectionReport {
-    pub intent_preview: String,
-    pub profile: Option<ContextProfile>,
-    pub selected_action: String,
-    pub fallback_action: String,
-    pub recommended_pattern: ExecutionPattern,
-    pub recommended_template: Option<CollaborationTemplateId>,
-    pub expected_projection: Vec<String>,
-    pub stateful: bool,
-    pub reason: String,
-    pub confidence: f32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -408,17 +392,30 @@ fn build_runtime_execution_decision_inner(
     }
     let user_input = input.prompt.clone();
     let delegated_leaf = context_profile == Some(ContextProfile::SubAgent);
-    let requested_template = input
-        .proposal
-        .as_ref()
-        .and_then(|proposal| proposal.template.clone());
     let mut strategy = decide_strategy(&input);
     let mut blocked_reasons = Vec::new();
+    let explicit_collaboration_requested =
+        !delegated_leaf && strategy.understanding.required_team_count > 0;
     if (strategy.pattern == ExecutionPattern::Collaborate
         || strategy.understanding.requests_multi_agent)
         && !resource_health.collaboration_available
     {
-        if let Err(error) = strategy.retarget(
+        if explicit_collaboration_requested {
+            if strategy.pattern != ExecutionPattern::Collaborate {
+                if let Err(error) = strategy.retarget(
+                    ExecutionPattern::Collaborate,
+                    "explicit Team execution remains the semantic target while admission is blocked",
+                ) {
+                    blocked_reasons.push(error);
+                } else {
+                    strategy.selected_candidate = ExecutionCandidateKind::Team;
+                }
+            }
+            blocked_reasons.push(
+                "explicit Team execution requirement cannot be admitted because the collaboration backend is unavailable"
+                    .to_string(),
+            );
+        } else if let Err(error) = strategy.retarget(
             ExecutionPattern::Execute,
             "collaboration backend unavailable; compiled as execution graph",
         ) {
@@ -475,17 +472,6 @@ fn build_runtime_execution_decision_inner(
             .reasons
             .push("resource health is assumed for detached planning".to_string());
     }
-    let template_decision = CollaborationTemplateMatcher.decide(&user_input, &strategy);
-    let template_reason = requested_template.map(|requested| {
-        if requested == template_decision.template_id.as_str() {
-            format!("validated model template proposal: {requested}")
-        } else {
-            format!(
-                "model template proposal `{requested}` rejected; strategy selected `{}`",
-                template_decision.template_id.as_str()
-            )
-        }
-    });
     let recommended_pattern = strategy.pattern;
     let mut candidate_patterns = vec![RuntimeExecutionPatternCandidate {
         pattern: recommended_pattern,
@@ -500,14 +486,13 @@ fn build_runtime_execution_decision_inner(
             why: "complex evidence can be acquired through an evidence graph".to_string(),
         });
     }
-    if template_decision.template_id == CollaborationTemplateId::DebateCriticArbiter
-        && recommended_pattern != ExecutionPattern::Deliberate
-    {
-        candidate_patterns.push(RuntimeExecutionPatternCandidate {
-            pattern: ExecutionPattern::Deliberate,
-            why: "material tradeoffs can be compiled as a deliberation graph".to_string(),
+    let collaboration_obligation = explicit_collaboration_requested
+        .then(|| CollaborationExecutionObligation::for_explicit_request(&strategy.understanding))
+        .transpose()
+        .unwrap_or_else(|error| {
+            blocked_reasons.push(error);
+            None
         });
-    }
 
     let catalog = ExecutionPatternCatalog::current();
     let recommended_spec = catalog.find(recommended_pattern);
@@ -519,20 +504,9 @@ fn build_runtime_execution_decision_inner(
         turn_ref: None,
         user_intent_preview: user_input.chars().take(180).collect(),
         strategy: strategy.clone(),
-        collaboration_obligation: None,
+        collaboration_obligation,
         candidate_patterns,
         evidence_mode,
-        recommended_template: (!delegated_leaf).then_some(template_decision.template_id),
-        recommended_actions: if blocked_reasons.is_empty() && !delegated_leaf {
-            action_hints(
-                recommended_pattern,
-                &strategy.modifiers,
-                &strategy.gates,
-                &template_decision.template_id,
-            )
-        } else {
-            Vec::new()
-        },
         compile_target: recommended_spec.map_or(RuntimeCompileTarget::InlineModel, |spec| {
             spec.compile_target
         }),
@@ -551,10 +525,6 @@ fn build_runtime_execution_decision_inner(
             .reasons
             .into_iter()
             .chain(recommended_spec.map(|spec| spec.summary.clone()))
-            .chain(template_reason)
-            .chain(delegated_leaf.then_some(
-                "delegated Agent leaf execution retains local model/tool work and cannot recommend nested Agent, Team, Session, or Mission orchestration".to_string(),
-            ))
             .chain(context_profile.map(|profile| format!("context profile: {profile:?}")))
             .collect(),
     }
@@ -580,155 +550,33 @@ fn evidence_mode_for_strategy(strategy: &StrategyDecision) -> EvidenceAcquisitio
     }
 }
 
-#[must_use]
-pub fn build_runtime_action_selection_report(
-    user_input: &str,
-    context_profile: Option<ContextProfile>,
-) -> RuntimeActionSelectionReport {
-    let decision = build_runtime_execution_decision(user_input, context_profile);
-    action_selection_report_for_decision(&decision, context_profile)
-}
-
-#[must_use]
-pub fn action_selection_report_for_decision(
-    decision: &RuntimeExecutionDecision,
-    context_profile: Option<ContextProfile>,
-) -> RuntimeActionSelectionReport {
-    if !decision.executable {
-        return RuntimeActionSelectionReport {
-            intent_preview: decision.user_intent_preview.clone(),
-            profile: context_profile,
-            selected_action: "partial".to_string(),
-            fallback_action: "partial".to_string(),
-            recommended_pattern: decision.pattern(),
-            recommended_template: decision.recommended_template,
-            expected_projection: vec!["runtime.execution_decision".to_string()],
-            stateful: false,
-            reason: decision.blocked_reasons.join("; "),
-            confidence: decision.confidence,
-        };
-    }
-    let selected = decision
-        .recommended_actions
-        .first()
-        .cloned()
-        .unwrap_or_else(|| RuntimeExecutionActionHint {
-            action: "direct".to_string(),
-            template_hint: None,
-            reason: "the canonical strategy selected the direct fast path".to_string(),
-        });
-    let stateful = selected.action != "direct";
-    RuntimeActionSelectionReport {
-        intent_preview: decision.user_intent_preview.clone(),
-        profile: context_profile,
-        selected_action: selected.action.clone(),
-        fallback_action: fallback_action_for(&selected.action).to_string(),
-        recommended_pattern: decision.pattern(),
-        recommended_template: decision.recommended_template,
-        expected_projection: expected_projection_for(&selected.action)
-            .iter()
-            .map(|item| (*item).to_string())
-            .collect(),
-        stateful,
-        reason: selected.reason,
-        confidence: decision.confidence,
-    }
-}
-
-fn fallback_action_for(action: &str) -> &'static str {
-    match action {
-        "propose:team" | "propose:review" | "propose:session_dispatch" => "propose:agent",
-        "propose:agent" => "direct",
-        "control:approval" => "direct",
-        _ => "direct",
-    }
-}
-
-fn expected_projection_for(action: &str) -> &'static [&'static str] {
-    match action {
-        "propose:team" => &[
-            "mission.agentic_team_projection",
-            "mission.agent_projection",
-            "mission.execution_graph_projection",
-            "mission.evidence_projection",
-        ],
-        "propose:agent" => &["runtime.execution_graph", "runtime.evidence_refs"],
-        "propose:review" => &["runtime.review_graph", "mission.evidence_projection"],
-        "propose:session_dispatch" => &["mission.session_projection", "runtime.execution_graph"],
-        "control:approval" => &["mission.conflict_projection", "mission.approval_projection"],
-        _ => &["runtime.execution_decision"],
-    }
-}
-
-fn action_hints(
-    pattern: ExecutionPattern,
-    _modifiers: &[ExecutionModifier],
-    gates: &[ExecutionPolicyGate],
-    template_hint: &CollaborationTemplateId,
-) -> Vec<RuntimeExecutionActionHint> {
-    if gates.contains(&ExecutionPolicyGate::Approval) {
-        return vec![RuntimeExecutionActionHint {
-            action: "control:approval".to_string(),
-            template_hint: None,
-            reason: "critical execution requires approval before graph dispatch".to_string(),
-        }];
-    }
-    let template = Some(template_hint.as_str().to_string());
-    match pattern {
-        ExecutionPattern::Direct => Vec::new(),
-        ExecutionPattern::Explore => vec![RuntimeExecutionActionHint {
-            action: "propose:agent".to_string(),
-            template_hint: template,
-            reason: "acquire checked evidence before synthesis".to_string(),
-        }],
-        ExecutionPattern::Execute => vec![RuntimeExecutionActionHint {
-            action: "propose:agent".to_string(),
-            template_hint: template,
-            reason: "compile a bounded execution and verification graph".to_string(),
-        }],
-        ExecutionPattern::Deliberate => vec![RuntimeExecutionActionHint {
-            action: "propose:review".to_string(),
-            template_hint: Some("cowd/debate-critic-arbiter".to_string()),
-            reason: "resolve competing options with evidence-backed arbitration".to_string(),
-        }],
-        ExecutionPattern::Collaborate => vec![RuntimeExecutionActionHint {
-            action: "propose:team".to_string(),
-            template_hint: template,
-            reason: "positive collaboration lift supports a governed team graph".to_string(),
-        }],
-        ExecutionPattern::Supervise => vec![RuntimeExecutionActionHint {
-            action: "propose:session_dispatch".to_string(),
-            template_hint: template,
-            reason: "long-running work belongs to a supervised mission graph".to_string(),
-        }],
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn complex_multi_agent_work_selects_collaboration() {
+    fn semantic_multi_agent_preference_selects_collaboration_without_hard_obligation() {
         let decision = build_runtime_execution_decision(
             "复杂架构需要多 Agent 并行分析 runtime gateway memory 并审查回归",
             Some(ContextProfile::DeepInvestigation),
         );
         assert_eq!(decision.pattern(), ExecutionPattern::Collaborate);
-        assert_eq!(decision.recommended_actions[0].action, "propose:team");
+        assert!(decision.collaboration_obligation.is_none());
     }
 
     #[test]
-    fn direct_work_has_no_stateful_action() {
-        let report = build_runtime_action_selection_report("解释这个名称", None);
-        assert_eq!(report.selected_action, "direct");
-        assert!(!report.stateful);
+    fn inferred_complexity_never_creates_a_hard_team_obligation() {
+        let decision = build_runtime_execution_decision(
+            "全面审查 runtime gateway frontend 三个独立责任域，分别给出工具证据后综合",
+            None,
+        );
+        assert!(decision.collaboration_obligation.is_none());
     }
 
     #[test]
-    fn resource_downgrade_retargets_the_whole_strategy_contract() {
+    fn unavailable_collaboration_backend_blocks_an_explicit_team_constraint() {
         let decision = StrategyDecisionEngine.decide_with_input(
-            StrategyInput::from_prompt("使用多 Agent 并行审查 runtime gateway memory 并汇总结果"),
+            StrategyInput::from_prompt("启动两个 Team 并行审查 runtime gateway memory 并汇总结果"),
             None,
             StrategyResourceHealth {
                 collaboration_available: false,
@@ -736,24 +584,50 @@ mod tests {
             },
         );
 
-        assert_eq!(decision.pattern(), ExecutionPattern::Execute);
-        assert_eq!(
-            decision.compile_target,
-            RuntimeCompileTarget::ExecutionGraph
-        );
+        assert_eq!(decision.pattern(), ExecutionPattern::Collaborate);
+        assert!(!decision.executable);
+        assert!(decision.collaboration_obligation.is_some());
         assert!(decision
-            .modifiers()
+            .blocked_reasons
             .iter()
-            .all(|modifier| ExecutionPattern::Execute.supports_modifier(*modifier)));
-        assert!(decision
-            .gates()
-            .iter()
-            .all(|gate| ExecutionPattern::Execute.supports_gate(*gate)));
-        assert!(decision.executable);
+            .any(|reason| reason.contains("explicit Team execution requirement")));
     }
 
     #[test]
-    fn delegated_agent_is_a_local_tool_leaf_without_nested_orchestration_hints() {
+    fn team_vocabulary_never_manufactures_a_hard_execution_obligation() {
+        for prompt in [
+            "讨论 team 这种组织方式的优缺点",
+            "解释多 Agent 协同与单 Agent 的区别",
+            "审计当前 Team 设计是否合理，但不要启动任何执行",
+        ] {
+            let decision = build_runtime_execution_decision(prompt, None);
+            assert_eq!(decision.strategy.understanding.required_team_count, 0);
+            assert!(decision.collaboration_obligation.is_none(), "{prompt}");
+        }
+    }
+
+    #[test]
+    fn explicit_team_execution_freezes_the_requested_cardinality() {
+        for prompt in [
+            "启动两个 Team 并行完成审计",
+            "组建两个团队实际执行研究与复核",
+            "用两个 Team 实际执行该任务",
+        ] {
+            let decision = build_runtime_execution_decision(prompt, None);
+            assert_eq!(decision.strategy.understanding.required_team_count, 2);
+            assert_eq!(
+                decision
+                    .collaboration_obligation
+                    .as_ref()
+                    .map(|obligation| obligation.required_team_count()),
+                Some(2),
+                "{prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn delegated_agent_prompt_cannot_manufacture_a_user_team_obligation() {
         let decision = StrategyDecisionEngine.decide_with_input(
             StrategyInput::from_prompt("分析三个输入文件并汇总结果后写入目标文件"),
             Some(ContextProfile::SubAgent),
@@ -765,16 +639,7 @@ mod tests {
         );
 
         assert!(decision.executable);
-        assert!(decision.recommended_template.is_none());
-        assert!(decision.recommended_actions.is_empty());
-        assert!(decision.reasons.iter().any(|reason| {
-            reason.contains("delegated Agent leaf execution")
-                && reason.contains("cannot recommend nested")
-        }));
-        let report =
-            action_selection_report_for_decision(&decision, Some(ContextProfile::SubAgent));
-        assert_eq!(report.selected_action, "direct");
-        assert!(!report.stateful);
+        assert!(decision.collaboration_obligation.is_none());
     }
 
     #[test]
@@ -793,7 +658,6 @@ mod tests {
 
         assert_eq!(decision.pattern(), ExecutionPattern::Execute);
         assert!(!decision.executable);
-        assert!(decision.recommended_actions.is_empty());
         assert!(decision.gates().contains(&ExecutionPolicyGate::Permission));
         assert!(decision.gates().contains(&ExecutionPolicyGate::Risk));
         assert!(decision.gates().contains(&ExecutionPolicyGate::Approval));
@@ -801,10 +665,6 @@ mod tests {
             .blocked_reasons
             .iter()
             .any(|reason| reason.contains("tool runtime unavailable")));
-        let report = action_selection_report_for_decision(&decision, None);
-        assert_eq!(report.selected_action, "partial");
-        assert_eq!(report.fallback_action, "partial");
-        assert!(!report.stateful);
     }
 
     #[test]
@@ -862,7 +722,6 @@ mod tests {
 
         assert_eq!(decision.pattern(), ExecutionPattern::Direct);
         assert!(!decision.executable);
-        assert!(decision.recommended_actions.is_empty());
         assert_eq!(
             decision.blocked_reasons,
             vec!["provider runtime unavailable".to_string()]

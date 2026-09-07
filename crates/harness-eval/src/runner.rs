@@ -264,6 +264,8 @@ pub fn run_eval_controlled(
     let mut execution_usage = merge_usage(&usage, &live_provider_evidence.usage);
     let mut execution_provider_rounds = live_provider_evidence.provider_rounds;
     let mut execution_usage_unknown_attempts = live_provider_evidence.usage_unknown_attempts;
+    let mut execution_cache_dimensions_unknown_attempts =
+        live_provider_evidence.cache_dimensions_unknown_attempts;
     let execution_cache_structure = live_provider_evidence.structure;
     let mut execution_rounds = live_provider_evidence.rounds;
     let report_reviewer_requested = report_reviewer_requested();
@@ -346,7 +348,9 @@ pub fn run_eval_controlled(
             "provider_cache": provider_cache_evidence(
                 &execution_usage,
                 execution_provider_rounds,
+                live_provider_evidence.physical_attempts,
                 execution_usage_unknown_attempts,
+                execution_cache_dimensions_unknown_attempts,
                 &execution_cache_structure,
             ),
             "rounds": execution_rounds,
@@ -398,6 +402,11 @@ pub fn run_eval_controlled(
             execution_usage_unknown_attempts =
                 execution_usage_unknown_attempts.saturating_add(provider_round_count as u64);
         }
+        // The legacy optional report reviewer exposes aggregate token usage
+        // but no field-presence receipt for cache dimensions. Do not promote
+        // its numeric zeroes to known cache telemetry.
+        execution_cache_dimensions_unknown_attempts =
+            execution_cache_dimensions_unknown_attempts.saturating_add(provider_round_count as u64);
         execution_usage = merge_usage(&execution_usage, &provider_review.usage);
         report["execution_trace"]["rounds"] = Value::Array(execution_rounds);
         report["execution_trace"]["provider_rounds"] = json!(execution_provider_rounds);
@@ -406,7 +415,11 @@ pub fn run_eval_controlled(
         report["execution_trace"]["provider_cache"] = provider_cache_evidence(
             &execution_usage,
             execution_provider_rounds,
+            live_provider_evidence
+                .physical_attempts
+                .saturating_add(provider_round_count as u64),
             execution_usage_unknown_attempts,
+            execution_cache_dimensions_unknown_attempts,
             &execution_cache_structure,
         );
         report["provider_round_details"] = provider_round_details;
@@ -529,7 +542,9 @@ fn first_agentic_program_projection(details: &Value) -> Option<Value> {
 struct LiveGatewayProviderEvidence {
     usage: HarnessEvalUsageSummary,
     provider_rounds: usize,
+    physical_attempts: u64,
     usage_unknown_attempts: u64,
+    cache_dimensions_unknown_attempts: u64,
     structure: ProviderCacheStructureEvidence,
     rounds: Vec<Value>,
 }
@@ -577,12 +592,24 @@ fn live_gateway_provider_evidence(details: Option<&Value>) -> LiveGatewayProvide
             .unwrap_or_else(|| json_u32(metrics.get("cache_tokens")));
         let total_tokens = json_u32(metrics.get("total_tokens"));
         let model_rounds = json_u32(metrics.get("model_rounds"));
+        let physical_attempts = metrics
+            .get("provider_attempt_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::from(model_rounds));
+        evidence.physical_attempts = evidence.physical_attempts.saturating_add(physical_attempts);
         evidence.usage_unknown_attempts = evidence.usage_unknown_attempts.saturating_add(
             metrics
                 .get("usage_unknown_attempts")
                 .and_then(Value::as_u64)
                 .unwrap_or_default(),
         );
+        evidence.cache_dimensions_unknown_attempts =
+            evidence.cache_dimensions_unknown_attempts.saturating_add(
+                metrics
+                    .get("provider_attempt_cache_dimensions_unknown_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(physical_attempts),
+            );
         macro_rules! add_structure {
             ($field:ident, $key:literal) => {
                 evidence.structure.$field = evidence.structure.$field.saturating_add(
@@ -672,7 +699,9 @@ fn merge_usage(
 fn provider_cache_evidence(
     usage: &HarnessEvalUsageSummary,
     provider_rounds: usize,
+    physical_attempts: u64,
     usage_unknown_attempts: u64,
+    cache_dimensions_unknown_attempts: u64,
     structure: &ProviderCacheStructureEvidence,
 ) -> Value {
     let miss = u64::from(usage.input_tokens);
@@ -702,8 +731,12 @@ fn provider_cache_evidence(
         "provider_prompt_tokens": prompt,
         "cache_hit_ratio_bp": ratio,
         "provider_rounds": provider_rounds,
+        "physical_provider_attempts": physical_attempts,
         "usage_known": (provider_rounds == 0 || prompt > 0) && usage_unknown_attempts == 0,
+        "cache_dimensions_known": cache_dimensions_unknown_attempts == 0
+            && physical_attempts >= provider_rounds as u64,
         "usage_unknown_attempts": usage_unknown_attempts,
+        "cache_dimensions_unknown_attempts": cache_dimensions_unknown_attempts,
         "structural_reuse_ratio_bp": structural_ratio,
         "warm_structural_reuse_ratio_bp": warm_structural_ratio,
         "warm_cache_hit_ratio_bp": warm_cache_ratio,
@@ -1100,7 +1133,9 @@ mod tests {
                         "output_tokens": 20,
                         "cache_tokens": 3,
                         "total_tokens": 123,
-                        "model_rounds": 1
+                        "model_rounds": 1,
+                        "provider_attempt_count": 1,
+                        "provider_attempt_cache_dimensions_unknown_count": 0
                     }
                 },
                 {
@@ -1111,7 +1146,9 @@ mod tests {
                         "output_tokens": 40,
                         "cache_tokens": 7,
                         "total_tokens": 247,
-                        "model_rounds": 4
+                        "model_rounds": 4,
+                        "provider_attempt_count": 4,
+                        "provider_attempt_cache_dimensions_unknown_count": 0
                     }
                 }
             ]
@@ -1120,6 +1157,8 @@ mod tests {
         let evidence = live_gateway_provider_evidence(Some(&details));
 
         assert_eq!(evidence.provider_rounds, 5);
+        assert_eq!(evidence.physical_attempts, 5);
+        assert_eq!(evidence.cache_dimensions_unknown_attempts, 0);
         assert_eq!(evidence.usage.input_tokens, 300);
         assert_eq!(evidence.usage.output_tokens, 60);
         assert_eq!(evidence.usage.cache_read_input_tokens, 10);
@@ -1130,6 +1169,22 @@ mod tests {
             evidence.rounds[1]["trace_artifact"],
             "live-scenarios/team.json"
         );
+    }
+
+    #[test]
+    fn cache_dimensions_do_not_vacuously_pass_with_zero_rounds_and_unknown_attempt() {
+        let cache = provider_cache_evidence(
+            &HarnessEvalUsageSummary::default(),
+            0,
+            1,
+            1,
+            1,
+            &ProviderCacheStructureEvidence::default(),
+        );
+
+        assert_eq!(cache["physical_provider_attempts"], 1);
+        assert_eq!(cache["cache_dimensions_unknown_attempts"], 1);
+        assert_eq!(cache["cache_dimensions_known"], false);
     }
 
     #[test]

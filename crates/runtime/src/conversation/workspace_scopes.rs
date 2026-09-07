@@ -12,18 +12,19 @@ pub(crate) fn explicit_workspace_resource_scopes(
     objective: &str,
     requires_write: bool,
 ) -> Vec<String> {
-    let paths = explicit_workspace_paths(workspace_root, objective, requires_write);
+    let mut paths = explicit_workspace_paths(workspace_root, objective, requires_write);
     if !requires_write {
         return paths
             .into_iter()
             .map(|path| format!("read:{path}"))
             .collect();
     }
-    let write_paths = paths
+    let mut write_paths = paths
         .iter()
         .filter(|path| objective_marks_path_for_write(workspace_root, objective, path))
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
+    bind_bare_artifacts_to_declared_directory(objective, &mut paths, &mut write_paths);
     if write_paths.is_empty() && paths.len() == 1 {
         return paths
             .into_iter()
@@ -40,6 +41,74 @@ pub(crate) fn explicit_workspace_resource_scopes(
             }
         })
         .collect()
+}
+
+/// A request such as "create directory `reports/run-1` and create
+/// `summary.md`" names a single delivery directory and then its artifact
+/// leaves. Treating the bare leaf as `./summary.md` (and treating the
+/// directory itself as a file delivery) creates an invented, impossible
+/// completion contract. Bind only this unambiguous shape to its declared
+/// parent; other requests retain their explicit paths unchanged.
+fn bind_bare_artifacts_to_declared_directory(
+    objective: &str,
+    paths: &mut Vec<String>,
+    write_paths: &mut std::collections::BTreeSet<String>,
+) {
+    let directory_candidates = paths
+        .iter()
+        .filter(|path| declared_directory_path(objective, path))
+        .cloned()
+        .collect::<Vec<_>>();
+    let [parent] = directory_candidates.as_slice() else {
+        return;
+    };
+    let bare_artifacts = paths
+        .iter()
+        .filter(|path| is_bare_planned_file_token(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    if bare_artifacts.is_empty() {
+        return;
+    }
+
+    paths.retain(|path| path != parent);
+    write_paths.remove(parent);
+    for artifact in bare_artifacts {
+        let bound = format!("{parent}/{artifact}");
+        paths.retain(|path| path != &artifact);
+        if write_paths.remove(&artifact) {
+            write_paths.insert(bound.clone());
+        }
+        paths.push(bound);
+    }
+    paths.sort();
+    paths.dedup();
+}
+
+fn declared_directory_path(objective: &str, relative: &str) -> bool {
+    if relative == "." || !relative.contains('/') || Path::new(relative).extension().is_some() {
+        return false;
+    }
+    objective_declares_directory_reference(objective, relative)
+}
+
+fn objective_declares_directory_reference(objective: &str, relative: &str) -> bool {
+    const DIRECTORY_MARKERS: &[&str] = &["目录", "文件夹", "directory", "folder"];
+    [relative.to_string(), format!("./{relative}")]
+        .iter()
+        .filter_map(|candidate| objective.find(candidate))
+        .any(|offset| {
+            let before = &objective[..offset];
+            let clause_start = before
+                .char_indices()
+                .rev()
+                .find(|(_, character)| matches!(character, '。' | '；' | ';' | '\n' | '！' | '？'))
+                .map_or(0, |(index, character)| index + character.len_utf8());
+            let clause = objective[clause_start..].to_ascii_lowercase();
+            DIRECTORY_MARKERS
+                .iter()
+                .any(|marker| clause_contains_action(&clause, marker))
+        })
 }
 
 fn objective_marks_path_for_write(workspace_root: &Path, objective: &str, relative: &str) -> bool {
@@ -140,7 +209,9 @@ fn explicit_workspace_paths(
         .filter_map(|token| {
             let token = workspace_pattern_existing_prefix(token, allow_missing)?
                 .unwrap_or_else(|| token.to_string());
-            if !is_probable_workspace_path_token(workspace_root, &token) {
+            if !is_probable_workspace_path_token(workspace_root, &token)
+                && !(allow_missing && declared_directory_path(objective, &token))
+            {
                 return None;
             }
             let candidate = if token.starts_with('/') {
@@ -322,4 +393,33 @@ fn workspace_relative_explicit_path(
         .ok()?
         .starts_with(canonical_root)
         .then(|| relative.to_string_lossy().replace('\\', "/"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::explicit_workspace_resource_scopes;
+
+    #[test]
+    fn binds_bare_artifacts_to_one_declared_delivery_directory() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let objective = "请在当前工作区创建隔离目录 .cowd-e2e/causal-ledger，并实际创建 calculate.py 与 README.md。";
+
+        assert_eq!(
+            explicit_workspace_resource_scopes(workspace.path(), objective, true),
+            vec![
+                "write:.cowd-e2e/causal-ledger/README.md".to_string(),
+                "write:.cowd-e2e/causal-ledger/calculate.py".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn keeps_bare_artifact_at_workspace_root_without_a_declared_directory() {
+        let workspace = tempfile::tempdir().expect("workspace");
+
+        assert_eq!(
+            explicit_workspace_resource_scopes(workspace.path(), "创建 README.md。", true),
+            vec!["write:README.md".to_string()]
+        );
+    }
 }

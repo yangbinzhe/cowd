@@ -40,6 +40,7 @@ fn paired_definition_workload_executes_contract_samples_and_returns_runtime_owne
         resource_scopes: vec!["read:crates/runtime".to_string()],
         permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
         model_lease: "default".to_string(),
+        replay_manifest: None,
     };
     fs::write(
         &scenario_path,
@@ -95,6 +96,7 @@ fn evaluator_rejects_observations_not_bound_to_candidate_revision() {
             resource_scopes: vec!["read:crates/runtime".to_string()],
             permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             model_lease: "default".to_string(),
+            replay_manifest: None,
         })
         .expect("scenario JSON"),
     )

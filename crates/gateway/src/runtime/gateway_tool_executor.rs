@@ -2,7 +2,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use runtime::{ConfigLoader, ToolError, ToolExecutor};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use tools::permissions::PermissionMode as ToolPermissionMode;
 use tools::ToolHost;
 #[cfg(test)]
@@ -190,6 +189,9 @@ fn parse_agent_action(
         action::TASK_SUPERSEDE_TOOL_ID => {
             action::AgentAction::TaskSupersede(serde_json::from_value(value)?)
         }
+        action::TASK_WITHDRAW_TOOL_ID => {
+            action::AgentAction::TaskWithdraw(serde_json::from_value(value)?)
+        }
         action::TASK_SUBMIT_TOOL_ID => {
             action::AgentAction::TaskSubmit(serde_json::from_value(value)?)
         }
@@ -204,6 +206,18 @@ fn parse_agent_action(
         }
         action::OBJECTIVE_COMPLETE_REQUEST_TOOL_ID => {
             action::AgentAction::ObjectiveCompleteRequest(serde_json::from_value(value)?)
+        }
+        action::OBJECTIVE_UPDATE_TOOL_ID => {
+            action::AgentAction::ObjectiveUpdate(serde_json::from_value(value)?)
+        }
+        action::OBJECTIVE_REVIEW_TOOL_ID => {
+            action::AgentAction::ObjectiveReview(serde_json::from_value(value)?)
+        }
+        action::MEMBERSHIP_UPDATE_TOOL_ID => {
+            action::AgentAction::MembershipUpdate(serde_json::from_value(value)?)
+        }
+        action::TEAM_UPDATE_TOOL_ID => {
+            action::AgentAction::TeamUpdate(serde_json::from_value(value)?)
         }
         _ => {
             return Err(serde_json::Error::io(std::io::Error::new(
@@ -314,3 +328,4 @@ include!("gateway_tool_executor/tool_executor_impl.rs");
 include!("gateway_tool_executor/runtime_host_impl.rs");
 include!("gateway_tool_executor/evidence_support.rs");
 include!("gateway_tool_executor/tests.rs");
+use sha2::{Digest, Sha256};

@@ -296,7 +296,7 @@ mod tests {
     async fn crash_after_external_send_blocks_replay_without_second_send() {
         let control = std::sync::Arc::new(
             runtime::CrossPlaneRuntimeService::open(std::sync::Arc::new(
-                RuntimeEventStore::try_open_in_memory().unwrap(),
+                RuntimeEventStore::for_test(),
             ))
             .unwrap(),
         );

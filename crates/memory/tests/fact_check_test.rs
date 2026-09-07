@@ -20,7 +20,6 @@ use memory::{
 fn test_config(sqlite_path: &std::path::Path) -> MemoryConfig {
     MemoryConfig {
         store: StoreConfig {
-            sqlite_path: sqlite_path.to_path_buf(),
             blob_dir: sqlite_path.parent().unwrap().join("blobs"),
             enable_vector_index: false,
             cache_capacity: 128,
@@ -100,7 +99,7 @@ async fn test_remember_contradictory_triple_confidence_downgraded() {
     let tmp = tempfile::TempDir::new().unwrap();
     let config = test_config(&tmp.path().join("test.db"));
 
-    let mgr = CognitiveContextManager::new(config)
+    let mgr = CognitiveContextManager::new_ephemeral(config)
         .await
         .expect("Should create CognitiveContextManager");
 
@@ -196,7 +195,7 @@ async fn test_remember_accepts_consistent_entry() {
     let tmp = tempfile::TempDir::new().unwrap();
     let config = test_config(&tmp.path().join("test.db"));
 
-    let mgr = CognitiveContextManager::new(config)
+    let mgr = CognitiveContextManager::new_ephemeral(config)
         .await
         .expect("Should create CognitiveContextManager");
 

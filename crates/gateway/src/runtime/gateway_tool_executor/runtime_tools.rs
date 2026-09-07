@@ -1,99 +1,4 @@
 impl GatewayToolExecutor {
-    async fn validate_agent_action_evidence(
-        &self,
-        services: &runtime::RuntimeServices,
-        actor: &harness_contract::agent_action::AgentActorBinding,
-        action: &harness_contract::agent_action::AgentAction,
-    ) -> Result<(), ToolError> {
-        use harness_contract::agent_action::AgentAction;
-
-        let evidence_refs: &[String] = match action {
-            AgentAction::TaskSubmit(input) => &input.evidence_refs,
-            AgentAction::TaskReview(input) => &input.evidence_refs,
-            AgentAction::TaskSupersede(input) => &input.evidence_refs,
-            AgentAction::ObjectiveCompleteRequest(input) => &input.evidence_refs,
-            _ => &[],
-        };
-        for evidence_ref in evidence_refs {
-            let artifact = if let Some(evidence_id) = evidence_ref.strip_prefix("tool://") {
-                let access = services
-                    .session_evidence_access(&actor.session_id, evidence_id)
-                    .await
-                    .map_err(|error| {
-                        ToolError::new(format!(
-                            "{} could not resolve evidence `{evidence_ref}` through the authenticated Session journal: {error}",
-                            action.kind()
-                        ))
-                    })?
-                    .ok_or_else(|| {
-                        ToolError::new(format!(
-                            "{} evidence `{evidence_ref}` has no canonical durable receipt in Session `{}`; use a tool:// reference returned by a completed tool call in this Session",
-                            action.kind(), actor.session_id
-                        ))
-                    })?;
-                let artifact = services
-                    .artifact_store()
-                    .resolve(&access.retrieval_selector)
-                    .map_err(|error| {
-                        ToolError::new(format!(
-                            "{} evidence `{evidence_ref}` points to missing durable content: {error}",
-                            action.kind()
-                        ))
-                    })?;
-                if artifact.sha256 != access.sha256
-                    || artifact.bytes != access.bytes
-                    || artifact.media_type != access.media_type
-                    || artifact.visibility_scope != access.visibility_scope
-                {
-                    return Err(ToolError::new(format!(
-                        "{} evidence `{evidence_ref}` failed durable receipt integrity validation",
-                        action.kind()
-                    )));
-                }
-                artifact
-            } else if evidence_ref.starts_with("artifact://") {
-                services
-                    .artifact_store()
-                    .resolve(evidence_ref)
-                    .map_err(|error| {
-                        ToolError::new(format!(
-                            "{} evidence `{evidence_ref}` points to missing durable content: {error}",
-                            action.kind()
-                        ))
-                    })?
-            } else {
-                continue;
-            };
-            let session_scope = format!("session:{}", actor.session_id);
-            if artifact.visibility_scope != "public"
-                && artifact.visibility_scope != session_scope
-                && !actor
-                    .resource_scopes
-                    .iter()
-                    .any(|scope| scope == &artifact.visibility_scope)
-            {
-                return Err(ToolError::new(format!(
-                    "{} evidence `{evidence_ref}` is not readable in Session `{}`",
-                    action.kind(), actor.session_id
-                )));
-            }
-            // Metadata resolution alone is not evidence availability: verify
-            // the backing object without materializing an arbitrarily large
-            // payload into the Action path.
-            services
-                .artifact_store()
-                .read(&artifact, &artifact.visibility_scope, Some(0..artifact.bytes.min(1)))
-                .await
-                .map_err(|error| {
-                    ToolError::new(format!(
-                        "{} evidence `{evidence_ref}` is not readable: {error}",
-                        action.kind()
-                    ))
-                })?;
-        }
-        Ok(())
-    }
-
     fn input_contract_error(&self, tool_name: &str, error: impl std::fmt::Display) -> ToolError {
         let lease = self.tool_host.pin_snapshot();
         let definition = lease
@@ -380,16 +285,6 @@ impl GatewayToolExecutor {
                     ));
                 }
             };
-            let fallback_action_id = format!(
-                "{:x}",
-                Sha256::digest(
-                    format!(
-                        "{}|{}|{}|{}",
-                        actor.program_id, actor.actor_id, tool_name, value
-                    )
-                    .as_bytes()
-                )
-            );
             let action = parse_agent_action(tool_name, value)
                 .map_err(|error| self.input_contract_error(tool_name, error))?;
             let resolved_content_ref = match &action {
@@ -402,18 +297,18 @@ impl GatewayToolExecutor {
                 action_id: binding
                     .action_id
                     .filter(|value| !value.trim().is_empty())
-                    .unwrap_or(fallback_action_id.as_str())
+                    .ok_or_else(|| ToolError::new(
+                        "Agent action requires a durable Runtime invocation id; payload hashes are not action identities",
+                    ))?
                     .to_string(),
                 actor,
                 expected_revision,
                 action,
             };
-            self.validate_agent_action_evidence(&services, &envelope.actor, &envelope.action)
-                .await?;
             let mut observation = services
-                .agent_action_service()
-                .apply(&envelope)
-                .map_err(|error| ToolError::new(error.to_string()))?;
+                .submit_agent_action(&envelope)
+                .await
+                .map_err(ToolError::new)?;
             // `objective_complete_request` only commits the model-authored
             // request here. The durable Program projection lane is the sole
             // live reconciliation trigger: it asks ObjectiveSupervisor for a
@@ -533,10 +428,6 @@ impl GatewayToolExecutor {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
-            let team_templates = self
-                .runtime_services
-                .get()
-                .and_then(|services| services.definition_registry().runnable_team_catalog().ok());
             let agent_catalog = self
                 .runtime_services
                 .get()
@@ -549,7 +440,6 @@ impl GatewayToolExecutor {
                     input.detail.as_deref(),
                     leased_decision.as_ref(),
                     &self.available_tool_names(),
-                    team_templates.as_deref(),
                     agent_catalog.as_deref(),
                 ),
             )

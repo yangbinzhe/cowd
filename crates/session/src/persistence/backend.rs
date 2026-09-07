@@ -6,7 +6,7 @@
 //! its async API without adding a process-wide mutex around database work.
 
 use crate::error::Result;
-use crate::persistence::sqlite::{
+use crate::persistence::types::{
     ContextIndexCard, ContextIndexCoverage, OutboxFailureClass, SessionBranchRequest,
     SessionBranchResult, SessionEvent, SessionInputAdmission, SessionLifecycleFenceRequest,
     SessionLifecycleTombstoneRequest, SessionListOptions, SessionListPage, SessionMessage,
@@ -14,7 +14,6 @@ use crate::persistence::sqlite::{
     SessionRecoverySignal, SessionRuntimeInputStatus, SessionRuntimeOutboxHealth,
     SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest, SessionSearchResult, SessionSnapshot,
     SessionTerminalTranscriptCommit, SessionTerminalTranscriptReceipt, SessionUsageSummary,
-    SqliteSessionStore,
 };
 use crate::{
     SessionBranchActivation, SessionBranchActivationTransition, SessionLifecycleIntent,
@@ -71,6 +70,7 @@ macro_rules! session_store_backend_contract {
             (get_session_domain_timeline_limited, (session_id: &str, from_seq: usize, limit: usize), Result<Vec<SessionEvent>>),
             (count_session_domain_timeline_from, (session_id: &str, from_seq: usize), Result<usize>),
             (get_session_domain_events_by_kind_limited, (session_id: &str, kind: &str, from_seq: usize, limit: usize), Result<Vec<SessionEvent>>),
+            (get_session_domain_events_for_epoch, (session_id: &str, kind: &str, execution_id: &str, turn_id: &str), Result<Vec<SessionEvent>>),
             (get_latest_session_domain_event_by_kind, (session_id: &str, kind: &str), Result<Option<SessionEvent>>),
             (count_session_domain_events_by_kind_from, (session_id: &str, kind: &str, from_seq: usize), Result<usize>),
             (has_session_domain_event_kind, (kind: &str), Result<bool>),
@@ -146,16 +146,6 @@ macro_rules! declare_session_store_backend {
 #[allow(clippy::too_many_arguments)]
 pub trait SessionStoreBackend: std::fmt::Debug + Send + Sync {
     session_store_backend_contract!(declare_session_store_backend);
-}
-
-macro_rules! delegate_to_sqlite {
-    ($(($name:ident, ($($arg:ident: $arg_ty:ty),*), $result:ty)),+ $(,)?) => {
-        $(fn $name(&self, $($arg: $arg_ty),*) -> $result { self.$name($($arg),*) })+
-    };
-}
-
-impl SessionStoreBackend for SqliteSessionStore {
-    session_store_backend_contract!(delegate_to_sqlite);
 }
 
 pub type SharedSessionStoreBackend = std::sync::Arc<dyn SessionStoreBackend>;

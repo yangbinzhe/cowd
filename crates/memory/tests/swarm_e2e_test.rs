@@ -31,7 +31,6 @@ use memory::{
 fn test_config(sqlite_path: &std::path::Path) -> MemoryConfig {
     MemoryConfig {
         store: StoreConfig {
-            sqlite_path: sqlite_path.to_path_buf(),
             blob_dir: sqlite_path.parent().unwrap().join("blobs"),
             enable_vector_index: false,
             cache_capacity: 128,
@@ -91,7 +90,9 @@ async fn test_swarm_e2e_planner_executor_reviewer_lifecycle() {
     let db_path = tmp.path().join("swarm_e2e.db");
     let config = test_config(&db_path);
 
-    let mgr = CognitiveContextManager::new(config).await.unwrap();
+    let mgr = CognitiveContextManager::new_ephemeral(config)
+        .await
+        .unwrap();
 
     let project_scope = MemoryScope::Project("e2e-swarm-project".into());
     let lifecycle_tag = format!("e2e-lifecycle-{}", uuid::Uuid::new_v4().as_simple());
@@ -318,7 +319,9 @@ async fn test_swarm_e2e_peer_perception() {
     let db_path = tmp.path().join("swarm_peer_perception.db");
     let config = test_config(&db_path);
 
-    let mgr = CognitiveContextManager::new(config).await.unwrap();
+    let mgr = CognitiveContextManager::new_ephemeral(config)
+        .await
+        .unwrap();
 
     let scope = MemoryScope::Project("peer-perception-proj".into());
     let session_tag = format!("peer-test-{}", uuid::Uuid::new_v4().as_simple());
@@ -480,7 +483,9 @@ async fn test_swarm_e2e_cross_scope_isolation() {
     let db_path = tmp.path().join("swarm_scope_isolation.db");
     let config = test_config(&db_path);
 
-    let mgr = CognitiveContextManager::new(config).await.unwrap();
+    let mgr = CognitiveContextManager::new_ephemeral(config)
+        .await
+        .unwrap();
 
     // Agent in Project A writes
     let scope_a = MemoryScope::Project("project-a".into());

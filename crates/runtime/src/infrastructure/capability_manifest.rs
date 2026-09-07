@@ -6,7 +6,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::definition_registry::RuntimeTeamTemplateCatalogEntry;
 use crate::execution_core::RuntimeExecutionDecision;
 use crate::AgentCatalogEntry;
 
@@ -165,13 +164,6 @@ impl RuntimeCapabilityCatalog {
             action_contracts,
         }
     }
-
-    /// Dynamic Teams replace catalog templates; old entries never become a
-    /// hidden fallback in the model-facing contract.
-    #[must_use]
-    pub fn from_registry(_entries: &[RuntimeTeamTemplateCatalogEntry]) -> Self {
-        Self::current()
-    }
 }
 
 fn action_purpose(action: &str) -> &'static str {
@@ -255,7 +247,6 @@ pub fn runtime_capabilities_response_with_leased_decision(
         leased_decision,
         &available_tools,
         None,
-        None,
     )
 }
 
@@ -267,7 +258,6 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
     detail: Option<&str>,
     leased_decision: Option<&RuntimeExecutionDecision>,
     available_tool_names: &[String],
-    _team_template_entries: Option<&[RuntimeTeamTemplateCatalogEntry]>,
     agent_catalog_entries: Option<&[AgentCatalogEntry]>,
 ) -> Value {
     let actions = harness_contract::agent_action::AGENT_ACTION_TOOL_IDS

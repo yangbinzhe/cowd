@@ -604,21 +604,13 @@ fn render_message_resource_context(
     if ids.is_empty() {
         return content.to_string();
     }
-    let store = artifact_store.map_or_else(
-        || {
-            runtime::ResourceStore::for_config_home_with_capabilities(
-                config_home,
-                capabilities.clone(),
-            )
-        },
-        |artifacts| {
-            runtime::ResourceStore::from_artifact_store(
-                config_home,
-                artifacts,
-                capabilities.clone(),
-            )
-        },
-    );
+    let Some(artifacts) = artifact_store else {
+        return format!(
+            "{content}\n\n## Attached Resources\n- unavailable: durable artifact backend is not configured"
+        );
+    };
+    let store =
+        runtime::ResourceStore::from_artifact_store(config_home, artifacts, capabilities.clone());
     let mut pairs = Vec::new();
     let mut failures = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
@@ -1072,7 +1064,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let input = temp.path().join("voice.mp3");
         std::fs::write(&input, b"fake mp3").expect("write resource");
-        let store = runtime::ResourceStore::default_for_config_home(&temp.path().join("home"));
+        let store = runtime::ResourceStore::for_test_config_home(&temp.path().join("home"));
         let (resource, _) = store
             .register_resource_from_path(
                 &input,
@@ -1085,7 +1077,9 @@ mod tests {
 
         let rendered = render_message_resource_context(
             &temp.path().join("home"),
-            None,
+            Some(Arc::new(runtime::ArtifactStore::for_test_default(
+                temp.path().join("artifacts"),
+            ))),
             &runtime::ResourceCapabilityIndex::default(),
             "请分析附件",
             &[resource.id.clone(), resource.id.clone()],

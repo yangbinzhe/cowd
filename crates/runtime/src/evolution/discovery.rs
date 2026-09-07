@@ -1221,7 +1221,7 @@ mod tests {
 
     #[test]
     fn discovery_ledger_is_idempotent_and_replayable() {
-        let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let events = Arc::new(RuntimeEventStore::for_test());
         let discovery = EvolutionDiscoveryService::new(Arc::clone(&events));
         let recorded = discovery.record_signal(signal()).expect("record signal");
         let repeated = discovery
@@ -1244,7 +1244,7 @@ mod tests {
 
     #[test]
     fn discovery_ledger_rejects_conflicting_signal_reuse() {
-        let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let events = Arc::new(RuntimeEventStore::for_test());
         let discovery = EvolutionDiscoveryService::new(Arc::clone(&events));
         let recorded = discovery.record_signal(signal()).expect("record signal");
         let mut conflicting = recorded.clone();
@@ -1264,7 +1264,7 @@ mod tests {
 
     #[test]
     fn legacy_import_keeps_existing_canonical_signal_on_payload_conflict() {
-        let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let events = Arc::new(RuntimeEventStore::for_test());
         let discovery = EvolutionDiscoveryService::new(Arc::clone(&events));
         let recorded = discovery.record_signal(signal()).expect("record signal");
         let mut legacy = recorded.clone();
@@ -1279,7 +1279,7 @@ mod tests {
 
     #[test]
     fn one_hundred_same_scope_signals_collapse_to_one_case_and_one_proposal() {
-        let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let events = Arc::new(RuntimeEventStore::for_test());
         let discovery = EvolutionDiscoveryService::new(events);
         for index in 0..100 {
             let mut next = signal();
@@ -1305,7 +1305,7 @@ mod tests {
 
     #[test]
     fn concurrent_case_observation_uses_stream_and_index_cas() {
-        let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let events = Arc::new(RuntimeEventStore::for_test());
         let discovery = Arc::new(EvolutionDiscoveryService::new(events));
         let mut workers = Vec::new();
         for index in 0..8 {
@@ -1332,7 +1332,7 @@ mod tests {
 
     #[test]
     fn case_catalog_paginates_across_frozen_pages_without_scope_replay() {
-        let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let events = Arc::new(RuntimeEventStore::for_test());
         let discovery = EvolutionDiscoveryService::new(events);
         for index in 0..=EVOLUTION_CASE_CATALOG_PAGE_SIZE {
             let mut next = signal();

@@ -7,24 +7,71 @@ use matrix_core::{
     MatrixScenarioOutputContract, MatrixScenarioResult, MatrixScenarioSpec, MatrixSnapshotRef,
     MatrixSourceKind, MatrixSourceSnapshotInput,
 };
-use matrix_repository::open_matrix_sqlite_repository_handle;
+use matrix_repository::{MatrixStore, PostgresMatrixRepository};
 use runtime::{
     AgentBindingRequest, MatrixScenarioStartRequest, RealityRecallPort, RuntimeServices,
 };
 use serde_json::json;
-use storage::{StorageDomainId, StorageRegistry};
+use storage::{PostgresConnectionConfig, PostgresExecutor, StaticSecretRefResolver};
+
+struct MatrixFixture {
+    repository: std::sync::Arc<PostgresMatrixRepository>,
+    executor: PostgresExecutor,
+    schema: String,
+}
+
+impl MatrixFixture {
+    fn isolated() -> Self {
+        let url =
+            std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
+        let resolver = StaticSecretRefResolver::new([("runtime.matrix.scenario".to_string(), url)]);
+        let executor = PostgresExecutor::connect(
+            PostgresConnectionConfig::new(
+                "runtime-matrix-scenario-test",
+                "runtime.matrix.scenario",
+                "runtime-matrix-scenario-test",
+            ),
+            &resolver,
+        )
+        .expect("PostgreSQL executor");
+        let schema = format!("runtime_matrix_{}", uuid::Uuid::new_v4().simple());
+        executor
+            .checkout_critical()
+            .expect("PostgreSQL connection")
+            .batch_execute(&format!("CREATE SCHEMA \"{schema}\""))
+            .expect("isolated schema");
+        let repository = std::sync::Arc::new(
+            PostgresMatrixRepository::new(
+                executor.scoped_namespace(&schema).expect("scoped executor"),
+            )
+            .expect("Matrix repository"),
+        );
+        Self {
+            repository,
+            executor,
+            schema,
+        }
+    }
+}
+
+impl Drop for MatrixFixture {
+    fn drop(&mut self) {
+        if let Ok(mut connection) = self.executor.checkout_critical() {
+            let _ = connection.batch_execute(&format!(
+                "DROP SCHEMA IF EXISTS \"{}\" CASCADE",
+                self.schema
+            ));
+        }
+    }
+}
 
 #[test]
+#[ignore = "requires COWD_TEST_POSTGRES_URL"]
 fn matrix_scenario_port_requires_the_binding_snapshot_lease_and_emits_candidate_only_results() {
     let home = tempfile::tempdir().unwrap();
     let services = RuntimeServices::in_memory().expect("runtime");
-    let registry = StorageRegistry::default_for_config_home(home.path());
-    let handle = registry
-        .endpoint(&StorageDomainId::Matrix)
-        .expect("matrix storage endpoint")
-        .as_handle();
-    std::fs::create_dir_all(handle.path.parent().expect("matrix parent")).expect("matrix dir");
-    let repository = open_matrix_sqlite_repository_handle(&handle).expect("matrix repository");
+    let fixture = MatrixFixture::isolated();
+    let repository = std::sync::Arc::clone(&fixture.repository);
     let source = repository
         .create_source_snapshot(MatrixSourceSnapshotInput {
             snapshot_id: Some("orders-v7".to_string()),
@@ -61,7 +108,12 @@ fn matrix_scenario_port_requires_the_binding_snapshot_lease_and_emits_candidate_
     allowed.granted_capabilities = vec![AgentCapability::Read];
     allowed.matrix_snapshot_refs = vec![snapshot.snapshot_ref.clone()];
     let allowed_binding = services.compile_agent_binding(allowed).unwrap().snapshot;
-    let port = RealityRecallPort::for_config_home(home.path()).matrix_scenarios();
+    let port = RealityRecallPort::with_fact_and_matrix_store(
+        home.path(),
+        std::sync::Arc::new(fact_kernel::EphemeralFactLedger::new()),
+        repository,
+    )
+    .matrix_scenarios();
     let run = port
         .start(
             &allowed_binding,

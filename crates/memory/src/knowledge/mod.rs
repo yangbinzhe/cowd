@@ -6,7 +6,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
-use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Utc};
@@ -18,7 +17,6 @@ use harness_contract::knowledge::{
     KnowledgePackKind, KnowledgeTurnReport, KnowledgeUsageSignal,
 };
 use harness_contract::reality::EvidenceRef;
-use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -187,8 +185,6 @@ pub enum KnowledgeStoreError {
     Io(#[from] std::io::Error),
     #[error("storage error: {0}")]
     Storage(#[from] storage::StorageError),
-    #[error("sqlite error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("backend error: {0}")]
@@ -1096,209 +1092,6 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct SqliteKnowledgeStore {
-    db_path: Arc<std::path::PathBuf>,
-}
-
-impl SqliteKnowledgeStore {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, KnowledgeStoreError> {
-        let store = Self {
-            db_path: Arc::new(path.as_ref().to_path_buf()),
-        };
-        store.ensure_schema()?;
-        Ok(store)
-    }
-
-    fn connection(&self) -> Result<Connection, KnowledgeStoreError> {
-        Ok(Connection::open(self.db_path.as_path())?)
-    }
-
-    fn ensure_schema(&self) -> Result<(), KnowledgeStoreError> {
-        let conn = self.connection()?;
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS knowledge_corpus (
-                corpus_id TEXT PRIMARY KEY,
-                namespace_key TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS knowledge_pack (
-                pack_id TEXT PRIMARY KEY,
-                namespace_key TEXT NOT NULL,
-                state TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS knowledge_canon (
-                canon_id TEXT PRIMARY KEY,
-                pack_id TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS knowledge_conflict (
-                conflict_id TEXT PRIMARY KEY,
-                pack_id TEXT,
-                state TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                detected_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS knowledge_chunk (
-                chunk_id TEXT PRIMARY KEY,
-                corpus_id TEXT NOT NULL,
-                payload_json TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS knowledge_usage (
-                signal_id TEXT PRIMARY KEY,
-                pack_id TEXT NOT NULL,
-                session_id TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                occurred_at TEXT NOT NULL
-            );
-            "#,
-        )?;
-        Ok(())
-    }
-}
-
-pub fn durable_knowledge_fabric_for_config_home(
-    config_home: impl AsRef<Path>,
-) -> Result<KnowledgeFabric, KnowledgeStoreError> {
-    let registry = storage::StorageRegistry::default_for_config_home(config_home);
-    let db_path = registry
-        .endpoint(&storage::StorageDomainId::Knowledge)?
-        .as_handle()
-        .path;
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let store = Arc::new(SqliteKnowledgeStore::open(db_path)?);
-    Ok(KnowledgeFabric::with_store(store))
-}
-
-impl KnowledgeStore for SqliteKnowledgeStore {
-    fn save_receipt(&self, receipt: &KnowledgeIngestionReceipt) -> Result<(), KnowledgeStoreError> {
-        let conn = self.connection()?;
-        conn.execute(
-            "INSERT OR REPLACE INTO knowledge_corpus (corpus_id, namespace_key, payload_json, updated_at) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                receipt.corpus.corpus_id,
-                receipt.corpus.namespace.key(),
-                serde_json::to_string(&receipt.corpus)?,
-                receipt.corpus.updated_at.to_rfc3339(),
-            ],
-        )?;
-        conn.execute(
-            "INSERT OR REPLACE INTO knowledge_pack (pack_id, namespace_key, state, payload_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                receipt.pack.pack_id,
-                receipt.pack.namespace.key(),
-                format!("{:?}", receipt.pack.state),
-                serde_json::to_string(&receipt.pack)?,
-                receipt.pack.updated_at.to_rfc3339(),
-            ],
-        )?;
-        conn.execute(
-            "INSERT OR REPLACE INTO knowledge_canon (canon_id, pack_id, payload_json, updated_at) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                receipt.canon.canon_id,
-                receipt.canon.pack_id,
-                serde_json::to_string(&receipt.canon)?,
-                receipt.canon.updated_at.to_rfc3339(),
-            ],
-        )?;
-        for conflict in &receipt.conflicts {
-            conn.execute(
-                "INSERT OR REPLACE INTO knowledge_conflict (conflict_id, pack_id, state, payload_json, detected_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    conflict.conflict_id,
-                    conflict.pack_id,
-                    format!("{:?}", conflict.state),
-                    serde_json::to_string(conflict)?,
-                    conflict.detected_at.to_rfc3339(),
-                ],
-            )?;
-        }
-        for chunk in &receipt.chunks {
-            conn.execute(
-                "INSERT OR REPLACE INTO knowledge_chunk (chunk_id, corpus_id, payload_json) VALUES (?1, ?2, ?3)",
-                params![chunk.chunk_id, chunk.corpus_id, serde_json::to_string(chunk)?],
-            )?;
-        }
-        Ok(())
-    }
-
-    fn save_pack(&self, pack: &KnowledgePack) -> Result<(), KnowledgeStoreError> {
-        let conn = self.connection()?;
-        conn.execute(
-            "INSERT OR REPLACE INTO knowledge_pack (pack_id, namespace_key, state, payload_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                pack.pack_id,
-                pack.namespace.key(),
-                format!("{:?}", pack.state),
-                serde_json::to_string(pack)?,
-                pack.updated_at.to_rfc3339(),
-            ],
-        )?;
-        Ok(())
-    }
-
-    fn save_conflict(&self, conflict: &KnowledgeConflictRecord) -> Result<(), KnowledgeStoreError> {
-        let conn = self.connection()?;
-        conn.execute(
-            "INSERT OR REPLACE INTO knowledge_conflict (conflict_id, pack_id, state, payload_json, detected_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                conflict.conflict_id,
-                conflict.pack_id,
-                format!("{:?}", conflict.state),
-                serde_json::to_string(conflict)?,
-                conflict.detected_at.to_rfc3339(),
-            ],
-        )?;
-        Ok(())
-    }
-
-    fn record_usage(&self, signal: &KnowledgeUsageSignal) -> Result<(), KnowledgeStoreError> {
-        let conn = self.connection()?;
-        conn.execute(
-            "INSERT OR REPLACE INTO knowledge_usage (signal_id, pack_id, session_id, payload_json, occurred_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                signal.signal_id,
-                signal.pack_id,
-                signal.session_id,
-                serde_json::to_string(signal)?,
-                signal.occurred_at.to_rfc3339(),
-            ],
-        )?;
-        Ok(())
-    }
-
-    fn snapshot(&self) -> Result<KnowledgeSnapshot, KnowledgeStoreError> {
-        fn load_json<T: for<'de> Deserialize<'de>>(
-            conn: &Connection,
-            table: &str,
-        ) -> Result<Vec<T>, KnowledgeStoreError> {
-            let mut stmt = conn.prepare(&format!("SELECT payload_json FROM {table}"))?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-            let mut values = Vec::new();
-            for row in rows {
-                values.push(serde_json::from_str(&row?)?);
-            }
-            Ok(values)
-        }
-        let conn = self.connection()?;
-        Ok(KnowledgeSnapshot {
-            corpus: load_json(&conn, "knowledge_corpus")?,
-            packs: load_json(&conn, "knowledge_pack")?,
-            canon: load_json(&conn, "knowledge_canon")?,
-            conflicts: load_json(&conn, "knowledge_conflict")?,
-            chunks: load_json(&conn, "knowledge_chunk")?,
-            usage: load_json(&conn, "knowledge_usage")?,
-        })
-    }
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct DocumentClassifier;
 
@@ -2195,8 +1988,7 @@ mod tests {
 
     #[test]
     fn archived_memory_source_quarantines_durable_knowledge() {
-        let root = tempfile::tempdir().unwrap();
-        let store = Arc::new(SqliteKnowledgeStore::open(root.path().join("knowledge.db")).unwrap());
+        let store = Arc::new(InMemoryKnowledgeStore::new());
         let fabric = KnowledgeFabric::with_store(store.clone());
         let mut document = DocumentContent::new(
             "Derived project decision",
@@ -2342,8 +2134,7 @@ mod tests {
 
     #[test]
     fn quarantining_a_source_retires_its_conflict_without_losing_evidence() {
-        let root = tempfile::tempdir().unwrap();
-        let store = Arc::new(SqliteKnowledgeStore::open(root.path().join("knowledge.db")).unwrap());
+        let store = Arc::new(InMemoryKnowledgeStore::new());
         let fabric = KnowledgeFabric::with_store(store.clone());
         let mut document = DocumentContent::new(
             "Retired conflict",
@@ -2431,9 +2222,8 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_knowledge_store_persists_corpus_pack_canon_conflict_and_usage() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let store = Arc::new(SqliteKnowledgeStore::open(dir.path().join("knowledge.db")).unwrap());
+    fn derived_knowledge_store_preserves_corpus_pack_canon_conflict_and_usage() {
+        let store = Arc::new(InMemoryKnowledgeStore::new());
         let fabric = KnowledgeFabric::with_store(store.clone());
         let receipt = fabric.ingest_document(
             KnowledgeNamespace::SharedLibrary("quality".to_string()),

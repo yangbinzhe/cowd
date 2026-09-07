@@ -194,10 +194,9 @@ fn projection_work_class_maps_background_without_downgrading_recovery() {
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 fn postgres_runtime_event_store_preserves_fences_outbox_restart_and_runtime_composition() {
     let (store, url) = open_real_store();
-    let sqlite_source = RuntimeEventStore::try_open_in_memory().expect("SQLite source opens");
-    sqlite_source
+    store
         .append_transaction(AppendTransactionRequest {
-            transaction_id: "copy-source-transaction".to_string(),
+            transaction_id: "postgres-source-transaction".to_string(),
             expected_streams: vec![
                 ExpectedStreamRevision {
                     stream_id: "copy:stream".to_string(),
@@ -211,29 +210,11 @@ fn postgres_runtime_event_store_preserves_fences_outbox_restart_and_runtime_comp
             events: vec![input(
                 "copy:stream",
                 RuntimeEventScope::Recovery,
-                "migration.source_seeded",
+                "postgres.source_seeded",
             )
             .into()],
         })
-        .expect("source event");
-    let manifest_root = tempfile::tempdir().expect("migration manifest root");
-    let manifest_path = manifest_root.path().join("runtime-event-cutover.json");
-    let copy = copy_quiesced_runtime_event_store(&sqlite_source, &store, &manifest_path)
-        .expect("SQLite to PostgreSQL migration copy");
-    assert_eq!(copy.source_digest, copy.target_digest);
-    assert!(manifest_path.is_file());
-    assert_eq!(
-        store
-            .export_migration_snapshot()
-            .expect("target snapshot")
-            .canonical_digest()
-            .expect("target digest"),
-        sqlite_source
-            .export_migration_snapshot()
-            .expect("source snapshot")
-            .canonical_digest()
-            .expect("source digest")
-    );
+        .expect("PostgreSQL source event");
     let store = Arc::new(store);
     store
         .append(input(
@@ -614,61 +595,8 @@ fn postgres_runtime_event_store_preserves_fences_outbox_restart_and_runtime_comp
 
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
-fn postgres_task_store_preserves_migration_restart_and_per_task_concurrency() {
+fn postgres_task_store_preserves_restart_and_per_task_concurrency() {
     let url = std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
-    let temp = tempfile::tempdir().expect("temporary task migration root");
-    let source_path = temp.path().join("source-tasks.db");
-    let source = TaskAggregateService::open(source_path).expect("SQLite task source opens");
-    let source_task = source
-        .create(TaskCreateCommand {
-            task_id: "task-pg-migration".to_string(),
-            mission_id: "mission-pg-migration".to_string(),
-            kind: TaskKind::Root,
-            origin: TaskOrigin::User,
-            origin_session_id: "session-pg-migration".to_string(),
-            origin_turn_id: "turn-pg-migration".to_string(),
-            root_task_id: "task-pg-migration".to_string(),
-            parent_task_id: None,
-            predecessor_task_id: None,
-            mission_assignment: TaskMissionAssignment::Default,
-            mission_assigned_by: "test".to_string(),
-            spec: policy_bound_task_spec("session-pg-migration", "Migrate the task control plane"),
-            evidence_refs: vec![EvidenceRef::observed(
-                "test_fixture",
-                "test://runtime-postgres/task-migration",
-            )],
-        })
-        .expect("source task starts")
-        .aggregate;
-    let phase = source
-        .start_phase(
-            &source_task.task_id,
-            source_task.revision,
-            TaskPhaseSpec {
-                name: "postgres-verification".to_string(),
-                objective: "prove target preserves the task record".to_string(),
-                dependency_refs: Vec::new(),
-                plan: vec!["copy task snapshot".to_string()],
-                acceptance: vec!["digest equality".to_string()],
-                test_commands: vec!["real PostgreSQL task test".to_string()],
-            },
-            Vec::new(),
-        )
-        .expect("source phase starts")
-        .aggregate;
-    let phase_id = phase.phases.last().expect("phase exists").phase_id.clone();
-    source
-        .record_phase_artifact(
-            &source_task.task_id,
-            phase.revision,
-            &phase_id,
-            "evidence",
-            "migration",
-            "source snapshot is canonical",
-            Vec::new(),
-        )
-        .expect("source artifact persists");
-
     let resolver = StaticSecretRefResolver::new([("task.pg".to_string(), url.clone())]);
     let pg_store = PostgresTaskStore::connect(
         PostgresConnectionConfig::new(
@@ -681,24 +609,55 @@ fn postgres_task_store_preserves_migration_restart_and_per_task_concurrency() {
     .expect("postgres task store opens");
     let executor = pg_store.executor().clone();
     let target = Arc::new(pg_store.into_task_service());
-    let manifest_path = temp.path().join("task-migration-manifest.json");
-    let manifest = copy_quiesced_task_service(&source, target.as_ref(), &manifest_path)
-        .expect("quiesced SQLite to PostgreSQL copy succeeds");
-    assert_eq!(manifest.source_digest, manifest.target_digest);
-    assert_eq!(manifest.task_count, 1);
-    assert!(manifest_path.is_file());
-    assert_eq!(
-        source
-            .export_migration_snapshot()
-            .expect("source snapshot")
-            .canonical_digest()
-            .expect("source digest"),
-        target
-            .export_migration_snapshot()
-            .expect("target snapshot")
-            .canonical_digest()
-            .expect("target digest")
-    );
+    let source_task = target
+        .create(TaskCreateCommand {
+            task_id: "task-pg-durable".to_string(),
+            mission_id: "mission-pg-durable".to_string(),
+            kind: TaskKind::Root,
+            origin: TaskOrigin::User,
+            origin_session_id: "session-pg-durable".to_string(),
+            origin_turn_id: "turn-pg-durable".to_string(),
+            root_task_id: "task-pg-durable".to_string(),
+            parent_task_id: None,
+            predecessor_task_id: None,
+            mission_assignment: TaskMissionAssignment::Default,
+            mission_assigned_by: "test".to_string(),
+            spec: policy_bound_task_spec("session-pg-durable", "Verify the task control plane"),
+            evidence_refs: vec![EvidenceRef::observed(
+                "test_fixture",
+                "test://runtime-postgres/task-durability",
+            )],
+        })
+        .expect("PostgreSQL task starts")
+        .aggregate;
+    let phase = target
+        .start_phase(
+            &source_task.task_id,
+            source_task.revision,
+            TaskPhaseSpec {
+                name: "postgres-verification".to_string(),
+                objective: "prove PostgreSQL preserves the task record".to_string(),
+                dependency_refs: Vec::new(),
+                plan: vec!["persist task state".to_string()],
+                acceptance: vec!["restart equality".to_string()],
+                test_commands: vec!["real PostgreSQL task test".to_string()],
+            },
+            Vec::new(),
+        )
+        .expect("PostgreSQL phase starts")
+        .aggregate;
+    let phase_id = phase.phases.last().expect("phase exists").phase_id.clone();
+    target
+        .record_phase_artifact(
+            &source_task.task_id,
+            phase.revision,
+            &phase_id,
+            "evidence",
+            "durability",
+            "PostgreSQL state is canonical",
+            Vec::new(),
+        )
+        .expect("PostgreSQL artifact persists");
 
     let barrier = Arc::new(Barrier::new(2));
     let workers = (0..2)
@@ -798,7 +757,7 @@ fn postgres_task_store_preserves_migration_restart_and_per_task_concurrency() {
     let mut clustered_replay = organization.clone();
     clustered_replay
         .affected_task_ids
-        .push("task-pg-migration".to_string());
+        .push("task-pg-durable".to_string());
     let retained = target
         .save_organization_decision(&clustered_replay, None)
         .expect("mutable cluster membership does not break Root idempotency");
@@ -825,20 +784,17 @@ fn postgres_task_store_preserves_migration_restart_and_per_task_concurrency() {
         .expect("reopened task list")
         .into_iter()
         .find(|task| task.task_id == source_task.task_id)
-        .expect("migrated task survives reopen");
+        .expect("durable task survives reopen");
     assert!(restored
         .phases
         .iter()
         .any(|candidate| candidate.phase_id == phase_id && !candidate.artifacts.is_empty()));
-    assert!(
-        copy_quiesced_task_service(&source, &reopened, temp.path().join("rejected.json")).is_err()
-    );
     assert!(executor.health().metrics.checkout_count > 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
-async fn postgres_artifact_repository_matches_sqlite_selector_and_scope_contract() {
+async fn postgres_artifact_repository_preserves_selector_and_scope_contract() {
     let url = std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let resolver = StaticSecretRefResolver::new([("artifact.pg".to_string(), url)]);

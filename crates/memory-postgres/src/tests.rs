@@ -4,11 +4,10 @@ use harness_contract::knowledge::{
     KnowledgeActivationPolicy, KnowledgeGovernanceLevel, KnowledgeNamespace, KnowledgeUsageSignal,
 };
 use memory::{
-    code_indexer::{CodeSymbol, SymbolEdge, SymbolEdgeType, SymbolKind},
-    entity::{Entity, EntityType, Triple},
-    knowledge::{DocumentContent, InMemoryKnowledgeStore, KnowledgeFabric, KnowledgeStore},
+    code_indexer::{CodeSymbol, SymbolKind},
+    knowledge::{DocumentContent, KnowledgeFabric, KnowledgeStore},
     project_scope::MemoryScope,
-    store::{sqlite::SqliteStore, MemoryStore},
+    store::MemoryStore,
     types::AgentVisibility,
     MemoryCategory, MemoryEntry, MemoryLayer, MemorySource, Priority,
 };
@@ -27,7 +26,7 @@ fn memory_entry(id: uuid::Uuid, marker: &str) -> MemoryEntry {
         title: format!("durable {marker}"),
         content: format!("portable memory truth {marker}"),
         embedding: Some(vec![0.25, 0.75]),
-        tags: vec!["migration".to_string()],
+        tags: vec!["durability".to_string()],
         relations: Vec::new(),
         confidence: 0.9,
         access_count: 0,
@@ -40,133 +39,6 @@ fn memory_entry(id: uuid::Uuid, marker: &str) -> MemoryEntry {
         source_agent: Some("test-agent".to_string()),
         visibility: AgentVisibility::Private,
     }
-}
-
-#[tokio::test]
-async fn sqlite_snapshot_covers_every_durable_memory_class() {
-    let store = SqliteStore::open_in_memory().expect("sqlite memory store");
-    let id = uuid::Uuid::new_v4();
-    store.insert(&memory_entry(id, "snapshot")).await.unwrap();
-    store
-        .save_entities(&[Entity {
-            id: "entity-1".to_string(),
-            name: "Cowd".to_string(),
-            entity_type: EntityType::Project,
-            confidence: 1.0,
-            frequency: 2,
-            first_seen: chrono::Utc::now(),
-            last_seen: chrono::Utc::now(),
-            source_ids: vec![id.to_string()],
-            source_type: "memory".to_string(),
-        }])
-        .await
-        .unwrap();
-    store
-        .save_triples(&[Triple {
-            id: "triple-1".to_string(),
-            subject_id: "entity-1".to_string(),
-            predicate: "uses".to_string(),
-            object_id: "postgres".to_string(),
-            valid_from: None,
-            valid_to: None,
-            source: Some("test".to_string()),
-            confidence: 1.0,
-            created_at: chrono::Utc::now(),
-            source_agent: None,
-        }])
-        .await
-        .unwrap();
-    store
-        .save_verbatim("verbatim-1", "raw", "test", 3, "2026-07-23T00:00:00Z")
-        .await
-        .unwrap();
-    store
-        .insert_symbol(&CodeSymbol {
-            id: "symbol-1".to_string(),
-            name: "snapshot".to_string(),
-            kind: SymbolKind::Function,
-            file_path: "src/lib.rs".to_string(),
-            line: 7,
-            signature: "fn snapshot()".to_string(),
-            doc: Some("test".to_string()),
-        })
-        .await
-        .unwrap();
-    store
-        .insert_edge(&SymbolEdge {
-            source_id: "symbol-1".to_string(),
-            target_id: "symbol-2".to_string(),
-            edge_type: SymbolEdgeType::Calls,
-            file_path: "src/lib.rs".to_string(),
-        })
-        .await
-        .unwrap();
-    store
-        .link_symbol_to_memory("symbol-1", &id, Some(3), "mentioned", 42)
-        .await
-        .unwrap();
-    store.kv_put("closet:test", "value").await.unwrap();
-
-    let first = export_memory_snapshot(&store).await.unwrap();
-    let second = export_memory_snapshot(&store).await.unwrap();
-    assert_eq!(
-        first.canonical_digest().unwrap(),
-        second.canonical_digest().unwrap()
-    );
-    assert_eq!(first.entries.len(), 1);
-    assert_eq!(first.entities.len(), 1);
-    assert_eq!(first.triples.len(), 1);
-    assert_eq!(first.verbatim.len(), 1);
-    assert_eq!(first.symbols.len(), 1);
-    assert_eq!(first.edges.len(), 1);
-    assert_eq!(first.symbol_memory_references.len(), 1);
-    assert_eq!(first.key_values.len(), 1);
-    assert_eq!(
-        first.entries[0].embedding.as_deref(),
-        Some(&[0.25, 0.75][..])
-    );
-}
-
-#[tokio::test]
-async fn vector_unavailable_is_not_reported_as_no_match() {
-    let store = SqliteStore::open_in_memory().expect("sqlite memory store");
-    assert!(!store.capabilities().vector_search);
-    let error = store.search_vector(&[0.5], 1).await.unwrap_err();
-    assert!(matches!(error, MemoryError::CapabilityUnavailable { .. }));
-}
-
-#[test]
-fn knowledge_snapshot_is_canonical_and_complete() {
-    let store = Arc::new(InMemoryKnowledgeStore::new());
-    let fabric = KnowledgeFabric::with_store(store.clone());
-    let receipt = fabric.ingest_document(
-        KnowledgeNamespace::Project("snapshot-test".to_string()),
-        KnowledgeActivationPolicy::OnDemand,
-        KnowledgeGovernanceLevel::Advisory,
-        DocumentContent::new("Snapshot", "The durable knowledge body."),
-    );
-    store
-        .record_usage(&KnowledgeUsageSignal {
-            signal_id: "usage-1".to_string(),
-            session_id: "session-1".to_string(),
-            pack_id: receipt.pack.pack_id,
-            action: "activated".to_string(),
-            summary: "used in test".to_string(),
-            score_delta_bp: 10,
-            occurred_at: chrono::Utc::now(),
-        })
-        .unwrap();
-    let first = export_knowledge_snapshot(store.as_ref()).unwrap();
-    let second = export_knowledge_snapshot(store.as_ref()).unwrap();
-    assert_eq!(
-        first.canonical_digest().unwrap(),
-        second.canonical_digest().unwrap()
-    );
-    assert_eq!(first.state.corpus.len(), 1);
-    assert_eq!(first.state.packs.len(), 1);
-    assert_eq!(first.state.canon.len(), 1);
-    assert!(!first.state.chunks.is_empty());
-    assert_eq!(first.state.usage.len(), 1);
 }
 
 #[tokio::test]
@@ -183,15 +55,14 @@ async fn real_postgres_memory_roundtrip() {
     let resolver = StaticSecretRefResolver::new([("memory-test-url".to_string(), url)]);
     let store =
         PostgresMemoryStore::connect(config.clone(), &resolver).expect("connect PostgreSQL");
-    let source = SqliteStore::open_in_memory().expect("SQLite migration source");
     let id = uuid::Uuid::new_v4();
     let entry = memory_entry(id, &marker);
-    source.insert(&entry).await.unwrap();
-    source
-        .kv_put(&format!("migration:{marker}"), "present")
+    store.insert(&entry).await.unwrap();
+    store
+        .kv_put(&format!("durability:{marker}"), "present")
         .await
         .unwrap();
-    source
+    store
         .insert_symbol(&CodeSymbol {
             id: format!("symbol-{marker}"),
             name: marker.clone(),
@@ -203,17 +74,10 @@ async fn real_postgres_memory_roundtrip() {
         })
         .await
         .unwrap();
-    source
+    store
         .link_symbol_to_memory(&format!("symbol-{marker}"), &id, None, "test", 1)
         .await
         .unwrap();
-
-    let manifest = copy_quiesced_memory_store(&source, &store)
-        .await
-        .expect("quiesced Memory copy");
-    assert_eq!(manifest.source_digest, manifest.target_digest);
-    assert_eq!(manifest.entry_count, 1);
-    assert_eq!(manifest.symbol_reference_count, 1);
 
     let reopened =
         PostgresMemoryStore::connect(config, &resolver).expect("reopen PostgreSQL owner");
@@ -274,22 +138,25 @@ async fn real_postgres_memory_roundtrip() {
     );
     assert_eq!(
         reopened
-            .kv_get(&format!("migration:{marker}"))
+            .kv_get(&format!("durability:{marker}"))
             .await
             .unwrap()
             .as_deref(),
         Some("present")
     );
 
-    let knowledge_source = Arc::new(InMemoryKnowledgeStore::new());
-    let fabric = KnowledgeFabric::with_store(knowledge_source.clone());
+    let knowledge_target = Arc::new(
+        PostgresKnowledgeStore::new(reopened.executor().clone())
+            .expect("PostgreSQL Knowledge owner"),
+    );
+    let fabric = KnowledgeFabric::with_store(knowledge_target.clone());
     let receipt = fabric.ingest_document(
         KnowledgeNamespace::Project(format!("project-{marker}")),
         KnowledgeActivationPolicy::OnDemand,
         KnowledgeGovernanceLevel::Required,
         DocumentContent::new("Real PG", format!("knowledge {marker}")),
     );
-    knowledge_source
+    knowledge_target
         .record_usage(&KnowledgeUsageSignal {
             signal_id: format!("usage-{marker}"),
             session_id: format!("session-{marker}"),
@@ -300,15 +167,6 @@ async fn real_postgres_memory_roundtrip() {
             occurred_at: chrono::Utc::now(),
         })
         .unwrap();
-    let knowledge_target = PostgresKnowledgeStore::new(reopened.executor().clone())
-        .expect("PostgreSQL Knowledge owner");
-    let knowledge_manifest =
-        copy_quiesced_knowledge_store(knowledge_source.as_ref(), &knowledge_target)
-            .expect("quiesced Knowledge copy");
-    assert_eq!(
-        knowledge_manifest.source_digest,
-        knowledge_manifest.target_digest
-    );
     let knowledge_reopened =
         PostgresKnowledgeStore::new(reopened.executor().clone()).expect("reopen Knowledge owner");
     let knowledge_snapshot = knowledge_reopened.snapshot().unwrap();

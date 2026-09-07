@@ -571,7 +571,7 @@ mod tests {
     };
 
     fn service() -> SkillRevisionGovernanceService {
-        let store = Arc::new(RuntimeEventStore::open_in_memory().expect("store"));
+        let store = Arc::new(RuntimeEventStore::for_test());
         let approvals = Arc::new(ApprovalQueue::new(Arc::clone(&store)));
         SkillRevisionGovernanceService::new(store, approvals)
     }

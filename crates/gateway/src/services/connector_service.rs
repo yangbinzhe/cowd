@@ -107,21 +107,14 @@ impl ConnectorService {
 
     pub(crate) fn resource_directory_handle(
         &self,
-        workspace_root: impl AsRef<Path>,
+        _workspace_root: impl AsRef<Path>,
     ) -> ResourceDirectoryResult<storage::StorageHandle> {
         if let Some(handle) = self.resource_directory_handle.as_ref() {
             return Ok(handle.clone());
         }
-        let workspace_root = workspace_root.as_ref();
-        let scope = storage::StorageScope::workspace_for_root(workspace_root);
-        storage::StorageRegistry::default_for_config_home(workspace_root.join(".cowd"))
-            .with_workspace(workspace_root)
-            .and_then(|registry| {
-                registry
-                    .endpoint_in_scope(&storage::StorageDomainId::ConnectorDirectory, &scope)
-                    .map(storage::StorageEndpoint::as_handle)
-            })
-            .map_err(connector::ResourceDirectoryError::backend)
+        Err(connector::ResourceDirectoryError::backend(
+            "ConnectorService requires the process-selected PostgreSQL resource directory",
+        ))
     }
 
     pub(crate) fn resource_directory_initialized(
@@ -209,11 +202,21 @@ impl ConnectorService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn gateway_connector_service_uses_durable_directory_port() {
         let workspace = tempfile::tempdir().expect("temporary workspace");
-        let service = ConnectorService::new();
+        let config_home = tempfile::tempdir().expect("temporary config home");
+        let topology = crate::selected_storage::SelectedStorageTopology::compose_for_test(
+            config_home.path(),
+            workspace.path(),
+        )
+        .expect("isolated PostgreSQL topology");
+        let service = ConnectorService::with_resource_directory_factory(
+            Arc::clone(&topology.connector_factory),
+            topology.connector_handle.clone(),
+        );
         let resource =
             ExternalResourceRef::new("feishu", "bitable", "gateway-port", "Gateway port");
         service

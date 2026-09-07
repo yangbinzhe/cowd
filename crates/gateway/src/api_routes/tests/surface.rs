@@ -63,7 +63,7 @@
             true,
         );
 
-        let response = api_router(state)
+        let response = api_router(Arc::clone(&state))
             .oneshot(
                 Request::builder()
                     .uri("/api/approval/pending?session_id=chat-session&domain=execution&blocks_execution=true")
@@ -346,6 +346,20 @@
             harness_contract::execution_graph::ExecutionNodeStatus::WaitingApproval
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let durable_events = Arc::clone(
+            &state
+                .services
+                .selected_storage
+                .as_ref()
+                .expect("selected PostgreSQL topology")
+                .runtime_event_store,
+        );
+        assert_eq!(
+            durable_events
+                .stream_revision(&projection.graph_id)
+                .expect("durable graph revision after approval wait"),
+            projection.revision
+        );
         let conflicting_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let conflicting_action =
             runtime::CrossPlaneAction::new("different-operator", "service.execute");
@@ -372,7 +386,7 @@
             &projection.graph_id,
             &approval.node_id,
         );
-        let response = api_router(state)
+        let response = api_router(Arc::clone(&state))
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -391,6 +405,12 @@
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            durable_events
+                .stream_revision(&projection.graph_id)
+                .expect("durable graph revision after approval response")
+                >= projection.revision
+        );
         runtime_services
             .execution_supervisor()
             .wait_for_quiescence(&projection.graph_id)
@@ -977,7 +997,7 @@
     }
 
     #[tokio::test]
-    async fn connector_resources_survive_new_app_state_for_same_workspace() {
+    async fn connector_resources_remain_available_from_selected_pg_directory() {
         let workspace = unique_test_workspace("connector-resources");
         let app = api_router(test_state_with_config_runtime_and_workspace(
             serde_json::json!({}),
@@ -992,6 +1012,7 @@
             "idempotency_key": format!("persisted-doc-{}", uuid::Uuid::new_v4())
         });
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -1004,12 +1025,7 @@
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let reopened = api_router(test_state_with_config_runtime_and_workspace(
-            serde_json::json!({}),
-            None,
-            workspace,
-        ));
-        let resources = reopened
+        let resources = app
             .oneshot(
                 Request::builder()
                     .uri("/api/connectors/resources?q=Persisted")
@@ -1134,7 +1150,7 @@
             std::env::temp_dir().join(format!("cowd-api-resource-memory-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let manager = Arc::new(
-            CognitiveContextManager::new(test_memory_config(&tmp.join("memory.db")))
+            crate::pg_test_support::memory_manager(test_memory_config(&tmp.join("memory.db")))
                 .await
                 .unwrap(),
         );

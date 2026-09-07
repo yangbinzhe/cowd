@@ -1,6 +1,6 @@
 // Legacy API behavior shard; included into one shared test scope.
     #[tokio::test]
-    async fn runtime_control_plane_reports_degraded_kernel_without_store() {
+    async fn runtime_control_plane_reports_selected_pg_without_memory_manager() {
         let root = test_temp_dir("runtime-control-plane-degraded");
         let workspace = root.join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -24,28 +24,22 @@
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["kind"], "runtime_control_plane");
         assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(json["status"], "degraded");
-        assert_eq!(json["degraded"], true);
-        assert_eq!(json["components"]["session"]["durable_store"], false);
-        assert_eq!(
-            json["components"]["session"]["source_of_truth"],
-            "unavailable"
-        );
-        assert_eq!(json["components"]["context"]["durable_history"], false);
+        assert_eq!(json["status"], "attention");
+        assert_eq!(json["degraded"], false);
+        assert_eq!(json["components"]["session"]["durable_store"], true);
+        assert_eq!(json["components"]["session"]["source_of_truth"], "postgres");
+        assert_eq!(json["components"]["context"]["durable_history"], true);
         assert_eq!(json["components"]["memory"]["status"], "unavailable");
         assert_eq!(json["components"]["permissions"]["auth_required"], false);
         assert_eq!(
             json["components"]["session"]["leases"]["status"],
             "available"
         );
-        assert_eq!(json["diagnostics"]["durable_session_store"], false);
+        assert_eq!(json["diagnostics"]["durable_session_store"], true);
         assert_eq!(json["diagnostics"]["memory_attached"], false);
-        assert_eq!(
-            json["diagnostics"]["stored_sessions"],
-            serde_json::Value::Null
-        );
+        assert_eq!(json["diagnostics"]["stored_sessions"], 0);
         assert_eq!(json["diagnostics"]["component_count"], 10);
-        assert_eq!(json["diagnostics"]["degraded_component_count"], 2);
+        assert_eq!(json["diagnostics"]["degraded_component_count"], 0);
         assert_eq!(json["diagnostics"]["attention_component_count"], 1);
         assert_eq!(
             json["diagnostics"]["capability_count"],
@@ -71,7 +65,7 @@
         assert_eq!(json["diagnostics"]["configured_model_resolved"], true);
         assert_eq!(json["diagnostics"]["production_ready"], false);
         assert_control_plane_readiness_accounting(&json);
-        assert!(json["readiness"]["blocked"]
+        assert!(!json["readiness"]["blocked"]
             .as_array()
             .unwrap()
             .iter()
@@ -86,7 +80,7 @@
             .unwrap()
             .iter()
             .any(|check| check["id"] == "provider.registry" && check["status"] == "ready"));
-        assert!(json["next_actions"]
+        assert!(!json["next_actions"]
             .as_array()
             .unwrap()
             .iter()
@@ -104,7 +98,7 @@
                     .unwrap_or_default()
                     .contains("runtime provider")
             }));
-        assert!(json["degraded_reasons"]
+        assert!(!json["degraded_reasons"]
             .as_array()
             .unwrap()
             .iter()
@@ -114,7 +108,7 @@
     }
     #[tokio::test]
     async fn session_mutations_require_the_exact_attached_writer_observer() {
-        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::pg_test_support::session_store());
         store
             .create_session(&new_api_session_record("writer-contract", None))
             .await
@@ -187,7 +181,7 @@
 
     #[tokio::test]
     async fn session_execution_policy_is_readable_but_revision_updates_require_the_writer() {
-        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::pg_test_support::session_store());
         let session_id = "execution-policy-contract";
         store
             .create_session(&new_api_session_record(session_id, None))
@@ -270,7 +264,7 @@
 
     #[tokio::test]
     async fn runtime_session_lease_routes_share_runtime_host_registry_projection() {
-        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::pg_test_support::session_store());
         store
             .create_session(&new_api_session_record("session-a", None))
             .await
@@ -477,7 +471,7 @@
 
     #[tokio::test]
     async fn writer_detach_releases_its_process_local_session_lease() {
-        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::pg_test_support::session_store());
         store
             .create_session(&new_api_session_record("session-detach", None))
             .await
@@ -549,7 +543,7 @@
         let config_home = root.join("home");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&config_home).unwrap();
-        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::pg_test_support::session_store());
         let state = test_state_with_store_and_workspace(store, workspace, config_home);
         seed_test_task(
             &state.services,
@@ -574,10 +568,10 @@
         assert_eq!(json["status"], "attention");
         assert_eq!(json["degraded"], false);
         assert_eq!(json["components"]["session"]["durable_store"], true);
-        assert_eq!(json["components"]["session"]["source_of_truth"], "attached");
+        assert_eq!(json["components"]["session"]["source_of_truth"], "postgres");
         assert!(json["config_reload"]["status"].is_string());
         assert!(json["health"]["runtime"].is_object());
-        assert_eq!(json["health"]["storage"]["backend"], "attached");
+        assert_eq!(json["health"]["storage"]["backend"], "postgres");
         assert_eq!(json["components"]["context"]["durable_history"], true);
         assert_eq!(json["components"]["task"]["total"], 1);
         assert_eq!(json["components"]["task"]["open"], 1);
@@ -631,38 +625,30 @@
     }
 
     #[tokio::test]
-    async fn runtime_control_plane_counts_file_backed_sqlite_sessions_after_reopen() {
+    async fn runtime_control_plane_counts_postgres_sessions() {
         let dir = test_temp_dir("runtime-control-plane-db");
-        let db_path = dir.join("sessions.db");
-        {
-            let store = UnifiedSessionStore::open(&db_path).unwrap();
-            store
-                .create_session(&new_api_session_record(
-                    "control-db-session-a",
-                    Some("model-a".into()),
-                ))
-                .await
-                .unwrap();
-            store
-                .create_session(&new_api_session_record(
-                    "control-db-session-b",
-                    Some("model-b".into()),
-                ))
-                .await
-                .unwrap();
-        }
-        assert!(
-            db_path.exists(),
-            "file-backed session database should exist"
-        );
+        let store = Arc::new(crate::pg_test_support::session_store());
+        store
+            .create_session(&new_api_session_record(
+                "control-db-session-a",
+                Some("model-a".into()),
+            ))
+            .await
+            .unwrap();
+        store
+            .create_session(&new_api_session_record(
+                "control-db-session-b",
+                Some("model-b".into()),
+            ))
+            .await
+            .unwrap();
 
         let workspace = dir.join("workspace");
         let config_home = dir.join("home");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&config_home).unwrap();
-        let reopened = Arc::new(UnifiedSessionStore::open(&db_path).unwrap());
         let app = api_router(test_state_with_store_and_workspace(
-            reopened,
+            store,
             workspace,
             config_home,
         ));
@@ -681,7 +667,7 @@
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["kind"], "runtime_control_plane");
         assert_eq!(json["components"]["session"]["durable_store"], true);
-        assert_eq!(json["components"]["session"]["source_of_truth"], "attached");
+        assert_eq!(json["components"]["session"]["source_of_truth"], "postgres");
         assert_eq!(json["diagnostics"]["durable_session_store"], true);
         assert_eq!(json["diagnostics"]["stored_sessions"], 2);
         assert_eq!(json["diagnostics"]["active_sessions"], 0);
@@ -939,7 +925,7 @@ providers:
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&config_home).unwrap();
 
-        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::pg_test_support::session_store());
         store
             .create_session(&new_api_session_record(
                 "s1",
@@ -1378,7 +1364,7 @@ providers:
         let config_home = root.join("home");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&config_home).unwrap();
-        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::pg_test_support::session_store());
         let state = test_state_with_store_and_workspace(store, workspace, config_home);
         seed_test_task(
             &state.services,
@@ -1444,7 +1430,7 @@ providers:
 
     #[tokio::test]
     async fn session_context_history_reads_context_events_only() {
-        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::pg_test_support::session_store());
         let session_id = "context-history-session";
         store
             .create_session(&new_api_session_record(
@@ -1521,7 +1507,7 @@ providers:
 
     #[tokio::test]
     async fn session_context_history_can_return_summaries_without_full_envelopes() {
-        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::pg_test_support::session_store());
         let session_id = "context-summary-only-session";
         store
             .create_session(&new_api_session_record(
@@ -1567,7 +1553,7 @@ providers:
 
     #[tokio::test]
     async fn session_context_history_paginates_summary_timeline() {
-        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::pg_test_support::session_store());
         let session_id = "context-summary-page-session";
         store
             .create_session(&new_api_session_record(
@@ -1619,127 +1605,12 @@ providers:
         assert_eq!(json["summaries"][1]["envelope_id"], "env-page-3");
     }
 
-    #[tokio::test]
-    async fn session_context_history_matches_sqlite_event_log() {
-        let dir = test_temp_dir("context-db-timeline");
-        let db_path = dir.join("sessions.sqlite");
-        let store = Arc::new(UnifiedSessionStore::open(&db_path).unwrap());
-        let session_id = "context-db-session";
-        store
-            .create_session(&new_api_session_record(
-                session_id,
-                Some("test-model".into()),
-            ))
-            .await
-            .unwrap();
-        for (sequence, event_type, payload) in [
-            (
-                0,
-                "TextDelta",
-                serde_json::json!({"type":"TextDelta","content":"not context"}),
-            ),
-            (
-                1,
-                "ContextEnvelope",
-                test_context_envelope(session_id, "env-db-1", "first db context"),
-            ),
-            (
-                2,
-                "ToolComplete",
-                serde_json::json!({"type":"ToolComplete","summary":"not context"}),
-            ),
-            (
-                3,
-                "ContextEnvelope",
-                test_context_envelope(session_id, "env-db-3", "second db context"),
-            ),
-        ] {
-            store
-                .append_event(&session::SessionEvent {
-                    session_id: session_id.to_string(),
-                    event_type: event_type.to_string(),
-                    event_json: payload.to_string(),
-                    sequence,
-                    created_at_ms: sequence as u64,
-                })
-                .await
-                .unwrap();
-        }
-
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        let db_context_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM session_events WHERE session_id = ?1 AND event_type = 'ContextEnvelope'",
-                [session_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let db_all_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM session_events WHERE session_id = ?1",
-                [session_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        drop(conn);
-
-        let state = test_state_with_store(store);
-        let app = api_router(state);
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(format!(
-                        "/api/sessions/{session_id}/context?limit=1&include_envelopes=false"
-                    ))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(db_all_count, 4);
-        assert_eq!(db_context_count, 2);
-        assert_eq!(json["total"], db_context_count);
-        assert_eq!(json["has_more"], true);
-        assert_eq!(json["next_seq"], 2);
-        assert_eq!(json["envelopes"].as_array().unwrap().len(), 0);
-        assert_eq!(json["summaries"].as_array().unwrap().len(), 1);
-        assert_eq!(json["summaries"][0]["sequence"], 1);
-        assert_eq!(json["summaries"][0]["envelope_id"], "env-db-1");
-
-        let detail_response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/context/env-db-3")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(detail_response.status(), StatusCode::OK);
-        let detail_body = to_bytes(detail_response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let detail_json: serde_json::Value = serde_json::from_slice(&detail_body).unwrap();
-        assert_eq!(detail_json["context"]["sequence"], 3);
-        assert_eq!(
-            detail_json["context"]["envelope"]["intent"],
-            "second db context"
-        );
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(trace_capture)]
     async fn session_context_history_emits_structured_trace_events() {
         use tracing_subscriber::prelude::*;
 
-        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::pg_test_support::session_store());
         let session_id = "context-log-session";
         store
             .create_session(&new_api_session_record(
@@ -1830,7 +1701,7 @@ providers:
 
     #[tokio::test]
     async fn context_envelope_route_reads_by_envelope_id() {
-        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::pg_test_support::session_store());
         let session_id = "context-id-session";
         store
             .create_session(&new_api_session_record(
@@ -1874,7 +1745,7 @@ providers:
 
     #[tokio::test]
     async fn context_recommendation_action_records_session_event() {
-        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::pg_test_support::session_store());
         let session_id = "context-recommendation-session";
         store
             .create_session(&new_api_session_record(
@@ -1922,7 +1793,7 @@ providers:
 
     #[tokio::test]
     async fn context_recommendation_stats_groups_actions() {
-        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::pg_test_support::session_store());
         let session_id = "context-recommendation-stats-session";
         store
             .create_session(&new_api_session_record(

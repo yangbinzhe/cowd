@@ -1,9 +1,10 @@
 use harness_contract::agent_action::{
-    AgentAction, AgentActionEnvelope, AgentActorKind, TaskAttemptFailInput, TaskClaimInput,
-    TaskPublishInput, TaskReleaseInput, TaskReviewInput, TaskSubmitInput, TaskSupersedeInput,
+    AgentAction, AgentActionEnvelope, AgentActorKind, TaskAttemptDispatchInput,
+    TaskAttemptFailInput, TaskClaimInput, TaskPublishInput, TaskReleaseInput, TaskReviewInput,
+    TaskSubmitInput, TaskSupersedeInput, TaskWithdrawInput,
 };
 
-use crate::agentic::program::{AgenticProgramProjection, AgenticTaskStatus};
+use crate::agentic::program::{AgenticProgramProjection, AgenticTaskStatus, AgenticTeamLifecycle};
 
 use super::{actor_agent_id, is_durable_evidence_ref};
 
@@ -24,7 +25,10 @@ pub(super) fn validate_transition(
     if matches!(
         projection.status,
         crate::agentic::program::AgenticProgramStatus::Verified
+            | crate::agentic::program::AgenticProgramStatus::Partial
             | crate::agentic::program::AgenticProgramStatus::Blocked
+            | crate::agentic::program::AgenticProgramStatus::Failed
+            | crate::agentic::program::AgenticProgramStatus::Cancelled
     ) && !matches!(envelope.action, AgentAction::StateInspect(_))
     {
         return Some((
@@ -49,8 +53,11 @@ pub(super) fn validate_transition(
             }
         }
         AgentAction::AgentInvite(input) => {
-            if !projection.teams.contains_key(&input.team_ref) {
+            let Some(team) = projection.teams.get(&input.team_ref) else {
                 return Some(("team_not_found", input.team_ref.clone()));
+            };
+            if team.lifecycle != AgenticTeamLifecycle::Active {
+                return Some(("team_not_accepting_members", input.team_ref.clone()));
             }
             if matches!(
                 envelope.actor.kind,
@@ -68,6 +75,10 @@ pub(super) fn validate_transition(
         AgentAction::TaskClaim(input) => validate_task_claim(projection, envelope, input, now_ms),
         AgentAction::TaskRelease(input) => validate_task_release(projection, envelope, input),
         AgentAction::TaskSupersede(input) => validate_task_supersede(projection, envelope, input),
+        AgentAction::TaskWithdraw(input) => validate_task_withdraw(projection, envelope, input),
+        AgentAction::TaskAttemptDispatch(input) => {
+            validate_task_attempt_dispatch(projection, envelope, input)
+        }
         AgentAction::TaskAttemptFail(input) => {
             validate_task_attempt_failure(projection, envelope, input)
         }
@@ -95,6 +106,59 @@ pub(super) fn validate_transition(
             }
             None
         }
+        AgentAction::ObjectiveUpdate(_) | AgentAction::ObjectiveReview(_) => {
+            if matches!(
+                envelope.actor.kind,
+                AgentActorKind::Root | AgentActorKind::Supervisor
+            ) {
+                None
+            } else {
+                Some((
+                    "objective_mutation_not_delegated",
+                    "only the root or Objective supervisor may mutate the user Objective"
+                        .to_string(),
+                ))
+            }
+        }
+        AgentAction::MembershipUpdate(input) => {
+            let Some(team) = projection.teams.get(&input.team_ref) else {
+                return Some(("membership_target_not_found", input.team_ref.clone()));
+            };
+            if !projection.agents.contains_key(&input.agent_ref) {
+                return Some(("membership_target_not_found", input.agent_ref.clone()));
+            }
+            if matches!(
+                input.operation,
+                harness_contract::agent_action::MembershipOperation::Join
+            ) && team.lifecycle != AgenticTeamLifecycle::Active
+            {
+                return Some(("team_not_accepting_members", input.team_ref.clone()));
+            }
+            if matches!(
+                envelope.actor.kind,
+                AgentActorKind::Root | AgentActorKind::Supervisor
+            ) || envelope.actor.agent_id.as_deref() == Some(input.agent_ref.as_str())
+            {
+                None
+            } else {
+                Some(("membership_update_not_delegated", input.agent_ref.clone()))
+            }
+        }
+        AgentAction::TeamUpdate(input) => {
+            let Some(team) = projection.teams.get(&input.team_ref) else {
+                return Some(("team_not_found", input.team_ref.clone()));
+            };
+            if matches!(
+                envelope.actor.kind,
+                AgentActorKind::Root | AgentActorKind::Supervisor
+            ) || (envelope.actor.kind == AgentActorKind::TeamLead
+                && envelope.actor.team_id.as_deref() == Some(team.team_id.as_str()))
+            {
+                None
+            } else {
+                Some(("team_update_not_delegated", input.team_ref.clone()))
+            }
+        }
         AgentAction::ObjectiveCompleteRequest(input) => {
             if !matches!(
                 envelope.actor.kind,
@@ -112,6 +176,34 @@ pub(super) fn validate_transition(
     }
 }
 
+fn validate_task_withdraw(
+    projection: &AgenticProgramProjection,
+    envelope: &AgentActionEnvelope,
+    input: &TaskWithdrawInput,
+) -> Option<(&'static str, String)> {
+    let Some(task) = projection.tasks.get(&input.task_ref) else {
+        return Some(("task_not_found", input.task_ref.clone()));
+    };
+    if matches!(
+        task.status,
+        AgenticTaskStatus::Accepted | AgenticTaskStatus::Superseded | AgenticTaskStatus::Withdrawn
+    ) {
+        return Some(("task_not_withdrawable", format!("{:?}", task.status)));
+    }
+    if matches!(
+        envelope.actor.kind,
+        AgentActorKind::Root | AgentActorKind::Supervisor
+    ) || (matches!(
+        envelope.actor.kind,
+        AgentActorKind::TeamLead | AgentActorKind::Agent
+    ) && envelope.actor.team_id.as_deref() == Some(task.team_id.as_str()))
+    {
+        None
+    } else {
+        Some(("task_withdraw_not_delegated", task.team_id.clone()))
+    }
+}
+
 fn validate_task_publish(
     projection: &AgenticProgramProjection,
     envelope: &AgentActionEnvelope,
@@ -119,6 +211,13 @@ fn validate_task_publish(
 ) -> Option<(&'static str, String)> {
     if !projection.teams.contains_key(&input.team_ref) {
         return Some(("team_not_found", input.team_ref.clone()));
+    }
+    if projection
+        .teams
+        .get(&input.team_ref)
+        .is_some_and(|team| team.lifecycle != AgenticTeamLifecycle::Active)
+    {
+        return Some(("team_not_accepting_work", input.team_ref.clone()));
     }
     if matches!(
         envelope.actor.kind,
@@ -178,10 +277,10 @@ fn validate_task_claim(
     let Some(agent_id) = envelope.actor.agent_id.as_ref() else {
         return Some(("actor_not_bound", "agent_id".to_string()));
     };
-    let Some(member) = projection.agents.get(agent_id) else {
+    if !projection.agents.contains_key(agent_id) {
         return Some(("actor_not_in_roster", agent_id.clone()));
-    };
-    if member.team_id != task.team_id {
+    }
+    if !projection.agent_is_active_in(agent_id, &task.team_id) {
         return Some(("task_outside_actor_team", task.team_id.clone()));
     }
     if !same_execution_renewal {
@@ -215,7 +314,10 @@ fn validate_task_release(
     let Some(task) = projection.tasks.get(&input.task_ref) else {
         return Some(("task_not_found", input.task_ref.clone()));
     };
-    if task.status != AgenticTaskStatus::Claimed {
+    if !matches!(
+        task.status,
+        AgenticTaskStatus::Claimed | AgenticTaskStatus::CancelRequested
+    ) {
         return Some(("task_not_claimed", input.task_ref.clone()));
     }
     let supervisor_recovery = envelope.actor.kind == AgentActorKind::Supervisor;
@@ -255,26 +357,18 @@ fn validate_task_supersede(
     }
     if !matches!(
         task.status,
-        AgenticTaskStatus::Published | AgenticTaskStatus::Rework | AgenticTaskStatus::Blocked
+        AgenticTaskStatus::Published
+            | AgenticTaskStatus::Rework
+            | AgenticTaskStatus::Blocked
+            | AgenticTaskStatus::Claimed
+            | AgenticTaskStatus::Submitted
     ) {
         return Some(("task_not_supersedable", format!("{:?}", task.status)));
-    }
-    if task.status == AgenticTaskStatus::Published
-        && task.failed_attempts == 0
-        && task.failed_review_attempts == 0
-    {
-        return Some((
-            "task_has_no_failed_or_challenged_attempt",
-            "fresh work cannot be retired merely to bypass its acceptance obligation".to_string(),
-        ));
     }
     for replacement_ref in &input.replacement_task_refs {
         let Some(replacement) = projection.tasks.get(replacement_ref) else {
             return Some(("replacement_task_not_found", replacement_ref.clone()));
         };
-        if replacement.team_id != task.team_id {
-            return Some(("replacement_task_outside_team", replacement_ref.clone()));
-        }
         if replacement.status == AgenticTaskStatus::Superseded {
             return Some((
                 "replacement_task_already_superseded",
@@ -313,20 +407,81 @@ fn validate_task_attempt_failure(
     let Some(task) = projection.tasks.get(&input.task_ref) else {
         return Some(("task_not_found", input.task_ref.clone()));
     };
+    let registered_attempt = task
+        .active_attempts
+        .get(&input.execution_id)
+        .is_some_and(|attempt| attempt.mode == input.mode);
     match input.mode {
         harness_contract::agent_action::AgentAttemptMode::Execute => {
-            if task.status != AgenticTaskStatus::Claimed {
+            if task.status == AgenticTaskStatus::CancelRequested && registered_attempt {
+                return None;
+            }
+            if task.status != AgenticTaskStatus::Claimed && !registered_attempt {
                 return Some(("task_not_claimed", input.task_ref.clone()));
             }
-            if task.claim_execution_id.as_deref() != Some(input.execution_id.as_str()) {
+            if !registered_attempt
+                && task.claim_execution_id.as_deref() != Some(input.execution_id.as_str())
+            {
                 return Some(("task_claim_fence_mismatch", input.task_ref.clone()));
             }
         }
         harness_contract::agent_action::AgentAttemptMode::Review => {
-            if task.status != AgenticTaskStatus::Submitted {
+            if task.status == AgenticTaskStatus::CancelRequested && registered_attempt {
+                return None;
+            }
+            // Pre-outbox journals can contain a submitted Task with no
+            // recorded review graph.  Preserve that deterministic recovery
+            // path; newly dispatched reviews always have a matching record.
+            if task.status != AgenticTaskStatus::Submitted
+                || (!registered_attempt && !task.active_attempts.is_empty())
+            {
                 return Some(("task_not_submitted", input.task_ref.clone()));
             }
         }
+    }
+    None
+}
+
+fn validate_task_attempt_dispatch(
+    projection: &AgenticProgramProjection,
+    envelope: &AgentActionEnvelope,
+    input: &TaskAttemptDispatchInput,
+) -> Option<(&'static str, String)> {
+    if envelope.actor.kind != AgentActorKind::Supervisor {
+        return Some((
+            "attempt_dispatch_requires_supervisor",
+            input.task_ref.clone(),
+        ));
+    }
+    let Some(task) = projection.tasks.get(&input.task_ref) else {
+        return Some(("task_not_found", input.task_ref.clone()));
+    };
+    if !projection.agents.contains_key(&input.agent_ref) {
+        return Some(("attempt_agent_not_in_roster", input.agent_ref.clone()));
+    }
+    let ready = match input.mode {
+        harness_contract::agent_action::AgentAttemptMode::Execute => {
+            matches!(
+                task.status,
+                AgenticTaskStatus::Published | AgenticTaskStatus::Rework
+            )
+        }
+        harness_contract::agent_action::AgentAttemptMode::Review => {
+            task.status == AgenticTaskStatus::Submitted
+        }
+    };
+    if !ready {
+        return Some(("task_not_dispatchable", format!("{:?}", task.status)));
+    }
+    if task
+        .active_attempts
+        .values()
+        .any(|attempt| attempt.mode == input.mode && attempt.generation == input.generation)
+    {
+        return Some((
+            "attempt_generation_already_dispatched",
+            input.task_ref.clone(),
+        ));
     }
     None
 }
@@ -378,9 +533,11 @@ fn validate_task_submission(
             .is_some_and(|artifact| {
                 artifact.committed_by != envelope.actor.actor_id
                     || !artifact.relates_to.contains(&input.task_ref)
+                    || artifact.claim_execution_id.as_deref() != task.claim_execution_id.as_deref()
+                    || artifact.claim_generation != Some(task.claim_generation)
             })
     }) {
-        return Some(("artifact_not_bound_to_claimant_and_task", unowned.clone()));
+        return Some(("artifact_not_bound_to_active_claim", unowned.clone()));
     }
     if input.artifact_refs.is_empty() {
         return Some((

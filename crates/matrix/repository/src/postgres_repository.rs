@@ -5,7 +5,7 @@
 //! expression indexes and dedicated source-key/revision tables keep query and
 //! concurrency semantics in PostgreSQL rather than in an in-process cache.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 
 use chrono::Utc;
 use matrix_core::{
@@ -30,11 +30,10 @@ use storage::{
     PostgresMigrationSpec, PostgresTransaction, SecretRefResolver,
 };
 
-use crate::migration::{canonicalize_payload, MATRIX_MIGRATION_TABLES};
 use crate::port::matrix_store_operations;
 use crate::{
-    MatrixHealth, MatrixLocalDataPlane, MatrixMetricRecomputeResult, MatrixMigrationSnapshot,
-    MatrixRecallQuery, MatrixRevisioned, MatrixStore, MatrixStoreError, MatrixStoreResult,
+    MatrixHealth, MatrixLocalDataPlane, MatrixMetricRecomputeResult, MatrixRecallQuery,
+    MatrixRevisioned, MatrixStore, MatrixStoreError, MatrixStoreResult,
 };
 
 const MATRIX_DOMAIN: &str = "matrix";
@@ -307,92 +306,6 @@ impl PostgresMatrixRepository {
     #[must_use]
     pub fn executor(&self) -> &PostgresExecutor {
         &self.executor
-    }
-
-    /// Export the complete logical Matrix store for a maintenance-window
-    /// digest comparison.  Physical timestamps are deliberately excluded;
-    /// only typed payloads and optimistic revisions define the cutover.
-    pub fn export_migration_snapshot(&self) -> MatrixStoreResult<MatrixMigrationSnapshot> {
-        self.with_connection(|connection| {
-            let mut tables = BTreeMap::new();
-            for table in MATRIX_MIGRATION_TABLES {
-                tables.insert(
-                    (*table).to_string(),
-                    export_migration_json_records(connection, table)?,
-                );
-            }
-            let revisions = export_revisions(connection)?;
-            MatrixMigrationSnapshot::new(
-                scalar_i64(
-                    connection,
-                    "SELECT schema_version FROM matrix_schema WHERE id = 1",
-                )?,
-                tables,
-                revisions,
-            )
-        })
-    }
-
-    /// Import one verified source snapshot into an empty PostgreSQL Matrix
-    /// store.  Refusing a nonempty target prevents an accidental merge or
-    /// second owner during cutover.
-    pub fn import_migration_snapshot(
-        &self,
-        snapshot: &MatrixMigrationSnapshot,
-    ) -> MatrixStoreResult<()> {
-        snapshot.validate()?;
-        self.with_transaction(|transaction| {
-            for table in MATRIX_MIGRATION_TABLES {
-                if count_table(transaction, table)? != 0 {
-                    return Err(MatrixStoreError::Backend(format!(
-                        "matrix migration target table `{table}` is not empty"
-                    )));
-                }
-            }
-            if count_table(transaction, "matrix_resource_revision")? != 0 {
-                return Err(MatrixStoreError::Backend(
-                    "matrix migration target revisions are not empty".to_string(),
-                ));
-            }
-            for table in MATRIX_MIGRATION_TABLES {
-                let Some(records) = snapshot.tables.get(*table) else {
-                    continue;
-                };
-                for (id, payload) in records {
-                    let persisted_id = if *table == WATERMARK {
-                        let watermark = serde_json::from_value::<MatrixDataPlaneWatermark>(payload.clone())
-                            .map_err(json_error)?;
-                        watermark_resource_id(&watermark)
-                    } else {
-                        id.clone()
-                    };
-                    write_json(transaction, table, &persisted_id, payload)?;
-                    if *table == ENTITY {
-                        let entity = serde_json::from_value::<MatrixEntity>(payload.clone())
-                            .map_err(json_error)?;
-                        replace_entity_source_keys(transaction, &entity)?;
-                    }
-                }
-            }
-            for (key, revision) in &snapshot.revisions {
-                let (resource_kind, resource_id) = key.split_once('\0').ok_or_else(|| {
-                    MatrixStoreError::Backend("matrix migration revision key is invalid".to_string())
-                })?;
-                persist_revision(
-                    transaction,
-                    resource_kind,
-                    &postgres_resource_revision_id(resource_kind, resource_id),
-                    *revision,
-                )?;
-            }
-            transaction
-                .execute(
-                    "UPDATE matrix_schema SET schema_version = GREATEST(schema_version, $1), updated_at = NOW() WHERE id = 1",
-                    &[&snapshot.schema_version],
-                )
-                .map_err(postgres_error)?;
-            Ok(())
-        })
     }
 
     fn with_connection<T>(
@@ -1874,7 +1787,7 @@ macro_rules! delegate_postgres_matrix_store_operations {
     };
 }
 
-// This expansion is intentionally shared with the SQLite adapter: PostgreSQL
+// This expansion is intentionally shared with the public port: PostgreSQL
 // cannot be selected unless it implements every typed Matrix operation.
 impl MatrixStore for PostgresMatrixRepository {
     matrix_store_operations!(delegate_postgres_matrix_store_operations);
@@ -1987,65 +1900,6 @@ fn list_json_ordered<C: PostgresClient, T: DeserializeOwned>(
         .collect()
 }
 
-fn export_json_records<C: PostgresClient>(
-    client: &mut C,
-    table: &str,
-) -> MatrixStoreResult<BTreeMap<String, Value>> {
-    let sql = format!("SELECT id, payload FROM {table} ORDER BY id ASC");
-    let rows = client.query(&sql, &[]).map_err(postgres_error)?;
-    rows.into_iter()
-        .map(|row| {
-            let id = row.get::<_, String>(0);
-            let payload = canonicalize_payload(table, row.get::<_, Value>(1))?;
-            Ok((id, payload))
-        })
-        .collect()
-}
-
-fn export_migration_json_records<C: PostgresClient>(
-    client: &mut C,
-    table: &str,
-) -> MatrixStoreResult<BTreeMap<String, Value>> {
-    let records = export_json_records(client, table)?;
-    if table != WATERMARK {
-        return Ok(records);
-    }
-    records
-        .into_values()
-        .map(|payload| {
-            let watermark = serde_json::from_value::<MatrixDataPlaneWatermark>(payload.clone())
-                .map_err(json_error)?;
-            Ok((logical_watermark_resource_id(&watermark), payload))
-        })
-        .collect()
-}
-
-fn export_revisions<C: PostgresClient>(client: &mut C) -> MatrixStoreResult<BTreeMap<String, u64>> {
-    let rows = client
-        .query(
-            "SELECT resource_kind, resource_id, revision \
-             FROM matrix_resource_revision \
-             ORDER BY resource_kind ASC, resource_id ASC",
-            &[],
-        )
-        .map_err(postgres_error)?;
-    Ok(rows
-        .into_iter()
-        .map(|row| {
-            let resource_kind = row.get::<_, String>(0);
-            let resource_id = row.get::<_, String>(1);
-            (
-                format!(
-                    "{}\0{}",
-                    resource_kind,
-                    logical_postgres_resource_id(&resource_kind, &resource_id)
-                ),
-                row.get::<_, i64>(2) as u64,
-            )
-        })
-        .collect())
-}
-
 fn watermark_resource_id(watermark: &MatrixDataPlaneWatermark) -> String {
     postgres_resource_revision_id(
         "data_plane_watermark",
@@ -2060,9 +1914,8 @@ fn logical_watermark_resource_id(watermark: &MatrixDataPlaneWatermark) -> String
     )
 }
 
-/// PostgreSQL text values cannot contain NUL.  The wire and SQLite logical
-/// key remain the existing three-part NUL-delimited value; only the physical
-/// PostgreSQL revision/table key is a reversible JSON-encoded representation.
+/// PostgreSQL text values cannot contain NUL. The logical watermark key is a
+/// three-part NUL-delimited value, while its physical key is JSON encoded.
 fn postgres_resource_revision_id(resource_kind: &str, resource_id: &str) -> String {
     if resource_kind != "data_plane_watermark" || !resource_id.contains('\0') {
         return resource_id.to_string();
@@ -2075,20 +1928,6 @@ fn postgres_resource_revision_id(resource_kind: &str, resource_id: &str) -> Stri
         "matrix-watermark:{}",
         serde_json::to_string(&parts).unwrap_or_default()
     )
-}
-
-fn logical_postgres_resource_id(resource_kind: &str, resource_id: &str) -> String {
-    let Some(encoded) = resource_id.strip_prefix("matrix-watermark:") else {
-        return resource_id.to_string();
-    };
-    if resource_kind != "data_plane_watermark" {
-        return resource_id.to_string();
-    }
-    serde_json::from_str::<Vec<String>>(encoded)
-        .ok()
-        .filter(|parts| parts.len() == 3)
-        .map(|parts| parts.join("\0"))
-        .unwrap_or_else(|| resource_id.to_string())
 }
 
 fn resource_revision<C: PostgresClient>(

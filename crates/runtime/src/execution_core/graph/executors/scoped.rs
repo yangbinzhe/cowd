@@ -53,6 +53,14 @@ impl ScopedNodeExecutor {
             .rev()
             .find_map(|resolver| resolver.resolve(ticket))
     }
+
+    /// Whether the exact durable node can currently be reconstructed.
+    /// Startup recovery uses this before waking a graph so a process-level
+    /// producer cannot race Session-scoped resolver installation.
+    #[must_use]
+    pub(crate) fn is_bound(&self, ticket: &NodeExecutionTicket) -> bool {
+        self.resolve(ticket).is_some()
+    }
 }
 
 #[async_trait]

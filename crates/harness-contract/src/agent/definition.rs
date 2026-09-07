@@ -184,6 +184,14 @@ pub struct AgentReleaseBinding {
 pub struct AgentEvaluationBinding {
     pub candidate_id: String,
     pub scenario_ref: String,
+    pub role: AgentEvaluationRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentEvaluationRole {
+    Baseline,
+    Candidate,
 }
 
 impl AgentEvaluationBinding {
@@ -333,6 +341,10 @@ pub enum AgentExecutorPolicy {
     CowdNative,
     ProcessJsonl {
         command_ref: String,
+        /// Digest of the exact Runtime-approved command manifest. A command
+        /// label alone is mutable configuration and cannot choose an
+        /// executable process for a frozen Agent Binding.
+        command_digest: String,
     },
     McpBacked {
         server_ref: String,
@@ -345,8 +357,12 @@ impl AgentExecutorPolicy {
     fn validate(&self) -> Result<(), ValidationError> {
         match self {
             Self::CowdNative | Self::ManualReview => Ok(()),
-            Self::ProcessJsonl { command_ref } => {
-                validate_reference("executor.command_ref", command_ref)
+            Self::ProcessJsonl {
+                command_ref,
+                command_digest,
+            } => {
+                validate_reference("executor.command_ref", command_ref)?;
+                validate_digest("executor.command_digest", command_digest)
             }
             Self::McpBacked {
                 server_ref,
@@ -725,6 +741,9 @@ impl AgentBindingSnapshot {
         execution_identity: crate::execution::ExecutionIdentity,
     ) -> Result<AgentTaskPacket, ValidationError> {
         self.validate()?;
+        if let Some(binding) = intent.agentic_binding.as_ref() {
+            binding.validate()?;
+        }
         validate_reference("task.principal_id", &intent.principal_id)?;
         validate_reference("task.source_turn_id", &intent.source_turn_id)?;
         validate_reference("task.run_id", &intent.run_id)?;
@@ -796,12 +815,11 @@ impl AgentBindingSnapshot {
             objective: intent.objective,
             required_acceptance,
             output_acceptance: intent.output_acceptance,
-            requires_managed_collaboration_escalation: intent
-                .requires_managed_collaboration_escalation,
             cohort_prompt_package: None,
             acceptance: intent.acceptance,
             constraints: intent.constraints,
             context_refs: intent.context_refs,
+            agentic_binding: intent.agentic_binding,
             evidence_refs: intent.evidence_refs,
             resource_scopes: intent.resource_scopes,
             allowed_tools: self.tool_contract_refs.clone(),

@@ -71,8 +71,10 @@ impl ExecutionGraphStateStore {
         &self,
         graph_id: &str,
     ) -> Result<Arc<ExecutionGraph>, ExecutionStateStoreError> {
-        if !self.verify_durable_revision {
-            if let Some(graph) = self.hot_graphs.get(graph_id) {
+        if let Some(graph) = self.hot_graphs.get(graph_id) {
+            if !self.verify_durable_revision
+                || self.event_store.stream_revision(graph_id)? == graph.revision
+            {
                 return Ok(graph);
             }
         }
@@ -130,6 +132,25 @@ impl ExecutionGraphStateStore {
         tokio::task::spawn_blocking(move || store.load(&graph_id))
             .await
             .map_err(|error| ExecutionStateStoreError::BlockingTask(error.to_string()))?
+    }
+
+    /// Read after a durable event without trusting a not-yet-published hot
+    /// snapshot. EventStore notification precedes the writer's cache publish;
+    /// a consumer must not acknowledge that notification using stale state.
+    /// The indexed stream-head check avoids replay when the cache is current.
+    pub(crate) async fn load_current_async(
+        &self,
+        graph_id: impl Into<String>,
+    ) -> Result<ExecutionGraph, ExecutionStateStoreError> {
+        let mut current = self.clone();
+        current.verify_durable_revision = true;
+        current.load_async(graph_id).await
+    }
+
+    fn load_current(&self, graph_id: &str) -> Result<ExecutionGraph, ExecutionStateStoreError> {
+        let mut current = self.clone();
+        current.verify_durable_revision = true;
+        current.load(graph_id)
     }
 
     pub fn graph_ids(&self) -> Result<Vec<String>, ExecutionStateStoreError> {
@@ -241,7 +262,8 @@ impl ExecutionGraphStateStore {
         &self,
         graph_id: &str,
     ) -> Result<ExecutionGraphProjection, ExecutionStateStoreError> {
-        let graph = self.load(graph_id)?;
+        // A Surface reducer may run directly after the durable commit wakeup.
+        let graph = self.load_current(graph_id)?;
         Ok(harness_contract::execution_graph::project_execution_graph(
             &graph,
         ))
@@ -364,7 +386,7 @@ mod tests {
 
     #[test]
     fn shared_hot_plane_recovers_once_then_serves_memory() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let write_plane = Arc::new(RuntimeHotStatePlane::default());
         let commit = ExecutionCommitService::with_hot_state(
             Arc::clone(&event_store),
@@ -391,9 +413,69 @@ mod tests {
         assert!(metrics.graph_hits >= 1);
     }
 
+    #[tokio::test]
+    async fn event_causal_read_cannot_consume_a_commit_using_an_older_hot_snapshot() {
+        use harness_contract::execution_graph::ExecutionNodeStatus;
+        let events = Arc::new(RuntimeEventStore::for_test());
+        let writer = ExecutionCommitService::new(Arc::clone(&events));
+        let reader_plane = Arc::new(RuntimeHotStatePlane::default());
+        let reader = ExecutionGraphStateStore::with_hot_state(
+            Arc::clone(&events),
+            Arc::clone(&reader_plane),
+        );
+        let mut graph = ExecutionGraph::new("causal terminal read");
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
+        graph.nodes.push(ExecutionNodeSpec::new(
+            ExecutionNodeKind::InlineModel,
+            "inline_model",
+            "{}",
+        ));
+        let registered = writer.register_graph(graph).unwrap().graph;
+        let initial = reader.load(&registered.id).unwrap();
+        let mut changes = reader.subscribe_commits();
+        let committed = writer
+            .transition_node(
+                &registered,
+                &registered.nodes[0].id,
+                ExecutionNodeStatus::Cancelled,
+                None,
+                vec![],
+            )
+            .unwrap()
+            .graph;
+        changes
+            .changed()
+            .await
+            .expect("durable commit notification");
+        // Separate hot planes deterministically retain the window that exists
+        // between EventStore commit publication and the graph writer's publish.
+        assert_eq!(
+            reader.load(&registered.id).unwrap().revision,
+            initial.revision
+        );
+        assert_eq!(
+            reader.projection(&registered.id).unwrap().revision,
+            committed.revision,
+            "public projection cannot publish stale state at a new event cursor"
+        );
+        let recovered = reader.load_current_async(&registered.id).await.unwrap();
+        assert_eq!(recovered.revision, committed.revision);
+        assert_eq!(
+            recovered.node_statuses[&registered.nodes[0].id],
+            ExecutionNodeStatus::Cancelled
+        );
+        let recoveries = reader_plane.metrics().snapshot().graph_recoveries;
+        reader.load_current_async(&registered.id).await.unwrap();
+        assert_eq!(
+            reader_plane.metrics().snapshot().graph_recoveries,
+            recoveries,
+            "current hot state uses indexed revision validation, not full journal replay"
+        );
+    }
+
     #[test]
     fn legacy_full_graph_delta_event_is_upcast_as_checkpoint() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let commit = ExecutionCommitService::new(Arc::clone(&event_store));
         let mut graph = ExecutionGraph::new("legacy graph");
         crate::test_support::attach_execution_graph_lineage(&mut graph);
@@ -430,7 +512,7 @@ mod tests {
 
     #[test]
     fn state_store_projection_keeps_node_payloads_opaque() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let commit = ExecutionCommitService::new(Arc::clone(&event_store));
         let mut graph = ExecutionGraph::new("opaque payload projection");
         crate::test_support::attach_execution_graph_lineage(&mut graph);

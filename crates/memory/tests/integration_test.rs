@@ -15,10 +15,10 @@ use std::io::Write;
 
 use memory::config::{BudgetConfig, StoreConfig};
 #[cfg(feature = "code-index")]
-use memory::store::sqlite::SqliteStore;
-#[cfg(feature = "code-index")]
 use memory::store::MemoryStore;
 use memory::types::Message;
+#[cfg(feature = "code-index")]
+use memory::EphemeralMemoryStore;
 #[cfg(feature = "code-index")]
 use memory::{CodeIndexer, CodeSymbol, SymbolEdge, SymbolEdgeType, SymbolKind};
 use memory::{CognitiveContextManager, MemoryConfig, TuningConfig};
@@ -30,7 +30,6 @@ use memory::{CognitiveContextManager, MemoryConfig, TuningConfig};
 fn test_config(db_path: &std::path::Path) -> MemoryConfig {
     MemoryConfig {
         store: StoreConfig {
-            sqlite_path: db_path.to_path_buf(),
             blob_dir: db_path.parent().unwrap().to_path_buf(),
             ..Default::default()
         },
@@ -115,7 +114,7 @@ async fn test_integration_no_injection_on_non_code_query() {
     let db_path = tmp.path().join("e2e_nocode.db");
 
     let cfg = test_config(&db_path);
-    let mgr = CognitiveContextManager::new(cfg).await.unwrap();
+    let mgr = CognitiveContextManager::new_ephemeral(cfg).await.unwrap();
 
     let query = "tell me about the weather";
     let ctx = mgr.prepare_context(query, &[], None).await.unwrap();
@@ -132,7 +131,7 @@ async fn test_integration_tool_sandbox_rejects_raw_without_durable_evidence() {
     let db_path = tmp.path().join("e2e_sandbox.db");
 
     let cfg = test_config_with_sandbox(&db_path);
-    let mgr = CognitiveContextManager::new(cfg).await.unwrap();
+    let mgr = CognitiveContextManager::new_ephemeral(cfg).await.unwrap();
     let needle = "COWD_SANDBOX_NEEDLE_ALPHA";
     let large_tool_output = (0..80)
         .map(|i| format!("line {i}: build log detail {needle} component-{i}"))
@@ -166,7 +165,7 @@ async fn test_integration_build_context_with_code_wraps_prepare() {
     let db_path = tmp.path().join("e2e_build.db");
 
     let cfg = test_config(&db_path);
-    let mgr = CognitiveContextManager::new(cfg).await.unwrap();
+    let mgr = CognitiveContextManager::new_ephemeral(cfg).await.unwrap();
 
     let ctx = mgr
         .build_context_with_code("refactor the auth module", &[])
@@ -180,9 +179,8 @@ async fn test_integration_build_context_with_code_wraps_prepare() {
 #[tokio::test]
 async fn test_integration_impact_analysis_with_store() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("e2e_impact.db");
 
-    let sqlite = SqliteStore::open_path(&db_path).unwrap();
+    let store = EphemeralMemoryStore::new();
 
     let authenticate = CodeSymbol {
         id: "auth.rs:authenticate:10".into(),
@@ -203,8 +201,8 @@ async fn test_integration_impact_analysis_with_store() {
         doc: None,
     };
 
-    sqlite.insert_symbol(&authenticate).await.unwrap();
-    sqlite.insert_symbol(&login_handler).await.unwrap();
+    store.insert_symbol(&authenticate).await.unwrap();
+    store.insert_symbol(&login_handler).await.unwrap();
 
     let edge = SymbolEdge {
         source_id: "handlers.rs:login_handler:5".into(),
@@ -212,15 +210,9 @@ async fn test_integration_impact_analysis_with_store() {
         edge_type: SymbolEdgeType::Calls,
         file_path: "handlers.rs".into(),
     };
-    sqlite
-        .index_file_symbols(
-            "handlers.rs",
-            &[authenticate.clone(), login_handler.clone()],
-            &[edge],
-        )
-        .unwrap();
+    store.insert_edge(&edge).await.unwrap();
 
-    let store: std::sync::Arc<dyn MemoryStore> = std::sync::Arc::new(sqlite);
+    let store: std::sync::Arc<dyn MemoryStore> = std::sync::Arc::new(store);
     let indexer = CodeIndexer::new(tmp.path()).unwrap().with_store(store);
 
     let report = indexer.get_impact("authenticate", 1).await;

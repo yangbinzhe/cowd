@@ -148,6 +148,9 @@ where
             permission_fingerprint,
             system_prompt,
             usage_tracker,
+            cache_dimensions_observation: Arc::new(std::sync::Mutex::new(
+                TurnCacheDimensionsObservation::default(),
+            )),
             hook_runner: HookRunner::from_feature_config(feature_config),
             cowd_bus: None,
             turn_callback: None,
@@ -619,6 +622,7 @@ where
                 Arc::new(SessionProviderWireEvidenceWriter {
                     artifacts: Arc::clone(artifacts),
                     session_port: Arc::clone(session_port),
+                    cache_dimensions: Arc::clone(&self.cache_dimensions_observation),
                 }) as Arc<dyn crate::ProviderWireEvidenceWriter>
             });
         self.api_client.configure_provider_wire_evidence(writer);

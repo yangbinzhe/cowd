@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ApprovalQueue, ApprovalSource, ApprovalTimeoutPolicy, AutonomyDecisionInput,
-    AutonomyDecisionKind, AutonomyProfileCatalog, AutonomyProfileId, CollaborationTemplateId,
-    GlobalApprovalRequest, SubmitGlobalApprovalRequest,
+    AutonomyDecisionKind, AutonomyProfileCatalog, AutonomyProfileId, GlobalApprovalRequest,
+    SubmitGlobalApprovalRequest,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,7 +22,6 @@ pub struct StewardActionRequest {
     pub summary: String,
     pub risk: TaskRisk,
     pub requested_tool: Option<String>,
-    pub template_id: Option<CollaborationTemplateId>,
     pub requires_write: bool,
     pub is_critical_operation: bool,
     pub evidence_refs: Vec<String>,
@@ -74,7 +73,6 @@ impl StewardAgent {
             profile_id: request.profile_id,
             requested_risk: request.risk,
             requested_tool: request.requested_tool.clone(),
-            template_id: request.template_id,
             requires_write: request.requires_write,
             is_critical_operation: request.is_critical_operation,
         });
@@ -186,7 +184,6 @@ mod tests {
                     summary: "read local evidence".to_string(),
                     risk: TaskRisk::Low,
                     requested_tool: Some("read_file".to_string()),
-                    template_id: Some(CollaborationTemplateId::PlannerExecutorVerifier),
                     requires_write: false,
                     is_critical_operation: false,
                     evidence_refs: vec!["trace:low".to_string()],
@@ -213,7 +210,6 @@ mod tests {
                     summary: "write runtime changes".to_string(),
                     risk: TaskRisk::High,
                     requested_tool: Some("apply_patch".to_string()),
-                    template_id: Some(CollaborationTemplateId::ImplementationReviewFix),
                     requires_write: true,
                     is_critical_operation: false,
                     evidence_refs: vec!["trace:risky".to_string()],

@@ -1392,6 +1392,7 @@ mod tests {
         crate::protocol::ExecutionProjection {
             schema_version: harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION,
             execution_id: "execution-547".to_string(),
+            agentic_collaboration: Default::default(),
             revision: 4,
             cursor: 4,
             detail_scope: harness_contract::projection::ProjectionDetailScope::Summary,

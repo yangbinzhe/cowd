@@ -939,7 +939,7 @@ mod tests {
 
     #[test]
     fn due_interval_is_claimed_once_and_rebuilds_from_events() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("event store"));
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let schedules =
             MissionScheduleStore::event_sourced(Arc::clone(&event_store), "workspace-a")
                 .expect("schedule store");
@@ -969,7 +969,7 @@ mod tests {
 
     #[test]
     fn idle_ticks_do_not_append_duplicate_schedule_snapshots() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("event store"));
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let schedules =
             MissionScheduleStore::event_sourced(Arc::clone(&event_store), "workspace-a")
                 .expect("schedule store");
@@ -994,7 +994,7 @@ mod tests {
 
     #[test]
     fn manual_fire_keeps_automatic_cursor_and_delete_retains_fire_evidence() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("event store"));
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let schedules = MissionScheduleStore::event_sourced(event_store, "workspace-a")
             .expect("schedule store");
         let schedule = schedules
@@ -1026,7 +1026,7 @@ mod tests {
 
     #[test]
     fn cron_requires_valid_expression_and_timezone() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("event store"));
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let schedules = MissionScheduleStore::event_sourced(event_store, "workspace-a")
             .expect("schedule store");
         assert!(schedules
@@ -1042,7 +1042,7 @@ mod tests {
 
     #[test]
     fn update_requires_current_revision_and_recomputes_the_next_fire() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("event store"));
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let schedules = MissionScheduleStore::event_sourced(event_store, "workspace-a")
             .expect("schedule store");
         let schedule = schedules
@@ -1084,7 +1084,7 @@ mod tests {
 
     #[test]
     fn fire_policy_is_bound_once_and_terminal_history_leaves_hot_state() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("event store"));
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let schedules =
             MissionScheduleStore::event_sourced(Arc::clone(&event_store), "workspace-a")
                 .expect("schedule store");
@@ -1163,7 +1163,7 @@ mod tests {
 
     #[test]
     fn ten_thousand_terminal_fires_do_not_accumulate_in_hot_snapshots() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("event store"));
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let schedules =
             MissionScheduleStore::event_sourced(Arc::clone(&event_store), "workspace-a")
                 .expect("schedule store");

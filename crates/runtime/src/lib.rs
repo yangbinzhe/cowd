@@ -179,8 +179,6 @@ pub mod artifact;
 pub mod authorization_negotiator;
 #[path = "policy/autonomy_profile.rs"]
 pub mod autonomy_profile;
-#[path = "agent/collaboration_template.rs"]
-pub mod collaboration_template;
 #[path = "conflict/conflict_arbiter.rs"]
 pub mod conflict_arbiter;
 #[path = "context/context_fanout.rs"]
@@ -199,8 +197,9 @@ mod test_support;
 pub use agentic::{
     AgentActionService, AgentActionServiceError, AgentMemberProjection, AgenticArtifactProjection,
     AgenticCompletionRequestProjection, AgenticDispatchContext, AgenticDispatchReceipt,
-    AgenticObjectiveVerdictProjection, AgenticProgramProjection, AgenticProgramStatus,
-    AgenticTaskProjection, AgenticTaskStatus, AgenticTeamProjection, AgenticTopicEntryProjection,
+    AgenticMembershipLifecycle, AgenticMembershipProjection, AgenticObjectiveVerdictProjection,
+    AgenticProgramProjection, AgenticProgramStatus, AgenticTaskProjection, AgenticTaskRetirement,
+    AgenticTaskStatus, AgenticTeamLifecycle, AgenticTeamProjection, AgenticTopicEntryProjection,
 };
 pub use definition_registry::AgentDefinitionDraftReceipt;
 #[path = "infrastructure/eval_gate.rs"]
@@ -307,8 +306,6 @@ pub mod summary_compression;
 #[path = "infrastructure/surface_contract.rs"]
 pub mod surface_contract;
 pub mod task;
-#[path = "team/definition/mod.rs"]
-pub mod team_definition;
 #[path = "team/l4_promotion.rs"]
 pub mod team_l4_promotion;
 #[path = "tooling/tool_dispatch.rs"]
@@ -384,9 +381,6 @@ pub use capability_manifest::{
     RuntimeActionContract, RuntimeCapability, RuntimeCapabilityCatalog, RuntimeCapabilityManifest,
     RuntimeOperation, RuntimeOperationGroup, RuntimeTemplateSummary,
 };
-pub use collaboration_template::{
-    CollaborationDecision, CollaborationTemplateId, CollaborationTemplateMatcher,
-};
 pub use compact::{
     estimate_session_tokens, format_compact_summary, get_compact_continuation_message,
     should_compact, CompactionConfig, CompactionResult,
@@ -438,14 +432,11 @@ pub use cross_plane_policy::{
     CrossPlanePolicyConfig, CrossPlanePolicyDecision, CrossPlanePolicyEngine,
     CrossPlaneResolvedIdentity, CrossPlaneSummary, GrantType, IdentityTrust,
 };
-pub use definition_registry::{
-    DefinitionRegistryError, RuntimeDefinitionRegistry, RuntimeTeamTemplateCatalogEntry,
-};
+pub use definition_registry::{DefinitionRegistryError, RuntimeDefinitionRegistry};
 pub use evidence_planner::{
     evidence_plan_prompt, plan_evidence, EvidenceAcquisitionMode, EvidencePlan,
 };
 pub use execution_core::{
-    action_selection_report_for_decision, build_runtime_action_selection_report,
     build_runtime_execution_decision, execution_pattern_catalog_response, rewoo_plan_for_intent,
     runtime_execution_guidance_prompt, runtime_execution_guidance_prompt_with_tool_exposure,
     runtime_orchestration_action_guidance, runtime_orchestration_actions, tool_intents_from_rewoo,
@@ -456,14 +447,14 @@ pub use execution_core::{
     ExecutionStartupRecoveryRecord, ExecutionStartupRecoveryReport, LegacyOutcomeImportReceipt,
     OutcomeRecordReceipt, ReflexionRecord, ReflexionTrigger, RewooEvidencePlan,
     RewooEvidenceResult, RewooEvidenceStep, RewooObservation, RewooSolverContract,
-    RuntimeActionSelectionReport, RuntimeCompileTarget, RuntimeEventReader, RuntimeEvidenceSummary,
-    RuntimeExecutionActionHint, RuntimeExecutionDecision, RuntimeExecutionHealth,
-    RuntimeExecutionOwnerReport, RuntimeExecutionPatternCandidate, RuntimeExecutionPatternSpec,
-    RuntimeExecutionReportSpec, RuntimeExecutionShutdownReport, RuntimeExecutionSupervisor,
-    RuntimeServices, RuntimeServicesBuilder, RuntimeServicesError, RuntimeWorkAdmissionReceipt,
-    SessionTerminalDeliveryPort, StrategyDecisionEngine, StrategyLease, StrategyResourceHealth,
-    ToolIntentDependency, ToolIntentDependencyKind, ToolIntentGraph, ToolIntentNode,
-    TurnStrategyActualOutcome, TurnStrategyDecisionState, TurnStrategyDecisionStatus,
+    RuntimeCompileTarget, RuntimeEventReader, RuntimeEvidenceSummary, RuntimeExecutionDecision,
+    RuntimeExecutionHealth, RuntimeExecutionOwnerReport, RuntimeExecutionPatternCandidate,
+    RuntimeExecutionPatternSpec, RuntimeExecutionReportSpec, RuntimeExecutionShutdownReport,
+    RuntimeExecutionSupervisor, RuntimeServices, RuntimeServicesBuilder, RuntimeServicesError,
+    RuntimeWorkAdmissionReceipt, SessionTerminalDeliveryPort, StrategyDecisionEngine,
+    StrategyLease, StrategyResourceHealth, ToolIntentDependency, ToolIntentDependencyKind,
+    ToolIntentGraph, ToolIntentNode, TurnStrategyActualOutcome, TurnStrategyDecisionState,
+    TurnStrategyDecisionStatus,
 };
 pub use git_context::{GitCommitEntry, GitContext};
 pub use harness_contract::agent::AgentLifecycleEvent;
@@ -503,7 +494,7 @@ pub use artifact::{
     ArtifactError, ArtifactGcPort, ArtifactGcReport, ArtifactMetadataPort,
     ArtifactMetadataRepository, ArtifactObjectRecord, ArtifactObjectTier, ArtifactReadPort,
     ArtifactRecord, ArtifactStore, ArtifactStoreConfig, ArtifactStoreStats, ArtifactWriteSink,
-    SqliteArtifactRepository, ARTIFACT_PERMANENT_PIN_UNTIL_MS, ARTIFACT_STAGING_PIN_TTL_MS,
+    EphemeralArtifactRepository, ARTIFACT_PERMANENT_PIN_UNTIL_MS, ARTIFACT_STAGING_PIN_TTL_MS,
 };
 pub(crate) use evolution::EvolutionCandidateRegistration;
 pub use evolution::{
@@ -669,10 +660,10 @@ pub use remote::{
 };
 pub use request_compiler::{PreparedRequestBasis, PreparedRequestCompiler, RequestCompilerStats};
 pub use resources::{
-    register_resource_from_path, render_resource_context_markdown, resource_hint,
-    ResourceCapabilityIndex, ResourceCapabilitySnapshot, ResourceEvidence, ResourceHint,
-    ResourceKind, ResourceMigrationOptions, ResourceMigrationReport, ResourceProjection,
-    ResourcePromptHint, ResourceStore,
+    render_resource_context_markdown, resource_hint, ResourceCapabilityIndex,
+    ResourceCapabilitySnapshot, ResourceEvidence, ResourceHint, ResourceKind,
+    ResourceMigrationOptions, ResourceMigrationReport, ResourceProjection, ResourcePromptHint,
+    ResourceStore,
 };
 pub use runtime_event_reactor::{
     RuntimeEventReactor, RuntimeEventReactorHealth, RuntimeEventReactorShutdownReport,
@@ -686,16 +677,13 @@ pub use runtime_event_replay::{
 pub use runtime_event_store::{
     decode_session_terminal_artifact_ref, encode_session_terminal_artifact_ref,
     AppendTransactionReceipt, AppendTransactionRequest, CommittedEventBatch,
-    CommittedStreamRevision, DurableRuntimeEvent, ExpectedStreamRevision,
-    RuntimeDecisionLeaseSnapshot, RuntimeEventCommitSnapshot, RuntimeEventInput,
+    CommittedStreamRevision, DurableRuntimeEvent, ExpectedStreamRevision, RuntimeEventInput,
     RuntimeEventRecord, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore,
     RuntimeEventStoreBackend, RuntimeEventStoreError, RuntimeEventStoreResult,
-    RuntimeEventStoreSnapshot, RuntimeEventStreamHeadSnapshot,
-    RuntimeEventTransactionStreamSnapshot, RuntimeProjectionCheckpoint,
-    RuntimeProjectionEventInterest, RuntimeProjectionInterest, RuntimeProjectionScanPage,
-    RuntimeProjectionWorkClass, RuntimeSessionOutboxFailureClass, RuntimeSessionOutboxHealth,
-    RuntimeSessionOutboxRecord, RuntimeSessionTerminalFenceAdoption, RuntimeTransactionEventInput,
-    SessionTerminalInput, SESSION_TERMINAL_ARTIFACT_SCHEMA_VERSION,
+    RuntimeProjectionCheckpoint, RuntimeProjectionEventInterest, RuntimeProjectionInterest,
+    RuntimeProjectionScanPage, RuntimeProjectionWorkClass, RuntimeSessionOutboxFailureClass,
+    RuntimeSessionOutboxHealth, RuntimeSessionOutboxRecord, RuntimeSessionTerminalFenceAdoption,
+    RuntimeTransactionEventInput, SessionTerminalInput, SESSION_TERMINAL_ARTIFACT_SCHEMA_VERSION,
 };
 #[doc(hidden)]
 pub use runtime_event_store::{
@@ -764,8 +752,7 @@ pub use task::{
     TaskEvidenceOutboxRecord, TaskExecutionPolicy, TaskGraphRef, TaskKind, TaskMissionAssignment,
     TaskMutation, TaskMutationResult, TaskOrigin, TaskPhase, TaskPhaseArtifact, TaskPhaseStatus,
     TaskPhaseTerminalReceipt, TaskRouteMaterialization, TaskRouter, TaskRuntimePort, TaskSpec,
-    TaskStatus as MissionTaskStatus, TaskStoreBackend, TaskStoreSnapshot, TaskTurnBinding,
-    TaskTurnRole,
+    TaskStatus as MissionTaskStatus, TaskStoreBackend, TaskTurnBinding, TaskTurnRole,
 };
 pub use team_l4_promotion::{
     KnowledgeCandidateProjection, L4CandidateLifecycle, L4PromotionCandidate, L4PromotionReceipt,

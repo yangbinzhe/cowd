@@ -3,9 +3,6 @@
 //! The adapter owns SQL, schema, pooling and copy verification.  Promotion
 //! policy remains in `fact-kernel`; Gateway and Runtime only see its port.
 
-use std::fs;
-use std::path::{Path, PathBuf};
-
 use chrono::Utc;
 use fact_kernel::{
     EvidencePacket, FactLedger, FactLedgerError, FactLedgerResult, FactLedgerSnapshot,
@@ -13,7 +10,6 @@ use fact_kernel::{
 };
 use harness_contract::growth::GrowthEvent;
 use postgres::Row;
-use serde::{Deserialize, Serialize};
 use storage::{
     PostgresClient, PostgresConnectionConfig, PostgresExecutor, PostgresMigrationSpec,
     SecretRefResolver,
@@ -519,75 +515,6 @@ fn json_error(error: serde_json::Error) -> FactLedgerError {
     FactLedgerError::backend(error.to_string())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FactLedgerMigrationManifest {
-    pub domain: String,
-    pub source_digest: String,
-    pub target_digest: String,
-    pub fact_count: usize,
-    pub evidence_count: usize,
-    pub growth_event_count: usize,
-    pub growth_promotion_count: usize,
-}
-
-/// Copy a quiesced source exactly once.  A second source snapshot proves the
-/// owner did not change during copy; the target must have the same digest
-/// before the manifest is written.  Normal runtime paths never call this.
-pub fn copy_quiesced_fact_ledger(
-    source: &dyn FactLedger,
-    target: &dyn FactLedger,
-    manifest_path: impl AsRef<Path>,
-) -> FactLedgerResult<FactLedgerMigrationManifest> {
-    let snapshot = source.export_snapshot()?;
-    let source_digest = snapshot.canonical_digest()?;
-    target.import_snapshot(&snapshot)?;
-    let source_after_digest = source.export_snapshot()?.canonical_digest()?;
-    if source_after_digest != source_digest {
-        return Err(FactLedgerError::backend(
-            "fact ledger source changed while migration maintenance barrier was active",
-        ));
-    }
-    let target_digest = target.export_snapshot()?.canonical_digest()?;
-    if target_digest != source_digest {
-        return Err(FactLedgerError::backend(
-            "fact ledger target digest differs from source after copy",
-        ));
-    }
-    let manifest = FactLedgerMigrationManifest {
-        domain: FACT_LEDGER_DOMAIN.to_string(),
-        source_digest,
-        target_digest,
-        fact_count: snapshot.facts.len(),
-        evidence_count: snapshot.evidence.len(),
-        growth_event_count: snapshot.growth_events.len(),
-        growth_promotion_count: snapshot.growth_promotions.len(),
-    };
-    write_manifest(manifest_path.as_ref(), &manifest)?;
-    Ok(manifest)
-}
-
-fn write_manifest(
-    manifest_path: &Path,
-    manifest: &FactLedgerMigrationManifest,
-) -> FactLedgerResult<()> {
-    if let Some(parent) = manifest_path.parent() {
-        fs::create_dir_all(parent).map_err(|error| FactLedgerError::backend(error.to_string()))?;
-    }
-    let temporary = PathBuf::from(format!(
-        "{}.{}.tmp",
-        manifest_path.display(),
-        uuid::Uuid::new_v4()
-    ));
-    fs::write(
-        &temporary,
-        serde_json::to_vec_pretty(manifest).map_err(json_error)?,
-    )
-    .map_err(|error| FactLedgerError::backend(error.to_string()))?;
-    fs::rename(temporary, manifest_path)
-        .map_err(|error| FactLedgerError::backend(error.to_string()))?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -600,10 +527,7 @@ mod tests {
         core::{ExecutionPattern, TaskComplexity, TaskRisk},
         growth::{GrowthEvent, GrowthEventInput, GrowthEvidenceRef, GrowthInput, LearningRecord},
     };
-    use storage::{
-        PostgresConnectionConfig, StaticSecretRefResolver, StorageDomainId, StorageEndpoint,
-        StorageScope,
-    };
+    use storage::{PostgresConnectionConfig, StaticSecretRefResolver};
 
     use super::*;
 
@@ -764,53 +688,5 @@ mod tests {
             digest
         );
         clear(&reopened);
-    }
-
-    #[test]
-    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
-    fn real_sqlite_to_postgres_copy_is_digest_exact_and_reopens() {
-        let url =
-            std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
-        let target = ledger_from_url(url, "fact-postgres-copy-contract");
-        clear(&target);
-        let temp = tempfile::tempdir().unwrap();
-        let endpoint = StorageEndpoint::sqlite(
-            StorageDomainId::Fact,
-            StorageScope::Global,
-            temp.path().join("fact.sqlite"),
-            "fact-postgres-copy-source",
-            "fact.0002.ledger",
-        );
-        let source_ledger = fact_sqlite::SqliteFactLedger::open(&endpoint).unwrap();
-        let mut fact = FactRecord::new("policy", "copy only after quiesce");
-        fact.id = FactId::from_string("fact-postgres-copy");
-        source_ledger.upsert_fact(fact).unwrap();
-        source_ledger
-            .upsert_evidence(EvidencePacket::new(
-                source(),
-                serde_json::json!({"copy": true}),
-            ))
-            .unwrap();
-        let event = growth_event();
-        source_ledger.record_growth_event(event.clone()).unwrap();
-        source_ledger
-            .record_growth_promotion(GrowthPromotionRecord {
-                id: GrowthPromotionRecord::stable_id(&event.id, "fact.policy", None, "copied"),
-                event_id: event.id,
-                target: "fact.policy".to_string(),
-                status: "promoted".to_string(),
-                target_id: Some("fact-postgres-copy".to_string()),
-                summary: "copied".to_string(),
-                error: None,
-                created_at: "2026-07-23T00:00:00Z".to_string(),
-            })
-            .unwrap();
-        let manifest_path = temp.path().join("fact-cutover.json");
-        let manifest = copy_quiesced_fact_ledger(&source_ledger, &target, &manifest_path).unwrap();
-        assert_eq!(manifest.source_digest, manifest.target_digest);
-        assert!(manifest_path.exists());
-        assert_eq!(target.list_facts().unwrap().len(), 1);
-        assert_eq!(target.list_growth_events().unwrap().len(), 1);
-        clear(&target);
     }
 }

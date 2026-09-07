@@ -462,7 +462,6 @@ fn agent_directory_filters_by_skill_overlap() {
 async fn test_reputation_flows_to_agent_directory() {
     use memory::agent_directory::{AgentDirectory, AgentInfo, AgentStatus, ReputationScore};
     use memory::agent_reputation::ReputationManager;
-    use memory::store::sqlite::SqliteStore;
     use std::sync::Arc;
 
     let now = std::time::SystemTime::now()
@@ -470,10 +469,7 @@ async fn test_reputation_flows_to_agent_directory() {
         .unwrap_or_default()
         .as_millis() as u64;
 
-    let store = SqliteStore::open_in_memory().expect("store");
-    let pool = store.pool();
-
-    let rep_mgr = Arc::new(ReputationManager::with_default_config(pool));
+    let rep_mgr = Arc::new(ReputationManager::with_default_config());
     ReputationManager::set_global(rep_mgr.clone());
 
     // 2. Register agent with empty reputation

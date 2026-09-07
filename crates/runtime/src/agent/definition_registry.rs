@@ -1,4 +1,4 @@
-//! Runtime-owned registry for durable Agent and Team Definition assets.
+//! Runtime-owned registry for durable Agent Definition assets.
 //!
 //! This is the composition boundary between the generic storage registry and
 //! executable Definition resolvers. It deliberately has no current-directory
@@ -14,12 +14,7 @@ use harness_contract::agent::{
     AgentDefinitionId, AgentDefinitionRevisionRef, DefaultPointer, ReleaseAssignment,
     ReleaseAssignmentStatus, ReleaseAuthorization, ReleaseChannel, RevisionSelector,
 };
-use harness_contract::team::{
-    TeamRoleDefinition, TeamRoleDependency, TeamTemplateDefinitionId, TeamTemplateRevisionRef,
-    TeamTopologyContract,
-};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::agent::definition::{
@@ -27,43 +22,15 @@ use crate::agent::definition::{
     DefinitionStoreError, ExplicitTomlAgentImport, RegisteredAgentDefinitionLayout,
     ResolvedAgentDefinition,
 };
-use crate::team_definition::{
-    bootstrap_builtin_teams, BuiltinTeamTrust, ExactAgentRevisionResolver,
-    RegisteredTeamTemplateLayout, ResolvedTeamTemplate, TeamDefinitionStoreError,
-    TeamTemplateDefinitionResolver, TeamTemplateDefinitionStore,
-};
 use crate::{
     AgentCatalogEntry, EvolutionCandidateSubject, EvolutionReleaseAssignment, ReleaseChangeAction,
 };
 
-/// Composition failures for the two Definition domains.
+/// Agent Definition composition failures.
 #[derive(Debug, Error)]
 pub enum DefinitionRegistryError {
     #[error(transparent)]
     Agent(#[from] DefinitionStoreError),
-    #[error(transparent)]
-    Team(#[from] TeamDefinitionStoreError),
-}
-
-/// Read-only projection of a runnable Team Template revision. It deliberately
-/// contains no mutable collaboration or execution graph data.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeTeamTemplateCatalogEntry {
-    pub revision_ref: TeamTemplateRevisionRef,
-    pub name: String,
-    /// Content digest of the exact published Team Template revision.
-    pub content_digest: String,
-    /// Digest of the digest-bound TEAM.md public fragment, when the revision
-    /// carries one. Binding compilers freeze this once and never rescan.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub team_markdown_digest: Option<String>,
-    pub topology: TeamTopologyContract,
-    pub role_count: usize,
-    #[serde(default)]
-    pub roles: Vec<TeamRoleDefinition>,
-    #[serde(default)]
-    pub dependencies: Vec<TeamRoleDependency>,
-    pub result_fields: Vec<String>,
 }
 
 /// Agent catalog entry paired with the frozen content digest of its exact
@@ -84,20 +51,12 @@ pub struct AgentDefinitionDraftReceipt {
     pub content_digest: String,
 }
 
-/// Sole Runtime composition root for Agent and Team Definition stores.
-///
-/// Both domains share one registered definitions root but retain separate
-/// `agents/` and `teams/` subtrees inside their stores. All IDs are qualified
-/// by scope, so a workspace definition can never shadow a user or builtin
-/// definition by local name alone.
+/// Sole Runtime composition root for Agent Definition storage and resolution.
 #[derive(Debug)]
 pub struct RuntimeDefinitionRegistry {
     agents: AgentDefinitionStore<RegisteredAgentDefinitionLayout>,
-    teams: TeamTemplateDefinitionStore<RegisteredTeamTemplateLayout>,
     builtin_agent_trust: BuiltinAgentTrust,
-    builtin_team_trust: BuiltinTeamTrust,
     exact_agent_cache: RwLock<HashMap<(String, u64), ResolvedAgentDefinition>>,
-    exact_team_cache: RwLock<HashMap<(String, u64), ResolvedTeamTemplate>>,
 }
 
 impl RuntimeDefinitionRegistry {
@@ -109,28 +68,17 @@ impl RuntimeDefinitionRegistry {
         builtin_definitions_root: impl Into<PathBuf>,
         workspace_root: impl AsRef<Path>,
     ) -> Result<Self, DefinitionRegistryError> {
-        let builtin_definitions_root = builtin_definitions_root.into();
         let agents =
             AgentDefinitionStore::new(RegisteredAgentDefinitionLayout::from_storage_registry(
                 storage,
-                builtin_definitions_root.clone(),
+                builtin_definitions_root,
                 workspace_root.as_ref(),
             )?);
-        let teams =
-            TeamTemplateDefinitionStore::new(RegisteredTeamTemplateLayout::from_storage_registry(
-                storage,
-                builtin_definitions_root,
-                workspace_root,
-            )?);
         let builtin_agent_trust = bootstrap_builtin_agents(&agents)?;
-        let builtin_team_trust = bootstrap_builtin_teams(&teams)?;
         Ok(Self {
             agents,
-            teams,
             builtin_agent_trust,
-            builtin_team_trust,
             exact_agent_cache: RwLock::new(HashMap::new()),
-            exact_team_cache: RwLock::new(HashMap::new()),
         })
     }
 
@@ -142,29 +90,17 @@ impl RuntimeDefinitionRegistry {
         builtin_definitions_root: impl Into<PathBuf>,
         workspace_root: impl Into<PathBuf>,
     ) -> Result<Self, DefinitionRegistryError> {
-        let builtin_definitions_root = builtin_definitions_root.into();
-        let workspace_root = workspace_root.into();
         let agents =
             AgentDefinitionStore::new(RegisteredAgentDefinitionLayout::from_storage_layout(
-                storage,
-                builtin_definitions_root.clone(),
-                workspace_root.clone(),
-            )?);
-        let teams =
-            TeamTemplateDefinitionStore::new(RegisteredTeamTemplateLayout::from_storage_layout(
                 storage,
                 builtin_definitions_root,
                 workspace_root,
             )?);
         let builtin_agent_trust = bootstrap_builtin_agents(&agents)?;
-        let builtin_team_trust = bootstrap_builtin_teams(&teams)?;
         Ok(Self {
             agents,
-            teams,
             builtin_agent_trust,
-            builtin_team_trust,
             exact_agent_cache: RwLock::new(HashMap::new()),
-            exact_team_cache: RwLock::new(HashMap::new()),
         })
     }
 
@@ -174,20 +110,8 @@ impl RuntimeDefinitionRegistry {
     }
 
     #[must_use]
-    pub(crate) fn teams(&self) -> &TeamTemplateDefinitionStore<RegisteredTeamTemplateLayout> {
-        &self.teams
-    }
-
-    #[must_use]
     pub fn agent_resolver(&self) -> AgentDefinitionResolver<'_, RegisteredAgentDefinitionLayout> {
         AgentDefinitionResolver::new(self.agents())
-    }
-
-    #[must_use]
-    pub fn team_resolver(
-        &self,
-    ) -> TeamTemplateDefinitionResolver<'_, RegisteredTeamTemplateLayout> {
-        TeamTemplateDefinitionResolver::new(self.teams())
     }
 
     pub fn resolve_agent(
@@ -260,49 +184,6 @@ impl RuntimeDefinitionRegistry {
         })
     }
 
-    pub fn resolve_team(
-        &self,
-        template_id: &TeamTemplateDefinitionId,
-        selector: RevisionSelector,
-    ) -> Result<ResolvedTeamTemplate, DefinitionRegistryError> {
-        let exact_key = match &selector {
-            RevisionSelector::ExactApprovedRevision { revision } => {
-                Some((template_id.as_str().to_string(), *revision))
-            }
-            RevisionSelector::LatestApprovedStable | RevisionSelector::DefaultPointer => None,
-        };
-        if let Some(cached) = exact_key.as_ref().and_then(|key| {
-            self.exact_team_cache
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(key)
-                .cloned()
-        }) {
-            return Ok(cached);
-        }
-        let resolved = self
-            .team_resolver()
-            .resolve(template_id, selector.clone(), self)
-            .map_err(DefinitionRegistryError::from)?;
-        if resolved.revision.revision_ref.template_id.scope()
-            == harness_contract::agent::DefinitionScope::Builtin
-        {
-            self.builtin_team_trust
-                .verify(
-                    &resolved.revision.revision_ref,
-                    &resolved.revision.content_digest,
-                )
-                .map_err(DefinitionRegistryError::from)?;
-        }
-        if let Some(key) = exact_key {
-            self.exact_team_cache
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(key, resolved.clone());
-        }
-        Ok(resolved)
-    }
-
     /// Rebuild the Runtime's runnable Agent catalog from immutable Definition
     /// revisions. Draft, revoked, stopped, quarantined, and corrupted
     /// Definitions never appear in this projection.
@@ -342,58 +223,6 @@ impl RuntimeDefinitionRegistry {
         Ok(entries)
     }
 
-    /// Rebuild the read-only Team Template hint catalog from exact published
-    /// definitions. Templates never instantiate or own execution.
-    pub fn runnable_team_catalog(
-        &self,
-    ) -> Result<Vec<RuntimeTeamTemplateCatalogEntry>, DefinitionRegistryError> {
-        let mut entries = Vec::new();
-        for template_id in self.teams().list_template_ids()? {
-            let resolved = match self
-                .resolve_team(&template_id, RevisionSelector::LatestApprovedStable)
-            {
-                Ok(resolved) => resolved,
-                Err(DefinitionRegistryError::Team(
-                    TeamDefinitionStoreError::UnresolvablePointer(_, _),
-                )) => continue,
-                Err(error)
-                    if template_id.scope() != harness_contract::agent::DefinitionScope::Builtin
-                        && is_isolatable_custom_team_catalog_error(&error) =>
-                {
-                    tracing::warn!(
-                        template_id = template_id.as_str(),
-                        error = %error,
-                        "excluding non-runnable custom Team Template from catalog projection"
-                    );
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            let manifest = &resolved.revision.manifest;
-            entries.push(RuntimeTeamTemplateCatalogEntry {
-                revision_ref: resolved.revision.revision_ref,
-                name: manifest.name.clone(),
-                content_digest: resolved.revision.content_digest.clone(),
-                team_markdown_digest: Some(format!(
-                    "{:x}",
-                    Sha256::digest(resolved.team_markdown.as_bytes())
-                )),
-                topology: manifest.topology.clone(),
-                role_count: manifest.roles.len(),
-                roles: manifest.roles.clone(),
-                dependencies: manifest.dependencies.clone(),
-                result_fields: manifest.result_contract.required_fields.clone(),
-            });
-        }
-        entries.sort_by(|left, right| {
-            left.revision_ref
-                .template_id
-                .as_str()
-                .cmp(right.revision_ref.template_id.as_str())
-        });
-        Ok(entries)
-    }
-
     /// Explicitly import one caller-selected external TOML Definition as a
     /// local Draft. The adapter cannot discover external roots or set release
     /// state, so imports never become runnable without the Runtime release
@@ -417,8 +246,8 @@ impl RuntimeDefinitionRegistry {
         &self,
         assignment: &EvolutionReleaseAssignment,
     ) -> Result<(), DefinitionRegistryError> {
-        // Eligibility and default pointers are mutable projections. Clear both
-        // exact caches before applying a release transition so partial durable
+        // Eligibility and default pointers are mutable projections. Clear the
+        // exact cache before applying a release transition so partial durable
         // success can never leave a stale runnable definition in memory.
         self.invalidate_definition_caches();
         let EvolutionCandidateSubject::AgentDefinition { revision_ref } = &assignment.subject;
@@ -495,25 +324,7 @@ impl RuntimeDefinitionRegistry {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
-        self.exact_team_cache
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
     }
-}
-
-fn is_isolatable_custom_team_catalog_error(error: &DefinitionRegistryError) -> bool {
-    matches!(
-        error,
-        DefinitionRegistryError::Team(
-            TeamDefinitionStoreError::Deserialize(_)
-                | TeamDefinitionStoreError::Contract(_)
-                | TeamDefinitionStoreError::RevisionNotFound { .. }
-                | TeamDefinitionStoreError::CorruptRevision { .. }
-                | TeamDefinitionStoreError::DigestMismatch { .. }
-                | TeamDefinitionStoreError::ReleaseDigestMismatch
-        )
-    )
 }
 
 fn agent_catalog_entry(
@@ -540,36 +351,15 @@ fn agent_catalog_entry(
     }
 }
 
-impl ExactAgentRevisionResolver for RuntimeDefinitionRegistry {
-    fn ensure_exact_approved_revision(
-        &self,
-        definition_id: &AgentDefinitionId,
-        revision: u64,
-    ) -> Result<(), String> {
-        self.resolve_agent(
-            definition_id,
-            RevisionSelector::ExactApprovedRevision { revision },
-        )
-        .map(|_| ())
-        .map_err(|error| error.to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::*;
     use harness_contract::agent::{
         AgentCapability, AgentCapabilityContract, AgentCognitivePolicy, AgentDefinitionManifest,
         AgentEvaluationContract, AgentExecutorPolicy, AgentModelPolicy, AgentOutputContract,
         CognitiveReadScope, CognitiveWriteMode, DefinitionScope, ReleaseAssignment,
         ReleaseAssignmentStatus, ReleaseAuthorization, ReleaseChannel, RevisionLifecycle,
     };
-    use harness_contract::team::{
-        RoleCardinalityPolicy, RolePartitionPolicy, TeamResultContract, TeamRoleDefinition,
-        TeamRoleTaskContract, TeamTemplateManifest, TeamTopologyContract,
-    };
-
-    use super::*;
-    use crate::team_definition::TeamReleaseAssignment;
 
     fn digest(value: &str) -> String {
         use sha2::{Digest, Sha256};
@@ -642,120 +432,6 @@ mod tests {
         definition_id
     }
 
-    fn publish_team(
-        registry: &RuntimeDefinitionRegistry,
-        reviewer: AgentDefinitionId,
-    ) -> TeamTemplateDefinitionId {
-        let instructions = "# Review team\n\nReview and synthesize.\n";
-        let template_id =
-            TeamTemplateDefinitionId::new(DefinitionScope::Workspace, "cowd/review-team")
-                .expect("team id");
-        let stored = registry
-            .teams()
-            .store_revision(
-                TeamTemplateManifest {
-                    api_version: "cowd.team/v1".to_string(),
-                    template_id: template_id.clone(),
-                    revision: 1,
-                    name: "Review team".to_string(),
-                    display: None,
-                    lifecycle: RevisionLifecycle::Published,
-                    topology: TeamTopologyContract {
-                        protocol_ref: "review_fix@1".to_string(),
-                        require_synthesis: true,
-                        require_review: true,
-                    },
-                    role_aliases: std::collections::BTreeMap::new(),
-                    roles: vec![TeamRoleDefinition {
-                        role_id: "reviewer".to_string(),
-                        display_name: None,
-                        responsibility: "Review implementation evidence".to_string(),
-                        agent_definition_id: reviewer,
-                        agent_selector: RevisionSelector::ExactApprovedRevision { revision: 1 },
-                        cardinality: RoleCardinalityPolicy::Fixed { count: 1 },
-                        partition: RolePartitionPolicy::Single,
-                        behavior: vec![
-                            harness_contract::team::RoleBehaviorFacet::TerminalCandidate {
-                                required: true,
-                            },
-                        ],
-                        grant_ceiling: vec![AgentCapability::Read],
-                        task_contract: TeamRoleTaskContract {
-                            contract_ref: "task/review@1".to_string(),
-                            acceptance: vec!["evidence".to_string()],
-                            allowed_tool_contract_refs: Vec::new(),
-                            allowed_skill_refs: Vec::new(),
-                            dataflow: Default::default(),
-                        },
-                    }],
-                    dependencies: vec![],
-                    result_contract: TeamResultContract {
-                        required_fields: vec!["summary".to_string(), "evidence".to_string()],
-                        evidence_required: true,
-                        synthesis_required: true,
-                    },
-                    evaluation: harness_contract::team::TeamEvaluationContract::single_release_gate(
-                        "team/review",
-                        "team_interoperability",
-                    ),
-                    instructions_digest: digest(instructions),
-                },
-                instructions,
-            )
-            .expect("stored team");
-        registry
-            .teams()
-            .record_release_assignment(&TeamReleaseAssignment {
-                scope: DefinitionScope::Workspace,
-                revision_ref: stored.revision.revision_ref.clone(),
-                channel: ReleaseChannel::Stable,
-                status: ReleaseAssignmentStatus::Active,
-                authorization: ReleaseAuthorization::HumanApproval {
-                    approval_ref: "approval/team-v1".to_string(),
-                },
-                content_digest: stored.revision.content_digest,
-            })
-            .expect("team release");
-        template_id
-    }
-
-    fn remove_first_role_behavior(path: &Path) {
-        let mut manifest: serde_yaml::Value =
-            serde_yaml::from_slice(&std::fs::read(path).expect("team manifest"))
-                .expect("valid team yaml");
-        manifest["roles"][0]
-            .as_mapping_mut()
-            .expect("first role mapping")
-            .remove(serde_yaml::Value::String("behavior".to_string()));
-        std::fs::write(
-            path,
-            serde_yaml::to_string(&manifest).expect("legacy team yaml"),
-        )
-        .expect("rewrite test fixture");
-    }
-
-    #[test]
-    fn agent_and_team_revisions_use_separate_subtrees_under_one_registered_root() {
-        let (temporary, registry) = registry();
-        let reviewer = publish_reviewer(&registry);
-        let template = publish_team(&registry, reviewer.clone());
-
-        assert!(temporary
-            .path()
-            .join("workspace/.cowd/definitions/agents/cowd/reviewer/revisions/1/agent.yaml")
-            .is_file());
-        assert!(temporary
-            .path()
-            .join("workspace/.cowd/definitions/teams/cowd/review-team/revisions/1/team.yaml")
-            .is_file());
-        assert!(registry
-            .resolve_agent(&reviewer, RevisionSelector::LatestApprovedStable)
-            .is_ok());
-        assert!(registry
-            .resolve_team(&template, RevisionSelector::LatestApprovedStable)
-            .is_ok());
-    }
-
     #[test]
     fn runnable_catalog_exposes_exact_definition_and_removes_stopped_release() {
         let (_temporary, registry) = registry();
@@ -816,129 +492,9 @@ mod tests {
     }
 
     #[test]
-    fn runnable_team_catalog_includes_custom_template_with_frozen_digests() {
+    fn exact_approved_revisions_are_cached_and_release_changes_invalidate_the_cache() {
         let (_temporary, registry) = registry();
         let reviewer = publish_reviewer(&registry);
-        let template = publish_team(&registry, reviewer);
-        let catalog = registry.runnable_team_catalog().expect("team catalog");
-        let entry = catalog
-            .iter()
-            .find(|entry| entry.revision_ref.template_id == template)
-            .expect("custom published Team template enters the runnable catalog");
-        let stored = registry
-            .teams()
-            .read_revision(&entry.revision_ref)
-            .expect("stored custom Team template");
-        assert_eq!(entry.content_digest, stored.revision.content_digest);
-        assert_eq!(
-            entry.team_markdown_digest.as_deref(),
-            Some(format!("{:x}", Sha256::digest(stored.team_markdown.as_bytes())).as_str()),
-            "the catalog freezes the TEAM.md fragment digest for Binding compilers"
-        );
-        assert_eq!(entry.role_count, 1);
-        assert_eq!(entry.roles[0].role_id, "reviewer");
-    }
-
-    #[test]
-    fn runnable_team_catalog_isolates_legacy_custom_manifest_without_inference() {
-        let (temporary, registry) = registry();
-        let reviewer = publish_reviewer(&registry);
-        let template = publish_team(&registry, reviewer);
-        let manifest_path = temporary
-            .path()
-            .join("workspace/.cowd/definitions/teams/cowd/review-team/revisions/1/team.yaml");
-        remove_first_role_behavior(&manifest_path);
-
-        assert!(
-            registry
-                .resolve_team(&template, RevisionSelector::LatestApprovedStable)
-                .is_err(),
-            "explicit resolution must keep legacy behavior-less manifests fail-closed"
-        );
-        let catalog = registry
-            .runnable_team_catalog()
-            .expect("one invalid custom manifest must not poison valid catalog entries");
-        assert!(catalog
-            .iter()
-            .all(|entry| entry.revision_ref.template_id != template));
-        assert!(catalog.iter().any(|entry| {
-            entry.revision_ref.template_id.as_str() == "builtin/cowd/direct-executor"
-        }));
-    }
-
-    #[test]
-    fn runnable_team_catalog_keeps_builtin_manifest_corruption_fatal() {
-        let (temporary, registry) = registry();
-        remove_first_role_behavior(
-            &temporary
-                .path()
-                .join("bundle/definitions/teams/cowd/direct-executor/revisions/3/team.yaml"),
-        );
-
-        assert!(registry.runnable_team_catalog().is_err());
-    }
-
-    #[test]
-    fn fresh_registry_resolves_embedded_agent_and_team_primitives() {
-        let (_temporary, registry) = registry();
-        let execute = AgentDefinitionId::new(DefinitionScope::Builtin, "cowd/execute")
-            .expect("builtin agent id");
-        let team = TeamTemplateDefinitionId::new(DefinitionScope::Builtin, "cowd/execute-review")
-            .expect("builtin team id");
-        assert!(registry
-            .resolve_agent(&execute, RevisionSelector::LatestApprovedStable)
-            .is_ok());
-        assert!(registry
-            .resolve_team(&team, RevisionSelector::LatestApprovedStable)
-            .is_ok());
-        let teams = registry.runnable_team_catalog().expect("team catalog");
-        assert!(
-            teams.len() >= 8,
-            "builtin Team catalog must expose all standard templates"
-        );
-        let execute_review = teams
-            .iter()
-            .find(|entry| entry.revision_ref.template_id == team)
-            .expect("execute-review builtin Team template");
-        assert_eq!(execute_review.revision_ref.revision, 3);
-    }
-
-    #[test]
-    fn team_resolution_fails_after_its_exact_agent_release_is_stopped() {
-        let (_temporary, registry) = registry();
-        let reviewer = publish_reviewer(&registry);
-        let template = publish_team(&registry, reviewer.clone());
-        let stored = registry
-            .agents()
-            .read_revision(
-                &harness_contract::agent::AgentDefinitionRevisionRef::new(reviewer, 1)
-                    .expect("revision ref"),
-            )
-            .expect("stored reviewer");
-        registry
-            .agents()
-            .record_release_assignment(&ReleaseAssignment {
-                scope: DefinitionScope::Workspace,
-                revision_ref: stored.revision.revision_ref,
-                channel: ReleaseChannel::Stable,
-                status: ReleaseAssignmentStatus::Stopped,
-                authorization: ReleaseAuthorization::HumanApproval {
-                    approval_ref: "approval/reviewer-v1".to_string(),
-                },
-                content_digest: stored.revision.content_digest,
-            })
-            .expect("stopped release");
-
-        assert!(registry
-            .resolve_team(&template, RevisionSelector::LatestApprovedStable)
-            .is_err());
-    }
-
-    #[test]
-    fn exact_approved_revisions_are_cached_and_release_changes_invalidate_both_domains() {
-        let (_temporary, registry) = registry();
-        let reviewer = publish_reviewer(&registry);
-        let template = publish_team(&registry, reviewer.clone());
 
         registry
             .resolve_agent(
@@ -946,12 +502,6 @@ mod tests {
                 RevisionSelector::ExactApprovedRevision { revision: 1 },
             )
             .expect("exact Agent revision");
-        registry
-            .resolve_team(
-                &template,
-                RevisionSelector::ExactApprovedRevision { revision: 1 },
-            )
-            .expect("exact Team revision");
         assert_eq!(
             registry
                 .exact_agent_cache
@@ -960,24 +510,10 @@ mod tests {
                 .len(),
             1
         );
-        assert_eq!(
-            registry
-                .exact_team_cache
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .len(),
-            1
-        );
-
         registry.invalidate_definition_caches();
 
         assert!(registry
             .exact_agent_cache
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty());
-        assert!(registry
-            .exact_team_cache
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_empty());

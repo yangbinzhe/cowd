@@ -1,8 +1,8 @@
 //! Backend-neutral Matrix persistence contract.
 //!
 //! Matrix has a broad, typed persistence surface.  Keeping that surface in a
-//! single port prevents Gateway callers from silently choosing SQLite while a
-//! different backend is selected.  Concrete adapters own SQL; this module
+//! single port prevents Gateway callers from silently choosing an unintended
+//! backend. Concrete adapters own SQL; this module
 //! owns only domain operations and error semantics.
 
 use std::collections::BTreeSet;
@@ -25,7 +25,7 @@ use serde_json::Value;
 use storage::{PostgresExecutor, StorageBackendKind, StorageEndpoint};
 use thiserror::Error;
 
-use crate::{MatrixSqliteRepository, MatrixSqliteRepositoryError, PostgresMatrixRepository};
+use crate::PostgresMatrixRepository;
 
 pub type MatrixStoreResult<T> = Result<T, MatrixStoreError>;
 
@@ -94,28 +94,6 @@ pub enum MatrixStoreError {
     },
     #[error("matrix backend failure: {0}")]
     Backend(String),
-}
-
-impl From<MatrixSqliteRepositoryError> for MatrixStoreError {
-    fn from(error: MatrixSqliteRepositoryError) -> Self {
-        match error {
-            MatrixSqliteRepositoryError::NotFound(message) => Self::NotFound(message),
-            MatrixSqliteRepositoryError::Migration(message) => Self::Backend(message),
-            MatrixSqliteRepositoryError::InvalidScenario(message) => Self::InvalidScenario(message),
-            MatrixSqliteRepositoryError::InvalidMetricQuery(message) => Self::Backend(message),
-            MatrixSqliteRepositoryError::ScenarioState(message) => Self::ScenarioState(message),
-            MatrixSqliteRepositoryError::RevisionConflict {
-                resource_ref,
-                expected,
-                actual,
-            } => Self::RevisionConflict {
-                resource_ref,
-                expected,
-                actual,
-            },
-            other => Self::Backend(other.to_string()),
-        }
-    }
 }
 
 // Versioned optimistic-concurrency result shared by all Matrix adapters.
@@ -258,24 +236,9 @@ pub trait MatrixStore: Send + Sync {
     matrix_store_operations!(declare_matrix_store_operations);
 }
 
-macro_rules! delegate_matrix_store_operations {
-    ($($method:ident($($argument:ident: $argument_type:ty),*) -> $output:ty;)*) => {
-        $(
-            fn $method(&self, $($argument: $argument_type),*) -> MatrixStoreResult<$output> {
-                MatrixSqliteRepository::$method(self, $($argument),*).map_err(MatrixStoreError::from)
-            }
-        )*
-    };
-}
-
-impl MatrixStore for MatrixSqliteRepository {
-    matrix_store_operations!(delegate_matrix_store_operations);
-}
-
-/// Endpoint-bound composition seam.  SQLite can be opened from its local
-/// endpoint; PostgreSQL must be provided by the composition root as an
-/// already-resolved bounded executor.  This prevents a domain adapter from
-/// reading secrets or falling back to a local file behind the caller's back.
+/// Endpoint-bound composition seam. PostgreSQL must be provided by the
+/// composition root as an already-resolved bounded executor. This prevents a
+/// domain adapter from reading secrets or selecting another backend.
 #[derive(Debug, Clone)]
 pub struct MatrixStoreHandle {
     endpoint: StorageEndpoint,
@@ -293,20 +256,10 @@ impl MatrixStoreHandle {
     }
 
     pub fn open(&self) -> MatrixStoreResult<Arc<dyn MatrixStore>> {
-        if self.endpoint.backend != StorageBackendKind::Sqlite {
-            return Err(MatrixStoreError::Backend(format!(
-                "Matrix backend `{:?}` requires an injected backend executor",
-                self.endpoint.backend
-            )));
-        }
-        let handle = self.endpoint.as_handle();
-        if let Some(parent) = handle.path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| MatrixStoreError::Backend(error.to_string()))?;
-        }
-        Ok(Arc::new(
-            MatrixSqliteRepository::open_storage_handle(&handle).map_err(MatrixStoreError::from)?,
-        ))
+        Err(MatrixStoreError::Backend(format!(
+            "Matrix backend `{:?}` requires an injected PostgreSQL executor",
+            self.endpoint.backend
+        )))
     }
 
     pub fn open_with_postgres_executor(
@@ -332,17 +285,12 @@ mod tests {
     fn assert_matrix_store<T: MatrixStore>() {}
 
     #[test]
-    fn sqlite_adapter_implements_the_complete_matrix_store_contract() {
-        assert_matrix_store::<MatrixSqliteRepository>();
-    }
-
-    #[test]
     fn postgres_adapter_implements_the_complete_matrix_store_contract() {
         assert_matrix_store::<PostgresMatrixRepository>();
     }
 
     #[test]
-    fn unavailable_selected_backend_fails_closed_without_creating_sqlite() {
+    fn unavailable_selected_backend_fails_closed_without_an_executor() {
         let handle = MatrixStoreHandle::new(StorageEndpoint::postgres(
             StorageDomainId::Matrix,
             StorageScope::Global,

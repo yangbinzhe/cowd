@@ -122,7 +122,7 @@ pub(crate) fn parse_frame_with_provider(
         return Ok(None);
     }
 
-    serde_json::from_str::<StreamEvent>(&payload)
+    crate::types::deserialize_provider_stream_event(&payload)
         .map(Some)
         .map_err(|error| ApiError::json_deserialize(provider, model, &payload, error))
 }
@@ -211,6 +211,8 @@ mod tests {
                         cache_read_input_tokens: 0,
                         output_tokens: 2,
                     },
+                    usage_observed: true,
+                    cache_dimensions_observed: false,
                 }),
                 StreamEvent::MessageStop(crate::types::MessageStopEvent {}),
             ]
@@ -326,6 +328,8 @@ mod tests {
                     stop_sequence: None,
                 },
                 usage: Usage::default(),
+                usage_observed: true,
+                cache_dimensions_observed: false,
             }))
         );
     }

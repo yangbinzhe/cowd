@@ -736,7 +736,7 @@ mod tests {
 
     #[test]
     fn input_redacts_secret_shaped_text_and_enforces_ready_case() {
-        let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let events = Arc::new(RuntimeEventStore::for_test());
         let discovery = Arc::new(EvolutionDiscoveryService::new(Arc::clone(&events)));
         let analyst = EvolutionAnalystService::new(events, Arc::clone(&discovery));
         let mut open_signal = EvolutionSignal::low_novelty_tool_loop(
@@ -801,7 +801,7 @@ mod tests {
 
     #[test]
     fn durable_claim_is_single_flight_and_late_results_are_revision_fenced() {
-        let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let events = Arc::new(RuntimeEventStore::for_test());
         let discovery = Arc::new(EvolutionDiscoveryService::new(Arc::clone(&events)));
         let analyst = EvolutionAnalystService::new(Arc::clone(&events), discovery);
         let packet = packet();

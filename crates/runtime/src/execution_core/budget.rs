@@ -424,7 +424,7 @@ mod tests {
 
     #[test]
     fn four_children_share_one_durable_capacity_ledger() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let parent = parent();
         let ledger = ParentExecutionBudgetLedger::new(store, parent.clone()).unwrap();
         let mut reservations = (0..4)
@@ -456,7 +456,7 @@ mod tests {
 
     #[test]
     fn complex_child_borrows_idle_parent_capacity_without_a_commercial_gate() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let parent = parent();
         let ledger = ParentExecutionBudgetLedger::new(store, parent.clone()).unwrap();
         let child = child(&parent, 0);
@@ -475,7 +475,7 @@ mod tests {
 
     #[test]
     fn capacity_prediction_never_blocks_or_truncates_a_provider_request() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let parent = parent();
         let ledger = ParentExecutionBudgetLedger::new(store, parent.clone()).unwrap();
         let requested_output_tokens = parent.max_tokens.saturating_mul(3);
@@ -495,7 +495,7 @@ mod tests {
 
     #[test]
     fn crash_restart_replays_the_full_unsettled_capacity_reservation() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let parent = parent();
         let ledger = ParentExecutionBudgetLedger::new(Arc::clone(&store), parent.clone()).unwrap();
         let reservation = ledger

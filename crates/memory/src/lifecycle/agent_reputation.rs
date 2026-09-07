@@ -1,14 +1,10 @@
 //! AgentReputation — sub-agent performance tracking and role evolution.
 //!
 //! Tracks per-agent metrics (tasks completed, quality, punctuality, domain
-//! expertise) in a SQLite table and computes a decaying reputation score
+//! expertise) in a process-local derived index and computes a decaying reputation score
 //! that influences future agent selection and role specialisation.
 
 use chrono::{DateTime, Utc};
-use r2d2::Pool;
-use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::params;
-use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -134,10 +130,10 @@ fn update_rolling_rate(old_rate: f64, new_val: f64, n: u64) -> f64 {
 // ReputationManager
 // ---------------------------------------------------------------------------
 
-/// Thread-safe manager for agent reputation metrics backed by a SQLite pool.
-#[derive(Debug, Clone)]
+/// Thread-safe derived reputation index.
+#[derive(Debug)]
 pub struct ReputationManager {
-    pool: Pool<SqliteConnectionManager>,
+    metrics: parking_lot::RwLock<HashMap<String, AgentMetrics>>,
     decay_config: DecayConfig,
 }
 
@@ -155,88 +151,28 @@ impl ReputationManager {
         GLOBAL_REP_MGR.get().cloned()
     }
 
-    /// Create a new manager using the provided r2d2 pool.
-    pub fn new(pool: Pool<SqliteConnectionManager>, decay_config: DecayConfig) -> Self {
-        Self { pool, decay_config }
+    /// Create an isolated derived reputation index.
+    pub fn new(decay_config: DecayConfig) -> Self {
+        Self {
+            metrics: parking_lot::RwLock::new(HashMap::new()),
+            decay_config,
+        }
     }
 
     /// Create with default decay config.
-    pub fn with_default_config(pool: Pool<SqliteConnectionManager>) -> Self {
-        Self::new(pool, DecayConfig::default())
+    pub fn with_default_config() -> Self {
+        Self::new(DecayConfig::default())
     }
 
-    /// Get a connection from the pool.
-    fn conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>, MemoryError> {
-        use rusqlite::Error as RusqliteError;
-        let conn = self
-            .pool
-            .get()
-            .map_err(|e| MemoryError::Store(e.to_string()))?;
-        // Handle PRAGMAs that may return results in rusqlite 0.31+
-        let _ = conn
-            .execute("PRAGMA journal_mode=WAL", [])
-            .or_else(|e| match e {
-                RusqliteError::ExecuteReturnedResults => Ok(0),
-                other => Err(other),
-            })
-            .map_err(|e| MemoryError::Store(e.to_string()))?;
-        let _ = conn
-            .execute("PRAGMA foreign_keys=ON", [])
-            .or_else(|e| match e {
-                RusqliteError::ExecuteReturnedResults => Ok(0),
-                other => Err(other),
-            })
-            .map_err(|e| MemoryError::Store(e.to_string()))?;
-        let _ = conn
-            .execute("PRAGMA busy_timeout=5000", [])
-            .or_else(|e| match e {
-                RusqliteError::ExecuteReturnedResults => Ok(0),
-                other => Err(other),
-            })
-            .map_err(|e| MemoryError::Store(e.to_string()))?;
-        Ok(conn)
-    }
-
-    // -----------------------------------------------------------------------
-    // CRUD
-    // -----------------------------------------------------------------------
-
-    /// Upsert agent metrics: creates a new record if the agent doesn't exist,
-    /// otherwise updates the existing one.
+    /// Upsert agent metrics.
     pub fn upsert(&self, metrics: &AgentMetrics) -> Result<(), MemoryError> {
-        let conn = self.conn()?;
-        let expertise_json = serde_json::to_string(&metrics.domain_expertise)
-            .map_err(|e| MemoryError::Store(e.to_string()))?;
-        conn.execute(
-            r"INSERT INTO agent_metrics
-               (agent_id, tasks_completed, avg_quality_score, on_time_rate,
-                domain_expertise, reputation_score, updated_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-               ON CONFLICT(agent_id) DO UPDATE SET
-                 tasks_completed   = excluded.tasks_completed,
-                 avg_quality_score = excluded.avg_quality_score,
-                 on_time_rate      = excluded.on_time_rate,
-                 domain_expertise  = excluded.domain_expertise,
-                 reputation_score  = excluded.reputation_score,
-                 updated_at        = excluded.updated_at",
-            params![
-                metrics.agent_id,
-                metrics.tasks_completed as i64,
-                metrics.avg_quality_score,
-                metrics.on_time_rate,
-                expertise_json,
-                metrics.reputation_score,
-                metrics.updated_at.to_rfc3339(),
-            ],
-        )
-        .map_err(|e| MemoryError::Store(e.to_string()))?;
+        self.metrics
+            .write()
+            .insert(metrics.agent_id.clone(), metrics.clone());
         Ok(())
     }
 
     /// Record the completion of a single task by an agent.
-    ///
-    /// Updates rolling averages, applies decay to the old reputation score,
-    /// and bumps domain expertise for the given set of domains.
     pub fn record_completion(
         &self,
         agent_id: &str,
@@ -244,47 +180,15 @@ impl ReputationManager {
         completed_on_time: bool,
         domains: &[String],
     ) -> Result<AgentMetrics, MemoryError> {
-        let conn = self.conn()?;
         let now = Utc::now();
-
-        // Fetch existing record directly using this connection (avoid nested pool get).
-        let mut current = {
-            let mut stmt = conn
-                .prepare(
-                    r"SELECT agent_id, tasks_completed, avg_quality_score, on_time_rate,
-                              domain_expertise, reputation_score, updated_at
-                       FROM agent_metrics WHERE agent_id = ?1",
-                )
-                .map_err(|e| MemoryError::Store(e.to_string()))?;
-            stmt.query_row(params![agent_id], |row| {
-                let expertise_str: String = row.get(4)?;
-                let expertise: HashMap<String, f64> =
-                    serde_json::from_str(&expertise_str).unwrap_or_default();
-                let updated_str: String = row.get(6)?;
-                let updated = DateTime::parse_from_rfc3339(&updated_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
-                Ok(AgentMetrics {
-                    agent_id: row.get(0)?,
-                    tasks_completed: row.get::<_, i64>(1)? as u64,
-                    avg_quality_score: row.get(2)?,
-                    on_time_rate: row.get(3)?,
-                    domain_expertise: expertise,
-                    reputation_score: row.get(5)?,
-                    updated_at: updated,
-                })
-            })
-            .optional()
-            .map_err(|e| MemoryError::Store(e.to_string()))?
-            .unwrap_or_else(|| AgentMetrics::new(agent_id))
-        };
-
-        // Compute idle time and apply decay to the old composite score.
+        let mut metrics = self.metrics.write();
+        let mut current = metrics
+            .get(agent_id)
+            .cloned()
+            .unwrap_or_else(|| AgentMetrics::new(agent_id));
         let idle_days =
             (now - current.updated_at).num_milliseconds() as f64 / (1000.0 * 60.0 * 60.0 * 24.0);
         let decayed_old = apply_decay(current.reputation_score, idle_days, &self.decay_config);
-
-        // Update rolling metrics.
         let n = current.tasks_completed;
         current.avg_quality_score = update_rolling_avg(current.avg_quality_score, quality_score, n);
         current.on_time_rate = update_rolling_rate(
@@ -293,162 +197,56 @@ impl ReputationManager {
             n,
         );
         current.tasks_completed = n + 1;
-
-        // Domain expertise: bump each domain by a small increment, bounded.
         for domain in domains {
-            let entry = current
+            let expertise = current
                 .domain_expertise
                 .entry(domain.clone())
                 .or_insert(0.0);
-            *entry = (*entry + 0.05).min(1.0);
+            *expertise = (*expertise + 0.05).min(1.0);
         }
-
-        // Recompute composite score, weighted blend of decayed old and fresh.
-        current.reputation_score = compute_reputation(
+        let fresh = compute_reputation(
             current.tasks_completed,
             current.avg_quality_score,
             current.on_time_rate,
             &self.decay_config,
         );
-        // Blend with decayed historical score for stability.
-        current.reputation_score = decayed_old * 0.3 + current.reputation_score * 0.7;
-
+        current.reputation_score = decayed_old * 0.3 + fresh * 0.7;
         current.updated_at = now;
-
-        // Persist.
-        let expertise_json = serde_json::to_string(&current.domain_expertise)
-            .map_err(|e| MemoryError::Store(e.to_string()))?;
-        conn.execute(
-            r"INSERT INTO agent_metrics
-               (agent_id, tasks_completed, avg_quality_score, on_time_rate,
-                domain_expertise, reputation_score, updated_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-               ON CONFLICT(agent_id) DO UPDATE SET
-                 tasks_completed   = excluded.tasks_completed,
-                 avg_quality_score = excluded.avg_quality_score,
-                 on_time_rate      = excluded.on_time_rate,
-                 domain_expertise  = excluded.domain_expertise,
-                 reputation_score  = excluded.reputation_score,
-                 updated_at        = excluded.updated_at",
-            params![
-                current.agent_id,
-                current.tasks_completed as i64,
-                current.avg_quality_score,
-                current.on_time_rate,
-                expertise_json,
-                current.reputation_score,
-                current.updated_at.to_rfc3339(),
-            ],
-        )
-        .map_err(|e| MemoryError::Store(e.to_string()))?;
-
+        metrics.insert(agent_id.to_string(), current.clone());
         Ok(current)
     }
 
     /// Fetch the metrics for a single agent by id.
     pub fn get(&self, agent_id: &str) -> Result<Option<AgentMetrics>, MemoryError> {
-        let conn = self.conn()?;
-        let mut stmt = conn
-            .prepare(
-                r"SELECT agent_id, tasks_completed, avg_quality_score, on_time_rate,
-                          domain_expertise, reputation_score, updated_at
-                   FROM agent_metrics WHERE agent_id = ?1",
-            )
-            .map_err(|e| MemoryError::Store(e.to_string()))?;
-
-        let result = stmt
-            .query_row(params![agent_id], |row| {
-                let expertise_str: String = row.get(4)?;
-                let expertise: HashMap<String, f64> =
-                    serde_json::from_str(&expertise_str).unwrap_or_default();
-                let updated_str: String = row.get(6)?;
-                let updated = DateTime::parse_from_rfc3339(&updated_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
-                Ok(AgentMetrics {
-                    agent_id: row.get(0)?,
-                    tasks_completed: row.get::<_, i64>(1)? as u64,
-                    avg_quality_score: row.get(2)?,
-                    on_time_rate: row.get(3)?,
-                    domain_expertise: expertise,
-                    reputation_score: row.get(5)?,
-                    updated_at: updated,
-                })
-            })
-            .optional()
-            .map_err(|e| MemoryError::Store(e.to_string()))?;
-
-        Ok(result)
+        Ok(self.metrics.read().get(agent_id).cloned())
     }
 
     /// List the top-N agents by reputation score, optionally filtered by domain.
-    ///
-    /// When `domain` is provided, agents are ranked by their expertise in that
-    /// domain multiplied by their composite reputation score.
     pub fn list_top_agents(
         &self,
         domain: Option<&str>,
         limit: usize,
     ) -> Result<Vec<AgentMetrics>, MemoryError> {
-        let conn = self.conn()?;
-        let mut stmt = conn
-            .prepare(
-                r"SELECT agent_id, tasks_completed, avg_quality_score, on_time_rate,
-                          domain_expertise, reputation_score, updated_at
-                   FROM agent_metrics
-                   ORDER BY reputation_score DESC
-                   LIMIT ?1",
-            )
-            .map_err(|e| MemoryError::Store(e.to_string()))?;
-
-        let rows = stmt
-            .query_map(params![limit as i64], |row| {
-                let expertise_str: String = row.get(4)?;
-                let expertise: HashMap<String, f64> =
-                    serde_json::from_str(&expertise_str).unwrap_or_default();
-                let updated_str: String = row.get(6)?;
-                let updated = DateTime::parse_from_rfc3339(&updated_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
-                Ok(AgentMetrics {
-                    agent_id: row.get(0)?,
-                    tasks_completed: row.get::<_, i64>(1)? as u64,
-                    avg_quality_score: row.get(2)?,
-                    on_time_rate: row.get(3)?,
-                    domain_expertise: expertise,
-                    reputation_score: row.get(5)?,
-                    updated_at: updated,
-                })
-            })
-            .map_err(|e| MemoryError::Store(e.to_string()))?;
-
-        let mut agents: Vec<AgentMetrics> = rows.filter_map(|r| r.ok()).collect();
-
-        // If a domain filter is requested, re-rank by domain_expertise * reputation.
-        if let Some(d) = domain {
-            agents.sort_by(|a, b| {
-                let score_a =
-                    a.domain_expertise.get(d).copied().unwrap_or(0.0) * a.reputation_score;
-                let score_b =
-                    b.domain_expertise.get(d).copied().unwrap_or(0.0) * b.reputation_score;
-                score_b
-                    .partial_cmp(&score_a)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            agents.truncate(limit);
-        }
-
+        let mut agents: Vec<_> = self.metrics.read().values().cloned().collect();
+        agents.sort_by(|a, b| {
+            let score = |metrics: &AgentMetrics| match domain {
+                Some(domain) => {
+                    metrics.domain_expertise.get(domain).copied().unwrap_or(0.0)
+                        * metrics.reputation_score
+                }
+                None => metrics.reputation_score,
+            };
+            score(b)
+                .partial_cmp(&score(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        agents.truncate(limit);
         Ok(agents)
     }
 
-    /// Delete the metrics record for an agent (e.g. on agent decommission).
+    /// Delete the metrics record for an agent.
     pub fn delete(&self, agent_id: &str) -> Result<(), MemoryError> {
-        let conn = self.conn()?;
-        conn.execute(
-            "DELETE FROM agent_metrics WHERE agent_id = ?1",
-            params![agent_id],
-        )
-        .map_err(|e| MemoryError::Store(e.to_string()))?;
+        self.metrics.write().remove(agent_id);
         Ok(())
     }
 }
@@ -460,17 +258,10 @@ impl ReputationManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::sqlite::SqliteStore;
-
-    fn test_pool() -> Pool<SqliteConnectionManager> {
-        let store = SqliteStore::open_in_memory().expect("store");
-        store.pool()
-    }
 
     #[test]
     fn record_completion_updates_metrics() {
-        let pool = test_pool();
-        let mgr = ReputationManager::with_default_config(pool);
+        let mgr = ReputationManager::with_default_config();
         let agent = "test-agent-1";
 
         let metrics = mgr
@@ -496,8 +287,7 @@ mod tests {
 
     #[test]
     fn list_top_agents_respects_limit() {
-        let pool = test_pool();
-        let mgr = ReputationManager::with_default_config(pool);
+        let mgr = ReputationManager::with_default_config();
 
         mgr.record_completion("a1", 0.95, true, &["rust".into()])
             .expect("a1");
@@ -514,8 +304,7 @@ mod tests {
 
     #[test]
     fn domain_filter_reranks() {
-        let pool = test_pool();
-        let mgr = ReputationManager::with_default_config(pool);
+        let mgr = ReputationManager::with_default_config();
 
         mgr.record_completion("a1", 0.9, true, &["rust".into()])
             .expect("a1");
@@ -561,8 +350,7 @@ mod tests {
 
     #[test]
     fn upsert_and_get_roundtrip() {
-        let pool = test_pool();
-        let mgr = ReputationManager::with_default_config(pool);
+        let mgr = ReputationManager::with_default_config();
         let metrics = AgentMetrics {
             agent_id: "rt-agent".into(),
             tasks_completed: 42,
@@ -588,8 +376,7 @@ mod tests {
 
     #[test]
     fn delete_removes_record() {
-        let pool = test_pool();
-        let mgr = ReputationManager::with_default_config(pool);
+        let mgr = ReputationManager::with_default_config();
         mgr.record_completion("del-me", 0.5, true, &[])
             .expect("record");
         assert!(mgr.get("del-me").expect("get").is_some());

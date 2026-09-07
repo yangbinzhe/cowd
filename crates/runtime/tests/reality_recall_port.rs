@@ -6,23 +6,67 @@ use harness_contract::agent::{
     AgentCapability, AgentDefinitionId, DefinitionScope, RevisionSelector,
 };
 use matrix_core::{MatrixFact, MatrixFactInput, MatrixSourceKind, MatrixSourceSnapshotInput};
-use matrix_repository::open_matrix_sqlite_repository_handle;
+use matrix_repository::{MatrixStore, PostgresMatrixRepository};
 use runtime::{AgentBindingRequest, ContextSourceKind, RealityRecallPort, RuntimeServices};
-use storage::{StorageDomainId, StorageRegistry};
+use storage::{PostgresConnectionConfig, PostgresExecutor, StaticSecretRefResolver};
+
+struct MatrixFixture {
+    repository: std::sync::Arc<PostgresMatrixRepository>,
+    executor: PostgresExecutor,
+    schema: String,
+}
+
+impl MatrixFixture {
+    fn isolated() -> Self {
+        let url =
+            std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
+        let resolver = StaticSecretRefResolver::new([("runtime.reality.recall".to_string(), url)]);
+        let executor = PostgresExecutor::connect(
+            PostgresConnectionConfig::new(
+                "runtime-reality-recall-test",
+                "runtime.reality.recall",
+                "runtime-reality-recall-test",
+            ),
+            &resolver,
+        )
+        .expect("PostgreSQL executor");
+        let schema = format!("runtime_recall_{}", uuid::Uuid::new_v4().simple());
+        executor
+            .checkout_critical()
+            .expect("PostgreSQL connection")
+            .batch_execute(&format!("CREATE SCHEMA \"{schema}\""))
+            .expect("isolated schema");
+        let repository = std::sync::Arc::new(
+            PostgresMatrixRepository::new(
+                executor.scoped_namespace(&schema).expect("scoped executor"),
+            )
+            .expect("Matrix repository"),
+        );
+        Self {
+            repository,
+            executor,
+            schema,
+        }
+    }
+}
+
+impl Drop for MatrixFixture {
+    fn drop(&mut self) {
+        if let Ok(mut connection) = self.executor.checkout_critical() {
+            let _ = connection.batch_execute(&format!(
+                "DROP SCHEMA IF EXISTS \"{}\" CASCADE",
+                self.schema
+            ));
+        }
+    }
+}
 
 #[test]
+#[ignore = "requires COWD_TEST_POSTGRES_URL"]
 fn reality_recall_port_injects_only_fact_and_matrix_evidence_granted_by_the_binding() {
     let home = tempfile::tempdir().unwrap();
-    let registry = StorageRegistry::default_for_config_home(home.path());
-
-    let matrix_handle = registry
-        .endpoint(&StorageDomainId::Matrix)
-        .expect("matrix storage endpoint")
-        .as_handle();
-    std::fs::create_dir_all(matrix_handle.path.parent().expect("matrix parent"))
-        .expect("matrix dir");
-    let repository =
-        open_matrix_sqlite_repository_handle(&matrix_handle).expect("matrix repository");
+    let fixture = MatrixFixture::isolated();
+    let repository = std::sync::Arc::clone(&fixture.repository);
     let snapshot = repository
         .create_source_snapshot(MatrixSourceSnapshotInput {
             snapshot_id: Some("recall-port-snapshot".to_string()),
@@ -57,10 +101,7 @@ fn reality_recall_port_injects_only_fact_and_matrix_evidence_granted_by_the_bind
         }))
         .expect("ingest Matrix fact");
 
-    let fact_endpoint = registry
-        .endpoint(&StorageDomainId::Fact)
-        .expect("fact storage endpoint");
-    let fact_ledger = fact_sqlite::SqliteFactLedger::open(fact_endpoint).expect("fact ledger");
+    let fact_ledger = fact_kernel::EphemeralFactLedger::new();
     let mut fact = fact_kernel::FactRecord::new(
         "supply.policy",
         "east region requires an expedited allocation",
@@ -85,7 +126,11 @@ fn reality_recall_port_injects_only_fact_and_matrix_evidence_granted_by_the_bind
         .expect("binding")
         .snapshot;
 
-    let port = RealityRecallPort::for_config_home(home.path());
+    let port = RealityRecallPort::with_fact_and_matrix_store(
+        home.path(),
+        std::sync::Arc::new(fact_ledger),
+        repository,
+    );
     let report = port.recall_for_binding(&binding, "east shortage allocation", 12);
     assert!(report
         .items

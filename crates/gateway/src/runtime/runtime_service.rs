@@ -1,11 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::{Deref, DerefMut};
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use futures::FutureExt;
 
 use crate::active_session::{ActiveSessionDirectory, PreparedActiveSession, SessionRelayLease};
 use crate::event_bus::{RuntimeStreamRange, SessionProjectionEvent, SessionProjectionHub};
@@ -241,9 +243,7 @@ pub(crate) struct ActiveTurnDrainReport {
 }
 
 struct RuntimeTurnOwner {
-    session_id: String,
     entry: Arc<tokio::sync::Mutex<crate::runtime_entry::GatewayRuntimeEntry>>,
-    gateway_tasks: Arc<crate::runtime_host::task_set::GatewayRuntimeTaskSet>,
     runtime:
         Option<runtime::StandardRuntimeHost<crate::gateway_tool_executor::GatewayToolExecutor>>,
 }
@@ -293,15 +293,11 @@ async fn lock_runtime_entry(
 
 impl RuntimeTurnOwner {
     fn new(
-        session_id: String,
         entry: Arc<tokio::sync::Mutex<crate::runtime_entry::GatewayRuntimeEntry>>,
-        gateway_tasks: Arc<crate::runtime_host::task_set::GatewayRuntimeTaskSet>,
         runtime: runtime::StandardRuntimeHost<crate::gateway_tool_executor::GatewayToolExecutor>,
     ) -> Self {
         Self {
-            session_id,
             entry,
-            gateway_tasks,
             runtime: Some(runtime),
         }
     }
@@ -328,29 +324,9 @@ impl RuntimeTurnOwner {
 
 impl Drop for RuntimeTurnOwner {
     fn drop(&mut self) {
-        let Some(runtime) = self.runtime.take() else {
-            return;
-        };
-        let entry = Arc::clone(&self.entry);
-        let session_id = self.session_id.clone();
-        if let Err(error) = self.gateway_tasks.spawn(
-            crate::runtime_host::task_set::GatewayTaskKind::RuntimeRestoration,
-            Some(session_id.clone()),
-            move |_| async move {
-                    let mut entry = lock_runtime_entry(&entry).await;
-                    if entry.turn_is_owned() {
-                        entry.restore_runtime_after_turn(runtime);
-                    } else {
-                        tracing::error!(
-                            "cancelled turn attempted to restore a Runtime host into an occupied session"
-                        );
-                    }
-                },
-        ) {
-            tracing::warn!(
-                %session_id,
-                %error,
-                "cancelled turn restoration was rejected because Gateway lifecycle is closing"
+        if self.runtime.is_some() && !std::thread::panicking() {
+            tracing::error!(
+                "Runtime turn owner dropped before explicit restoration; durable recovery is required"
             );
         }
     }
@@ -1158,41 +1134,23 @@ impl RuntimeService {
             .record_live_execution(session_id, execution_id, turn_id);
     }
 
-    fn complete_live_execution(
+    fn enrich_finalized_session_live(
         &self,
         execution_id: &str,
+        expected_status: ExecutionLiveStatus,
         report: &ContextTurnReport,
         write_attempt_paths: &[String],
         terminal_ref: String,
-    ) {
-        self.runtime_services.complete_live_execution(
+        error: Option<String>,
+    ) -> Result<(), String> {
+        self.runtime_services.enrich_finalized_session_live(
             execution_id,
+            expected_status,
+            terminal_ref,
             report,
             write_attempt_paths,
-            terminal_ref,
-        );
-    }
-
-    fn fail_live_execution(&self, execution_id: &str, error: String) {
-        self.runtime_services
-            .fail_live_execution(execution_id, error);
-    }
-
-    fn block_live_execution(
-        &self,
-        execution_id: &str,
-        report: &ContextTurnReport,
-        write_attempt_paths: &[String],
-        terminal_ref: String,
-        reason: String,
-    ) {
-        self.runtime_services.block_live_execution(
-            execution_id,
-            report,
-            write_attempt_paths,
-            terminal_ref,
-            reason,
-        );
+            error,
+        )
     }
 
     fn install_active_turn_control(
@@ -1247,7 +1205,7 @@ impl RuntimeService {
         ))
     }
 
-    fn cancel_active_turn_control(&self, turn_id: &str, reason: &str) -> Option<String> {
+    fn cancel_active_turn_control(&self, turn_id: &str, _reason: &str) -> Option<String> {
         let control = self
             .active_turns
             .state
@@ -1257,20 +1215,11 @@ impl RuntimeService {
             .get(turn_id)
             .cloned()?;
         if let Some(execution_id) = &control.execution_id {
-            match self
-                .runtime_services
-                .try_cancel_live_execution(execution_id, reason.to_string())
-            {
-                Ok(true) => {
-                    control.cancellation_token.cancel();
-                    return Some(execution_id.clone());
-                }
-                Ok(false) => return None,
-                Err(error) => {
-                    tracing::error!(execution_id, %error, "durable cancellation winner could not be persisted");
-                    return None;
-                }
-            }
+            // Requested intent is already durable when the user-cancel path
+            // reaches this process-local signal. The live terminal is not
+            // exposed until the durable terminal cancellation receipt wins.
+            control.cancellation_token.cancel();
+            return Some(execution_id.clone());
         }
         control.cancellation_token.cancel();
         Some(control.execution_id.unwrap_or_else(|| turn_id.to_string()))
@@ -1509,6 +1458,16 @@ impl RuntimeService {
         matches_target && self.cancel_active_turn_control(turn_id, reason).is_some()
     }
 
+    pub(crate) fn has_active_turn_for_session(&self, session_id: &str) -> bool {
+        self.active_turns
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .controls
+            .values()
+            .any(|control| control.session_id == session_id)
+    }
+
     #[cfg(test)]
     pub(crate) fn spawn_test_active_session_execution(
         &self,
@@ -1529,7 +1488,7 @@ impl RuntimeService {
     /// Atomically close Runtime turn admission and cancel every turn that was
     /// already accepted. The registry lock is the admission fence: no turn can
     /// be inserted between the snapshot and cancellation.
-    pub(crate) fn stop_accepting_and_cancel_active_turns(&self, reason: &str) -> Vec<String> {
+    pub(crate) fn stop_accepting_and_cancel_active_turns(&self, _reason: &str) -> Vec<String> {
         let controls = {
             let mut state = self
                 .active_turns
@@ -1545,14 +1504,32 @@ impl RuntimeService {
         };
         for (_, control) in &controls {
             control.cancellation_token.cancel();
-            if let Some(execution_id) = &control.execution_id {
-                self.runtime_services
-                    .cancel_live_execution(execution_id, reason.to_string());
-            }
         }
         controls
             .into_iter()
             .map(|(turn_id, control)| control.execution_id.unwrap_or(turn_id))
+            .collect()
+    }
+
+    /// Close process-local admission while preserving accepted business work
+    /// for restart recovery. Host shutdown, rolling deployment, and evaluator
+    /// disconnect are lifecycle events, not user cancellation intents.
+    pub(crate) fn stop_accepting_for_recovery(&self) -> Vec<String> {
+        let mut state = self
+            .active_turns
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.accepting = false;
+        state
+            .controls
+            .iter()
+            .map(|(turn_id, control)| {
+                control
+                    .execution_id
+                    .clone()
+                    .unwrap_or_else(|| turn_id.clone())
+            })
             .collect()
     }
 
@@ -1716,8 +1693,52 @@ impl RuntimeService {
                 graph_id.clone(),
                 record.turn_id.clone(),
             );
-            self.runtime_services
-                .complete_recovered_live_execution(&graph_id, terminal_id.clone());
+            let recovered_payload = crate::session_runtime_bridge::load_terminal_payload(
+                self.runtime_services.artifact_store(),
+                &terminal,
+            )
+            .await
+            .map_err(|(_, error)| error)?;
+            let recovered_status = crate::session_runtime_bridge::live_terminal_status(
+                recovered_payload.goal_completion,
+            );
+            let recovered_generation = terminal.session_generation.ok_or_else(|| {
+                format!("materialized terminal `{terminal_id}` has no Session generation")
+            })?;
+            match self.runtime_services.claim_live_terminal_fence(
+                &graph_id,
+                terminal_id.clone(),
+                recovered_status,
+                recovered_generation,
+            ) {
+                Ok(
+                    runtime::execution_live::TerminalFenceClaim::Claimed
+                    | runtime::execution_live::TerminalFenceClaim::SamePending,
+                ) => match self.runtime_services.finalize_live_terminal_fence(
+                    &graph_id,
+                    &terminal_id,
+                    recovered_status,
+                    recovered_generation,
+                ) {
+                    Ok(
+                        runtime::execution_live::TerminalFenceClaim::Claimed
+                        | runtime::execution_live::TerminalFenceClaim::SameTerminal,
+                    ) => {}
+                    Ok(other) => {
+                        return Err(format!(
+                            "materialized Session terminal live reconciliation returned {other:?}"
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                },
+                Ok(runtime::execution_live::TerminalFenceClaim::SameTerminal) => {}
+                Ok(other) => {
+                    return Err(format!(
+                        "materialized Session terminal conflicts with live projection: {other:?}"
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
             self.bind_primary_ingress_projection(record, &graph_id)
                 .await;
             self.settle_primary_ingress_projection(record, &graph_id, &terminal_id)
@@ -1784,27 +1805,36 @@ impl RuntimeService {
             None,
         )
         .await?;
-        self.session_data
-            .append_session_input_journal(
-                &record.session_id,
-                crate::session_runtime_data_port::SessionInputJournalKind::TaskRouted,
-                serde_json::json!({
-                    "request_id": record.request_id,
-                    "turn_id": record.turn_id,
-                    "route_receipt": task_route.receipt,
-                    "bindings": task_route.bindings,
-                }),
-                chrono::Utc::now().timestamp_millis().max(0) as u64,
-                &format!(
-                    "session-input:{}:{}:{}:{}",
-                    crate::session_runtime_data_port::SessionInputJournalKind::TaskRouted.as_str(),
-                    record.session_id,
-                    record.request_id,
-                    record.turn_id
-                ),
-            )
+        let routed_event_id = format!(
+            "session-input:{}:{}:{}:{}",
+            crate::session_runtime_data_port::SessionInputJournalKind::TaskRouted.as_str(),
+            record.session_id,
+            record.request_id,
+            record.turn_id
+        );
+        if self
+            .session_data
+            .stored_session_input_journal(&record.session_id, &routed_event_id)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())?
+            .is_none()
+        {
+            self.session_data
+                .append_session_input_journal(
+                    &record.session_id,
+                    crate::session_runtime_data_port::SessionInputJournalKind::TaskRouted,
+                    serde_json::json!({
+                        "request_id": record.request_id,
+                        "turn_id": record.turn_id,
+                        "route_receipt": task_route.receipt,
+                        "bindings": task_route.bindings,
+                    }),
+                    chrono::Utc::now().timestamp_millis().max(0) as u64,
+                    &routed_event_id,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         let organizer = runtime::MissionOrganizer::new(Arc::clone(&self.runtime_services));
         for binding in &task_route.bindings {
             if let Some(task) = self
@@ -1862,7 +1892,6 @@ impl RuntimeService {
             Ok(options) => options.unwrap_or_default(),
             Err(error) => {
                 let error = format!("invalid persisted ingress runtime options: {error}");
-                self.fail_live_execution(&graph_id, error.clone());
                 return Err(error);
             }
         };
@@ -1915,17 +1944,12 @@ impl RuntimeService {
             .sessions
             .session(&record.session_id)
             .and_then(|session| session.model());
-        let mut owned_runtime = match async {
+        let owned_runtime = match async {
             let mut runtime = lock_runtime_entry(&runtime_entry).await;
             let host = runtime
                 .take_runtime_for_turn()
                 .map_err(|error| error.to_string())?;
-            Ok::<_, String>(RuntimeTurnOwner::new(
-                record.session_id.clone(),
-                Arc::clone(&runtime_entry),
-                Arc::clone(&self.gateway_tasks),
-                host,
-            ))
+            Ok::<_, String>(RuntimeTurnOwner::new(Arc::clone(&runtime_entry), host))
         }
         .await
         {
@@ -1934,50 +1958,106 @@ impl RuntimeService {
                 return Err(format!("{SESSION_RUNTIME_BUSY_ERROR}: {error}"));
             }
         };
-        let prepare_result = async {
-            let runtime = owned_runtime.runtime_mut()?;
-            runtime.set_execution_policy(execution_policy.clone())?;
-            if let Some(model) = active_model.as_deref() {
-                runtime.update_session_model(model).await;
-            }
-            runtime.set_context_profile(ingress_options.profile);
-            for message in ingress_options.pre_messages {
-                runtime
-                    .append_external_message(message.into_conversation_message())
-                    .await
-                    .map_err(|error| error.to_string())?;
-            }
-            runtime.install_turn_control(
-                cancellation_token.clone(),
-                runtime::HookAbortSignal::default(),
-            );
-            Ok::<_, String>(())
-        }
-        .await;
-        if let Err(error) = prepare_result {
-            owned_runtime.restore().await;
-            self.fail_live_execution(&graph_id, error.clone());
-            return Err(error);
-        }
-        self.record_live_execution(&record.session_id, graph_id.clone(), record.turn_id.clone());
-        self.bind_primary_ingress_projection(record, &graph_id)
-            .await;
-        tracing::debug!(
-            %invocation_id,
-            request_id = %record.request_id,
-            graph_id,
-            "starting fresh Runtime ingress turn"
+        // The HTTP/Surface caller is only an observer of the accepted durable
+        // turn.  Once the Runtime host has been removed from the Session entry,
+        // a caller cancellation must not drop that host and strand the Session.
+        // A tracked Session task therefore owns prepare, execution and explicit
+        // restoration.  Dropping the receiver leaves the task running; orderly
+        // Session/process shutdown cancels it through the task-set token.
+        let owner_slot = Arc::new(Mutex::new(Some(owned_runtime)));
+        let task_owner_slot = Arc::clone(&owner_slot);
+        let service = self.clone();
+        let task_record = record.clone();
+        let task_graph_id = graph_id.clone();
+        let task_content = content.to_string();
+        let task_cancellation_token = cancellation_token.clone();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let spawn_result = self.gateway_tasks.spawn(
+            crate::runtime_host::task_set::GatewayTaskKind::SessionRuntimeTurn,
+            Some(record.session_id.clone()),
+            move |shutdown| async move {
+                let mut owned_runtime = task_owner_slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                    .expect("accepted Session Runtime task owns its host");
+                let result = async {
+                    let runtime = owned_runtime.runtime_mut()?;
+                    runtime.set_execution_policy(execution_policy)?;
+                    if let Some(model) = active_model.as_deref() {
+                        runtime.update_session_model(model).await;
+                    }
+                    runtime.set_context_profile(ingress_options.profile);
+                    for message in ingress_options.pre_messages {
+                        runtime
+                            .append_external_message(message.into_conversation_message())
+                            .await
+                            .map_err(|error| error.to_string())?;
+                    }
+                    runtime.install_turn_control(
+                        task_cancellation_token.clone(),
+                        runtime::HookAbortSignal::default(),
+                    );
+                    service.record_live_execution(
+                        &task_record.session_id,
+                        task_graph_id.clone(),
+                        task_record.turn_id.clone(),
+                    );
+                    service
+                        .bind_primary_ingress_projection(&task_record, &task_graph_id)
+                        .await;
+                    tracing::debug!(
+                        %invocation_id,
+                        request_id = %task_record.request_id,
+                        graph_id = %task_graph_id,
+                        "starting fresh Runtime ingress turn"
+                    );
+                    let prompter = runtime::permissions::SharedPrompter::none();
+                    let mut submission = Box::pin(runtime.submit_ingress_turn(
+                        &task_content,
+                        &prompter,
+                        ingress,
+                    ));
+                    tokio::select! {
+                        result = &mut submission => result.map_err(|error| error.to_string()),
+                        () = shutdown.cancelled() => {
+                            task_cancellation_token.cancel();
+                            tokio::time::timeout(Duration::from_secs(4), &mut submission)
+                                .await
+                                .map_err(|_| "Session Runtime turn did not quiesce after shutdown cancellation".to_string())?
+                                .map_err(|error| error.to_string())
+                        }
+                    }
+                };
+                let guarded = AssertUnwindSafe(result).catch_unwind().await;
+                owned_runtime.restore().await;
+                let result = match guarded {
+                    Ok(result) => result,
+                    Err(_) => Err(
+                        "Session Runtime turn panicked after its host was safely restored"
+                            .to_string(),
+                    ),
+                };
+                let _ = result_tx.send(result);
+            },
         );
-        // The complete Runtime turn state machine is intentionally large. Keep
-        // it behind one heap allocation so Gateway worker stacks do not grow
-        // with every execution capability added to Runtime.
-        let summary_result = Box::pin(owned_runtime.runtime_mut()?.submit_ingress_turn(
-            content,
-            &runtime::permissions::SharedPrompter::none(),
-            ingress,
-        ))
-        .await;
-        owned_runtime.restore().await;
+        if let Err(error) = spawn_result {
+            let rejected_owner = {
+                owner_slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+            };
+            if let Some(mut owned_runtime) = rejected_owner {
+                owned_runtime.restore().await;
+            }
+            return Err(format!(
+                "unable to start tracked Session Runtime turn: {error}"
+            ));
+        }
+        let summary_result = result_rx
+            .await
+            .map_err(|_| "tracked Session Runtime turn ended without a result".to_string())?;
         let summary = match summary_result {
             Ok(summary) => summary,
             Err(error) => {
@@ -2081,8 +2161,6 @@ impl RuntimeService {
                         status: runtime::SessionIngressExecutionStatus::Completed,
                     });
                 }
-                self.fail_live_execution(&graph_id, error.clone());
-                self.fail_primary_ingress_projection(record, &error).await;
                 return Err(error);
             }
         };
@@ -2094,14 +2172,10 @@ impl RuntimeService {
             Ok(Some(terminal)) => terminal,
             Ok(None) => {
                 let error = format!("runtime committed no terminal for {}", record.request_id);
-                self.fail_primary_ingress_projection(record, &error).await;
-                self.fail_live_execution(&graph_id, error.clone());
                 return Err(error);
             }
             Err(error) => {
                 let error = error.to_string();
-                self.fail_primary_ingress_projection(record, &error).await;
-                self.fail_live_execution(&graph_id, error.clone());
                 return Err(error);
             }
         };
@@ -2130,63 +2204,41 @@ impl RuntimeService {
                 .and_then(|ledger| ledger.calibrated_input_tokens),
             "materialized fresh Runtime terminal; committing canonical live terminal"
         );
-        // Once the durable terminal is materialized, every canonical live read
-        // must observe a terminal state. Session input projection journaling is
-        // useful evidence but is not allowed to hold completion behind storage
-        // latency or a failed secondary write.
-        match summary.terminal_completion {
-            harness_contract::goal::GoalCompletion::Satisfied => self.complete_live_execution(
-                &graph_id,
-                &summary.context_turn_report,
-                &summary.write_attempt_paths,
-                terminal_id.clone(),
-            ),
+        // `materialized` is visible only after the Session transcript and the
+        // exact live terminal fence have committed. Foreground execution may
+        // enrich that derived projection, but must never transition it or
+        // clear a delivery claim through the Agent-only direct APIs.
+        let (terminal_error, emit_turn_error) = match summary.terminal_completion {
+            harness_contract::goal::GoalCompletion::Satisfied
+            | harness_contract::goal::GoalCompletion::Cancelled => (None, false),
             harness_contract::goal::GoalCompletion::Partial
             | harness_contract::goal::GoalCompletion::Open => {
                 let reason = format!("Runtime turn blocked: {}", summary.final_answer);
-                self.block_live_execution(
-                    &graph_id,
-                    &summary.context_turn_report,
-                    &summary.write_attempt_paths,
-                    terminal_id.clone(),
-                    reason.clone(),
-                );
-                let event = runtime::CowdEvent::ExecutionScoped {
-                    context: runtime::CowdExecutionContext {
-                        execution_id: graph_id.clone(),
-                        session_id: record.session_id.clone(),
-                        turn_id: record.turn_id.clone(),
-                    },
-                    activity_binding: None,
-                    event: Box::new(runtime::CowdEvent::TurnError { error: reason }),
-                };
-                self.projection_hub
-                    .publish(&record.session_id, SessionProjectionEvent::runtime(event))
-                    .await;
+                (Some(reason), true)
             }
             harness_contract::goal::GoalCompletion::WaitingExternalDecision => {
                 let reason = format!(
                     "Runtime turn waiting for external decision: {}",
                     summary.final_answer
                 );
-                self.block_live_execution(
-                    &graph_id,
-                    &summary.context_turn_report,
-                    &summary.write_attempt_paths,
-                    terminal_id.clone(),
-                    reason.clone(),
-                );
+                (Some(reason), false)
             }
             harness_contract::goal::GoalCompletion::Blocked
             | harness_contract::goal::GoalCompletion::Failed => {
                 let reason = format!("Runtime turn failed: {}", summary.final_answer);
-                self.block_live_execution(
-                    &graph_id,
-                    &summary.context_turn_report,
-                    &summary.write_attempt_paths,
-                    terminal_id.clone(),
-                    reason.clone(),
-                );
+                (Some(reason), true)
+            }
+        };
+        self.enrich_finalized_session_live(
+            &graph_id,
+            crate::session_runtime_bridge::live_terminal_status(summary.terminal_completion),
+            &summary.context_turn_report,
+            &summary.write_attempt_paths,
+            terminal_id.clone(),
+            terminal_error.clone(),
+        )?;
+        if emit_turn_error {
+            if let Some(reason) = terminal_error {
                 let event = runtime::CowdEvent::ExecutionScoped {
                     context: runtime::CowdExecutionContext {
                         execution_id: graph_id.clone(),
@@ -2199,10 +2251,6 @@ impl RuntimeService {
                 self.projection_hub
                     .publish(&record.session_id, SessionProjectionEvent::runtime(event))
                     .await;
-            }
-            harness_contract::goal::GoalCompletion::Cancelled => {
-                self.runtime_services
-                    .cancel_live_execution(&graph_id, "Runtime turn cancelled".to_string());
             }
         }
         self.settle_primary_ingress_projection(record, &graph_id, &terminal_id)
@@ -3322,6 +3370,7 @@ impl RuntimeService {
         let gateway_bus = Arc::clone(&self.projection_hub);
         let runtime_services = Arc::clone(&self.runtime_services);
         let mut receiver = bus.subscribe();
+        let telemetry_bus = bus.clone();
         let task_id = self
             .gateway_tasks
             .replace_session_task(
@@ -3372,8 +3421,19 @@ impl RuntimeService {
                                         active_tool_instances.remove(&key);
                                     }
                                 }
-                                runtime_services
-                                    .observe_live_execution_event(&relay_session_id, &event);
+                                // Usage telemetry is synchronously reduced by
+                                // Runtime before emit returns, so terminal seal
+                                // cannot race this presentation relay. All
+                                // remaining live events retain async delivery.
+                                if !telemetry_bus.has_live_telemetry_observer()
+                                    || !matches!(
+                                        event.domain_event(),
+                                        runtime::CowdEvent::RunModelTelemetry { .. }
+                                    )
+                                {
+                                    runtime_services
+                                        .observe_live_execution_event(&relay_session_id, &event);
+                                }
                                 let stream_range =
                                     match (event.execution_context(), event.domain_event()) {
                                         (Some(context), runtime::CowdEvent::TextDelta { text }) => {
@@ -3697,40 +3757,6 @@ impl RuntimeService {
         );
     }
 
-    async fn fail_primary_ingress_projection(
-        &self,
-        outbox: &session::SessionRuntimeOutboxRecord,
-        error: &str,
-    ) {
-        let stream = match self.session_input_stream_for(&outbox.session_id).await {
-            Ok(stream) => stream,
-            Err(_) => return,
-        };
-        let turn_id = TurnId::from_string(outbox.turn_id.clone());
-        match stream.fail_primary_ingress(&outbox.request_id, &turn_id, error) {
-            Ok(Some(record)) => {
-                let receipt = record.to_receipt();
-                self.emit_session_input_events(&outbox.session_id, &stream, Some(receipt.clone()));
-                self.persist_session_input_domain_event(
-                    &outbox.session_id,
-                    SessionInputJournalKind::IngressFailed,
-                    Some(&receipt),
-                    Some(&record),
-                    &stream,
-                    &format!("{}:{}", outbox.request_id, outbox.turn_id),
-                )
-                .await;
-            }
-            Ok(None) => {}
-            Err(mutation_error) => tracing::warn!(
-                session_id = %outbox.session_id,
-                request_id = %outbox.request_id,
-                %mutation_error,
-                "refused to fail an unrelated session input"
-            ),
-        }
-    }
-
     async fn cancel_primary_ingress_projection(
         &self,
         outbox: &session::SessionRuntimeOutboxRecord,
@@ -4052,19 +4078,18 @@ impl RuntimeService {
         self.persist_session_execution_policy_state(&record, &state)
             .await?;
 
-        let mut applied_revision = None;
-        if let Some(control) = self
+        let (control, publish_control) = if let Some(control) = self
             .runtime_services
             .session_execution_policy_control(session_id)
         {
-            applied_revision = Some(control.replace(desired.clone())?);
+            (Some(control), false)
         } else if let Some(runtime_entry) = self.sessions.get(session_id) {
             let runtime_guard = lock_runtime_entry(&runtime_entry).await;
             let control = runtime_guard.execution_policy_control();
-            applied_revision = Some(control.replace(desired.clone())?);
-            self.runtime_services
-                .publish_session_execution_policy(session_id.to_string(), control);
-        }
+            (Some(control), true)
+        } else {
+            (None, false)
+        };
         let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
         receipt.phase = harness_contract::policy::PolicyTransitionPhase::Stable;
         receipt.effective_revision = desired.revision;
@@ -4078,6 +4103,19 @@ impl RuntimeService {
         };
         self.persist_policy_transition_phase(session_id, &stable_state)
             .await?;
+        // Durable state is the recovery authority. Publish the new live
+        // revision only after Stable is committed so observers can never see
+        // an applied revision whose durable policy still names the old one.
+        let applied_revision = if let Some(control) = control {
+            let revision = control.replace(desired.clone())?;
+            if publish_control {
+                self.runtime_services
+                    .publish_session_execution_policy(session_id.to_string(), control);
+            }
+            Some(revision)
+        } else {
+            None
+        };
         self.unfreeze_session_policy_transition(session_id, transition_id);
 
         if let Some(bus) = self
@@ -4974,11 +5012,18 @@ fn upgrade_agentic_program_status(
     status: runtime::AgenticProgramStatus,
 ) -> runtime::UpgradeCarrierStatus {
     match status {
-        runtime::AgenticProgramStatus::Open => runtime::UpgradeCarrierStatus::Running,
-        runtime::AgenticProgramStatus::CompletionRequested => {
+        runtime::AgenticProgramStatus::Open | runtime::AgenticProgramStatus::Draining => {
+            runtime::UpgradeCarrierStatus::Running
+        }
+        runtime::AgenticProgramStatus::Waiting
+        | runtime::AgenticProgramStatus::CompletionRequested => {
             runtime::UpgradeCarrierStatus::Waiting
         }
-        runtime::AgenticProgramStatus::Verified => runtime::UpgradeCarrierStatus::Completed,
+        runtime::AgenticProgramStatus::Verified | runtime::AgenticProgramStatus::Partial => {
+            runtime::UpgradeCarrierStatus::Completed
+        }
         runtime::AgenticProgramStatus::Blocked => runtime::UpgradeCarrierStatus::Blocked,
+        runtime::AgenticProgramStatus::Failed => runtime::UpgradeCarrierStatus::Failed,
+        runtime::AgenticProgramStatus::Cancelled => runtime::UpgradeCarrierStatus::Cancelled,
     }
 }

@@ -963,7 +963,7 @@ mod tests {
 
     #[test]
     fn incremental_replay_and_restart_have_the_same_snapshot_hash() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let service = crate::execution_core::OutcomeService::new(Arc::clone(&store));
         service.record_terminal(&outcome("execution-1")).unwrap();
         service.record_terminal(&outcome("execution-2")).unwrap();
@@ -983,7 +983,7 @@ mod tests {
 
     #[test]
     fn concurrent_projectors_converge_without_losing_outcomes() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let service = crate::execution_core::OutcomeService::new(Arc::clone(&store));
         service.record_terminal(&outcome("execution-1")).unwrap();
         service.record_terminal(&outcome("execution-2")).unwrap();
@@ -1029,7 +1029,7 @@ mod tests {
 
     #[test]
     fn projector_checkpoint_is_mutable_and_does_not_self_trigger() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let service = crate::execution_core::OutcomeService::new(Arc::clone(&store));
         service.record_terminal(&outcome("execution-1")).unwrap();
         let commits = store.subscribe_commits();
@@ -1055,7 +1055,7 @@ mod tests {
 
     #[test]
     fn restart_replays_outcomes_committed_after_the_last_checkpoint() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let service = crate::execution_core::OutcomeService::new(Arc::clone(&store));
         service.record_terminal(&outcome("execution-1")).unwrap();
         let first = OutcomeProjector::new(Arc::clone(&store));
@@ -1087,7 +1087,7 @@ mod tests {
 
     #[test]
     fn malformed_outcome_is_dead_lettered_and_does_not_break_replay_or_restart() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         store
             .append(RuntimeEventInput {
                 stream_id: "outcome:malformed".to_string(),
@@ -1114,7 +1114,7 @@ mod tests {
 
     #[test]
     fn strategy_experience_is_exactly_isolated_by_every_scope_dimension() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let service = crate::execution_core::OutcomeService::new(Arc::clone(&store));
         let baseline = outcome("scope-baseline");
         let baseline_key = StrategyExperienceKey::from_outcome(&baseline).unwrap();
@@ -1174,7 +1174,7 @@ mod tests {
 
     #[test]
     fn only_paired_quality_complete_team_evidence_proves_positive_lift() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let service = crate::execution_core::OutcomeService::new(Arc::clone(&store));
         let mut direct = outcome("paired-direct");
         direct.identity.paired_sample_id = Some("pair-1".to_string());
@@ -1209,7 +1209,7 @@ mod tests {
 
     #[test]
     fn missing_durable_evidence_cannot_prove_team_lift() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let service = crate::execution_core::OutcomeService::new(Arc::clone(&store));
         let mut direct = outcome("incomplete-direct");
         direct.identity.paired_sample_id = Some("pair-incomplete".to_string());

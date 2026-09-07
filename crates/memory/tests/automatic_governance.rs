@@ -21,7 +21,6 @@ use memory::{
 fn test_config(path: &std::path::Path) -> MemoryConfig {
     MemoryConfig {
         store: StoreConfig {
-            sqlite_path: path.to_path_buf(),
             blob_dir: path.parent().unwrap().join("blobs"),
             enable_vector_index: false,
             ..StoreConfig::default()
@@ -104,7 +103,7 @@ impl SemanticGovernanceResolver for CountingResolver {
 async fn exact_duplicates_are_archived_once_and_the_decision_stays_applied() {
     let tmp = tempfile::tempdir().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("governance.db")))
+        CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("governance.db")))
             .await
             .unwrap(),
     );
@@ -188,7 +187,7 @@ async fn exact_duplicates_are_archived_once_and_the_decision_stays_applied() {
 async fn authority_resolves_only_unambiguous_conflicts() {
     let tmp = tempfile::tempdir().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("authority.db")))
+        CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("authority.db")))
             .await
             .unwrap(),
     );
@@ -279,7 +278,7 @@ async fn authority_resolves_only_unambiguous_conflicts() {
 async fn semantic_governance_resolves_only_low_risk_derived_conflicts() {
     let tmp = tempfile::tempdir().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("semantic.db")))
+        CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("semantic.db")))
             .await
             .unwrap(),
     );
@@ -330,9 +329,11 @@ async fn semantic_governance_resolves_only_low_risk_derived_conflicts() {
 async fn semantic_governance_never_receives_authoritative_user_memory() {
     let tmp = tempfile::tempdir().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("semantic-boundary.db")))
-            .await
-            .unwrap(),
+        CognitiveContextManager::new_ephemeral(test_config(
+            &tmp.path().join("semantic-boundary.db"),
+        ))
+        .await
+        .unwrap(),
     );
     let first = entry(
         MemorySource::UserExplicit,
@@ -377,47 +378,10 @@ async fn semantic_governance_never_receives_authoritative_user_memory() {
 }
 
 #[tokio::test]
-async fn fatal_scan_failure_persists_the_current_failed_run_report() {
-    let tmp = tempfile::tempdir().unwrap();
-    let database = tmp.path().join("governance-failure.db");
-    let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&database))
-            .await
-            .unwrap(),
-    );
-    rusqlite::Connection::open(&database)
-        .unwrap()
-        .execute_batch("DROP TABLE memories")
-        .unwrap();
-
-    let error = run_automatic_governance(
-        Arc::clone(&manager),
-        None,
-        &GovernanceConfig::default(),
-        AutomaticGovernanceMode::Manual,
-    )
-    .await
-    .expect_err("a missing canonical memory table must fail the run");
-    let persisted = last_automatic_governance_report(manager.as_ref())
-        .await
-        .unwrap()
-        .expect("the failed run report must survive independently of the scan table");
-
-    let error = error.to_string();
-    assert_eq!(persisted.outcome, "failed");
-    assert_eq!(persisted.fatal_error.as_deref(), Some(error.as_str()));
-    assert!(persisted.completed_at >= persisted.started_at);
-    assert!(persisted
-        .errors
-        .iter()
-        .any(|item| item == &format!("fatal: {error}")));
-}
-
-#[tokio::test]
 async fn obsolete_open_candidates_leave_the_human_review_queue() {
     let tmp = tempfile::tempdir().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("obsolete.db")))
+        CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("obsolete.db")))
             .await
             .unwrap(),
     );
@@ -466,9 +430,11 @@ async fn obsolete_open_candidates_leave_the_human_review_queue() {
 async fn actionable_knowledge_conflicts_are_counted_as_human_review() {
     let tmp = tempfile::tempdir().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("knowledge-conflict.db")))
-            .await
-            .unwrap(),
+        CognitiveContextManager::new_ephemeral(test_config(
+            &tmp.path().join("knowledge-conflict.db"),
+        ))
+        .await
+        .unwrap(),
     );
     let knowledge = KnowledgeFabric::new();
     let receipt = knowledge.ingest_document(
@@ -502,9 +468,11 @@ async fn actionable_knowledge_conflicts_are_counted_as_human_review() {
 async fn paged_full_scan_detects_duplicates_across_storage_page_boundaries() {
     let tmp = tempfile::tempdir().unwrap();
     let manager = Arc::new(
-        CognitiveContextManager::new(test_config(&tmp.path().join("paged-governance.db")))
-            .await
-            .unwrap(),
+        CognitiveContextManager::new_ephemeral(test_config(
+            &tmp.path().join("paged-governance.db"),
+        ))
+        .await
+        .unwrap(),
     );
     let now = Utc::now();
     let mut newest = entry(

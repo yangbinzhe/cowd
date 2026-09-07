@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+: "${COWD_TEST_POSTGRES_URL:?set COWD_TEST_POSTGRES_URL to an isolated disposable PostgreSQL database}"
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 FRONTEND_REPO="${COWD_FRONTEND_REPO:-${ROOT}/../cowd-edge}"
 INSTALL_DIR="${1:-${COWD_INSTALL_DIR:-}}"
@@ -158,12 +160,11 @@ permissions:
   default_mode: "danger-full-access"
 memory:
   enabled: true
-  store:
-    sqlite_path: "$TMP_DIR/memory.db"
-    blob_dir: "$TMP_DIR/blobs"
-    enable_vector_index: false
 storage:
-  backend: sqlite
+  backend: postgres
+  postgres:
+    logicalIdentity: "cowd-full-product-smoke"
+    secretRef: "env:COWD_TEST_POSTGRES_URL"
 gateway:
   enabled: true
   sessionReset: "none"

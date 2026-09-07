@@ -29,6 +29,7 @@ pub(crate) enum GatewayTaskKind {
     MemoryGovernance,
     EventLoopProbe,
     RuntimeRestoration,
+    SessionRuntimeTurn,
     SessionEventRelay,
     PolicyTransition,
 }
@@ -682,6 +683,7 @@ fn task_kind_label(kind: GatewayTaskKind) -> &'static str {
         GatewayTaskKind::MemoryGovernance => "memory_governance",
         GatewayTaskKind::EventLoopProbe => "event_loop_probe",
         GatewayTaskKind::RuntimeRestoration => "runtime_restoration",
+        GatewayTaskKind::SessionRuntimeTurn => "session_runtime_turn",
         GatewayTaskKind::SessionEventRelay => "session_event_relay",
         GatewayTaskKind::PolicyTransition => "policy_transition",
     }

@@ -968,7 +968,7 @@ fn next_gen_evidence_refs(
             vec!["strategy:direct:no_over_orchestration".to_string()]
         }
         NextGenHarnessScenarioKind::ComplexStrategySelection => {
-            vec!["runtime-capability:use_team_template".to_string()]
+            vec!["runtime-capability:agent_action_program".to_string()]
         }
         NextGenHarnessScenarioKind::ToolBatchEfficiency => {
             if input.level == "quick" {

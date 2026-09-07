@@ -605,7 +605,7 @@ mod tests {
 
     #[test]
     fn sealed_reactor_rejects_duplicate_lane_ids() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let lane = || {
             RuntimeProjectionLane::blocking(descriptor("projector:test"), |_| {
                 Ok(RuntimeProjectionPass::default())
@@ -625,7 +625,7 @@ mod tests {
 
     #[tokio::test]
     async fn one_failing_lane_does_not_stop_another_lane() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let successful_passes = Arc::new(AtomicU64::new(0));
         let successful = Arc::clone(&successful_passes);
         let reactor = Arc::new(
@@ -656,7 +656,7 @@ mod tests {
 
     #[tokio::test]
     async fn one_lane_is_never_reentered_while_backlog_remains() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let active = Arc::new(AtomicUsize::new(0));
         let maximum = Arc::new(AtomicUsize::new(0));
         let run_active = Arc::clone(&active);

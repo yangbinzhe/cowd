@@ -32,7 +32,12 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
             };
             &normalized_request
         };
-        if request.evaluation_isolated && request.category != runtime::ToolSafetyCategory::ReadOnly
+        if request.evaluation_isolated
+            && request.category != runtime::ToolSafetyCategory::ReadOnly
+            && !request
+                .authorized_scopes
+                .iter()
+                .any(|scope| scope.starts_with("write:.cowd/evaluation/"))
         {
             return runtime::RuntimeToolExecutionOutcome {
                 tool_use_id: request.tool_use_id.clone(),
@@ -41,7 +46,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                 category: request.category,
                 output: None,
                 error: Some(
-                    "paired evaluation permits only read-only tools; use a dedicated sandboxed evaluation executor for mutations"
+                    "paired evaluation mutation is missing its Runtime-issued isolated output lease"
                         .to_string(),
                 ),
                 evidence_ref,

@@ -13,6 +13,8 @@ if [[ ! -d "$SURFACE_WEBUI_DIR" ]]; then
   exit 2
 fi
 
+: "${COWD_TEST_POSTGRES_URL:?set COWD_TEST_POSTGRES_URL to an isolated disposable PostgreSQL database}"
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT/target}"
 BIN="${COWD_BIN:-$TARGET_ROOT/debug/cowd}"
@@ -137,7 +139,10 @@ permissions:
 memory:
   enabled: false
 storage:
-  backend: sqlite
+  backend: postgres
+  postgres:
+    logicalIdentity: "cowd-webui-live-test"
+    secretRef: "env:COWD_TEST_POSTGRES_URL"
 gateway:
   enabled: true
   webui_dir: "$SURFACE_WEBUI_DIR/dist"

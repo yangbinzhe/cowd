@@ -783,18 +783,6 @@ impl CognitiveContextManager {
             .await
     }
 
-    /// Read held scope migrations for operator review. These records remain
-    /// excluded from normal recall until an explicit classification command is
-    /// implemented by the management layer.
-    pub async fn legacy_scope_migration_reports(
-        &self,
-    ) -> Result<Vec<crate::store::sqlite::LegacyScopeMigrationReport>> {
-        self.orchestrator
-            .store()
-            .legacy_scope_migration_reports()
-            .await
-    }
-
     /// Snapshot the active token budget configuration used by the kernel.
     pub fn budget_config(&self) -> crate::config::BudgetConfig {
         self.config.budget.clone()

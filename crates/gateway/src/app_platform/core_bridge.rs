@@ -1110,10 +1110,24 @@ mod tests {
     };
     use http_body_util::BodyExt;
     use managed_worker_runtime::{GenerationFence, ManagedH2Channel, PeerCredentialPolicy};
-    use matrix_repository::MatrixSqliteRepository;
     use serde_json::Value;
 
     use super::*;
+
+    fn fixture_matrix_store() -> (
+        crate::selected_storage::SelectedStorageTopology,
+        Arc<dyn matrix_repository::MatrixStore>,
+    ) {
+        let config_home = tempfile::tempdir().expect("temporary config home");
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let topology = crate::selected_storage::SelectedStorageTopology::compose_for_test(
+            config_home.path(),
+            workspace.path(),
+        )
+        .expect("isolated PostgreSQL test topology; set COWD_TEST_POSTGRES_URL");
+        let store = Arc::clone(&topology.matrix_store);
+        (topology, store)
+    }
 
     fn fixture_manifest(
         definition: &core_matrix_catalog::CoreMatrixOperationDefinition,
@@ -1531,11 +1545,12 @@ mod tests {
         );
         let root = tempfile::tempdir().expect("tempdir");
         let socket = root.path().join("core.sock");
+        let (_matrix_topology, matrix_store) = fixture_matrix_store();
         let server = CoreBridgeServer::start(
             socket.clone(),
             Arc::clone(&registry),
-            Arc::new(MatrixSqliteRepository::in_memory().expect("matrix")),
-            Arc::new(RuntimeEventStore::open_in_memory().expect("events")),
+            matrix_store,
+            Arc::new(RuntimeEventStore::for_test()),
         )
         .await
         .expect("server");
@@ -1739,11 +1754,12 @@ mod tests {
         );
         let root = tempfile::tempdir().expect("socket root");
         let socket = root.path().join("core-business.sock");
+        let (_matrix_topology, matrix_store) = fixture_matrix_store();
         let server = CoreBridgeServer::start(
             socket.clone(),
             Arc::clone(&registry),
-            Arc::new(MatrixSqliteRepository::in_memory().expect("matrix")),
-            Arc::new(RuntimeEventStore::open_in_memory().expect("events")),
+            matrix_store,
+            Arc::new(RuntimeEventStore::for_test()),
         )
         .await
         .expect("server");
@@ -2077,8 +2093,9 @@ mod tests {
             },
             payload: serde_json::json!({}),
         };
+        let (_matrix_topology, matrix_store) = fixture_matrix_store();
         let failure = dispatch_with_deadline(
-            Arc::new(MatrixSqliteRepository::in_memory().expect("matrix")),
+            matrix_store,
             Arc::new(OnceLock::new()),
             "fixture".to_owned(),
             "fixture.operation".to_owned(),
@@ -2095,7 +2112,7 @@ mod tests {
 
     #[test]
     fn durable_command_fence_replays_receipt_and_rejects_changed_payload() {
-        let store = RuntimeEventStore::open_in_memory().expect("events");
+        let store = RuntimeEventStore::for_test();
         let registration = CoreBridgeRegistration {
             app_id: AppId("fixture".to_owned()),
             generation: GenerationId(

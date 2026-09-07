@@ -69,6 +69,12 @@ impl SynthesizeBackend for ProtocolResultReducer {
             usage.cached_tokens = usage
                 .cached_tokens
                 .saturating_add(result.usage.cached_tokens);
+            usage.cache_creation_input_tokens = usage
+                .cache_creation_input_tokens
+                .saturating_add(result.usage.cache_creation_input_tokens);
+            usage.cache_read_input_tokens = usage
+                .cache_read_input_tokens
+                .saturating_add(result.usage.cache_read_input_tokens);
             usage.tool_calls = usage.tool_calls.saturating_add(result.usage.tool_calls);
             evidence.extend(result.evidence_refs.clone());
             let role = packet

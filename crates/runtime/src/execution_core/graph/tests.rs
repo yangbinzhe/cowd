@@ -694,7 +694,7 @@ fn harness() -> (
     ExecutionGraphStateStore,
     ExecutionCommitService,
 ) {
-    let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("event store"));
+    let event_store = Arc::new(RuntimeEventStore::for_test());
     (
         Arc::new(NodeExecutorRegistry::new()),
         ExecutionGraphStateStore::new(Arc::clone(&event_store)),
@@ -785,7 +785,6 @@ fn agent_intent_payload(graph_id: &str, node_id: &str, deadline_at_ms: u64) -> S
         objective: format!("execute {node_id}"),
         required_acceptance: Default::default(),
         output_acceptance: Vec::new(),
-        requires_managed_collaboration_escalation: false,
         acceptance: Vec::new(),
         constraints: Vec::new(),
         context_refs: Vec::new(),
@@ -806,6 +805,7 @@ fn agent_intent_payload(graph_id: &str, node_id: &str, deadline_at_ms: u64) -> S
         deadline_at_ms,
         managed_invocation: None,
         idempotency_key: format!("idempotency:{graph_id}:{node_id}"),
+        agentic_binding: None,
     })
     .expect("serialize test AgentTask intent")
 }
@@ -969,9 +969,9 @@ async fn continuation_retry_returns_the_existing_root_to_the_execution_runner() 
             source_session_id: "continuation-session".to_string(),
             source_turn_id: "continuation-turn".to_string(),
             source_root_id: "continuation-source-root".to_string(),
-            team_set_ref: "team_graph:continuation-source-team".to_string(),
+            team_set_ref: "agentic_program:continuation-source-program".to_string(),
             delivery_revision: 7,
-            result_refs: vec!["team_graph:continuation-source-team".to_string()],
+            result_refs: vec!["agentic_program:continuation-source-program".to_string()],
             handoff_id: None,
         },
         "continuation-ingress",
@@ -1037,7 +1037,6 @@ async fn two_root_teams_overlap_through_real_supervisor_and_agent_resource_quota
             objective: format!("execute root Team {index}"),
             required_acceptance: Default::default(),
             output_acceptance: Vec::new(),
-            requires_managed_collaboration_escalation: false,
             acceptance: Vec::new(),
             constraints: Vec::new(),
             context_refs: Vec::new(),
@@ -1058,6 +1057,7 @@ async fn two_root_teams_overlap_through_real_supervisor_and_agent_resource_quota
             deadline_at_ms: u64::MAX,
             managed_invocation: None,
             idempotency_key: format!("root-team-idempotency-{index}"),
+            agentic_binding: None,
         })
         .expect("serialize AgentTaskIntent");
         graph.nodes.push(agent);
@@ -1827,8 +1827,7 @@ fn worktree_scope_rejects_absolute_parent_and_symlink_escape() {
 
 #[test]
 fn terminal_replan_is_one_transaction_and_survives_projection_restart() {
-    let database = tempfile::NamedTempFile::new().unwrap();
-    let event_store = Arc::new(RuntimeEventStore::try_open(database.path()).unwrap());
+    let event_store = Arc::new(RuntimeEventStore::for_test());
     let commits = ExecutionCommitService::new(Arc::clone(&event_store));
     let mut graph = test_graph("atomic terminal replan");
     graph.nodes.push(node("model"));
@@ -1874,9 +1873,7 @@ fn terminal_replan_is_one_transaction_and_survives_projection_restart() {
     assert_eq!(receipt.graph.revision, before_revision + 1);
     assert_eq!(receipt.transaction.event_ids.len(), 2);
     drop(commits);
-    drop(event_store);
-    let reopened = Arc::new(RuntimeEventStore::try_open(database.path()).unwrap());
-    let projected = ExecutionGraphStateStore::new(reopened)
+    let projected = ExecutionGraphStateStore::new(event_store)
         .load(&graph.id)
         .unwrap();
     assert_eq!(projected.revision, before_revision + 1);
@@ -1896,7 +1893,7 @@ fn terminal_replan_is_one_transaction_and_survives_projection_restart() {
 
 #[test]
 fn graph_admission_rejects_missing_canonical_business_lineage_without_panicking() {
-    let event_store = Arc::new(RuntimeEventStore::open_in_memory().unwrap());
+    let event_store = Arc::new(RuntimeEventStore::for_test());
     let commits = ExecutionCommitService::new(event_store);
     let error = match commits.register_graph(ExecutionGraph::new("missing lineage")) {
         Ok(_) => panic!("unscoped graph must be rejected"),
@@ -2298,8 +2295,7 @@ async fn recovery_requeues_retryable_running_node_and_preserves_waiting_approval
 
 #[tokio::test]
 async fn restart_rebuilds_running_node_from_persistent_graph_payload() {
-    let database = tempfile::NamedTempFile::new().unwrap();
-    let event_store = Arc::new(RuntimeEventStore::try_open(database.path()).unwrap());
+    let event_store = Arc::new(RuntimeEventStore::for_test());
     let commits = ExecutionCommitService::new(Arc::clone(&event_store));
     let mut graph = test_graph("persistent restart");
     graph.nodes.push(node("durable"));
@@ -2326,11 +2322,8 @@ async fn restart_rebuilds_running_node_from_persistent_graph_payload() {
         .graph;
     let graph_id = graph.id.clone();
     drop(commits);
-    drop(event_store);
-
-    let reopened = Arc::new(RuntimeEventStore::try_open(database.path()).unwrap());
-    let state = ExecutionGraphStateStore::new(Arc::clone(&reopened));
-    let commits = ExecutionCommitService::new(reopened);
+    let state = ExecutionGraphStateStore::new(Arc::clone(&event_store));
+    let commits = ExecutionCommitService::new(event_store);
     let registry = Arc::new(NodeExecutorRegistry::new());
     let executor = Arc::new(TestExecutor::new(Vec::new(), Duration::from_millis(1)));
     registry.register(executor.clone()).unwrap();
@@ -2357,8 +2350,7 @@ async fn restart_rebuilds_running_node_from_persistent_graph_payload() {
 
 #[tokio::test]
 async fn restart_installs_fresh_scoped_resolver_and_executes_from_persistent_payload() {
-    let database = tempfile::NamedTempFile::new().unwrap();
-    let event_store = Arc::new(RuntimeEventStore::try_open(database.path()).unwrap());
+    let event_store = Arc::new(RuntimeEventStore::for_test());
     let commits = ExecutionCommitService::new(Arc::clone(&event_store));
     let mut graph = test_graph("resolver restart");
     let mut durable = node("durable");
@@ -2387,11 +2379,8 @@ async fn restart_installs_fresh_scoped_resolver_and_executes_from_persistent_pay
         .graph;
     let graph_id = graph.id.clone();
     drop(commits);
-    drop(event_store);
-
-    let reopened = Arc::new(RuntimeEventStore::try_open(database.path()).unwrap());
-    let state = ExecutionGraphStateStore::new(Arc::clone(&reopened));
-    let commits = ExecutionCommitService::new(reopened);
+    let state = ExecutionGraphStateStore::new(Arc::clone(&event_store));
+    let commits = ExecutionCommitService::new(event_store);
     let registry = Arc::new(NodeExecutorRegistry::new());
     let executor = Arc::new(super::executors::ScopedNodeExecutor::new("durable_scoped"));
     let calls = Arc::new(AtomicUsize::new(0));
@@ -2421,8 +2410,7 @@ async fn restart_installs_fresh_scoped_resolver_and_executes_from_persistent_pay
 
 #[tokio::test]
 async fn restart_replays_completed_effect_receipt_without_provider_or_tool_reexecution() {
-    let database = tempfile::NamedTempFile::new().unwrap();
-    let event_store = Arc::new(RuntimeEventStore::try_open(database.path()).unwrap());
+    let event_store = Arc::new(RuntimeEventStore::for_test());
     let commits = ExecutionCommitService::new(Arc::clone(&event_store));
     let mut graph = test_graph("effect receipt restart");
     graph.nodes.push(node("durable"));
@@ -2468,11 +2456,8 @@ async fn restart_replays_completed_effect_receipt_without_provider_or_tool_reexe
         .unwrap();
     let graph_id = graph.id.clone();
     drop(commits);
-    drop(event_store);
-
-    let reopened = Arc::new(RuntimeEventStore::try_open(database.path()).unwrap());
-    let state = ExecutionGraphStateStore::new(Arc::clone(&reopened));
-    let commits = ExecutionCommitService::new(reopened);
+    let state = ExecutionGraphStateStore::new(Arc::clone(&event_store));
+    let commits = ExecutionCommitService::new(event_store);
     let registry = Arc::new(NodeExecutorRegistry::new());
     let executor = Arc::new(TestExecutor::new(Vec::new(), Duration::from_millis(1)));
     registry.register(executor.clone()).unwrap();
@@ -2889,7 +2874,7 @@ async fn verify_satisfied_evidence_allows_exactly_one_terminal_synthesis() {
 
 #[test]
 fn graph_enumeration_excludes_legacy_non_graph_execution_scope_streams() {
-    let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("event store"));
+    let event_store = Arc::new(RuntimeEventStore::for_test());
     let commits = ExecutionCommitService::new(Arc::clone(&event_store));
     let mut graph = test_graph("canonical graph");
     graph.nodes.push(node("canonical"));
@@ -2924,7 +2909,7 @@ fn graph_enumeration_excludes_legacy_non_graph_execution_scope_streams() {
 
 #[test]
 fn graph_enumeration_is_cursor_paginated_without_full_stream_scan() {
-    let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("event store"));
+    let event_store = Arc::new(RuntimeEventStore::for_test());
     let commits = ExecutionCommitService::new(Arc::clone(&event_store));
     let mut expected = Vec::new();
     for objective in ["team page one", "team page two", "team page three"] {

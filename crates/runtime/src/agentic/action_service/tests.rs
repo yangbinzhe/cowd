@@ -1,8 +1,8 @@
 use harness_contract::agent_action::{
     AgentAction, AgentActionEnvelope, AgentActorBinding, AgentActorKind, AgentInviteInput,
-    ArtifactCommitInput, MessagePublishInput, ObjectiveCompleteRequestInput, TaskAttemptFailInput,
-    TaskClaimInput, TaskPublishInput, TaskReviewDecision, TaskReviewInput, TaskSubmitInput,
-    TaskSupersedeInput, TeamCreateInput,
+    ArtifactCommitInput, MessagePublishInput, ObjectiveCompleteRequestInput, StateInspectInput,
+    TaskAttemptFailInput, TaskClaimInput, TaskPublishInput, TaskReviewDecision, TaskReviewInput,
+    TaskSubmitInput, TaskSupersedeInput, TeamCreateInput,
 };
 use harness_contract::goal::{
     AcceptanceCriterion, AcceptanceStatus, GoalCompletion, GoalContract,
@@ -76,8 +76,44 @@ fn supervisor(action_id: &str, execution_id: &str, action: AgentAction) -> Agent
 }
 
 #[test]
+fn shared_read_model_tracks_durable_head_across_service_handles() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let read_model = Arc::new(super::super::AgenticReadModel::new(4));
+    let first =
+        AgentActionService::new(Arc::clone(&store)).with_read_model(Arc::clone(&read_model));
+    first
+        .apply(&root(
+            "cache-team-a",
+            AgentAction::TeamCreate(TeamCreateInput {
+                name: "Research".to_string(),
+                mission: "establish cached state".to_string(),
+                objective: None,
+            }),
+        ))
+        .expect("first mutation");
+    let before = first.project("program-1").expect("first projection");
+    assert_eq!(read_model.len(), 1);
+
+    let second = AgentActionService::new(store).with_read_model(Arc::clone(&read_model));
+    second
+        .apply(&root(
+            "cache-team-b",
+            AgentAction::TeamCreate(TeamCreateInput {
+                name: "Review".to_string(),
+                mission: "advance durable head".to_string(),
+                objective: None,
+            }),
+        ))
+        .expect("delta mutation");
+    let after = second.project("program-1").expect("delta projection");
+    assert!(after.revision > before.revision);
+    assert_eq!(after.teams.len(), 2);
+    assert_eq!(read_model.len(), 1);
+}
+
+#[test]
 fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
-    let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("event store"));
+    let store = Arc::new(RuntimeEventStore::for_test());
     let service = AgentActionService::new(Arc::clone(&store));
     let team_a = service
         .apply(&root(
@@ -112,6 +148,11 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
                     role: role.to_string(),
                     mission: "observe committed topic deltas".to_string(),
                     required_capabilities: vec!["read".to_string()],
+                    existing_agent_ref: None,
+                    definition_ref: None,
+                    model_profile_ref: None,
+                    expertise_hints: Vec::new(),
+                    execution_requirements: Vec::new(),
                 }),
             ))
             .expect("invite")
@@ -131,6 +172,8 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
                 summary: Some("public cross-Team finding".to_string()),
                 content_ref: None,
                 refs: vec!["artifact://finding".to_string()],
+                recipients: Vec::new(),
+                intent: None,
             }),
         ))
         .expect("Program broadcast");
@@ -144,6 +187,8 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
                 summary: Some("Team-only implementation note".to_string()),
                 content_ref: None,
                 refs: Vec::new(),
+                recipients: Vec::new(),
+                intent: None,
             }),
         ))
         .expect("Team message");
@@ -195,8 +240,74 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
 }
 
 #[test]
+fn state_inspect_pages_indexes_and_never_falls_back_to_full_program_dump() {
+    let service = AgentActionService::new(Arc::new(RuntimeEventStore::for_test()));
+    for index in 0..33 {
+        let result = service
+            .apply(&root(
+                &format!("inspect-team-{index}"),
+                AgentAction::TeamCreate(TeamCreateInput {
+                    name: format!("Team {index:02}"),
+                    mission: "provide a bounded inspect fixture".to_string(),
+                    objective: None,
+                }),
+            ))
+            .expect("team mutation");
+        assert_eq!(result.status, AgentActionStatus::Applied);
+    }
+    let first = service
+        .apply(&root(
+            "inspect-first-page",
+            AgentAction::StateInspect(StateInspectInput {
+                scope_ref: None,
+                after_revision: None,
+                page_cursor: None,
+                entry_ref: None,
+            }),
+        ))
+        .expect("first page");
+    let first = first.projection.expect("bounded index page");
+    assert_eq!(first["entries"].as_array().map(Vec::len), Some(32));
+    assert_eq!(first["next_page_cursor"], "state:32");
+    assert!(
+        first.get("tasks").is_none(),
+        "index must not expose a full Program"
+    );
+
+    let second = service
+        .apply(&root(
+            "inspect-second-page",
+            AgentAction::StateInspect(StateInspectInput {
+                scope_ref: None,
+                after_revision: None,
+                page_cursor: Some("state:32".to_string()),
+                entry_ref: None,
+            }),
+        ))
+        .expect("second page")
+        .projection
+        .expect("bounded second page");
+    assert_eq!(second["entries"].as_array().map(Vec::len), Some(1));
+    assert!(second["next_page_cursor"].is_null());
+
+    let malformed = service
+        .apply(&root(
+            "inspect-malformed-cursor",
+            AgentAction::StateInspect(StateInspectInput {
+                scope_ref: None,
+                after_revision: None,
+                page_cursor: Some("state:not-a-number".to_string()),
+                entry_ref: None,
+            }),
+        ))
+        .expect("invalid inspect is an observation");
+    assert_eq!(malformed.status, AgentActionStatus::Rejected);
+    assert_eq!(malformed.error.expect("error").code, "invalid_action");
+}
+
+#[test]
 fn complete_vertical_chain_is_durable_and_idempotent() {
-    let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("event store"));
+    let store = Arc::new(RuntimeEventStore::for_test());
     let service = AgentActionService::new(Arc::clone(&store));
     let goals = Arc::new(crate::execution_core::goal::GoalStore::new(store));
     goals
@@ -207,6 +318,8 @@ fn complete_vertical_chain_is_durable_and_idempotent() {
             criteria: vec![AcceptanceCriterion {
                 id: "terminal_synthesis".to_string(),
                 statement: "produce one durable terminal synthesis".to_string(),
+                statement_ref: None,
+                source_refs: Vec::new(),
                 required_evidence: vec!["execution_graph:root-execution-1".to_string()],
                 status: AcceptanceStatus::Open,
                 waiver: None,
@@ -216,13 +329,28 @@ fn complete_vertical_chain_is_durable_and_idempotent() {
             evidence_refs: Vec::new(),
             unresolved: Vec::new(),
             blockers: Vec::new(),
+            scope: harness_contract::goal::GoalScope::UserObjective,
+            user_intent_criterion_id: Some("terminal_synthesis".to_string()),
+            source_intent_ref: Some("session_message:test".to_string()),
+            execution_binding: Some(harness_contract::goal::GoalExecutionBinding {
+                objective_id: "objective-1".to_string(),
+                session_id: "session-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                root_execution_id: "root-execution-1".to_string(),
+                agentic_program_id: "program-1".to_string(),
+            }),
+            spec_revision: 1,
+            spec_digest: "action-service-test".to_string(),
+            review_refs: Vec::new(),
+            waiting: None,
+            participation_requirement: None,
             obligations: Vec::new(),
-            program_ref: Some("root-execution-1".to_string()),
             recovery: None,
             terminal: None,
             completion: GoalCompletion::Open,
             revision: 1,
             user_sequence: 1,
+            reviews: Vec::new(),
         })
         .expect("goal");
 
@@ -257,6 +385,11 @@ fn complete_vertical_chain_is_durable_and_idempotent() {
                 role: "researcher".to_string(),
                 mission: "produce evidence".to_string(),
                 required_capabilities: vec!["read".to_string()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
             }),
         ))
         .expect("agent");
@@ -269,6 +402,11 @@ fn complete_vertical_chain_is_durable_and_idempotent() {
                 role: "reviewer".to_string(),
                 mission: "verify evidence independently".to_string(),
                 required_capabilities: vec!["read".to_string()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
             }),
         ))
         .expect("reviewer");
@@ -283,6 +421,11 @@ fn complete_vertical_chain_is_durable_and_idempotent() {
                 acceptance: "artifact and evidence".to_string(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
+
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
             }),
         ))
         .expect("task");
@@ -362,7 +505,7 @@ fn complete_vertical_chain_is_durable_and_idempotent() {
             &team_id,
             &reviewer_id,
             AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
-                final_artifact_ref: artifact_ref.clone(),
+                result_refs: vec![artifact_ref.clone()],
                 evidence_refs: vec!["artifact://abc".to_string()],
                 unresolved: Vec::new(),
             }),
@@ -377,7 +520,7 @@ fn complete_vertical_chain_is_durable_and_idempotent() {
         .apply(&root(
             "complete",
             AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
-                final_artifact_ref: artifact_ref,
+                result_refs: vec![artifact_ref],
                 evidence_refs: vec!["artifact://abc".to_string()],
                 unresolved: Vec::new(),
             }),
@@ -508,7 +651,7 @@ fn complete_vertical_chain_is_durable_and_idempotent() {
 #[tokio::test]
 async fn production_artifact_authority_closes_submit_review_and_completion_chain() {
     let temporary = tempfile::tempdir().expect("artifact root");
-    let artifacts = Arc::new(crate::ArtifactStore::sqlite_default(temporary.path()));
+    let artifacts = Arc::new(crate::ArtifactStore::for_test_default(temporary.path()));
     let content = artifacts
         .write_bytes(
             harness_contract::context::ArtifactWriteDescriptor {
@@ -521,10 +664,8 @@ async fn production_artifact_authority_closes_submit_review_and_completion_chain
         )
         .await
         .expect("durable content");
-    let service = AgentActionService::new(Arc::new(
-        RuntimeEventStore::try_open_in_memory().expect("event store"),
-    ))
-    .with_artifact_store(artifacts);
+    let service = AgentActionService::new(Arc::new(RuntimeEventStore::for_test()))
+        .with_artifact_store(artifacts);
     let team = service
         .apply(&root(
             "durable-team",
@@ -545,6 +686,11 @@ async fn production_artifact_authority_closes_submit_review_and_completion_chain
                 role: "implementer".to_string(),
                 mission: "produce the report".to_string(),
                 required_capabilities: vec!["read".to_string()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
             }),
         ))
         .expect("worker")
@@ -558,6 +704,11 @@ async fn production_artifact_authority_closes_submit_review_and_completion_chain
                 role: "reviewer".to_string(),
                 mission: "verify the report".to_string(),
                 required_capabilities: vec!["read".to_string()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
             }),
         ))
         .expect("reviewer")
@@ -573,6 +724,11 @@ async fn production_artifact_authority_closes_submit_review_and_completion_chain
                 acceptance: "durable report and independent review".to_string(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
+
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
             }),
         ))
         .expect("task")
@@ -647,7 +803,7 @@ async fn production_artifact_authority_closes_submit_review_and_completion_chain
             .apply(&root(
                 "blocked-objective-complete",
                 AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
-                    final_artifact_ref: artifact.clone(),
+                    result_refs: vec![artifact.clone()],
                     evidence_refs: vec![content.selector.clone()],
                     unresolved: vec!["Objective-level delivery blocker".to_string()],
                 }),
@@ -662,7 +818,7 @@ async fn production_artifact_authority_closes_submit_review_and_completion_chain
             .apply(&root(
                 "durable-complete",
                 AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
-                    final_artifact_ref: artifact,
+                    result_refs: vec![artifact],
                     evidence_refs: vec![content.selector],
                     unresolved: Vec::new(),
                 }),
@@ -676,9 +832,7 @@ async fn production_artifact_authority_closes_submit_review_and_completion_chain
 
 #[test]
 fn completion_cannot_bypass_real_artifact_and_task_review() {
-    let service = AgentActionService::new(Arc::new(
-        RuntimeEventStore::try_open_in_memory().expect("event store"),
-    ));
+    let service = AgentActionService::new(Arc::new(RuntimeEventStore::for_test()));
     service
         .apply(&root(
             "create-team",
@@ -693,7 +847,7 @@ fn completion_cannot_bypass_real_artifact_and_task_review() {
         .apply(&root(
             "complete",
             AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
-                final_artifact_ref: "artifact:missing".to_string(),
+                result_refs: vec!["artifact:missing".to_string()],
                 evidence_refs: Vec::new(),
                 unresolved: Vec::new(),
             }),
@@ -708,9 +862,7 @@ fn completion_cannot_bypass_real_artifact_and_task_review() {
 
 #[test]
 fn task_claim_requires_a_roster_agent_and_expired_lease_is_reclaimable() {
-    let service = AgentActionService::new(Arc::new(
-        RuntimeEventStore::try_open_in_memory().expect("event store"),
-    ));
+    let service = AgentActionService::new(Arc::new(RuntimeEventStore::for_test()));
     let team = service
         .apply(&root(
             "lease-team",
@@ -731,6 +883,11 @@ fn task_claim_requires_a_roster_agent_and_expired_lease_is_reclaimable() {
                 role: "worker".to_string(),
                 mission: "own recoverable work".to_string(),
                 required_capabilities: vec!["read".to_string()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
             }),
         ))
         .expect("agent")
@@ -746,6 +903,11 @@ fn task_claim_requires_a_roster_agent_and_expired_lease_is_reclaimable() {
                 acceptance: "durable result".to_string(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
+
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
             }),
         ))
         .expect("task")
@@ -804,9 +966,7 @@ fn task_claim_requires_a_roster_agent_and_expired_lease_is_reclaimable() {
 
 #[test]
 fn one_physical_agent_execution_cannot_claim_two_active_tasks() {
-    let service = AgentActionService::new(Arc::new(
-        RuntimeEventStore::try_open_in_memory().expect("event store"),
-    ));
+    let service = AgentActionService::new(Arc::new(RuntimeEventStore::for_test()));
     let team = service
         .apply(&root(
             "single-execution-team",
@@ -827,6 +987,11 @@ fn one_physical_agent_execution_cannot_claim_two_active_tasks() {
                 role: "worker".to_string(),
                 mission: "execute exactly one bound task".to_string(),
                 required_capabilities: vec!["read".to_string()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
             }),
         ))
         .expect("agent")
@@ -842,6 +1007,11 @@ fn one_physical_agent_execution_cannot_claim_two_active_tasks() {
                 acceptance: "reviewed artifact".to_string(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
+
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
             }),
         ))
         .expect("task A")
@@ -857,6 +1027,11 @@ fn one_physical_agent_execution_cannot_claim_two_active_tasks() {
                 acceptance: "reviewed artifact".to_string(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
+
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
             }),
         ))
         .expect("task B")
@@ -892,10 +1067,8 @@ fn one_physical_agent_execution_cannot_claim_two_active_tasks() {
 }
 
 #[test]
-fn failed_physical_attempts_stop_auto_retry_without_blocking_program_replan() {
-    let service = AgentActionService::new(Arc::new(
-        RuntimeEventStore::try_open_in_memory().expect("event store"),
-    ));
+fn repeated_identical_physical_failure_blocks_for_explicit_replan() {
+    let service = AgentActionService::new(Arc::new(RuntimeEventStore::for_test()));
     let team = service
         .apply(&root(
             "failure-team",
@@ -916,6 +1089,11 @@ fn failed_physical_attempts_stop_auto_retry_without_blocking_program_replan() {
                 role: "worker".to_string(),
                 mission: "attempt work".to_string(),
                 required_capabilities: vec!["read".to_string()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
             }),
         ))
         .expect("agent")
@@ -931,13 +1109,18 @@ fn failed_physical_attempts_stop_auto_retry_without_blocking_program_replan() {
                 acceptance: "durable completion or blocker".to_string(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
+
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
             }),
         ))
         .expect("task")
         .changed_refs[0]
         .clone();
     let execution_id = format!("execution:{agent}");
-    for attempt in 1..=3 {
+    for attempt in 1..=2 {
         assert_eq!(
             service
                 .apply(&managed(
@@ -962,7 +1145,7 @@ fn failed_physical_attempts_stop_auto_retry_without_blocking_program_replan() {
                         task_ref: task.clone(),
                         execution_id: execution_id.clone(),
                         mode: harness_contract::agent_action::AgentAttemptMode::Execute,
-                        reason: format!("provider failure {attempt}"),
+                        reason: "provider failure: unavailable capability".to_string(),
                         retryable: true,
                     }),
                 ))
@@ -973,46 +1156,19 @@ fn failed_physical_attempts_stop_auto_retry_without_blocking_program_replan() {
     }
     let projection = service.project("program-1").expect("projection");
     let task = projection.tasks.get(&task).expect("task");
-    assert_eq!(task.failed_attempts, 3);
-    assert_eq!(task.status, AgenticTaskStatus::Published);
-    assert_eq!(task.last_failure.as_deref(), Some("provider failure 3"));
+    assert_eq!(task.failed_attempts, 2);
+    assert_eq!(task.status, AgenticTaskStatus::Blocked);
+    assert_eq!(
+        task.last_failure.as_deref(),
+        Some("provider failure: unavailable capability")
+    );
     assert_eq!(projection.status, crate::AgenticProgramStatus::Open);
     assert!(projection.unresolved.is_empty());
-    let replacement_agent = service
-        .apply(&root(
-            "failure-replacement-agent",
-            AgentAction::AgentInvite(AgentInviteInput {
-                team_ref: team.clone(),
-                role: "recovery worker".to_string(),
-                mission: "take over after the bounded automatic retry window".to_string(),
-                required_capabilities: vec!["read".to_string()],
-            }),
-        ))
-        .expect("replacement agent")
-        .changed_refs[0]
-        .clone();
-    assert_eq!(
-        service
-            .apply(&managed(
-                "failure-reassigned-claim",
-                &team,
-                &replacement_agent,
-                AgentAction::TaskClaim(TaskClaimInput {
-                    task_ref: task.task_id.clone(),
-                    reason: Some("reassign after repeated provider failures".to_string()),
-                }),
-            ))
-            .expect("reassigned claim")
-            .status,
-        AgentActionStatus::Applied
-    );
 }
 
 #[test]
-fn failed_review_attempts_stop_auto_retry_and_return_work_to_market() {
-    let service = AgentActionService::new(Arc::new(
-        RuntimeEventStore::try_open_in_memory().expect("event store"),
-    ));
+fn repeated_identical_review_failure_blocks_for_explicit_replan() {
+    let service = AgentActionService::new(Arc::new(RuntimeEventStore::for_test()));
     let team = service
         .apply(&root(
             "review-failure-team",
@@ -1035,6 +1191,11 @@ fn failed_review_attempts_stop_auto_retry_and_return_work_to_market() {
                 acceptance: "bounded independent review".to_string(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
+
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
             }),
         ))
         .expect("task")
@@ -1046,12 +1207,12 @@ fn failed_review_attempts_stop_auto_retry_and_return_work_to_market() {
     let mut projection = service.project("program-1").expect("projection");
     projection.tasks.get_mut(&task).expect("task").status = AgenticTaskStatus::Submitted;
 
-    for attempt in 1..=3 {
+    for attempt in 1..=2 {
         let input = TaskAttemptFailInput {
             task_ref: task.clone(),
             execution_id: format!("review-execution-{attempt}"),
             mode: harness_contract::agent_action::AgentAttemptMode::Review,
-            reason: format!("review provider failure {attempt}"),
+            reason: "review provider failure: unavailable capability".to_string(),
             retryable: true,
         };
         assert_eq!(
@@ -1069,20 +1230,18 @@ fn failed_review_attempts_stop_auto_retry_and_return_work_to_market() {
         crate::agentic::work_market::apply_task_attempt_fail(&mut projection, &input);
     }
     let task = projection.tasks.get(&task).expect("task");
-    assert_eq!(task.review_generation, 3);
-    assert_eq!(task.failed_review_attempts, 3);
-    assert_eq!(task.status, AgenticTaskStatus::Published);
+    assert_eq!(task.review_generation, 2);
+    assert_eq!(task.failed_review_attempts, 2);
+    assert_eq!(task.status, AgenticTaskStatus::Blocked);
     assert_eq!(
         task.last_failure.as_deref(),
-        Some("review provider failure 3")
+        Some("review provider failure: unavailable capability")
     );
 }
 
 #[test]
 fn roster_agent_can_expand_own_team_but_not_mutate_another_team() {
-    let service = AgentActionService::new(Arc::new(
-        RuntimeEventStore::try_open_in_memory().expect("event store"),
-    ));
+    let service = AgentActionService::new(Arc::new(RuntimeEventStore::for_test()));
     let first_team = service
         .apply(&root(
             "delegation-team-a",
@@ -1115,6 +1274,11 @@ fn roster_agent_can_expand_own_team_but_not_mutate_another_team() {
                 role: "lead".to_string(),
                 mission: "organize local work".to_string(),
                 required_capabilities: vec!["read".to_string()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
             }),
         ))
         .expect("agent")
@@ -1130,6 +1294,11 @@ fn roster_agent_can_expand_own_team_but_not_mutate_another_team() {
                 role: "peer".to_string(),
                 mission: "help locally".to_string(),
                 required_capabilities: vec!["read".to_string()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
             }),
         ))
         .expect("local invite");
@@ -1144,6 +1313,11 @@ fn roster_agent_can_expand_own_team_but_not_mutate_another_team() {
                 role: "outsider".to_string(),
                 mission: "mutate other team".to_string(),
                 required_capabilities: vec!["read".to_string()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
             }),
         ))
         .expect("cross-team observation");
@@ -1156,7 +1330,7 @@ fn roster_agent_can_expand_own_team_but_not_mutate_another_team() {
 
 #[test]
 fn concurrent_actions_serialize_without_stale_revision_loss() {
-    let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("event store"));
+    let store = Arc::new(RuntimeEventStore::for_test());
     let service = AgentActionService::new(store);
     let workers = (0..24)
         .map(|index| {
@@ -1187,14 +1361,11 @@ fn concurrent_actions_serialize_without_stale_revision_loss() {
 }
 
 #[test]
-fn program_projection_recovers_exactly_after_process_reopen() {
-    let directory = tempfile::tempdir().expect("temporary event store");
-    let path = directory.path().join("agentic-events.sqlite3");
+fn program_projection_recovers_exactly_after_service_reconstruction() {
+    let store = Arc::new(RuntimeEventStore::for_test());
     let team_id;
     {
-        let service = AgentActionService::new(Arc::new(
-            RuntimeEventStore::try_open(&path).expect("event store"),
-        ));
+        let service = AgentActionService::new(Arc::clone(&store));
         team_id = service
             .apply(&root(
                 "recover-team",
@@ -1215,14 +1386,17 @@ fn program_projection_recovers_exactly_after_process_reopen() {
                     role: "recovery owner".to_string(),
                     mission: "resume durable work".to_string(),
                     required_capabilities: vec!["read".to_string()],
+                    existing_agent_ref: None,
+                    definition_ref: None,
+                    model_profile_ref: None,
+                    expertise_hints: Vec::new(),
+                    execution_requirements: Vec::new(),
                 }),
             ))
             .expect("commit member");
     }
 
-    let reopened = AgentActionService::new(Arc::new(
-        RuntimeEventStore::try_open(&path).expect("reopen event store"),
-    ));
+    let reopened = AgentActionService::new(store);
     let projection = reopened.project("program-1").expect("replay program");
     assert_eq!(projection.teams[&team_id].name, "Recovery Team");
     assert_eq!(projection.teams[&team_id].member_ids.len(), 1);
@@ -1244,7 +1418,7 @@ fn program_projection_recovers_exactly_after_process_reopen() {
 
 #[test]
 fn failed_task_supersede_is_cas_idempotent_recoverable_and_not_fake_completion() {
-    let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("event store"));
+    let store = Arc::new(RuntimeEventStore::for_test());
     let service = AgentActionService::new(Arc::clone(&store));
     let team = service
         .apply(&root(
@@ -1266,6 +1440,11 @@ fn failed_task_supersede_is_cas_idempotent_recoverable_and_not_fake_completion()
                 role: "investigator".to_string(),
                 mission: "run falsifiable work".to_string(),
                 required_capabilities: vec!["read".to_string()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
             }),
         ))
         .expect("worker")
@@ -1281,6 +1460,11 @@ fn failed_task_supersede_is_cas_idempotent_recoverable_and_not_fake_completion()
                 acceptance: "reproducible evidence".to_string(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
+
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
             }),
         ))
         .expect("source task")
@@ -1297,6 +1481,11 @@ fn failed_task_supersede_is_cas_idempotent_recoverable_and_not_fake_completion()
                     acceptance: "independently reviewable artifact".to_string(),
                     required_capabilities: vec!["read".to_string()],
                     depends_on,
+
+                    obligation_refs: Vec::new(),
+                    purpose: Default::default(),
+                    execution_requirements: Vec::new(),
+                    expertise_hints: Vec::new(),
                 }),
             ))
             .expect("successor task")
@@ -1320,16 +1509,16 @@ fn failed_task_supersede_is_cas_idempotent_recoverable_and_not_fake_completion()
         })
     };
 
-    let fresh_bypass = service
+    let invalid_replacement = service
         .apply(&root(
-            "supersede-fresh-bypass",
-            supersede_action(vec![part_a.clone(), part_b.clone()]),
+            "supersede-cycle-rejection",
+            supersede_action(vec![cyclic.clone()]),
         ))
-        .expect("fresh task rejection");
-    assert_eq!(fresh_bypass.status, AgentActionStatus::Rejected);
+        .expect("cyclic replacement rejection");
+    assert_eq!(invalid_replacement.status, AgentActionStatus::Rejected);
     assert_eq!(
-        fresh_bypass.error.expect("error").code,
-        "task_has_no_failed_or_challenged_attempt"
+        invalid_replacement.error.expect("error").code,
+        "replacement_depends_on_superseded_task"
     );
 
     service
@@ -1465,13 +1654,15 @@ fn failed_task_supersede_is_cas_idempotent_recoverable_and_not_fake_completion()
             title: "Premature replacement synthesis".to_string(),
             relates_to: vec![part_a.clone(), part_b.clone()],
             committed_by: "root-1".to_string(),
+            claim_execution_id: None,
+            claim_generation: None,
         },
     );
     assert!(
         super::super::supervision::completion_gap(
             &incomplete_projection,
             &ObjectiveCompleteRequestInput {
-                final_artifact_ref: final_artifact_ref.clone(),
+                result_refs: vec![final_artifact_ref.clone()],
                 evidence_refs: vec!["tool://failure-receipt".to_string()],
                 unresolved: Vec::new(),
             },
@@ -1501,13 +1692,15 @@ fn failed_task_supersede_is_cas_idempotent_recoverable_and_not_fake_completion()
             title: "Replacement synthesis".to_string(),
             relates_to: vec![part_a, part_b, cyclic],
             committed_by: "agent:author".to_string(),
+            claim_execution_id: None,
+            claim_generation: None,
         },
     );
     assert_eq!(
         super::super::supervision::completion_gap(
             &supervisor_projection,
             &ObjectiveCompleteRequestInput {
-                final_artifact_ref,
+                result_refs: vec![final_artifact_ref],
                 evidence_refs: vec!["tool://accepted-evidence".to_string()],
                 unresolved: Vec::new(),
             },

@@ -38,7 +38,7 @@ pub use persistence::{
     SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest,
     SessionSearchResult, SessionSnapshot, SessionStoreBackend, SessionTerminalExecutionFence,
     SessionTerminalTranscriptCommit, SessionTerminalTranscriptReceipt, SessionUsageBucket,
-    SessionUsageSummary, SharedSessionStoreBackend, SqliteSessionStore, StorageExecutionLane,
+    SessionUsageSummary, SharedSessionStoreBackend, StorageExecutionLane,
     StorageExecutionLaneStats, StorageExecutionPlaneConfig, StorageExecutionPlaneStats,
     StorageTier, TieredSessionStore, TieredSessionStoreConfig, UnifiedSessionStore,
     CONTEXT_INDEX_CARD_SCHEMA_VERSION, SESSION_ACTIVATION_MANIFEST_SCHEMA_VERSION,

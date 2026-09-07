@@ -681,8 +681,12 @@ fn agentic_team_status(program: &crate::AgenticProgramProjection, team_id: &str)
 
     match program.status {
         AgenticProgramStatus::Verified => "completed",
-        AgenticProgramStatus::Blocked => "blocked",
+        AgenticProgramStatus::Partial => "partial",
+        AgenticProgramStatus::Blocked | AgenticProgramStatus::Failed => "blocked",
+        AgenticProgramStatus::Cancelled => "cancelled",
         AgenticProgramStatus::CompletionRequested => "verifying",
+        AgenticProgramStatus::Waiting => "waiting",
+        AgenticProgramStatus::Draining => "draining",
         AgenticProgramStatus::Open => {
             let statuses = program
                 .tasks
@@ -735,8 +739,8 @@ fn agent_nodes(
             let task = program
                 .tasks
                 .values()
-                .filter(|task| task.team_id == member.team_id)
                 .find(|task| task.claimant.as_deref() == Some(member.agent_id.as_str()));
+            let active_team_ids = program.active_team_ids_for(&member.agent_id);
             let status = task
                 .map(|task| agentic_task_activity_status(task.status))
                 .unwrap_or("invited");
@@ -752,7 +756,11 @@ fn agent_nodes(
                     execution_id: task
                         .and_then(|task| task.claim_execution_id.clone())
                         .or_else(|| Some(root_execution_id.clone())),
-                    team_id: Some(member.team_id.clone()),
+                    team_id: task.map(|task| task.team_id.clone()).or_else(|| {
+                        active_team_ids
+                            .first()
+                            .map(|team_id| (*team_id).to_string())
+                    }),
                     session_id: Some(program.session_id.clone()),
                     status: Some(status.to_string()),
                     backend: None,
@@ -760,6 +768,7 @@ fn agent_nodes(
                         "program_id": program.program_id,
                         "program_revision": program.revision,
                         "member": member,
+                        "active_team_ids": active_team_ids,
                         "task": task,
                     }),
                     display_label: Some(member.role.clone()),
@@ -822,7 +831,9 @@ fn agentic_task_activity_status(status: crate::AgenticTaskStatus) -> &'static st
         crate::AgenticTaskStatus::Accepted => "completed",
         crate::AgenticTaskStatus::Rework => "rework",
         crate::AgenticTaskStatus::Blocked => "blocked",
+        crate::AgenticTaskStatus::CancelRequested => "cancelling",
         crate::AgenticTaskStatus::Superseded => "superseded",
+        crate::AgenticTaskStatus::Withdrawn => "withdrawn",
     }
 }
 
@@ -1585,6 +1596,7 @@ mod tests {
                     "instance:agent:s1".to_string(),
                 ],
                 task_ids: Vec::new(),
+                lifecycle: Default::default(),
             },
         );
         for (agent_id, role, mission) in [
@@ -1595,11 +1607,35 @@ mod tests {
                 agent_id.to_string(),
                 crate::AgentMemberProjection {
                     agent_id: agent_id.to_string(),
-                    team_id: "team-1".to_string(),
+                    display_name: role.to_string(),
                     role: role.to_string(),
                     mission: mission.to_string(),
                     required_capabilities: Vec::new(),
                     invited_by: "root:session-1".to_string(),
+                    membership_ids: Vec::new(),
+                    definition_ref: None,
+                    model_profile_ref: None,
+                    expertise_hints: Vec::new(),
+                    execution_requirements: Vec::new(),
+                },
+            );
+            let membership_id = crate::AgenticProgramProjection::membership_id(agent_id, "team-1");
+            program
+                .agents
+                .get_mut(agent_id)
+                .expect("agent")
+                .membership_ids
+                .push(membership_id.clone());
+            program.memberships.insert(
+                membership_id.clone(),
+                crate::AgenticMembershipProjection {
+                    membership_id,
+                    agent_id: agent_id.to_string(),
+                    team_id: "team-1".to_string(),
+                    lifecycle: crate::AgenticMembershipLifecycle::Active,
+                    delegation_ref: None,
+                    reason_ref: None,
+                    created_by: "root:session-1".to_string(),
                 },
             );
         }

@@ -73,6 +73,21 @@ struct LiveExecutionRecord {
     own_model_usage: Option<crate::RunModelTelemetry>,
     #[serde(default)]
     descendant_model_usage: BTreeMap<String, crate::RunModelTelemetry>,
+    /// Monotonic request-local execution bus generation that most recently
+    /// contributed model usage. Generation zero is the legacy/asynchronous
+    /// surface relay and cannot overwrite a newer synchronous owner.
+    #[serde(default)]
+    model_usage_generation: u64,
+    /// Sealed with every terminal winner. Once present, delayed child or
+    /// relay telemetry cannot mutate the billed terminal truth.
+    #[serde(default)]
+    model_usage_fence_generation: Option<u64>,
+    /// Reversible arbitration slot shared by Session terminal delivery and
+    /// cancellation. Preparing a claim freezes competing terminal writers but
+    /// deliberately leaves the public live status non-terminal until the
+    /// corresponding durable business carrier commits.
+    #[serde(default)]
+    pending_terminal_claim: Option<PendingLiveTerminalClaim>,
     /// 30-minute warning buckets already surfaced for this execution. While a
     /// healthy execution keeps progressing it is never cut by a wall-clock
     /// deadline; instead the user is warned every 30 minutes and may choose to
@@ -87,6 +102,8 @@ struct DurableLiveCheckpoint {
     source_cursor: u64,
     row_revision: u64,
     live_revision: u64,
+    model_usage_generation: u64,
+    model_usage_fence_generation: Option<u64>,
     updated_at_ms: u64,
 }
 
@@ -125,26 +142,70 @@ impl LiveExecutionRecord {
             reality_item_ids: BTreeSet::new(),
             own_model_usage: None,
             descendant_model_usage: BTreeMap::new(),
+            model_usage_generation: 0,
+            model_usage_fence_generation: None,
+            pending_terminal_claim: None,
             warning_buckets: 0,
         }
+    }
+
+    fn admit_model_usage(&mut self, generation: u64) -> bool {
+        if self.model_usage_fence_generation.is_some() || self.live.status.is_terminal() {
+            tracing::debug!(
+                execution_id = %self.execution_id,
+                generation,
+                fence_generation = ?self.model_usage_fence_generation,
+                "ignored model telemetry after terminal usage fence"
+            );
+            return false;
+        }
+        if generation < self.model_usage_generation {
+            tracing::debug!(
+                execution_id = %self.execution_id,
+                generation,
+                current_generation = self.model_usage_generation,
+                "ignored stale model telemetry generation"
+            );
+            return false;
+        }
+        self.model_usage_generation = generation;
+        true
+    }
+
+    fn seal_model_usage(&mut self) {
+        self.model_usage_fence_generation = Some(self.model_usage_generation);
     }
 
     fn refresh_model_usage_metrics(&mut self) {
         let mut input_tokens = 0_u64;
         let mut output_tokens = 0_u64;
-        let mut total_tokens = 0_u64;
+        let mut cache_creation_input_tokens = 0_u64;
+        let mut cache_read_input_tokens = 0_u64;
+        let mut usage_count = 0_u64;
+        let mut cache_dimensions_known = true;
         for telemetry in self
             .own_model_usage
             .iter()
             .chain(self.descendant_model_usage.values())
         {
+            usage_count = usage_count.saturating_add(1);
+            cache_dimensions_known &= telemetry.cache_dimensions_known;
             input_tokens = input_tokens.saturating_add(telemetry.input_tokens);
             output_tokens = output_tokens.saturating_add(telemetry.output_tokens);
-            total_tokens = total_tokens.saturating_add(telemetry.total_tokens);
+            cache_creation_input_tokens =
+                cache_creation_input_tokens.saturating_add(telemetry.cache_create_tokens);
+            cache_read_input_tokens =
+                cache_read_input_tokens.saturating_add(telemetry.cache_read_tokens);
         }
         self.live.metrics.input_tokens = input_tokens;
         self.live.metrics.output_tokens = output_tokens;
-        self.live.metrics.total_tokens = total_tokens;
+        self.live.metrics.cache_creation_input_tokens = cache_creation_input_tokens;
+        self.live.metrics.cache_read_input_tokens = cache_read_input_tokens;
+        self.live.metrics.cache_dimensions_known = usage_count > 0 && cache_dimensions_known;
+        self.live.metrics.total_tokens = input_tokens
+            .saturating_add(output_tokens)
+            .saturating_add(cache_creation_input_tokens)
+            .saturating_add(cache_read_input_tokens);
         self.refresh_latency();
     }
 
@@ -355,6 +416,14 @@ impl LiveExecutionRecord {
         write_attempt_paths: &[String],
         terminal_ref: String,
     ) -> bool {
+        if self.live.status == ExecutionLiveStatus::Complete
+            && self.live.terminal_ref.as_deref() == Some(terminal_ref.as_str())
+        {
+            self.apply_terminal_projection(report, write_attempt_paths, terminal_ref);
+            self.touch();
+            self.seal_model_usage();
+            return true;
+        }
         if !self.transition(
             ExecutionLiveStatus::Complete,
             Some("terminal committed".to_string()),
@@ -363,26 +432,20 @@ impl LiveExecutionRecord {
         }
         self.apply_terminal_projection(report, write_attempt_paths, terminal_ref);
         self.live.error = None;
-        true
-    }
-
-    fn complete_recovered(&mut self, terminal_ref: String) -> bool {
-        if !self.transition(
-            ExecutionLiveStatus::Complete,
-            Some("durable terminal recovered".to_string()),
-        ) {
-            return false;
-        }
-        self.live.terminal_ref = Some(terminal_ref);
-        self.live.error = None;
+        self.pending_terminal_claim = None;
+        self.seal_model_usage();
         true
     }
 
     fn fail(&mut self, error: String) -> bool {
+        if self.pending_terminal_claim.is_some() {
+            return false;
+        }
         if !self.transition(ExecutionLiveStatus::Error, Some(error.clone())) {
             return false;
         }
         self.live.error = Some(error.clone());
+        self.seal_model_usage();
         true
     }
 
@@ -393,19 +456,69 @@ impl LiveExecutionRecord {
         terminal_ref: String,
         reason: String,
     ) -> bool {
+        if self.live.status == ExecutionLiveStatus::Error
+            && self.live.terminal_ref.as_deref() == Some(terminal_ref.as_str())
+        {
+            self.apply_terminal_projection(report, write_attempt_paths, terminal_ref);
+            self.live.error = Some(reason);
+            self.touch();
+            self.seal_model_usage();
+            return true;
+        }
         if !self.transition(ExecutionLiveStatus::Error, Some(reason.clone())) {
             return false;
         }
         self.apply_terminal_projection(report, write_attempt_paths, terminal_ref);
         self.live.error = Some(reason.clone());
+        self.pending_terminal_claim = None;
+        self.seal_model_usage();
         true
     }
 
+    /// Enrich a Session-root projection only after the durable Session
+    /// terminal transaction has won and finalized the exact same terminal.
+    /// This deliberately cannot transition lifecycle state or clear a pending
+    /// delivery claim; those mutations belong exclusively to
+    /// `claim_terminal`/`finalize_terminal`/`abort_terminal_claim`.
+    fn enrich_finalized_session_terminal(
+        &mut self,
+        expected_status: ExecutionLiveStatus,
+        terminal_ref: String,
+        report: &ContextTurnReport,
+        write_attempt_paths: &[String],
+        error: Option<String>,
+    ) -> Result<(), String> {
+        if !self.live.status.is_terminal()
+            || self.live.status != expected_status
+            || self.live.terminal_ref.as_deref() != Some(terminal_ref.as_str())
+        {
+            return Err(format!(
+                "Session terminal enrichment rejected for execution `{}`: expected {expected_status:?} `{terminal_ref}`, found {:?} {:?}",
+                self.execution_id, self.live.status, self.live.terminal_ref
+            ));
+        }
+        if self.pending_terminal_claim.is_some() {
+            return Err(format!(
+                "Session terminal enrichment rejected for execution `{}`: a delivery claim is still pending",
+                self.execution_id
+            ));
+        }
+        self.apply_terminal_projection(report, write_attempt_paths, terminal_ref);
+        self.live.error = error;
+        self.touch();
+        self.seal_model_usage();
+        Ok(())
+    }
+
     fn cancel(&mut self, detail: String) -> bool {
+        if self.pending_terminal_claim.is_some() {
+            return false;
+        }
         if !self.transition(ExecutionLiveStatus::Cancelled, Some(detail)) {
             return false;
         }
         self.live.error = None;
+        self.seal_model_usage();
         true
     }
 
@@ -423,17 +536,9 @@ impl LiveExecutionRecord {
                 changed = true;
             }
         }
-        if event.kind == "runtime.session.terminal_requested" {
-            let terminal_ref = event
-                .payload
-                .get("payload_ref")
-                .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned)
-                .or_else(|| self.live.terminal_ref.clone());
-            if let Some(terminal_ref) = terminal_ref {
-                let _ = self.complete_recovered(terminal_ref);
-            }
-        }
+        // `runtime.session.terminal_requested` is an outbox request, not the
+        // Session terminal itself. Delivery owns the reversible pending claim
+        // and only a committed Session transcript may finalize live status.
         if changed {
             self.live.revision = self.live.revision.saturating_add(1);
             self.live.updated_at_ms = self.live.updated_at_ms.max(event.created_at_ms);
@@ -441,6 +546,13 @@ impl LiveExecutionRecord {
             self.refresh_latency();
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PendingLiveTerminalClaim {
+    terminal_ref: String,
+    status: ExecutionLiveStatus,
+    session_generation: u64,
 }
 
 /// The sole lifecycle reducer for provider-backed session executions.
@@ -457,9 +569,19 @@ pub(crate) struct ExecutionLiveStore {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalFenceClaim {
     Claimed,
-    SameWinner,
-    ConflictingWinner,
+    SamePending,
+    SameTerminal,
+    ConflictingPending,
+    ConflictingTerminal,
     MissingExecution,
+}
+
+/// Exact execution-ID partition retained by the live usage owner. Consumers
+/// must not infer this split from the flattened presentation metrics.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ExecutionModelUsageSnapshot {
+    pub(crate) own: Option<crate::RunModelTelemetry>,
+    pub(crate) descendants: BTreeMap<String, crate::RunModelTelemetry>,
 }
 
 impl ExecutionLiveStore {
@@ -523,7 +645,151 @@ impl ExecutionLiveStore {
         self.prune_terminal_cache();
     }
 
+    /// Allocate the request-local telemetry generation from the durable live
+    /// checkpoint. A process restart therefore continues above the last
+    /// admitted lease instead of restarting at one and being rejected by its
+    /// own recovered fence.
+    pub(crate) fn allocate_model_usage_generation(
+        &self,
+        execution_id: &str,
+    ) -> Result<u64, String> {
+        self.allocate_model_usage_generation_with_post_cas(execution_id, |_| {})
+    }
+
+    fn allocate_model_usage_generation_with_post_cas(
+        &self,
+        execution_id: &str,
+        post_cas: impl FnOnce(u64),
+    ) -> Result<u64, String> {
+        const MAX_CAS_ATTEMPTS: usize = 16;
+        let mut post_cas = Some(post_cas);
+        let _gate = self
+            .checkpoint_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self
+            .released_terminal_checkpoints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(execution_id)
+        {
+            return Err(format!(
+                "cannot allocate model telemetry generation for released execution `{execution_id}`"
+            ));
+        }
+
+        for _ in 0..MAX_CAS_ATTEMPTS {
+            let checkpoint = self
+                .event_store
+                .projection_checkpoint(&live_projection_id(execution_id))
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    format!(
+                        "cannot allocate model telemetry generation before execution `{execution_id}` is durably registered"
+                    )
+                })?;
+            let mut durable_record: LiveExecutionRecord =
+                serde_json::from_value(checkpoint.payload.clone()).map_err(|error| {
+                    format!(
+                        "decode live execution `{execution_id}` for telemetry generation: {error}"
+                    )
+                })?;
+            if durable_record.live.status.is_terminal()
+                || durable_record.model_usage_fence_generation.is_some()
+            {
+                return Err(format!(
+                    "cannot allocate model telemetry generation for terminal execution `{execution_id}`"
+                ));
+            }
+            let generation = durable_record
+                .model_usage_generation
+                .max(
+                    durable_record
+                        .model_usage_fence_generation
+                        .unwrap_or_default(),
+                )
+                .checked_add(1)
+                .ok_or_else(|| {
+                    format!("model telemetry generation exhausted for execution `{execution_id}`")
+                })?;
+            durable_record.model_usage_generation = generation;
+            let payload = serde_json::to_value(&durable_record).map_err(|error| {
+                format!("encode live execution `{execution_id}` telemetry generation: {error}")
+            })?;
+            let updated_at_ms = current_time_ms();
+            match self.event_store.compare_and_put_projection_checkpoint(
+                &checkpoint.projection_id,
+                checkpoint.source_cursor,
+                checkpoint.revision,
+                &payload,
+                updated_at_ms,
+            ) {
+                Ok(updated) => {
+                    self.durable_checkpoints
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(
+                            execution_id.to_string(),
+                            DurableLiveCheckpoint {
+                                source_cursor: updated.source_cursor,
+                                row_revision: updated.revision,
+                                live_revision: durable_record.live.revision,
+                                model_usage_generation: durable_record.model_usage_generation,
+                                model_usage_fence_generation: durable_record
+                                    .model_usage_fence_generation,
+                                updated_at_ms: updated.updated_at_ms,
+                            },
+                        );
+                    drop(_gate);
+                    if let Some(post_cas) = post_cas.take() {
+                        post_cas(generation);
+                    }
+                    let shard_index = self.record_shard(execution_id);
+                    let mut records = self.record_shards[shard_index]
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let resident_record = if let Some(record) = records.get_mut(execution_id) {
+                        if record.live.status.is_terminal()
+                            || record.model_usage_fence_generation.is_some()
+                        {
+                            return Err(format!(
+                                "execution `{execution_id}` became terminal while allocating model telemetry generation"
+                            ));
+                        }
+                        record.model_usage_generation =
+                            record.model_usage_generation.max(generation);
+                        record.clone()
+                    } else {
+                        durable_record
+                    };
+                    drop(records);
+                    self.publish_record_residency(&resident_record);
+                    return Ok(generation);
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        execution_id,
+                        %error,
+                        "retrying durable model telemetry generation allocation after checkpoint race"
+                    );
+                }
+            }
+        }
+        Err(format!(
+            "model telemetry generation allocation for execution `{execution_id}` exceeded {MAX_CAS_ATTEMPTS} checkpoint races"
+        ))
+    }
+
     pub(crate) fn observe_event(&self, expected_session_id: &str, event: &CowdEvent) {
+        self.observe_event_with_generation(expected_session_id, event, 0);
+    }
+
+    pub(crate) fn observe_event_with_generation(
+        &self,
+        expected_session_id: &str,
+        event: &CowdEvent,
+        model_usage_generation: u64,
+    ) {
         let Some(context) = event.execution_context() else {
             return;
         };
@@ -754,6 +1020,9 @@ impl ExecutionLiveStore {
                 changed
             }
             CowdEvent::RunModelTelemetry { telemetry } => {
+                if !record.admit_model_usage(model_usage_generation) {
+                    return;
+                }
                 record.own_model_usage = Some(telemetry.clone());
                 record.refresh_model_usage_metrics();
                 let mut usage = record.live.context_usage.clone().unwrap_or_default();
@@ -817,7 +1086,12 @@ impl ExecutionLiveStore {
         }
         self.prune_terminal_cache();
         if let Some(parent_execution_id) = parent_execution_id {
-            self.observe_descendant_event(&parent_execution_id, context, event);
+            self.observe_descendant_event(
+                &parent_execution_id,
+                context,
+                event,
+                model_usage_generation,
+            );
         }
     }
 
@@ -867,6 +1141,7 @@ impl ExecutionLiveStore {
         parent_execution_id: &str,
         child_context: &crate::CowdExecutionContext,
         event: &CowdEvent,
+        model_usage_generation: u64,
     ) {
         let shard_index = self.record_shard(parent_execution_id);
         let mut records = self.record_shards[shard_index]
@@ -966,6 +1241,9 @@ impl ExecutionLiveStore {
                 changed
             }
             CowdEvent::RunModelTelemetry { telemetry } => {
+                if !record.admit_model_usage(model_usage_generation) {
+                    return;
+                }
                 record
                     .descendant_model_usage
                     .insert(child_context.execution_id.clone(), telemetry.clone());
@@ -1006,10 +1284,42 @@ impl ExecutionLiveStore {
         });
     }
 
-    pub(crate) fn complete_recovered(&self, execution_id: &str, terminal_ref: String) -> bool {
-        self.update_record(execution_id, |record| {
-            record.complete_recovered(terminal_ref)
-        })
+    pub(crate) fn enrich_finalized_session_terminal(
+        &self,
+        execution_id: &str,
+        expected_status: ExecutionLiveStatus,
+        terminal_ref: String,
+        report: &ContextTurnReport,
+        write_attempt_paths: &[String],
+        error: Option<String>,
+    ) -> Result<(), String> {
+        let shard_index = self.record_shard(execution_id);
+        let mut records = self.record_shards[shard_index]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(record) = records.get_mut(execution_id) else {
+            return Err(format!(
+                "Session terminal enrichment rejected: execution `{execution_id}` is not registered"
+            ));
+        };
+        let previous = record.clone();
+        record.enrich_finalized_session_terminal(
+            expected_status,
+            terminal_ref,
+            report,
+            write_attempt_paths,
+            error,
+        )?;
+        let checkpoint = record.clone();
+        let session_id = record.session_id.clone();
+        if let Err(error) = self.persist_if_due(&checkpoint, true) {
+            *record = previous;
+            return Err(error);
+        }
+        drop(records);
+        self.refresh_hot_session(&session_id);
+        self.prune_terminal_cache();
+        Ok(())
     }
 
     pub(crate) fn claim_terminal(
@@ -1017,10 +1327,10 @@ impl ExecutionLiveStore {
         execution_id: &str,
         terminal_ref: String,
         status: ExecutionLiveStatus,
+        session_generation: u64,
     ) -> Result<TerminalFenceClaim, String> {
-        // A prior worker may have claimed the terminal fence and then crashed
-        // after the hot record was evicted. Reload the retained checkpoint so
-        // the same terminal can resume materialization idempotently.
+        // Reload the retained checkpoint so a worker retry observes a pending
+        // claim left before a process crash.
         let _ = self.execution_live(execution_id);
         let shard_index = self.record_shard(execution_id);
         let mut records = self.record_shards[shard_index]
@@ -1030,20 +1340,29 @@ impl ExecutionLiveStore {
             return Ok(TerminalFenceClaim::MissingExecution);
         };
         if record.live.status.is_terminal() {
-            if record.live.status != status
-                || record.live.terminal_ref.as_deref() != Some(terminal_ref.as_str())
+            if record.live.status == status
+                && record.live.terminal_ref.as_deref() == Some(terminal_ref.as_str())
             {
-                return Ok(TerminalFenceClaim::ConflictingWinner);
+                return Ok(TerminalFenceClaim::SameTerminal);
             }
-            self.persist_if_due(&record.clone(), true)?;
-            return Ok(TerminalFenceClaim::SameWinner);
+            return Ok(TerminalFenceClaim::ConflictingTerminal);
+        }
+        if let Some(pending) = record.pending_terminal_claim.as_ref() {
+            if pending.terminal_ref == terminal_ref
+                && pending.status == status
+                && pending.session_generation == session_generation
+            {
+                return Ok(TerminalFenceClaim::SamePending);
+            }
+            return Ok(TerminalFenceClaim::ConflictingPending);
         }
         let previous = record.clone();
-        if !record.transition(status, Some("durable terminal fence claimed".to_string())) {
-            return Ok(TerminalFenceClaim::ConflictingWinner);
-        }
-        record.live.terminal_ref = Some(terminal_ref);
-        record.live.error = None;
+        record.pending_terminal_claim = Some(PendingLiveTerminalClaim {
+            terminal_ref,
+            status,
+            session_generation,
+        });
+        record.touch();
         let checkpoint = record.clone();
         let session_id = record.session_id.clone();
         if let Err(error) = self.persist_if_due(&checkpoint, true) {
@@ -1054,6 +1373,103 @@ impl ExecutionLiveStore {
         self.refresh_hot_session(&session_id);
         self.prune_terminal_cache();
         Ok(TerminalFenceClaim::Claimed)
+    }
+
+    pub(crate) fn finalize_terminal(
+        &self,
+        execution_id: &str,
+        terminal_ref: &str,
+        status: ExecutionLiveStatus,
+        session_generation: u64,
+    ) -> Result<TerminalFenceClaim, String> {
+        let _ = self.execution_live(execution_id);
+        let shard_index = self.record_shard(execution_id);
+        let mut records = self.record_shards[shard_index]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(record) = records.get_mut(execution_id) else {
+            return Ok(TerminalFenceClaim::MissingExecution);
+        };
+        if record.live.status.is_terminal() {
+            return Ok(
+                if record.live.status == status
+                    && record.live.terminal_ref.as_deref() == Some(terminal_ref)
+                {
+                    TerminalFenceClaim::SameTerminal
+                } else {
+                    TerminalFenceClaim::ConflictingTerminal
+                },
+            );
+        }
+        let Some(pending) = record.pending_terminal_claim.as_ref() else {
+            return Ok(TerminalFenceClaim::ConflictingPending);
+        };
+        if pending.terminal_ref != terminal_ref
+            || pending.status != status
+            || pending.session_generation != session_generation
+        {
+            return Ok(TerminalFenceClaim::ConflictingPending);
+        }
+        let previous = record.clone();
+        if !record.transition(
+            status,
+            Some("durable Session terminal committed".to_string()),
+        ) {
+            return Ok(TerminalFenceClaim::ConflictingTerminal);
+        }
+        record.live.terminal_ref = Some(terminal_ref.to_string());
+        record.live.error = (status == ExecutionLiveStatus::Error)
+            .then(|| "Runtime turn completed without full satisfaction".to_string());
+        record.pending_terminal_claim = None;
+        record.seal_model_usage();
+        let checkpoint = record.clone();
+        let session_id = record.session_id.clone();
+        if let Err(error) = self.persist_if_due(&checkpoint, true) {
+            *record = previous;
+            return Err(error);
+        }
+        drop(records);
+        self.refresh_hot_session(&session_id);
+        self.prune_terminal_cache();
+        Ok(TerminalFenceClaim::Claimed)
+    }
+
+    pub(crate) fn abort_terminal_claim(
+        &self,
+        execution_id: &str,
+        terminal_ref: &str,
+        session_generation: u64,
+    ) -> Result<bool, String> {
+        let _ = self.execution_live(execution_id);
+        let shard_index = self.record_shard(execution_id);
+        let mut records = self.record_shards[shard_index]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(record) = records.get_mut(execution_id) else {
+            return Ok(false);
+        };
+        let matches = record
+            .pending_terminal_claim
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.terminal_ref == terminal_ref
+                    && pending.session_generation == session_generation
+            });
+        if !matches {
+            return Ok(false);
+        }
+        let previous = record.clone();
+        record.pending_terminal_claim = None;
+        record.touch();
+        let checkpoint = record.clone();
+        let session_id = record.session_id.clone();
+        if let Err(error) = self.persist_if_due(&checkpoint, true) {
+            *record = previous;
+            return Err(error);
+        }
+        drop(records);
+        self.refresh_hot_session(&session_id);
+        Ok(true)
     }
 
     pub(crate) fn release_terminal_checkpoint(&self, execution_id: &str) {
@@ -1137,6 +1553,22 @@ impl ExecutionLiveStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(execution_id.to_string(), record);
         Some(live)
+    }
+
+    pub(crate) fn model_usage_snapshot(
+        &self,
+        execution_id: &str,
+    ) -> Option<ExecutionModelUsageSnapshot> {
+        let _ = self.execution_live(execution_id)?;
+        let shard_index = self.record_shard(execution_id);
+        self.record_shards[shard_index]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(execution_id)
+            .map(|record| ExecutionModelUsageSnapshot {
+                own: record.own_model_usage.clone(),
+                descendants: record.descendant_model_usage.clone(),
+            })
     }
 
     fn execution_live_hot(&self, execution_id: &str) -> Option<ExecutionLiveState> {
@@ -1307,6 +1739,8 @@ impl ExecutionLiveStore {
                     source_cursor: checkpoint.source_cursor,
                     row_revision: checkpoint.revision,
                     live_revision: record.live.revision,
+                    model_usage_generation: record.model_usage_generation,
+                    model_usage_fence_generation: record.model_usage_fence_generation,
                     updated_at_ms: checkpoint.updated_at_ms,
                 },
             );
@@ -1326,19 +1760,6 @@ impl ExecutionLiveStore {
         {
             return Ok(());
         }
-        let payload = match serde_json::to_value(record) {
-            Ok(payload) => payload,
-            Err(error) => {
-                tracing::error!(
-                    execution_id = %record.execution_id,
-                    %error,
-                    "failed to serialize Runtime live execution checkpoint"
-                );
-                self.publish_record_residency(record);
-                return Err(error.to_string());
-            }
-        };
-        let updated_at_ms = current_time_ms();
         let durable = self
             .durable_checkpoints
             .lock()
@@ -1348,6 +1769,39 @@ impl ExecutionLiveStore {
         if durable.is_some_and(|checkpoint| checkpoint.live_revision > record.live.revision) {
             return Ok(());
         }
+        // Generation allocation is a durable lease operation and deliberately
+        // does not bump the user-visible live revision. A record clone made
+        // before that CAS may therefore arrive here with an equal or newer
+        // live revision. Preserve the monotonic lease/fence dimensions before
+        // serializing so such a clone cannot roll a restart back to an old
+        // generation. `Some` is an irreversible terminal fence.
+        let mut candidate = record.clone();
+        if let Some(checkpoint) = durable {
+            candidate.model_usage_generation = candidate
+                .model_usage_generation
+                .max(checkpoint.model_usage_generation);
+            candidate.model_usage_fence_generation = match (
+                candidate.model_usage_fence_generation,
+                checkpoint.model_usage_fence_generation,
+            ) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+                (Some(value), None) | (None, Some(value)) => Some(value),
+                (None, None) => None,
+            };
+        }
+        let payload = match serde_json::to_value(&candidate) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::error!(
+                    execution_id = %record.execution_id,
+                    %error,
+                    "failed to serialize Runtime live execution checkpoint"
+                );
+                self.publish_record_residency(&candidate);
+                return Err(error.to_string());
+            }
+        };
+        let updated_at_ms = current_time_ms();
         let source_cursor = durable.map_or_else(
             || self.event_store.current_commit_cursor(),
             |checkpoint| {
@@ -1373,11 +1827,13 @@ impl ExecutionLiveStore {
                         DurableLiveCheckpoint {
                             source_cursor: checkpoint.source_cursor,
                             row_revision: checkpoint.revision,
-                            live_revision: record.live.revision,
+                            live_revision: candidate.live.revision,
+                            model_usage_generation: candidate.model_usage_generation,
+                            model_usage_fence_generation: candidate.model_usage_fence_generation,
                             updated_at_ms: checkpoint.updated_at_ms,
                         },
                     );
-                self.publish_record_residency(record);
+                self.publish_record_residency(&candidate);
                 Ok(())
             }
             Err(error) => {
@@ -1629,6 +2085,8 @@ fn recover_live_records_once(
                 source_cursor: checkpoint.source_cursor,
                 row_revision: checkpoint.revision,
                 live_revision: record.live.revision,
+                model_usage_generation: record.model_usage_generation,
+                model_usage_fence_generation: record.model_usage_fence_generation,
                 updated_at_ms: checkpoint.updated_at_ms,
             },
         );
@@ -1810,7 +2268,7 @@ mod tests {
 
     #[test]
     fn completed_tool_plan_is_visible_before_execution_and_counted_once() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let store = ExecutionLiveStore::new(event_store);
         let context = CowdExecutionContext {
             execution_id: "execution-tool-plan".to_string(),
@@ -1868,7 +2326,7 @@ mod tests {
 
     #[test]
     fn descendant_tool_activity_aggregates_into_root_without_changing_root_phase() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let store = ExecutionLiveStore::new(Arc::clone(&event_store));
         store.record_queued(
             "session-team",
@@ -1948,8 +2406,494 @@ mod tests {
     }
 
     #[test]
+    fn cumulative_inline_root_and_descendant_usage_is_replaced_by_id_without_double_counting() {
+        fn telemetry(
+            input_tokens: u64,
+            output_tokens: u64,
+            cache_create_tokens: u64,
+            cache_read_tokens: u64,
+        ) -> crate::RunModelTelemetry {
+            crate::RunModelTelemetry {
+                model: Some("model-a".to_string()),
+                models_used: vec!["model-a".to_string()],
+                first_token_latency_ms: Some(1),
+                active_stream_duration_ms: Some(2),
+                wall_duration_ms: 3,
+                output_chars: output_tokens,
+                output_chunks: 1,
+                input_tokens,
+                output_tokens,
+                cache_create_tokens,
+                cache_read_tokens,
+                cache_dimensions_known: true,
+                total_tokens: input_tokens
+                    .saturating_add(output_tokens)
+                    .saturating_add(cache_create_tokens)
+                    .saturating_add(cache_read_tokens),
+                usage_source: "provider_actual".to_string(),
+                wall_chars_per_second: None,
+                wall_tokens_per_second: None,
+                active_chars_per_second: None,
+                active_tokens_per_second: None,
+                chars_per_second: None,
+                tokens_per_second: None,
+            }
+        }
+
+        let event_store = Arc::new(RuntimeEventStore::for_test());
+        let store = ExecutionLiveStore::new(Arc::clone(&event_store));
+        let session_id = "session-model-tree";
+        let turn_id = "turn-model-tree";
+        let root_execution_id = "root-model-tree";
+        let child_execution_id = "child-model-tree";
+        store.record_queued(
+            session_id,
+            root_execution_id.to_string(),
+            turn_id.to_string(),
+        );
+
+        let root_context = CowdExecutionContext {
+            execution_id: root_execution_id.to_string(),
+            session_id: session_id.to_string(),
+            turn_id: turn_id.to_string(),
+        };
+        // Each execution emits cumulative snapshots. A later snapshot replaces
+        // the prior value for that execution rather than adding another bill.
+        for usage in [telemetry(100, 10, 20, 30), telemetry(120, 12, 25, 35)] {
+            store.observe_event(
+                session_id,
+                &CowdEvent::ExecutionScoped {
+                    context: root_context.clone(),
+                    activity_binding: None,
+                    event: Box::new(CowdEvent::RunModelTelemetry { telemetry: usage }),
+                },
+            );
+        }
+
+        let lineage = crate::CowdExecutionLineage {
+            parent_execution_id: root_execution_id.to_string(),
+            graph_id: "team-graph".to_string(),
+            node_id: "researcher:1".to_string(),
+            team_id: Some("team-run".to_string()),
+            agent_id: Some("researcher".to_string()),
+        };
+        let child_context = CowdExecutionContext {
+            execution_id: child_execution_id.to_string(),
+            session_id: session_id.to_string(),
+            turn_id: turn_id.to_string(),
+        };
+        for usage in [telemetry(40, 4, 5, 10), telemetry(50, 5, 7, 13)] {
+            store.observe_event(
+                session_id,
+                &CowdEvent::RelatedExecution {
+                    lineage: lineage.clone(),
+                    event: Box::new(CowdEvent::ExecutionScoped {
+                        context: child_context.clone(),
+                        activity_binding: None,
+                        event: Box::new(CowdEvent::RunModelTelemetry { telemetry: usage }),
+                    }),
+                },
+            );
+        }
+
+        let assert_usage = |live: ExecutionLiveState| {
+            assert_eq!(live.metrics.input_tokens, 170);
+            assert_eq!(live.metrics.output_tokens, 17);
+            assert_eq!(live.metrics.cache_creation_input_tokens, 32);
+            assert_eq!(live.metrics.cache_read_input_tokens, 48);
+            assert!(live.metrics.cache_dimensions_known);
+            assert_eq!(live.metrics.total_tokens, 267);
+        };
+        assert_usage(store.execution_live(root_execution_id).unwrap());
+
+        // Terminal checkpoint serialization is the durable projection replay
+        // path used after a process restart.
+        let report = ContextTurnReport::new(
+            turn_id,
+            harness_contract::context::ContextPressureState::new("default", 32_000, 170),
+        );
+        store.complete(
+            root_execution_id,
+            &report,
+            &[],
+            "terminal:model-tree".to_string(),
+        );
+        let rehydrated = ExecutionLiveStore::new(event_store);
+        assert_usage(rehydrated.execution_live(root_execution_id).unwrap());
+    }
+
+    #[test]
+    fn durable_model_usage_generation_survives_restart_and_rejects_old_lease() {
+        fn telemetry(input_tokens: u64) -> crate::RunModelTelemetry {
+            crate::RunModelTelemetry {
+                model: Some("model-a".to_string()),
+                models_used: vec!["model-a".to_string()],
+                first_token_latency_ms: Some(1),
+                active_stream_duration_ms: Some(2),
+                wall_duration_ms: 3,
+                output_chars: 1,
+                output_chunks: 1,
+                input_tokens,
+                output_tokens: 1,
+                cache_create_tokens: 0,
+                cache_read_tokens: 0,
+                cache_dimensions_known: true,
+                total_tokens: input_tokens.saturating_add(1),
+                usage_source: "provider_actual".to_string(),
+                wall_chars_per_second: None,
+                wall_tokens_per_second: None,
+                active_chars_per_second: None,
+                active_tokens_per_second: None,
+                chars_per_second: None,
+                tokens_per_second: None,
+            }
+        }
+
+        let event_store = Arc::new(RuntimeEventStore::for_test());
+        let session_id = "session-generation-restart";
+        let execution_id = "execution-generation-restart";
+        let turn_id = "turn-generation-restart";
+        let first_process = ExecutionLiveStore::new(Arc::clone(&event_store));
+        first_process.record_queued(session_id, execution_id.to_string(), turn_id.to_string());
+        let mut old_generation = 0;
+        for _ in 0..32 {
+            old_generation = first_process
+                .allocate_model_usage_generation(execution_id)
+                .unwrap();
+        }
+        drop(first_process);
+
+        let restarted = ExecutionLiveStore::new(event_store);
+        let new_generation = restarted
+            .allocate_model_usage_generation(execution_id)
+            .unwrap();
+        assert_eq!(new_generation, old_generation + 1);
+        let context = CowdExecutionContext {
+            execution_id: execution_id.to_string(),
+            session_id: session_id.to_string(),
+            turn_id: turn_id.to_string(),
+        };
+        let scoped = |usage| CowdEvent::ExecutionScoped {
+            context: context.clone(),
+            activity_binding: None,
+            event: Box::new(CowdEvent::RunModelTelemetry { telemetry: usage }),
+        };
+        restarted.observe_event_with_generation(
+            session_id,
+            &scoped(telemetry(200)),
+            new_generation,
+        );
+        restarted.observe_event_with_generation(
+            session_id,
+            &scoped(telemetry(999)),
+            old_generation,
+        );
+        assert_eq!(
+            restarted
+                .model_usage_snapshot(execution_id)
+                .and_then(|snapshot| snapshot.own)
+                .map(|usage| usage.input_tokens),
+            Some(200)
+        );
+    }
+
+    #[test]
+    fn stale_event_checkpoint_cannot_rollback_generation_between_cas_and_resident_publish() {
+        let event_store = Arc::new(RuntimeEventStore::for_test());
+        let session_id = "session-generation-interleave";
+        let execution_id = "execution-generation-interleave";
+        let store = ExecutionLiveStore::new(Arc::clone(&event_store));
+        store.record_queued(
+            session_id,
+            execution_id.to_string(),
+            "turn-generation-interleave".to_string(),
+        );
+        let old_generation = store.allocate_model_usage_generation(execution_id).unwrap();
+        let shard = store.record_shard(execution_id);
+        let mut stale_event_clone = store.record_shards[shard]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(execution_id)
+            .unwrap()
+            .clone();
+        // Model an unrelated event clone that was reduced before allocation,
+        // then received a newer visible revision while the allocation CAS was
+        // in flight. The hook deterministically persists it after the durable
+        // CAS and before the allocator can update the resident record.
+        stale_event_clone.live.revision = stale_event_clone.live.revision.saturating_add(100);
+        let new_generation = store
+            .allocate_model_usage_generation_with_post_cas(execution_id, |_| {
+                store.persist(&stale_event_clone).unwrap();
+            })
+            .unwrap();
+        assert_eq!(new_generation, old_generation + 1);
+        drop(store);
+
+        let restarted = ExecutionLiveStore::new(Arc::clone(&event_store));
+        let after_restart = restarted
+            .allocate_model_usage_generation(execution_id)
+            .unwrap();
+        assert_eq!(after_restart, new_generation + 1);
+
+        let context = CowdExecutionContext {
+            execution_id: execution_id.to_string(),
+            session_id: session_id.to_string(),
+            turn_id: "turn-generation-interleave".to_string(),
+        };
+        let telemetry = |input_tokens| CowdEvent::ExecutionScoped {
+            context: context.clone(),
+            activity_binding: None,
+            event: Box::new(CowdEvent::RunModelTelemetry {
+                telemetry: crate::RunModelTelemetry {
+                    model: Some("model-a".to_string()),
+                    models_used: vec!["model-a".to_string()],
+                    first_token_latency_ms: Some(1),
+                    active_stream_duration_ms: Some(2),
+                    wall_duration_ms: 3,
+                    output_chars: 1,
+                    output_chunks: 1,
+                    input_tokens,
+                    output_tokens: 1,
+                    cache_create_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_dimensions_known: true,
+                    total_tokens: input_tokens.saturating_add(1),
+                    usage_source: "provider_actual".to_string(),
+                    wall_chars_per_second: None,
+                    wall_tokens_per_second: None,
+                    active_chars_per_second: None,
+                    active_tokens_per_second: None,
+                    chars_per_second: None,
+                    tokens_per_second: None,
+                },
+            }),
+        };
+        restarted.observe_event_with_generation(session_id, &telemetry(200), after_restart);
+        restarted.observe_event_with_generation(session_id, &telemetry(999), old_generation);
+        assert_eq!(
+            restarted
+                .model_usage_snapshot(execution_id)
+                .and_then(|snapshot| snapshot.own)
+                .map(|usage| usage.input_tokens),
+            Some(200)
+        );
+    }
+
+    #[test]
+    fn stale_checkpoint_none_cannot_remove_a_durable_model_usage_fence() {
+        let event_store = Arc::new(RuntimeEventStore::for_test());
+        let execution_id = "execution-generation-fence";
+        let store = ExecutionLiveStore::new(Arc::clone(&event_store));
+        store.record_queued(
+            "session-generation-fence",
+            execution_id.to_string(),
+            "turn-generation-fence".to_string(),
+        );
+        let generation = store.allocate_model_usage_generation(execution_id).unwrap();
+        let shard = store.record_shard(execution_id);
+        let mut fenced = store.record_shards[shard]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(execution_id)
+            .unwrap()
+            .clone();
+        fenced.model_usage_fence_generation = Some(generation);
+        store.persist(&fenced).unwrap();
+
+        let mut stale = fenced;
+        stale.model_usage_fence_generation = None;
+        stale.live.revision = stale.live.revision.saturating_add(1);
+        store.persist(&stale).unwrap();
+        drop(store);
+
+        let checkpoint = event_store
+            .projection_checkpoint(&live_projection_id(execution_id))
+            .unwrap()
+            .unwrap();
+        let recovered: LiveExecutionRecord = serde_json::from_value(checkpoint.payload).unwrap();
+        assert_eq!(
+            recovered.model_usage_fence_generation,
+            Some(generation),
+            "a newer stale clone must not turn a durable Some fence back into None"
+        );
+    }
+
+    #[test]
+    fn synchronous_telemetry_precedes_surface_relay_and_relay_replay_does_not_double_count() {
+        let event_store = Arc::new(RuntimeEventStore::for_test());
+        let store = Arc::new(ExecutionLiveStore::new(event_store));
+        let session_id = "session-sync-telemetry";
+        let root_execution_id = "root-sync-telemetry";
+        let child_execution_id = "child-sync-telemetry";
+        store.record_queued(
+            session_id,
+            root_execution_id.to_string(),
+            "turn-sync-telemetry".to_string(),
+        );
+
+        let root_bus = crate::CowdEventBus::new();
+        let observer_store = Arc::clone(&store);
+        root_bus.bind_live_telemetry_observer(1, move |event: &crate::CowdEvent| {
+            let context = event.execution_context().expect("scoped telemetry");
+            observer_store.observe_event_with_generation(&context.session_id, event, 1);
+        });
+        let mut surface_relay = root_bus.subscribe();
+        let _root_scope = root_bus.enter_execution(CowdExecutionContext {
+            execution_id: root_execution_id.to_string(),
+            session_id: session_id.to_string(),
+            turn_id: "turn-sync-telemetry".to_string(),
+        });
+
+        let child_bus = crate::CowdEventBus::new();
+        child_bus.forward_to(
+            &root_bus,
+            crate::CowdExecutionLineage {
+                parent_execution_id: root_execution_id.to_string(),
+                graph_id: "team-sync-telemetry".to_string(),
+                node_id: "agent:1".to_string(),
+                team_id: Some("team-1".to_string()),
+                agent_id: Some("agent-1".to_string()),
+            },
+        );
+        let _child_scope = child_bus.enter_execution(CowdExecutionContext {
+            execution_id: child_execution_id.to_string(),
+            session_id: session_id.to_string(),
+            turn_id: "turn-sync-telemetry".to_string(),
+        });
+        let child_usage = crate::RunModelTelemetry {
+            model: Some("model-a".to_string()),
+            models_used: vec!["model-a".to_string()],
+            first_token_latency_ms: Some(1),
+            active_stream_duration_ms: Some(2),
+            wall_duration_ms: 3,
+            output_chars: 5,
+            output_chunks: 1,
+            input_tokens: 20,
+            output_tokens: 5,
+            cache_create_tokens: 0,
+            cache_read_tokens: 0,
+            cache_dimensions_known: true,
+            total_tokens: 25,
+            usage_source: "provider_actual".to_string(),
+            wall_chars_per_second: None,
+            wall_tokens_per_second: None,
+            active_chars_per_second: None,
+            active_tokens_per_second: None,
+            chars_per_second: None,
+            tokens_per_second: None,
+        };
+        child_bus.emit(CowdEvent::RunModelTelemetry {
+            telemetry: child_usage,
+        });
+
+        // The store is already complete before the asynchronous Surface relay
+        // receives the same event.
+        let snapshot = store.model_usage_snapshot(root_execution_id).unwrap();
+        assert!(snapshot.own.is_none());
+        assert_eq!(snapshot.descendants.len(), 1);
+        assert_eq!(
+            store
+                .execution_live(root_execution_id)
+                .unwrap()
+                .metrics
+                .input_tokens,
+            20
+        );
+
+        let relayed = surface_relay.try_recv().expect("related telemetry relay");
+        store.observe_event(session_id, &relayed);
+        let after_relay = store.execution_live(root_execution_id).unwrap();
+        assert_eq!(after_relay.metrics.input_tokens, 20);
+        assert_eq!(after_relay.metrics.output_tokens, 5);
+        assert!(after_relay.metrics.cache_dimensions_known);
+    }
+
+    #[test]
+    fn terminal_usage_fence_rejects_late_child_telemetry_in_hot_and_replay_state() {
+        let event_store = Arc::new(RuntimeEventStore::for_test());
+        let store = ExecutionLiveStore::new(Arc::clone(&event_store));
+        let session_id = "session-terminal-usage-fence";
+        let turn_id = "turn-terminal-usage-fence";
+        let root_execution_id = "root-terminal-usage-fence";
+        let child_execution_id = "child-terminal-usage-fence";
+        store.record_queued(
+            session_id,
+            root_execution_id.to_string(),
+            turn_id.to_string(),
+        );
+        let telemetry = |input_tokens| crate::RunModelTelemetry {
+            model: Some("model-a".to_string()),
+            models_used: vec!["model-a".to_string()],
+            first_token_latency_ms: Some(1),
+            active_stream_duration_ms: Some(2),
+            wall_duration_ms: 3,
+            output_chars: 1,
+            output_chunks: 1,
+            input_tokens,
+            output_tokens: 1,
+            cache_create_tokens: 2,
+            cache_read_tokens: 3,
+            cache_dimensions_known: true,
+            total_tokens: input_tokens + 6,
+            usage_source: "provider_actual".to_string(),
+            wall_chars_per_second: None,
+            wall_tokens_per_second: None,
+            active_chars_per_second: None,
+            active_tokens_per_second: None,
+            chars_per_second: None,
+            tokens_per_second: None,
+        };
+        let related = |usage| CowdEvent::RelatedExecution {
+            lineage: crate::CowdExecutionLineage {
+                parent_execution_id: root_execution_id.to_string(),
+                graph_id: "team-terminal-fence".to_string(),
+                node_id: "agent:1".to_string(),
+                team_id: Some("team-1".to_string()),
+                agent_id: Some("agent-1".to_string()),
+            },
+            event: Box::new(CowdEvent::ExecutionScoped {
+                context: CowdExecutionContext {
+                    execution_id: child_execution_id.to_string(),
+                    session_id: session_id.to_string(),
+                    turn_id: turn_id.to_string(),
+                },
+                activity_binding: None,
+                event: Box::new(CowdEvent::RunModelTelemetry { telemetry: usage }),
+            }),
+        };
+        store.observe_event_with_generation(session_id, &related(telemetry(20)), 7);
+        let report = ContextTurnReport::new(
+            turn_id,
+            harness_contract::context::ContextPressureState::new("default", 32_000, 20),
+        );
+        store.complete(
+            root_execution_id,
+            &report,
+            &[],
+            "terminal:usage-fence".to_string(),
+        );
+        let sealed = store.execution_live(root_execution_id).unwrap();
+        assert_eq!(sealed.metrics.input_tokens, 20);
+        let sealed_revision = sealed.revision;
+
+        // A child event emitted by the old execution bus after terminal seal
+        // may still reach an asynchronous relay. It cannot change the root's
+        // hot or durable terminal bill.
+        store.observe_event_with_generation(session_id, &related(telemetry(200)), 7);
+        let after_late = store.execution_live(root_execution_id).unwrap();
+        assert_eq!(after_late.metrics.input_tokens, 20);
+        assert_eq!(after_late.revision, sealed_revision);
+
+        let replayed = ExecutionLiveStore::new(event_store)
+            .execution_live(root_execution_id)
+            .unwrap();
+        assert_eq!(replayed.metrics.input_tokens, 20);
+        assert_eq!(replayed.revision, sealed_revision);
+    }
+
+    #[test]
     fn scoped_event_updates_only_its_execution_and_rehydrates_from_mutable_projection() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let store = ExecutionLiveStore::new(Arc::clone(&event_store));
         store.record_queued("session-a", "execution-a".to_string(), "turn-a".to_string());
         store.record_queued("session-a", "execution-b".to_string(), "turn-b".to_string());
@@ -2000,7 +2944,7 @@ mod tests {
 
     #[test]
     fn restart_advances_canonical_cursor_without_granting_business_status_lifecycle_authority() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let execution_id = "execution-cursor-replay";
         let store = ExecutionLiveStore::new(Arc::clone(&event_store));
         store.record_queued(
@@ -2157,7 +3101,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_session_terminal_is_the_only_durable_completion_authority() {
+    fn terminal_delivery_request_never_owns_live_completion() {
         let mut record = LiveExecutionRecord::new(
             "session-explicit-terminal".to_string(),
             "execution-explicit-terminal".to_string(),
@@ -2195,25 +3139,14 @@ mod tests {
         assert_eq!(record.live.status, ExecutionLiveStatus::Finalizing);
 
         record.apply_durable_event(&terminal);
-        assert_eq!(record.live.status, ExecutionLiveStatus::Complete);
-        assert_eq!(
-            record.live.terminal_ref.as_deref(),
-            Some("terminal:durable")
-        );
+        assert_eq!(record.live.status, ExecutionLiveStatus::Finalizing);
+        assert_eq!(record.live.terminal_ref, None);
         let revision = record.live.revision;
         record.apply_durable_event(&terminal);
-        assert_eq!(record.live.status, ExecutionLiveStatus::Complete);
-        assert_eq!(
-            record.live.terminal_ref.as_deref(),
-            Some("terminal:durable")
-        );
+        assert_eq!(record.live.status, ExecutionLiveStatus::Finalizing);
+        assert_eq!(record.live.terminal_ref, None);
         assert_eq!(record.live.revision, revision);
-        assert!(!record.transition(
-            ExecutionLiveStatus::Finalizing,
-            Some("late child phase".to_string())
-        ));
-        assert_eq!(record.live.status, ExecutionLiveStatus::Complete);
-        assert_eq!(record.live.revision, revision);
+        assert!(record.pending_terminal_claim.is_none());
     }
 
     #[test]
@@ -2244,7 +3177,7 @@ mod tests {
 
     #[test]
     fn high_frequency_live_updates_coalesce_until_a_lifecycle_boundary() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let store = ExecutionLiveStore::new(Arc::clone(&event_store));
         let context = CowdExecutionContext {
             execution_id: "execution-coalesced".to_string(),
@@ -2320,7 +3253,7 @@ mod tests {
 
     #[test]
     fn live_output_recovery_uses_runtime_projection_identity_across_text_items() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let store = ExecutionLiveStore::new(event_store);
         let context = CowdExecutionContext {
             execution_id: "execution-output".to_string(),
@@ -2387,68 +3320,8 @@ mod tests {
     }
 
     #[test]
-    fn durable_terminal_recovery_closes_a_finalizing_live_projection_idempotently() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
-        let store = ExecutionLiveStore::new(Arc::clone(&event_store));
-        let execution_id = "execution-recovered-terminal";
-        store.record_queued(
-            "session-recovered-terminal",
-            execution_id.to_string(),
-            "turn-recovered-terminal".to_string(),
-        );
-        let phase = |status, detail: &str| CowdEvent::ExecutionScoped {
-            context: CowdExecutionContext {
-                execution_id: execution_id.to_string(),
-                session_id: "session-recovered-terminal".to_string(),
-                turn_id: "turn-recovered-terminal".to_string(),
-            },
-            activity_binding: None,
-            event: Box::new(CowdEvent::ExecutionPhase {
-                status,
-                detail: Some(detail.to_string()),
-            }),
-        };
-        store.observe_event(
-            "session-recovered-terminal",
-            &phase(ExecutionLiveStatus::CallingModel, "calling model"),
-        );
-        store.observe_event(
-            "session-recovered-terminal",
-            &phase(ExecutionLiveStatus::Finalizing, "synthesizing terminal"),
-        );
-
-        store.complete_recovered(execution_id, "terminal-recovered".to_string());
-        let terminal = store.execution_live(execution_id).unwrap();
-        assert_eq!(terminal.status, ExecutionLiveStatus::Complete);
-        assert_eq!(
-            terminal.status_detail.as_deref(),
-            Some("durable terminal recovered")
-        );
-        assert_eq!(terminal.terminal_ref.as_deref(), Some("terminal-recovered"));
-        let terminal_revision = terminal.revision;
-
-        store.complete_recovered(execution_id, "terminal-recovered".to_string());
-        assert_eq!(
-            store.execution_live(execution_id).unwrap().revision,
-            terminal_revision,
-            "replaying the same durable terminal must be idempotent"
-        );
-
-        let rehydrated = ExecutionLiveStore::new(event_store);
-        assert_eq!(
-            rehydrated
-                .execution_live(execution_id)
-                .unwrap()
-                .terminal_ref,
-            Some("terminal-recovered".to_string()),
-            "the winner checkpoint remains until the canonical carrier is acknowledged"
-        );
-        rehydrated.release_terminal_checkpoint(execution_id);
-    }
-
-    #[test]
     fn approval_metrics_deduplicate_stable_request_ids_across_replay_and_restart() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let store = ExecutionLiveStore::new(Arc::clone(&event_store));
         let context = CowdExecutionContext {
             execution_id: "execution-approval".to_string(),
@@ -2496,7 +3369,7 @@ mod tests {
 
     #[test]
     fn hot_cache_prunes_only_terminal_records() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let hot_state = Arc::new(RuntimeHotStatePlane::new(
             crate::execution_core::hot_state::HotStateConfig {
                 memory: crate::execution_core::hot_state::HotStateMemoryConfig {
@@ -2527,12 +3400,22 @@ mod tests {
 
     #[test]
     fn cancellation_and_terminal_commit_share_one_terminal_winner() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let store = ExecutionLiveStore::new(event_store);
         let report = ContextTurnReport::new(
             "turn-terminal-race",
             harness_contract::context::ContextPressureState::new("direct", 32_000, 1_000),
-        );
+        )
+        .with_ledger(harness_contract::context::ContextLedgerProjection {
+            max_tokens: 32_000,
+            consumed_tokens: 1_000,
+            remaining_tokens: 31_000,
+            tool_result_limit: 0,
+            tool_result_consumed: 0,
+            components: Vec::new(),
+            request_sequence: 2,
+            calibrated_input_tokens: Some(900),
+        });
 
         store.record_queued(
             "session-race",
@@ -2542,7 +3425,17 @@ mod tests {
         assert!(store
             .cancel("cancel-wins", "user cancelled".to_string())
             .unwrap());
-        store.complete("cancel-wins", &report, &[], "terminal-too-late".to_string());
+        assert_eq!(
+            store
+                .claim_terminal(
+                    "cancel-wins",
+                    "terminal-too-late".to_string(),
+                    ExecutionLiveStatus::Complete,
+                    1,
+                )
+                .unwrap(),
+            TerminalFenceClaim::ConflictingTerminal
+        );
         let cancelled = store.execution_live("cancel-wins").unwrap();
         assert_eq!(cancelled.status, ExecutionLiveStatus::Cancelled);
         assert!(cancelled.terminal_ref.is_none());
@@ -2552,24 +3445,72 @@ mod tests {
             "terminal-wins".to_string(),
             "turn-terminal-wins".to_string(),
         );
-        store.complete(
-            "terminal-wins",
-            &report,
-            &[],
-            "terminal-committed".to_string(),
+        assert_eq!(
+            store
+                .claim_terminal(
+                    "terminal-wins",
+                    "terminal-committed".to_string(),
+                    ExecutionLiveStatus::Complete,
+                    2,
+                )
+                .unwrap(),
+            TerminalFenceClaim::Claimed
         );
         assert!(!store
             .cancel("terminal-wins", "late cancel".to_string())
             .unwrap());
+        assert!(!store
+            .execution_live("terminal-wins")
+            .unwrap()
+            .status
+            .is_terminal());
+        assert_eq!(
+            store
+                .finalize_terminal(
+                    "terminal-wins",
+                    "terminal-committed",
+                    ExecutionLiveStatus::Complete,
+                    2,
+                )
+                .unwrap(),
+            TerminalFenceClaim::Claimed
+        );
+        store
+            .enrich_finalized_session_terminal(
+                "terminal-wins",
+                ExecutionLiveStatus::Complete,
+                "terminal-committed".to_string(),
+                &report,
+                &["result.md".to_string()],
+                None,
+            )
+            .unwrap();
         assert_eq!(
             store.execution_live("terminal-wins").unwrap().status,
             ExecutionLiveStatus::Complete
         );
+        assert_eq!(
+            store
+                .execution_live("terminal-wins")
+                .unwrap()
+                .metrics
+                .files_touched,
+            1,
+            "same durable terminal must accept the complete post-commit report"
+        );
+        assert_eq!(
+            store
+                .execution_live("terminal-wins")
+                .unwrap()
+                .context_usage
+                .and_then(|usage| usage.input_tokens),
+            Some(900)
+        );
     }
 
     #[test]
-    fn terminal_winner_checkpoint_survives_restart_until_canonical_delivery() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+    fn pending_terminal_claim_survives_restart_without_exposing_false_terminal() {
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         {
             let store = ExecutionLiveStore::new(Arc::clone(&event_store));
             store.record_queued(
@@ -2583,10 +3524,14 @@ mod tests {
                         "execution-restart",
                         "terminal-restart".to_string(),
                         ExecutionLiveStatus::Complete,
+                        7,
                     )
                     .unwrap(),
                 TerminalFenceClaim::Claimed
             );
+            let pending = store.execution_live("execution-restart").unwrap();
+            assert!(!pending.status.is_terminal());
+            assert!(pending.terminal_ref.is_none());
         }
 
         let recovered = ExecutionLiveStore::new(Arc::clone(&event_store));
@@ -2596,9 +3541,21 @@ mod tests {
                     "execution-restart",
                     "terminal-restart".to_string(),
                     ExecutionLiveStatus::Complete,
+                    7,
                 )
                 .unwrap(),
-            TerminalFenceClaim::SameWinner
+            TerminalFenceClaim::SamePending
+        );
+        assert_eq!(
+            recovered
+                .finalize_terminal(
+                    "execution-restart",
+                    "terminal-restart",
+                    ExecutionLiveStatus::Complete,
+                    7,
+                )
+                .unwrap(),
+            TerminalFenceClaim::Claimed
         );
         assert_eq!(
             recovered
@@ -2616,8 +3573,112 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_delivery_failure_aborts_pending_claim_and_reopens_cancellation() {
+        let event_store = Arc::new(RuntimeEventStore::for_test());
+        let store = ExecutionLiveStore::new(event_store);
+        let execution_id = "execution-abort-pending";
+        store.record_queued(
+            "session-abort-pending",
+            execution_id.to_string(),
+            "turn-abort-pending".to_string(),
+        );
+        assert_eq!(
+            store
+                .claim_terminal(
+                    execution_id,
+                    "terminal-stale".to_string(),
+                    ExecutionLiveStatus::Complete,
+                    3,
+                )
+                .unwrap(),
+            TerminalFenceClaim::Claimed
+        );
+        assert!(!store
+            .cancel(
+                execution_id,
+                "cancel waits for prepared delivery".to_string()
+            )
+            .unwrap());
+        assert!(store
+            .abort_terminal_claim(execution_id, "terminal-stale", 3)
+            .unwrap());
+        assert!(store
+            .cancel(execution_id, "cancel after deterministic abort".to_string())
+            .unwrap());
+        assert_eq!(
+            store.execution_live(execution_id).unwrap().status,
+            ExecutionLiveStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn session_foreground_enrichment_cannot_finalize_or_clear_delivery_claim() {
+        let event_store = Arc::new(RuntimeEventStore::for_test());
+        let store = ExecutionLiveStore::new(event_store);
+        let execution_id = "execution-enrichment-fence";
+        let terminal_ref = "terminal-enrichment-fence";
+        store.record_queued(
+            "session-enrichment-fence",
+            execution_id.to_string(),
+            "turn-enrichment-fence".to_string(),
+        );
+        assert_eq!(
+            store
+                .claim_terminal(
+                    execution_id,
+                    terminal_ref.to_string(),
+                    ExecutionLiveStatus::Complete,
+                    11,
+                )
+                .unwrap(),
+            TerminalFenceClaim::Claimed
+        );
+        let report = ContextTurnReport::new(
+            "turn-enrichment-fence",
+            harness_contract::context::ContextPressureState::new("default", 32_000, 512),
+        );
+
+        let error = store
+            .enrich_finalized_session_terminal(
+                execution_id,
+                ExecutionLiveStatus::Complete,
+                terminal_ref.to_string(),
+                &report,
+                &["must-not-appear.md".to_string()],
+                None,
+            )
+            .unwrap_err();
+        assert!(error.contains("enrichment rejected"));
+        assert!(!store
+            .execution_live(execution_id)
+            .unwrap()
+            .status
+            .is_terminal());
+        assert_eq!(
+            store
+                .claim_terminal(
+                    execution_id,
+                    terminal_ref.to_string(),
+                    ExecutionLiveStatus::Complete,
+                    11,
+                )
+                .unwrap(),
+            TerminalFenceClaim::SamePending,
+            "foreground enrichment must not remove the delivery winner"
+        );
+        assert!(store
+            .abort_terminal_claim(execution_id, terminal_ref, 11)
+            .unwrap());
+        assert!(!store
+            .execution_live(execution_id)
+            .unwrap()
+            .status
+            .is_terminal());
+    }
+
+    #[test]
     fn cancelled_winner_without_terminal_ref_survives_requested_crash_window() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         {
             let store = ExecutionLiveStore::new(Arc::clone(&event_store));
             store.record_queued(
@@ -2643,7 +3704,7 @@ mod tests {
 
     #[test]
     fn stale_nonterminal_checkpoint_cannot_overwrite_or_resurrect_terminal_winner() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let store = ExecutionLiveStore::new(Arc::clone(&event_store));
         let execution_id = "execution-stale-checkpoint";
         store.record_queued(
@@ -2682,7 +3743,7 @@ mod tests {
 
     #[test]
     fn completion_projects_real_memory_recall_occurrences_from_the_context_ledger() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let store = ExecutionLiveStore::new(event_store);
         store.record_queued(
             "session-a",
@@ -2726,7 +3787,7 @@ mod tests {
 
     #[test]
     fn generic_evidence_audits_are_not_relabelled_as_memory_evidence() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let store = ExecutionLiveStore::new(event_store);
         store.record_queued(
             "session-a",
@@ -2766,7 +3827,7 @@ mod tests {
 
     #[test]
     fn cumulative_model_telemetry_does_not_overwrite_request_context_occupancy() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let store = ExecutionLiveStore::new(event_store);
         let execution_id = "execution-multi-step";
         let context = CowdExecutionContext {
@@ -2811,6 +3872,7 @@ mod tests {
                         output_tokens: 40,
                         cache_create_tokens: 0,
                         cache_read_tokens: 0,
+                        cache_dimensions_known: true,
                         total_tokens: 1_340,
                         usage_source: "provider_actual".to_string(),
                         wall_chars_per_second: None,
@@ -2844,7 +3906,7 @@ mod tests {
 
     #[test]
     fn terminal_ledger_keeps_provider_model_window_and_calibrates_actual_input() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let store = ExecutionLiveStore::new(event_store);
         let execution_id = "execution-context-authority";
         let context = CowdExecutionContext {
@@ -2908,7 +3970,7 @@ mod tests {
 
     #[test]
     fn execution_graph_identity_is_persisted_separately_from_ingress_identity() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let store = ExecutionLiveStore::new(Arc::clone(&event_store));
         let execution_id = "session-ingress-graph:identity";
         let session_id = "session-graph-identity";
@@ -2959,7 +4021,7 @@ mod tests {
 
     #[test]
     fn blocked_terminal_remains_error_after_ledger_rehydration() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let store = ExecutionLiveStore::new(Arc::clone(&event_store));
         let execution_id = "execution-blocked";
         store.record_queued(
@@ -3000,7 +4062,7 @@ mod tests {
 
     #[test]
     fn completion_preserves_the_provider_observed_effective_model() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let store = ExecutionLiveStore::new(event_store);
         store.record_queued(
             "session-model",
@@ -3029,6 +4091,7 @@ mod tests {
                         output_tokens: 3,
                         cache_create_tokens: 0,
                         cache_read_tokens: 0,
+                        cache_dimensions_known: true,
                         total_tokens: 15,
                         usage_source: "provider_actual".to_string(),
                         wall_chars_per_second: None,

@@ -163,7 +163,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "read_file",
-            description: "Read a workspace text file. By default this returns a bounded line window; for ordinary large-file analysis, use grep_search first and read matching regions. When the task explicitly requires whole-file or EOF coverage, set complete=true to return the entire file under the file-size safety ceiling; complete cannot be combined with offset or limit.",
+            description: "Read a workspace text file. By default this returns a bounded line window; for ordinary large-file analysis, use grep_search first and read matching regions. When the task explicitly requires whole-file or EOF coverage, set complete=true to return the entire file under the file-size safety ceiling. If complete=true is sent with an inherited offset or limit, complete coverage safely takes precedence.",
             input_schema: json!({
                 "type": "object",
                 "properties": {

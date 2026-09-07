@@ -32,7 +32,6 @@ use std::{
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use crate::store::sqlite::SqliteStore;
 use crate::{error::MemoryError, types::MemoryId};
 
 // ─── Serialisation envelope ───────────────────────────────────────────────────
@@ -94,13 +93,12 @@ struct PersistenceCoordinator {
 }
 
 /// Immutable, cheap persistence view. Capturing it clones only `Arc` handles;
-/// serialisation and SQLite I/O happen after the `VectorIndex` lock is released.
+/// serialisation and file I/O happen after the `VectorIndex` lock is released.
 pub struct VectorPersistenceSnapshot {
     generation: u64,
     dimension: u32,
     vectors: Vec<(MemoryId, Arc<Vec<f32>>)>,
     persist_path: PathBuf,
-    sqlite_store: Option<SqliteStore>,
     coordinator: Arc<PersistenceCoordinator>,
 }
 
@@ -129,8 +127,6 @@ pub struct VectorIndex {
     max_entries: usize,
     /// Insertion order for LRU eviction (front = oldest).
     insert_order: VecDeque<MemoryId>,
-    /// Optional SQLite store for dual persistence (JSON + BLOB).
-    sqlite_store: Option<SqliteStore>,
     /// Monotonic content generation. Every effective mutation advances it.
     generation: u64,
     /// Number of capacity evictions since this process loaded the index.
@@ -150,39 +146,15 @@ impl VectorIndex {
             dimension,
             max_entries: 50_000,
             insert_order: VecDeque::new(),
-            sqlite_store: None,
             generation: 0,
             evictions: 0,
             persistence: Arc::new(PersistenceCoordinator::default()),
         })
     }
 
-    /// Attach a [`SqliteStore`] for dual persistence (SQLite BLOB + JSON file).
-    ///
-    /// When set, [`persist`] writes to both the JSON file and the SQLite
-    /// `vector_embeddings` table.  [`load`] tries SQLite first, falling back
-    /// to the JSON file if the table is empty.
-    pub fn set_sqlite_store(&mut self, store: SqliteStore) {
-        self.sqlite_store = Some(store);
-    }
-
-    /// Load a previously persisted index from disk.
-    ///
-    /// If a [`SqliteStore`] has been attached via [`set_sqlite_store`], tries to
-    /// load from the `vector_embeddings` table first.  Falls back to the JSON
-    /// file if the table is empty or no store is configured.
-    ///
-    /// Returns an empty index (with the given `dimension`) if neither source has
-    /// data, making cold-start initialisation transparent.
+    /// Load a previously persisted rebuildable index from its canonical JSON artifact.
+    /// Missing artifacts produce an empty index.
     pub fn load(persist_path: PathBuf, dimension: u32) -> Result<Self, MemoryError> {
-        Self::load_with_store(persist_path, dimension, None)
-    }
-
-    pub fn load_with_store(
-        persist_path: PathBuf,
-        dimension: u32,
-        sqlite_store: Option<SqliteStore>,
-    ) -> Result<Self, MemoryError> {
         let auto_dimension = dimension == 0;
         let mut idx = Self {
             vectors: HashMap::new(),
@@ -190,46 +162,10 @@ impl VectorIndex {
             dimension,
             max_entries: 50_000,
             insert_order: VecDeque::new(),
-            sqlite_store,
             generation: 0,
             evictions: 0,
             persistence: Arc::new(PersistenceCoordinator::default()),
         };
-
-        if let Some(ref store) = idx.sqlite_store {
-            match store.load_vectors_from_sqlite() {
-                Ok(vectors) if !vectors.is_empty() => {
-                    let dim = vectors.values().next().map_or(0, |v| v.len() as u32);
-                    if auto_dimension {
-                        idx.dimension = dim;
-                    } else if dim != idx.dimension {
-                        return Err(MemoryError::InvalidArgument(format!(
-                            "dimension mismatch: index has {dim}, requested {}",
-                            idx.dimension
-                        )));
-                    }
-                    Self::validate_loaded_vectors(&vectors, idx.dimension)?;
-                    idx.vectors = vectors
-                        .into_iter()
-                        .map(|(id, embedding)| (id, Arc::new(embedding)))
-                        .collect();
-                    idx.generation = store
-                        .load_vector_generation_from_sqlite()
-                        .unwrap_or_default();
-                    idx.persistence
-                        .persisted_generation
-                        .store(idx.generation, Ordering::Release);
-                    idx.restore_insert_order();
-                    return Ok(idx);
-                }
-                Ok(_) => {
-                    // Table exists but is empty — fall through to JSON.
-                }
-                Err(_) => {
-                    // Table might not exist yet — fall through to JSON.
-                }
-            }
-        }
 
         // JSON fallback
         match fs::read_to_string(&idx.persist_path) {
@@ -296,9 +232,6 @@ impl VectorIndex {
 
     /// Persist the index to [`persist_path`] atomically.
     ///
-    /// If a [`SqliteStore`] has been attached, also writes to the
-    /// `vector_embeddings` table for dual persistence.
-    ///
     /// Uses write-to-temp-then-rename to avoid corruption on interrupted writes.
     pub fn persist(&self) -> Result<(), MemoryError> {
         self.persistence_snapshot().persist()
@@ -317,32 +250,8 @@ impl VectorIndex {
             dimension: self.dimension,
             vectors,
             persist_path: self.persist_path.clone(),
-            sqlite_store: self.sqlite_store.clone(),
             coordinator: Arc::clone(&self.persistence),
         }
-    }
-
-    /// Persist vectors to the attached [`SqliteStore`] only (JSON file is not
-    /// written by this method).
-    pub fn persist_to_sqlite(&self) -> Result<(), MemoryError> {
-        let store = self
-            .sqlite_store
-            .as_ref()
-            .ok_or_else(|| MemoryError::Store("no SqliteStore configured".into()))?;
-        let snapshot = self.persistence_snapshot();
-        store.save_vector_snapshot_to_sqlite(&snapshot.vectors, self.dimension, snapshot.generation)
-    }
-
-    /// Load vectors from a [`SqliteStore`] into a new `VectorIndex`.
-    ///
-    /// The JSON `persist_path` is still required for the file-backed fallback.
-    /// If the `vector_embeddings` table is empty, returns an empty index.
-    pub fn load_from_sqlite(
-        persist_path: PathBuf,
-        dimension: u32,
-        store: SqliteStore,
-    ) -> Result<Self, MemoryError> {
-        Self::load_with_store(persist_path, dimension, Some(store))
     }
 
     // ─── Mutation ─────────────────────────────────────────────────────────────
@@ -579,28 +488,6 @@ impl VectorIndex {
         self.insert_order = ids.into();
     }
 
-    fn validate_loaded_vectors(
-        vectors: &HashMap<MemoryId, Vec<f32>>,
-        dimension: u32,
-    ) -> Result<(), MemoryError> {
-        if vectors.len() > 50_000 {
-            return Err(MemoryError::Store(format!(
-                "vector index exceeds the 50000 entry limit: {}",
-                vectors.len()
-            )));
-        }
-        for embedding in vectors.values() {
-            if embedding.len() != dimension as usize
-                || embedding.iter().any(|value| !value.is_finite())
-            {
-                return Err(MemoryError::Store(
-                    "vector index contains an invalid embedding".into(),
-                ));
-            }
-        }
-        Ok(())
-    }
-
     fn validate_loaded_arc_vectors(
         vectors: &HashMap<MemoryId, Arc<Vec<f32>>>,
         dimension: u32,
@@ -716,15 +603,6 @@ impl VectorPersistenceSnapshot {
                 .sync_all()
                 .map_err(|error| MemoryError::Store(format!("fsync tmp index file: {error}")))?;
 
-            // SQLite is updated transactionally before the canonical JSON
-            // replace. Any failure therefore leaves the old JSON intact.
-            if let Some(store) = &self.sqlite_store {
-                store.save_vector_snapshot_to_sqlite(
-                    &self.vectors,
-                    self.dimension,
-                    self.generation,
-                )?;
-            }
             fs::rename(&tmp, &self.persist_path)
                 .map_err(|error| MemoryError::Store(format!("replace vector index: {error}")))?;
             fs::File::open(parent)
@@ -1086,30 +964,5 @@ mod tests {
         }
         writer.join().unwrap();
         assert_eq!(index.read().count(), 2_050);
-    }
-
-    #[test]
-    fn sqlite_snapshot_over_parameter_limit_remains_complete() {
-        let tmp = TempDir::new().unwrap();
-        let store = SqliteStore::open_path(&tmp.path().join("memory.db")).unwrap();
-        let path = tmp.path().join("idx.json");
-        let mut index = VectorIndex::new(path.clone(), 2).unwrap();
-        index.set_sqlite_store(store.clone());
-        for ordinal in 1..=1_200_u128 {
-            index
-                .upsert(MemoryId::from_u128(ordinal), vec![ordinal as f32, 1.0])
-                .unwrap();
-        }
-        index.persist().unwrap();
-        assert_eq!(store.load_vectors_from_sqlite().unwrap().len(), 1_200);
-        for ordinal in 1..=100_u128 {
-            index.remove(&MemoryId::from_u128(ordinal)).unwrap();
-        }
-        index.persist().unwrap();
-        assert_eq!(store.load_vectors_from_sqlite().unwrap().len(), 1_100);
-        let restored = VectorIndex::load_with_store(path, 2, Some(store)).unwrap();
-        assert_eq!(restored.count(), 1_100);
-        assert_eq!(restored.runtime_stats().generation, 1_300);
-        assert_eq!(restored.runtime_stats().persisted_generation, 1_300);
     }
 }

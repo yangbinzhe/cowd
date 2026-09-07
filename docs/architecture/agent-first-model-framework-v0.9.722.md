@@ -120,6 +120,7 @@ Published -> Claimed -> Submitted -> Accepted
 - reviewer 负责 `task_review`，accept/rework 必须引用实际检查证据；
 - accepted Task 的 `unresolved` 仍在报告中保留，但不被第二 owner 重新否决；
 - 最终 Artifact 通过“实际提交该 Artifact 的 accepted Task → Task depends_on”传递血缘证明跨 Team 集成；依赖已被合法 supersede 时，遍历同 Team replacement lineage，并仍只让 accepted successor 贡献覆盖；模型只需维护正常依赖 DAG，不必在最终 Artifact 重复枚举全部上游引用；模型可写的 `Artifact.relates_to` 只作语义导航，不能单独证明 Team 覆盖；Runtime 以循环安全的确定性图遍历验收；
+- 当所有现有 delivery Task 已 accepted 而尚无上述可验收 Artifact 时，Root 仅收到“发布一个依赖这些 delivery Task 的综合 Task”这一事实性闭环动作；它仍自行选择 Team、作者、目标、验收标准、证据和综合内容。只有存在可验收的 accepted integration Artifact 后，Root 才收到 `objective_complete_request`。这使模型看到的终态动作与 ObjectiveSupervisor 的可达条件完全一致，避免重复提交 root-only Artifact；
 - Objective 只有在依赖 Task 已接受、物理 Agent 图无失败、目标级 `unresolved` 为空、关键交付存在时才 Verified；
 - evaluator 同时检查语义 Program 和物理 Agent 图，禁止“任务看起来都 accepted、但 reviewer/worker graph 实际 failed”的假通过。
 
@@ -148,6 +149,8 @@ v0.9.721 → v0.9.722 完成大规模不兼容切除：
 - 删除 orchestration coordinator/compiler/planner/recipe/template/team-instantiation 双路径；
 - 删除 `runtime_orchestrate`、`submit_collaboration_decision`、`request_collaboration_escalation` 生产入口；
 - 删除 Team-local 第二状态机、结果 reducer 和模板候选控制面；
+- 不兼容删除 `TeamTemplate` contract/store/resolver/bootstrap/registry、`/api/team-templates`、Surface/TUI catalog 和 `RuntimeEventScope::TeamTemplate`；动态 Team 只由 Agent Action journal 与 `AgenticTeamProjection` 承载；
+- 删除 strategy/Agent packet 的 `requires_managed_collaboration_escalation` 死字段、`ExecutionGraph.orchestration` 假图元数据和无生产 writer 的 `collaboration_receipt`；策略只表达需求，Agentic Program journal 才是协同事实 owner；
 - 删除长 JSON 编排与 prompt repair 作为状态机修复的做法；
 - Gateway executor 拆分为授权执行、证据、Runtime tools、introspection 和 host 适配模块；
 - Agent worker 拆分为 model loop、tool turn、scope、evidence collector、terminal 模块。
@@ -166,6 +169,7 @@ v0.9.721 → v0.9.722 完成大规模不兼容切除：
 8. Session、Runtime DB、workspace artifacts、harness report 四方事实一致。
 9. MFG snapshot/delta/resync 和生产 dist 浏览器门禁通过。
 10. 指定模型唯一，provider 不静默回退；版本、分支、tag、安装二进制 SHA 可追溯。
+11. 生产源中 `TeamTemplate|team_template|team-templates`、`requires_managed_collaboration_escalation`、`ExecutionOrchestrationMetadata|ReplaceGraphOrchestration`、`collaboration_receipt` 均为零引用；`AgenticTeamProjection`、Agent Action Team/Agent/Task 编排和实际 Agent 图必须继续通过回归。
 
 ## 12. 非目标与边界
 
@@ -173,3 +177,43 @@ v0.9.721 → v0.9.722 完成大规模不兼容切除：
 - 框架不把“更多 Agent”当作质量本身；高耦合工作可由少量 Agent 深做，独立工作才并发。
 - 安全和权限边界不会为追求自治而取消；业务流程硬编码、固定团队模板和费用型截断则不属于安全边界。
 - SQLite 可用于隔离测试；生产仍按配置使用 PostgreSQL 优先拓扑，不能静默热切换或双写。
+
+## 13. 最终恢复、缓存与成本真实性收口
+
+真实复杂场景暴露的最后一组问题不是模型能力不足，而是三个框架边界混淆：进程生命周期被当成业务取消、恢复生产者在 Session resolver 就绪前抢跑、请求本地上下文和大型 mutation 输出被错误沉淀进后续 Provider 历史。v0.9.722 的终态约束如下。
+
+### 13.1 恢复是有向依赖门，不是并发启动竞赛
+
+Gateway 在开放 HTTP/Surface ingress、Mission scheduler、Mission Organizer 和任何 Program reconcile 之前，必须同步完成：
+
+```text
+required Session hydration / scoped resolver install
+  -> nonterminal ExecutionGraph recovery
+  -> graph recovery report.errors == empty
+  -> Agentic Program dispatch reconciliation
+  -> Agentic Program wait reconciliation
+  -> business admission opens
+```
+
+每个阶段最多执行有界、幂等的启动重试；失败后启动整体失败并留下恢复报告，绝不在依赖不完整时开放一半业务能力。`executor unavailable` 仍然 fail-fast，不能用无限等待把真实接线错误伪装成“运行中”。
+
+正常 SIGTERM、滚动部署、测试观察者退出只关闭进程本地 admission 并停止本地 task；非终态图保持持久化 `Running/Ready` 事实供下一进程恢复。只有显式 Session cancel API 可以写入 Requested/Cancelled 业务回执并向子图传播。Evaluator 超时同样必须调用该 API，禁止用 GNU `timeout` 杀进程代替取消协议。
+
+### 13.2 Provider 请求只能是“稳定前缀 + 真实历史 + 当前尾部”
+
+每次请求从 canonical source 重建：共享 Program/Team 前缀、Agent 私有角色前缀、真实 Session transcript、且仅一个当前 Runtime capsule。时钟、策略、checkpoint、当前证据选择等 request-local 信息永不写回 Provider wire history。Agent 私有角色位于真实历史之前，使同一 Agent 的连续回合保持稳定；兄弟 Agent 仍共享更前面的 cohort 段。
+
+write/edit 完整回显不再进入下一轮模型上下文。Runtime 返回可验证的语义回执：路径、最终内容字节数与 SHA-256、前态字节数与 SHA-256、替换次数、原始 `tool://` evidence URI；完整原文仍在 evidence store 按需读取。edit 回执必须从 `originalFile + oldString/newString + replaceAll` 重建最终内容，禁止把 replacement fragment 当成最终文件，也禁止把整文件 patch 行数冒充实际增删行。
+
+### 13.3 缓存只认 Provider 原生 usage
+
+结构前缀复用率只证明请求构造稳定，不能证明账单命中。Provider usage 必须以四维事实贯穿 Provider、Session event、ExecutionUsage、terminal receipt、Harness 和 MFG projection：
+
+- input miss tokens；
+- output tokens；
+- cache creation input tokens；
+- cache read input tokens。
+
+DeepSeek hit/miss 字段以“字段存在性”归一化，显式 miss=0 是 100% hit，不能回退成完整 prompt 再与 hit 双计；OpenAI Chat `prompt_tokens_details`、Responses `input_tokens_details` 和 legacy split 分别解析。Provider 未返回 usage 时必须标记 unknown，不能生成 known-zero；已 packed 但没有 outcome 的崩溃窗口请求也计入 unknown。`cached_tokens` 只保留为 cache-read 的展示别名，不得再把 cache creation 合并后当命中。
+
+最终缓存验收同时要求 provider usage 完整、原生 cache-read 比率达标和结构复用比率达标；任一 unknown attempt 都使“缓存命中已证明”不成立。

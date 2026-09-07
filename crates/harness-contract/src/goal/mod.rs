@@ -21,7 +21,20 @@ pub enum AcceptanceStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcceptanceCriterion {
     pub id: String,
+    /// A concise, human-readable description.  It is deliberately not a
+    /// storage selector: long or evolving source material remains in the
+    /// durable content store and is named below.
     pub statement: String,
+    /// Canonical content that supplies the criterion's semantic statement.
+    /// Runtime validates visibility/readability before accepting this ref;
+    /// consumers must never mistake a selector string for the statement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statement_ref: Option<String>,
+    /// Original user input, attachments, or approved refinements that justify
+    /// this criterion.  This keeps scope changes auditable without copying
+    /// unbounded text into the Goal journal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_refs: Vec<String>,
     #[serde(default)]
     pub required_evidence: Vec<String>,
     pub status: AcceptanceStatus,
@@ -46,6 +59,73 @@ pub enum GoalCompletion {
     Failed,
     WaitingExternalDecision,
     Cancelled,
+}
+
+/// Whether a Goal is the user-visible Objective or a Runtime-local helper.
+/// Local Goals may inform their parent but must never be presented as a
+/// substitute terminal result for the user request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalScope {
+    #[default]
+    UserObjective,
+    Internal,
+}
+
+/// Immutable lineage joining the durable Goal, conversational turn, physical
+/// root execution and Agentic Program. These identities are Runtime-owned;
+/// model actions can only be authorized against an existing binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalExecutionBinding {
+    pub objective_id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub root_execution_id: String,
+    pub agentic_program_id: String,
+}
+
+/// A temporary, non-terminal reason why an Objective cannot presently make
+/// progress. It is intentionally distinct from a final Blocked outcome so a
+/// durable recovery signal can resume the same Objective without recreating
+/// a team or losing already proved work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitDescriptor {
+    pub reason_code: String,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_refs: Vec<String>,
+    pub generation: u64,
+}
+
+/// A user-sourced participation requirement. Runtime checks actual durable
+/// contribution records, not a roster size or a copied number in an Agent
+/// action binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParticipationRequirement {
+    pub minimum_team_count: u8,
+    pub source_ref: String,
+}
+
+/// Durable semantic review metadata. Runtime records identity and the exact
+/// Objective specification/evidence versions; the reviewer supplies only a
+/// bounded decision and references, never a self-declared independence flag.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectiveReviewRecord {
+    pub review_id: String,
+    pub criterion_ref: String,
+    pub spec_revision: u64,
+    pub input_manifest_digest: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub result_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+    pub reviewer_actor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_execution_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub producer_refs: Vec<String>,
+    pub decision: String,
+    pub reason_ref: String,
 }
 
 /// Durable state of one business obligation.  It is intentionally distinct
@@ -175,13 +255,37 @@ pub struct GoalContract {
     pub unresolved: Vec<String>,
     #[serde(default)]
     pub blockers: Vec<String>,
+    #[serde(default)]
+    pub scope: GoalScope,
+    /// The immutable criterion that represents the full original user input.
+    /// Later model refinements may add criteria but cannot retire this anchor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_intent_criterion_id: Option<String>,
+    /// Durable Session input/attachment manifest reference. It deliberately
+    /// stores a selector rather than copying user text into every event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_intent_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_binding: Option<GoalExecutionBinding>,
+    /// Changes only when the business Objective changes; `revision` remains
+    /// the generic event/CAS revision and may advance for progress updates.
+    #[serde(default)]
+    pub spec_revision: u64,
+    #[serde(default)]
+    pub spec_digest: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub review_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviews: Vec<ObjectiveReviewRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<WaitDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub participation_requirement: Option<ParticipationRequirement>,
     /// The only business obligations that can promote the Objective to a
     /// terminal result. Team/graph local terminal facts feed these entries but
     /// never substitute for them.
     #[serde(default)]
     pub obligations: Vec<ObjectiveObligation>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub program_ref: Option<String>,
     /// Runtime-owned bounded semantic recovery cursor.  This is deliberately
     /// additive so older goal streams remain readable and default to no
     /// recovery attempts.
@@ -524,6 +628,8 @@ mod tests {
             objective: "finish the governed task".into(),
             criteria: vec![AcceptanceCriterion {
                 id: "criterion-1".into(),
+                statement_ref: None,
+                source_refs: Vec::new(),
                 statement: "produce checked result".into(),
                 required_evidence: vec!["evidence:1".into()],
                 status: AcceptanceStatus::Open,
@@ -534,13 +640,22 @@ mod tests {
             evidence_refs: Vec::new(),
             unresolved: Vec::new(),
             blockers: Vec::new(),
+            scope: GoalScope::Internal,
+            user_intent_criterion_id: Some("criterion-1".into()),
+            source_intent_ref: Some("session_message:message-1".into()),
+            execution_binding: None,
+            spec_revision: 1,
+            spec_digest: "test-spec".into(),
+            review_refs: Vec::new(),
+            waiting: None,
+            participation_requirement: None,
             obligations: Vec::new(),
-            program_ref: None,
             recovery: None,
             terminal: None,
             completion: GoalCompletion::Open,
             revision: 1,
             user_sequence: 1,
+            reviews: Vec::new(),
         };
         assert_eq!(
             serde_json::from_str::<GoalContract>(&serde_json::to_string(&contract).unwrap())

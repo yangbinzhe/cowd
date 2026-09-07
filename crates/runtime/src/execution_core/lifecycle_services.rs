@@ -11,6 +11,17 @@ impl RuntimeServices {
     pub async fn recover_agentic_program_waits_on_startup(
         &self,
     ) -> Result<usize, RuntimeServicesError> {
+        let excluded_sessions = BTreeSet::new();
+        self.recover_agentic_program_waits_on_startup_excluding_sessions(&excluded_sessions)
+            .await
+    }
+
+    /// Reconcile Program root barriers whose owning Session is hydrated.
+    /// Excluded Sessions retain their durable wait unchanged for a later pass.
+    pub async fn recover_agentic_program_waits_on_startup_excluding_sessions(
+        &self,
+        excluded_sessions: &BTreeSet<String>,
+    ) -> Result<usize, RuntimeServicesError> {
         let streams = self
             .event_store
             .stream_ids_for_scope(RuntimeEventScope::Program)
@@ -21,6 +32,12 @@ impl RuntimeServices {
             let Some(program_id) = stream.strip_prefix("agentic-program:") else {
                 continue;
             };
+            let projection = actions
+                .project(program_id)
+                .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+            if excluded_sessions.contains(&projection.session_id) {
+                continue;
+            }
             self.reconcile_agentic_completion_request(program_id)
                 .map_err(RuntimeServicesError::Invariant)?;
             resolved = resolved.saturating_add(
@@ -423,14 +440,11 @@ impl RuntimeServices {
             .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
         let mut latest = BTreeMap::new();
         for event in events {
-            let Some(episode) = event.payload.get("episode").and_then(|value| {
-                serde_json::from_value::<
-                    harness_contract::evolution::CollaborationExperienceEpisode,
-                >(value.clone())
-                .ok()
-            }) else {
-                continue;
-            };
+            let episode: harness_contract::evolution::CollaborationExperienceEpisode =
+                serde_json::from_value(event.payload.get("episode").cloned().ok_or_else(|| {
+                    RuntimeServicesError::Invariant("collaboration episode payload missing".into())
+                })?)
+                .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
             latest.insert(episode.episode_id.clone(), episode);
         }
         let mut episodes = latest.into_values().collect::<Vec<_>>();
@@ -446,33 +460,8 @@ impl RuntimeServices {
         limit: usize,
     ) -> Result<Vec<harness_contract::evolution::CollaborationSemanticPattern>, RuntimeServicesError>
     {
-        let events = self
-            .event_store
-            .replay_scope_stream_prefix(RuntimeEventScope::Evolution, "evolution:pattern:")
-            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
-        let mut latest = BTreeMap::new();
-        for event in events {
-            if event.kind != "evolution.collaboration_pattern.projected.v1" {
-                continue;
-            }
-            let Some(pattern) = event.payload.get("pattern").and_then(|value| {
-                serde_json::from_value::<harness_contract::evolution::CollaborationSemanticPattern>(
-                    value.clone(),
-                )
-                .ok()
-            }) else {
-                continue;
-            };
-            latest.insert(pattern.pattern_id.clone(), pattern);
-        }
-        let mut patterns = latest.into_values().collect::<Vec<_>>();
-        patterns.sort_by(|left, right| {
-            right
-                .latest_completed_at_ms
-                .cmp(&left.latest_completed_at_ms)
-        });
-        patterns.truncate(limit);
-        Ok(patterns)
+        crate::evolution::collaboration_experience::read_patterns(&self.event_store, limit)
+            .map_err(RuntimeServicesError::Invariant)
     }
 
     pub fn evolution_candidates(
@@ -663,6 +652,10 @@ impl RuntimeServices {
                 semantic_signature_digest,
                 episode_ids,
                 aggregate_digest,
+                executable_baseline_ref,
+                executable_baseline_content_digest,
+                replay_manifest_ref,
+                replay_manifest_digest,
             } => {
                 let crate::EvolutionCandidateSubject::AgentDefinition { revision_ref } =
                     &intent.subject;
@@ -684,6 +677,9 @@ impl RuntimeServices {
                     .collect::<std::collections::BTreeSet<_>>();
                 if semantic_signature_digest.trim().is_empty()
                     || aggregate_digest.trim().is_empty()
+                    || executable_baseline_content_digest.trim().is_empty()
+                    || replay_manifest_ref.trim().is_empty()
+                    || replay_manifest_digest.trim().is_empty()
                     || episode_ids.len() < 3
                     || distinct.len() != episode_ids.len()
                     || episode_ids.iter().any(|id| id.trim().is_empty())
@@ -744,6 +740,23 @@ impl RuntimeServices {
                     return Err(RuntimeServicesError::Invariant(
                         "episode evaluation baseline is not backed by an advisory pattern"
                             .to_string(),
+                    ));
+                }
+                if executable_baseline_ref == revision_ref {
+                    return Err(RuntimeServicesError::Invariant(
+                        "episode evaluation baseline cannot execute the candidate revision"
+                            .to_string(),
+                    ));
+                }
+                let executable_baseline = self
+                    .definition_registry
+                    .resolve_agent_canary(executable_baseline_ref)
+                    .map_err(RuntimeServicesError::from)?;
+                if executable_baseline.revision.content_digest
+                    != *executable_baseline_content_digest
+                {
+                    return Err(RuntimeServicesError::Invariant(
+                        "episode evaluation executable baseline content digest changed".to_string(),
                     ));
                 }
                 None
@@ -969,7 +982,11 @@ impl RuntimeServices {
         scenario
             .validate()
             .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
-        validate_evolution_scenario_isolation(scenario, self.tool_execution_host.as_deref())?;
+        validate_evolution_scenario_isolation(
+            scenario,
+            self.tool_execution_host.as_deref(),
+            &self.skill_catalog(),
+        )?;
         self.ensure_evolution_execution_policy(&format!("evolution-eval:{candidate_id}"))?;
         let candidate = self.evolution_candidate(candidate_id)?;
         let crate::EvolutionCandidateSubject::AgentDefinition { revision_ref } = &candidate.subject;
@@ -983,30 +1000,58 @@ impl RuntimeServices {
                 "scenario is absent from the candidate's immutable evaluation contract".to_string(),
             ));
         }
-        let baseline_revision = candidate
-            .evaluation_baseline
-            .as_ref()
-            .and_then(crate::EvolutionEvaluationBaseline::published_revision)
-            .ok_or_else(|| {
-                RuntimeServicesError::Invariant(
-                    "episode-set evolution baseline requires its dedicated outcome evaluator"
-                        .to_string(),
+        let baseline = match candidate.evaluation_baseline.as_ref().ok_or_else(|| {
+            RuntimeServicesError::Invariant("evolution candidate has no baseline".to_string())
+        })? {
+            crate::EvolutionEvaluationBaseline::PublishedRevision { revision, .. } => {
+                let baseline_ref = harness_contract::agent::AgentDefinitionRevisionRef::new(
+                    revision_ref.definition_id.clone(),
+                    *revision,
                 )
-            })?;
-        let baseline_ref = harness_contract::agent::AgentDefinitionRevisionRef::new(
-            revision_ref.definition_id.clone(),
-            baseline_revision,
-        )
-        .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
-        let baseline = self
-            .definition_registry
-            .resolve_agent(
-                &baseline_ref.definition_id,
-                RevisionSelector::ExactApprovedRevision {
-                    revision: baseline_ref.revision,
-                },
-            )
-            .map_err(RuntimeServicesError::from)?;
+                .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+                self.definition_registry
+                    .resolve_agent(
+                        &baseline_ref.definition_id,
+                        RevisionSelector::ExactApprovedRevision {
+                            revision: baseline_ref.revision,
+                        },
+                    )
+                    .map_err(RuntimeServicesError::from)?
+            }
+            crate::EvolutionEvaluationBaseline::EpisodeSet {
+                aggregate_digest,
+                executable_baseline_ref,
+                executable_baseline_content_digest,
+                replay_manifest_ref,
+                replay_manifest_digest,
+                ..
+            } => {
+                let replay = scenario.replay_manifest.as_ref().ok_or_else(|| {
+                    RuntimeServicesError::Invariant(
+                        "episode evaluation scenario has no frozen replay manifest".to_string(),
+                    )
+                })?;
+                if replay.manifest_ref != *replay_manifest_ref
+                    || replay.source_episode_set_digest != *aggregate_digest
+                    || scenario.executable_replay_digest() != *replay_manifest_digest
+                {
+                    return Err(RuntimeServicesError::Invariant(
+                        "episode evaluation replay manifest does not match the registered baseline"
+                            .to_string(),
+                    ));
+                }
+                let resolved = self
+                    .definition_registry
+                    .resolve_agent_canary(executable_baseline_ref)
+                    .map_err(RuntimeServicesError::from)?;
+                if resolved.revision.content_digest != *executable_baseline_content_digest {
+                    return Err(RuntimeServicesError::Invariant(
+                        "episode evaluation executable baseline content digest changed".to_string(),
+                    ));
+                }
+                resolved
+            }
+        };
         let proposed = self
             .definition_registry
             .resolve_agent_canary(revision_ref)
@@ -1015,7 +1060,11 @@ impl RuntimeServices {
             &candidate,
             scenario,
             baseline,
-            None,
+            Some(AgentEvaluationBinding {
+                candidate_id: candidate.candidate_id.clone(),
+                scenario_ref: scenario.scenario_ref.clone(),
+                role: harness_contract::agent::AgentEvaluationRole::Baseline,
+            }),
             "baseline",
             sample_index,
         )?;
@@ -1026,10 +1075,14 @@ impl RuntimeServices {
             Some(AgentEvaluationBinding {
                 candidate_id: candidate.candidate_id.clone(),
                 scenario_ref: scenario.scenario_ref.clone(),
+                role: harness_contract::agent::AgentEvaluationRole::Candidate,
             }),
             "candidate",
             sample_index,
         )?;
+        // Both sides execute the same immutable inputs and ceilings. Distinct
+        // run/session identities and side-specific output leases prevent the
+        // first run from contaminating the second.
         let started = Instant::now();
         let baseline_return = self
             .agent_runtime
@@ -1044,20 +1097,34 @@ impl RuntimeServices {
             .await
             .map_err(RuntimeServicesError::AgentRuntime)?;
         let candidate_elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-        Ok((
-            scenario_observation(
-                &baseline_packet,
-                &baseline_return,
-                scenario,
-                baseline_elapsed_ms,
-            ),
-            scenario_observation(
-                &candidate_packet,
-                &candidate_return,
-                scenario,
-                candidate_elapsed_ms,
-            ),
-        ))
+        let baseline_observation = scenario_observation(
+            &baseline_packet,
+            &baseline_return,
+            scenario,
+            baseline_elapsed_ms,
+        );
+        let candidate_observation = scenario_observation(
+            &candidate_packet,
+            &candidate_return,
+            scenario,
+            candidate_elapsed_ms,
+        );
+        if baseline_observation.environment_fingerprint
+            != candidate_observation.environment_fingerprint
+        {
+            return Err(RuntimeServicesError::Invariant(
+                "paired evolution executions observed different environments".to_string(),
+            ));
+        }
+        if let Some(replay) = &scenario.replay_manifest {
+            if replay.environment_fingerprint != baseline_observation.environment_fingerprint {
+                return Err(RuntimeServicesError::Invariant(
+                    "paired evolution environment no longer matches the frozen replay manifest"
+                        .to_string(),
+                ));
+            }
+        }
+        Ok((baseline_observation, candidate_observation))
     }
 
     fn compile_evolution_scenario_packet(
@@ -1079,7 +1146,10 @@ impl RuntimeServices {
             sample_index
         );
         let task_id = format!("{run_id}:task");
-        let session_id = format!("evolution-eval:{}", candidate.candidate_id);
+        let session_id = format!(
+            "evolution-eval:{}:{side}:{sample_index}",
+            candidate.candidate_id
+        );
         let mut request = AgentBindingRequest::new(
             revision_ref.definition_id.clone(),
             RevisionSelector::ExactApprovedRevision {
@@ -1105,6 +1175,23 @@ impl RuntimeServices {
         .map_err(|error| RuntimeServicesError::AgentRuntime(error.to_string()))?;
         let deadline_at_ms = now_ms()
             .saturating_add(harness_contract::agent::DEFAULT_DELEGATED_EXECUTION_TIMEOUT_MS);
+        let isolation_digest = format!(
+            "{:x}",
+            Sha256::digest(format!(
+                "{}\0{}\0{side}\0{sample_index}",
+                candidate.candidate_id, scenario.scenario_ref
+            ))
+        );
+        let output_scope = format!(".cowd/evaluation/{isolation_digest}");
+        let mut resource_scopes = scenario.resource_scopes.clone();
+        resource_scopes.push(format!("write:{output_scope}"));
+        resource_scopes.sort();
+        resource_scopes.dedup();
+        let context_refs = scenario
+            .replay_manifest
+            .as_ref()
+            .map(|manifest| manifest.attachment_refs.clone())
+            .unwrap_or_default();
         let intent = AgentTaskIntent {
             selected_agent_id: None,
             definition_ref: Some(revision_ref),
@@ -1128,15 +1215,15 @@ impl RuntimeServices {
                 evidence_obligations: Vec::new(),
             },
             output_acceptance: Vec::new(),
-            requires_managed_collaboration_escalation: false,
             acceptance: scenario.acceptance.clone(),
             constraints: vec![
                 "evolution_evaluation:isolation_required".to_string(),
                 format!("evaluation_scenario:{}", scenario.scenario_ref),
+                format!("evaluation_output_scope:{output_scope}"),
             ],
-            context_refs: Vec::new(),
+            context_refs,
             evidence_refs: Vec::new(),
-            resource_scopes: Vec::new(),
+            resource_scopes,
             allowed_tools: scenario.allowed_tools.clone(),
             allowed_skills: scenario.allowed_skills.clone(),
             permission_ceiling: scenario.permission_ceiling.clone(),
@@ -1152,6 +1239,7 @@ impl RuntimeServices {
             deadline_at_ms,
             managed_invocation: None,
             idempotency_key: format!("evolution-eval:{}", run_id),
+            agentic_binding: None,
         };
         let execution_identity = self.prepare_agent_task_intent(&intent)?;
         let policy_revision = self.canonical_task_policy_revision(&intent.task_id)?;
@@ -1197,13 +1285,108 @@ impl RuntimeServices {
     pub async fn recover_execution_graphs_on_startup(
         &self,
     ) -> Result<ExecutionStartupRecoveryReport, RuntimeServicesError> {
+        let excluded_sessions = BTreeSet::new();
+        self.recover_execution_graphs_on_startup_excluding_sessions(&excluded_sessions)
+            .await
+    }
+
+    /// Recover durable graphs whose Session Runtime has completed hydration.
+    /// A graph owned by an excluded Session remains byte-for-byte unchanged and
+    /// is reported as deferred so a later partitioned pass can resume it.
+    pub async fn recover_execution_graphs_on_startup_excluding_sessions(
+        &self,
+        excluded_sessions: &BTreeSet<String>,
+    ) -> Result<ExecutionStartupRecoveryReport, RuntimeServicesError> {
         self.ensure_mutation_allowed()?;
-        let mut managed_dispositions = BTreeMap::new();
-        for invocation in self
+        // Establish every recovery partition before performing any mutation.
+        // A corrupt graph cannot be guessed into a healthy Session: fail the
+        // ordered pass closed while leaving all durable recovery inputs intact.
+        let graph_ids = self.graph_state_store.nonterminal_graph_ids_async().await?;
+        let mut excluded_graph_ids = BTreeSet::new();
+        let mut report = ExecutionStartupRecoveryReport {
+            examined_graphs: graph_ids.len(),
+            ..ExecutionStartupRecoveryReport::default()
+        };
+        for graph_id in &graph_ids {
+            let graph = self.graph_state_store.load_async(graph_id).await?;
+            let lineage = match graph.lineage.as_ref() {
+                Some(lineage) => lineage,
+                None => {
+                    let message = format!(
+                        "execution graph `{graph_id}` is missing canonical business lineage"
+                    );
+                    report.errors.push(ExecutionStartupRecoveryError {
+                        graph_id: graph_id.clone(),
+                        error: message.clone(),
+                    });
+                    report.records.push(ExecutionStartupRecoveryRecord {
+                        graph_id: graph_id.clone(),
+                        objective: graph.objective.clone(),
+                        before_revision: graph.revision,
+                        after_revision: graph.revision,
+                        before_status: graph_status_label(&graph),
+                        after_status: graph_status_label(&graph),
+                        action: "invalid_lineage".to_string(),
+                        error: Some(message),
+                    });
+                    continue;
+                }
+            };
+            if let Err(error) = lineage.validate() {
+                let message = format!(
+                    "execution graph `{graph_id}` has invalid canonical business lineage: {error}"
+                );
+                report.errors.push(ExecutionStartupRecoveryError {
+                    graph_id: graph_id.clone(),
+                    error: message.clone(),
+                });
+                report.records.push(ExecutionStartupRecoveryRecord {
+                    graph_id: graph_id.clone(),
+                    objective: graph.objective.clone(),
+                    before_revision: graph.revision,
+                    after_revision: graph.revision,
+                    before_status: graph_status_label(&graph),
+                    after_status: graph_status_label(&graph),
+                    action: "invalid_lineage".to_string(),
+                    error: Some(message),
+                });
+                continue;
+            }
+            if excluded_sessions.contains(&lineage.session_id) {
+                excluded_graph_ids.insert(graph_id.clone());
+            }
+        }
+        if !report.errors.is_empty() {
+            return Ok(report);
+        }
+
+        let managed_invocation_snapshot = self
             .managed_agents
             .invocations()
-            .map_err(RuntimeServicesError::Mission)?
-        {
+            .map_err(RuntimeServicesError::Mission)?;
+        let mut excluded_invocation_ids = BTreeSet::new();
+        for invocation in &managed_invocation_snapshot {
+            let definition = self
+                .managed_agents
+                .definition(
+                    &invocation.definition_id,
+                    Some(invocation.definition_revision),
+                )
+                .map_err(RuntimeServicesError::Mission)?;
+            if excluded_sessions.contains(&definition.session_id)
+                || invocation
+                    .execution_ref
+                    .as_ref()
+                    .is_some_and(|graph_id| excluded_graph_ids.contains(graph_id))
+            {
+                excluded_invocation_ids.insert(invocation.invocation_id.clone());
+            }
+        }
+        let mut managed_dispositions = BTreeMap::new();
+        for invocation in managed_invocation_snapshot {
+            if excluded_invocation_ids.contains(&invocation.invocation_id) {
+                continue;
+            }
             if invocation.status != crate::ManagedAgentInvocationStatus::Running {
                 continue;
             }
@@ -1246,7 +1429,11 @@ impl RuntimeServices {
             managed_dispositions.insert(invocation.invocation_id, disposition);
         }
         self.managed_agents
-            .recover_with_dispositions(now_ms(), &managed_dispositions)
+            .recover_with_dispositions_excluding(
+                now_ms(),
+                &managed_dispositions,
+                &excluded_invocation_ids,
+            )
             .map_err(RuntimeServicesError::Mission)?;
         let managed_invocations = self
             .managed_agents
@@ -1255,18 +1442,28 @@ impl RuntimeServices {
             .into_iter()
             .map(|invocation| (invocation.invocation_id.clone(), invocation))
             .collect::<BTreeMap<_, _>>();
-        let resolved_handoff_results = self.resolve_durable_handoff_results().await?;
-        let graph_ids = self.graph_state_store.nonterminal_graph_ids_async().await?;
-        let mut report = ExecutionStartupRecoveryReport {
-            examined_graphs: graph_ids.len(),
-            resolved_handoff_results,
-            ..ExecutionStartupRecoveryReport::default()
-        };
+        report.resolved_handoff_results = self
+            .resolve_durable_handoff_results_excluding_graphs(&excluded_graph_ids)
+            .await?;
         for graph_id in graph_ids {
             let before = self.graph_state_store.load_async(&graph_id).await?;
             let before_revision = before.revision;
             let before_status = graph_status_label(&before);
             let objective = before.objective.clone();
+            if excluded_graph_ids.contains(&graph_id) {
+                report.deferred_graphs = report.deferred_graphs.saturating_add(1);
+                report.records.push(ExecutionStartupRecoveryRecord {
+                    graph_id,
+                    objective,
+                    before_revision,
+                    after_revision: before_revision,
+                    before_status: before_status.clone(),
+                    after_status: before_status,
+                    action: "deferred_session_hydration".to_string(),
+                    error: None,
+                });
+                continue;
+            }
             let had_running = graph_has_status(&before, ExecutionNodeStatus::Running);
             let mut action = "observed".to_string();
             let mut error = None;
@@ -1336,13 +1533,23 @@ impl RuntimeServices {
                 }
             }
 
-            if error.is_none() && (managed_fences.is_empty() || managed_runnable) {
+            if error.is_none()
+                && (managed_fences.is_empty() || managed_runnable)
+                && self.graph_executors_are_bound(&before)
+            {
                 let current = self.graph_state_store.load_async(&graph_id).await?;
                 if graph_can_advance(&current) {
+                    let producers_released = self.execution_supervisor.graph_producers_released();
                     match self.execution_supervisor.notify_graph(&graph_id).await {
                         Ok(()) => {
-                            report.notified_graphs += 1;
-                            action = if had_running {
+                            if producers_released {
+                                report.notified_graphs += 1;
+                            } else {
+                                report.deferred_graphs += 1;
+                            }
+                            action = if !producers_released {
+                                "queued_for_recovery_release".to_string()
+                            } else if had_running {
                                 "recovered_and_notified".to_string()
                             } else {
                                 "notified_ready".to_string()
@@ -1358,6 +1565,17 @@ impl RuntimeServices {
                         }
                     }
                 }
+            } else if error.is_none()
+                && (managed_fences.is_empty() || managed_runnable)
+                && graph_can_advance(&self.graph_state_store.load_async(&graph_id).await?)
+            {
+                // Conversation-owned executors are rebound by the Session
+                // ingress worker after it has acquired the exact Runtime host
+                // and restored the turn context. Waking such a graph from the
+                // process-level recovery producer races that binding and used
+                // to fail the graph with `inline_model unavailable`.
+                report.deferred_graphs = report.deferred_graphs.saturating_add(1);
+                action = "deferred_turn_scoped_executor_binding".to_string();
             }
 
             let final_graph = self.graph_state_store.load_async(&graph_id).await?;
@@ -1389,6 +1607,14 @@ impl RuntimeServices {
     /// committed before an adapter process stopped. Graph ownership stays in
     /// Runtime; Gateway only delivers target turns and never owns recovery.
     pub async fn resolve_durable_handoff_results(&self) -> Result<usize, RuntimeServicesError> {
+        self.resolve_durable_handoff_results_excluding_graphs(&BTreeSet::new())
+            .await
+    }
+
+    async fn resolve_durable_handoff_results_excluding_graphs(
+        &self,
+        excluded_graph_ids: &BTreeSet<String>,
+    ) -> Result<usize, RuntimeServicesError> {
         let Some(router) = self.session_input_router() else {
             return Ok(0);
         };
@@ -1397,6 +1623,9 @@ impl RuntimeServices {
             .completed_handoff_resolutions()
             .map_err(RuntimeServicesError::SessionHandoffRecovery)?
         {
+            if excluded_graph_ids.contains(&resolution.source_graph_id) {
+                continue;
+            }
             if self.resolve_handoff_source(resolution).await? {
                 resolved += 1;
             }
@@ -2274,7 +2503,6 @@ impl RuntimeServices {
                             },
                         )
                         .collect(),
-                    requires_managed_collaboration_escalation: false,
                     acceptance: definition.acceptance.clone(),
                     constraints: vec![
                         format!(
@@ -2316,6 +2544,7 @@ impl RuntimeServices {
                         invocation.attempt_no,
                         invocation.fence_generation
                     ),
+                    agentic_binding: None,
                 };
                 let execution_identity = self.prepare_agent_task_intent(&intent)?;
                 let policy_revision = self.canonical_task_policy_revision(&intent.task_id)?;
@@ -2393,5 +2622,34 @@ impl RuntimeServices {
                 Ok(running)
             }
         }
+    }
+}
+
+impl RuntimeServices {
+    fn graph_executors_are_bound(&self, graph: &ExecutionGraph) -> bool {
+        graph.nodes.iter().all(|node| {
+            let executor = match node.executor_kind.as_str() {
+                "inline_model" => Some(self.model_step_executor.as_ref()),
+                "tool_batch" => Some(self.tool_batch_executor.as_ref()),
+                "cross_plane_connector" => Some(self.cross_plane_connector_executor.as_ref()),
+                _ => None,
+            };
+            executor.is_none_or(|executor| {
+                executor.is_bound(&crate::execution_core::NodeExecutionTicket {
+                    graph_id: graph.id.clone(),
+                    node_id: node.id.clone(),
+                    executor_kind: node.executor_kind.clone(),
+                    service_class: graph.service_class,
+                    attempt: graph
+                        .recovery_cursor
+                        .node_attempts
+                        .get(&node.id)
+                        .copied()
+                        .unwrap_or(1),
+                    idempotency_key: node.idempotency_key.clone(),
+                    payload_ref: node.payload_ref.clone(),
+                })
+            })
+        })
     }
 }

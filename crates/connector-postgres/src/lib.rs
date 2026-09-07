@@ -13,19 +13,14 @@
 //! the connector crate itself remains free of PostgreSQL in its normal
 //! dependency graph.
 
-use std::fs;
-use std::path::Path;
 use std::sync::Arc;
 
 use chrono::Utc;
 use connector::{
-    DurableResourceDirectoryRecord, ExternalResourceRef, ResourceDirectoryError,
-    ResourceDirectoryFactory, ResourceDirectoryRepository, ResourceDirectoryResult,
-    ResourceDirectorySourceBinding,
+    ExternalResourceRef, ResourceDirectoryError, ResourceDirectoryFactory,
+    ResourceDirectoryRepository, ResourceDirectoryResult, ResourceDirectorySourceBinding,
 };
 use postgres::Row;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use storage::{
     PostgresConnectionConfig, PostgresExecutor, PostgresMigrationSpec, SecretRefResolver,
     StorageBackendKind, StorageHandle,
@@ -274,90 +269,6 @@ impl ResourceDirectoryRepository for PostgresResourceDirectory {
             })
             .collect()
     }
-
-    fn export_records(&self) -> ResourceDirectoryResult<Vec<DurableResourceDirectoryRecord>> {
-        self.executor
-            .checkout_background()
-            .map_err(ResourceDirectoryError::backend)?
-            .query(
-                "SELECT reference, provider, account_id, resource_type, title, source,
-                    permissions_summary, digest, indexed_state, created_at, updated_at, last_seen_at
-                   FROM connector_resources
-                  ORDER BY reference ASC",
-                &[],
-            )
-            .map_err(ResourceDirectoryError::backend)?
-            .iter()
-            .map(row_to_durable_resource_directory_record)
-            .collect()
-    }
-
-    fn import_record(
-        &self,
-        record: &DurableResourceDirectoryRecord,
-    ) -> ResourceDirectoryResult<()> {
-        self.executor
-            .checkout_background()
-            .map_err(ResourceDirectoryError::backend)?
-            .execute(
-                "INSERT INTO connector_resources (
-                    reference, provider, account_id, resource_type, title, source,
-                    permissions_summary, digest, indexed_state, created_at, updated_at, last_seen_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                ON CONFLICT(reference) DO UPDATE SET
-                    provider = EXCLUDED.provider,
-                    account_id = EXCLUDED.account_id,
-                    resource_type = EXCLUDED.resource_type,
-                    title = EXCLUDED.title,
-                    source = EXCLUDED.source,
-                    permissions_summary = EXCLUDED.permissions_summary,
-                    digest = EXCLUDED.digest,
-                    indexed_state = EXCLUDED.indexed_state,
-                    created_at = EXCLUDED.created_at,
-                    updated_at = EXCLUDED.updated_at,
-                    last_seen_at = EXCLUDED.last_seen_at",
-                &[
-                    &record.resource.reference,
-                    &record.resource.provider,
-                    &record.resource.account_id,
-                    &record.resource.resource_type,
-                    &record.resource.title,
-                    &record.resource.source,
-                    &record.resource.permissions_summary,
-                    &record.resource.digest,
-                    &record.resource.indexed_state,
-                    &record.created_at,
-                    &record.updated_at,
-                    &record.last_seen_at,
-                ],
-            )
-            .map_err(ResourceDirectoryError::backend)?;
-        Ok(())
-    }
-
-    fn import_source_binding(
-        &self,
-        binding: &ResourceDirectorySourceBinding,
-    ) -> ResourceDirectoryResult<()> {
-        self.executor
-            .checkout_background()
-            .map_err(ResourceDirectoryError::backend)?
-            .execute(
-                "INSERT INTO connector_resource_sources
-                    (reference, source_kind, source_id, attached_at)
-                 VALUES ($1, $2, $3, $4)
-                 ON CONFLICT(reference, source_kind, source_id) DO UPDATE
-                    SET attached_at = EXCLUDED.attached_at",
-                &[
-                    &binding.reference,
-                    &binding.source_kind,
-                    &binding.source_id,
-                    &binding.attached_at,
-                ],
-            )
-            .map_err(ResourceDirectoryError::backend)?;
-        Ok(())
-    }
 }
 
 impl PostgresResourceDirectory {
@@ -393,27 +304,6 @@ fn row_to_resource_ref(row: &Row) -> ResourceDirectoryResult<ExternalResourceRef
         permissions_summary: row.try_get(6).map_err(ResourceDirectoryError::backend)?,
         digest: row.try_get(7).map_err(ResourceDirectoryError::backend)?,
         indexed_state: row.try_get(8).map_err(ResourceDirectoryError::backend)?,
-    })
-}
-
-fn row_to_durable_resource_directory_record(
-    row: &Row,
-) -> ResourceDirectoryResult<DurableResourceDirectoryRecord> {
-    Ok(DurableResourceDirectoryRecord {
-        resource: ExternalResourceRef {
-            reference: row.try_get(0).map_err(ResourceDirectoryError::backend)?,
-            provider: row.try_get(1).map_err(ResourceDirectoryError::backend)?,
-            account_id: row.try_get(2).map_err(ResourceDirectoryError::backend)?,
-            resource_type: row.try_get(3).map_err(ResourceDirectoryError::backend)?,
-            title: row.try_get(4).map_err(ResourceDirectoryError::backend)?,
-            source: row.try_get(5).map_err(ResourceDirectoryError::backend)?,
-            permissions_summary: row.try_get(6).map_err(ResourceDirectoryError::backend)?,
-            digest: row.try_get(7).map_err(ResourceDirectoryError::backend)?,
-            indexed_state: row.try_get(8).map_err(ResourceDirectoryError::backend)?,
-        },
-        created_at: row.try_get(9).map_err(ResourceDirectoryError::backend)?,
-        updated_at: row.try_get(10).map_err(ResourceDirectoryError::backend)?,
-        last_seen_at: row.try_get(11).map_err(ResourceDirectoryError::backend)?,
     })
 }
 
@@ -461,126 +351,11 @@ impl ResourceDirectoryFactory for PostgresResourceDirectoryFactory {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResourceDirectoryMigrationReceipt {
-    pub domain: String,
-    pub resource_count: usize,
-    pub source_binding_count: usize,
-    pub source_digest: String,
-    pub target_digest: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResourceDirectoryCutoverManifest {
-    pub domain: String,
-    pub source_digest: String,
-    pub target_digest: String,
-    pub resource_count: usize,
-    pub source_binding_count: usize,
-    pub completed_at: String,
-}
-
-/// Copies a quiesced directory into a fresh target and verifies canonical
-/// source/target digests. The caller owns the maintenance barrier; a second
-/// source digest is taken before the manifest can be written, so concurrent
-/// source mutation fails closed instead of producing a writable dual owner.
-pub fn copy_quiesced_resource_directory(
-    source: &dyn ResourceDirectoryRepository,
-    target: &dyn ResourceDirectoryRepository,
-) -> ResourceDirectoryResult<ResourceDirectoryMigrationReceipt> {
-    let source_snapshot = snapshot(source)?;
-    let source_digest = canonical_digest(&source_snapshot)?;
-    for record in &source_snapshot.records {
-        target.import_record(record)?;
-    }
-    for binding in &source_snapshot.bindings {
-        target.import_source_binding(binding)?;
-    }
-    let source_after = snapshot(source)?;
-    let source_after_digest = canonical_digest(&source_after)?;
-    if source_after_digest != source_digest {
-        return Err(ResourceDirectoryError::backend(
-            "connector directory source changed while migration maintenance barrier was active",
-        ));
-    }
-    let target_digest = canonical_digest(&snapshot(target)?)?;
-    if target_digest != source_digest {
-        return Err(ResourceDirectoryError::backend(
-            "connector directory target digest differs from source after copy",
-        ));
-    }
-    Ok(ResourceDirectoryMigrationReceipt {
-        domain: CONNECTOR_DIRECTORY_DOMAIN.to_string(),
-        resource_count: source_snapshot.records.len(),
-        source_binding_count: source_snapshot.bindings.len(),
-        source_digest,
-        target_digest,
-    })
-}
-
-/// Writes the cutover manifest atomically after a successful verified copy.
-/// This does not change the active backend; V572 owns the global cutover.
-pub fn write_cutover_manifest(
-    path: impl AsRef<Path>,
-    receipt: &ResourceDirectoryMigrationReceipt,
-) -> ResourceDirectoryResult<ResourceDirectoryCutoverManifest> {
-    let manifest = ResourceDirectoryCutoverManifest {
-        domain: receipt.domain.clone(),
-        source_digest: receipt.source_digest.clone(),
-        target_digest: receipt.target_digest.clone(),
-        resource_count: receipt.resource_count,
-        source_binding_count: receipt.source_binding_count,
-        completed_at: Utc::now().to_rfc3339(),
-    };
-    let path = path.as_ref();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(ResourceDirectoryError::backend)?;
-    }
-    let temporary = path.with_extension("tmp");
-    fs::write(
-        &temporary,
-        serde_json::to_vec_pretty(&manifest).map_err(ResourceDirectoryError::backend)?,
-    )
-    .map_err(ResourceDirectoryError::backend)?;
-    fs::rename(&temporary, path).map_err(ResourceDirectoryError::backend)?;
-    Ok(manifest)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct ResourceDirectorySnapshot {
-    records: Vec<DurableResourceDirectoryRecord>,
-    bindings: Vec<ResourceDirectorySourceBinding>,
-}
-
-fn snapshot(
-    directory: &dyn ResourceDirectoryRepository,
-) -> ResourceDirectoryResult<ResourceDirectorySnapshot> {
-    let mut records = directory.export_records()?;
-    records.sort_by(|left, right| left.resource.reference.cmp(&right.resource.reference));
-    let mut bindings = Vec::new();
-    for record in &records {
-        bindings.extend(directory.list_sources(&record.resource.reference)?);
-    }
-    bindings.sort_by(|left, right| {
-        (&left.reference, &left.source_kind, &left.source_id).cmp(&(
-            &right.reference,
-            &right.source_kind,
-            &right.source_id,
-        ))
-    });
-    Ok(ResourceDirectorySnapshot { records, bindings })
-}
-
-fn canonical_digest(snapshot: &ResourceDirectorySnapshot) -> ResourceDirectoryResult<String> {
-    let encoded = serde_json::to_vec(snapshot).map_err(ResourceDirectoryError::backend)?;
-    Ok(format!("{:x}", Sha256::digest(encoded)))
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use connector::{ResourceDirectoryRepository, SqliteResourceDirectory};
+    use connector::ResourceDirectoryRepository;
     use storage::{PostgresConnectionConfig, PostgresMigrationSpec, StaticSecretRefResolver};
 
     use super::*;
@@ -591,7 +366,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
-    fn postgres_resource_directory_migrates_restarts_and_copies_real_database() {
+    fn postgres_resource_directory_migrates_restarts_and_handles_concurrency() {
         let url =
             std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
         let resolver = StaticSecretRefResolver::new([("test.pg".to_string(), url)]);
@@ -686,38 +461,5 @@ mod tests {
             "connector",
             "test"
         )));
-        let mut connection = factory
-            .directory
-            .executor()
-            .checkout_critical()
-            .expect("checkout target reset connection");
-        connection
-            .batch_execute(
-                "DELETE FROM connector_resource_sources; DELETE FROM connector_resources;",
-            )
-            .expect("reset isolated target database");
-        drop(connection);
-        let temporary = tempfile::tempdir().expect("temporary directory");
-        let source = SqliteResourceDirectory::open(temporary.path().join("source.sqlite"))
-            .expect("sqlite source opens");
-        let first = resource("postgres-copy", "Copy source resource");
-        source.upsert(&first).expect("source upsert");
-        source
-            .attach_source(&first.reference, "bitable", "source-id")
-            .expect("source binding");
-        let target = PostgresResourceDirectory::connect(
-            PostgresConnectionConfig::new(
-                "connector-directory-copy-test",
-                "test.pg",
-                "cowd-connector-postgres-copy-contract",
-            ),
-            &resolver,
-        )
-        .expect("postgres target opens");
-        let receipt = copy_quiesced_resource_directory(&source, &target).expect("copy succeeds");
-        assert_eq!(receipt.source_digest, receipt.target_digest);
-        let manifest = write_cutover_manifest(temporary.path().join("cutover.json"), &receipt)
-            .expect("manifest writes atomically");
-        assert_eq!(manifest.source_digest, manifest.target_digest);
     }
 }

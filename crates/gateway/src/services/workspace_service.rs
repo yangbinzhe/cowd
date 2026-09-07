@@ -73,19 +73,12 @@ impl WorkspaceService {
         let session = if let Some(endpoint) = selected_session {
             endpoint
         } else {
-            let registry = storage::StorageRegistry::default_for_config_home(config_home);
-            fallback = registry
-                .endpoint(&storage::StorageDomainId::Session)
-                .cloned()
-                .unwrap_or_else(|_| {
-                    storage::StorageEndpoint::sqlite(
-                        storage::StorageDomainId::Session,
-                        storage::StorageScope::Global,
-                        registry.layout.root.join("session.sqlite"),
-                        "session",
-                        "default_session_endpoint_fallback",
-                    )
-                });
+            fallback = storage::StorageEndpoint::postgres(
+                storage::StorageDomainId::Session,
+                storage::StorageScope::Global,
+                "cowd-selected-storage",
+                "postgres-only-since-0.9.723",
+            );
             &fallback
         };
         serde_json::json!({

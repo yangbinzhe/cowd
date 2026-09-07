@@ -8,7 +8,6 @@ members = [
     "crates/auth-broker",
     "crates/cli",
     "crates/fact-kernel",
-    "crates/fact-sqlite",
     "crates/fact-postgres",
     "crates/gateway",
     "crates/harness-eval",
@@ -27,7 +26,6 @@ members = [
     "crates/sandbox-launcher",
     "crates/session",
     "crates/session-postgres",
-    "crates/sqlite-pool-tracker",
     "crates/skill/service",
     "crates/storage",
     "crates/surface",
@@ -46,7 +44,6 @@ default-members = [
     "crates/auth-broker",
     "crates/cli",
     "crates/fact-kernel",
-    "crates/fact-sqlite",
     "crates/fact-postgres",
     "crates/gateway",
     "crates/harness-eval",
@@ -74,7 +71,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.9.722"
+version = "0.9.723"
 edition = "2021"
 license = "MIT"
 publish = false

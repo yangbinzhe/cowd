@@ -1,13 +1,11 @@
 //! Project-scoped memory management.
 //!
-//! Each registered project gets its own SQLite database (`memory_<12-char-hash>.db`)
-//! stored alongside the global `memory.db`.  The [`ProjectScopeManager`] tracks
-//! registered projects, provides per-project stores, and allows switching the
-//! active project at runtime.
+//! Projects share the host-selected Memory store and are isolated by the
+//! explicit [`MemoryScope::Project`] key.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -16,7 +14,7 @@ use crate::code_indexer::{CodeIndexer, CodeSymbol, SymbolEdge};
 use crate::entity::{Entity, EntityType, KnowledgeGraph};
 use crate::entity_registry::EntityRegistry;
 use crate::error::MemoryError;
-use crate::store::sqlite::SqliteStore;
+use crate::store::MemoryStore;
 
 /// Module-level entity registry for dedup during KG building.
 static ENTITY_REGISTRY: OnceLock<Mutex<EntityRegistry>> = OnceLock::new();
@@ -152,16 +150,11 @@ pub struct ProjectManifest {
 
 /// Internal mutable state — protected by [`Mutex`] for thread safety.
 struct Inner {
-    /// Path to the global memory database file.
-    global_path: PathBuf,
-    /// The global store (always available, never destroyed).
-    global_store: SqliteStore,
+    global_store: Arc<dyn MemoryStore>,
     /// All registered projects, keyed by project ID.
     projects: HashMap<String, ProjectManifest>,
     /// The currently active project ID.
     active_project: Option<String>,
-    /// Cached per-project stores, keyed by project ID.
-    project_stores: HashMap<String, SqliteStore>,
     /// Optional callback invoked after each project registration.
     on_project_registered: Option<Box<dyn Fn(&PathBuf) + Send + Sync>>,
 }
@@ -174,7 +167,9 @@ struct Inner {
 /// use std::path::PathBuf;
 /// use memory::project_scope::ProjectScopeManager;
 ///
-/// let manager = ProjectScopeManager::new(PathBuf::from("memory.db")).unwrap();
+/// let manager = ProjectScopeManager::with_store(std::sync::Arc::new(
+///     memory::EphemeralMemoryStore::new()
+/// ));
 /// let pid = manager.register_project(std::path::Path::new("/my/project")).unwrap();
 /// manager.switch_project(&pid).unwrap();
 /// assert!(manager.current_project().is_some());
@@ -184,29 +179,17 @@ pub struct ProjectScopeManager {
 }
 
 impl ProjectScopeManager {
-    /// Create a new manager with a global store at `global_path`.
-    ///
-    /// The global store is opened immediately; per-project stores are created
-    /// lazily on [`register_project`](Self::register_project).
-    pub fn new(global_path: PathBuf) -> Result<Self, MemoryError> {
-        let global_handle = storage::StorageHandle::sqlite(
-            "memory",
-            global_path.clone(),
-            "memory",
-            "project_scope_global_storage_handle_since_0.9.315",
-        );
-        let global_store = SqliteStore::open_storage_handle(&global_handle)?;
-
-        Ok(Self {
+    /// Create a manager over the store selected by the composition root.
+    #[must_use]
+    pub fn with_store(global_store: Arc<dyn MemoryStore>) -> Self {
+        Self {
             inner: Mutex::new(Inner {
-                global_path,
                 global_store,
                 projects: HashMap::new(),
                 active_project: None,
-                project_stores: HashMap::new(),
                 on_project_registered: None,
             }),
-        })
+        }
     }
 
     /// Set a callback to be invoked after each successful project registration.
@@ -234,34 +217,12 @@ impl ProjectScopeManager {
             .canonicalize()
             .map_err(|e| MemoryError::Store(format!("failed to canonicalize path: {e}")))?;
         let project_id = hash_path(&canonical);
-        let db_filename = format!("memory_{}.db", &project_id[..12.min(project_id.len())]);
-        let db_path = if let Some(parent) = self
-            .inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .global_path
-            .parent()
-        {
-            parent.join(&db_filename)
-        } else {
-            PathBuf::from(&db_filename)
-        };
-
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
         // Idempotent: return existing ID if already registered.
         if let Some(existing) = inner.projects.values().find(|m| m.path == canonical) {
             return Ok(existing.project_id.clone());
         }
-
-        // Open (or create) the per-project SQLite store.
-        let handle = storage::StorageHandle::sqlite(
-            "memory",
-            db_path,
-            "memory",
-            "project_scope_project_storage_handle_since_0.9.315",
-        );
-        let store = SqliteStore::open_storage_handle(&handle)?;
 
         let canonical_clone = canonical.clone();
         let now = Utc::now();
@@ -275,9 +236,6 @@ impl ProjectScopeManager {
         };
 
         inner.projects.insert(project_id.clone(), manifest);
-        inner
-            .project_stores
-            .insert(project_id.clone(), store.clone());
         let project_registered_cb = inner.on_project_registered.as_ref().map(|_| ());
         drop(inner);
 
@@ -302,18 +260,15 @@ impl ProjectScopeManager {
 
     /// Switch the active project to `project_id`.
     ///
-    /// Returns the [`SqliteStore`] for that project so callers can start
-    /// reading/writing immediately.
-    pub fn switch_project(&self, project_id: &str) -> Result<SqliteStore, MemoryError> {
+    /// Returns the shared scoped store capability.
+    pub fn switch_project(&self, project_id: &str) -> Result<Arc<dyn MemoryStore>, MemoryError> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-
-        let store = inner
-            .project_stores
-            .get(project_id)
-            .cloned()
-            .ok_or_else(|| {
-                MemoryError::NotFound(format!("project not registered: {project_id}"))
-            })?;
+        if !inner.projects.contains_key(project_id) {
+            return Err(MemoryError::NotFound(format!(
+                "project not registered: {project_id}"
+            )));
+        }
+        let store = Arc::clone(&inner.global_store);
 
         // Update last_activity.
         if let Some(manifest) = inner.projects.get_mut(project_id) {
@@ -338,12 +293,14 @@ impl ProjectScopeManager {
     /// Return a clone of the global store.
     ///
     /// The global store is always available and never destroyed.
-    pub fn global_store(&self) -> SqliteStore {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .global_store
-            .clone()
+    pub fn global_store(&self) -> Arc<dyn MemoryStore> {
+        Arc::clone(
+            &self
+                .inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .global_store,
+        )
     }
 
     /// Check whether the indexed files for a registered project have changed

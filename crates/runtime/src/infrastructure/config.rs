@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use cowd_app_protocol::{AppActivationPolicyV1, AppId};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::json::JsonValue;
 use crate::runtime_control::RuntimeControlPolicy;
@@ -227,6 +228,13 @@ impl RuntimeConfig {
     #[must_use]
     pub fn provider_resources(&self) -> &crate::ProviderResourceConfig {
         &self.feature_config.provider_resources
+    }
+
+    /// Operator-approved ProcessJsonl command manifests. The returned values
+    /// contain only environment references, never resolved secret values.
+    #[must_use]
+    pub fn agent_executor_commands(&self) -> &[AgentExecutorCommandConfig] {
+        &self.feature_config.agent_executor_commands
     }
 }
 
@@ -466,6 +474,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn provider_resources(&self) -> &crate::ProviderResourceConfig {
         &self.provider_resources
+    }
+
+    #[must_use]
+    pub fn agent_executor_commands(&self) -> &[AgentExecutorCommandConfig] {
+        &self.agent_executor_commands
     }
 }
 impl McpConfigCollection {
@@ -786,6 +799,208 @@ fn parse_optional_workspace(root: &JsonValue) -> Result<Option<PathBuf>, ConfigE
         ));
     }
     Ok(Some(PathBuf::from(workspace)))
+}
+
+/// Parse the only configuration that may approve an executable ProcessJsonl
+/// worker. Project and local configuration are intentionally rejected here:
+/// Agent definitions and workspace text are model-adjacent input, while a
+/// command manifest is host code execution authority. Launchers that obtain
+/// deployment configuration by another trusted channel inject the same typed
+/// manifests through `RuntimeServicesBuilder`.
+pub(super) fn parse_trusted_agent_executor_commands(
+    source: ConfigSource,
+    root: &BTreeMap<String, JsonValue>,
+    path: &Path,
+) -> Result<Vec<AgentExecutorCommandConfig>, ConfigError> {
+    let Some(value) = root.get("agent_executor_commands") else {
+        return Ok(Vec::new());
+    };
+    if source != ConfigSource::User {
+        return Err(ConfigError::Parse(format!(
+            "{}: agent_executor_commands may only be loaded from the operator-owned user/deployment configuration layer",
+            path.display()
+        )));
+    }
+    let commands = expect_object(
+        value,
+        &format!("{}: agent_executor_commands", path.display()),
+    )?;
+    let mut parsed = Vec::with_capacity(commands.len());
+    for (command_ref, command) in commands {
+        if command_ref.trim().is_empty() {
+            return Err(ConfigError::Parse(format!(
+                "{}: agent_executor_commands has an empty command reference",
+                path.display()
+            )));
+        }
+        let context = format!("{}: agent_executor_commands.{command_ref}", path.display());
+        let command = expect_object(command, &context)?;
+        let executable = command
+            .get("executable")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                ConfigError::Parse(format!("{context}.executable must be a non-empty string"))
+            })?
+            .to_string();
+        if executable.contains('\0') {
+            return Err(ConfigError::Parse(format!(
+                "{context}.executable must not contain a NUL byte"
+            )));
+        }
+        let args = match command.get("args") {
+            None => Vec::new(),
+            Some(value) => value
+                .as_array()
+                .ok_or_else(|| ConfigError::Parse(format!("{context}.args must be an array")))?
+                .iter()
+                .map(|value| {
+                    value.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                        ConfigError::Parse(format!("{context}.args must contain only strings"))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        if args.iter().any(|arg| arg.contains('\0')) {
+            return Err(ConfigError::Parse(format!(
+                "{context}.args must not contain a NUL byte"
+            )));
+        }
+        let working_directory = match command.get("working_directory") {
+            None => None,
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        ConfigError::Parse(format!(
+                            "{context}.working_directory must be a non-empty string"
+                        ))
+                    })?
+                    .to_string(),
+            ),
+        };
+        let mut environment_refs = BTreeMap::new();
+        if let Some(value) = command.get("environment_refs") {
+            let references = value.as_object().ok_or_else(|| {
+                ConfigError::Parse(format!("{context}.environment_refs must be an object"))
+            })?;
+            for (name, reference) in references {
+                if !valid_process_environment_name(name) {
+                    return Err(ConfigError::Parse(format!(
+                        "{context}.environment_refs key `{name}` is not a valid non-COWD environment name"
+                    )));
+                }
+                let reference = reference.as_str().ok_or_else(|| {
+                    ConfigError::Parse(format!(
+                        "{context}.environment_refs.{name} must be an env:VARIABLE reference"
+                    ))
+                })?;
+                if !valid_process_environment_reference(reference) {
+                    return Err(ConfigError::Parse(format!(
+                        "{context}.environment_refs.{name} must use env:VARIABLE"
+                    )));
+                }
+                environment_refs.insert(name.clone(), reference.to_string());
+            }
+        }
+        let sandbox_profile_value = match command.get("sandbox_profile") {
+            None => "workspace_read_write",
+            Some(value) => value.as_str().ok_or_else(|| {
+                ConfigError::Parse(format!("{context}.sandbox_profile must be a string"))
+            })?,
+        };
+        let sandbox_profile = match sandbox_profile_value {
+            "workspace_read_write" => AgentExecutorSandboxProfile::WorkspaceReadWrite,
+            "workspace_read_only" => AgentExecutorSandboxProfile::WorkspaceReadOnly,
+            "isolated_read_write" => AgentExecutorSandboxProfile::IsolatedReadWrite,
+            "isolated_read_only" => AgentExecutorSandboxProfile::IsolatedReadOnly,
+            value => {
+                return Err(ConfigError::Parse(format!(
+                    "{context}.sandbox_profile `{value}` is unsupported"
+                )))
+            }
+        };
+        let unknown = command
+            .keys()
+            .filter(|key| {
+                !matches!(
+                    key.as_str(),
+                    "executable"
+                        | "args"
+                        | "working_directory"
+                        | "environment_refs"
+                        | "sandbox_profile"
+                )
+            })
+            .collect::<Vec<_>>();
+        if !unknown.is_empty() {
+            return Err(ConfigError::Parse(format!(
+                "{context} has unsupported fields: {}",
+                unknown
+                    .into_iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        let manifest_digest = process_executor_manifest_digest(
+            command_ref,
+            &executable,
+            &args,
+            working_directory.as_deref(),
+            &environment_refs,
+            sandbox_profile,
+        );
+        parsed.push(AgentExecutorCommandConfig {
+            command_ref: command_ref.clone(),
+            executable,
+            args,
+            working_directory,
+            environment_refs,
+            sandbox_profile,
+            manifest_digest,
+        });
+    }
+    Ok(parsed)
+}
+
+fn valid_process_environment_name(name: &str) -> bool {
+    !name.starts_with("COWD_")
+        && name.chars().enumerate().all(|(index, character)| {
+            matches!(
+                (index, character),
+                (0, 'A'..='Z' | 'a'..='z' | '_')
+                    | (_, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_')
+            )
+        })
+}
+
+fn valid_process_environment_reference(reference: &str) -> bool {
+    reference
+        .strip_prefix("env:")
+        .is_some_and(|name| !name.is_empty() && valid_process_environment_name(name))
+}
+
+fn process_executor_manifest_digest(
+    command_ref: &str,
+    executable: &str,
+    args: &[String],
+    working_directory: Option<&str>,
+    environment_refs: &BTreeMap<String, String>,
+    sandbox_profile: AgentExecutorSandboxProfile,
+) -> String {
+    let canonical = serde_json::json!({
+        "command_ref": command_ref,
+        "executable": executable,
+        "args": args,
+        "working_directory": working_directory,
+        "environment_refs": environment_refs,
+        "sandbox_profile": sandbox_profile,
+    });
+    format!("{:x}", Sha256::digest(canonical.to_string().as_bytes()))
 }
 
 fn parse_routing_mode(root: &JsonValue) -> Result<RoutingMode, ConfigError> {
@@ -2251,44 +2466,22 @@ fn parse_optional_storage_config(root: &JsonValue) -> Result<StorageTopologyConf
         return Ok(StorageTopologyConfig::default());
     };
     let storage = expect_object(value, "merged settings.storage")?;
-    let backend =
-        match optional_string(storage, "backend", "merged settings.storage")?.unwrap_or("auto") {
-            "sqlite" => StorageBackendSelection::Sqlite,
-            "postgres" => StorageBackendSelection::Postgres,
-            "auto" => StorageBackendSelection::Auto,
-            other => {
-                return Err(ConfigError::Parse(format!(
-                    "merged settings.storage.backend must be sqlite, postgres, or auto, got {other}"
-                )))
-            }
-        };
-    let preferred = match optional_string(storage, "preferred", "merged settings.storage")?
+    let backend = match optional_string(storage, "backend", "merged settings.storage")?
         .unwrap_or("postgres")
     {
         "postgres" => StorageBackendSelection::Postgres,
         other => {
             return Err(ConfigError::Parse(format!(
-                "merged settings.storage.preferred must be postgres, got {other}"
+                "merged settings.storage.backend must be postgres; {other} is not supported"
             )))
         }
     };
-    let fallback = match optional_string(storage, "fallback", "merged settings.storage")?
-        .unwrap_or("sqlite")
-    {
-        "sqlite" => StorageBackendSelection::Sqlite,
-        other => {
+    for retired in ["preferred", "fallback", "fallbackProbeTimeoutMs"] {
+        if storage.contains_key(retired) {
             return Err(ConfigError::Parse(format!(
-                "merged settings.storage.fallback must be sqlite, got {other}"
-            )))
+                "merged settings.storage.{retired} was retired; PostgreSQL is the only database"
+            )));
         }
-    };
-    let fallback_probe_timeout_ms =
-        optional_u64(storage, "fallbackProbeTimeoutMs", "merged settings.storage")?
-            .unwrap_or(3_000);
-    if !(100..=60_000).contains(&fallback_probe_timeout_ms) {
-        return Err(ConfigError::Parse(
-            "merged settings.storage.fallbackProbeTimeoutMs must be 100..60000".to_string(),
-        ));
     }
     let postgres = storage
         .get("postgres")
@@ -2468,20 +2661,8 @@ fn parse_optional_storage_config(root: &JsonValue) -> Result<StorageTopologyConf
             "merged settings.storage.postgres is required when backend=postgres".to_string(),
         ));
     }
-    if backend == StorageBackendSelection::Auto
-        && (preferred != StorageBackendSelection::Postgres
-            || fallback != StorageBackendSelection::Sqlite)
-    {
-        return Err(ConfigError::Parse(
-            "merged settings.storage.backend=auto supports only preferred=postgres and fallback=sqlite"
-                .to_string(),
-        ));
-    }
     Ok(StorageTopologyConfig {
         backend,
-        preferred,
-        fallback,
-        fallback_probe_timeout_ms,
         postgres,
         session_execution,
         artifacts,

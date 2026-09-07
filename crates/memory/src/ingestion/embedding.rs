@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -125,6 +126,9 @@ pub struct EmbeddingClient {
     /// Per-payload single-flight gates close the race between a first 400 and
     /// concurrent identical callers. Weak entries disappear after the callers.
     request_gates: Arc<AsyncMutex<HashMap<u64, Weak<AsyncMutex<()>>>>>,
+    /// Provider-observed upper bound for this configured route/model revision.
+    /// Clones share it; a newly configured client starts a fresh capability.
+    learned_batch_cap: Arc<AtomicUsize>,
 }
 
 impl EmbeddingClient {
@@ -171,12 +175,14 @@ impl EmbeddingClient {
             .build()
             .unwrap_or_default();
 
+        let initial_batch_cap = config.batch_size.max(1);
         Self {
             http,
             config,
             detected_dimension,
             deterministic_failures: Arc::new(RwLock::new(Vec::new())),
             request_gates: Arc::new(AsyncMutex::new(HashMap::new())),
+            learned_batch_cap: Arc::new(AtomicUsize::new(initial_batch_cap)),
         }
     }
 
@@ -213,7 +219,7 @@ impl EmbeddingClient {
             .iter()
             .map(|input| input.text.as_str())
             .collect::<Vec<_>>();
-        let batch_size = self.config.batch_size.max(1);
+        let batch_size = self.learned_batch_cap.load(Ordering::Acquire).max(1);
         let mut segment_vectors = Vec::with_capacity(prepared.len());
 
         for chunk in prepared_refs.chunks(batch_size) {
@@ -271,7 +277,13 @@ impl EmbeddingClient {
     ) -> Result<Vec<(usize, Vec<f32>)>, MemoryError> {
         // Explicit work stack avoids recursive async (boxing) while keeping
         // input order deterministic.
-        let mut pending = vec![(0usize, chunk.to_vec())];
+        let cap = self.learned_batch_cap.load(Ordering::Acquire).max(1);
+        let mut pending = chunk
+            .chunks(cap)
+            .enumerate()
+            .rev()
+            .map(|(index, batch)| (index.saturating_mul(cap), batch.to_vec()))
+            .collect::<Vec<_>>();
         let mut results: Vec<(usize, Vec<f32>)> = Vec::new();
         while let Some((base, batch)) = pending.pop() {
             match self.embed_batch(&batch).await {
@@ -282,6 +294,8 @@ impl EmbeddingClient {
                 }
                 Err(error) if is_batch_size_rejection(&error) && batch.len() > 1 => {
                     let half = batch.len() / 2;
+                    self.learned_batch_cap
+                        .fetch_min(half.max(1), Ordering::AcqRel);
                     warn!(
                         len = batch.len(),
                         "embedding provider rejected batch size; halving to {half}"
@@ -811,6 +825,49 @@ mod tests {
         )
     }
 
+    async fn spawn_batch_limited_server(
+        max_batch: usize,
+    ) -> (String, Arc<Mutex<Vec<usize>>>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind limited embedding server");
+        let address = listener.local_addr().expect("server address");
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let batches = Arc::clone(&observed);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let body = read_request_body(&mut stream).await;
+                let request: serde_json::Value =
+                    serde_json::from_slice(&body).expect("embedding request");
+                let inputs = request["input"].as_array().expect("input array");
+                batches.lock().expect("batch recorder").push(inputs.len());
+                let (status, response) = if inputs.len() > max_batch {
+                    (
+                        "400 Bad Request",
+                        serde_json::json!({"error":{"message":format!("batch size too large, maximum {max_batch}")}}),
+                    )
+                } else {
+                    let data = inputs
+                        .iter()
+                        .enumerate()
+                        .map(|(index, _)| serde_json::json!({"index":index,"embedding":[1.0,2.0]}))
+                        .collect::<Vec<_>>();
+                    ("200 OK", serde_json::json!({"data":data}))
+                };
+                let response = response.to_string();
+                let wire = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
+                    response.len()
+                );
+                stream.write_all(wire.as_bytes()).await.expect("response");
+            }
+        });
+        (format!("http://{address}/v1/embeddings"), observed, task)
+    }
+
     fn unconfigured_client() -> EmbeddingClient {
         EmbeddingClient::new(VectorConfig::default())
     }
@@ -909,6 +966,29 @@ mod tests {
 
         assert!(is_batch_size_rejection(&error));
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn provider_batch_cap_is_learned_once_and_reused_by_clones() {
+        let (url, batches, server) = spawn_batch_limited_server(2).await;
+        let client = EmbeddingClient::new(VectorConfig {
+            enabled: true,
+            model: "route-revision-a".into(),
+            api_url: url,
+            dimension: 2,
+            batch_size: 4,
+            max_input_tokens: 32,
+            ..VectorConfig::default()
+        });
+        let inputs = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        assert_eq!(client.embed(&inputs).await.expect("first request").len(), 8);
+        let clone = client.clone();
+        assert_eq!(clone.embed(&inputs).await.expect("warm request").len(), 8);
+
+        let observed = batches.lock().expect("batch recorder").clone();
+        assert_eq!(observed.iter().filter(|size| **size > 2).count(), 1);
+        assert_eq!(client.learned_batch_cap.load(Ordering::Acquire), 2);
+        server.abort();
     }
 
     #[test]

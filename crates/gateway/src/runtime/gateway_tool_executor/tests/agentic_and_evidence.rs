@@ -23,7 +23,7 @@
         let temporary = tempfile::tempdir().expect("temporary Runtime root");
         let workspace = temporary.path().join("workspace");
         std::fs::create_dir_all(&workspace).expect("workspace");
-        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().expect("Session store"));
+        let store = Arc::new(crate::pg_test_support::session_store());
         let session_id = "session-logical-evidence";
         store
             .create_session(&session::SessionRecord {
@@ -63,6 +63,11 @@
             temporary.path().join("home"),
             &workspace,
         )
+        .runtime_event_store(Arc::new(runtime::RuntimeEventStore::for_test()))
+        .task_aggregate_service(Arc::new(runtime::TaskAggregateService::for_test()))
+        .artifact_store(Arc::new(runtime::ArtifactStore::for_test_default(
+            temporary.path().join("artifacts"),
+        )))
         .build()
         .expect("Runtime services");
         services
@@ -143,8 +148,8 @@
                 unresolved: Vec::new(),
             },
         );
-        executor
-            .validate_agent_action_evidence(&services, &actor, &action)
+        services
+            .validate_agent_action_evidence(&actor, &action)
             .await
             .expect("logical evidence is authenticated before Program mutation");
 
@@ -421,8 +426,8 @@
                 unresolved: Vec::new(),
             },
         );
-        executor
-            .validate_agent_action_evidence(&services, &actor, &direct_artifact)
+        services
+            .validate_agent_action_evidence(&actor, &direct_artifact)
             .await
             .expect("same-Session direct artifact evidence is readable");
 
@@ -447,8 +452,8 @@
                 unresolved: Vec::new(),
             },
         );
-        let error = executor
-            .validate_agent_action_evidence(&services, &actor, &foreign_evidence)
+        let error = services
+            .validate_agent_action_evidence(&actor, &foreign_evidence)
             .await
             .expect_err("cross-Session private artifact evidence must fail closed");
         assert!(error.to_string().contains("is not readable in Session"));
@@ -461,8 +466,8 @@
                 unresolved: Vec::new(),
             },
         );
-        let error = executor
-            .validate_agent_action_evidence(&services, &actor, &fake_evidence)
+        let error = services
+            .validate_agent_action_evidence(&actor, &fake_evidence)
             .await
             .expect_err("invented logical evidence must fail at trusted ingress");
         assert!(
@@ -790,6 +795,62 @@
             &request,
             &ambiguous.to_string(),
             "ambiguous",
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn compact_write_receipt_keeps_typed_workspace_evidence_after_body_elision() {
+        let services = runtime::RuntimeServices::in_memory().expect("runtime services");
+        let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
+        executor
+            .bind_runtime_services(Arc::clone(&services))
+            .expect("bind runtime services");
+        let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
+            &runtime::tool_dispatch::ToolRequest {
+                tool_use_id: "compact-write-receipt".to_string(),
+                tool_name: "write_file".to_string(),
+                input: "{}".to_string(),
+                depends_on: Vec::new(),
+            },
+        );
+        request.observation_wave_sequence = 11;
+
+        // This is the canonical model-facing receipt emitted after the full
+        // adapter response is intentionally elided from the conversation.
+        let content = "created through compact receipt";
+        let output = serde_json::json!({
+            "operation": "create",
+            "path": services.workspace_root().join("compact-created.txt"),
+            "content_bytes": content.len(),
+            "content_sha256": format!("{:x}", Sha256::digest(content.as_bytes())),
+            "prior_bytes": 0,
+            "prior_sha256": null,
+            "replacement_count": 0,
+            "replace_all": true,
+        });
+        let observed =
+            gateway_observed_evidence(&executor, &request, &output.to_string(), "compact-create");
+
+        assert_eq!(observed.len(), 1);
+        assert!(matches!(
+            &observed[0].target,
+            harness_contract::context::EvidenceTargetIdentity::Workspace { scope }
+                if scope.access_mode == harness_contract::context::WorkspaceAccessMode::Write
+                    && scope.path.workspace_relative_path == "compact-created.txt"
+        ));
+        assert_eq!(
+            observed[0].workspace_prior_state,
+            Some(harness_contract::context::WorkspacePriorState::Absent)
+        );
+
+        let mut malformed = output;
+        malformed["content_sha256"] = serde_json::json!("not-a-digest");
+        assert!(gateway_observed_evidence(
+            &executor,
+            &request,
+            &malformed.to_string(),
+            "compact-malformed",
         )
         .is_empty());
     }

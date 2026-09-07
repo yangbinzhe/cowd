@@ -2456,9 +2456,8 @@ mod tests {
     async fn exact_memory_retrieval_respects_runtime_binding_scope() {
         let temp = tempfile::tempdir().expect("temporary memory root");
         let manager = Arc::new(
-            CognitiveContextManager::new(crate::config::MemoryConfig {
+            CognitiveContextManager::new_ephemeral(crate::config::MemoryConfig {
                 store: crate::config::StoreConfig {
-                    sqlite_path: temp.path().join("memory.sqlite"),
                     blob_dir: temp.path().join("blobs"),
                     enable_vector_index: false,
                     ..Default::default()
@@ -2737,9 +2736,8 @@ mod tests {
     async fn checkpoint_fact_projection_is_idempotent_across_replay() {
         let temp = tempfile::tempdir().expect("temporary memory root");
         let manager = Arc::new(
-            CognitiveContextManager::new(crate::config::MemoryConfig {
+            CognitiveContextManager::new_ephemeral(crate::config::MemoryConfig {
                 store: crate::config::StoreConfig {
-                    sqlite_path: temp.path().join("memory.sqlite"),
                     blob_dir: temp.path().join("blobs"),
                     enable_vector_index: false,
                     ..Default::default()

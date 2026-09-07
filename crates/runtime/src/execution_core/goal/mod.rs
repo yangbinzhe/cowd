@@ -237,6 +237,265 @@ impl GoalProgressReducer {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedGoalMutation {
+    pub stream_id: String,
+    pub expected_stream_revision: u64,
+    pub event: RuntimeTransactionEventInput,
+}
+
+impl GoalStore {
+    /// Prepare the Goal-side half of an Agentic Objective action. The caller
+    /// must commit the returned event in the same transaction as the Program
+    /// action through AgentActionService::apply_with_goal_event.
+    pub(crate) fn prepare_agentic_objective_action(
+        &self,
+        envelope: &harness_contract::agent_action::AgentActionEnvelope,
+        producer_refs: &[String],
+    ) -> Result<PreparedGoalMutation, String> {
+        use harness_contract::agent_action::{
+            AgentAction, ObjectiveReviewDecision, ObjectiveUpdateOperation,
+        };
+
+        let root_execution_id = envelope
+            .actor
+            .root_execution_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "Objective action requires a root execution binding".to_string())?;
+        let goal_id = format!("goal:{root_execution_id}");
+        let current = self
+            .get(&goal_id)?
+            .ok_or_else(|| format!("Objective action target {goal_id} not found"))?;
+        let binding = current.execution_binding.as_ref().ok_or_else(|| {
+            "Objective action target has no immutable GoalExecutionBinding".to_string()
+        })?;
+        if binding.objective_id != envelope.actor.objective_id
+            || binding.session_id != envelope.actor.session_id
+            || binding.turn_id != envelope.actor.turn_id
+            || binding.root_execution_id != root_execution_id
+            || binding.agentic_program_id != envelope.actor.program_id
+        {
+            return Err("Objective action binding does not match the durable Goal".to_string());
+        }
+        if let harness_contract::agent_action::AgentAction::ObjectiveUpdate(input) =
+            &envelope.action
+        {
+            if matches!(
+                input.operation,
+                harness_contract::agent_action::ObjectiveUpdateOperation::Replace
+                    | harness_contract::agent_action::ObjectiveUpdateOperation::Retire
+            ) {
+                let criterion_ref = input
+                    .criterion_ref
+                    .as_deref()
+                    .ok_or_else(|| "Objective update requires criterion_ref".to_string())?;
+                if current.user_intent_criterion_id.as_deref() == Some(criterion_ref) {
+                    return Err(
+                        "the original user_intent criterion cannot be replaced or retired"
+                            .to_string(),
+                    );
+                }
+                if !current
+                    .criteria
+                    .iter()
+                    .any(|criterion| criterion.id == criterion_ref)
+                {
+                    return Err("Objective update criterion does not exist".to_string());
+                }
+            }
+        }
+        let expected_goal_stream_revision = self
+            .event_store
+            .stream_revision(&stream_id(&goal_id))
+            .map_err(|error| error.to_string())?;
+        let expected_goal_revision = current.revision;
+        let next_sequence = current.user_sequence.saturating_add(1);
+        let producer_refs = sorted_unique(producer_refs.to_vec());
+        let (updated, _, event) = match &envelope.action {
+            AgentAction::ObjectiveUpdate(input) => self.revision_event(
+                &goal_id,
+                expected_goal_revision,
+                next_sequence,
+                format!("agentic_objective_update:{}", envelope.action_id),
+                |goal| {
+                    let changed = match input.operation {
+                        ObjectiveUpdateOperation::Add => {
+                            let statement_ref = input.statement_ref.as_ref().expect(
+                                "AgentAction validation requires statement_ref for objective add",
+                            );
+                            let criterion_id = format!(
+                                "criterion:{:x}",
+                                sha2::Sha256::digest(
+                                    format!("{}|{}|{}", goal.id, envelope.action_id, statement_ref)
+                                        .as_bytes()
+                                )
+                            );
+                            goal.criteria.push(harness_contract::goal::AcceptanceCriterion {
+                                id: criterion_id,
+                                statement: "Model-proposed criterion (see statement_ref)".to_string(),
+                                statement_ref: Some(statement_ref.clone()),
+                                source_refs: input.source_refs.clone(),
+                                required_evidence: input.evidence_requirements.clone(),
+                                status: harness_contract::goal::AcceptanceStatus::Open,
+                                waiver: None,
+                            });
+                            vec!["criteria".to_string()]
+                        }
+                        ObjectiveUpdateOperation::Replace => {
+                            let criterion_ref = input.criterion_ref.as_ref().expect(
+                                "AgentAction validation requires criterion_ref for objective replace",
+                            );
+                            let Some(criterion) =
+                                goal.criteria.iter_mut().find(|item| item.id == *criterion_ref)
+                            else {
+                                return Vec::new();
+                            };
+                            if let Some(statement_ref) = input.statement_ref.as_ref() {
+                                criterion.statement =
+                                    "Model-proposed criterion (see statement_ref)".to_string();
+                                criterion.statement_ref = Some(statement_ref.clone());
+                            }
+                            if !input.source_refs.is_empty() {
+                                criterion.source_refs.clone_from(&input.source_refs);
+                            }
+                            if !input.evidence_requirements.is_empty() {
+                                criterion
+                                    .required_evidence
+                                    .clone_from(&input.evidence_requirements);
+                            }
+                            criterion.status = harness_contract::goal::AcceptanceStatus::Open;
+                            vec!["criteria".to_string()]
+                        }
+                        ObjectiveUpdateOperation::Retire => {
+                            let criterion_ref = input.criterion_ref.as_ref().expect(
+                                "AgentAction validation requires criterion_ref for objective retire",
+                            );
+                            let before = goal.criteria.len();
+                            goal.criteria.retain(|criterion| criterion.id != *criterion_ref);
+                            debug_assert!(before != goal.criteria.len());
+                            vec!["criteria".to_string()]
+                        }
+                    };
+                    goal.spec_revision = goal.spec_revision.saturating_add(1);
+                    goal.spec_digest = goal_spec_digest(goal);
+                    goal.waiting = None;
+                    let mut fields = changed;
+                    fields.extend([
+                        "spec_revision".to_string(),
+                        "spec_digest".to_string(),
+                        "waiting".to_string(),
+                    ]);
+                    fields
+                },
+            )?,
+            AgentAction::ObjectiveReview(input) => self.revision_event(
+                &goal_id,
+                expected_goal_revision,
+                next_sequence,
+                format!("agentic_objective_review:{}", envelope.action_id),
+                |goal| {
+                    let Some(criterion) = goal
+                        .criteria
+                        .iter_mut()
+                        .find(|item| item.id == input.criterion_ref)
+                    else {
+                        return vec!["missing_criterion".to_string()];
+                    };
+                    let decision = match input.decision {
+                        ObjectiveReviewDecision::Satisfied => "satisfied",
+                        ObjectiveReviewDecision::Gap => "gap",
+                        ObjectiveReviewDecision::Blocked => "blocked",
+                    };
+                    criterion.status = match input.decision {
+                        ObjectiveReviewDecision::Satisfied => {
+                            harness_contract::goal::AcceptanceStatus::Satisfied
+                        }
+                        ObjectiveReviewDecision::Gap | ObjectiveReviewDecision::Blocked => {
+                            harness_contract::goal::AcceptanceStatus::Open
+                        }
+                    };
+                    let review_id = format!(
+                        "objective_review:{:x}",
+                        sha2::Sha256::digest(
+                            format!("{}|{}|{}", goal.id, envelope.action_id, input.criterion_ref)
+                                .as_bytes()
+                        )
+                    );
+                    goal.review_refs.push(review_id.clone());
+                    goal.review_refs.sort();
+                    goal.review_refs.dedup();
+                    goal.reviews.push(harness_contract::goal::ObjectiveReviewRecord {
+                        review_id,
+                        criterion_ref: input.criterion_ref.clone(),
+                        spec_revision: goal.spec_revision,
+                        input_manifest_digest: goal.spec_digest.clone(),
+                        result_refs: input.result_refs.clone(),
+                        evidence_refs: input.evidence_refs.clone(),
+                        reviewer_actor: envelope.actor.actor_id.clone(),
+                        reviewer_execution_id: envelope.actor.execution_id.clone(),
+                        producer_refs: producer_refs.clone(),
+                        decision: decision.to_string(),
+                        reason_ref: input.reason_ref.clone(),
+                    });
+                    vec!["criteria".to_string(), "review_refs".to_string(), "reviews".to_string()]
+                },
+            )?,
+            _ => return Err("action is not an Objective mutation".to_string()),
+        };
+        if updated
+            .reviews
+            .iter()
+            .any(|review| review.reviewer_actor.trim().is_empty())
+        {
+            return Err("Objective review is missing reviewer identity".to_string());
+        }
+        if let harness_contract::agent_action::AgentAction::ObjectiveReview(input) =
+            &envelope.action
+        {
+            let review = updated
+                .reviews
+                .iter()
+                .rev()
+                .find(|review| review.criterion_ref == input.criterion_ref)
+                .ok_or_else(|| "Objective review was not durably recorded".to_string())?;
+            if review.producer_refs.is_empty() {
+                return Err(
+                    "Objective review cannot establish independent review without a Runtime-resolved result producer"
+                        .to_string(),
+                );
+            }
+            if review
+                .producer_refs
+                .iter()
+                .any(|producer| producer == &review.reviewer_actor)
+            {
+                return Err(
+                    "Objective reviewer is also a producer of the reviewed result".to_string(),
+                );
+            }
+        }
+        Ok(PreparedGoalMutation {
+            stream_id: stream_id(&goal_id),
+            expected_stream_revision: expected_goal_stream_revision,
+            event,
+        })
+    }
+}
+
+fn goal_spec_digest(goal: &GoalContract) -> String {
+    let canonical = serde_json::json!({
+        "source_intent_ref": goal.source_intent_ref,
+        "criteria": goal.criteria,
+        "constraints": goal.constraints,
+        "participation_requirement": goal.participation_requirement,
+    });
+    format!(
+        "{:x}",
+        sha2::Sha256::digest(canonical.to_string().as_bytes())
+    )
+}
+
 impl GoalStore {
     #[must_use]
     pub fn new(event_store: Arc<RuntimeEventStore>) -> Self {
@@ -942,6 +1201,7 @@ impl GoalStore {
                     criterion.status = *status;
                 }
                 if criterion.status == AcceptanceStatus::Open
+                    && !criterion.required_evidence.is_empty()
                     && criterion
                         .required_evidence
                         .iter()
@@ -984,6 +1244,7 @@ impl GoalStore {
                 );
             }
         }
+        validate_completion(&goal, &projection.progress, completion, &durable_evidence)?;
         for criterion in &goal.criteria {
             if criterion.status == AcceptanceStatus::Waived {
                 let Some(waiver) = &criterion.waiver else {
@@ -1084,6 +1345,9 @@ impl GoalStore {
                 "goal completion has stale revision {expected_revision}"
             ));
         }
+        let durable_evidence = projection.progress.evidence_refs.clone();
+        apply_completion_criterion_state(&mut goal, &projection.progress, &durable_evidence);
+        validate_completion(&goal, &projection.progress, completion, &durable_evidence)?;
         match completion {
             GoalCompletion::Satisfied => {
                 for criterion in &mut goal.criteria {
@@ -1135,7 +1399,7 @@ impl GoalStore {
                 return Err("completion cannot transition back to open".to_string())
             }
         };
-        goal.evidence_refs = projection.progress.evidence_refs;
+        goal.evidence_refs = durable_evidence;
         goal.revision = goal.revision.saturating_add(1);
         self.append_goal_event(
             &stream_id,
@@ -1205,6 +1469,12 @@ impl GoalStore {
             ObjectiveTerminalKind::Failed => GoalCompletion::Failed,
             ObjectiveTerminalKind::Cancelled => GoalCompletion::Cancelled,
         };
+        let mut durable_evidence = projection.progress.evidence_refs.clone();
+        durable_evidence.extend(goal.evidence_refs.iter().cloned());
+        durable_evidence.extend(terminal.evidence_refs.iter().cloned());
+        durable_evidence.sort();
+        durable_evidence.dedup();
+        apply_completion_criterion_state(&mut goal, &projection.progress, &durable_evidence);
         if terminal.kind == ObjectiveTerminalKind::Satisfied {
             let required_open = goal.obligations.iter().any(|obligation| {
                 obligation.required
@@ -1244,11 +1514,8 @@ impl GoalStore {
             GoalCompletion::Cancelled => "cancelled".to_string(),
             GoalCompletion::Open => return Err("objective terminal cannot be open".to_string()),
         };
-        let mut evidence_refs = goal.evidence_refs.clone();
-        evidence_refs.extend(terminal.evidence_refs.iter().cloned());
-        evidence_refs.sort();
-        evidence_refs.dedup();
-        goal.evidence_refs = evidence_refs;
+        validate_completion(&goal, &projection.progress, completion, &durable_evidence)?;
+        goal.evidence_refs = durable_evidence;
         goal.revision = goal.revision.saturating_add(1);
         self.append_goal_event(
             &stream_id,
@@ -1405,6 +1672,136 @@ fn stream_id(goal_id: &str) -> String {
     format!("goal:{goal_id}")
 }
 
+fn apply_completion_criterion_state(
+    goal: &mut GoalContract,
+    progress: &GoalProgressSnapshot,
+    durable_evidence: &[String],
+) {
+    for criterion in &mut goal.criteria {
+        if let Some(status) = progress.criteria.get(&criterion.id) {
+            criterion.status = *status;
+        }
+        // An empty requirement set means semantic review is still required;
+        // all() over an empty iterator must never manufacture success.
+        if criterion.status == AcceptanceStatus::Open
+            && !criterion.required_evidence.is_empty()
+            && criterion
+                .required_evidence
+                .iter()
+                .all(|evidence| durable_evidence.contains(evidence))
+        {
+            criterion.status = AcceptanceStatus::Satisfied;
+        }
+    }
+}
+
+fn validate_completion(
+    goal: &GoalContract,
+    progress: &GoalProgressSnapshot,
+    completion: GoalCompletion,
+    durable_evidence: &[String],
+) -> Result<(), String> {
+    if completion == GoalCompletion::Open {
+        return Err("terminal completion must not be open".to_string());
+    }
+    if completion == GoalCompletion::WaitingExternalDecision {
+        return Err(
+            "waiting_external_decision is a resumable wait state, not an immutable Goal terminal"
+                .to_string(),
+        );
+    }
+    for criterion in &goal.criteria {
+        if criterion.status == AcceptanceStatus::Waived {
+            let Some(waiver) = &criterion.waiver else {
+                return Err(format!(
+                    "criterion {} is waived without a durable waiver receipt",
+                    criterion.id
+                ));
+            };
+            if waiver.actor.trim().is_empty()
+                || waiver.reason.trim().is_empty()
+                || waiver.permission_receipt.trim().is_empty()
+            {
+                return Err(format!(
+                    "criterion {} has an invalid waiver receipt",
+                    criterion.id
+                ));
+            }
+        }
+    }
+    if completion != GoalCompletion::Satisfied {
+        return Ok(());
+    }
+    let unresolved_obligations = goal
+        .obligations
+        .iter()
+        .filter(|obligation| {
+            obligation.required
+                && (obligation.state != ObjectiveObligationState::Satisfied
+                    || (obligation
+                        .evidence_requirement
+                        .independent_verifier_required
+                        && obligation.verifier_decision.is_none())
+                    || (obligation.evidence_requirement.reread_required
+                        && obligation.reread_receipts.is_empty()))
+        })
+        .map(|obligation| obligation.obligation_id.clone())
+        .collect::<Vec<_>>();
+    if !unresolved_obligations.is_empty() {
+        return Err(format!(
+            "cannot satisfy a goal while required obligations are unresolved: {}",
+            unresolved_obligations.join(", ")
+        ));
+    }
+    if goal.criteria.iter().any(|criterion| {
+        !matches!(
+            criterion.status,
+            AcceptanceStatus::Satisfied | AcceptanceStatus::Waived
+        )
+    }) {
+        return Err(
+            "cannot satisfy a goal until every current criterion has semantic review or required durable evidence"
+                .to_string(),
+        );
+    }
+    let user_intent = goal
+        .user_intent_criterion_id
+        .as_deref()
+        .and_then(|id| goal.criteria.iter().find(|criterion| criterion.id == id));
+    if goal.scope == harness_contract::goal::GoalScope::UserObjective && user_intent.is_none() {
+        return Err(
+            "a user Objective cannot complete without its original user_intent criterion"
+                .to_string(),
+        );
+    }
+    if goal.scope == harness_contract::goal::GoalScope::UserObjective && durable_evidence.is_empty()
+    {
+        return Err(
+            "a user Objective cannot complete with an empty durable evidence set".to_string(),
+        );
+    }
+    if !progress.open_conflicts.is_empty() {
+        return Err(format!(
+            "cannot satisfy a goal with unresolved conflicts: {}",
+            progress.open_conflicts.join(", ")
+        ));
+    }
+    if !progress.open_unknowns.is_empty() {
+        return Err(format!(
+            "cannot satisfy a goal with unresolved unknowns: {}",
+            progress.open_unknowns.join(", ")
+        ));
+    }
+    if progress
+        .effects
+        .values()
+        .any(|effect| *effect == harness_contract::goal::EffectTerminalClass::Uncertain)
+    {
+        return Err("cannot satisfy a goal while an effect has no terminal receipt".to_string());
+    }
+    Ok(())
+}
+
 fn validate_goal(goal: &GoalContract) -> Result<(), String> {
     if goal.id.trim().is_empty()
         || goal.session_id.trim().is_empty()
@@ -1421,6 +1818,52 @@ fn validate_goal(goal: &GoalContract) -> Result<(), String> {
         .any(|criterion| criterion.id.trim().is_empty() || criterion.statement.trim().is_empty())
     {
         return Err("goal criteria require non-empty id and statement".to_string());
+    }
+    if goal.spec_revision == 0 || goal.spec_digest.trim().is_empty() {
+        return Err(
+            "goal requires a non-zero semantic specification revision and digest".to_string(),
+        );
+    }
+    if goal.scope == harness_contract::goal::GoalScope::UserObjective {
+        let source_intent = goal
+            .source_intent_ref
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "user Objective requires a durable source_intent_ref".to_string())?;
+        let intent_id = goal
+            .user_intent_criterion_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "user Objective requires a user_intent criterion".to_string())?;
+        if !goal
+            .criteria
+            .iter()
+            .any(|criterion| criterion.id == intent_id)
+        {
+            return Err("user_intent criterion is not present in the Goal criteria".to_string());
+        }
+        let binding = goal
+            .execution_binding
+            .as_ref()
+            .ok_or_else(|| "user Objective requires immutable GoalExecutionBinding".to_string())?;
+        if binding.objective_id.trim().is_empty()
+            || binding.session_id != goal.session_id
+            || binding.turn_id.trim().is_empty()
+            || binding.root_execution_id.trim().is_empty()
+            || binding.agentic_program_id.trim().is_empty()
+            || source_intent.trim().is_empty()
+        {
+            return Err(
+                "GoalExecutionBinding is incomplete or crosses the Goal Session".to_string(),
+            );
+        }
+    }
+    if let Some(requirement) = goal.participation_requirement.as_ref() {
+        if requirement.minimum_team_count == 0 || requirement.source_ref.trim().is_empty() {
+            return Err(
+                "participation requirement needs a user source and positive team count".to_string(),
+            );
+        }
     }
     for criterion in &goal.criteria {
         if criterion.status == AcceptanceStatus::Waived {
@@ -1464,6 +1907,8 @@ mod tests {
             criteria: vec![AcceptanceCriterion {
                 id: "checked".to_string(),
                 statement: "result is checked".to_string(),
+                statement_ref: None,
+                source_refs: Vec::new(),
                 required_evidence: Vec::new(),
                 status: AcceptanceStatus::Open,
                 waiver: None,
@@ -1473,13 +1918,22 @@ mod tests {
             evidence_refs: Vec::new(),
             unresolved: Vec::new(),
             blockers: Vec::new(),
+            scope: harness_contract::goal::GoalScope::Internal,
+            user_intent_criterion_id: Some("checked".to_string()),
+            source_intent_ref: Some("session_message:test".to_string()),
+            execution_binding: None,
+            spec_revision: 1,
+            spec_digest: "test".to_string(),
+            review_refs: Vec::new(),
+            waiting: None,
+            participation_requirement: None,
             obligations: Vec::new(),
-            program_ref: None,
             recovery: None,
             terminal: None,
             completion: GoalCompletion::Open,
             revision: 1,
             user_sequence: 1,
+            reviews: Vec::new(),
         }
     }
 
@@ -1522,7 +1976,7 @@ mod tests {
 
     #[test]
     fn goal_revision_is_monotonic_and_completion_requires_acceptance() {
-        let store = GoalStore::new(Arc::new(RuntimeEventStore::try_open_in_memory().unwrap()));
+        let store = GoalStore::new(Arc::new(RuntimeEventStore::for_test()));
         store.create(goal()).unwrap();
         assert!(store
             .complete("goal-test", 1, GoalCompletion::Satisfied, "done")
@@ -1548,7 +2002,7 @@ mod tests {
 
     #[test]
     fn revision_event_carries_snapshot_and_revision_for_graph_atomic_commit() {
-        let store = GoalStore::new(Arc::new(RuntimeEventStore::try_open_in_memory().unwrap()));
+        let store = GoalStore::new(Arc::new(RuntimeEventStore::for_test()));
         store.create(goal()).unwrap();
 
         let (revised, revision, event) = store
@@ -1573,7 +2027,7 @@ mod tests {
 
     #[test]
     fn typed_observation_reducer_is_idempotent_and_completion_uses_its_evidence() {
-        let store = GoalStore::new(Arc::new(RuntimeEventStore::try_open_in_memory().unwrap()));
+        let store = GoalStore::new(Arc::new(RuntimeEventStore::for_test()));
         store.create(goal()).unwrap();
         let mut observation = observation(1);
         observation.criterion_deltas.push(CriterionDelta {
@@ -1614,7 +2068,7 @@ mod tests {
 
     #[test]
     fn unrelated_goal_revision_preserves_reduced_progress_and_unknown_resolution() {
-        let store = GoalStore::new(Arc::new(RuntimeEventStore::try_open_in_memory().unwrap()));
+        let store = GoalStore::new(Arc::new(RuntimeEventStore::for_test()));
         store.create(goal()).unwrap();
         let mut opened = observation(1);
         opened.unknown_deltas.push(UnknownDelta {
@@ -1648,7 +2102,7 @@ mod tests {
 
     #[test]
     fn intervention_projection_retains_full_trigger_identity() {
-        let store = GoalStore::new(Arc::new(RuntimeEventStore::try_open_in_memory().unwrap()));
+        let store = GoalStore::new(Arc::new(RuntimeEventStore::for_test()));
         store.create(goal()).unwrap();
         let trigger = observation(1);
         store.record_observation(trigger.clone()).unwrap();

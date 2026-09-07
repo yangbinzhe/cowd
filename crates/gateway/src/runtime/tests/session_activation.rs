@@ -21,7 +21,7 @@ fn concurrent_session_owner_conflict_remains_retryable() {
 
 #[tokio::test]
 async fn checkpoint_consumed_supplement_remains_attached_until_terminal_commit() {
-    let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+    let store = Arc::new(crate::pg_test_support::session_store());
     let now = chrono::Utc::now().to_rfc3339();
     store
         .create_session(&SessionRecord {
@@ -96,7 +96,7 @@ async fn checkpoint_consumed_supplement_remains_attached_until_terminal_commit()
 
 #[tokio::test]
 async fn terminal_primary_failure_rolls_attached_input_into_a_new_turn() {
-    let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+    let store = Arc::new(crate::pg_test_support::session_store());
     let now = chrono::Utc::now().to_rfc3339();
     store
         .create_session(&SessionRecord {
@@ -244,22 +244,29 @@ async fn delivery_fixture() -> (
     Arc<UnifiedSessionStore>,
     Arc<SessionProjectionHub>,
     Arc<runtime::RuntimeServices>,
+    Arc<crate::selected_storage::SelectedStorageTopology>,
     crate::event_bus::SessionProjectionSubscription,
 ) {
-    let runtime_event_store = Arc::new(runtime::RuntimeEventStore::try_open_in_memory().unwrap());
     let fixture_root = std::env::temp_dir()
         .join("cowd-terminal-delivery-fixtures")
         .join(uuid::Uuid::new_v4().to_string());
     let home = fixture_root.join("home");
     let workspace = fixture_root.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
+    let topology = Arc::new(
+        crate::selected_storage::SelectedStorageTopology::compose_for_test(&home, &workspace)
+            .expect("isolated PostgreSQL topology"),
+    );
+    let runtime_event_store = Arc::clone(&topology.runtime_event_store);
     let runtime_services = runtime::RuntimeServices::builder(&home, &workspace)
         .runtime_event_store(Arc::clone(&runtime_event_store))
+        .task_aggregate_service(Arc::clone(&topology.task_service))
+        .artifact_store(Arc::clone(&topology.artifact_store))
         .build()
         .unwrap();
     let event_store = runtime_services.session_terminal_delivery();
     let artifacts = Arc::clone(runtime_services.artifact_store());
-    let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+    let store = Arc::clone(&topology.session_store);
     let now = chrono::Utc::now().to_rfc3339();
     store
         .create_session(&SessionRecord {
@@ -290,6 +297,7 @@ async fn delivery_fixture() -> (
         store,
         event_bus,
         runtime_services,
+        topology,
         rx,
     )
 }
@@ -428,6 +436,50 @@ fn terminal_payload_requires_the_canonical_artifact_schema() {
 }
 
 #[test]
+fn terminal_session_errors_preserve_retryable_unknown_outcomes() {
+    use runtime::RuntimeSessionOutboxFailureClass::{Permanent, Retryable};
+
+    assert_eq!(
+        classify_terminal_session_error(&session::SessionError::StaleExecutionFence(
+            "generation changed".to_string()
+        )),
+        Permanent
+    );
+    assert_eq!(
+        classify_terminal_session_error(&session::SessionError::StorageQueueFull {
+            workers: 1,
+            queue_capacity: 1,
+        }),
+        Retryable
+    );
+    assert_eq!(
+        classify_terminal_session_error(&session::SessionError::StoragePlaneShutdown),
+        Retryable
+    );
+    assert_eq!(
+        classify_terminal_session_error(&session::SessionError::StorageWorkerPanic),
+        Retryable
+    );
+    assert_eq!(
+        classify_terminal_session_error(&session::SessionError::StorageWorkerJoin(
+            "join".to_string()
+        )),
+        Retryable
+    );
+    assert_eq!(
+        classify_terminal_session_error(&session::SessionError::StorageDrainTimeout {
+            active: 1,
+            queued: 1,
+        }),
+        Retryable
+    );
+    assert_eq!(
+        classify_terminal_session_error(&session::SessionError::Store("unknown IO".to_string())),
+        Retryable
+    );
+}
+
+#[test]
 fn terminal_payload_schema_three_round_trips_collaboration_terminal() {
     let terminal_presentation = serde_json::json!({
         "presentation_id": "presentation-1",
@@ -531,13 +583,30 @@ fn recovery_health_is_updated_after_background_restoration() {
         ..Default::default()
     };
 
-    supervisor.record_recovery(recovery);
+    supervisor.record_recovery(recovery, SessionStartupRecoveryState::Completed);
 
     let health = supervisor.health();
     assert_eq!(health.recovery.discovered, 7);
     assert_eq!(health.recovery.required, 2);
     assert_eq!(health.recovery.recovered, 2);
+    assert_eq!(
+        health.recovery_state,
+        SessionStartupRecoveryState::Completed
+    );
     assert!(health.recovery_completed_at_ms > 0);
+
+    supervisor.record_recovery(
+        crate::services::session_service::activation::SessionRecoverySummary {
+            failed: 1,
+            global_failures: 1,
+            failures: vec!["storage unavailable".to_string()],
+            ..Default::default()
+        },
+        SessionStartupRecoveryState::Failed,
+    );
+    let failed = supervisor.health();
+    assert_eq!(failed.recovery_state, SessionStartupRecoveryState::Failed);
+    assert_eq!(failed.recovery_completed_at_ms, 0);
 }
 
 #[test]
@@ -597,9 +666,15 @@ async fn append_success_ack_failure_replays_notification_without_duplicate_messa
         session_service,
         store,
         event_bus,
-        _runtime_services,
+        runtime_services,
+        _topology,
         mut rx,
     ) = delivery_fixture().await;
+    runtime_services.record_live_execution(
+        "s1",
+        "execution:request-1".to_string(),
+        "turn-1".to_string(),
+    );
     let private_reasoning = "private-provider-reasoning";
     let provider_signature = "provider-signature";
     let sealed_reasoning =
@@ -654,7 +729,7 @@ async fn append_success_ack_failure_replays_notification_without_duplicate_messa
         &artifacts,
         &session_service,
         &event_bus,
-        None,
+        Some(runtime_services.as_ref()),
         "wrong-owner",
         record,
     )
@@ -686,6 +761,15 @@ async fn append_success_ack_failure_replays_notification_without_duplicate_messa
     assert_eq!(terminal_event["runtime_commit_cursor"], commit_cursor);
     assert_eq!(terminal_event["replayed"], false);
     assert_eq!(event_store.get("t1").unwrap().unwrap().status, "claimed");
+    assert_eq!(
+        runtime_services
+            .execution_live("execution:request-1")
+            .unwrap()
+            .terminal_ref
+            .as_deref(),
+        Some("t1"),
+        "durable Session commit finalizes live before fallible broadcast acknowledgement"
+    );
 
     let reclaimed = event_store
         .claim("owner-b", claim_at + 11, 10, 1)
@@ -697,7 +781,7 @@ async fn append_success_ack_failure_replays_notification_without_duplicate_messa
         &artifacts,
         &session_service,
         &event_bus,
-        None,
+        Some(runtime_services.as_ref()),
         "owner-b",
         reclaimed,
     )
@@ -736,9 +820,16 @@ async fn generation_change_after_delivery_claim_rejects_terminal_without_project
         session_service,
         store,
         event_bus,
-        _runtime_services,
+        runtime_services,
+        _topology,
         mut rx,
     ) = delivery_fixture().await;
+    let execution_id = "execution:request-stale-generation";
+    runtime_services.record_live_execution(
+        "s1",
+        execution_id.to_string(),
+        "turn-stale-generation".to_string(),
+    );
     enqueue_fenced_terminal(
         &runtime_event_store,
         &store,
@@ -772,6 +863,33 @@ async fn generation_change_after_delivery_claim_rejects_terminal_without_project
         .unwrap()
         .pop()
         .unwrap();
+    let stale_generation = record.session_generation.unwrap();
+    assert_eq!(
+        runtime_services
+            .claim_live_terminal_fence(
+                execution_id,
+                "terminal-stale-generation".to_string(),
+                harness_contract::projection::ExecutionLiveStatus::Complete,
+                stale_generation,
+            )
+            .unwrap(),
+        runtime::execution_live::TerminalFenceClaim::Claimed,
+        "simulate an earlier attempt that retained its claim after an unknown DB outcome"
+    );
+    let report = harness_contract::context::ContextTurnReport::new(
+        "turn-stale-generation",
+        harness_contract::context::ContextPressureState::new("default", 32_000, 512),
+    );
+    assert!(runtime_services
+        .enrich_finalized_session_live(
+            execution_id,
+            harness_contract::projection::ExecutionLiveStatus::Complete,
+            "terminal-stale-generation".to_string(),
+            &report,
+            &["must-not-commit.md".to_string()],
+            None,
+        )
+        .is_err());
     store
         .advance_session_input_generation(
             "s1",
@@ -789,7 +907,7 @@ async fn generation_change_after_delivery_claim_rejects_terminal_without_project
         &artifacts,
         &session_service,
         &event_bus,
-        None,
+        Some(runtime_services.as_ref()),
         "delivery-stale-generation",
         record,
     )
@@ -805,6 +923,31 @@ async fn generation_change_after_delivery_claim_rejects_terminal_without_project
         rx.try_recv().is_err(),
         "a rejected stale terminal must not reach Surface projections"
     );
+    let live = runtime_services.execution_live(execution_id).unwrap();
+    assert!(
+        !live.status.is_terminal(),
+        "a stale Session generation must abort the reversible live claim"
+    );
+    assert!(live.terminal_ref.is_none());
+    assert_eq!(
+        runtime_services
+            .claim_live_terminal_fence(
+                execution_id,
+                "terminal-after-stale".to_string(),
+                harness_contract::projection::ExecutionLiveStatus::Complete,
+                stale_generation.saturating_add(1),
+            )
+            .unwrap(),
+        runtime::execution_live::TerminalFenceClaim::Claimed,
+        "the deterministic stale fence must release an older retained claim"
+    );
+    runtime_services
+        .abort_live_terminal_fence(
+            execution_id,
+            "terminal-after-stale",
+            stale_generation.saturating_add(1),
+        )
+        .unwrap();
     let terminal = event_store
         .get("terminal-stale-generation")
         .unwrap()
@@ -822,18 +965,28 @@ async fn generation_change_after_delivery_claim_rejects_terminal_without_project
 #[tokio::test]
 async fn corrupt_terminal_is_poisoned_and_visible_to_operations() {
     let (
-        _runtime_event_store,
+        runtime_event_store,
         event_store,
         artifacts,
         session_service,
         _store,
         event_bus,
         _runtime_services,
+        _topology,
         _rx,
     ) = delivery_fixture().await;
-    event_store
-        .enqueue("poison", "m2", "s1", 8, "not-typed")
-        .unwrap();
+    enqueue_fenced_terminal(
+        runtime_event_store.as_ref(),
+        _store.as_ref(),
+        "poison",
+        "m2",
+        "poison-request",
+        "poison-turn",
+        "poison-ingress",
+        artifacts.as_ref(),
+        serde_json::json!({"not": "a terminal payload"}),
+    )
+    .await;
     let record = event_store
         .claim("worker", 100, 10, 1)
         .unwrap()
@@ -866,6 +1019,7 @@ async fn typed_terminal_atomically_materializes_usage_and_session_counters_befor
         store,
         event_bus,
         _runtime_services,
+        _topology,
         _rx,
     ) = delivery_fixture().await;
     enqueue_fenced_terminal(
@@ -942,6 +1096,7 @@ async fn cancelled_execution_fence_suppresses_late_terminal_materialization() {
         store,
         event_bus,
         runtime_services,
+        _topology,
         _rx,
     ) = delivery_fixture().await;
     let request_id = "cancel-wins-request";
@@ -951,12 +1106,31 @@ async fn cancelled_execution_fence_suppresses_late_terminal_materialization() {
         execution_id.clone(),
         "cancel-wins-turn".to_string(),
     );
-    assert!(runtime_services
-        .try_cancel_live_execution(
-            &execution_id,
-            "user cancelled before terminal materialization".to_string(),
-        )
-        .unwrap());
+    let cancellation_id = "cancel-wins-receipt";
+    runtime_services
+        .commit_cancellation_receipt(harness_contract::turn::CancellationReceipt {
+            cancellation_id: cancellation_id.to_string(),
+            session_id: "s1".to_string(),
+            turn_id: "cancel-wins-turn".to_string(),
+            execution_id: execution_id.clone(),
+            actor_id: "test".to_string(),
+            cause: harness_contract::turn::CancellationCause::UserRequested,
+            reason: Some("user cancelled before terminal materialization".to_string()),
+            requested_at_ms: now_ms(),
+            effective_at_ms: None,
+            status: harness_contract::turn::CancellationStatus::Requested,
+            journal_sequence: 0,
+            projection_revision: 0,
+        })
+        .unwrap();
+    assert_eq!(
+        runtime_services
+            .resolve_requested_cancellation(cancellation_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        harness_contract::turn::CancellationStatus::Cancelled
+    );
     enqueue_fenced_terminal(
         &runtime_event_store,
         &store,
@@ -1037,6 +1211,7 @@ async fn partial_terminal_claims_error_instead_of_complete() {
         store,
         event_bus,
         runtime_services,
+        _topology,
         _rx,
     ) = delivery_fixture().await;
     let request_id = "partial-terminal-request";
@@ -1097,7 +1272,7 @@ async fn partial_terminal_claims_error_instead_of_complete() {
 }
 
 #[tokio::test]
-async fn delivery_worker_wakes_on_commit_and_shuts_down_gracefully() {
+async fn delivery_worker_waits_for_recovery_release_then_wakes_and_shuts_down() {
     let (
         runtime_event_store,
         event_store,
@@ -1106,9 +1281,11 @@ async fn delivery_worker_wakes_on_commit_and_shuts_down_gracefully() {
         store,
         event_bus,
         _runtime_services,
+        _topology,
         _rx,
     ) = delivery_fixture().await;
     let (shutdown, receiver) = watch::channel(false);
+    let (producer_admission, _) = watch::channel(false);
     let (ready, ready_rx) = oneshot::channel();
     let mut commit_observer = event_store.subscribe_commits();
     let handle = tokio::spawn(run_delivery_worker(
@@ -1118,6 +1295,7 @@ async fn delivery_worker_wakes_on_commit_and_shuts_down_gracefully() {
         event_bus,
         None,
         test_backend_reporter("terminal_delivery"),
+        producer_admission.subscribe(),
         receiver,
         ready,
     ));
@@ -1153,6 +1331,13 @@ async fn delivery_worker_wakes_on_commit_and_shuts_down_gracefully() {
         .await
         .expect("terminal transaction must publish a commit notification")
         .expect("terminal commit signal remains open");
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(
+        store.get_message_count("s1").await.unwrap(),
+        1,
+        "terminal delivery crossed the startup recovery fence"
+    );
+    producer_admission.send_replace(true);
     let delivered = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if store.get_message_count("s1").await.unwrap() >= 2 {
@@ -1630,10 +1815,11 @@ async fn startup_timeout_rolls_back_all_six_started_workers() {
 
 #[tokio::test]
 async fn reconciliation_workers_publish_continuous_runtime_progress() {
-    let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+    let store = Arc::new(crate::pg_test_support::session_store());
     let service = test_session_service(store, SessionProjectionHub::new());
     let progress = Arc::new(Mutex::new(reconciliation_progress_map()));
     let (shutdown, receiver) = watch::channel(false);
+    let (producer_admission, _) = watch::channel(true);
     let (lifecycle_ready, lifecycle_ready_rx) = oneshot::channel();
     let lifecycle = tokio::spawn(run_lifecycle_reconciliation_worker(
         Arc::clone(&service),
@@ -1642,6 +1828,7 @@ async fn reconciliation_workers_publish_continuous_runtime_progress() {
         None,
         Arc::clone(&progress),
         test_backend_reporter("lifecycle_reconciliation"),
+        producer_admission.subscribe(),
         receiver.clone(),
         lifecycle_ready,
     ));
@@ -1650,6 +1837,7 @@ async fn reconciliation_workers_publish_continuous_runtime_progress() {
         Arc::clone(&service),
         Arc::clone(&progress),
         test_backend_reporter("branch_activation_reconciliation"),
+        producer_admission.subscribe(),
         receiver,
         branch_ready,
     ));
@@ -1695,6 +1883,118 @@ async fn reconciliation_workers_publish_continuous_runtime_progress() {
         assert!(observation.last_success_at_ms.is_some());
         assert!(observation.last_error.is_none());
     }
+}
+
+#[tokio::test]
+async fn reconciliation_producers_do_not_advance_before_startup_recovery_release() {
+    let store = Arc::new(crate::pg_test_support::session_store());
+    let service = test_session_service(store, SessionProjectionHub::new());
+    let progress = Arc::new(Mutex::new(reconciliation_progress_map()));
+    let (shutdown, receiver) = watch::channel(false);
+    let (producer_admission, _) = watch::channel(false);
+    let (lifecycle_ready, lifecycle_ready_rx) = oneshot::channel();
+    let lifecycle = tokio::spawn(run_lifecycle_reconciliation_worker(
+        Arc::clone(&service),
+        None,
+        None,
+        None,
+        Arc::clone(&progress),
+        test_backend_reporter("lifecycle_reconciliation"),
+        producer_admission.subscribe(),
+        receiver.clone(),
+        lifecycle_ready,
+    ));
+    let (branch_ready, branch_ready_rx) = oneshot::channel();
+    let branch = tokio::spawn(run_branch_activation_reconciliation_worker(
+        Arc::clone(&service),
+        Arc::clone(&progress),
+        test_backend_reporter("branch_activation_reconciliation"),
+        producer_admission.subscribe(),
+        receiver,
+        branch_ready,
+    ));
+    lifecycle_ready_rx.await.unwrap().unwrap();
+    branch_ready_rx.await.unwrap().unwrap();
+
+    let before_release = progress
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    service.lifecycle_work_wake().notify_one();
+    service.branch_work_wake().notify_one();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    let still_fenced = progress
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    for name in [
+        "lifecycle_reconciliation",
+        "branch_activation_reconciliation",
+    ] {
+        assert_eq!(
+            still_fenced.get(name).unwrap().scan_count,
+            before_release.get(name).unwrap().scan_count,
+            "{name} crossed the startup recovery fence"
+        );
+        assert_eq!(
+            still_fenced.get(name).unwrap().attempted_count,
+            before_release.get(name).unwrap().attempted_count,
+            "{name} attempted durable work before startup recovery"
+        );
+    }
+
+    producer_admission.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if snapshot
+                .values()
+                .all(|observation| observation.scan_count >= 2)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both reconciliation producers must advance after recovery release");
+
+    shutdown.send(true).unwrap();
+    lifecycle.await.unwrap().unwrap();
+    branch.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn producer_admission_has_no_release_before_subscribe_lost_wakeup() {
+    let (producer_admission, _) = watch::channel(false);
+    producer_admission.send_replace(true);
+    let mut late_subscriber = producer_admission.subscribe();
+    let (_shutdown, mut shutdown) = watch::channel(false);
+
+    assert!(tokio::time::timeout(
+        Duration::from_millis(100),
+        await_session_producer_admission(&mut late_subscriber, &mut shutdown),
+    )
+    .await
+    .expect("late subscriber observes the current released state"));
+}
+
+#[tokio::test]
+async fn fenced_producer_exits_promptly_when_shutdown_wins() {
+    let (_producer_admission, mut fenced) = watch::channel(false);
+    let (shutdown, mut shutdown_rx) = watch::channel(false);
+    let waiter = tokio::spawn(async move {
+        await_session_producer_admission(&mut fenced, &mut shutdown_rx).await
+    });
+    shutdown.send_replace(true);
+
+    assert!(!tokio::time::timeout(Duration::from_millis(100), waiter)
+        .await
+        .expect("fenced worker must not deadlock during shutdown")
+        .unwrap());
 }
 
 #[test]

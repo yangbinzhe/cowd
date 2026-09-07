@@ -64,6 +64,7 @@ pub enum AgentActionServiceError {
 pub struct AgentActionService {
     store: Arc<RuntimeEventStore>,
     artifacts: Option<Arc<crate::ArtifactStore>>,
+    read_model: Arc<super::AgenticReadModel>,
 }
 
 impl AgentActionService {
@@ -72,7 +73,14 @@ impl AgentActionService {
         Self {
             store,
             artifacts: None,
+            read_model: Arc::new(super::AgenticReadModel::default()),
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_read_model(mut self, read_model: Arc<super::AgenticReadModel>) -> Self {
+        self.read_model = read_model;
+        self
     }
 
     /// Bind the physical artifact authority used by production Runtime
@@ -83,7 +91,7 @@ impl AgentActionService {
         self
     }
 
-    pub fn apply(
+    pub(crate) fn apply(
         &self,
         envelope: &AgentActionEnvelope,
     ) -> Result<AgentActionObservation, AgentActionServiceError> {
@@ -92,13 +100,39 @@ impl AgentActionService {
         }
         let stream_id = program_stream(&envelope.actor.program_id);
         self.store
-            .with_stream_lock(&stream_id, || self.apply_locked(envelope, &stream_id))
+            .with_stream_lock(&stream_id, || self.apply_locked(envelope, &stream_id, None))
+    }
+
+    /// Commit one Program action and its prepared Goal revision atomically.
+    /// The Goal mutation is prepared from durable state before acquiring the
+    /// ordered two-stream lock; expected revisions make a stale preparation a
+    /// whole-transaction conflict rather than a partial Objective update.
+    pub(crate) fn apply_with_goal_event(
+        &self,
+        envelope: &AgentActionEnvelope,
+        goal_stream_id: String,
+        expected_goal_stream_revision: u64,
+        goal_event: RuntimeTransactionEventInput,
+    ) -> Result<AgentActionObservation, AgentActionServiceError> {
+        if let Err(error) = envelope.validate() {
+            return Ok(rejected(envelope, 0, "invalid_action", &error.to_string()));
+        }
+        let program_stream_id = program_stream(&envelope.actor.program_id);
+        self.store
+            .with_stream_locks(&[program_stream_id.clone(), goal_stream_id.clone()], || {
+                self.apply_locked(
+                    envelope,
+                    &program_stream_id,
+                    Some((goal_stream_id, expected_goal_stream_revision, goal_event)),
+                )
+            })
     }
 
     fn apply_locked(
         &self,
         envelope: &AgentActionEnvelope,
         stream_id: &str,
+        goal_event: Option<(String, u64, RuntimeTransactionEventInput)>,
     ) -> Result<AgentActionObservation, AgentActionServiceError> {
         if let Some(existing) = self
             .store
@@ -171,6 +205,35 @@ impl AgentActionService {
         }
 
         if matches!(envelope.action, AgentAction::StateInspect(_)) {
+            if matches!(&envelope.action, AgentAction::StateInspect(input)
+                if input.scope_ref.as_deref() == Some("collaboration_patterns"))
+            {
+                let patterns =
+                    match crate::evolution::collaboration_experience::read_patterns(&self.store, 8)
+                    {
+                        Ok(patterns) => patterns,
+                        Err(error) => {
+                            return Ok(rejected(
+                                envelope,
+                                projection.revision,
+                                "advisory_evidence_unavailable",
+                                &error,
+                            ))
+                        }
+                    };
+                let mut observation = inspected_observation(envelope, &projection);
+                observation.projection = Some(json!({
+                    "advisory_only": true,
+                    "instruction": "These are structural observations from independent completed Turns, not prescribed plans, quality guarantees, executable definitions, or capability grants. Adopt, adapt, or ignore them. Inspect Runtime capabilities before using any suggested tool or skill.",
+                    "patterns": patterns.iter().filter(|pattern| pattern.is_actionable()).map(|pattern| json!({
+                        "pattern_ref": pattern.pattern_id,
+                        "revision": pattern.pattern_revision,
+                        "suggestion": pattern.semantic_suggestion,
+                        "evidence_summary": pattern.evidence_summary,
+                    })).collect::<Vec<_>>(),
+                }));
+                return Ok(observation);
+            }
             return Ok(inspected_observation(envelope, &projection));
         }
         if let Some(expected) = envelope.expected_revision {
@@ -206,6 +269,8 @@ impl AgentActionService {
                 AgentAction::TaskSubmit(input) => &input.evidence_refs,
                 AgentAction::TaskReview(input) => &input.evidence_refs,
                 AgentAction::TaskSupersede(input) => &input.evidence_refs,
+                AgentAction::TaskWithdraw(input) => &input.evidence_refs,
+                AgentAction::ObjectiveReview(input) => &input.evidence_refs,
                 AgentAction::ObjectiveCompleteRequest(input) => &input.evidence_refs,
                 _ => &[],
             };
@@ -296,16 +361,24 @@ impl AgentActionService {
             idempotency_key: Some(action_key(&envelope.action_id)),
             schema_version: 1,
         });
+        let mut expected_streams = vec![ExpectedStreamRevision {
+            stream_id: stream_id.to_string(),
+            expected_revision: projection.revision,
+        }];
+        if let Some((goal_stream_id, expected_goal_stream_revision, goal_event)) = goal_event {
+            expected_streams.push(ExpectedStreamRevision {
+                stream_id: goal_stream_id,
+                expected_revision: expected_goal_stream_revision,
+            });
+            events.push(goal_event);
+        }
         self.store
             .append_transaction_locked(AppendTransactionRequest {
                 transaction_id: format!(
                     "agent-action:{}:{}",
                     envelope.actor.program_id, envelope.action_id
                 ),
-                expected_streams: vec![ExpectedStreamRevision {
-                    stream_id: stream_id.to_string(),
-                    expected_revision: projection.revision,
-                }],
+                expected_streams,
                 events,
             })?;
         projection = self.project(&envelope.actor.program_id)?;
@@ -317,6 +390,51 @@ impl AgentActionService {
         program_id: &str,
     ) -> Result<AgenticProgramProjection, AgentActionServiceError> {
         let stream_id = program_stream(program_id);
+        let durable_revision = self.store.stream_revision(&stream_id)?;
+        if let Some(mut cached) = self.read_model.get(program_id) {
+            if cached.revision == durable_revision {
+                return Ok(cached);
+            }
+            if cached.revision < durable_revision {
+                let delta = self
+                    .store
+                    .list_stream_after(
+                        &stream_id,
+                        cached.revision,
+                        durable_revision,
+                        10_000,
+                        32 * 1024 * 1024,
+                    )
+                    .map_err(AgentActionServiceError::EventStore)?;
+                if delta.last().map(|event| event.sequence) == Some(durable_revision) {
+                    apply_projection_events(&mut cached, delta)?;
+                    self.remember_projection(&cached);
+                    return Ok(cached);
+                }
+            }
+        }
+        if let Some(mut persisted) = self.persisted_projection(program_id, durable_revision)? {
+            if persisted.revision < durable_revision {
+                let delta = self
+                    .store
+                    .list_stream_after(
+                        &stream_id,
+                        persisted.revision,
+                        durable_revision,
+                        10_000,
+                        32 * 1024 * 1024,
+                    )
+                    .map_err(AgentActionServiceError::EventStore)?;
+                if delta.last().map(|event| event.sequence) == Some(durable_revision) {
+                    apply_projection_events(&mut persisted, delta)?;
+                    self.remember_projection(&persisted);
+                    return Ok(persisted);
+                }
+            } else {
+                self.read_model.put(persisted.clone());
+                return Ok(persisted);
+            }
+        }
         let events = self
             .store
             .list_stream(&stream_id)
@@ -380,35 +498,70 @@ impl AgentActionService {
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or_default();
-        for event in events {
-            if event.kind == OBJECTIVE_VERDICT_EVENT_KIND {
-                let verdict =
-                    serde_json::from_value::<super::program::AgenticObjectiveVerdictProjection>(
-                        event.payload.get("verdict").cloned().ok_or_else(|| {
-                            AgentActionServiceError::Corrupt(
-                                "objective_verdict_event_missing_verdict".to_string(),
-                            )
-                        })?,
-                    )?;
-                projection.apply_objective_verdict(verdict, event.sequence);
-                continue;
-            }
-            if event.kind != ACTION_EVENT_KIND {
-                projection.revision = event.sequence;
-                continue;
-            }
-            let envelope: AgentActionEnvelope = serde_json::from_value(
-                event.payload.get("envelope").cloned().ok_or_else(|| {
-                    AgentActionServiceError::Corrupt("action_event_missing_envelope".to_string())
-                })?,
-            )?;
-            let entity_ref = event
-                .payload
-                .get("entity_ref")
-                .and_then(serde_json::Value::as_str);
-            projection.apply(&envelope, entity_ref, event.sequence, event.created_at_ms);
-        }
+        apply_projection_events(&mut projection, events)?;
+        self.remember_projection(&projection);
         Ok(projection)
+    }
+
+    fn persisted_projection(
+        &self,
+        program_id: &str,
+        durable_revision: u64,
+    ) -> Result<Option<AgenticProgramProjection>, AgentActionServiceError> {
+        let Some(checkpoint) = self
+            .store
+            .projection_checkpoint(&read_model_projection_id(program_id))?
+        else {
+            return Ok(None);
+        };
+        if checkpoint.source_cursor > durable_revision {
+            tracing::warn!(
+                program_id,
+                checkpoint_revision = checkpoint.source_cursor,
+                durable_revision,
+                "discarding Agentic read snapshot ahead of its durable Program"
+            );
+            return Ok(None);
+        }
+        let Ok(projection) = serde_json::from_value::<AgenticProgramProjection>(checkpoint.payload)
+        else {
+            tracing::warn!(program_id, "discarding corrupt Agentic read snapshot");
+            return Ok(None);
+        };
+        if projection.program_id != program_id || projection.revision != checkpoint.source_cursor {
+            tracing::warn!(program_id, "discarding misbound Agentic read snapshot");
+            return Ok(None);
+        }
+        Ok(Some(projection))
+    }
+
+    fn remember_projection(&self, projection: &AgenticProgramProjection) {
+        self.read_model.put(projection.clone());
+        let projection_id = read_model_projection_id(&projection.program_id);
+        let already_current = self
+            .store
+            .projection_checkpoint(&projection_id)
+            .ok()
+            .flatten()
+            .is_some_and(|checkpoint| checkpoint.source_cursor == projection.revision);
+        if already_current {
+            return;
+        }
+        let payload = match serde_json::to_value(projection) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::warn!(program_id = %projection.program_id, %error, "Agentic read snapshot serialization failed");
+                return;
+            }
+        };
+        if let Err(error) = self.store.put_projection_checkpoint(
+            &projection_id,
+            projection.revision,
+            &payload,
+            now_ms(),
+        ) {
+            tracing::warn!(program_id = %projection.program_id, %error, "Agentic read snapshot persistence failed");
+        }
     }
 
     /// Return the bounded, durable Program/own-Team topic delta for one
@@ -432,21 +585,17 @@ impl AgentActionService {
             return Ok(None);
         }
         let projection = self.project(program_id)?;
-        let member = projection.agents.get(agent_id).ok_or_else(|| {
+        let _member = projection.agents.get(agent_id).ok_or_else(|| {
             AgentActionServiceError::Corrupt(format!(
                 "topic_observer_not_in_program_roster:{agent_id}"
             ))
         })?;
-        let team_topic = projection
-            .teams
-            .get(&member.team_id)
+        let team_topics = projection
+            .active_team_ids_for(agent_id)
+            .into_iter()
+            .filter_map(|team_id| projection.teams.get(team_id))
             .map(|team| team.topic_ref.as_str())
-            .ok_or_else(|| {
-                AgentActionServiceError::Corrupt(format!(
-                    "topic_observer_team_not_found:{}",
-                    member.team_id
-                ))
-            })?;
+            .collect::<std::collections::BTreeSet<_>>();
         let cursor_stream = topic_cursor_stream(program_id, execution_id);
         let (from_revision, cursor_revision) = self.topic_cursor(&cursor_stream)?;
         let program_topic = format!("topic:{program_id}");
@@ -454,7 +603,8 @@ impl AgentActionService {
             .topics
             .iter()
             .filter(|(topic_ref, _)| {
-                topic_ref.as_str() == program_topic.as_str() || topic_ref.as_str() == team_topic
+                topic_ref.as_str() == program_topic.as_str()
+                    || team_topics.contains(topic_ref.as_str())
             })
             .flat_map(|(topic_ref, entries)| {
                 entries.iter().map(|entry| AgenticTopicObservation {
@@ -463,7 +613,14 @@ impl AgentActionService {
                 })
             })
             .filter(|observation| {
-                observation.entry.revision > from_revision && observation.entry.actor_id != agent_id
+                observation.entry.revision > from_revision
+                    && observation.entry.actor_id != agent_id
+                    && (observation.entry.recipients.is_empty()
+                        || observation
+                            .entry
+                            .recipients
+                            .iter()
+                            .any(|recipient| recipient == agent_id))
             })
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| {
@@ -635,7 +792,13 @@ impl AgentActionService {
         );
         if goal.id != expected_goal_id
             || goal.session_id != projection.session_id
-            || goal.program_ref.as_deref() != Some(root_execution_id)
+            || goal.execution_binding.as_ref().is_none_or(|binding| {
+                binding.objective_id != projection.objective_id
+                    || binding.session_id != projection.session_id
+                    || binding.turn_id != projection.turn_id
+                    || binding.root_execution_id != root_execution_id
+                    || binding.agentic_program_id != program_id
+            })
             || terminal.terminal_fence != expected_fence
             || terminal.authority_revision != request.program_revision
             || !terminal_matches_completion
@@ -723,11 +886,7 @@ impl AgentActionService {
         program_id: &str,
     ) -> Result<Option<AgenticProgramProjection>, AgentActionServiceError> {
         let stream_id = program_stream(program_id);
-        let events = self
-            .store
-            .list_stream(&stream_id)
-            .map_err(AgentActionServiceError::EventStore)?;
-        if events.is_empty() {
+        if self.store.stream_revision(&stream_id)? == 0 {
             return Ok(None);
         }
         self.project(program_id).map(Some)
@@ -763,9 +922,9 @@ impl AgentActionService {
                     "program_id": projection.program_id,
                     "revision": projection.revision,
                     "team": team,
-                    "agents": team.member_ids.iter().filter_map(|id| projection.agents.get(id)).collect::<Vec<_>>(),
-                    "tasks": team.task_ids.iter().filter_map(|id| projection.tasks.get(id)).collect::<Vec<_>>(),
-                    "topics": projection.topics.get(&team.topic_ref),
+                    "agents": team.member_ids.iter().take(STATE_INSPECT_PAGE_SIZE).filter_map(|id| projection.agents.get(id)).collect::<Vec<_>>(),
+                    "tasks": team.task_ids.iter().take(STATE_INSPECT_PAGE_SIZE).filter_map(|id| projection.tasks.get(id)).collect::<Vec<_>>(),
+                    "topics": projection.topics.get(&team.topic_ref).map(|entries| entries.iter().rev().take(STATE_INSPECT_PAGE_SIZE).collect::<Vec<_>>()),
                 });
             }
             if let Some(agent) = projection.agents.get(scope_ref) {
@@ -795,7 +954,7 @@ impl AgentActionService {
                     "program_id": projection.program_id,
                     "revision": projection.revision,
                     "topic_ref": scope_ref,
-                    "entries": entries,
+                    "entries": entries.iter().rev().take(STATE_INSPECT_PAGE_SIZE).collect::<Vec<_>>(),
                 });
             }
         }
@@ -803,6 +962,43 @@ impl AgentActionService {
             |_| json!({"program_id": projection.program_id, "revision": projection.revision}),
         )
     }
+}
+
+fn apply_projection_events(
+    projection: &mut AgenticProgramProjection,
+    events: Vec<crate::DurableRuntimeEvent>,
+) -> Result<(), AgentActionServiceError> {
+    for event in events {
+        if event.sequence <= projection.revision {
+            continue;
+        }
+        if event.kind == OBJECTIVE_VERDICT_EVENT_KIND {
+            let verdict =
+                serde_json::from_value::<super::program::AgenticObjectiveVerdictProjection>(
+                    event.payload.get("verdict").cloned().ok_or_else(|| {
+                        AgentActionServiceError::Corrupt(
+                            "objective_verdict_event_missing_verdict".to_string(),
+                        )
+                    })?,
+                )?;
+            projection.apply_objective_verdict(verdict, event.sequence);
+            continue;
+        }
+        if event.kind != ACTION_EVENT_KIND {
+            projection.revision = event.sequence;
+            continue;
+        }
+        let envelope: AgentActionEnvelope =
+            serde_json::from_value(event.payload.get("envelope").cloned().ok_or_else(|| {
+                AgentActionServiceError::Corrupt("action_event_missing_envelope".to_string())
+            })?)?;
+        let entity_ref = event
+            .payload
+            .get("entity_ref")
+            .and_then(serde_json::Value::as_str);
+        projection.apply(&envelope, entity_ref, event.sequence, event.created_at_ms);
+    }
+    Ok(())
 }
 
 fn is_durable_evidence_ref(reference: &str) -> bool {
@@ -871,15 +1067,41 @@ fn action_refs(envelope: &AgentActionEnvelope, entity_ref: Option<&str>) -> Vec<
             id: id.clone(),
         }));
     }
+    if let AgentAction::TaskWithdraw(input) = &envelope.action {
+        refs.push(RuntimeEventRef {
+            kind: "task".to_string(),
+            id: input.task_ref.clone(),
+        });
+        refs.extend(input.evidence_refs.iter().map(|id| RuntimeEventRef {
+            kind: "evidence".to_string(),
+            id: id.clone(),
+        }));
+    }
+    if let AgentAction::TaskAttemptDispatch(input) = &envelope.action {
+        refs.push(RuntimeEventRef {
+            kind: "task".to_string(),
+            id: input.task_ref.clone(),
+        });
+        refs.push(RuntimeEventRef {
+            kind: "execution_graph".to_string(),
+            id: input.execution_id.clone(),
+        });
+    }
     refs
 }
 
 fn entity_ref(envelope: &AgentActionEnvelope) -> Option<String> {
+    if let AgentAction::AgentInvite(input) = &envelope.action {
+        if let Some(existing_agent_ref) = input.existing_agent_ref.as_ref() {
+            return Some(existing_agent_ref.clone());
+        }
+    }
     let prefix = match envelope.action {
         AgentAction::TeamCreate(_) => "team",
         AgentAction::AgentInvite(_) => "agent",
         AgentAction::TaskPublish(_) => "task",
         AgentAction::TaskSupersede(ref input) => return Some(input.task_ref.clone()),
+        AgentAction::TaskWithdraw(ref input) => return Some(input.task_ref.clone()),
         AgentAction::MessagePublish(_) => "message",
         AgentAction::ArtifactCommit(_) => "artifact",
         _ => return None,
@@ -940,18 +1162,21 @@ fn inspected_observation(
     envelope: &AgentActionEnvelope,
     projection: &AgenticProgramProjection,
 ) -> AgentActionObservation {
-    let (scope_ref, after_revision) = match &envelope.action {
-        AgentAction::StateInspect(input) => (input.scope_ref.as_deref(), input.after_revision),
-        _ => (None, None),
+    let input = match &envelope.action {
+        AgentAction::StateInspect(input) => input,
+        _ => unreachable!("only state_inspect reaches inspected_observation"),
     };
-    let value = if after_revision.is_some_and(|revision| revision == projection.revision) {
+    let value = if input.after_revision == Some(projection.revision)
+        && input.entry_ref.is_none()
+        && input.scope_ref.is_none()
+    {
         json!({
             "program_id": projection.program_id,
             "revision": projection.revision,
             "unchanged": true,
         })
     } else {
-        AgentActionService::compact_projection(projection, scope_ref)
+        inspect_projection_page(projection, input)
     };
     AgentActionObservation {
         receipt_id: format!(
@@ -969,6 +1194,109 @@ fn inspected_observation(
         projection: Some(value),
         error: None,
     }
+}
+
+const STATE_INSPECT_PAGE_SIZE: usize = 32;
+
+/// Return a bounded navigation page or one exact entity.  The output never
+/// contains an unbounded Program dump: models use the returned stable refs to
+/// retrieve only the Task, Team, topic, or artifact relevant to their next
+/// decision.  The cursor is a deterministic index over a revision snapshot,
+/// so it is safe to discard after any revision change.
+fn inspect_projection_page(
+    projection: &AgenticProgramProjection,
+    input: &harness_contract::agent_action::StateInspectInput,
+) -> serde_json::Value {
+    let exact_ref = input.entry_ref.as_deref().or(input.scope_ref.as_deref());
+    if let Some(reference) = exact_ref {
+        if projection.teams.contains_key(reference)
+            || projection.agents.contains_key(reference)
+            || projection.tasks.contains_key(reference)
+            || projection.artifacts.contains_key(reference)
+            || projection.topics.contains_key(reference)
+        {
+            return AgentActionService::compact_projection(projection, Some(reference));
+        }
+        return json!({
+            "program_id": projection.program_id,
+            "revision": projection.revision,
+            "entry_ref": reference,
+            "not_found": true,
+        });
+    }
+    let offset = input
+        .page_cursor
+        .as_deref()
+        .and_then(|cursor| {
+            cursor
+                .strip_prefix("state:")
+                .and_then(|value| value.parse::<usize>().ok())
+        })
+        .unwrap_or_default();
+    let mut entries = projection
+        .teams
+        .values()
+        .map(|team| {
+            json!({
+                "entry_ref": team.team_id,
+                "kind": "team",
+                "label": team.name,
+                "lifecycle": team.lifecycle,
+            })
+        })
+        .chain(projection.agents.values().map(|agent| {
+            json!({
+                "entry_ref": agent.agent_id,
+                "kind": "agent",
+                "label": agent.role,
+                "memberships": agent.membership_ids,
+            })
+        }))
+        .chain(projection.tasks.values().map(|task| {
+            json!({
+                "entry_ref": task.task_id,
+                "kind": "task",
+                "label": task.title,
+                "status": task.status,
+                "team_ref": task.team_id,
+                "active_attempt_count": task.active_attempts.len(),
+            })
+        }))
+        .chain(projection.topics.keys().map(|topic_ref| {
+            json!({
+                "entry_ref": topic_ref,
+                "kind": "topic",
+            })
+        }))
+        .chain(projection.artifacts.values().map(|artifact| {
+            json!({
+                "entry_ref": artifact.artifact_ref,
+                "kind": "artifact",
+                "label": artifact.title,
+            })
+        }))
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left["entry_ref"].as_str().cmp(&right["entry_ref"].as_str()));
+    let start = offset.min(entries.len());
+    let end = start
+        .saturating_add(STATE_INSPECT_PAGE_SIZE)
+        .min(entries.len());
+    let next_cursor = (end < entries.len()).then(|| format!("state:{end}"));
+    json!({
+        "program_id": projection.program_id,
+        "objective_id": projection.objective_id,
+        "revision": projection.revision,
+        "status": projection.status,
+        "counts": {
+            "teams": projection.teams.len(),
+            "agents": projection.agents.len(),
+            "memberships": projection.memberships.len(),
+            "tasks": projection.tasks.len(),
+            "artifacts": projection.artifacts.len(),
+        },
+        "entries": entries[start..end].to_vec(),
+        "next_page_cursor": next_cursor,
+    })
 }
 
 fn rejected(
@@ -1012,7 +1340,19 @@ fn actionable(projection: &AgenticProgramProjection, duplicate: bool) -> Vec<Str
             return actions;
         }
         super::program::AgenticProgramStatus::Verified
-        | super::program::AgenticProgramStatus::Blocked => return actions,
+        | super::program::AgenticProgramStatus::Partial
+        | super::program::AgenticProgramStatus::Blocked
+        | super::program::AgenticProgramStatus::Failed
+        | super::program::AgenticProgramStatus::Cancelled => return actions,
+        super::program::AgenticProgramStatus::Waiting => {
+            actions.push("await the recorded external dependency or permission change".to_string());
+            return actions;
+        }
+        super::program::AgenticProgramStatus::Draining => {
+            actions
+                .push("await cancellation and effect verification before finalizing".to_string());
+            return actions;
+        }
         super::program::AgenticProgramStatus::Open => {}
     }
     if projection.teams.is_empty() {
@@ -1075,6 +1415,13 @@ fn topic_cursor_stream(program_id: &str, execution_id: &str) -> String {
 
 fn action_key(action_id: &str) -> String {
     format!("agent-action:{action_id}")
+}
+
+fn read_model_projection_id(program_id: &str) -> String {
+    format!(
+        "runtime:agentic-read-model:v1:{:x}",
+        Sha256::digest(program_id.as_bytes())
+    )
 }
 
 fn now_ms() -> u64 {

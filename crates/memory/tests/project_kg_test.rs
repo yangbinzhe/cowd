@@ -1143,7 +1143,8 @@ fn test_file_change_triggers_kg_rebuild() {
     fs::write(proj.join("lib.rs"), "fn old_function() {}\n").unwrap();
 
     // 2. Register project and build KG
-    let mgr = ProjectScopeManager::new(tmp.path().join("global.db")).unwrap();
+    let mgr =
+        ProjectScopeManager::with_store(std::sync::Arc::new(memory::EphemeralMemoryStore::new()));
     let pid = mgr.register_project(&proj).unwrap();
 
     // 3. Assert: is_kg_stale() returns false immediately after registration
@@ -1170,8 +1171,8 @@ fn test_file_change_triggers_kg_rebuild() {
 
 #[test]
 fn test_is_kg_stale_unknown_project() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let mgr = ProjectScopeManager::new(tmp.path().join("global.db")).unwrap();
+    let mgr =
+        ProjectScopeManager::with_store(std::sync::Arc::new(memory::EphemeralMemoryStore::new()));
 
     let result = mgr.is_kg_stale("nonexistent_project_id");
     assert!(

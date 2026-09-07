@@ -2,20 +2,19 @@
 
 use std::sync::Arc;
 
-use memory::store::{sqlite::SqliteStore, MemoryStore};
+use memory::store::{EphemeralMemoryStore, MemoryStore};
 use memory::{
     L4PromotionCommand, MemoryConfig, MemoryLayer, MemoryOrchestrator, MemoryScope, Priority,
 };
 
 #[tokio::test]
-async fn only_governed_l4_promotion_crosses_the_shared_persistent_boundary_and_survives_reopen() {
-    let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("shared-persistent-boundary.db");
+async fn only_governed_l4_promotion_crosses_the_shared_store_boundary() {
     let mut config = MemoryConfig::default();
     config.layers.l4_enabled = true;
+    let store: Arc<dyn MemoryStore> = Arc::new(EphemeralMemoryStore::new());
     let id = {
-        let store: Arc<dyn MemoryStore> = Arc::new(SqliteStore::open_path(&path).unwrap());
-        let memory = MemoryOrchestrator::from_store(config.clone(), store, None).unwrap();
+        let memory =
+            MemoryOrchestrator::from_store(config.clone(), Arc::clone(&store), None).unwrap();
         assert!(memory
             .write(
                 MemoryLayer::L4,
@@ -44,7 +43,6 @@ async fn only_governed_l4_promotion_crosses_the_shared_persistent_boundary_and_s
             .await
             .expect("governed promotion")
     };
-    let store: Arc<dyn MemoryStore> = Arc::new(SqliteStore::open_path(&path).unwrap());
     let memory = MemoryOrchestrator::from_store(config, store, None).unwrap();
     let promoted = memory
         .recall(&id)

@@ -14,12 +14,9 @@ use fact_kernel::{
 use harness_contract::agent::{AgentBindingSnapshot, CognitiveReadScope};
 use harness_contract::reality::RealityBoundary;
 use matrix_core::{MatrixScenarioResult, MatrixScenarioRun, MatrixScenarioSpec, MatrixSnapshotRef};
-#[cfg(test)]
-use matrix_repository::open_matrix_sqlite_repository_handle;
-use matrix_repository::{MatrixRecallQuery, MatrixStore, MatrixStoreHandle};
+use matrix_repository::{MatrixRecallQuery, MatrixStore};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use storage::StorageRegistry;
 
 use crate::{ContextItem, ContextRole, ContextSourceKind, ContextVisibility};
 
@@ -61,21 +58,16 @@ pub struct RealityRecallPort {
 impl RealityRecallPort {
     #[must_use]
     pub fn for_config_home(config_home: impl Into<PathBuf>) -> Self {
-        let config_home = config_home.into();
-        let ledger = StorageRegistry::default_for_config_home(&config_home)
-            .endpoint(&storage::StorageDomainId::Fact)
-            .map_err(|error| error.to_string())
-            .and_then(|endpoint| {
-                fact_sqlite::SqliteFactLedger::open(endpoint).map_err(|error| error.to_string())
-            })
-            .map(|ledger| Arc::new(ledger) as Arc<dyn FactLedger>)
-            .unwrap_or_else(|error| Arc::new(UnavailableFactLedger::new(error)));
-        let (matrix_store, matrix_store_error) = matrix_store_for_config_home(&config_home)
-            .map_or_else(|error| (None, Some(error)), |store| (Some(store), None));
+        let _config_home = config_home.into();
+        let ledger: Arc<dyn FactLedger> = Arc::new(UnavailableFactLedger::new(
+            "RealityRecallPort requires an injected PostgreSQL FactLedger",
+        ));
         Self {
             fact_ledger: ledger,
-            matrix_store,
-            matrix_store_error,
+            matrix_store: None,
+            matrix_store_error: Some(
+                "RealityRecallPort requires an injected PostgreSQL MatrixStore".to_string(),
+            ),
             project_scope_key: None,
         }
     }
@@ -99,13 +91,13 @@ impl RealityRecallPort {
         config_home: impl Into<PathBuf>,
         fact_ledger: Arc<dyn FactLedger>,
     ) -> Self {
-        let config_home = config_home.into();
-        let (matrix_store, matrix_store_error) = matrix_store_for_config_home(&config_home)
-            .map_or_else(|error| (None, Some(error)), |store| (Some(store), None));
+        let _config_home = config_home.into();
         Self {
             fact_ledger,
-            matrix_store,
-            matrix_store_error,
+            matrix_store: None,
+            matrix_store_error: Some(
+                "RealityRecallPort requires an injected PostgreSQL MatrixStore".to_string(),
+            ),
             project_scope_key: None,
         }
     }
@@ -499,17 +491,6 @@ fn ensure_matrix_snapshot_granted(
     Ok(())
 }
 
-fn matrix_store_for_config_home(config_home: &Path) -> Result<Arc<dyn MatrixStore>, String> {
-    let registry = StorageRegistry::default_for_config_home(config_home);
-    let endpoint = registry
-        .endpoint(&storage::StorageDomainId::Matrix)
-        .cloned()
-        .map_err(|error| error.to_string())?;
-    MatrixStoreHandle::new(endpoint)
-        .open()
-        .map_err(|error| error.to_string())
-}
-
 fn fact_context_item(fact: fact_kernel::FactRecord) -> ContextItem {
     let mut item = ContextItem::new(
         format!("fact:{}", fact.id.as_str()),
@@ -630,7 +611,59 @@ mod tests {
         MatrixFact, MatrixFactInput, MatrixScenarioOutputContract, MatrixSourceKind,
         MatrixSourceSnapshotInput,
     };
-    use storage::StorageRegistry;
+    use matrix_repository::PostgresMatrixRepository;
+    use storage::{PostgresConnectionConfig, PostgresExecutor, StaticSecretRefResolver};
+
+    struct MatrixFixture {
+        repository: Arc<PostgresMatrixRepository>,
+        executor: PostgresExecutor,
+        schema: String,
+    }
+
+    impl MatrixFixture {
+        fn isolated() -> Self {
+            let url = std::env::var("COWD_TEST_POSTGRES_URL")
+                .expect("COWD_TEST_POSTGRES_URL is required");
+            let resolver = StaticSecretRefResolver::new([("runtime.recall.unit".to_string(), url)]);
+            let executor = PostgresExecutor::connect(
+                PostgresConnectionConfig::new(
+                    "runtime-recall-unit",
+                    "runtime.recall.unit",
+                    "runtime-recall-unit",
+                ),
+                &resolver,
+            )
+            .expect("PostgreSQL executor");
+            let schema = format!("runtime_recall_unit_{}", uuid::Uuid::new_v4().simple());
+            executor
+                .checkout_critical()
+                .expect("PostgreSQL connection")
+                .batch_execute(&format!("CREATE SCHEMA \"{schema}\""))
+                .expect("isolated schema");
+            let repository = Arc::new(
+                PostgresMatrixRepository::new(
+                    executor.scoped_namespace(&schema).expect("scoped executor"),
+                )
+                .expect("Matrix repository"),
+            );
+            Self {
+                repository,
+                executor,
+                schema,
+            }
+        }
+    }
+
+    impl Drop for MatrixFixture {
+        fn drop(&mut self) {
+            if let Ok(mut connection) = self.executor.checkout_critical() {
+                let _ = connection.batch_execute(&format!(
+                    "DROP SCHEMA IF EXISTS \"{}\" CASCADE",
+                    self.schema
+                ));
+            }
+        }
+    }
 
     fn binding(config_home: &Path, snapshot_ref: Option<String>) -> AgentBindingSnapshot {
         let _ = config_home;
@@ -674,15 +707,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires COWD_TEST_POSTGRES_URL"]
     fn matrix_scenario_port_refuses_unleased_snapshot_and_returns_candidate_only() {
         let home = tempfile::tempdir().unwrap();
-        let registry = StorageRegistry::default_for_config_home(home.path());
-        let handle = registry
-            .endpoint(&storage::StorageDomainId::Matrix)
-            .unwrap()
-            .as_handle();
-        std::fs::create_dir_all(handle.path.parent().unwrap()).unwrap();
-        let repository = open_matrix_sqlite_repository_handle(&handle).unwrap();
+        let fixture = MatrixFixture::isolated();
+        let repository = Arc::clone(&fixture.repository);
         let snapshot = repository
             .create_source_snapshot(MatrixSourceSnapshotInput {
                 snapshot_id: Some("scenario-port-snapshot".to_string()),
@@ -700,7 +729,12 @@ mod tests {
             })
             .unwrap();
         let snapshot_ref = MatrixSnapshotRef::from_source_snapshot(&snapshot);
-        let port = RealityRecallPort::for_config_home(home.path()).matrix_scenarios();
+        let port = RealityRecallPort::with_fact_and_matrix_store(
+            home.path(),
+            Arc::new(fact_kernel::EphemeralFactLedger::new()),
+            repository,
+        )
+        .matrix_scenarios();
         let denied = binding(home.path(), None);
         let request = MatrixScenarioStartRequest {
             spec: MatrixScenarioSpec::new(
@@ -736,15 +770,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires COWD_TEST_POSTGRES_URL"]
     fn recall_port_injects_only_binding_leased_fact_and_matrix_evidence() {
         let home = tempfile::tempdir().unwrap();
-        let registry = StorageRegistry::default_for_config_home(home.path());
-        let matrix_handle = registry
-            .endpoint(&storage::StorageDomainId::Matrix)
-            .unwrap()
-            .as_handle();
-        std::fs::create_dir_all(matrix_handle.path.parent().unwrap()).unwrap();
-        let repository = open_matrix_sqlite_repository_handle(&matrix_handle).unwrap();
+        let fixture = MatrixFixture::isolated();
+        let repository = Arc::clone(&fixture.repository);
         let snapshot = repository
             .create_source_snapshot(MatrixSourceSnapshotInput {
                 snapshot_id: Some("recall-port-snapshot".to_string()),
@@ -779,8 +809,7 @@ mod tests {
             }))
             .unwrap();
 
-        let fact_endpoint = registry.endpoint(&storage::StorageDomainId::Fact).unwrap();
-        let fact_ledger = fact_sqlite::SqliteFactLedger::open(fact_endpoint).unwrap();
+        let fact_ledger = fact_kernel::EphemeralFactLedger::new();
         let mut fact = fact_kernel::FactRecord::new(
             "supply.policy",
             "east region requires an expedited allocation",
@@ -794,11 +823,12 @@ mod tests {
             Some(MatrixSnapshotRef::from_source_snapshot(&snapshot).snapshot_ref),
         );
         leased.data_lease.fact_refs = vec!["fact:fact-recall-policy".to_string()];
-        let report = RealityRecallPort::for_config_home(home.path()).recall_for_binding(
-            &leased,
-            "east shortage allocation",
-            12,
+        let port = RealityRecallPort::with_fact_and_matrix_store(
+            home.path(),
+            Arc::new(fact_ledger),
+            repository,
         );
+        let report = port.recall_for_binding(&leased, "east shortage allocation", 12);
         assert!(report
             .items
             .iter()
@@ -810,11 +840,7 @@ mod tests {
 
         leased.data_lease.fact_refs.clear();
         leased.data_lease.matrix_snapshot_refs.clear();
-        let denied = RealityRecallPort::for_config_home(home.path()).recall_for_binding(
-            &leased,
-            "east shortage allocation",
-            12,
-        );
+        let denied = port.recall_for_binding(&leased, "east shortage allocation", 12);
         assert!(denied.items.is_empty());
         assert!(denied
             .sources
@@ -822,11 +848,7 @@ mod tests {
             .all(|source| source.status == "disabled_by_binding"));
 
         leased.data_lease.fact_refs = vec!["not-a-fact-reference".to_string()];
-        let invalid = RealityRecallPort::for_config_home(home.path()).recall_for_binding(
-            &leased,
-            "east shortage allocation",
-            12,
-        );
+        let invalid = port.recall_for_binding(&leased, "east shortage allocation", 12);
         assert!(invalid.items.is_empty());
         assert!(invalid
             .sources

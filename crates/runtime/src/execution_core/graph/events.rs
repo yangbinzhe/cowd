@@ -2,8 +2,7 @@ use std::collections::BTreeMap;
 
 use harness_contract::execution_graph::{
     ExecutionEdge, ExecutionGraph, ExecutionNodeResult, ExecutionNodeSpec, ExecutionNodeStatus,
-    ExecutionOrchestrationMetadata, ExecutionParentBinding, ExecutionRecoveryCursor,
-    ExecutionServiceClass,
+    ExecutionParentBinding, ExecutionRecoveryCursor, ExecutionServiceClass,
 };
 use serde::{Deserialize, Serialize};
 
@@ -27,8 +26,6 @@ pub struct ExecutionGraphDelta {
     pub service_class: Option<ExecutionServiceClass>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_execution: Option<Option<ExecutionParentBinding>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub orchestration: Option<Option<ExecutionOrchestrationMetadata>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation_binding:
         Option<Option<harness_contract::turn::CollaborationContinuationBinding>>,
@@ -65,8 +62,6 @@ impl ExecutionGraphDelta {
                 .then_some(next.service_class),
             parent_execution: (previous.parent_execution != next.parent_execution)
                 .then(|| next.parent_execution.clone()),
-            orchestration: (previous.orchestration != next.orchestration)
-                .then(|| next.orchestration.clone()),
             continuation_binding: (previous.continuation_binding != next.continuation_binding)
                 .then(|| next.continuation_binding.clone()),
             delivery_envelope: (previous.delivery_envelope != next.delivery_envelope)
@@ -146,9 +141,6 @@ impl ExecutionGraphDelta {
         }
         if let Some(parent_execution) = &self.parent_execution {
             graph.parent_execution.clone_from(parent_execution);
-        }
-        if let Some(orchestration) = &self.orchestration {
-            graph.orchestration.clone_from(orchestration);
         }
         if let Some(binding) = &self.continuation_binding {
             graph.continuation_binding.clone_from(binding);

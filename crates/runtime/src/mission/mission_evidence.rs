@@ -547,7 +547,7 @@ mod tests {
 
     #[test]
     fn committed_write_is_immediately_readable_and_checkpointing_is_async() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let bus = MissionEvidenceBus::new(Arc::clone(&store));
         bus.record(evidence("e1")).unwrap();
         bus.record(evidence("e1")).unwrap();
@@ -576,7 +576,7 @@ mod tests {
 
     #[test]
     fn concurrent_projectors_converge_on_one_checkpoint() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         MissionEvidenceBus::new(Arc::clone(&store))
             .record(evidence("e1"))
             .unwrap();
@@ -602,7 +602,7 @@ mod tests {
 
     #[test]
     fn stale_background_snapshot_cannot_hide_newer_foreground_evidence() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let bus = MissionEvidenceBus::new(Arc::clone(&store));
         bus.record(evidence("e1")).unwrap();
 
@@ -615,7 +615,7 @@ mod tests {
 
     #[tokio::test]
     async fn background_worker_advances_checkpoint_without_read_path_catchup() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let bus = Arc::new(MissionEvidenceBus::new(Arc::clone(&store)));
         let reactor = Arc::new(
             crate::RuntimeEventReactor::sealed(
@@ -639,7 +639,7 @@ mod tests {
 
     #[test]
     fn malformed_source_is_invisible_and_restarts_from_durable_dlq_state() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         store
             .append(RuntimeEventInput {
                 stream_id: "session:session-1".to_string(),

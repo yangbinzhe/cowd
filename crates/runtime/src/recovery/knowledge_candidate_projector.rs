@@ -375,7 +375,6 @@ mod tests {
         let root = tempfile::tempdir().expect("runtime fixture");
         let mut memory_config = MemoryConfig {
             store: StoreConfig {
-                sqlite_path: root.path().join("memory.sqlite"),
                 blob_dir: root.path().join("memory-blobs"),
                 enable_vector_index: false,
                 ..Default::default()
@@ -390,11 +389,11 @@ mod tests {
         };
         memory_config.layers.l4_enabled = true;
         let memory = Arc::new(
-            CognitiveContextManager::new(memory_config)
+            CognitiveContextManager::new_ephemeral(memory_config)
                 .await
                 .expect("memory manager"),
         );
-        let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let events = Arc::new(RuntimeEventStore::for_test());
         let approvals = Arc::new(crate::ApprovalQueue::new(Arc::clone(&events)));
         let promotion = Arc::new(L4PromotionService::new(
             Arc::clone(&events),

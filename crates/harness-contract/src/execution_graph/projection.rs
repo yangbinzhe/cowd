@@ -4,9 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     ExecutionAcceptance, ExecutionDependencyPolicy, ExecutionEdgeKind, ExecutionFailure,
-    ExecutionGraph, ExecutionNodeKind, ExecutionNodeStatus, ExecutionOrchestrationMetadata,
-    ExecutionParentBinding, ExecutionServiceClass, ExecutionUsage, ExecutionWorkContract,
-    ExecutionWorkRole,
+    ExecutionGraph, ExecutionNodeKind, ExecutionNodeStatus, ExecutionParentBinding,
+    ExecutionServiceClass, ExecutionUsage, ExecutionWorkContract, ExecutionWorkRole,
 };
 use crate::context::EvidenceAccessRef;
 
@@ -122,8 +121,6 @@ pub struct ExecutionGraphProjection {
     pub parent_execution: Option<ExecutionParentBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lineage: Option<super::ExecutionGraphLineage>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub orchestration: Option<ExecutionOrchestrationMetadata>,
     pub nodes: Vec<ExecutionNodeProjection>,
     pub edges: Vec<ExecutionEdgeProjection>,
     pub commit_cursor: u64,
@@ -149,6 +146,8 @@ pub struct ExecutionWorkGraphProjection {
     pub actual_speedup_basis_points: Option<u32>,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
     pub cached_tokens: u64,
     pub optional_nodes: usize,
     pub cancelled_optional_nodes: usize,
@@ -163,7 +162,6 @@ pub fn project_execution_graph(graph: &ExecutionGraph) -> ExecutionGraphProjecti
         service_class: graph.service_class,
         parent_execution: graph.parent_execution.clone(),
         lineage: graph.lineage.clone(),
-        orchestration: graph.orchestration.clone(),
         nodes: graph
             .nodes
             .iter()
@@ -417,6 +415,12 @@ pub fn project_work_graph(graph: &ExecutionGraph) -> Option<ExecutionWorkGraphPr
             total.cached_tokens = total
                 .cached_tokens
                 .saturating_add(result.usage.cached_tokens);
+            total.cache_creation_input_tokens = total
+                .cache_creation_input_tokens
+                .saturating_add(result.usage.cache_creation_input_tokens);
+            total.cache_read_input_tokens = total
+                .cache_read_input_tokens
+                .saturating_add(result.usage.cache_read_input_tokens);
             total
         });
     Some(ExecutionWorkGraphProjection {
@@ -437,6 +441,8 @@ pub fn project_work_graph(graph: &ExecutionGraph) -> Option<ExecutionWorkGraphPr
         ),
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
+        cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        cache_read_input_tokens: usage.cache_read_input_tokens,
         cached_tokens: usage.cached_tokens,
         optional_nodes: work_nodes
             .iter()

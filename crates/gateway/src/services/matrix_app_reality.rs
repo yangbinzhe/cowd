@@ -454,17 +454,19 @@ pub(super) fn dispatch(
 mod tests {
     use super::*;
 
-    fn fixture_store() -> (tempfile::TempDir, std::sync::Arc<dyn MatrixStore>) {
+    fn fixture_store() -> (
+        crate::selected_storage::SelectedStorageTopology,
+        std::sync::Arc<dyn MatrixStore>,
+    ) {
         let config_home = tempfile::tempdir().expect("temporary config home");
-        let registry = storage::StorageRegistry::default_for_config_home(config_home.path());
-        registry.ensure_directories().expect("storage directories");
-        let handle = registry
-            .endpoint(&storage::StorageDomainId::Matrix)
-            .expect("Matrix endpoint")
-            .as_handle();
-        let store =
-            matrix_repository::open_matrix_sqlite_repository_handle(&handle).expect("Matrix store");
-        (config_home, std::sync::Arc::new(store))
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let topology = crate::selected_storage::SelectedStorageTopology::compose_for_test(
+            config_home.path(),
+            workspace.path(),
+        )
+        .expect("isolated PostgreSQL test topology; set COWD_TEST_POSTGRES_URL");
+        let store = std::sync::Arc::clone(&topology.matrix_store);
+        (topology, store)
     }
 
     fn context() -> ContextService {

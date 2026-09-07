@@ -449,6 +449,16 @@ impl GatewaySessionRuntimePort {
             .map(|event| Some(event.sequence))
     }
 
+    pub(crate) async fn stored_session_input_journal(
+        &self,
+        session_id: &str,
+        event_id: &str,
+    ) -> Result<Option<session::SessionDomainEvent>, session::SessionError> {
+        self.service()?
+            .stored_session_input_journal(session_id, event_id)
+            .await
+    }
+
     pub(crate) async fn runtime_inputs(
         &self,
         session_id: &str,

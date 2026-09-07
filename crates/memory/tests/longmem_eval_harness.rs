@@ -12,15 +12,15 @@
 
 use memory::config::{BudgetConfig, StoreConfig};
 use memory::{
-    evaluate_retrieval, CognitiveContextManager, MemoryCategory, MemoryConfig, MemoryEntry,
-    MemoryEvalCase, MemoryEvalOptions, MemoryLayer, MemoryScope, MemorySource, Priority,
+    evaluate_retrieval, CognitiveContextManager, EphemeralMemoryStore, MemoryCategory,
+    MemoryConfig, MemoryEntry, MemoryEvalCase, MemoryEvalOptions, MemoryLayer, MemoryScope,
+    MemorySource, MemoryStore, Priority,
 };
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 fn test_config(sqlite_path: &std::path::Path) -> MemoryConfig {
     MemoryConfig {
         store: StoreConfig {
-            sqlite_path: sqlite_path.to_path_buf(),
             blob_dir: sqlite_path.parent().unwrap().join("blobs"),
             enable_vector_index: false,
             cache_capacity: 256,
@@ -81,7 +81,7 @@ fn distractor_entry(i: usize) -> MemoryEntry {
 #[tokio::test]
 async fn test_longmem_eval_recall_at_5() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let mgr = CognitiveContextManager::new(test_config(&tmp.path().join("lme.db")))
+    let mgr = CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("lme.db")))
         .await
         .unwrap();
 
@@ -136,11 +136,17 @@ async fn test_longmem_persistence_recall() {
 
     let n = 50;
     let mut ids = Vec::new();
+    let store: Arc<dyn MemoryStore> = Arc::new(EphemeralMemoryStore::new());
 
     {
-        let mgr = CognitiveContextManager::new(test_config(&db_path))
-            .await
-            .unwrap();
+        let mgr = CognitiveContextManager::new_with_selected_store(
+            test_config(&db_path),
+            None,
+            None,
+            Arc::clone(&store),
+        )
+        .await
+        .unwrap();
         for i in 0..n {
             let fact = format!("persist_fact_{}", i);
             let entry = MemoryEntry {
@@ -171,9 +177,14 @@ async fn test_longmem_persistence_recall() {
     }
 
     {
-        let mgr = CognitiveContextManager::new(test_config(&db_path))
-            .await
-            .unwrap();
+        let mgr = CognitiveContextManager::new_with_selected_store(
+            test_config(&db_path),
+            None,
+            None,
+            Arc::clone(&store),
+        )
+        .await
+        .unwrap();
         let mut found = 0u32;
         for target_id in &ids {
             if let Ok(Some(_)) = mgr.get_entry(&target_id.to_string()).await {

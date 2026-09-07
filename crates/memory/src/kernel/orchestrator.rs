@@ -37,7 +37,7 @@ use crate::{
     performance_monitor::PerformanceReport,
     project_scope::MemoryScope,
     shared::SharedMemoryManager,
-    store::{sqlite::SqliteStore, MemoryStore},
+    store::MemoryStore,
     temporal_graph::{EntityFacts, Triple},
     types::{
         MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemoryMeta, MemorySource,
@@ -129,33 +129,21 @@ impl L4PromotionCommand {
 impl MemoryOrchestrator {
     /// Initialise the orchestrator with the given configuration.
     ///
-    /// Opens storage backends, runs migrations, and wires up all layer
-    /// managers.  The `workspace_root` is used by the L2 layer for project
-    /// context discovery.
+    /// Production composition must inject the selected PostgreSQL-backed
+    /// `MemoryStore` through [`Self::from_store`].
     pub async fn init(config: MemoryConfig) -> Result<Self> {
         Self::init_with_workspace(config, None).await
     }
 
     /// Initialise with an explicit workspace root for L2 project discovery.
     pub async fn init_with_workspace(
-        config: MemoryConfig,
+        _config: MemoryConfig,
         workspace_root: Option<PathBuf>,
     ) -> Result<Self> {
-        // Open the SQLite store.
-        let handle = storage::StorageHandle::sqlite(
-            "memory",
-            config.store.sqlite_path.clone(),
-            "memory",
-            "memory_orchestrator_storage_handle_since_0.9.315",
-        );
-        let store: Arc<dyn MemoryStore> = Arc::new(
-            SqliteStore::open_storage_handle(&handle)
-                .map_err(|e| MemoryError::Store(format!("open sqlite: {e}")))?,
-        );
-
-        let orchestrator = Self::from_store(config.clone(), Arc::clone(&store), workspace_root)?;
-        Self::bootstrap_identity(&store, &config).await?;
-        Ok(orchestrator)
+        let _ = workspace_root;
+        Err(MemoryError::Store(
+            "MemoryOrchestrator requires an injected canonical MemoryStore".to_string(),
+        ))
     }
 
     /// Write operator-owned L0 identity entries (role/language) exactly once.
@@ -694,8 +682,8 @@ impl MemoryOrchestrator {
                 .save_verbatim(
                     &entry_id.to_string(),
                     &content,
-                    crate::store::sqlite::source_to_str(source),
-                    crate::store::sqlite::layer_to_int(layer),
+                    crate::store::source_to_str(source),
+                    crate::store::layer_to_int(layer),
                     &timestamp,
                 )
                 .await?;
@@ -871,8 +859,8 @@ impl MemoryOrchestrator {
             .save_verbatim(
                 &entry_id.to_string(),
                 &content,
-                crate::store::sqlite::source_to_str(MemorySource::Import),
-                crate::store::sqlite::layer_to_int(MemoryLayer::L4),
+                crate::store::source_to_str(MemorySource::Import),
+                crate::store::layer_to_int(MemoryLayer::L4),
                 &now.to_rfc3339(),
             )
             .await?;
@@ -1137,12 +1125,11 @@ fn identity_entry(title: &str, content: &str) -> crate::types::MemoryEntry {
 mod tests {
     use super::*;
     use crate::config::{BudgetConfig, MemoryConfig};
-    use crate::store::sqlite::SqliteStore;
+    use crate::store::EphemeralMemoryStore;
     use crate::types::{MemoryCategory, MemorySource, Priority};
 
     fn in_memory_store() -> Arc<dyn MemoryStore> {
-        let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
-        Arc::new(SqliteStore::open_path(&tmp.path().join("test.db")).unwrap())
+        Arc::new(EphemeralMemoryStore::new())
     }
 
     fn test_config() -> MemoryConfig {

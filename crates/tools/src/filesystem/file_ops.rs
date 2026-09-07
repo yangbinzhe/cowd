@@ -256,12 +256,10 @@ pub fn read_file(
 
     let content = fs::read_to_string(&absolute_path)?;
     let lines: Vec<&str> = content.lines().collect();
-    if complete && (offset.is_some() || limit.is_some()) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "complete read_file mode cannot be combined with offset or limit",
-        ));
-    }
+    // Provider tool emitters often retain an inherited pagination field while
+    // upgrading a read to complete coverage. `complete=true` is unambiguous
+    // and read-only, so it safely takes precedence instead of consuming a
+    // recovery turn on an otherwise harmless redundant offset or limit.
     let start_index = if complete {
         0
     } else {
@@ -872,14 +870,16 @@ mod tests {
         assert!(output.file.content.ends_with("line-1249"));
         assert!(!output.truncated);
         assert!(output.guidance.is_none());
-        assert!(read_file(
+        let complete_with_redundant_pagination = read_file(
             &policy,
             path.to_string_lossy().as_ref(),
             Some(1),
-            None,
+            Some(1),
             true,
         )
-        .is_err());
+        .expect("complete coverage takes precedence over redundant pagination");
+        assert_eq!(complete_with_redundant_pagination.file.num_lines, 1_250);
+        assert_eq!(complete_with_redundant_pagination.file.start_line, 1);
     }
 
     #[test]

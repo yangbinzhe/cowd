@@ -14,12 +14,41 @@ use crate::{
     types::{MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemoryMeta},
 };
 
-pub use verbatim::VerbatimEntry;
-
 pub mod blob;
-pub mod sqlite;
+mod ephemeral;
 pub mod vector;
-pub mod verbatim;
+pub use ephemeral::EphemeralMemoryStore;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VerbatimEntry {
+    pub id: String,
+    pub content: String,
+    pub source: String,
+    pub layer: i32,
+    pub timestamp: String,
+}
+
+#[must_use]
+pub const fn layer_to_int(layer: MemoryLayer) -> i32 {
+    match layer {
+        MemoryLayer::L0 => 0,
+        MemoryLayer::L1 => 1,
+        MemoryLayer::L2 => 2,
+        MemoryLayer::L3 => 3,
+        MemoryLayer::L4 => 4,
+    }
+}
+
+#[must_use]
+pub const fn source_to_str(source: crate::types::MemorySource) -> &'static str {
+    match source {
+        crate::types::MemorySource::UserExplicit => "UserExplicit",
+        crate::types::MemorySource::AutoExtracted => "AutoExtracted",
+        crate::types::MemorySource::Compression => "Compression",
+        crate::types::MemorySource::Import => "Import",
+        crate::types::MemorySource::Prefetch => "Prefetch",
+    }
+}
 
 /// Unified result type used throughout the store module.
 pub type Result<T> = std::result::Result<T, MemoryError>;
@@ -55,19 +84,6 @@ pub struct MemoryStoreCapabilities {
     pub lexical_fallback: bool,
     pub vector_search: bool,
     pub code_index: bool,
-}
-
-/// A durable report for a historical scope that was deliberately kept out of
-/// normal recall until an operator classifies it.  This is a port DTO rather
-/// than a SQLite implementation detail because it must survive a backend
-/// cutover unchanged.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct LegacyScopeMigrationReport {
-    pub memory_id: String,
-    pub raw_scope: Option<String>,
-    pub held_scope: String,
-    pub reason: String,
-    pub migrated_at: String,
 }
 
 /// A durable code-to-memory recall association.  Listing these records is
@@ -232,11 +248,6 @@ pub trait MemoryStore: Send + Sync {
 
     /// Batch auxiliary-state lookup used for lifecycle filtering.
     async fn kv_get_many(&self, keys: &[String]) -> Result<Vec<MemoryKeyValue>>;
-
-    /// Return historical scope records that were deliberately held during a
-    /// contract migration. Selected durable backends must implement this
-    /// explicitly so cutover cannot silently omit held records.
-    async fn legacy_scope_migration_reports(&self) -> Result<Vec<LegacyScopeMigrationReport>>;
 
     // -----------------------------------------------------------------------
     // Knowledge-graph persistence

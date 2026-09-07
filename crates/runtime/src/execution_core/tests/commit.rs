@@ -116,7 +116,6 @@ fn agent_task_graph() -> ExecutionGraph {
         objective: "verify canonical reverse lineage".to_string(),
         required_acceptance: Default::default(),
         output_acceptance: Vec::new(),
-        requires_managed_collaboration_escalation: false,
         acceptance: Vec::new(),
         cohort_prompt_package: None,
         constraints: Vec::new(),
@@ -139,6 +138,7 @@ fn agent_task_graph() -> ExecutionGraph {
         binding: None,
         managed_invocation: None,
         idempotency_key: "agent-task-idempotency".to_string(),
+        agentic_binding: None,
     };
     let mut node = ExecutionNodeSpec::new(
         ExecutionNodeKind::AgentTask,
@@ -159,15 +159,15 @@ fn agent_task_graph() -> ExecutionGraph {
 
 #[test]
 fn planned_graph_and_continuation_claim_commit_in_one_transaction() {
-    let store = Arc::new(crate::RuntimeEventStore::try_open_in_memory().expect("store"));
+    let store = Arc::new(crate::RuntimeEventStore::for_test());
     let service = ExecutionCommitService::new(Arc::clone(&store));
     let candidate = crate::session_continuation::ContinuationCandidate {
         source_session_id: "session".to_string(),
         source_turn_id: "turn-previous".to_string(),
         source_root_id: "root-previous".to_string(),
-        team_set_ref: "team_graph:team-previous".to_string(),
+        team_set_ref: "agentic_program:program-previous".to_string(),
         delivery_revision: 9,
-        result_refs: vec!["team_graph:team-previous".to_string()],
+        result_refs: vec!["agentic_program:program-previous".to_string()],
         handoff_id: None,
     };
     let binding = crate::session_continuation::compile_continuation_binding(
@@ -253,7 +253,7 @@ fn graph_events_expose_complete_execution_identity_reverse_refs() {
 
 #[test]
 fn readonly_wave_receipts_commit_atomically_and_replay_idempotently() {
-    let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+    let store = Arc::new(RuntimeEventStore::for_test());
     let service = ExecutionCommitService::new(Arc::clone(&store));
     let receipts = vec![
         (request("read-1"), outcome("read-1", "one")),
@@ -285,7 +285,7 @@ fn readonly_wave_receipts_commit_atomically_and_replay_idempotently() {
 
 #[test]
 fn readonly_receipt_rehydrates_only_for_the_same_tool_and_input_fingerprint() {
-    let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+    let store = Arc::new(RuntimeEventStore::for_test());
     let service = ExecutionCommitService::new(store);
     let original = request("read-recovery");
     service
@@ -312,7 +312,7 @@ fn readonly_receipt_rehydrates_only_for_the_same_tool_and_input_fingerprint() {
 
 #[test]
 fn delegated_agent_receipts_are_indexed_atomically_and_reload_without_scanning_effects() {
-    let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+    let store = Arc::new(RuntimeEventStore::for_test());
     let service = ExecutionCommitService::new(Arc::clone(&store));
     let request = crate::RuntimeToolExecutionRequest {
         parent_execution: Some(harness_contract::execution_graph::ExecutionParentBinding {
@@ -348,7 +348,7 @@ fn delegated_agent_receipts_are_indexed_atomically_and_reload_without_scanning_e
 
 #[test]
 fn mutation_intent_blocks_uncertain_replay_and_completed_receipt_rehydrates() {
-    let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+    let store = Arc::new(RuntimeEventStore::for_test());
     let service = ExecutionCommitService::new(store);
     let mutation_request = request("mutation");
     let non_idempotent = mutation_effect(ToolIdempotency::NonIdempotent);
@@ -448,7 +448,7 @@ fn mutation_intent_blocks_uncertain_replay_and_completed_receipt_rehydrates() {
 
 #[test]
 fn scoped_cancel_changes_only_the_authorized_node() {
-    let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+    let store = Arc::new(RuntimeEventStore::for_test());
     let service = ExecutionCommitService::new(store);
     let mut graph = agent_task_graph();
     let mut peer = ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent", "peer-payload");

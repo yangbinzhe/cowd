@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -32,6 +33,10 @@ pub(crate) struct SessionRepository {
     event_bus: Arc<SessionProjectionHub>,
     lifecycle_work_wake: Arc<Notify>,
     branch_work_wake: Arc<Notify>,
+    /// Read-through projection for records whose Runtime carrier is hot. All
+    /// mutations pass through this repository, so hot activation can avoid
+    /// repeating durable reads without weakening PostgreSQL as truth source.
+    hot_records: std::sync::RwLock<HashMap<String, SessionRecord>>,
 }
 
 impl SessionRepository {
@@ -47,6 +52,7 @@ impl SessionRepository {
             event_bus,
             lifecycle_work_wake: Arc::new(Notify::new()),
             branch_work_wake: Arc::new(Notify::new()),
+            hot_records: std::sync::RwLock::new(HashMap::new()),
         }
     }
 
@@ -75,6 +81,12 @@ impl SessionRepository {
     #[must_use]
     pub(crate) fn test_unified_store(&self) -> Option<Arc<UnifiedSessionStore>> {
         self.unified_store.clone()
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn test_active_sessions(&self) -> Arc<ActiveSessionDirectory> {
+        self.active_sessions()
     }
 
     #[must_use]
@@ -157,10 +169,28 @@ impl SessionRepository {
         &self,
         session_id: &str,
     ) -> Result<Option<SessionRecord>, SessionError> {
+        if self.active_sessions.get(session_id).is_some() {
+            if let Some(record) = self
+                .hot_records
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(session_id)
+                .cloned()
+            {
+                return Ok(Some(record));
+            }
+        }
         let Some(store) = self.unified_store.as_ref() else {
             return Ok(None);
         };
-        store.get_session(session_id).await
+        let record = store.get_session(session_id).await?;
+        if let Some(record) = record.as_ref() {
+            self.hot_records
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(session_id.to_string(), record.clone());
+        }
+        Ok(record)
     }
 
     pub(crate) async fn stored_sessions_by_ids(
@@ -248,6 +278,10 @@ impl SessionRepository {
             return Ok(false);
         };
         store.upsert_session(record).await?;
+        self.hot_records
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(record.session_id.clone(), record.clone());
         Ok(true)
     }
 
@@ -259,6 +293,10 @@ impl SessionRepository {
             return Ok(false);
         };
         store.update_session(record).await?;
+        self.hot_records
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(record.session_id.clone(), record.clone());
         Ok(true)
     }
 
@@ -325,6 +363,10 @@ impl SessionRepository {
             return Ok(false);
         }
         store.delete_session(session_id).await?;
+        self.hot_records
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
         Ok(true)
     }
 
@@ -1054,7 +1096,7 @@ mod tests {
     #[test]
     fn kernel_shares_session_runtime_store_and_event_bus_handles() {
         let active_sessions = Arc::new(ActiveSessionDirectory::new());
-        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::pg_test_support::session_store());
         let event_bus = SessionProjectionHub::new();
 
         let kernel = SessionRepository::new(
@@ -1086,7 +1128,7 @@ mod tests {
 
     #[tokio::test]
     async fn kernel_queries_stored_session_records() {
-        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::pg_test_support::session_store());
         let kernel = SessionRepository::new(
             Arc::new(ActiveSessionDirectory::new()),
             Some(store.clone()),
@@ -1118,7 +1160,7 @@ mod tests {
 
     #[tokio::test]
     async fn turn_journal_never_creates_a_missing_session() {
-        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::pg_test_support::session_store());
         let kernel = SessionRepository::new(
             Arc::new(ActiveSessionDirectory::new()),
             Some(store.clone()),

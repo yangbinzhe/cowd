@@ -149,28 +149,20 @@ pub(super) fn agentic_task_protocol_pending(
     services: &crate::RuntimeServices,
     packet: &AgentTaskPacket,
 ) -> Result<bool, String> {
-    let Some(program_id) = packet
-        .context_refs
-        .iter()
-        .find_map(|reference| reference.strip_prefix("agentic_program:"))
-    else {
+    let Some(agentic) = packet.agentic_binding.as_ref() else {
         return Ok(false);
     };
-    let task_id = packet
-        .context_refs
-        .iter()
-        .find_map(|reference| reference.strip_prefix("agentic_task:"))
-        .ok_or_else(|| "Agent-first recovery packet has no task binding".to_string())?;
-    let agent_id = packet
-        .context_refs
-        .iter()
-        .find_map(|reference| reference.strip_prefix("agentic_member:"))
-        .ok_or_else(|| "Agent-first recovery packet has no member binding".to_string())?;
-    let mode = packet
-        .context_refs
-        .iter()
-        .find_map(|reference| reference.strip_prefix("agentic_mode:"))
-        .ok_or_else(|| "Agent-first recovery packet has no attempt mode".to_string())?;
+    let (task_id, mode) = match &agentic.focus {
+        harness_contract::agent::AgenticExecutionFocus::TaskExecute { task_ref } => {
+            (task_ref.as_str(), "execute")
+        }
+        harness_contract::agent::AgenticExecutionFocus::TaskReview { task_ref } => {
+            (task_ref.as_str(), "review")
+        }
+        _ => return Ok(false),
+    };
+    let program_id = agentic.program_id.as_str();
+    let agent_id = agentic.agent_id.as_str();
     let projection = services
         .agent_action_service()
         .project(program_id)
@@ -294,40 +286,36 @@ pub(super) fn agent_autonomy_checkpoint(
     services: &Arc<RuntimeServices>,
     packet: &AgentTaskPacket,
 ) -> Result<Option<AgentAutonomyCheckpoint>, String> {
-    let agentic_program_id = packet
-        .context_refs
-        .iter()
-        .find_map(|reference| reference.strip_prefix("agentic_program:"));
-    let agentic_member_id = packet
-        .context_refs
-        .iter()
-        .find_map(|reference| reference.strip_prefix("agentic_member:"));
-    let Some(program_id) = agentic_program_id else {
+    let Some(agentic) = packet.agentic_binding.as_ref() else {
         // Generic ExecutionGraph/Team packets have no autonomous market. The
         // Agent-first Program is the sole collaboration control plane.
         return Ok(None);
     };
-    let Some(agent_id) = agentic_member_id else {
-        return Err("Agent-first packet has no immutable Program member binding".to_string());
+    let (task_id, mode) = match &agentic.focus {
+        harness_contract::agent::AgenticExecutionFocus::TaskExecute { task_ref } => {
+            (task_ref.as_str(), "execute")
+        }
+        harness_contract::agent::AgenticExecutionFocus::TaskReview { task_ref } => {
+            (task_ref.as_str(), "review")
+        }
+        _ => return Ok(None),
     };
-    let task_id = packet
-        .context_refs
-        .iter()
-        .find_map(|reference| reference.strip_prefix("agentic_task:"))
-        .ok_or_else(|| "Agent-first packet has no immutable Task binding".to_string())?;
-    let mode = packet
-        .context_refs
-        .iter()
-        .find_map(|reference| reference.strip_prefix("agentic_mode:"))
-        .ok_or_else(|| "Agent-first packet has no immutable attempt mode".to_string())?;
+    let program_id = agentic.program_id.as_str();
+    let agent_id = agentic.agent_id.as_str();
     let projection = services
         .agent_action_service()
         .project(program_id)
         .map_err(|error| format!("load Agent-first autonomy checkpoint: {error}"))?;
-    let member = projection
+    let _member = projection
         .agents
         .get(agent_id)
         .ok_or_else(|| format!("Agent-first Program `{program_id}` has no member `{agent_id}`"))?;
+    if projection
+        .membership_for(agent_id, &agentic.team_id)
+        .is_none_or(|membership| membership.membership_id != agentic.membership_id)
+    {
+        return Err("Agent-first packet membership no longer matches Program".to_string());
+    }
     let task = projection
         .tasks
         .get(task_id)
@@ -337,7 +325,7 @@ pub(super) fn agent_autonomy_checkpoint(
     // not reuse the execution ownership fence for review packets: doing so
     // lets the review action commit and then falsely fails the physical Agent
     // graph at the next checkpoint.
-    if mode == "execute" && member.team_id != task.team_id {
+    if mode == "execute" && !projection.agent_is_active_in(agent_id, &task.team_id) {
         return Err("Agent-first packet member is outside the bound Task Team".to_string());
     }
     let topic_ref = projection

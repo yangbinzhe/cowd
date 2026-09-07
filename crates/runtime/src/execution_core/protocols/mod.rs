@@ -145,7 +145,6 @@ impl<'a> ProtocolGraphBuilder<'a> {
                     task_id: request.root_task_id.clone(),
                     generation: request.budget_revision.max(1),
                 }),
-                orchestration: None,
                 continuation_binding: None,
                 nodes: Vec::new(),
                 edges: Vec::new(),
@@ -268,7 +267,6 @@ impl<'a> ProtocolGraphBuilder<'a> {
                 evidence_obligations: Vec::new(),
             },
             output_acceptance: Vec::new(),
-            requires_managed_collaboration_escalation: false,
             acceptance,
             constraints,
             context_refs: self.request.context_refs.clone(),
@@ -289,6 +287,7 @@ impl<'a> ProtocolGraphBuilder<'a> {
             deadline_at_ms,
             managed_invocation: None,
             idempotency_key: idempotency_key.clone(),
+            agentic_binding: None,
         };
         let mut node = ExecutionNodeSpec::new(
             ExecutionNodeKind::AgentTask,

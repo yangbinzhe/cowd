@@ -71,7 +71,7 @@ pub(super) fn model_observed_evidence(
 /// by `AcceptanceEvaluator::evaluate_required` at the terminal boundary.
 pub(super) fn derive_receipt_backed_satisfied_criteria(
     packet: &AgentTaskPacket,
-    summary: &crate::TurnSummary,
+    terminal_answer: &str,
     evidence_refs: &[harness_contract::context::EvidenceAccessRef],
     tool_executor: &ScopedRuntimeToolExecutor,
     model_observed_evidence: &[harness_contract::context::ObservedEvidence],
@@ -140,7 +140,7 @@ pub(super) fn derive_receipt_backed_satisfied_criteria(
             | harness_contract::agent::OutputAcceptanceCheck::UpstreamEvidence => None,
         })
         .collect::<Vec<_>>();
-    let output = structured_agent_output_for_fields(&summary.final_answer, &required_fields);
+    let output = structured_agent_output_for_fields(terminal_answer, &required_fields);
     let field_present = |field: harness_contract::agent::StructuredOutputField| {
         let value = output
             .as_ref()

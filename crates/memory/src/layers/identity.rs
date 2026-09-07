@@ -170,11 +170,10 @@ fn estimate_tokens(content: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::sqlite::SqliteStore;
+    use crate::store::EphemeralMemoryStore;
 
     fn in_memory() -> Arc<dyn MemoryStore> {
-        let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
-        Arc::new(SqliteStore::open_path(&tmp.path().join("test.db")).unwrap())
+        Arc::new(EphemeralMemoryStore::new())
     }
 
     #[tokio::test]

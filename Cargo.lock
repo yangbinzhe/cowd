@@ -9,18 +9,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
-name = "ahash"
-version = "0.8.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
-dependencies = [
- "cfg-if",
- "once_cell",
- "version_check",
- "zerocopy",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -72,7 +60,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "auth-broker"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "base64",
  "cowd-app-protocol",
@@ -285,7 +273,7 @@ dependencies = [
 
 [[package]]
 name = "cli"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "auth-broker",
  "cowd-app-protocol",
@@ -325,11 +313,10 @@ dependencies = [
 
 [[package]]
 name = "connector"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "chrono",
  "harness-contract",
- "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -341,16 +328,12 @@ dependencies = [
 
 [[package]]
 name = "connector-postgres"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "chrono",
  "connector",
  "postgres",
- "serde",
- "serde_json",
- "sha2 0.10.9",
  "storage",
- "tempfile",
 ]
 
 [[package]]
@@ -376,7 +359,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "cowd-app-host"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "base64",
  "cowd-app-protocol",
@@ -502,27 +485,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
 dependencies = [
  "hybrid-array",
-]
-
-[[package]]
-name = "csv"
-version = "1.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52cd9d68cf7efc6ddfaaee42e7288d3a99d613d4b50f76ce9827ae0c6e14f938"
-dependencies = [
- "csv-core",
- "itoa",
- "ryu",
- "serde_core",
-]
-
-[[package]]
-name = "csv-core"
-version = "0.1.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "704a3c26996a80471189265814dbc2c257598b96b8a7feae2d31ace646bb9782"
-dependencies = [
- "memchr",
 ]
 
 [[package]]
@@ -698,7 +660,7 @@ dependencies = [
 
 [[package]]
 name = "fact-kernel"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "chrono",
  "harness-contract",
@@ -710,32 +672,15 @@ dependencies = [
 
 [[package]]
 name = "fact-postgres"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "chrono",
  "fact-kernel",
- "fact-sqlite",
  "harness-contract",
  "postgres",
  "serde",
  "serde_json",
  "storage",
- "tempfile",
- "uuid",
-]
-
-[[package]]
-name = "fact-sqlite"
-version = "0.9.722"
-dependencies = [
- "chrono",
- "fact-kernel",
- "harness-contract",
- "rusqlite",
- "serde",
- "serde_json",
- "storage",
- "tempfile",
 ]
 
 [[package]]
@@ -743,18 +688,6 @@ name = "fallible-iterator"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4443176a9f2c162692bd3d352d745ef9413eec5782a80d8fd6f8a1ac692a07f7"
-
-[[package]]
-name = "fallible-iterator"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649"
-
-[[package]]
-name = "fallible-streaming-iterator"
-version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
 name = "fastrand"
@@ -919,7 +852,7 @@ dependencies = [
 
 [[package]]
 name = "gateway"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "async-trait",
  "auth-broker",
@@ -933,7 +866,6 @@ dependencies = [
  "cowd-app-protocol",
  "fact-kernel",
  "fact-postgres",
- "fact-sqlite",
  "fs2",
  "futures",
  "harness-contract",
@@ -952,12 +884,9 @@ dependencies = [
  "model-protocol",
  "plugins",
  "provider",
- "r2d2",
- "r2d2_sqlite",
  "reqwest",
  "runtime",
  "runtime-postgres",
- "rusqlite",
  "sandbox-launcher",
  "schemars",
  "serde",
@@ -1059,7 +988,7 @@ dependencies = [
 
 [[package]]
 name = "harness-contract"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "chrono",
  "schemars",
@@ -1072,7 +1001,7 @@ dependencies = [
 
 [[package]]
 name = "harness-eval"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "async-trait",
  "fact-kernel",
@@ -1088,15 +1017,6 @@ dependencies = [
  "tempfile",
  "tools",
  "uuid",
-]
-
-[[package]]
-name = "hashbrown"
-version = "0.14.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
-dependencies = [
- "ahash",
 ]
 
 [[package]]
@@ -1119,15 +1039,6 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash",
-]
-
-[[package]]
-name = "hashlink"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ba4ff7128dee98c7dc9794b6a411377e1404dba1c97deb8d1a55297bd25d8af"
-dependencies = [
- "hashbrown 0.14.5",
 ]
 
 [[package]]
@@ -1563,17 +1474,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "libsqlite3-sys"
-version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c10584274047cb335c23d3e61bcef8e323adae7c5c8c760540f73610177fc3f"
-dependencies = [
- "cc",
- "pkg-config",
- "vcpkg",
-]
-
-[[package]]
 name = "line-clipping"
 version = "0.3.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1647,7 +1547,7 @@ dependencies = [
 
 [[package]]
 name = "managed-worker-launcher"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "landlock",
  "libc",
@@ -1660,7 +1560,7 @@ dependencies = [
 
 [[package]]
 name = "managed-worker-runtime"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "base64",
  "bytes",
@@ -1696,7 +1596,7 @@ checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
 name = "matrix-core"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "chrono",
  "fact-kernel",
@@ -1709,12 +1609,11 @@ dependencies = [
 
 [[package]]
 name = "matrix-repository"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "chrono",
  "matrix-core",
  "postgres",
- "rusqlite",
  "schemars",
  "serde",
  "serde_json",
@@ -1727,7 +1626,7 @@ dependencies = [
 
 [[package]]
 name = "mcp"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "serde",
  "serde_json",
@@ -1752,7 +1651,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "memory"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1760,16 +1659,12 @@ dependencies = [
  "harness-contract",
  "notify",
  "parking_lot",
- "r2d2",
- "r2d2_sqlite",
  "regex",
  "reqwest",
- "rusqlite",
  "serde",
  "serde_json",
  "serial_test",
  "session",
- "sqlite-pool-tracker",
  "storage",
  "tempfile",
  "thiserror",
@@ -1787,7 +1682,7 @@ dependencies = [
 
 [[package]]
 name = "memory-postgres"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1796,7 +1691,6 @@ dependencies = [
  "postgres",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "storage",
  "tokio",
  "uuid",
@@ -1860,7 +1754,7 @@ dependencies = [
 
 [[package]]
 name = "model-protocol"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "serde",
  "serde_json",
@@ -2120,7 +2014,7 @@ dependencies = [
 
 [[package]]
 name = "plugins"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "serde",
  "serde_json",
@@ -2139,7 +2033,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33ad20e0aa0b24f5a394eab4f78c781d248982b22b25cecc7e3aa46a681605bd"
 dependencies = [
  "bytes",
- "fallible-iterator 0.2.0",
+ "fallible-iterator",
  "futures-util",
  "log",
  "tokio",
@@ -2155,7 +2049,7 @@ dependencies = [
  "base64",
  "byteorder",
  "bytes",
- "fallible-iterator 0.2.0",
+ "fallible-iterator",
  "hmac 0.13.0",
  "md-5",
  "memchr",
@@ -2172,7 +2066,7 @@ checksum = "851ca9db4932932d69f3ea811b1abe63087a0f740a47692619dd40d4899b68be"
 dependencies = [
  "bytes",
  "chrono",
- "fallible-iterator 0.2.0",
+ "fallible-iterator",
  "postgres-protocol",
  "serde_core",
  "serde_json",
@@ -2213,7 +2107,7 @@ dependencies = [
 
 [[package]]
 name = "provider"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "httpdate",
  "model-protocol",
@@ -2344,17 +2238,6 @@ checksum = "efd4b47636dbca581cd057e2f27a5d39be741ea4f85fd3c29e415c55f71c7595"
 dependencies = [
  "postgres",
  "r2d2",
-]
-
-[[package]]
-name = "r2d2_sqlite"
-version = "0.24.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a982edf65c129796dba72f8775b292ef482b40d035e827a9825b3bc07ccc5f2"
-dependencies = [
- "r2d2",
- "rusqlite",
- "uuid",
 ]
 
 [[package]]
@@ -2609,7 +2492,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "async-trait",
  "base64",
@@ -2618,7 +2501,6 @@ dependencies = [
  "cowd-app-protocol",
  "cron",
  "fact-kernel",
- "fact-sqlite",
  "fs2",
  "futures",
  "glob",
@@ -2630,19 +2512,17 @@ dependencies = [
  "model-protocol",
  "plugins",
  "provider",
- "r2d2",
- "r2d2_sqlite",
  "rand 0.8.7",
  "regex",
  "reqwest",
  "ring",
- "rusqlite",
  "sandbox-launcher",
  "schemars",
  "serde",
  "serde_json",
  "serde_yaml",
  "session",
+ "session-postgres",
  "sha2 0.10.9",
  "storage",
  "tempfile",
@@ -2656,7 +2536,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-postgres"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "harness-contract",
  "postgres",
@@ -2667,26 +2547,6 @@ dependencies = [
  "storage",
  "tempfile",
  "tokio",
- "uuid",
-]
-
-[[package]]
-name = "rusqlite"
-version = "0.31.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b838eba278d213a8beaf485bd313fd580ca4505a00d5871caeb1457c55322cae"
-dependencies = [
- "bitflags 2.13.1",
- "chrono",
- "csv",
- "fallible-iterator 0.3.0",
- "fallible-streaming-iterator",
- "hashlink",
- "libsqlite3-sys",
- "serde_json",
- "smallvec",
- "time",
- "url",
  "uuid",
 ]
 
@@ -2776,7 +2636,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-launcher"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "landlock",
  "libc",
@@ -2967,18 +2827,14 @@ dependencies = [
 
 [[package]]
 name = "session"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "chrono",
  "harness-contract",
  "lz4_flex",
- "r2d2",
- "r2d2_sqlite",
- "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "sqlite-pool-tracker",
  "storage",
  "tempfile",
  "thiserror",
@@ -2989,12 +2845,11 @@ dependencies = [
 
 [[package]]
 name = "session-postgres"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "chrono",
  "harness-contract",
  "postgres",
- "rusqlite",
  "serde",
  "serde_json",
  "session",
@@ -3092,7 +2947,7 @@ checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "skill"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "fs2",
  "harness-contract",
@@ -3137,10 +2992,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 
 [[package]]
-name = "sqlite-pool-tracker"
-version = "0.9.722"
-
-[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3154,17 +3005,14 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "storage"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "postgres",
  "r2d2",
  "r2d2_postgres",
- "r2d2_sqlite",
- "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "sqlite-pool-tracker",
  "tempfile",
  "thiserror",
  "tokio",
@@ -3223,7 +3071,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "surface"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "chrono",
  "harness-contract",
@@ -3236,7 +3084,7 @@ dependencies = [
 
 [[package]]
 name = "surface-postgres"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "chrono",
  "harness-contract",
@@ -3466,7 +3314,7 @@ dependencies = [
  "async-trait",
  "byteorder",
  "bytes",
- "fallible-iterator 0.2.0",
+ "fallible-iterator",
  "futures-channel",
  "futures-util",
  "log",
@@ -3561,7 +3409,7 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "tools"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "base64",
  "flate2",
@@ -3807,7 +3655,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tui"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "chrono",
  "cowd-app-protocol",
@@ -3952,7 +3800,6 @@ checksum = "2cefc03fd367c0c6d4305de1b312cf00248c4114f4a0418ce6a6af769e3b0bd9"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
- "rand 0.10.2",
  "serde_core",
  "sha1_smol",
  "wasm-bindgen",
@@ -3963,12 +3810,6 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
-
-[[package]]
-name = "vcpkg"
-version = "0.2.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "version_check"
@@ -4409,7 +4250,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.9.722"
+version = "0.9.723"
 dependencies = [
  "base64",
  "cowd-app-protocol",

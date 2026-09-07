@@ -1,27 +1,8 @@
 //! Unified session store — the canonical wrapper for session persistence.
 //!
-//! `UnifiedSessionStore` delegates to a complete selected durable backend,
-//! while retaining explicit SQLite construction helpers for SQLite topology.
-//!
-//! # Migration from SqliteSessionStore
-//!
-//! Replace:
-//!
-//! ```rust,no_run
-//! use session::SqliteSessionStore;
-//! use std::path::Path;
-//! let store = SqliteSessionStore::open(Path::new("sessions.db")).unwrap();
-//! ```
+//! `UnifiedSessionStore` delegates to the complete PostgreSQL backend selected
+//! and injected by the process composition root.
 
-//! with:
-
-//! ```rust,no_run
-//! use session::UnifiedSessionStore;
-//! use std::path::Path;
-//! let store = UnifiedSessionStore::open(Path::new("sessions.db")).unwrap();
-//! ```
-
-use std::path::Path;
 use std::sync::Arc;
 
 use crate::domain::{
@@ -36,7 +17,7 @@ use crate::persistence::execution_plane::{
     StorageExecutionPlaneStats,
 };
 use crate::persistence::history::SessionContextPage;
-use crate::persistence::sqlite::{
+use crate::persistence::types::{
     ContextIndexCard, ContextIndexCoverage, OutboxFailureClass, SessionEvent,
     SessionInputAdmission, SessionLifecycleFenceRequest, SessionLifecycleTombstoneRequest,
     SessionListOptions, SessionListPage, SessionMessage, SessionMessageMetadata,
@@ -44,7 +25,6 @@ use crate::persistence::sqlite::{
     SessionRuntimeInputStatus, SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord,
     SessionRuntimeOutboxRequest, SessionSearchResult, SessionSnapshot,
     SessionTerminalTranscriptCommit, SessionTerminalTranscriptReceipt, SessionUsageSummary,
-    SqliteSessionStore,
 };
 
 // ---------------------------------------------------------------------------
@@ -57,14 +37,6 @@ use crate::persistence::sqlite::{
 /// backend owns its bounded connection pool; no process-wide async mutex is
 /// introduced, so unrelated sessions remain independently schedulable.
 ///
-/// # Example
-///
-/// ```rust,no_run
-/// use session::UnifiedSessionStore;
-/// use std::path::Path;
-///
-/// let store = UnifiedSessionStore::open(Path::new("sessions.db")).unwrap();
-/// ```
 #[derive(Debug, Clone)]
 pub struct UnifiedSessionStore {
     inner: SharedSessionStoreBackend,
@@ -75,56 +47,6 @@ impl UnifiedSessionStore {
     // -----------------------------------------------------------------------
     // Construction
     // -----------------------------------------------------------------------
-
-    /// Open (or create) a session database at `path`.
-    ///
-    /// Creates any missing parent directories and initialises the schema if
-    /// the database is new.
-    pub fn open(path: &Path) -> Result<Self> {
-        let store = SqliteSessionStore::open(path)?;
-        Ok(Self {
-            inner: Arc::new(store),
-            execution: Arc::new(StorageExecutionPlane::sqlite_default_plane()),
-        })
-    }
-
-    /// Open a SQLite session database from an explicitly SQLite storage
-    /// handle. PostgreSQL composition uses [`Self::from_backend`] instead.
-    pub fn open_sqlite_storage_handle(handle: &storage::StorageHandle) -> Result<Self> {
-        Self::open_sqlite_storage_handle_with_execution_config(
-            handle,
-            StorageExecutionPlaneConfig::default(),
-        )
-    }
-
-    /// Open a SQLite session database with an explicit bounded execution
-    /// plane. Process composition roots use this constructor so SQLite and
-    /// PostgreSQL obey the same concurrency and overload policy.
-    pub fn open_sqlite_storage_handle_with_execution_config(
-        handle: &storage::StorageHandle,
-        config: StorageExecutionPlaneConfig,
-    ) -> Result<Self> {
-        if handle.backend != storage::StorageBackendKind::Sqlite {
-            return Err(SessionError::Store(format!(
-                "storage handle `{}` is not sqlite-backed",
-                handle.domain
-            )));
-        }
-        let store = SqliteSessionStore::open_storage_handle(handle)?;
-        Ok(Self {
-            inner: Arc::new(store),
-            execution: Arc::new(StorageExecutionPlane::new_sqlite(config)?),
-        })
-    }
-
-    /// Open an in-memory session database (useful for testing).
-    pub fn open_in_memory() -> Result<Self> {
-        let store = SqliteSessionStore::open_in_memory()?;
-        Ok(Self {
-            inner: Arc::new(store),
-            execution: Arc::new(StorageExecutionPlane::sqlite_default_plane()),
-        })
-    }
 
     /// Build the application-facing store from the selected durable backend.
     /// Composition roots use this to inject PostgreSQL without exposing a
@@ -754,6 +676,26 @@ impl UnifiedSessionStore {
         .await
     }
 
+    /// Read the complete durable event set for one execution/turn epoch in a
+    /// single backend query. This is intentionally separate from timeline
+    /// pagination: recovery cost must not grow with unrelated Session history.
+    pub async fn get_session_domain_events_for_epoch(
+        &self,
+        session_id: &str,
+        kind: &str,
+        execution_id: &str,
+        turn_id: &str,
+    ) -> Result<Vec<SessionEvent>> {
+        let session_id = session_id.to_string();
+        let kind = kind.to_string();
+        let execution_id = execution_id.to_string();
+        let turn_id = turn_id.to_string();
+        self.execute_read(move |backend| {
+            backend.get_session_domain_events_for_epoch(&session_id, &kind, &execution_id, &turn_id)
+        })
+        .await
+    }
+
     pub async fn get_latest_session_domain_event_by_kind(
         &self,
         session_id: &str,
@@ -1050,8 +992,8 @@ impl UnifiedSessionStore {
 
     pub async fn branch_session_at_cutoff(
         &self,
-        request: &crate::persistence::sqlite::SessionBranchRequest,
-    ) -> Result<crate::persistence::sqlite::SessionBranchResult> {
+        request: &crate::persistence::types::SessionBranchRequest,
+    ) -> Result<crate::persistence::types::SessionBranchResult> {
         let request = request.clone();
         self.execute_write(move |backend| backend.branch_session_at_cutoff(&request))
             .await
@@ -1783,404 +1725,4 @@ impl UnifiedSessionStore {
 
 fn clamp_event_page_limit(limit: usize) -> usize {
     limit.clamp(1, 500)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::domain::SessionDomainScope;
-
-    fn make_record(id: &str) -> SessionRecord {
-        SessionRecord {
-            session_id: id.to_string(),
-            platform: "test".to_string(),
-            chat_id: "chat-1".to_string(),
-            user_id: Some("user-1".to_string()),
-            model: None,
-            created_at: "2024-01-01T00:00:00Z".to_string(),
-            last_activity: "2024-01-01T00:01:00Z".to_string(),
-            message_count: 0,
-            reset_policy: "None".to_string(),
-            metadata_json: None,
-            input_tokens: 0,
-            output_tokens: 0,
-            status: "active".to_string(),
-        }
-    }
-
-    fn make_message(session_id: &str, sequence: usize) -> SessionMessage {
-        SessionMessage {
-            stable_message_id: format!("{session_id}:{sequence}"),
-            session_id: session_id.to_string(),
-            sequence,
-            role: "user".to_string(),
-            content_json: format!(r#"[{{"type":"text","text":"message-{sequence}"}}]"#),
-            blocks_count: 1,
-            tool_use_id: None,
-            tool_name: None,
-            token_usage_json: None,
-            created_at_ms: sequence as u64,
-        }
-    }
-
-    #[tokio::test]
-    async fn session_domain_events_page_returns_only_canonical_events() {
-        let store = UnifiedSessionStore::open_in_memory().unwrap();
-        store
-            .create_session(&make_record("s-runtime-page"))
-            .await
-            .unwrap();
-        store
-            .append_event(&SessionEvent {
-                session_id: "s-runtime-page".to_string(),
-                event_type: "TextDelta".to_string(),
-                event_json: serde_json::json!({"text": "legacy"}).to_string(),
-                sequence: 0,
-                created_at_ms: 1,
-            })
-            .await
-            .unwrap();
-        store
-            .append_session_domain_event(&SessionDomainEvent::new(
-                "s-runtime-page",
-                1,
-                SessionDomainScope::Turn,
-                "turn.completed",
-                serde_json::json!({"ok": true}),
-                2,
-            ))
-            .await
-            .unwrap();
-
-        let page = store
-            .session_domain_events_page("s-runtime-page", 0, 50)
-            .await
-            .unwrap();
-        assert_eq!(page.total, 1);
-        assert_eq!(page.events.len(), 1);
-        assert_eq!(page.events[0].kind, "turn.completed");
-        assert_eq!(page.next_seq, Some(2));
-        assert!(!page.has_more);
-    }
-
-    #[tokio::test]
-    async fn domain_event_allocator_keeps_column_and_envelope_sequence_equal() {
-        let store = UnifiedSessionStore::open_in_memory().unwrap();
-        store
-            .create_session(&make_record("s-runtime-allocated"))
-            .await
-            .unwrap();
-        let stored = store
-            .append_session_domain_event_allocating_sequence(&SessionDomainEvent::new(
-                "s-runtime-allocated",
-                9_999,
-                SessionDomainScope::Turn,
-                "turn.completed",
-                serde_json::json!({"ok": true}),
-                2,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(stored.sequence, 0);
-
-        let page = store
-            .session_domain_events_page("s-runtime-allocated", 0, 10)
-            .await
-            .unwrap();
-        assert_eq!(page.events[0].sequence, 0);
-        assert_eq!(page.next_seq, Some(1));
-    }
-
-    #[tokio::test]
-    async fn domain_event_batch_is_contiguous_and_visible_as_one_compaction_pair() {
-        let store = UnifiedSessionStore::open_in_memory().unwrap();
-        store
-            .create_session(&make_record("s-runtime-compaction-batch"))
-            .await
-            .unwrap();
-        let events = [
-            SessionDomainEvent::new(
-                "s-runtime-compaction-batch",
-                0,
-                SessionDomainScope::Context,
-                "context.session_compacted",
-                serde_json::json!({"checkpoint_id":"checkpoint-1"}),
-                1,
-            ),
-            SessionDomainEvent::new(
-                "s-runtime-compaction-batch",
-                0,
-                SessionDomainScope::Memory,
-                "memory.semantic_checkpoint.created",
-                serde_json::json!({"checkpoint_id":"checkpoint-1"}),
-                1,
-            ),
-        ];
-        let stored = store
-            .append_session_domain_events_allocating_sequence(&events)
-            .await
-            .unwrap();
-        assert_eq!(
-            stored
-                .iter()
-                .map(|event| event.sequence)
-                .collect::<Vec<_>>(),
-            vec![0, 1]
-        );
-
-        let page = store
-            .session_domain_events_page("s-runtime-compaction-batch", 0, 10)
-            .await
-            .unwrap();
-        assert_eq!(page.events.len(), 2);
-        assert_eq!(page.events[0].kind, "context.session_compacted");
-        assert_eq!(page.events[1].kind, "memory.semantic_checkpoint.created");
-    }
-
-    #[tokio::test]
-    async fn checkpoint_batch_retry_reuses_the_committed_bundle() {
-        let store = UnifiedSessionStore::open_in_memory().unwrap();
-        store
-            .create_session(&make_record("s-runtime-compaction-dedup"))
-            .await
-            .unwrap();
-        let checkpoint_id = "checkpoint-stable-1";
-        let events = || {
-            vec![
-                SessionDomainEvent::new(
-                    "s-runtime-compaction-dedup",
-                    0,
-                    SessionDomainScope::Context,
-                    "context.session_compacted",
-                    serde_json::json!({"checkpoint_id":checkpoint_id}),
-                    1,
-                ),
-                SessionDomainEvent::new(
-                    "s-runtime-compaction-dedup",
-                    0,
-                    SessionDomainScope::Memory,
-                    "memory.semantic_checkpoint.created",
-                    serde_json::json!({"checkpoint":{"checkpoint_id":checkpoint_id}}),
-                    1,
-                ),
-            ]
-        };
-        assert!(store
-            .append_session_domain_events_if_checkpoint_absent(&events(), checkpoint_id)
-            .await
-            .unwrap());
-        assert!(!store
-            .append_session_domain_events_if_checkpoint_absent(&events(), checkpoint_id)
-            .await
-            .unwrap());
-        assert_eq!(
-            store
-                .session_domain_events_page("s-runtime-compaction-dedup", 0, 10)
-                .await
-                .unwrap()
-                .events
-                .len(),
-            2
-        );
-    }
-
-    #[tokio::test]
-    async fn timeline_events_page_excludes_legacy_rows() {
-        let store = UnifiedSessionStore::open_in_memory().unwrap();
-        store
-            .create_session(&make_record("s-runtime-timeline"))
-            .await
-            .unwrap();
-        store
-            .append_event(&SessionEvent {
-                session_id: "s-runtime-timeline".to_string(),
-                event_type: "ToolStart".to_string(),
-                event_json: serde_json::json!({"tool": "shell"}).to_string(),
-                sequence: 0,
-                created_at_ms: 1,
-            })
-            .await
-            .unwrap();
-        store
-            .append_session_domain_event(&SessionDomainEvent::new(
-                "s-runtime-timeline",
-                1,
-                SessionDomainScope::Memory,
-                "memory.pulse.created",
-                serde_json::json!({"candidates": 3}),
-                2,
-            ))
-            .await
-            .unwrap();
-
-        let page = store
-            .timeline_events_page("s-runtime-timeline", 0, 1)
-            .await
-            .unwrap();
-        assert_eq!(page.total, 1);
-        assert_eq!(page.events.len(), 1);
-        assert_eq!(page.events[0].kind, "memory.pulse.created");
-        assert_eq!(page.events[0].scope, SessionDomainScope::Memory);
-        assert_eq!(page.next_seq, Some(2));
-        assert!(!page.has_more);
-    }
-
-    #[tokio::test]
-    async fn concurrent_allocating_appends_produce_one_ordered_sequence() {
-        let store = UnifiedSessionStore::open_in_memory().unwrap();
-        store
-            .create_session(&make_record("s-concurrent-sequence"))
-            .await
-            .unwrap();
-
-        let mut tasks = Vec::new();
-        for index in 0..100usize {
-            let store = store.clone();
-            tasks.push(tokio::spawn(async move {
-                store
-                    .append_event_allocating_sequence(&SessionEvent {
-                        session_id: "s-concurrent-sequence".to_string(),
-                        event_type: "concurrent".to_string(),
-                        event_json: format!(r#"{{"index":{index}}}"#),
-                        sequence: usize::MAX,
-                        created_at_ms: index as u64,
-                    })
-                    .await
-                    .unwrap()
-                    .sequence
-            }));
-        }
-        let mut allocated = Vec::new();
-        for task in tasks {
-            allocated.push(task.await.unwrap());
-        }
-        allocated.sort_unstable();
-        assert_eq!(allocated, (0..100).collect::<Vec<_>>());
-
-        let replay = store.get_events("s-concurrent-sequence", 0).await.unwrap();
-        assert_eq!(replay.len(), 100);
-        assert!(replay
-            .iter()
-            .enumerate()
-            .all(|(expected, event)| event.sequence == expected));
-    }
-
-    #[tokio::test]
-    async fn list_sessions_by_workspace_root_uses_db_metadata_namespace() {
-        let store = UnifiedSessionStore::open_in_memory().unwrap();
-        let workspace_a = "/tmp/cowd-unified-a";
-        let workspace_b = "/tmp/cowd-unified-b";
-
-        let mut older = make_record("unified-a-older");
-        older.last_activity = "2024-01-01T00:00:00Z".to_string();
-        older.metadata_json = Some(serde_json::json!({"workspace_root": workspace_a}).to_string());
-        store.create_session(&older).await.unwrap();
-
-        let mut newer = make_record("unified-a-newer");
-        newer.last_activity = "2024-01-02T00:00:00Z".to_string();
-        newer.metadata_json = Some(serde_json::json!({"workspace_root": workspace_a}).to_string());
-        store.create_session(&newer).await.unwrap();
-
-        let mut other = make_record("unified-b");
-        other.metadata_json = Some(serde_json::json!({"workspace_root": workspace_b}).to_string());
-        store.create_session(&other).await.unwrap();
-
-        let records = store
-            .list_sessions_by_workspace_root(workspace_a)
-            .await
-            .expect("workspace sessions should list");
-
-        assert_eq!(
-            records
-                .iter()
-                .map(|record| record.session_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["unified-a-newer", "unified-a-older"]
-        );
-    }
-
-    #[tokio::test]
-    async fn repository_operations_are_attributed_to_their_semantic_lanes() {
-        let store = UnifiedSessionStore::open_in_memory().unwrap();
-        store
-            .create_session(&make_record("lane-routing"))
-            .await
-            .unwrap();
-        assert!(store.get_session("lane-routing").await.unwrap().is_some());
-        let _ = store
-            .list_active_session_recovery_manifests(0, 10)
-            .await
-            .unwrap();
-
-        let stats = store.execution_stats();
-        assert_eq!(stats.interactive_write.submitted, 1);
-        assert_eq!(stats.interactive_read.submitted, 1);
-        assert_eq!(stats.background.submitted, 1);
-        assert_eq!(stats.submitted, 3);
-        assert_eq!(stats.completed, 3);
-        assert_eq!(stats.active, 0);
-        assert_eq!(stats.queued, 0);
-    }
-
-    #[tokio::test]
-    async fn cold_context_page_uses_one_admitted_read_operation() {
-        let store = UnifiedSessionStore::open_in_memory().unwrap();
-        store
-            .create_session(&make_record("context-page"))
-            .await
-            .unwrap();
-        let before = store.execution_stats();
-
-        let page = store
-            .page_in_session_context("context-page", 128)
-            .await
-            .expect("context page read")
-            .expect("session context page");
-
-        let after = store.execution_stats();
-        assert_eq!(page.manifest.recovery.session_id, "context-page");
-        assert_eq!(
-            after
-                .interactive_read
-                .submitted
-                .saturating_sub(before.interactive_read.submitted),
-            1,
-            "manifest and cards must share one admitted read"
-        );
-    }
-
-    #[tokio::test]
-    async fn selected_context_ranges_share_one_admitted_read_and_remain_exact() {
-        let store = UnifiedSessionStore::open_in_memory().unwrap();
-        store
-            .create_session(&make_record("context-ranges"))
-            .await
-            .unwrap();
-        let messages = (0..20)
-            .map(|sequence| make_message("context-ranges", sequence))
-            .collect::<Vec<_>>();
-        store.insert_messages_batch(&messages).await.unwrap();
-        let before = store.execution_stats();
-
-        let selected = store
-            .get_messages_in_ranges("context-ranges", &[(2, 5), (12, 15)], 32)
-            .await
-            .expect("selected ranges");
-
-        let after = store.execution_stats();
-        assert_eq!(
-            selected
-                .iter()
-                .map(|message| message.sequence)
-                .collect::<Vec<_>>(),
-            vec![2, 3, 4, 12, 13, 14]
-        );
-        assert_eq!(
-            after
-                .interactive_read
-                .submitted
-                .saturating_sub(before.interactive_read.submitted),
-            1
-        );
-    }
 }

@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::store::sqlite::SqliteStore;
 use crate::store::Result as StoreResult;
 
 /// Disambiguation key to distinguish entities with the same name.
@@ -42,7 +41,7 @@ pub struct EntityRecord {
     pub occurrences: usize,
 }
 
-/// A single evolution event in an entity's timeline, persisted to SQLite.
+/// A single evolution event in an entity's timeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvolutionRecord {
     pub id: i64,
@@ -98,7 +97,8 @@ impl EvolutionRecord {
 
 pub struct EntityRegistry {
     entities: HashMap<String, Vec<EntityRecord>>,
-    store: Option<SqliteStore>,
+    evolution_tracking: bool,
+    evolutions: Vec<EvolutionRecord>,
 }
 
 impl Default for EntityRegistry {
@@ -111,19 +111,23 @@ impl EntityRegistry {
     pub fn new() -> Self {
         Self {
             entities: HashMap::new(),
-            store: None,
+            evolution_tracking: false,
+            evolutions: Vec::new(),
         }
     }
 
-    /// Attach a SQLite store for persistent entity evolution tracking.
-    pub fn with_store(mut self, store: SqliteStore) -> Self {
-        self.store = Some(store);
+    /// Enable process-local evolution tracking.
+    ///
+    /// Durable knowledge belongs to the canonical `MemoryStore`; this registry
+    /// deliberately remains a derived, rebuildable context index.
+    pub fn with_evolution_tracking(mut self) -> Self {
+        self.evolution_tracking = true;
         self
     }
 
-    /// Check whether a persistent store is attached.
+    /// Check whether evolution context collection is enabled.
     pub fn has_store(&self) -> bool {
-        self.store.is_some()
+        self.evolution_tracking
     }
 
     pub fn register(&mut self, name: &str, key: DisambiguationKey, confidence: f32) {
@@ -139,10 +143,7 @@ impl EntityRegistry {
             .push(record);
     }
 
-    /// Register an entity AND persist the evolution event to SQLite.
-    ///
-    /// If no store is attached, this behaves like `register()` (memory only).
-    /// Returns `Ok(())` if both in-memory and SQLite writes succeed.
+    /// Register an entity and, when enabled, record a rebuildable evolution event.
     pub fn register_persistent(
         &mut self,
         name: &str,
@@ -171,18 +172,18 @@ impl EntityRegistry {
             .or_default()
             .push(record);
 
-        // Persist to SQLite if available
-        if let Some(ref store) = self.store {
-            let key_clone = key.clone();
-            store.insert_entity_evolution(
-                name,
-                &key_str,
-                agent_id,
-                old_val.as_deref(),
-                Some(&format!("{key_clone}")),
-                Some(confidence),
-                operation,
-            )?;
+        if self.evolution_tracking {
+            self.evolutions.push(EvolutionRecord {
+                id: self.evolutions.len() as i64 + 1,
+                entity_name: name.to_string(),
+                entity_key: key_str,
+                agent_id: agent_id.to_string(),
+                old_value: old_val,
+                new_value: Some(format!("{key}")),
+                confidence: Some(confidence),
+                operation: operation.to_string(),
+                recorded_at_ms: chrono::Utc::now().timestamp_millis(),
+            });
         }
 
         Ok(())
@@ -212,16 +213,18 @@ impl EntityRegistry {
             .or_default()
             .push(record);
 
-        if let Some(ref store) = self.store {
-            store.insert_entity_evolution(
-                name,
-                &key_str,
-                agent_id,
-                old_value,
-                new_value,
-                Some(confidence),
-                operation,
-            )?;
+        if self.evolution_tracking {
+            self.evolutions.push(EvolutionRecord {
+                id: self.evolutions.len() as i64 + 1,
+                entity_name: name.to_string(),
+                entity_key: key_str,
+                agent_id: agent_id.to_string(),
+                old_value: old_value.map(str::to_string),
+                new_value: new_value.map(str::to_string),
+                confidence: Some(confidence),
+                operation: operation.to_string(),
+                recorded_at_ms: chrono::Utc::now().timestamp_millis(),
+            });
         }
 
         Ok(())
@@ -252,26 +255,13 @@ impl EntityRegistry {
 
     /// Retrieve the chronological evolution timeline for an entity.
     ///
-    /// Returns an empty `Vec` if no store is attached or no records exist.
+    /// Returns an empty `Vec` if tracking is disabled or no records exist.
     pub fn get_entity_timeline(&self, entity_name: &str) -> StoreResult<Vec<EvolutionRecord>> {
-        let store = match &self.store {
-            Some(s) => s,
-            None => return Ok(Vec::new()),
-        };
-        let rows = store.get_entity_timeline(entity_name, 200)?;
-        Ok(rows
-            .into_iter()
-            .map(|(id, en, ek, ai, ov, nv, cf, op, ts)| EvolutionRecord {
-                id,
-                entity_name: en,
-                entity_key: ek,
-                agent_id: ai,
-                old_value: ov,
-                new_value: nv,
-                confidence: cf,
-                operation: op,
-                recorded_at_ms: ts,
-            })
+        Ok(self
+            .evolutions
+            .iter()
+            .filter(|record| record.entity_name == entity_name)
+            .cloned()
             .collect())
     }
 
@@ -315,27 +305,10 @@ impl EntityRegistry {
 
     /// Get the most recent N entity evolution events across all entities.
     ///
-    /// Returns an empty `Vec` if no store is attached.
+    /// Returns an empty `Vec` if tracking is disabled.
     pub fn get_recent_evolutions(&self, limit: usize) -> StoreResult<Vec<EvolutionRecord>> {
-        let store = match &self.store {
-            Some(s) => s,
-            None => return Ok(Vec::new()),
-        };
-        let rows = store.get_recent_evolutions(limit)?;
-        Ok(rows
-            .into_iter()
-            .map(|(id, en, ek, ai, ov, nv, cf, op, ts)| EvolutionRecord {
-                id,
-                entity_name: en,
-                entity_key: ek,
-                agent_id: ai,
-                old_value: ov,
-                new_value: nv,
-                confidence: cf,
-                operation: op,
-                recorded_at_ms: ts,
-            })
-            .collect())
+        let start = self.evolutions.len().saturating_sub(limit);
+        Ok(self.evolutions[start..].to_vec())
     }
 
     pub fn count(&self) -> usize {
@@ -411,8 +384,7 @@ mod tests {
 
     #[test]
     fn test_register_persistent_with_store() {
-        let store = SqliteStore::open_in_memory().expect("open in-memory store");
-        let mut r = EntityRegistry::new().with_store(store);
+        let mut r = EntityRegistry::new().with_evolution_tracking();
         assert!(r.has_store());
 
         let result = r.register_persistent(
@@ -444,8 +416,7 @@ mod tests {
 
     #[test]
     fn test_narrative_arc() {
-        let store = SqliteStore::open_in_memory().expect("open in-memory store");
-        let mut r = EntityRegistry::new().with_store(store);
+        let mut r = EntityRegistry::new().with_evolution_tracking();
 
         r.register_persistent(
             "bob",
@@ -486,8 +457,7 @@ mod tests {
 
     #[test]
     fn test_recent_evolutions() {
-        let store = SqliteStore::open_in_memory().expect("open in-memory store");
-        let mut r = EntityRegistry::new().with_store(store);
+        let mut r = EntityRegistry::new().with_evolution_tracking();
 
         r.register_persistent("e1", DisambiguationKey::Id("e1".into()), 0.9, "AgentA")
             .unwrap();

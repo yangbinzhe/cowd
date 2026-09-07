@@ -1248,7 +1248,7 @@ mod tests {
         Arc<RuntimeServices>,
         Arc<SessionInputRouter>,
     ) {
-        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::test_support::session_store());
         let now = chrono::Utc::now().to_rfc3339();
         store
             .create_session(&SessionRecord {

@@ -4,7 +4,7 @@
 //   - Surface registry (builtin TUI/WebUI plus external JSONL sidecars)
 // Shared state: ActiveSessionDirectory, CognitiveContextManager, ToolCatalog, SessionProjectionHub
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -824,6 +824,7 @@ fn emit_startup_diagnostics(diagnostics: &StartupDiagnostics) {
 fn emit_execution_startup_recovery(report: &runtime::ExecutionStartupRecoveryReport) {
     tracing::info!(
         examined_graphs = report.examined_graphs,
+        deferred_graphs = report.deferred_graphs,
         recovered_graphs = report.recovered_graphs,
         advanced_graphs = report.advanced_graphs,
         terminal_graphs = report.terminal_graphs,
@@ -1216,17 +1217,17 @@ async fn shutdown_runtime_host_resources(
                 enter_phase(initial_phase, &failures);
             }
 
-            // Close every ingress fence before cancelling accepted work. Runtime turn
-            // admission shares the same registry lock as turn insertion, so the
-            // cancellation snapshot cannot race with a newly accepted turn.
+            // Close every ingress fence before draining accepted work. Process
+            // shutdown preserves durable execution for restart; only an
+            // explicit Session cancellation is allowed to terminalize it.
             enter_phase("stop_accepting", &failures);
             gateway_tasks.stop_accepting();
             if let Some(supervisor) = resources.session_worker_supervisor {
                 supervisor.stop_accepting();
             }
-            let cancelled_turns = resources.runtime_service.map_or_else(Vec::new, |runtime| {
-                runtime.stop_accepting_and_cancel_active_turns("Gateway process shutdown")
-            });
+            let preserved_turns = resources
+                .runtime_service
+                .map_or_else(Vec::new, |runtime| runtime.stop_accepting_for_recovery());
 
             enter_phase("drain_ingress", &failures);
             let admission_report = gateway_tasks
@@ -1305,7 +1306,7 @@ async fn shutdown_runtime_host_resources(
             enter_phase("drain_active_turns", &failures);
             if let Some(runtime_service) = resources.runtime_service {
                 let report = runtime_service
-                    .wait_for_active_turns(cancelled_turns.len(), Duration::from_secs(30))
+                    .wait_for_active_turns(0, Duration::from_secs(30))
                     .await;
                 if !report.remaining_turn_ids.is_empty() {
                     failures.push(format!(
@@ -1419,6 +1420,7 @@ async fn shutdown_runtime_host_resources(
             }
             tracing::info!(
                 active_session_count = active_session_ids.len(),
+                preserved_turn_count = preserved_turns.len(),
                 joined = runtime_report.joined,
                 panicked = runtime_report.panicked,
                 forced_aborts = runtime_report.forced_aborts,
@@ -1541,8 +1543,6 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     let cognitive: Option<Arc<CognitiveContextManager>> = match &config.memory_config {
         Some(mem_cfg) => {
             tracing::info!("initialising memory manager over selected storage...");
-            let sqlite_auxiliaries =
-                selected_storage.backend == runtime::StorageBackendSelection::Sqlite;
             let llm_summarizer = if mem_cfg.compression.llm.is_configured() {
                 match runtime::RuntimeMemorySummarizer::new(
                     Arc::clone(&provider_registry),
@@ -1569,7 +1569,6 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                     .as_ref()
                     .map(|store| Arc::new(store.history_reader())),
                 Arc::clone(&selected_storage.memory_store),
-                sqlite_auxiliaries,
                 Some(selected_storage.memory_maintenance_queue.clone()),
                 llm_summarizer,
             )
@@ -1798,6 +1797,12 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             .provider_transport_pool(Arc::clone(&provider_transport_pool))
             .provider_template_cache(Arc::clone(&provider_template_cache))
             .provider_resource_config(runtime_config.provider_resources().clone())
+            .process_jsonl_commands(
+                runtime_config
+                    .agent_executor_commands()
+                    .iter()
+                    .map(runtime::ProcessJsonlSpec::from_config),
+            )
             .provider_fallbacks(runtime_config.fallbacks().iter().cloned())
             .tool_execution_host(runtime_tool_host)
             .runtime_event_store(Arc::clone(&selected_storage.runtime_event_store))
@@ -1924,20 +1929,6 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         let error = format!("failed to bind runtime services: {error}");
         return Err(startup_registry.rollback(error).await);
     }
-    let execution_recovery_started_at = Instant::now();
-    let startup_recovery = match runtime_services.recover_execution_graphs_on_startup().await {
-        Ok(report) => report,
-        Err(error) => {
-            let error = format!("failed to recover execution graphs on startup: {error}");
-            return Err(startup_registry.rollback(error).await);
-        }
-    };
-    tracing::info!(
-        elapsed_ms = execution_recovery_started_at.elapsed().as_millis() as u64,
-        "Runtime execution startup recovery completed"
-    );
-    emit_execution_startup_recovery(&startup_recovery);
-    reconcile_agentic_startup(&runtime_services).await?;
     let runtime_service = match RuntimeService::new_with_gateway_tasks(
         sessions.clone(),
         lease_registry.clone(),
@@ -2035,11 +2026,12 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         Arc::clone(&selected_storage),
         growth_projection_services,
     );
-    if let Some(executor) = &selected_storage.postgres_executor {
-        if let Err(error) = executor.verify_registered_migration_catalogs() {
-            let error = format!("failed to verify enabled APP storage catalogs: {error}");
-            return Err(startup_registry.rollback(error).await);
-        }
+    if let Err(error) = selected_storage
+        .postgres_executor
+        .verify_registered_migration_catalogs()
+    {
+        let error = format!("failed to verify enabled APP storage catalogs: {error}");
+        return Err(startup_registry.rollback(error).await);
     }
     let services = Arc::new(services.with_app_platform(Arc::clone(&app_platform)));
     let app_state = Arc::new(api_routes::AppState {
@@ -2059,11 +2051,30 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         let error = format!("failed to bind CoreBridge Gateway dependencies: {error}");
         return Err(startup_registry.rollback(error).await);
     }
-    if let Err(error) = app_platform.start_resident().await {
-        let error = format!("failed to start resident APPs: {error}");
+    config_reload::initialize_config_reload_status(&config_reload, &app_state);
+
+    // No business ingress or autonomous producer may run until every owner
+    // required by durable work has been restored in dependency order. Keeping
+    // this gate synchronous avoids a second, partially enforced "restoring"
+    // mode across HTTP, Surface, scheduler, organizer and graph dispatch.
+    if let Err(error) = restore_runtime_before_admission(
+        &session_service,
+        &session_worker_supervisor,
+        &runtime_services,
+    )
+    .await
+    {
         return Err(startup_registry.rollback(error).await);
     }
-    config_reload::initialize_config_reload_status(&config_reload, &app_state);
+    if let Err(error) = runtime_services.release_recovered_producers().await {
+        let error = format!("failed to release recovered Runtime producers: {error}");
+        return Err(startup_registry.rollback(error).await);
+    }
+    session_worker_supervisor.release_recovered_producers();
+    if let Err(error) = app_platform.start_resident().await {
+        let error = format!("failed to start resident APPs after Runtime recovery: {error}");
+        return Err(startup_registry.rollback(error).await);
+    }
 
     // 2. Build HTTP router (reuse api_routes + SSE)
     let app = {
@@ -2170,36 +2181,6 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                 },
             )
             .map_err(|error| format!("failed to start HTTP server: {error}"))?;
-        let recovery_service = Arc::clone(&session_service);
-        let recovery_supervisor = Arc::clone(&session_worker_supervisor);
-        gateway_tasks
-            .spawn(
-                GatewayTaskKind::RuntimeRestoration,
-                None,
-                move |cancellation| async move {
-                    let recovery = tokio::select! {
-                        _ = cancellation.cancelled() => return,
-                        recovery = recovery_service.recover_required_sessions() => recovery,
-                    };
-                    match recovery {
-                        Ok(summary) => recovery_supervisor.record_recovery(summary),
-                        Err(error) => {
-                            tracing::error!(
-                                %error,
-                                "Session startup recovery failed before producing a summary"
-                            );
-                            let mut summary =
-                                crate::services::session_service::activation::SessionRecoverySummary {
-                                    failed: 1,
-                                    ..Default::default()
-                                };
-                            summary.failures.push(error);
-                            recovery_supervisor.record_recovery(summary);
-                        }
-                    }
-                },
-            )
-            .map_err(|error| format!("failed to start Session restoration task: {error}"))?;
         if let Some((manager, knowledge, policy)) = memory_governance_task {
             start_memory_governance_task(
                 &gateway_tasks,
@@ -2265,13 +2246,110 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     }
 }
 
-async fn reconcile_agentic_startup(services: &Arc<runtime::RuntimeServices>) -> Result<(), String> {
+pub(crate) async fn restore_runtime_before_admission(
+    session_service: &Arc<crate::services::SessionService>,
+    recovery_supervisor: &Arc<crate::session_runtime_bridge::SessionWorkerSupervisor>,
+    runtime_services: &Arc<runtime::RuntimeServices>,
+) -> Result<(), String> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut retry_delay = Duration::from_millis(250);
+    let mut last_failures = Vec::new();
+    for attempt in 1..=MAX_ATTEMPTS {
+        let mut summary = session_service
+            .recover_required_sessions()
+            .await
+            .map_err(|error| format!("Session startup recovery failed: {error}"))?;
+        let excluded_sessions = summary.failed_session_ids.clone();
+        let mut runtime_recovery_failed = false;
+        if summary.global_failures == 0 {
+            let execution_recovery_started_at = Instant::now();
+            match runtime_services
+                .recover_execution_graphs_on_startup_excluding_sessions(&excluded_sessions)
+                .await
+            {
+                Ok(report) if report.errors.is_empty() => {
+                    tracing::info!(
+                        elapsed_ms = execution_recovery_started_at.elapsed().as_millis() as u64,
+                        "Runtime execution startup recovery completed after Session hydration"
+                    );
+                    emit_execution_startup_recovery(&report);
+                    if let Err(error) =
+                        reconcile_agentic_startup(runtime_services, &excluded_sessions).await
+                    {
+                        runtime_recovery_failed = true;
+                        summary.failed = summary.failed.saturating_add(1);
+                        summary.failures.push(error);
+                    }
+                }
+                Ok(report) => {
+                    emit_execution_startup_recovery(&report);
+                    runtime_recovery_failed = true;
+                    summary.failed = summary.failed.saturating_add(report.errors.len());
+                    summary
+                        .failures
+                        .extend(report.errors.into_iter().map(|error| {
+                            format!("execution graph {}: {}", error.graph_id, error.error)
+                        }));
+                }
+                Err(error) => {
+                    runtime_recovery_failed = true;
+                    summary.failed = summary.failed.saturating_add(1);
+                    summary.failures.push(format!(
+                        "failed to recover execution graphs on startup: {error}"
+                    ));
+                }
+            }
+        }
+        // Every durable Session partition must hydrate before global producers
+        // are released. A failed local partition is retried with the same
+        // bounded ordered pass; after three failures startup remains fenced.
+        let complete = startup_recovery_pass_is_complete(&summary, runtime_recovery_failed);
+        last_failures.clone_from(&summary.failures);
+        let recovery_state = if complete {
+            crate::session_runtime_bridge::SessionStartupRecoveryState::Completed
+        } else {
+            crate::session_runtime_bridge::SessionStartupRecoveryState::Failed
+        };
+        recovery_supervisor.record_recovery(summary, recovery_state);
+        if complete {
+            return Ok(());
+        }
+        if attempt < MAX_ATTEMPTS {
+            tracing::warn!(
+                attempt,
+                retry_delay_ms = retry_delay.as_millis() as u64,
+                "Ordered Runtime restoration failed before admission; retrying"
+            );
+            tokio::time::sleep(retry_delay).await;
+            retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(2));
+        }
+    }
+    Err(format!(
+        "ordered Runtime restoration did not complete after {MAX_ATTEMPTS} attempts: {}",
+        last_failures.join("; ")
+    ))
+}
+
+fn startup_recovery_pass_is_complete(
+    summary: &crate::services::session_service::activation::SessionRecoverySummary,
+    runtime_recovery_failed: bool,
+) -> bool {
+    summary.failed == 0
+        && summary.global_failures == 0
+        && summary.failed_session_ids.is_empty()
+        && !runtime_recovery_failed
+}
+
+async fn reconcile_agentic_startup(
+    services: &Arc<runtime::RuntimeServices>,
+    excluded_sessions: &BTreeSet<String>,
+) -> Result<(), String> {
     let dispatches = services
-        .recover_agentic_programs_on_startup()
+        .recover_agentic_programs_on_startup_excluding_sessions(excluded_sessions)
         .await
         .map_err(|error| format!("failed to reconcile Agent-first Programs on startup: {error}"))?;
     let waits = services
-        .recover_agentic_program_waits_on_startup()
+        .recover_agentic_program_waits_on_startup_excluding_sessions(excluded_sessions)
         .await
         .map_err(|error| {
             format!("failed to reconcile Agent-first Program waits on startup: {error}")
@@ -2429,6 +2507,33 @@ mod tests {
     use memory::MemoryConfig;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn ordered_recovery_requires_every_session_and_runtime_partition() {
+        let summary = crate::services::session_service::activation::SessionRecoverySummary {
+            failed: 1,
+            global_failures: 0,
+            failed_session_ids: BTreeSet::from(["quarantined-session".to_string()]),
+            failures: vec!["quarantined-session: corrupt transcript".to_string()],
+            ..Default::default()
+        };
+
+        assert!(!startup_recovery_pass_is_complete(&summary, false));
+        assert!(!startup_recovery_pass_is_complete(&summary, true));
+
+        assert!(startup_recovery_pass_is_complete(
+            &crate::services::session_service::activation::SessionRecoverySummary::default(),
+            false,
+        ));
+
+        let global = crate::services::session_service::activation::SessionRecoverySummary {
+            failed: 1,
+            global_failures: 1,
+            failures: vec!["manifest store unavailable".to_string()],
+            ..Default::default()
+        };
+        assert!(!startup_recovery_pass_is_complete(&global, false));
+    }
 
     fn temp_webui_dir(label: &str) -> std::path::PathBuf {
         let unique = format!(

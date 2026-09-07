@@ -72,6 +72,7 @@ impl ConfigLoader {
         let mut merged = BTreeMap::new();
         let mut loaded_entries = Vec::new();
         let mut mcp_servers = BTreeMap::new();
+        let mut agent_executor_commands = BTreeMap::new();
         let mut all_warnings = Vec::new();
 
         for entry in self.discover() {
@@ -100,6 +101,11 @@ impl ConfigLoader {
                 validate_optional_hooks_config(&parsed.object, &entry.path)?;
             }
             merge_mcp_servers(&mut mcp_servers, entry.source, &parsed.object, &entry.path)?;
+            for command in
+                parse_trusted_agent_executor_commands(entry.source, &parsed.object, &entry.path)?
+            {
+                agent_executor_commands.insert(command.command_ref.clone(), command);
+            }
             deep_merge_objects(&mut merged, &parsed.object);
             loaded_entries.push(entry);
         }
@@ -159,6 +165,7 @@ impl ConfigLoader {
             runtime_control: parse_optional_runtime_control_config(&merged_value)?,
             hot_state: parse_optional_hot_state_config(&merged_value)?,
             provider_resources: parse_optional_provider_resource_config(&merged_value)?,
+            agent_executor_commands: agent_executor_commands.into_values().collect(),
         };
 
         Ok(ConfigLoadResult {

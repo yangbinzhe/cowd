@@ -2,6 +2,7 @@ pub(crate) mod analyst;
 pub mod candidate_kind;
 pub mod capability_goal;
 pub mod case;
+pub(crate) mod collaboration_experience;
 pub mod diagnosis;
 pub(crate) mod discovery;
 pub mod governance;

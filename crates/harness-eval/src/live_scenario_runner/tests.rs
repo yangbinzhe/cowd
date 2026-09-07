@@ -127,7 +127,7 @@ fn agentic_program_projection(
         "topics": {"topic:program:test": [{"entry_id":"entry-1","revision":8,"actor_id":"agent-a","summary":"finding","content_ref":null,"refs":["artifact:a"]}]},
         "artifacts": artifacts,
         "final_artifact_ref": "artifact:final",
-        "completion_request": {"action_id":"complete-1","requested_by":"root","program_revision":8,"final_artifact_ref":"artifact:final","evidence_refs":["evidence:read"],"unresolved":[]},
+        "completion_request": {"action_id":"complete-1","requested_by":"root","program_revision":8,"result_refs":["artifact:final"],"primary_artifact_ref":"artifact:final","evidence_refs":["evidence:read"],"unresolved":[]},
         "objective_verdict": (status == "verified").then(|| json!({"goal_id":"objective:test","goal_revision":1,"terminal_fence":"fence","authority_revision":9,"kind":"satisfied"})),
         "unresolved": []
     })).expect("typed Agent-first Program fixture")
@@ -211,11 +211,11 @@ fn unknown_or_unscheduled_explicit_scenarios_fail_before_dispatch() {
 }
 
 #[test]
-fn live_prompt_carries_an_explicit_shared_provider_token_lease() {
+fn live_prompt_uses_an_optional_advisory_provider_token_telemetry_lease() {
     let controlled = controlled_live_prompt(
         "live_group_theory_ai_research_simulation",
         "complete the research".to_string(),
-        5_000_000,
+        Some(5_000_000),
     );
     let (header, prompt) = controlled.split_once('\n').expect("control header");
     let encoded = header
@@ -234,11 +234,8 @@ fn live_prompt_carries_an_explicit_shared_provider_token_lease() {
         .is_some_and(|id| id.starts_with("live-scenario:live_group_theory")));
     assert_eq!(prompt, "complete the research");
 
-    let tool_controlled = controlled_live_prompt(
-        "live_tool_evidence",
-        "read the manifest".to_string(),
-        10_000,
-    );
+    let tool_controlled =
+        controlled_live_prompt("live_tool_evidence", "read the manifest".to_string(), None);
     let (tool_header, _) = tool_controlled
         .split_once('\n')
         .expect("tool control header");
@@ -257,11 +254,13 @@ fn live_prompt_carries_an_explicit_shared_provider_token_lease() {
             "read:Cargo.toml"
         ])
     );
+    assert!(tool_control.get("max_total_tokens").is_none());
+    assert!(tool_control.get("budget_lease_id").is_none());
 
     let autonomous = controlled_live_prompt(
         AUTONOMOUS_DEEPSEEK_SCENARIO_ID,
         "run autonomous collaboration".to_string(),
-        5_000_000,
+        None,
     );
     let (autonomous_header, _) = autonomous.split_once('\n').expect("control header");
     let autonomous_control: Value = serde_json::from_str(
@@ -1192,6 +1191,7 @@ fn scenario_metrics_prefer_unique_provider_attempt_outcomes_and_exact_prefix_evi
                 "request_id": request_id,
                 "terminal_status": "completed",
                 "usage_status": "known",
+                "cache_dimensions_status": "known",
                 "usage": {
                     "input_tokens": miss,
                     "output_tokens": 2,
@@ -1219,10 +1219,76 @@ fn scenario_metrics_prefer_unique_provider_attempt_outcomes_and_exact_prefix_evi
     assert_eq!(metrics["cache_read_input_tokens"], 90);
     assert_eq!(metrics["provider_attempt_count"], 2);
     assert_eq!(metrics["provider_attempt_usage_unknown_count"], 0);
+    assert_eq!(
+        metrics["provider_attempt_cache_dimensions_unknown_count"],
+        0
+    );
     assert_eq!(metrics["cache_cold_leader_count"], 1);
     assert_eq!(metrics["cache_waiter_count"], 1);
     assert_eq!(metrics["structural_reuse_ratio_bp"], 4_761);
     assert_eq!(metrics["warm_structural_reuse_ratio_bp"], 9_090);
+}
+
+#[test]
+fn scenario_metrics_count_packed_attempt_without_outcome_as_usage_unknown() {
+    let timeline = json!({
+        "session_events": [{
+            "kind": "context.provider_request_packed",
+            "payload": {
+                "type": "ProviderRequestPacked",
+                "request_id": "orphan-after-wire-send",
+                "model": "deepseek-v4-flash",
+                "model_visible_prompt_bytes": 4096,
+                "reusable_prefix_bytes": 4000,
+                "cache_cold_leader": false
+            }
+        }],
+        "team_session": {"runtime_run_count": 1}
+    });
+    let metrics = scenario_metrics(&timeline, &[], None, Duration::from_secs(1));
+
+    assert_eq!(metrics["provider_attempt_count"], 1);
+    assert_eq!(metrics["provider_attempt_usage_unknown_count"], 1);
+    assert_eq!(
+        metrics["provider_attempt_cache_dimensions_unknown_count"],
+        1
+    );
+    assert_eq!(metrics["usage_unknown_attempts"], 1);
+    assert_eq!(metrics["provider_usage_records"], 0);
+}
+
+#[test]
+fn scenario_metrics_do_not_treat_missing_cache_fields_as_known_zero() {
+    let timeline = json!({
+        "session_events": [
+            {
+                "kind": "context.provider_request_packed",
+                "payload": {
+                    "type": "ProviderRequestPacked",
+                    "request_id": "usage-without-cache-dimensions",
+                    "model": "deepseek-v4-flash"
+                }
+            },
+            {
+                "kind": "context.provider_attempt_outcome",
+                "payload": {
+                    "type": "ProviderAttemptOutcome",
+                    "request_id": "usage-without-cache-dimensions",
+                    "terminal_status": "completed",
+                    "usage_status": "known",
+                    "usage": {"input_tokens": 100, "output_tokens": 5}
+                }
+            }
+        ],
+        "team_session": {"runtime_run_count": 1}
+    });
+    let metrics = scenario_metrics(&timeline, &[], None, Duration::from_secs(1));
+
+    assert_eq!(metrics["provider_attempt_usage_unknown_count"], 0);
+    assert_eq!(
+        metrics["provider_attempt_cache_dimensions_unknown_count"],
+        1
+    );
 }
 
 #[test]
@@ -1231,7 +1297,7 @@ fn scenario_metrics_aggregate_deduplicated_root_and_child_graph_usage() {
         "graph": {
             "graph_id": "root",
             "nodes": [
-                {"node_id": "model", "kind": "inline_model", "status": "completed", "usage": {"model": "deepseek-v4-flash", "input_tokens": 21, "output_tokens": 8, "cached_tokens": 3, "tool_calls": 0}},
+                {"node_id": "model", "kind": "inline_model", "status": "completed", "usage": {"model": "deepseek-v4-flash", "input_tokens": 21, "output_tokens": 8, "cache_creation_input_tokens": 2, "cache_read_input_tokens": 3, "cached_tokens": 3, "tool_calls": 0}},
                 {"node_id": "tool", "kind": "tool_batch", "status": "completed", "usage": {"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0, "tool_calls": 1}},
                 {"node_id": "agent", "kind": "agent_task", "status": "completed", "usage": {"model": "deepseek-v4-flash", "input_tokens": 21, "output_tokens": 8, "cached_tokens": 3, "tool_calls": 1}},
                 {"node_id": "synthesis", "kind": "synthesize", "status": "completed", "usage": {"model": "deepseek-v4-flash", "input_tokens": 21, "output_tokens": 8, "cached_tokens": 3, "tool_calls": 1}},
@@ -1243,7 +1309,7 @@ fn scenario_metrics_aggregate_deduplicated_root_and_child_graph_usage() {
         "graph": {
             "graph_id": "child",
             "nodes": [
-                {"node_id": "model", "kind": "inline_model", "status": "completed", "usage": {"model": "deepseek-v4-flash", "input_tokens": 13, "output_tokens": 5, "cached_tokens": 1, "tool_calls": 0}}
+                {"node_id": "model", "kind": "inline_model", "status": "completed", "usage": {"model": "deepseek-v4-flash", "input_tokens": 13, "output_tokens": 5, "cache_creation_input_tokens": 1, "cache_read_input_tokens": 1, "cached_tokens": 1, "tool_calls": 0}}
             ]
         }
     });
@@ -1256,9 +1322,9 @@ fn scenario_metrics_aggregate_deduplicated_root_and_child_graph_usage() {
 
     assert_eq!(metrics["input_tokens"], 34);
     assert_eq!(metrics["output_tokens"], 13);
-    assert_eq!(metrics["cache_creation_input_tokens"], 0);
+    assert_eq!(metrics["cache_creation_input_tokens"], 3);
     assert_eq!(metrics["cache_read_input_tokens"], 4);
-    assert_eq!(metrics["cache_tokens"], 4);
+    assert_eq!(metrics["cache_tokens"], 7);
     assert_eq!(metrics["tool_calls"], 1);
     assert_eq!(metrics["model_rounds"], 2);
     assert_eq!(metrics["token_usage_records"], 3);

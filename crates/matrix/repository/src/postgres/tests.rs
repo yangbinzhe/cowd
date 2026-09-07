@@ -8,7 +8,7 @@ use matrix_core::{
 use storage::{StaticSecretRefResolver, StorageDomainId, StorageEndpoint, StorageScope};
 
 use super::*;
-use crate::{copy_quiesced_matrix_store, MatrixRecallQuery, MatrixSqliteRepository};
+use crate::MatrixRecallQuery;
 
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
@@ -60,9 +60,19 @@ fn real_postgres_bounded_recall_matches_authorization_order_and_limit_contract()
 
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
-fn real_postgres_adapter_preserves_matrix_snapshot_and_metric_semantics() {
+fn real_postgres_adapter_preserves_matrix_state_and_metric_semantics() {
     let url = env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
-    let source = MatrixSqliteRepository::in_memory().expect("sqlite source opens");
+    let resolver = StaticSecretRefResolver::new([("matrix.pg.test".to_string(), url)]);
+    let target = PostgresMatrixRepository::connect(
+        PostgresConnectionConfig::new(
+            "matrix-postgres-integration-test",
+            "matrix.pg.test",
+            "cowd-matrix-postgres-contract",
+        ),
+        &resolver,
+    )
+    .expect("postgres target opens");
+    let source = target.clone();
     let entity = source
         .upsert_entity(&MatrixEntity::from_input(MatrixEntityInput {
             entity_id: Some("matrix-pg-migration-entity".to_string()),
@@ -182,7 +192,7 @@ fn real_postgres_adapter_preserves_matrix_snapshot_and_metric_semantics() {
         .expect("metric dependency saves");
     let source_lineage = source
         .metric_lineage("good_units", 6)
-        .expect("sqlite lineage computes");
+        .expect("PostgreSQL lineage computes");
     let plan = source
         .plan_data_plane_ingest(MatrixDataPlaneIngestPlanInput {
             source_ref: "erp://inventory/test".to_string(),
@@ -204,16 +214,6 @@ fn real_postgres_adapter_preserves_matrix_snapshot_and_metric_semantics() {
         .commit_data_plane_ingest(&plan)
         .expect("watermark commits");
 
-    let resolver = StaticSecretRefResolver::new([("matrix.pg.test".to_string(), url)]);
-    let target = PostgresMatrixRepository::connect(
-        PostgresConnectionConfig::new(
-            "matrix-postgres-integration-test",
-            "matrix.pg.test",
-            "cowd-matrix-postgres-contract",
-        ),
-        &resolver,
-    )
-    .expect("postgres target opens");
     let mut index_client = target
         .executor()
         .checkout_critical()
@@ -245,10 +245,6 @@ fn real_postgres_adapter_preserves_matrix_snapshot_and_metric_semantics() {
             .get(0);
     assert_eq!(obsolete_index_count, 0);
     drop(index_client);
-    let manifest_root = tempfile::tempdir().expect("manifest root");
-    let manifest =
-        copy_quiesced_matrix_store(&source, &target, manifest_root.path().join("matrix.json"))
-            .expect("quiesced migration succeeds");
     let selected = crate::MatrixStoreHandle::new(StorageEndpoint::postgres(
         StorageDomainId::Matrix,
         StorageScope::Global,
@@ -258,8 +254,6 @@ fn real_postgres_adapter_preserves_matrix_snapshot_and_metric_semantics() {
     .open_with_postgres_executor(target.executor().clone())
     .expect("injected PostgreSQL Matrix selection succeeds");
 
-    assert_eq!(manifest.source_digest, manifest.target_digest);
-    assert!(manifest.record_count >= 7);
     assert_eq!(
         MatrixStore::health(&*selected)
             .expect("selected store health")
@@ -511,7 +505,7 @@ fn real_postgres_adapter_preserves_matrix_snapshot_and_metric_semantics() {
     );
     source
         .register_metric_definition(&invalid_definition)
-        .expect("sqlite invalid definition saves");
+        .expect("PostgreSQL invalid definition saves");
     MatrixStore::register_metric_definition(&target, &invalid_definition)
         .expect("postgres invalid definition saves");
     let invalid_fact = MatrixFact::from_input(MatrixFactInput {
@@ -531,15 +525,10 @@ fn real_postgres_adapter_preserves_matrix_snapshot_and_metric_semantics() {
     });
     source
         .ingest_fact(&invalid_fact)
-        .expect("sqlite invalid fact saves");
-    MatrixStore::ingest_fact(&target, &invalid_fact).expect("postgres invalid fact saves");
+        .expect("PostgreSQL invalid fact saves");
     let only_invalid = vec!["invalid_units".to_string()];
     assert!(source
         .recompute_metrics_for_metric_ids(&only_invalid)
         .is_err());
     assert!(MatrixStore::recompute_metrics_for_metric_ids(&target, &only_invalid).is_err());
-    assert!(
-        copy_quiesced_matrix_store(&source, &target, manifest_root.path().join("again.json"))
-            .is_err()
-    );
 }

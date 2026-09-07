@@ -301,20 +301,28 @@ fn live_scenario_selection_passed(
         && selected.is_none_or(|selected| selected_spec_count == selected.len())
 }
 
-fn live_provider_token_limit() -> Result<u64, String> {
-    let raw = std::env::var("COWD_EVAL_MAX_PROVIDER_TOKENS").map_err(|_| {
-        "COWD_EVAL_MAX_PROVIDER_TOKENS is required for every live provider scenario".to_string()
-    })?;
+fn live_provider_token_telemetry_limit() -> Result<Option<u64>, String> {
+    let Some(raw) = std::env::var("COWD_EVAL_MAX_PROVIDER_TOKENS")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        // Live execution is already an explicit harness opt-in.  An omitted
+        // cost ceiling means "measure every provider receipt", not "block
+        // the task".  A supplied value remains useful telemetry and is never
+        // turned into a model-output or task-completion cap.
+        return Ok(None);
+    };
     let limit = raw.parse::<u64>().map_err(|_| {
-        "COWD_EVAL_MAX_PROVIDER_TOKENS must be an integer token capacity".to_string()
+        "COWD_EVAL_MAX_PROVIDER_TOKENS must be a positive integer when supplied".to_string()
     })?;
-    if limit == 0 || limit > 20_000_000 {
-        return Err("COWD_EVAL_MAX_PROVIDER_TOKENS must be between 1 and 20000000".to_string());
+    if limit == 0 {
+        return Err("COWD_EVAL_MAX_PROVIDER_TOKENS must be positive when supplied".to_string());
     }
-    Ok(limit)
+    Ok(Some(limit))
 }
 
-fn controlled_live_prompt(spec_id: &str, prompt: String, max_total_tokens: u64) -> String {
+fn controlled_live_prompt(spec_id: &str, prompt: String, telemetry_limit: Option<u64>) -> String {
     let mut resource_scopes = vec!["provider", "provider_account", "provider_token_pool"];
     // Scenario admission is a capability lease, not a hint. The tool-evidence
     // fixture asks the root execution to read this exact file, so grant only
@@ -340,10 +348,14 @@ fn controlled_live_prompt(spec_id: &str, prompt: String, max_total_tokens: u64) 
         "provider_constraint": "normal",
         "temperature_milli": 0,
         "resource_scopes": resource_scopes,
-        "budget_lease_id": format!("live-scenario:{spec_id}:{}", uuid::Uuid::new_v4()),
-        "max_total_tokens": max_total_tokens,
         "prompt": prompt,
     });
+    let mut control = control;
+    if let Some(limit) = telemetry_limit {
+        control["budget_lease_id"] =
+            json!(format!("live-scenario:{spec_id}:{}", uuid::Uuid::new_v4()));
+        control["max_total_tokens"] = json!(limit);
+    }
     format!("COWD_EVAL_CONTROL {control}\n{prompt}")
 }
 
@@ -364,7 +376,7 @@ pub fn run_live_gateway_scenarios(options: &HarnessEvalRunnerOptions) -> Value {
             });
         }
     };
-    let max_provider_tokens = match live_provider_token_limit() {
+    let provider_token_telemetry_limit = match live_provider_token_telemetry_limit() {
         Ok(limit) => limit,
         Err(reason) => {
             return json!({
@@ -438,7 +450,7 @@ pub fn run_live_gateway_scenarios(options: &HarnessEvalRunnerOptions) -> Value {
         model: options.provider.clone(),
         claim_scope,
     };
-    runner.run(max_provider_tokens)
+    runner.run(provider_token_telemetry_limit)
 }
 
 struct LiveScenarioRunner {
@@ -798,7 +810,7 @@ fn root_execution_terminal_state(projection: &Value) -> RootExecutionTerminal {
 }
 
 impl LiveScenarioRunner {
-    fn run(&self, max_provider_tokens: u64) -> Value {
+    fn run(&self, provider_token_telemetry_limit: Option<u64>) -> Value {
         let claim_scope = self.claim_scope;
         let health_observations = [
             ("gateway", "/healthz", LiveHealthContract::Gateway),
@@ -965,7 +977,7 @@ impl LiveScenarioRunner {
         let scenarios = if selection_passed {
             scenario_specs
                 .into_iter()
-                .map(|spec| self.run_scenario(spec, max_provider_tokens))
+                .map(|spec| self.run_scenario(spec, provider_token_telemetry_limit))
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
@@ -1025,7 +1037,7 @@ impl LiveScenarioRunner {
             "certification_scenarios_present": certification_scenarios_present,
             "gateway_url": self.base_url,
             "model": self.model,
-            "max_provider_tokens_per_scenario": max_provider_tokens,
+            "provider_token_telemetry_limit_per_scenario": provider_token_telemetry_limit,
             "timeout_cap_ms": self.timeout_cap.map(|value| value.as_millis()),
             "poll_interval_ms": self.poll_interval.as_millis(),
             "health_status": if health_passed { "passed" } else { "failed" },
@@ -1042,7 +1054,11 @@ impl LiveScenarioRunner {
         })
     }
 
-    fn run_scenario(&self, spec: LiveScenarioSpec, max_provider_tokens: u64) -> Value {
+    fn run_scenario(
+        &self,
+        spec: LiveScenarioSpec,
+        provider_token_telemetry_limit: Option<u64>,
+    ) -> Value {
         let started = Instant::now();
         let mut trace = Vec::new();
         let timeout = spec.timeout.with_cap(self.timeout_cap);
@@ -1062,7 +1078,7 @@ impl LiveScenarioRunner {
         } else {
             spec.prompt.to_string()
         };
-        let prompt = controlled_live_prompt(spec.id, prompt, max_provider_tokens);
+        let prompt = controlled_live_prompt(spec.id, prompt, provider_token_telemetry_limit);
         let admission = actor.post_mutation(
             &format!("/api/sessions/{session_id}/messages"),
             json!({
@@ -1776,53 +1792,33 @@ impl LiveScenarioRunner {
         }
     }
 
-    /// Evaluation timeouts must not leave a real graph running after its
-    /// report has already declared failure. Cancel descendants first, then
-    /// the root through the same revision-checked public command surface used
-    /// by TUI/WebUI. Cleanup receipts stay in the raw trace for audit.
+    /// Evaluation timeouts must not leave a real lineage running after its
+    /// report has declared failure. A Session root may only be terminalized
+    /// through the durable Session cancellation protocol; that owner records
+    /// the Requested/Cancelled receipt and propagates to descendants.
     fn cancel_execution_lineage(
         &self,
         root_execution_id: &str,
         actor: &mut SessionActor<'_>,
         trace: &mut Vec<Value>,
     ) -> Value {
-        let projections =
-            self.execution_lineage_projections(root_execution_id, trace, &mut BTreeMap::new());
-        let mut receipts = Vec::new();
-        let mut succeeded = 0_usize;
-        for projection in projections.into_iter().rev() {
-            let Some(execution_id) = projection.get("execution_id").and_then(Value::as_str) else {
-                continue;
-            };
-            let Some(revision) = projection.get("revision").and_then(Value::as_u64) else {
-                continue;
-            };
-            let path = format!("/api/runtime/executions/{execution_id}/commands");
-            let request = json!({
-                "command_id": format!("live-eval-cleanup-{}", uuid::Uuid::new_v4()),
-                "expected_revision": revision,
-                "command": "cancel",
-                "payload": {"reason": "isolated live evaluation timed out; canceling owned execution"},
-            });
-            let response = actor.post_control_mutation(&path, request);
-            succeeded = succeeded.saturating_add(usize::from(response.is_ok()));
-            trace.extend(actor.drain_trace());
-            receipts.push(json!({
-                "execution_id": execution_id,
-                "expected_revision": revision,
-                "response": response,
-            }));
-        }
-        let attempted = receipts.len();
-        let failed = attempted.saturating_sub(succeeded);
-        let complete = attempted > 0 && failed == 0;
+        let path = format!("/api/sessions/{}/cancel", actor.session_id());
+        let response = actor.post_mutation(
+            &path,
+            json!({
+                "reason": "isolated live evaluation timed out; cancelling owned Session lineage",
+                "expected_execution_id": root_execution_id,
+            }),
+        );
+        trace.extend(actor.drain_trace());
+        let complete = response.is_ok();
         json!({
             "status": if complete { "passed" } else { "failed" },
-            "attempted": attempted,
-            "succeeded": succeeded,
-            "failed": failed,
-            "reason": (attempted == 0).then_some("owned execution lineage was not observable for cancellation"),
-            "receipts": receipts,
+            "attempted": 1,
+            "succeeded": usize::from(complete),
+            "failed": usize::from(!complete),
+            "reason": (!complete).then_some("durable Session cancellation was rejected"),
+            "receipt": response,
         })
     }
 
@@ -1899,7 +1895,9 @@ fn aggregate_scenario_metrics(scenarios: &[Value]) -> Value {
         "warm_cache_read_input_tokens": total("warm_cache_read_input_tokens"),
         "cache_cold_leader_count": total("cache_cold_leader_count"),
         "cache_waiter_count": total("cache_waiter_count"),
+        "provider_attempt_count": total("provider_attempt_count"),
         "provider_attempt_usage_unknown_count": total("provider_attempt_usage_unknown_count"),
+        "provider_attempt_cache_dimensions_unknown_count": total("provider_attempt_cache_dimensions_unknown_count"),
         "cache_tokens": total("cache_tokens"),
         "total_tokens": total("total_tokens"),
         "model_rounds": total("model_rounds"),
@@ -2094,6 +2092,10 @@ fn scenario_metrics(
                 json!(provider_attempts.usage_unknown_count),
             ),
             (
+                "provider_attempt_cache_dimensions_unknown_count".to_string(),
+                json!(provider_attempts.cache_dimensions_unknown_count),
+            ),
+            (
                 "provider_cache_identity_count".to_string(),
                 json!(provider_attempts.cache_identities.len()),
             ),
@@ -2172,6 +2174,7 @@ struct ProviderAttemptMetrics {
     usage: ScenarioTokenUsage,
     attempt_count: u64,
     usage_unknown_count: u64,
+    cache_dimensions_unknown_count: u64,
     cache_identities: BTreeSet<String>,
     cold_leaders: u64,
     waiters: u64,
@@ -2221,14 +2224,37 @@ fn provider_attempt_metrics(timeline: &Value) -> ProviderAttemptMetrics {
     let mut outcomes = BTreeMap::<String, Value>::new();
     collect_provider_attempt_events(timeline, &mut packed, &mut outcomes);
     let mut metrics = ProviderAttemptMetrics::default();
-    metrics.attempt_count = outcomes.len() as u64;
+    metrics.attempt_count = packed
+        .keys()
+        .chain(outcomes.keys())
+        .collect::<BTreeSet<_>>()
+        .len() as u64;
+    // A request packed onto the wire is a physical Provider attempt even if
+    // the process or transport disappeared before a terminal outcome could
+    // be committed. Count that attempt as usage-unknown; silently dropping it
+    // understates both cost risk and cache evidence completeness.
+    metrics.usage_unknown_count = packed
+        .keys()
+        .filter(|request_id| !outcomes.contains_key(*request_id))
+        .count() as u64;
+    metrics.cache_dimensions_unknown_count = metrics.usage_unknown_count;
     for (request_id, outcome) in outcomes {
         let usage = outcome.get("usage").unwrap_or(&Value::Null);
         let usage_known = outcome.get("usage_status").and_then(Value::as_str) == Some("known")
             && usage.is_object();
         if !usage_known {
             metrics.usage_unknown_count = metrics.usage_unknown_count.saturating_add(1);
+            metrics.cache_dimensions_unknown_count =
+                metrics.cache_dimensions_unknown_count.saturating_add(1);
             continue;
+        }
+        if outcome
+            .get("cache_dimensions_status")
+            .and_then(Value::as_str)
+            != Some("known")
+        {
+            metrics.cache_dimensions_unknown_count =
+                metrics.cache_dimensions_unknown_count.saturating_add(1);
         }
         metrics.usage.input_tokens = metrics
             .usage
@@ -2385,25 +2411,35 @@ fn execution_graph_usage_metrics(projections: &[Value]) -> ScenarioTokenUsage {
                 .then(|| value_u64(node_usage, &["output_tokens"]))
                 .unwrap_or_default();
             let cache_read_input_tokens = (kind == "inline_model")
-                .then(|| value_u64(node_usage, &["cached_tokens"]))
+                .then(|| value_u64(node_usage, &["cache_read_input_tokens"]))
+                .unwrap_or_default();
+            let cache_creation_input_tokens = (kind == "inline_model")
+                .then(|| value_u64(node_usage, &["cache_creation_input_tokens"]))
                 .unwrap_or_default();
             let tool_calls = (kind == "tool_batch")
                 .then(|| value_u64(node_usage, &["tool_calls"]))
                 .unwrap_or_default();
             if input_tokens > 0
                 || output_tokens > 0
+                || cache_creation_input_tokens > 0
                 || cache_read_input_tokens > 0
                 || tool_calls > 0
             {
                 usage.record_count = usage.record_count.saturating_add(1);
             }
             if kind == "inline_model"
-                && (input_tokens > 0 || output_tokens > 0 || cache_read_input_tokens > 0)
+                && (input_tokens > 0
+                    || output_tokens > 0
+                    || cache_creation_input_tokens > 0
+                    || cache_read_input_tokens > 0)
             {
                 usage.provider_usage_records = usage.provider_usage_records.saturating_add(1);
             }
             usage.input_tokens = usage.input_tokens.saturating_add(input_tokens);
             usage.output_tokens = usage.output_tokens.saturating_add(output_tokens);
+            usage.cache_creation_input_tokens = usage
+                .cache_creation_input_tokens
+                .saturating_add(cache_creation_input_tokens);
             usage.cache_read_input_tokens = usage
                 .cache_read_input_tokens
                 .saturating_add(cache_read_input_tokens);
@@ -3454,7 +3490,7 @@ fn active_agentic_tasks(
     program
         .tasks
         .values()
-        .filter(|task| task.status != runtime::AgenticTaskStatus::Superseded)
+        .filter(|task| !task.status.is_retired())
 }
 
 #[derive(Default)]
@@ -3676,6 +3712,8 @@ fn projected_team_health(program: &runtime::AgenticProgramProjection) -> Project
             | runtime::AgenticTaskStatus::Claimed
             | runtime::AgenticTaskStatus::Submitted
             | runtime::AgenticTaskStatus::Rework
+            | runtime::AgenticTaskStatus::CancelRequested
+            | runtime::AgenticTaskStatus::Withdrawn
             | runtime::AgenticTaskStatus::Superseded => {}
         }
     }
@@ -3691,7 +3729,7 @@ fn projected_team_health(program: &runtime::AgenticProgramProjection) -> Project
                 .task_ids
                 .iter()
                 .filter_map(|task_id| program.tasks.get(task_id))
-                .filter(|task| task.status != runtime::AgenticTaskStatus::Superseded)
+                .filter(|task| !task.status.is_retired())
                 .collect::<Vec<_>>();
             !tasks.is_empty()
                 && tasks

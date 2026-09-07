@@ -1227,9 +1227,15 @@
                 harness_contract::task::TaskSpec::new("test conversation turn"),
             )
             .expect("bind canonical test Task policy");
-        services
-            .task_runtime_port()
-            .create(harness_contract::task::TaskCreateCommand {
+        if services
+            .task_aggregate_service()
+            .get(&lineage.task_id)
+            .expect("canonical test Task lookup")
+            .is_none()
+        {
+            services
+                .task_runtime_port()
+                .create(harness_contract::task::TaskCreateCommand {
                 task_id: lineage.task_id.clone(),
                 mission_id: services.mission_runtime().default_mission_id().to_string(),
                 kind: harness_contract::task::TaskKind::Root,
@@ -1246,8 +1252,9 @@
                     "test_input",
                     "host-test",
                 )],
-            })
-            .expect("canonical test Task");
+                })
+                .expect("canonical test Task");
+        }
         let registry = Arc::new(
             crate::ProviderRegistry::new(crate::config::ProvidersConfig {
                 providers: HashMap::from([(
@@ -2559,7 +2566,7 @@
         let services = crate::RuntimeServices::in_memory().expect("runtime services");
         let attempts = Arc::new(AtomicUsize::new(0));
         let session_store =
-            Arc::new(session::UnifiedSessionStore::open_in_memory().expect("session store"));
+            Arc::new(crate::test_support::session_store());
         let session = Session::new();
         session_store
             .create_session(&session::SessionRecord {

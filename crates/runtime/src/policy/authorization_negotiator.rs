@@ -1897,7 +1897,7 @@ mod tests {
 
     #[test]
     fn durable_controlled_recovery_restores_until_graph_terminal_and_then_acks_exactly() {
-        let store = crate::RuntimeEventStore::try_open_in_memory().expect("event store");
+        let store = crate::RuntimeEventStore::for_test();
         let negotiator = AuthorizationNegotiator::new();
         let assessment = negotiator.assess(
             &PermissionPolicy::new(PermissionMode::ReadOnly),
@@ -2004,7 +2004,7 @@ mod tests {
 
     #[test]
     fn sibling_executions_in_one_turn_commit_distinct_recovery_terminals() {
-        let store = crate::RuntimeEventStore::try_open_in_memory().expect("event store");
+        let store = crate::RuntimeEventStore::for_test();
         let terminal = |execution_id: &str| ControlledRecoveryTerminalRecord {
             recovery_scope: "turn:shared-turn".to_string(),
             session_id: "shared-session".to_string(),
@@ -2096,7 +2096,7 @@ mod tests {
 
     #[test]
     fn durable_ack_releases_terminal_lease_but_preserves_exact_history() {
-        let store = crate::RuntimeEventStore::try_open_in_memory().expect("event store");
+        let store = crate::RuntimeEventStore::for_test();
         let negotiator = AuthorizationNegotiator::new();
         let assessment = negotiator.assess(
             &PermissionPolicy::new(PermissionMode::WorkspaceWrite),

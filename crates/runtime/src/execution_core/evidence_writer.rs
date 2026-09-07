@@ -333,7 +333,7 @@ mod tests {
 
     #[test]
     fn shutdown_drains_priority_and_coalesces_waiting_observations() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("event store"));
+        let store = Arc::new(RuntimeEventStore::for_test());
         let writer = ResourceEvidenceWriter::start(Arc::clone(&store));
         let waiting_id = Uuid::new_v4();
         writer.try_publish(&observation(
@@ -373,7 +373,7 @@ mod tests {
 
     #[test]
     fn bounded_priority_drain_leaves_a_fair_slot_for_coalesced_updates() {
-        let store = RuntimeEventStore::try_open_in_memory().expect("event store");
+        let store = RuntimeEventStore::for_test();
         let (sender, receiver) = mpsc::sync_channel(PRIORITY_DRAIN_BATCH + 1);
         let published = AtomicU64::new(0);
         let failures = AtomicU64::new(0);

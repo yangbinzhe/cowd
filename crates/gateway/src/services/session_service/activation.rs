@@ -124,8 +124,13 @@ pub(crate) struct SessionRecoverySummary {
     pub(crate) metadata_only: usize,
     pub(crate) model_rebind_required: usize,
     pub(crate) failed: usize,
+    pub(crate) global_failures: usize,
     pub(crate) hot_bytes: u64,
     pub(crate) failures: Vec<String>,
+    /// Session-scoped failures that can be quarantined while independent
+    /// Sessions recover. A failure without an id is global and must fence the
+    /// whole restoration pass.
+    pub(crate) failed_session_ids: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -779,38 +784,11 @@ impl SessionActivationCoordinator {
         if self.runtime.has_active_session(session_id) {
             self.resource_lifecycle.register(session_id).await;
             self.resource_lifecycle.mark_active(session_id).await;
-            let mut record = match existing {
-                Some(record) => record,
-                None => {
-                    let record = self.persist_new_record(&request).await?;
-                    if let Err(error) = self.presence_ledger.mark_active(session_id).await {
-                        return Err(self
-                            .rollback_created_session(&record, error.to_string())
-                            .await);
-                    }
-                    record
-                }
-            };
-            let manifest = self
-                .repository
-                .stored_recovery_manifest(session_id)
-                .await
-                .map_err(|error| error.to_string())?
-                .unwrap_or_else(|| manifest_from_record(&record));
-            self.register_manifest_metadata(&manifest, []).await;
-            let actual_bytes = self
-                .actual_hydration_bytes(session_id, manifest.transcript_bytes)
-                .await;
-            if let Err(error) = self
-                .finish_hydration(session_id, actual_bytes, Ok(()))
-                .await
-            {
-                self.runtime
-                    .remove_active_runtime_if_present(session_id)
-                    .await;
-                self.resource_lifecycle.unregister(session_id).await;
-                return Err(error);
-            }
+            let mut record = existing.ok_or_else(|| {
+                format!(
+                    "session {session_id} has a hot Runtime carrier but no durable Session record"
+                )
+            })?;
             let explicit_model = request
                 .model
                 .as_deref()
@@ -1113,6 +1091,7 @@ impl SessionActivationCoordinator {
                 Ok(None) => break,
                 Err(error) => {
                     summary.failed += 1;
+                    summary.global_failures += 1;
                     summary.failures.push(error.to_string());
                     break;
                 }
@@ -1167,6 +1146,7 @@ impl SessionActivationCoordinator {
                     Ok(None) => {}
                     Err(error) => {
                         summary.failed += 1;
+                        summary.global_failures += 1;
                         summary.failures.push(format!(
                             "failed to recover derived Session manifests: {error}"
                         ));
@@ -1188,6 +1168,7 @@ impl SessionActivationCoordinator {
             Ok(None) => BTreeMap::new(),
             Err(error) => {
                 summary.failed += 1;
+                summary.global_failures += 1;
                 summary.failures.push(format!(
                     "failed to batch-load Session recovery metadata: {error}"
                 ));
@@ -1200,6 +1181,9 @@ impl SessionActivationCoordinator {
                 Some(record) => record,
                 None => {
                     summary.failed += 1;
+                    summary
+                        .failed_session_ids
+                        .insert(manifest.session_id.clone());
                     summary.failures.push(format!(
                         "{}: recovery manifest has no Session record",
                         manifest.session_id
@@ -1231,6 +1215,9 @@ impl SessionActivationCoordinator {
                     Ok(None) => {}
                     Err(error) => {
                         summary.failed += 1;
+                        summary
+                            .failed_session_ids
+                            .insert(manifest.session_id.clone());
                         summary.failures.push(format!(
                             "{}: failed to reconcile approval manifest: {error}",
                             manifest.session_id
@@ -1254,6 +1241,9 @@ impl SessionActivationCoordinator {
                     Ok(None) => {}
                     Err(error) => {
                         summary.failed += 1;
+                        summary
+                            .failed_session_ids
+                            .insert(manifest.session_id.clone());
                         summary.failures.push(format!(
                             "{}: failed to reconcile continuation manifest: {error}",
                             manifest.session_id
@@ -1377,6 +1367,7 @@ impl SessionActivationCoordinator {
                 Ok(_) => summary.recovered += 1,
                 Err(error) => {
                     summary.failed += 1;
+                    summary.failed_session_ids.insert(session_id.clone());
                     summary.failures.push(format!("{session_id}: {error}"));
                 }
             }
@@ -1554,7 +1545,7 @@ mod tests {
         Arc<ActiveSessionDirectory>,
         Arc<SessionWorkingSetManager>,
     ) {
-        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::pg_test_support::session_store());
         let active = Arc::new(ActiveSessionDirectory::with_max_sessions(
             runtime_max_active_sessions,
         ));
@@ -2437,7 +2428,14 @@ mod tests {
             .iter()
             .find(|entry| entry.session_id == "session-attached")
             .unwrap();
-        assert!(attached.pin_reasons.contains("writer_or_attachment"));
+        assert!(
+            attached.pin_reasons.contains("writer_or_attachment"),
+            "attached working-set entry: {attached:?}; durable manifest: {:?}",
+            store
+                .get_session_recovery_manifest("session-attached")
+                .await
+                .unwrap()
+        );
         let mission = projection
             .entries
             .iter()

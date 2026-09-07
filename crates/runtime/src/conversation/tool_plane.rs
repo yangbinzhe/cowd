@@ -307,7 +307,11 @@ where
             output_tokens,
             cache_create_tokens: u64::from(usage.cache_creation_input_tokens),
             cache_read_tokens: u64::from(usage.cache_read_input_tokens),
-            total_tokens: input_tokens.saturating_add(output_tokens),
+            cache_dimensions_known: self.turn_cache_dimensions_known(),
+            total_tokens: input_tokens
+                .saturating_add(output_tokens)
+                .saturating_add(u64::from(usage.cache_creation_input_tokens))
+                .saturating_add(u64::from(usage.cache_read_input_tokens)),
             usage_source: "provider".to_string(),
             wall_chars_per_second: rate_per_second(
                 final_answer.chars().count() as u64,
@@ -1474,10 +1478,6 @@ where
                 "risk": format!("{:?}", trace.execution_decision.strategy.understanding.risk),
                 "modifiers": trace.execution_decision.strategy.modifiers.iter().map(|item| item.as_str()).collect::<Vec<_>>(),
             },
-            "collaboration": {
-                "template_id": trace.collaboration_decision.template_id.as_str(),
-                "rationale": trace.collaboration_decision.rationale,
-            },
             "context": {
                 "epoch_id": trace.context_epoch.epoch_id,
                 "envelope_id": trace.context_envelope_id,
@@ -1537,22 +1537,7 @@ where
                 },
                 "eval_checks": trace.behavior_policy.eval_checks,
             },
-            "execution_graph": trace.execution_graph.as_ref().map(|graph| serde_json::json!({
-                "id": graph.id,
-                "node_count": graph.nodes.len(),
-                "edge_count": graph.edges.len(),
-            })),
-            "execution_graph_quality": trace.execution_graph_quality.as_ref().map(|quality| serde_json::json!({
-                "node_count": quality.node_count,
-                "edge_count": quality.edge_count,
-                "ready_count": quality.ready_count,
-                "blocked_count": quality.blocked_count,
-                "failed_count": quality.failed_count,
-                "has_verify_node": quality.has_verify_node,
-                "has_synthesize_node": quality.has_synthesize_node,
-                "is_dag": quality.is_dag,
-                "warnings": quality.warnings,
-            })),
+            "execution_graph_ref": trace.execution_decision.execution_graph_ref,
             "bench": {
                 "passed": trace.bench_result.passed,
                 "score": trace.bench_result.score,

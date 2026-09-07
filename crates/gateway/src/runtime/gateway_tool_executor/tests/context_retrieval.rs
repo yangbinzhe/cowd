@@ -63,9 +63,8 @@
         let workspace = temp.path().join("workspace");
         std::fs::create_dir_all(&workspace).expect("workspace");
         let manager = Arc::new(
-            memory::CognitiveContextManager::new(memory::MemoryConfig {
+            crate::pg_test_support::memory_manager(memory::MemoryConfig {
                 store: memory::config::StoreConfig {
-                    sqlite_path: temp.path().join("memory.sqlite"),
                     blob_dir: temp.path().join("blobs"),
                     enable_vector_index: false,
                     ..Default::default()
@@ -173,6 +172,11 @@
         );
         let services = runtime::RuntimeServices::builder(temp.path().join("home"), &workspace)
             .memory_manager(Arc::clone(&manager))
+            .runtime_event_store(Arc::new(runtime::RuntimeEventStore::for_test()))
+            .task_aggregate_service(Arc::new(runtime::TaskAggregateService::for_test()))
+            .artifact_store(Arc::new(runtime::ArtifactStore::for_test_default(
+                temp.path().join("artifacts"),
+            )))
             .build()
             .expect("runtime services");
         let registry = GatewayToolRegistry::builtin()
@@ -247,7 +251,7 @@
         let workspace = temp.path().join("workspace");
         std::fs::create_dir_all(&workspace).expect("workspace");
         let store =
-            Arc::new(session::UnifiedSessionStore::open_in_memory().expect("session store"));
+            Arc::new(crate::pg_test_support::session_store());
         let now = chrono::Utc::now().to_rfc3339();
         for session_id in [
             "session-current",
@@ -323,6 +327,11 @@
                 repository, presence,
             );
         let services = runtime::RuntimeServices::builder(temp.path().join("home"), &workspace)
+            .runtime_event_store(Arc::new(runtime::RuntimeEventStore::for_test()))
+            .task_aggregate_service(Arc::new(runtime::TaskAggregateService::for_test()))
+            .artifact_store(Arc::new(runtime::ArtifactStore::for_test_default(
+                temp.path().join("artifacts"),
+            )))
             .build()
             .expect("runtime services");
         services
@@ -443,4 +452,3 @@
             .expect_err("other actor Session must remain hidden");
         assert!(denied.to_string().contains("outside"));
     }
-

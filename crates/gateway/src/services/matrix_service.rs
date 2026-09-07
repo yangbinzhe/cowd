@@ -62,15 +62,13 @@ impl MatrixService {
         &self,
         config_home: impl AsRef<Path>,
     ) -> Result<serde_json::Value, GatewayMatrixRepositoryError> {
-        let fallback;
         let endpoint = if let Some(endpoint) = self.selected_endpoint.as_ref() {
             endpoint
         } else {
-            fallback = storage::StorageRegistry::default_for_config_home(config_home)
-                .endpoint(&storage::StorageDomainId::Matrix)
-                .cloned()
-                .map_err(|error| GatewayMatrixRepositoryError::Backend(error.to_string()))?;
-            &fallback
+            let _ = config_home.as_ref();
+            return Err(GatewayMatrixRepositoryError::Backend(
+                "MatrixService requires the process-selected PostgreSQL endpoint".to_string(),
+            ));
         };
         Ok(serde_json::json!({
             "logical_id": endpoint.logical_id(),
@@ -984,7 +982,15 @@ mod tests {
         let config_home =
             std::env::temp_dir().join(format!("cowd-source-record-batch-{}", uuid::Uuid::new_v4()));
         let workspace_root = config_home.join("workspace");
-        let service = MatrixService::new();
+        let service = MatrixService::with_store(
+            crate::pg_test_support::matrix_store(),
+            storage::StorageEndpoint::postgres(
+                storage::StorageDomainId::Matrix,
+                storage::StorageScope::Global,
+                "gateway-test",
+                "postgres-test-schema",
+            ),
+        );
         let batch = SourceRecordBatch {
             adapter_id: "csv".to_string(),
             resource_ref: "file:///tmp/orders.csv".to_string(),

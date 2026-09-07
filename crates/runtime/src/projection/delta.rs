@@ -183,9 +183,6 @@ fn materialize_delta_operations(
             service_class: graph.service_class,
             parent_execution: graph.parent_execution.clone(),
         });
-        operations.push(ProjectionOperation::ReplaceGraphOrchestration {
-            orchestration: graph.orchestration.clone(),
-        });
         if topology_changed {
             operations.push(ProjectionOperation::ReplaceGraphTopology {
                 node_ids: graph
@@ -247,6 +244,9 @@ fn materialize_delta_operations(
     if graph_changed || !events.is_empty() {
         operations.push(ProjectionOperation::ReplaceConcurrency {
             concurrency: super::snapshot::execution_concurrency(services, graph, scope),
+        });
+        operations.push(ProjectionOperation::ReplaceAgenticCollaboration {
+            collaboration: scope.agentic_collaboration.clone(),
         });
         if topology_changed || descendant_changed {
             let (activities, relations) =

@@ -9,7 +9,6 @@ use std::{
     io::Read,
     path::{Component, Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use fact_kernel::FactLedger;
@@ -25,10 +24,8 @@ use surface::SurfaceMessageLedger;
 
 #[derive(Clone)]
 pub(crate) struct SelectedStorageTopology {
-    pub(crate) backend: runtime::StorageBackendSelection,
-    pub(crate) fallback_reason: Option<String>,
     pub(crate) registry: StorageRegistry,
-    pub(crate) postgres_executor: Option<PostgresExecutor>,
+    pub(crate) postgres_executor: PostgresExecutor,
     pub(crate) session_store: Arc<UnifiedSessionStore>,
     pub(crate) memory_store: Arc<dyn MemoryStore>,
     pub(crate) memory_maintenance_queue: memory::MaintenanceQueue,
@@ -42,6 +39,73 @@ pub(crate) struct SelectedStorageTopology {
     pub(crate) connector_factory: Arc<dyn connector::ResourceDirectoryFactory>,
     pub(crate) connector_handle: storage::StorageHandle,
     pub(crate) artifact_store: Arc<runtime::ArtifactStore>,
+    #[cfg(test)]
+    test_namespace: Option<Arc<TestPostgresNamespace>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct TestPostgresNamespace {
+    executor: PostgresExecutor,
+    name: String,
+    _permit: TestPostgresFixturePermit,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct TestPostgresFixturePermit;
+
+#[cfg(test)]
+fn acquire_test_postgres_fixture_permit() -> TestPostgresFixturePermit {
+    let (active, available) = test_postgres_fixture_capacity();
+    let mut active = active
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while *active >= 8 {
+        active = available
+            .wait(active)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    *active += 1;
+    TestPostgresFixturePermit
+}
+
+#[cfg(test)]
+impl Drop for TestPostgresFixturePermit {
+    fn drop(&mut self) {
+        let (active, available) = test_postgres_fixture_capacity();
+        let mut active = active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *active = active.saturating_sub(1);
+        available.notify_one();
+    }
+}
+
+#[cfg(test)]
+fn test_postgres_fixture_capacity() -> &'static (std::sync::Mutex<usize>, std::sync::Condvar) {
+    static CAPACITY: std::sync::OnceLock<(std::sync::Mutex<usize>, std::sync::Condvar)> =
+        std::sync::OnceLock::new();
+    CAPACITY.get_or_init(|| (std::sync::Mutex::new(0), std::sync::Condvar::new()))
+}
+
+#[cfg(test)]
+impl Drop for TestPostgresNamespace {
+    fn drop(&mut self) {
+        // `name` is generated below and validated by `scoped_namespace`; it is
+        // never caller-controlled. Cleanup is deliberately limited to this
+        // fixture-owned schema and can therefore not touch public/user data.
+        let statement = format!("DROP SCHEMA IF EXISTS \"{}\" CASCADE", self.name);
+        if let Ok(mut connection) = self.executor.checkout_critical() {
+            if let Err(error) = connection.batch_execute(&statement) {
+                tracing::warn!(
+                    schema = %self.name,
+                    %error,
+                    "failed to remove isolated PostgreSQL test namespace"
+                );
+            }
+        }
+    }
 }
 
 impl SelectedStorageTopology {
@@ -61,6 +125,74 @@ impl SelectedStorageTopology {
         Self::compose(config, false, config_home, workspace_root)
     }
 
+    /// Build the complete production topology inside a fixture-owned schema.
+    ///
+    /// Database-dependent tests intentionally fail when the required URL is
+    /// absent. This prevents `cargo test` from silently proving a different
+    /// SQLite architecture than the one shipped by Gateway.
+    #[cfg(test)]
+    pub(crate) fn compose_for_test(
+        config_home: &Path,
+        workspace_root: &Path,
+    ) -> Result<Self, String> {
+        let permit = acquire_test_postgres_fixture_permit();
+        let mut postgres = runtime::PostgresTopologyConfig::default();
+        postgres.logical_identity = format!("cowd-test-{}", std::process::id());
+        postgres.secret_ref = "env:COWD_TEST_POSTGRES_URL".to_string();
+        // All isolated schemas share one bounded process pool. Domain work
+        // still retains separate workload lanes while schema count does not
+        // multiply server connections.
+        postgres.max_connections = 24;
+        postgres.server_reserve = 4;
+        postgres.critical.max_connections = Some(8);
+        postgres.online_read.max_connections = Some(12);
+        postgres.background.max_connections = Some(4);
+        postgres.critical.min_idle_connections = None;
+        postgres.online_read.min_idle_connections = None;
+        postgres.background.min_idle_connections = None;
+        let config = runtime::StorageTopologyConfig {
+            backend: runtime::StorageBackendSelection::Postgres,
+            postgres: Some(postgres),
+            session_execution: runtime::SessionStorageExecutionConfig {
+                workers: 1,
+                queue_capacity: 64,
+            },
+            ..runtime::StorageTopologyConfig::default()
+        };
+        let registry = base_registry(config_home, workspace_root)?;
+        let executor = shared_test_postgres_executor(
+            config.postgres.as_ref().expect("test PostgreSQL config"),
+            config_home,
+        )?;
+        let name = format!(
+            "cowdtest_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        );
+        executor
+            .checkout_critical()
+            .map_err(stringify)?
+            .batch_execute(&format!("CREATE SCHEMA \"{name}\""))
+            .map_err(stringify)?;
+        let scoped = executor.scoped_namespace(&name).map_err(stringify)?;
+        let guard = Arc::new(TestPostgresNamespace {
+            executor,
+            name,
+            _permit: permit,
+        });
+        let result = Self::postgres(registry, scoped, config.session_execution, config.artifacts);
+        match result {
+            Ok(mut topology) => {
+                topology.test_namespace = Some(guard);
+                topology.verify_runtime_readiness()
+            }
+            Err(error) => {
+                drop(guard);
+                Err(error)
+            }
+        }
+    }
+
     fn compose(
         config: &runtime::StorageTopologyConfig,
         runtime_mode: bool,
@@ -68,39 +200,8 @@ impl SelectedStorageTopology {
         workspace_root: &Path,
     ) -> Result<Self, String> {
         let registry = base_registry(config_home, workspace_root)?;
-        match config.backend {
-            runtime::StorageBackendSelection::Sqlite => {
-                Self::sqlite(registry, config.session_execution, config.artifacts)
-            }
-            runtime::StorageBackendSelection::Postgres => {
-                Self::compose_postgres(config, runtime_mode, config_home, registry)
-            }
-            runtime::StorageBackendSelection::Auto => {
-                // Maintenance/cutover mode stays deterministic: PostgreSQL only.
-                if !runtime_mode {
-                    return Self::compose_postgres(config, runtime_mode, config_home, registry);
-                }
-                let fallback_reason = match config.postgres.as_ref() {
-                    Some(_) => {
-                        match Self::compose_postgres(
-                            config,
-                            runtime_mode,
-                            config_home,
-                            registry.clone(),
-                        ) {
-                            Ok(topology) => return Ok(topology),
-                            Err(error) => error,
-                        }
-                    }
-                    None => "storage.postgres is not configured; backend=auto fallback to sqlite"
-                        .to_string(),
-                };
-                let topology = Self::sqlite(registry, config.session_execution, config.artifacts)?
-                    .with_fallback(fallback_reason.clone());
-                write_fallback_marker(config_home, &fallback_reason);
-                Ok(topology)
-            }
-        }
+        let _ = config.backend;
+        Self::compose_postgres(config, runtime_mode, config_home, registry)
     }
 
     fn compose_postgres(
@@ -127,110 +228,12 @@ impl SelectedStorageTopology {
             .verify_runtime_readiness()
     }
 
-    fn sqlite(
-        registry: StorageRegistry,
-        session_execution: runtime::SessionStorageExecutionConfig,
-        artifacts: runtime::ArtifactStorageConfig,
-    ) -> Result<Self, String> {
-        registry.ensure_directories().map_err(stringify)?;
-        let session_endpoint = endpoint(&registry, &StorageDomainId::Session, None)?;
-        let memory_endpoint = endpoint(&registry, &StorageDomainId::Memory, None)?;
-        let knowledge_endpoint = endpoint(&registry, &StorageDomainId::Knowledge, None)?;
-        let fact_endpoint = endpoint(&registry, &StorageDomainId::Fact, None)?;
-        let growth_endpoint = endpoint(&registry, &StorageDomainId::Growth, None)?;
-        let matrix_endpoint = endpoint(&registry, &StorageDomainId::Matrix, None)?;
-        let surface_endpoint = endpoint(&registry, &StorageDomainId::SurfaceMessages, None)?;
-        let workspace_scope = workspace_scope(&registry)?;
-        let task_endpoint = endpoint(&registry, &StorageDomainId::Tasks, Some(&workspace_scope))?;
-        let runtime_endpoint = endpoint(
-            &registry,
-            &StorageDomainId::RuntimeEvents,
-            Some(&workspace_scope),
-        )?;
-        let connector_endpoint = endpoint(
-            &registry,
-            &StorageDomainId::ConnectorDirectory,
-            Some(&workspace_scope),
-        )?;
-        let blob_endpoint = endpoint(&registry, &StorageDomainId::Blobs, None)?;
-        let artifact_store = Arc::new(
-            runtime::ArtifactStore::sqlite(blob_endpoint.path, artifacts.into())
-                .map_err(|error| error.to_string())?,
-        );
-
-        let session_store = Arc::new(
-            UnifiedSessionStore::open_sqlite_storage_handle_with_execution_config(
-                &session_endpoint.as_handle(),
-                session::StorageExecutionPlaneConfig {
-                    workers: session_execution.workers,
-                    queue_capacity: session_execution.queue_capacity,
-                },
-            )
-            .map_err(stringify)?,
-        );
-        let memory_store: Arc<dyn MemoryStore> = Arc::new(
-            memory::store::sqlite::SqliteStore::open_storage_handle(&memory_endpoint.as_handle())
-                .map_err(stringify)?,
-        );
-        let memory_maintenance_queue =
-            memory::MaintenanceQueue::open_sqlite(&memory_endpoint.path).map_err(stringify)?;
-        let knowledge_store: Arc<dyn KnowledgeStore> = Arc::new(
-            memory::SqliteKnowledgeStore::open(&knowledge_endpoint.path).map_err(stringify)?,
-        );
-        let knowledge_fabric = KnowledgeFabric::with_store(Arc::clone(&knowledge_store));
-        let runtime_event_store = Arc::new(
-            runtime::RuntimeEventStore::try_open(&runtime_endpoint.path).map_err(stringify)?,
-        );
-        let task_service = Arc::new(
-            runtime::TaskAggregateService::open_storage_handle(&task_endpoint.as_handle())
-                .map_err(stringify)?,
-        );
-        let fact_ledger: Arc<dyn FactLedger> = Arc::new(
-            fact_sqlite::SqliteFactLedger::open_with_legacy_growth(
-                &fact_endpoint,
-                &growth_endpoint,
-            )
-            .map_err(stringify)?,
-        );
-        let matrix_store = matrix_repository::MatrixStoreHandle::new(matrix_endpoint.clone())
-            .open()
-            .map_err(stringify)?;
-        let surface_messages: Arc<dyn SurfaceMessageLedger> = Arc::new(
-            crate::surface_host::SqliteSurfaceMessageStore::from_storage_endpoint(
-                &surface_endpoint,
-            )?,
-        );
-        let connector_factory: Arc<dyn connector::ResourceDirectoryFactory> =
-            Arc::new(connector::SqliteResourceDirectoryFactory);
-
-        Ok(Self {
-            backend: runtime::StorageBackendSelection::Sqlite,
-            fallback_reason: None,
-            registry,
-            postgres_executor: None,
-            session_store,
-            memory_store,
-            memory_maintenance_queue,
-            knowledge_store,
-            knowledge_fabric,
-            runtime_event_store,
-            task_service,
-            fact_ledger,
-            matrix_store,
-            surface_messages,
-            connector_factory,
-            connector_handle: connector_endpoint.as_handle(),
-            artifact_store,
-        })
-    }
-
     fn postgres(
-        mut registry: StorageRegistry,
+        registry: StorageRegistry,
         executor: PostgresExecutor,
         session_execution: runtime::SessionStorageExecutionConfig,
         artifacts: runtime::ArtifactStorageConfig,
     ) -> Result<Self, String> {
-        replace_business_endpoints_with_postgres(&mut registry)?;
         let workspace_scope = workspace_scope(&registry)?;
         let connector_endpoint = endpoint(
             &registry,
@@ -309,10 +312,8 @@ impl SelectedStorageTopology {
         );
 
         Ok(Self {
-            backend: runtime::StorageBackendSelection::Postgres,
-            fallback_reason: None,
             registry,
-            postgres_executor: Some(executor.clone()),
+            postgres_executor: executor.clone(),
             session_store,
             memory_store,
             memory_maintenance_queue,
@@ -326,47 +327,48 @@ impl SelectedStorageTopology {
             connector_factory,
             connector_handle: connector_endpoint.as_handle(),
             artifact_store,
+            #[cfg(test)]
+            test_namespace: None,
         })
     }
 
     #[must_use]
     pub(crate) const fn backend_label(&self) -> &'static str {
-        match self.backend {
-            runtime::StorageBackendSelection::Sqlite => "sqlite",
-            runtime::StorageBackendSelection::Postgres => "postgres",
-            runtime::StorageBackendSelection::Auto => "postgres",
-        }
+        "postgres"
     }
 
     pub(crate) fn health_projection(&self) -> serde_json::Value {
         serde_json::json!({
             "backend": self.backend_label(),
             "effective_backend": self.backend_label(),
-            "fallback_reason": self.fallback_reason,
             "endpoint_count": self.registry.endpoints.len(),
-            "postgres": self.postgres_executor.as_ref().map(PostgresExecutor::health),
+            "postgres": self.postgres_executor.health(),
         })
     }
 
-    fn with_fallback(mut self, reason: String) -> Self {
-        self.fallback_reason = Some(reason);
-        self
-    }
-
     fn verify_runtime_readiness(self) -> Result<Self, String> {
-        if let Some(executor) = &self.postgres_executor {
-            executor
-                .verify_registered_migration_catalogs()
-                .map_err(stringify)?;
-        }
+        self.postgres_executor
+            .verify_registered_migration_catalogs()
+            .map_err(stringify)?;
         Ok(self)
     }
 }
 
+#[cfg(test)]
+fn shared_test_postgres_executor(
+    config: &runtime::PostgresTopologyConfig,
+    config_home: &Path,
+) -> Result<PostgresExecutor, String> {
+    static EXECUTOR: std::sync::OnceLock<Result<PostgresExecutor, String>> =
+        std::sync::OnceLock::new();
+    EXECUTOR
+        .get_or_init(|| connect_postgres(config, PostgresMigrationMode::Maintenance, config_home))
+        .clone()
+}
+
 fn base_registry(config_home: &Path, workspace_root: &Path) -> Result<StorageRegistry, String> {
-    StorageRegistry::default_for_config_home(config_home)
-        .with_workspace(workspace_root)
-        .and_then(StorageRegistry::with_surface_messages)
+    StorageRegistry::postgres_for_config_home(config_home)
+        .with_postgres_workspace(workspace_root)
         .map_err(stringify)
 }
 
@@ -402,51 +404,6 @@ fn workspace_scope(registry: &StorageRegistry) -> Result<StorageScope, String> {
     scopes
         .pop_first()
         .ok_or_else(|| "selected storage has no workspace scope".to_string())
-}
-
-fn replace_business_endpoints_with_postgres(registry: &mut StorageRegistry) -> Result<(), String> {
-    let domains = [
-        StorageDomainId::Session,
-        StorageDomainId::Memory,
-        StorageDomainId::Knowledge,
-        StorageDomainId::Fact,
-        StorageDomainId::Growth,
-        StorageDomainId::Matrix,
-        StorageDomainId::Tasks,
-        StorageDomainId::SurfaceMessages,
-    ];
-    for domain in domains {
-        registry
-            .replace_endpoint(StorageEndpoint::postgres(
-                domain,
-                StorageScope::Global,
-                "cowd-selected-storage",
-                "postgres-selected-since-0.9.581",
-            ))
-            .map_err(stringify)?;
-    }
-    let workspace_scope = workspace_scope(registry)?;
-    for domain in [
-        StorageDomainId::RuntimeEvents,
-        StorageDomainId::ConnectorDirectory,
-    ] {
-        registry
-            .replace_endpoint(StorageEndpoint::postgres(
-                domain,
-                workspace_scope.clone(),
-                "cowd-selected-storage",
-                "postgres-selected-since-0.9.581",
-            ))
-            .map_err(stringify)?;
-    }
-    // The selected topology is an operational inventory, not a catalogue of
-    // historical defaults. PostgreSQL composition injects every live database
-    // adapter above, so retaining unused SQLite endpoints would advertise a
-    // false dual-backend runtime and make health diagnostics probe stale files.
-    registry
-        .endpoints
-        .retain(|endpoint| endpoint.backend != storage::StorageBackendKind::Sqlite);
-    Ok(())
 }
 
 struct ConfigHomeSecretRefResolver {
@@ -611,36 +568,6 @@ fn stringify(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
-fn fallback_marker_path(config_home: &Path) -> PathBuf {
-    config_home.join("storage").join("fallback.json")
-}
-
-pub(crate) fn write_fallback_marker(config_home: &Path, reason: &str) {
-    let path = fallback_marker_path(config_home);
-    let marker = serde_json::json!({
-        "effective_backend": "sqlite",
-        "reason": reason,
-        "at_ms": SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_millis() as u64),
-    });
-    if let Some(parent) = path.parent() {
-        if let Ok(content) = serde_json::to_string_pretty(&marker) {
-            let _ = fs::create_dir_all(parent);
-            let _ = fs::write(&path, content);
-        }
-    }
-}
-
-pub(crate) fn clear_fallback_marker(config_home: &Path) {
-    let _ = fs::remove_file(fallback_marker_path(config_home));
-}
-
-pub(crate) fn read_fallback_marker(config_home: &Path) -> Option<serde_json::Value> {
-    let content = fs::read_to_string(fallback_marker_path(config_home)).ok()?;
-    serde_json::from_str(&content).ok()
-}
-
 fn postgres_session_workers(configured: usize, max_connections: u32) -> usize {
     configured.max(1).min(max_connections.max(1) as usize)
 }
@@ -685,17 +612,18 @@ mod tests {
     }
 
     #[test]
-    fn postgres_registry_contains_no_sqlite_endpoint_after_selection() {
+    fn registry_contains_only_supported_endpoint_kinds_after_selection() {
         let home = tempfile::tempdir().expect("config home");
         let workspace = tempfile::tempdir().expect("workspace");
-        let mut registry = base_registry(home.path(), workspace.path()).expect("base registry");
+        let registry = base_registry(home.path(), workspace.path()).expect("base registry");
 
-        replace_business_endpoints_with_postgres(&mut registry).expect("PostgreSQL endpoints");
-
-        assert!(registry
-            .endpoints
-            .iter()
-            .all(|endpoint| endpoint.backend != storage::StorageBackendKind::Sqlite));
+        assert!(registry.endpoints.iter().all(|endpoint| matches!(
+            endpoint.backend,
+            storage::StorageBackendKind::Postgres
+                | storage::StorageBackendKind::FileJson
+                | storage::StorageBackendKind::Directory
+                | storage::StorageBackendKind::BlobDirectory
+        )));
         assert_eq!(
             registry
                 .endpoint(&StorageDomainId::Tasks)
@@ -703,40 +631,6 @@ mod tests {
                 .backend,
             storage::StorageBackendKind::Postgres
         );
-    }
-
-    #[test]
-    fn sqlite_topology_selects_every_business_domain_once() {
-        let home = tempfile::tempdir().expect("config home");
-        let workspace = tempfile::tempdir().expect("workspace");
-        let topology = SelectedStorageTopology::compose_for_runtime(
-            &runtime::StorageTopologyConfig::default(),
-            home.path(),
-            workspace.path(),
-        )
-        .expect("SQLite topology");
-        assert_eq!(topology.backend_label(), "sqlite");
-        assert!(topology.postgres_executor.is_none());
-        assert_eq!(
-            topology
-                .registry
-                .endpoints
-                .iter()
-                .filter(|endpoint| endpoint.domain == StorageDomainId::Session)
-                .count(),
-            1
-        );
-        let workspace_scope = StorageScope::workspace_for_root(workspace.path());
-        let workspace_tasks = topology
-            .registry
-            .endpoint_in_scope(&StorageDomainId::Tasks, &workspace_scope)
-            .expect("workspace task endpoint");
-        let global_tasks = topology
-            .registry
-            .endpoint(&StorageDomainId::Tasks)
-            .expect("legacy global task endpoint");
-        assert!(workspace_tasks.path.exists());
-        assert!(!global_tasks.path.exists());
     }
 
     #[test]
@@ -826,48 +720,5 @@ mod tests {
             .expect_err("broad permissions must fail")
             .to_string()
             .contains("permissions"));
-    }
-
-    #[test]
-    fn auto_without_postgres_falls_back_to_sqlite_and_records_marker() {
-        let home = tempfile::tempdir().expect("config home");
-        let workspace = tempfile::tempdir().expect("workspace");
-        let topology = SelectedStorageTopology::compose_for_runtime(
-            &runtime::StorageTopologyConfig::default(),
-            home.path(),
-            workspace.path(),
-        )
-        .expect("auto fallback must succeed");
-        assert_eq!(topology.backend_label(), "sqlite");
-        let reason = topology
-            .fallback_reason
-            .as_deref()
-            .expect("fallback reason must be recorded");
-        assert!(reason.contains("not configured"));
-        let marker = read_fallback_marker(home.path()).expect("fallback marker");
-        assert_eq!(marker["effective_backend"], "sqlite");
-    }
-
-    #[test]
-    fn auto_maintenance_mode_requires_postgres() {
-        let home = tempfile::tempdir().expect("config home");
-        let workspace = tempfile::tempdir().expect("workspace");
-        let error = SelectedStorageTopology::compose_for_maintenance(
-            &runtime::StorageTopologyConfig::default(),
-            home.path(),
-            workspace.path(),
-        )
-        .err()
-        .expect("maintenance auto must require postgres");
-        assert!(error.contains("requires storage.postgres"));
-    }
-
-    #[test]
-    fn clear_fallback_marker_removes_record() {
-        let home = tempfile::tempdir().expect("config home");
-        write_fallback_marker(home.path(), "test reason");
-        assert!(read_fallback_marker(home.path()).is_some());
-        clear_fallback_marker(home.path());
-        assert!(read_fallback_marker(home.path()).is_none());
     }
 }

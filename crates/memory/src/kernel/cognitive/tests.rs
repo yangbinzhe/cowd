@@ -322,21 +322,19 @@ fn truncate_summary_exact_length() {
 
 #[tokio::test]
 async fn new_constructs_with_default_config() {
-    let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
+    let tmp = tempfile::TempDir::new().unwrap();
     let mut cfg = test_config();
-    cfg.store.sqlite_path = tmp.path().join("test.db");
     cfg.store.blob_dir = tmp.path().join("blobs");
 
-    let mgr = CognitiveContextManager::new(cfg).await.unwrap();
+    let mgr = CognitiveContextManager::new_ephemeral(cfg).await.unwrap();
     assert_eq!(mgr.search_mode_label(), "keyword");
     assert_eq!(mgr.vector_index_count(), 0);
 }
 
 #[tokio::test]
 async fn corrupt_vector_artifact_degrades_to_fts_without_false_empty() {
-    let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
+    let tmp = tempfile::TempDir::new().unwrap();
     let mut cfg = test_config();
-    cfg.store.sqlite_path = tmp.path().join("test.db");
     cfg.store.blob_dir = tmp.path().join("blobs");
     std::fs::create_dir_all(&cfg.store.blob_dir).unwrap();
     std::fs::write(
@@ -345,7 +343,7 @@ async fn corrupt_vector_artifact_degrades_to_fts_without_false_empty() {
     )
     .unwrap();
 
-    let mgr = CognitiveContextManager::new(cfg).await.unwrap();
+    let mgr = CognitiveContextManager::new_ephemeral(cfg).await.unwrap();
     let entry = semantic_entry(
         MemoryLayer::L2,
         MemoryCategory::ProjectKnowledge,
@@ -370,11 +368,10 @@ async fn corrupt_vector_artifact_degrades_to_fts_without_false_empty() {
 
 #[tokio::test]
 async fn usage_signals_are_visible_in_memory_before_coalesced_persistence() {
-    let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
+    let tmp = tempfile::TempDir::new().unwrap();
     let mut cfg = test_config();
-    cfg.store.sqlite_path = tmp.path().join("test.db");
     cfg.store.blob_dir = tmp.path().join("blobs");
-    let mgr = CognitiveContextManager::new(cfg).await.unwrap();
+    let mgr = CognitiveContextManager::new_ephemeral(cfg).await.unwrap();
     let memory_id = uuid::Uuid::new_v4();
 
     for index in 0..8 {
@@ -407,10 +404,9 @@ async fn usage_signals_are_visible_in_memory_before_coalesced_persistence() {
 async fn with_write_source_configures_guard() {
     let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
     let mut cfg = test_config();
-    cfg.store.sqlite_path = tmp.path().join("test.db");
     cfg.store.blob_dir = tmp.path().join("blobs");
 
-    let mgr = CognitiveContextManager::new(cfg)
+    let mgr = CognitiveContextManager::new_ephemeral(cfg)
         .await
         .unwrap()
         .with_write_source(WriteSource::System);
@@ -422,10 +418,9 @@ async fn with_write_source_configures_guard() {
 async fn list_layers_returns_info() {
     let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
     let mut cfg = test_config();
-    cfg.store.sqlite_path = tmp.path().join("test.db");
     cfg.store.blob_dir = tmp.path().join("blobs");
 
-    let mgr = CognitiveContextManager::new(cfg).await.unwrap();
+    let mgr = CognitiveContextManager::new_ephemeral(cfg).await.unwrap();
     let layers = mgr.list_layers().await;
     assert!(!layers.is_empty());
 }
@@ -434,10 +429,9 @@ async fn list_layers_returns_info() {
 async fn embedding_capability_defaults_fts5_only() {
     let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
     let mut cfg = test_config();
-    cfg.store.sqlite_path = tmp.path().join("test.db");
     cfg.store.blob_dir = tmp.path().join("blobs");
 
-    let mgr = CognitiveContextManager::new(cfg).await.unwrap();
+    let mgr = CognitiveContextManager::new_ephemeral(cfg).await.unwrap();
     assert!(!mgr.embedding_capability().supports_semantic());
 }
 
@@ -445,10 +439,9 @@ async fn embedding_capability_defaults_fts5_only() {
 async fn vector_index_stats_empty() {
     let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
     let mut cfg = test_config();
-    cfg.store.sqlite_path = tmp.path().join("test.db");
     cfg.store.blob_dir = tmp.path().join("blobs");
 
-    let mgr = CognitiveContextManager::new(cfg).await.unwrap();
+    let mgr = CognitiveContextManager::new_ephemeral(cfg).await.unwrap();
     assert_eq!(mgr.vector_index_stats().count, 0);
 }
 
@@ -515,11 +508,9 @@ fn test_format_code_context_empty() {
 
 #[tokio::test]
 async fn test_auto_inject_on_code_query() {
-    let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
-    let mut cfg = test_config();
-    cfg.store.sqlite_path = tmp.path().join("test.db");
+    let cfg = test_config();
 
-    let mgr = CognitiveContextManager::new(cfg).await.unwrap();
+    let mgr = CognitiveContextManager::new_ephemeral(cfg).await.unwrap();
     let query = "fix bug in src/auth.rs";
     let ctx = mgr.prepare_context(query, &[], None).await.unwrap();
 
@@ -530,11 +521,9 @@ async fn test_auto_inject_on_code_query() {
 
 #[tokio::test]
 async fn test_no_inject_on_non_code_query() {
-    let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
-    let mut cfg = test_config();
-    cfg.store.sqlite_path = tmp.path().join("test.db");
+    let cfg = test_config();
 
-    let mgr = CognitiveContextManager::new(cfg).await.unwrap();
+    let mgr = CognitiveContextManager::new_ephemeral(cfg).await.unwrap();
     let query = "tell me a joke";
     let ctx = mgr.prepare_context(query, &[], None).await.unwrap();
 
@@ -544,11 +533,9 @@ async fn test_no_inject_on_non_code_query() {
 
 #[tokio::test]
 async fn test_build_context_with_code_delegates() {
-    let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
-    let mut cfg = test_config();
-    cfg.store.sqlite_path = tmp.path().join("test.db");
+    let cfg = test_config();
 
-    let mgr = CognitiveContextManager::new(cfg).await.unwrap();
+    let mgr = CognitiveContextManager::new_ephemeral(cfg).await.unwrap();
     let ctx = mgr.build_context_with_code("hello", &[]).await.unwrap();
 
     // build_context_with_code wraps prepare_context
@@ -557,11 +544,9 @@ async fn test_build_context_with_code_delegates() {
 
 #[tokio::test]
 async fn background_tasks_are_joined_and_shutdown_is_idempotent() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let mut cfg = test_config();
-    cfg.store.sqlite_path = tmp.path().join("test.db");
+    let cfg = test_config();
 
-    let mgr = CognitiveContextManager::new(cfg).await.unwrap();
+    let mgr = CognitiveContextManager::new_ephemeral(cfg).await.unwrap();
     let first = mgr.shutdown_background_tasks().await;
     assert_eq!(first.forced_aborts, 0);
     assert!(first.errors.is_empty(), "{:?}", first.errors);
@@ -580,10 +565,8 @@ async fn background_tasks_are_joined_and_shutdown_is_idempotent() {
 
 #[tokio::test]
 async fn automatic_governance_admission_is_single_owner_until_completion() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let mut cfg = test_config();
-    cfg.store.sqlite_path = tmp.path().join("test.db");
-    let mgr = CognitiveContextManager::new(cfg).await.unwrap();
+    let cfg = test_config();
+    let mgr = CognitiveContextManager::new_ephemeral(cfg).await.unwrap();
 
     let nightly = mgr
         .try_begin_automatic_governance("nightly")

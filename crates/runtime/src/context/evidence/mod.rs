@@ -4,6 +4,7 @@ pub mod raw;
 use harness_contract::context::EvidenceContentKind;
 use harness_contract::reality::EvidenceRef;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::context_ledger::estimate_text_tokens;
 
@@ -38,7 +39,7 @@ pub fn build_tool_receipt(
     );
     let prefix_tokens = estimate_text_tokens(&fixed_prefix);
     let body_budget = token_budget.saturating_sub(prefix_tokens).max(1);
-    let body = summarize_body(output, content_kind, body_budget);
+    let body = summarize_body(tool_name, output, content_kind, body_budget);
     let summary = format!("{fixed_prefix}{body}");
     let receipt_tokens = estimate_text_tokens(&summary);
     ModelReceipt {
@@ -66,12 +67,17 @@ fn classify_content(output: &str, is_error: bool) -> EvidenceContentKind {
     }
 }
 
-fn summarize_body(output: &str, kind: EvidenceContentKind, token_budget: u64) -> String {
+fn summarize_body(
+    tool_name: &str,
+    output: &str,
+    kind: EvidenceContentKind,
+    token_budget: u64,
+) -> String {
     if output.is_empty() {
         return "No output.".to_string();
     }
     let normalized = match kind {
-        EvidenceContentKind::Json => summarize_json(output),
+        EvidenceContentKind::Json => summarize_json(tool_name, output),
         EvidenceContentKind::Diff => summarize_diff(output),
         EvidenceContentKind::Error => summarize_error(output),
         EvidenceContentKind::Text | EvidenceContentKind::Media => output.to_string(),
@@ -79,10 +85,15 @@ fn summarize_body(output: &str, kind: EvidenceContentKind, token_budget: u64) ->
     truncate_head_tail(&normalized, token_budget)
 }
 
-fn summarize_json(output: &str) -> String {
+fn summarize_json(tool_name: &str, output: &str) -> String {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(output) else {
         return output.to_string();
     };
+    if matches!(tool_name, "write_file" | "edit_file") {
+        if let Some(receipt) = mutation_receipt(tool_name, &value) {
+            return receipt;
+        }
+    }
     match value {
         serde_json::Value::Object(map) => {
             let keys = map.keys().take(32).cloned().collect::<Vec<_>>().join(", ");
@@ -93,6 +104,64 @@ fn summarize_json(output: &str) -> String {
         }
         _ => output.to_string(),
     }
+}
+
+fn mutation_receipt(tool_name: &str, value: &serde_json::Value) -> Option<String> {
+    let object = value.as_object()?;
+    let operation = object
+        .get("type")
+        .or_else(|| object.get("operation"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("mutation");
+    let path = ["filePath", "path", "target"]
+        .into_iter()
+        .find_map(|key| object.get(key).and_then(serde_json::Value::as_str))
+        .unwrap_or("unknown");
+    let original = object
+        .get("originalFile")
+        .and_then(serde_json::Value::as_str);
+    let (content, replacement_count, replace_all) = if tool_name == "edit_file" {
+        let original = original?;
+        let old = object.get("oldString")?.as_str()?;
+        let new = object.get("newString")?.as_str()?;
+        let replace_all = object
+            .get("replaceAll")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let replacement_count = if replace_all {
+            original.matches(old).count()
+        } else {
+            usize::from(original.contains(old))
+        };
+        let updated = if replace_all {
+            original.replace(old, new)
+        } else {
+            original.replacen(old, new, 1)
+        };
+        (updated, replacement_count, replace_all)
+    } else {
+        (
+            object.get("content")?.as_str()?.to_string(),
+            usize::from(original.is_some()),
+            true,
+        )
+    };
+    let prior_bytes = original.map_or(0, str::len);
+    let prior_sha256 = original.map(|value| format!("{:x}", Sha256::digest(value.as_bytes())));
+    Some(
+        serde_json::json!({
+            "operation": operation,
+            "path": path,
+            "content_bytes": content.len(),
+            "content_sha256": format!("{:x}", Sha256::digest(content.as_bytes())),
+            "prior_bytes": prior_bytes,
+            "prior_sha256": prior_sha256,
+            "replacement_count": replacement_count,
+            "replace_all": replace_all,
+            "detail": "full mutation output is available through the evidence URI",
+        })
+        .to_string(),
+    )
 }
 
 fn summarize_diff(output: &str) -> String {
@@ -147,5 +216,59 @@ mod tests {
         assert!(receipt.summary.contains("tool://raw-1"));
         assert!(receipt.receipt_tokens <= 180);
         assert!(receipt.omitted_tokens > 0);
+    }
+
+    #[test]
+    fn mutation_receipt_does_not_echo_file_or_patch_bodies() {
+        let output = serde_json::json!({
+            "type": "update",
+            "filePath": "src/large.rs",
+            "oldString": "old-secret-body",
+            "newString": "new-important-body".repeat(1_000),
+            "originalFile": format!("prefix\n{}\nsuffix\n", "old-secret-body"),
+            "structuredPatch": [{
+                "oldLines": 40,
+                "newLines": 55,
+                "lines": vec!["+duplicated-line"; 5_000],
+            }],
+        })
+        .to_string();
+        let receipt = build_tool_receipt(
+            "edit_file",
+            &output,
+            false,
+            EvidenceRef::observed("tool", "mutation-raw"),
+            100_000,
+        );
+        assert!(receipt.summary.contains("src/large.rs"));
+        assert!(receipt.summary.contains("tool://mutation-raw"));
+        assert!(!receipt.summary.contains("old-secret-body"));
+        assert!(!receipt.summary.contains("duplicated-line"));
+        assert!(receipt.receipt_tokens < 256);
+        assert!(receipt.truncated);
+    }
+
+    #[test]
+    fn already_compact_transaction_receipt_keeps_per_file_evidence() {
+        let output = serde_json::json!({
+            "type": "mutation_apply",
+            "appliedCount": 2,
+            "applied": [
+                {"path": "src/a.rs", "sha256": "aaa", "replacementCount": 1},
+                {"path": "src/b.rs", "sha256": "bbb", "replacementCount": 2},
+            ],
+        })
+        .to_string();
+        let receipt = build_tool_receipt(
+            "apply_patch_transaction",
+            &output,
+            false,
+            EvidenceRef::observed("tool", "transaction-raw"),
+            1_000,
+        );
+        assert!(receipt.summary.contains("src/a.rs"));
+        assert!(receipt.summary.contains("src/b.rs"));
+        assert!(receipt.summary.contains("aaa"));
+        assert!(receipt.summary.contains("bbb"));
     }
 }

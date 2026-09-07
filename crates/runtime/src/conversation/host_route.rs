@@ -402,9 +402,19 @@ where
                         // in the owning task, so it also clears if the caller has
                         // already been cancelled.
                         let execution_bus = runtime.cowd_bus().cloned();
-                        let execution_bus_lease = execution_bus.as_ref().map(|bus| {
-                            services.bind_active_execution_bus(execution_id.clone(), bus.clone())
-                        });
+                        let execution_bus_lease = match execution_bus.as_ref() {
+                            Some(bus) => match services
+                                .bind_active_execution_bus(execution_id.clone(), bus.clone())
+                            {
+                                Ok(lease) => Some(lease),
+                                Err(error) => {
+                                    let _ = completion_sender
+                                        .send((runtime, Err(RuntimeError::new(error))));
+                                    return;
+                                }
+                            },
+                            None => None,
+                        };
                         let execution_scope = execution_bus.map(|bus| {
                             let activity_id =
                                 format!("activity:execution:{execution_id}");

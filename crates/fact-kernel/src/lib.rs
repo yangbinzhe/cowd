@@ -40,6 +40,8 @@ pub use extraction::{
     FactExtractionBatch, FactExtractionBatchId, FactExtractionTokenUsage, FactExtractionTrigger,
 };
 pub use indexer::FactSearchHit;
+#[cfg(any(test, feature = "test-support"))]
+pub use ledger::EphemeralFactLedger;
 pub use ledger::{
     FactGrowthBatch, FactLedger, FactLedgerError, FactLedgerResult, FactLedgerSnapshot,
     FactRecallQuery, GrowthPromotionRecord, UnavailableFactLedger,

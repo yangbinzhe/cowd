@@ -42,9 +42,9 @@ expect_absent \
   'start_selected_strategy' \
   crates/runtime/src
 expect_absent \
-  'retired hand-written builtin Team selection summary returned' \
-  'builtin_team_template_summaries' \
-  crates/runtime/src
+  'retired Team definition control plane returned' \
+  'TeamTemplate|team_template|team-templates' \
+  crates/runtime/src crates/harness-contract/src crates/gateway/src crates/surface/src crates/tui/src crates/harness-eval/src
 expect_absent \
   'retired role/slot runtime string dispatch returned' \
   '(?:contains|strip_prefix|starts_with|split_once|==|match)\([^\n]*(?:role_slot:|team_role:)|(?:role_slot:|team_role:)[^\n]*(?:contains|strip_prefix|starts_with|split_once|==|match)' \

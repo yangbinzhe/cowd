@@ -477,12 +477,6 @@ impl crate::store::MemoryStore for NoopStore {
         Ok(Vec::new())
     }
 
-    async fn legacy_scope_migration_reports(
-        &self,
-    ) -> crate::store::Result<Vec<crate::store::sqlite::LegacyScopeMigrationReport>> {
-        Self::unavailable()
-    }
-
     async fn save_entities(&self, _entities: &[Entity]) -> crate::store::Result<()> {
         Ok(())
     }
@@ -602,12 +596,11 @@ impl crate::store::MemoryStore for NoopStore {
 mod tests {
     use super::*;
     use crate::config::DriftConfig;
-    use crate::store::sqlite::SqliteStore;
+    use crate::store::EphemeralMemoryStore;
     use crate::types::{MemorySource, Priority};
 
     fn in_memory() -> Arc<dyn MemoryStore> {
-        let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
-        Arc::new(SqliteStore::open_path(&tmp.path().join("test.db")).unwrap())
+        Arc::new(EphemeralMemoryStore::new())
     }
 
     fn shared_entry(staleness: f32) -> MemoryEntry {

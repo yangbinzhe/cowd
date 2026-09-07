@@ -4,49 +4,23 @@ use matrix_core::{
     MatrixDataPlaneIngestPlan, MatrixDataPlaneIngestPlanInput, MatrixDataPlaneWatermark,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MatrixDataPlaneBackend {
-    EmbeddedSqlite,
-    PostgreSql,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatrixLocalDataPlane {
     pub watermark_count: u64,
-    pub backend: MatrixDataPlaneBackend,
 }
 
 impl MatrixLocalDataPlane {
     #[must_use]
-    pub fn embedded_sqlite(watermark_count: u64) -> Self {
-        Self {
-            watermark_count,
-            backend: MatrixDataPlaneBackend::EmbeddedSqlite,
-        }
-    }
-
-    #[must_use]
     pub fn postgres(watermark_count: u64) -> Self {
-        Self {
-            watermark_count,
-            backend: MatrixDataPlaneBackend::PostgreSql,
-        }
+        Self { watermark_count }
     }
 }
 
 impl MatrixDataPlane for MatrixLocalDataPlane {
     fn health(&self) -> MatrixDataPlaneHealth {
-        let (provider, mode) = match self.backend {
-            MatrixDataPlaneBackend::EmbeddedSqlite => {
-                ("embedded_sqlite", "embedded_transactional_data_plane")
-            }
-            MatrixDataPlaneBackend::PostgreSql => {
-                ("postgresql", "postgresql_transactional_data_plane")
-            }
-        };
         MatrixDataPlaneHealth {
-            provider: provider.to_string(),
-            mode: mode.to_string(),
+            provider: "postgresql".to_string(),
+            mode: "postgresql_transactional_data_plane".to_string(),
             status: "operational".to_string(),
             capabilities: vec![
                 capability(
@@ -156,12 +130,6 @@ mod tests {
 
     #[test]
     fn health_reports_the_real_storage_backend() {
-        let sqlite = MatrixLocalDataPlane::embedded_sqlite(3).health();
-        assert_eq!(sqlite.provider, "embedded_sqlite");
-        assert_eq!(sqlite.mode, "embedded_transactional_data_plane");
-        assert_eq!(sqlite.status, "operational");
-        assert_eq!(sqlite.watermark_count, 3);
-
         let postgres = MatrixLocalDataPlane::postgres(7).health();
         assert_eq!(postgres.provider, "postgresql");
         assert_eq!(postgres.mode, "postgresql_transactional_data_plane");

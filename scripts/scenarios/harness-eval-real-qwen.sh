@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+: "${COWD_TEST_POSTGRES_URL:?set COWD_TEST_POSTGRES_URL to an isolated disposable PostgreSQL database}"
+
 # Run the deep-real Harness lane through an isolated, short-lived Gateway.
 #
 # The evaluated route is resolved from the installed Cowd configuration. The
@@ -39,35 +41,18 @@ PROVIDER_CREDENTIAL=""
 STAGED_CREDENTIAL_REF=""
 STAGED_CREDENTIAL_ENV=""
 
-# One invocation owns exactly one paid scenario and one explicit total-token
-# authorization. This is a pre-dispatch runaway boundary, not a request-output
-# downgrade: every scenario has a quality-preserving minimum based on its
-# frozen acceptance topology.
+# One invocation owns exactly one paid scenario.  Live opt-in is sufficient to
+# run it: an optional provider-token value is advisory accounting only, never
+# a scenario-specific quality floor or a task-execution stop condition.
 SCENARIO_ID="${COWD_EVAL_LIVE_SCENARIOS:-}"
-MAX_PROVIDER_TOKENS="${COWD_EVAL_MAX_PROVIDER_TOKENS:-}"
 [[ -n "$SCENARIO_ID" && "$SCENARIO_ID" != *,* ]] || {
   echo 'set COWD_EVAL_LIVE_SCENARIOS to exactly one paid scenario id' >&2
   exit 2
 }
 case "$SCENARIO_ID" in
-  live_direct_terminal) MIN_PROVIDER_TOKENS=100000 ;;
-  live_tool_evidence) MIN_PROVIDER_TOKENS=250000 ;;
-  live_single_architecture_baseline) MIN_PROVIDER_TOKENS=750000 ;;
-  live_implicit_collaboration_obligation) MIN_PROVIDER_TOKENS=2000000 ;;
-  live_team_projection|live_agent_escalation) MIN_PROVIDER_TOKENS=2000000 ;;
-  live_group_theory_ai_research_simulation) MIN_PROVIDER_TOKENS=5000000 ;;
-  live_qwen38_large_scale_collaboration) MIN_PROVIDER_TOKENS=8000000 ;;
-  live_autonomous_collaboration_deepseek) MIN_PROVIDER_TOKENS=12000000 ;;
+  live_direct_terminal|live_tool_evidence|live_single_architecture_baseline|live_implicit_collaboration_obligation|live_team_projection|live_agent_escalation|live_group_theory_ai_research_simulation|live_qwen38_large_scale_collaboration|live_autonomous_collaboration_deepseek) ;;
   *) echo "unsupported paid live scenario: $SCENARIO_ID" >&2; exit 2 ;;
 esac
-[[ "$MAX_PROVIDER_TOKENS" =~ ^[0-9]+$ ]] || {
-  echo 'COWD_EVAL_MAX_PROVIDER_TOKENS must be an explicit integer authorization' >&2
-  exit 2
-}
-if ((MAX_PROVIDER_TOKENS < MIN_PROVIDER_TOKENS || MAX_PROVIDER_TOKENS > 20000000)); then
-  echo "scenario $SCENARIO_ID requires COWD_EVAL_MAX_PROVIDER_TOKENS between $MIN_PROVIDER_TOKENS and 20000000" >&2
-  exit 2
-fi
 
 cleanup() {
   local status=$?
@@ -325,7 +310,10 @@ permissions:
 memory:
   enabled: true
 storage:
-  backend: sqlite
+  backend: postgres
+  postgres:
+    logicalIdentity: "cowd-harness-eval-test"
+    secretRef: "env:COWD_TEST_POSTGRES_URL"
 gateway:
   enabled: true
   session_reset: none
@@ -448,16 +436,15 @@ PROGRESS_PID="$!"
 
 cd "$ROOT"
 # A deep real-provider run contains serial scenarios, each with its own
-# Runtime-aware progress and inactivity bounds. Do not impose a second,
-# shorter whole-suite deadline by default: it can kill a later Team graph that
-# is still making durable progress. Operators who need a wall-clock cap can
-# opt in with COWD_EVAL_TIMEOUT_SECS; Mission Control remains the live view in
-# either mode.
+# Runtime-aware progress and inactivity bounds. A wall-clock cap must be
+# handled inside the evaluator so timeout cleanup can commit a durable Session
+# cancellation receipt. Never wrap the evaluator in GNU timeout: killing the
+# observer must not silently become a business cancellation or strand a root.
 EVAL_COMMAND=(
   cargo run -p harness-eval -- deep-real --provider "$MODEL" --budget full --allow-real-model
 )
-if [[ -n "${COWD_EVAL_TIMEOUT_SECS:-}" ]]; then
-  EVAL_COMMAND=(timeout "${COWD_EVAL_TIMEOUT_SECS}s" "${EVAL_COMMAND[@]}")
+if [[ -n "${COWD_EVAL_TIMEOUT_SECS:-}" && -z "${COWD_EVAL_SCENARIO_TIMEOUT_SECS:-}" ]]; then
+  export COWD_EVAL_SCENARIO_TIMEOUT_SECS="$COWD_EVAL_TIMEOUT_SECS"
 fi
 env \
   COWD_CONFIG_HOME="$CONFIG_HOME" \

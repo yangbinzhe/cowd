@@ -39,6 +39,59 @@ fn provider_blocked_reason(terminal: bool, intervention_reason: &str, evidence: 
     }
 }
 
+fn workspace_mutation_is_objectively_forbidden(
+    task_explicitly_forbids_workspace_write: bool,
+    required_permission: harness_contract::tool::ToolPermissionMode,
+) -> bool {
+    task_explicitly_forbids_workspace_write
+        && required_permission != harness_contract::tool::ToolPermissionMode::ReadOnly
+}
+
+/// Merge mutation epochs persisted by already-committed Goal observations with
+/// epochs completed earlier in this owned graph turn. The latter is essential
+/// for the immediate successor node: graph scheduling may make that node
+/// runnable before the Goal-stream event transaction is observable through a
+/// new store read. Both inputs are Runtime-authored facts; no model text or
+/// requested path participates in this causal proof.
+fn prior_workspace_mutation_sequences(
+    durable: impl IntoIterator<Item = u64>,
+    in_turn: &BTreeSet<u64>,
+) -> BTreeSet<u64> {
+    let mut sequences = durable.into_iter().collect::<BTreeSet<_>>();
+    sequences.extend(in_turn.iter().copied());
+    sequences
+}
+
+/// Whether a completed Runtime-authorized effect can establish the mutation
+/// epoch required before an exact workspace postcondition read. A direct file
+/// adapter remains stronger because it identifies the changed file and its
+/// pre-image. This deliberately admits a local shell `Destructive` effect
+/// too: a command that creates artifacts and then removes its own temporary
+/// file is conservatively classified as destructive, but its later exact read
+/// can still prove the required final state. System, package, and network
+/// effects never cross this boundary.
+fn is_local_workspace_mutation_effect(
+    effect: &harness_contract::tool::ToolEffectDescriptor,
+) -> bool {
+    use harness_contract::policy::{PermissionOperation, PermissionResource};
+    use harness_contract::tool::ToolEffectKind;
+
+    if effect.effect_kind == ToolEffectKind::Write
+        && effect.assessment.externality == harness_contract::policy::EffectExternality::Workspace
+    {
+        return true;
+    }
+
+    effect.effect_kind == ToolEffectKind::Destructive
+        && !effect.uses_network
+        && !effect.mutates_system
+        && !effect.mutates_packages
+        && effect.scopes.iter().any(|scope| {
+            scope.resource == PermissionResource::Shell
+                && scope.operation == PermissionOperation::Write
+        })
+}
+
 #[async_trait]
 impl<C, T> ScopedNodeBackend for TurnModelStepBackend<C, T>
 where
@@ -62,6 +115,7 @@ where
             if let Some(program) =
                 root_agentic_program_projection(self.services.as_ref(), &session_id, &turn_id)
             {
+                let terminal_action = root_agentic_terminal_action(&program);
                 let mut state = self.state.lock().await;
                 if state.agentic_program_context_revision != Some(program.revision) {
                     let checkpoint = compact_agentic_program_checkpoint(&program);
@@ -79,6 +133,40 @@ where
                     item.evidence = vec![format!("program_revision:{}", program.revision)];
                     state.pending_next_model_context.push(item);
                     state.agentic_program_context_revision = Some(program.revision);
+                }
+                // Only a mechanically unique Program closure is narrowed.
+                // The model retains the semantic decision surface for every
+                // ordinary planning/execution state, including the Team,
+                // author and contents of a required integration Task.
+                // Running-turn input disposition retains priority and may
+                // replace the topology before another closure is attempted.
+                if state.pending_disposition_inputs.is_empty() {
+                    if let Some(action) = terminal_action {
+                        state.force_text_only_next_model = false;
+                        state.clean_terminal_synthesis_next = false;
+                        state.force_tool_allowlist_next_model = Some(action.tool_ids());
+                        let evidence = match &action {
+                            RootAgenticTerminalAction::PublishIntegration {
+                                prerequisite_task_refs,
+                            } => prerequisite_task_refs.clone(),
+                            RootAgenticTerminalAction::RequestObjectiveCompletion {
+                                result_artifact_refs,
+                            } => result_artifact_refs.clone(),
+                        };
+                        let mut item = ContextItem::new(
+                            format!(
+                                "agentic-root-terminal-action:{}:{}",
+                                program.program_id, program.revision
+                            ),
+                            ContextSourceKind::Task,
+                            ContextRole::Instruction,
+                            action.continuation_instruction(),
+                        );
+                        item.authority = ContextAuthority::System;
+                        item.visibility = ContextVisibility::Private;
+                        item.evidence = evidence;
+                        state.pending_next_model_context.push(item);
+                    }
                 }
             }
         }
@@ -215,8 +303,7 @@ where
                             state.agentic_protocol_recovery_attempts.saturating_add(1);
                         if let Some(protocol) = delegated_protocol_at_step.as_ref() {
                             state.force_text_only_next_model = false;
-                            state.force_tool_allowlist_next_model =
-                                Some(protocol.required_terminal_tools());
+                            state.force_tool_allowlist_next_model = None;
                             let mut item = ContextItem::new(
                                 format!("agentic-protocol-fuse-recovery:{}", ticket.node_id),
                                 ContextSourceKind::Task,
@@ -505,6 +592,7 @@ where
             .await
             .truncate_messages(transcript_len);
         let consumed_inputs = runtime.take_consumed_session_inputs();
+        let cache_dimensions_known = runtime.turn_cache_dimensions_known();
         let cowd_bus = runtime.cowd_bus().cloned();
         drop(runtime);
         match result {
@@ -531,8 +619,9 @@ where
                     model: step.model.clone(),
                     input_tokens: u64::from(step.usage.input_tokens),
                     output_tokens: u64::from(step.usage.output_tokens),
-                    cached_tokens: u64::from(step.usage.cache_read_input_tokens)
-                        .saturating_add(u64::from(step.usage.cache_creation_input_tokens)),
+                    cache_creation_input_tokens: u64::from(step.usage.cache_creation_input_tokens),
+                    cache_read_input_tokens: u64::from(step.usage.cache_read_input_tokens),
+                    cached_tokens: u64::from(step.usage.cache_read_input_tokens),
                     duration_ms: step.wall_duration_ms,
                     tool_calls: 0,
                     ..ExecutionUsage::default()
@@ -632,75 +721,20 @@ where
                         .insert(receipt.call.id.clone(), receipt.clone());
                 }
                 state.iterations = state.iterations.saturating_add(1);
-                state.input_tokens = state
-                    .input_tokens
-                    .saturating_add(u64::from(step.usage.input_tokens));
-                state.output_tokens = state
-                    .output_tokens
-                    .saturating_add(u64::from(step.usage.output_tokens));
-                state.cache_create_tokens = state
-                    .cache_create_tokens
-                    .saturating_add(u64::from(step.usage.cache_creation_input_tokens));
-                state.cache_read_tokens = state
-                    .cache_read_tokens
-                    .saturating_add(u64::from(step.usage.cache_read_input_tokens));
-                state.output_chars = state.output_chars.saturating_add(step_output_chars);
-                state.output_chunks = state.output_chunks.saturating_add(1);
-                state.wall_duration_ms =
-                    state.wall_duration_ms.saturating_add(step.wall_duration_ms);
-                state.model = step.model.clone();
-                for model in &step.models_used {
-                    if !state.models_used.contains(model) {
-                        state.models_used.push(model.clone());
-                    }
-                }
-                if state.first_token_latency_ms.is_none() {
-                    state.first_token_latency_ms = step.first_token_latency_ms;
-                }
-                state.active_stream_duration_ms = state
-                    .active_stream_duration_ms
-                    .saturating_add(step.active_stream_duration_ms.unwrap_or_default());
+                state.record_root_model_usage(RootModelUsageDelta {
+                    usage: step.usage,
+                    model: step.model.clone(),
+                    models_used: step.models_used.clone(),
+                    first_token_latency_ms: step.first_token_latency_ms,
+                    active_stream_duration_ms: step.active_stream_duration_ms,
+                    wall_duration_ms: step.wall_duration_ms,
+                    output_chars: step_output_chars,
+                    output_chunks: 1,
+                    cache_dimensions_known,
+                });
                 if let Some(bus) = cowd_bus.as_ref() {
-                    let rate = |value: u64, duration_ms: u64| {
-                        (duration_ms > 0).then(|| value as f64 * 1_000.0 / duration_ms as f64)
-                    };
                     bus.emit(CowdEvent::RunModelTelemetry {
-                        telemetry: crate::cowd_event::RunModelTelemetry {
-                            model: state.model.clone(),
-                            models_used: state.models_used.clone(),
-                            first_token_latency_ms: state.first_token_latency_ms,
-                            active_stream_duration_ms: Some(state.active_stream_duration_ms.max(1)),
-                            wall_duration_ms: state.wall_duration_ms.max(1),
-                            output_chars: state.output_chars,
-                            output_chunks: state.output_chunks,
-                            input_tokens: state.input_tokens,
-                            output_tokens: state.output_tokens,
-                            cache_create_tokens: state.cache_create_tokens,
-                            cache_read_tokens: state.cache_read_tokens,
-                            total_tokens: state.input_tokens.saturating_add(state.output_tokens),
-                            usage_source: "provider".to_string(),
-                            wall_chars_per_second: rate(state.output_chars, state.wall_duration_ms),
-                            wall_tokens_per_second: rate(
-                                state.output_tokens,
-                                state.wall_duration_ms,
-                            ),
-                            active_chars_per_second: rate(
-                                state.output_chars,
-                                state.active_stream_duration_ms,
-                            ),
-                            active_tokens_per_second: rate(
-                                state.output_tokens,
-                                state.active_stream_duration_ms,
-                            ),
-                            chars_per_second: rate(
-                                state.output_chars,
-                                state.active_stream_duration_ms,
-                            ),
-                            tokens_per_second: rate(
-                                state.output_tokens,
-                                state.active_stream_duration_ms,
-                            ),
-                        },
+                        telemetry: state.root_model_telemetry(),
                     });
                 }
                 state
@@ -1030,8 +1064,7 @@ where
                             state.pending_transcript.remove(&ticket.node_id);
                             state.force_text_only_next_model = false;
                             state.clean_terminal_synthesis_next = false;
-                            state.force_tool_allowlist_next_model =
-                                Some(protocol.required_terminal_tools());
+                            state.force_tool_allowlist_next_model = None;
                             let reason = protocol.continuation_instruction();
                             let mut item = ContextItem::new(
                                 format!("agentic-task-protocol-continue:{}", ticket.node_id),
@@ -1097,12 +1130,7 @@ where
                                     compact_agentic_program_checkpoint
                                 )
                             );
-                            state.force_tool_allowlist_next_model = Some(
-                                harness_contract::agent_action::AGENT_ACTION_TOOL_IDS
-                                    .iter()
-                                    .map(|tool| (*tool).to_string())
-                                    .collect(),
-                            );
+                            state.force_tool_allowlist_next_model = None;
                             let mut item = ContextItem::new(
                                 format!("agentic-collaboration-continue:{}", ticket.node_id),
                                 ContextSourceKind::Task,
@@ -1187,8 +1215,7 @@ where
                                         state.required_workspace_write_scopes.join(", ")
                                     ));
                                 }
-                                state.force_tool_allowlist_next_model =
-                                    Some(required_mutation_tool_allowlist());
+                                state.force_tool_allowlist_next_model = None;
                             }
                             if recover_language {
                                 state.root_language_replan_attempted = true;
@@ -2023,18 +2050,24 @@ where
                     }
                     state.iterations = state.iterations.saturating_add(1);
                     if let Some(usage) = provider_usage {
-                        state.input_tokens = state
-                            .input_tokens
-                            .saturating_add(u64::from(usage.input_tokens));
-                        state.output_tokens = state
-                            .output_tokens
-                            .saturating_add(u64::from(usage.output_tokens));
-                        state.cache_create_tokens = state
-                            .cache_create_tokens
-                            .saturating_add(u64::from(usage.cache_creation_input_tokens));
-                        state.cache_read_tokens = state
-                            .cache_read_tokens
-                            .saturating_add(u64::from(usage.cache_read_input_tokens));
+                        state.record_root_model_usage(RootModelUsageDelta {
+                            usage,
+                            model: None,
+                            models_used: Vec::new(),
+                            first_token_latency_ms: None,
+                            active_stream_duration_ms: None,
+                            wall_duration_ms: 0,
+                            output_chars: 0,
+                            output_chunks: 0,
+                            cache_dimensions_known,
+                        });
+                    } else {
+                        state.cache_dimensions_known = cache_dimensions_known;
+                    }
+                    if let Some(bus) = cowd_bus.as_ref() {
+                        bus.emit(CowdEvent::RunModelTelemetry {
+                            telemetry: state.root_model_telemetry(),
+                        });
                     }
                     // `execute_model_step` temporarily appends the ingress user
                     // before asking the provider, and the host rolls that
@@ -2290,8 +2323,7 @@ where
                         RuntimeInterventionKind::Replan => {
                             let instruction = if let Some(protocol) = pending_delegated_protocol {
                                 state.force_text_only_next_model = false;
-                                state.force_tool_allowlist_next_model =
-                                    Some(protocol.required_terminal_tools());
+                                state.force_tool_allowlist_next_model = None;
                                 protocol.continuation_instruction()
                             } else if protocol_failure {
                                 let detail = protocol_failure_detail
@@ -2548,29 +2580,6 @@ impl DelegatedAgenticProtocolState {
         }
     }
 
-    pub(super) fn required_terminal_tools(&self) -> BTreeSet<String> {
-        match self.mode.as_str() {
-            "review" => BTreeSet::from([
-                "evidence_retrieve".to_string(),
-                harness_contract::agent_action::TASK_REVIEW_TOOL_ID.to_string(),
-            ]),
-            _ if self.artifact_refs.is_empty() => {
-                BTreeSet::from(
-                    [harness_contract::agent_action::ARTIFACT_COMMIT_TOOL_ID.to_string()],
-                )
-            }
-            _ => BTreeSet::from([harness_contract::agent_action::TASK_SUBMIT_TOOL_ID.to_string()]),
-        }
-    }
-
-    pub(super) fn convergence_action_tools(&self) -> BTreeSet<String> {
-        if self.mode == "review" {
-            BTreeSet::from([harness_contract::agent_action::TASK_REVIEW_TOOL_ID.to_string()])
-        } else {
-            self.required_terminal_tools()
-        }
-    }
-
     pub(super) fn continuation_instruction(&self) -> String {
         match self.mode.as_str() {
             "review" => format!(
@@ -2594,6 +2603,23 @@ impl DelegatedAgenticProtocolState {
                 self.program_id
             ),
         }
+    }
+
+    /// The one durable protocol action that can close the current Agent
+    /// boundary. Runtime uses this only after the model itself has exhausted
+    /// its evidence work or attempted a text terminal; it never narrows the
+    /// Agent's ordinary research/planning tool surface. That split preserves
+    /// semantic autonomy while preventing a generic presentation synthesis
+    /// from orphaning a claimed Task between its artifact and submission.
+    pub(super) fn closure_tool_ids(&self) -> BTreeSet<String> {
+        let tool = match self.mode.as_str() {
+            "review" => harness_contract::agent_action::TASK_REVIEW_TOOL_ID,
+            _ if self.artifact_refs.is_empty() => {
+                harness_contract::agent_action::ARTIFACT_COMMIT_TOOL_ID
+            }
+            _ => harness_contract::agent_action::TASK_SUBMIT_TOOL_ID,
+        };
+        [tool.to_string()].into_iter().collect()
     }
 }
 
@@ -2644,31 +2670,19 @@ pub(super) fn delegated_agentic_protocol_state(
             .map_err(|error| {
                 protocol_error(format!("decode delegated AgentTask packet: {error}"))
             })?;
-    let Some(program_id) = packet
-        .context_refs
-        .iter()
-        .find_map(|reference| reference.strip_prefix("agentic_program:"))
-    else {
+    let Some(agentic) = packet.agentic_binding.as_ref() else {
         return Ok(None);
     };
-    let program_id = program_id.to_string();
-    let task_id = packet
-        .context_refs
-        .iter()
-        .find_map(|reference| reference.strip_prefix("agentic_task:"))
-        .ok_or_else(|| protocol_error("Agent-first packet has no task binding".to_string()))?
-        .to_string();
-    let mode = packet
-        .context_refs
-        .iter()
-        .find_map(|reference| reference.strip_prefix("agentic_mode:"))
-        .ok_or_else(|| protocol_error("Agent-first packet has no attempt mode".to_string()))?
-        .to_string();
-    if !matches!(mode.as_str(), "execute" | "review") {
-        return Err(protocol_error(format!(
-            "Agent-first packet has unsupported attempt mode `{mode}`"
-        )));
-    }
+    let program_id = agentic.program_id.clone();
+    let (task_id, mode) = match &agentic.focus {
+        harness_contract::agent::AgenticExecutionFocus::TaskExecute { task_ref } => {
+            (task_ref.clone(), "execute")
+        }
+        harness_contract::agent::AgenticExecutionFocus::TaskReview { task_ref } => {
+            (task_ref.clone(), "review")
+        }
+        _ => return Ok(None),
+    };
     let projection = services
         .agent_action_service()
         .project(&program_id)
@@ -2678,19 +2692,37 @@ pub(super) fn delegated_agentic_protocol_state(
             "Agent-first Program `{program_id}` has no Task `{task_id}`"
         ))
     })?;
-    let actor_id = packet.agent_id();
+    // `AgentTaskPacket::agent_id()` is the physical Binding instance identity
+    // (for run locks, cancellation and process isolation). Agent-first
+    // Program state is instead owned by the immutable logical identity that
+    // Runtime attested in `agentic_binding`. These IDs intentionally differ
+    // in production. Comparing the physical instance to Task.claimant made a
+    // live claim appear foreign, which allowed generic text synthesis to
+    // preempt artifact/submit closure and caused cross-graph retry loops.
+    let actor_id = agentic.agent_id.as_str();
     let mut artifacts = projection
         .artifacts
         .values()
-        .filter(|artifact| match mode.as_str() {
+        .filter(|artifact| match mode {
+            // A review is intentionally bound to the submitted artifact set,
+            // which TaskSubmit has already fenced to its claim.
             "review" => task.artifact_refs.contains(&artifact.artifact_ref),
-            _ => artifact.committed_by == actor_id && artifact.relates_to.contains(&task_id),
+            // Execution must see only evidence committed by this exact
+            // physical claim. A rework retains historical artifacts for
+            // auditability, but those artifacts cannot close its new attempt.
+            _ => {
+                artifact.committed_by == actor_id
+                    && artifact.relates_to.contains(&task_id)
+                    && artifact.claim_execution_id.as_deref()
+                        == Some(packet.assignment.graph_id.as_str())
+                    && artifact.claim_generation == Some(u64::from(packet.attempt))
+            }
         })
         .map(|artifact| (artifact.artifact_ref.clone(), artifact.content_ref.clone()))
         .collect::<Vec<_>>();
     artifacts.sort();
     artifacts.dedup();
-    let owns_active_attempt = match mode.as_str() {
+    let owns_active_attempt = match mode {
         "execute" => {
             task.status == crate::AgenticTaskStatus::Claimed
                 && task.claimant.as_deref() == Some(actor_id)
@@ -2707,7 +2739,7 @@ pub(super) fn delegated_agentic_protocol_state(
     Ok(Some(DelegatedAgenticProtocolState {
         program_id,
         task_id,
-        mode,
+        mode: mode.to_string(),
         status: task.status,
         artifact_refs: artifacts
             .iter()
@@ -2779,11 +2811,7 @@ fn delegated_agent_task_packet(
         })?;
     let packet =
         serde_json::from_str::<harness_contract::agent::AgentTaskPacket>(&payload_ref).ok()?;
-    packet
-        .context_refs
-        .iter()
-        .any(|reference| reference.starts_with("agentic_program:"))
-        .then_some(packet)
+    packet.agentic_binding.is_some().then_some(packet)
 }
 
 fn agentic_message_text(message: &ConversationMessage) -> Option<String> {
@@ -3176,15 +3204,21 @@ where
                     .iter()
                     .map(|invocation| (invocation.invocation_id.clone(), invocation.clone()))
                     .collect::<std::collections::HashMap<_, _>>();
-                // A permissive session profile is an authorization ceiling,
-                // never permission to contradict a read-only user objective.
-                // Keep this decision at the governed effect boundary so it
-                // applies to every mutating tool descriptor, including tools
-                // added after this host is compiled; no role, template, or
-                // tool-name branch is involved.
-                let task_requires_workspace_write = runtime
-                    .active_turn_strategy()
-                    .is_none_or(|strategy| strategy.decision.strategy.understanding.requires_write);
+                // `requires_write` is a planning prediction, not a negative
+                // authorization grant. A false negative must not turn a
+                // user-requested artifact or a model-selected, otherwise
+                // authorized effect into a permanent capability gap. Only an
+                // explicit read-only user constraint is an effect-boundary
+                // deny, which keeps the boundary universal for future tools
+                // without reducing agent autonomy to a keyword classifier.
+                let task_explicitly_forbids_workspace_write =
+                    runtime.active_turn_strategy().is_some_and(|strategy| {
+                        strategy
+                            .decision
+                            .strategy
+                            .understanding
+                            .forbids_workspace_write
+                    });
                 let governed_compilation = crate::GovernedToolCompiler.compile_partial(
                     self.services.workspace_root(),
                     &requests,
@@ -3229,16 +3263,16 @@ where
                         .find(|invocation| invocation.invocation_id == call.id)
                     {
                         let descriptor = invocation.effect.clone();
-                        if !task_requires_workspace_write
-                            && descriptor.required_permission
-                                != harness_contract::tool::ToolPermissionMode::ReadOnly
-                        {
+                        if workspace_mutation_is_objectively_forbidden(
+                            task_explicitly_forbids_workspace_write,
+                            descriptor.required_permission,
+                        ) {
                             gaps.insert(
                                 call.id.clone(),
                                 synthetic_capability_gap(
                                     &descriptor,
                                     runtime.active_permission_mode(),
-                                    "the active user task is read-only; Runtime rejects mutating tool effects even under a full-trust session profile".to_string(),
+                                    "the active user task explicitly prohibits workspace mutation; Runtime rejects mutating tool effects even under a full-trust session profile".to_string(),
                                 ),
                             );
                             continue;
@@ -3293,8 +3327,8 @@ where
         let (
             result,
             mut orchestration_terminal_summary,
-            _prepared_tool_invocations,
-            successful_observed_evidence,
+            prepared_tool_invocations,
+            mut successful_observed_evidence,
             agentic_progress_refs,
         ) = if let Some(host) = governed_host {
             let (
@@ -3451,6 +3485,15 @@ where
         let failed = result.failed;
         let failed_tools = failed_tool_names(&result.messages);
         let successful_call_ids = successful_tool_call_ids(&result.messages);
+        // Read the registered, Runtime-compiled descriptor that was actually
+        // authorized for the successful call. Do not infer an effect from
+        // model input or stdout: generic mutation tools retain their autonomy,
+        // while a later exact ToolHost read can prove their final state.
+        let successful_workspace_mutation_effect = successful_call_ids.iter().any(|call_id| {
+            prepared_tool_invocations
+                .get(call_id)
+                .is_some_and(|invocation| is_local_workspace_mutation_effect(&invocation.effect))
+        });
         // Parking is a post-action state invariant, not a special consequence
         // of `task_publish`. In particular, a Task may be published before its
         // Team is staffed; the later `agent_invite` dispatches it and must park
@@ -3532,6 +3575,36 @@ where
             .filter(|observation| observation.kind == RuntimeObservationKind::ToolProgress)
             .flat_map(|observation| observation.observed_evidence.iter().cloned())
             .collect::<Vec<_>>();
+        // These markers are durable Runtime observation facts. They are
+        // emitted only when an authorized workspace effect completed
+        // successfully, so a model cannot manufacture a mutation epoch by
+        // claiming one in text or tool input.
+        let durable_workspace_mutation_sequences = prior_observations
+            .iter()
+            .filter(|observation| observation.kind == RuntimeObservationKind::ToolProgress)
+            .flat_map(|observation| observation.evidence_refs.iter())
+            .filter_map(|reference| workspace_mutation_effect_sequence(reference));
+        let (prior_workspace_mutation_sequences, required_workspace_write_scopes) = {
+            let state = self.state.lock().await;
+            (
+                prior_workspace_mutation_sequences(
+                    durable_workspace_mutation_sequences,
+                    &state.workspace_mutation_effect_sequences,
+                ),
+                state.required_workspace_write_scopes.clone(),
+            )
+        };
+        let verified_postcondition_writes = verified_workspace_postcondition_write_evidence(
+            &required_workspace_write_scopes,
+            &prior_workspace_mutation_sequences,
+            &successful_observed_evidence,
+            self.services.path_identity_resolver(),
+        );
+        for evidence in verified_postcondition_writes {
+            if !successful_observed_evidence.contains(&evidence) {
+                successful_observed_evidence.push(evidence);
+            }
+        }
         let new_observed_fingerprints =
             crate::path_identity::fresh_novel_observed_evidence_fingerprints(
                 &prior_observed_evidence,
@@ -3759,6 +3832,11 @@ where
             .filter_map(|scope| scope.strip_prefix("write:"))
             .map(str::to_string)
             .collect::<Vec<_>>();
+        if successful_workspace_mutation_effect {
+            state
+                .workspace_mutation_effect_sequences
+                .insert(u64::try_from(iteration).unwrap_or(u64::MAX).max(1));
+        }
         let successful_write_in_batch = !successful_workspace_write_scope_keys.is_empty();
         state.committed_workspace_write_observed |= successful_write_in_batch;
         state
@@ -3786,7 +3864,7 @@ where
             // The provider has already supplied the necessary read evidence.
             // The next request should author the mutation, not spend another
             // turn rediscovering the same files.
-            state.force_tool_allowlist_next_model = Some(required_mutation_tool_allowlist());
+            state.force_tool_allowlist_next_model = None;
         }
         if state.bounded_evidence_role
             && successful_write_in_batch
@@ -3844,7 +3922,7 @@ where
             state.consecutive_low_novelty_batches = 0;
             state.force_text_only_next_model = false;
             state.clean_terminal_synthesis_next = false;
-            state.force_tool_allowlist_next_model = Some(protocol.required_terminal_tools());
+            state.force_tool_allowlist_next_model = None;
             let mut item = ContextItem::new(
                 format!("agentic-artifact-ready:{}", ticket.node_id),
                 ContextSourceKind::ToolTrace,
@@ -3878,7 +3956,7 @@ where
             state.clean_terminal_synthesis_next = false;
             state.force_tool_allowlist_next_model = delegated_protocol_for_batch
                 .as_ref()
-                .map(DelegatedAgenticProtocolState::convergence_action_tools);
+                .map(DelegatedAgenticProtocolState::closure_tool_ids);
             if let Some(protocol) = delegated_protocol_for_batch.as_ref() {
                 let mut item = ContextItem::new(
                     format!("agentic-terminal-action-ready:{}", ticket.node_id),
@@ -4069,6 +4147,15 @@ where
                     .iter()
                     .map(|scope| format!("focus_resource_scope:{scope}")),
             )
+            .chain(
+                successful_workspace_mutation_effect
+                    .then(|| {
+                        workspace_mutation_effect_evidence_ref(
+                            u64::try_from(iteration).unwrap_or(u64::MAX).max(1),
+                        )
+                    })
+                    .into_iter(),
+            )
             .chain(agentic_progress_refs.iter().cloned())
             .collect();
         observation.evidence_delta.added = verified_evidence_refs.clone();
@@ -4131,7 +4218,7 @@ where
                     reason: error.to_string(),
                 })?;
         }
-        let intervention = if pending_delegated_action {
+        let mut intervention = if pending_delegated_action {
             Some(RuntimeIntervention {
                 goal_id: goal_id.clone(),
                 kind: RuntimeInterventionKind::Replan,
@@ -4248,6 +4335,35 @@ where
                 .transpose()?
                 .flatten()
         };
+        // A generic evidence-saturation synthesis is allowed for ordinary
+        // work, but it cannot terminate a claimed Agent Task half-way through
+        // its durable artifact/submit/review protocol. The prior behavior
+        // disabled tools here, so a model could only describe its pending
+        // submission in prose; the outer autonomy loop then re-dispatched the
+        // same claimed work in a fresh graph. Preserve all model-led research
+        // until this exact boundary, then require only the irreducible durable
+        // closure action instead of synthesizing text.
+        let protocol_closure_required = delegated_protocol_for_batch
+            .as_ref()
+            .is_some_and(|protocol| !protocol.is_terminal())
+            && intervention
+                .as_ref()
+                .is_some_and(|candidate| candidate.kind == RuntimeInterventionKind::Synthesize);
+        if protocol_closure_required {
+            let protocol = delegated_protocol_for_batch
+                .as_ref()
+                .expect("active delegated protocol was checked above");
+            intervention = Some(RuntimeIntervention {
+                goal_id: goal_id.clone(),
+                kind: RuntimeInterventionKind::Replan,
+                reason: format!(
+                    "delegated Agent Task `{}` remains {:?}; a generic text synthesis cannot preempt its durable closure action",
+                    protocol.task_id, protocol.status
+                ),
+                evidence_refs: observation.evidence_refs.clone(),
+                expected_graph_revision: None,
+            });
+        }
         if let Some(intervention) = intervention
             .as_ref()
             .filter(|intervention| intervention.kind != RuntimeInterventionKind::Continue)
@@ -4272,6 +4388,27 @@ where
             };
         let next = {
             let mut state = self.state.lock().await;
+            if protocol_closure_required {
+                let protocol = delegated_protocol_for_batch
+                    .as_ref()
+                    .expect("active delegated protocol was checked above");
+                state.force_text_only_next_model = false;
+                state.clean_terminal_synthesis_next = false;
+                state.force_tool_allowlist_next_model = Some(protocol.closure_tool_ids());
+                let mut item = ContextItem::new(
+                    format!("agentic-protocol-closure-required:{}", ticket.node_id),
+                    ContextSourceKind::Task,
+                    ContextRole::Instruction,
+                    format!(
+                        "Runtime closure boundary: exploration is complete for this Agent turn. {}",
+                        protocol.continuation_instruction()
+                    ),
+                );
+                item.authority = ContextAuthority::System;
+                item.visibility = ContextVisibility::Private;
+                item.evidence = protocol.artifact_evidence_refs.clone();
+                state.pending_next_model_context.push(item);
+            }
             let node = if let Some(answer) = orchestration_terminal_summary.as_ref() {
                 state.terminal_override = Some((GoalCompletion::Satisfied, answer.clone()));
                 let mut node = dynamic_node(
@@ -4489,5 +4626,75 @@ where
             .await
             .extend_messages(messages);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        is_local_workspace_mutation_effect, prior_workspace_mutation_sequences,
+        workspace_mutation_is_objectively_forbidden,
+    };
+    use harness_contract::{
+        policy::{PermissionOperation, PermissionResource, PermissionScope},
+        tool::{
+            ToolApprovalClass, ToolEffectDescriptor, ToolEffectKind, ToolIdempotency,
+            ToolPermissionMode,
+        },
+    };
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn planning_false_negative_cannot_deny_an_authorized_workspace_effect() {
+        assert!(!workspace_mutation_is_objectively_forbidden(
+            false,
+            ToolPermissionMode::WorkspaceWrite,
+        ));
+    }
+
+    #[test]
+    fn explicit_read_only_objective_still_denies_workspace_effects() {
+        assert!(workspace_mutation_is_objectively_forbidden(
+            true,
+            ToolPermissionMode::WorkspaceWrite,
+        ));
+        assert!(!workspace_mutation_is_objectively_forbidden(
+            true,
+            ToolPermissionMode::ReadOnly,
+        ));
+    }
+
+    #[test]
+    fn same_turn_mutation_epoch_is_visible_before_goal_event_commit() {
+        let epochs = prior_workspace_mutation_sequences([2_u64], &BTreeSet::from([1_u64, 3_u64]));
+
+        assert_eq!(epochs, BTreeSet::from([1_u64, 2_u64, 3_u64]));
+    }
+
+    #[test]
+    fn local_shell_cleanup_still_establishes_a_postcondition_epoch() {
+        let effect = ToolEffectDescriptor {
+            tool_id: "bash".to_string(),
+            descriptor_hash: "test".to_string(),
+            effect_kind: ToolEffectKind::Destructive,
+            idempotency: ToolIdempotency::Unknown,
+            scopes: vec![PermissionScope {
+                resource: PermissionResource::Shell,
+                operation: PermissionOperation::Write,
+                target: None,
+            }],
+            required_permission: ToolPermissionMode::DangerFullAccess,
+            approval_class: ToolApprovalClass::Administrator,
+            uses_network: false,
+            spawns_process: true,
+            mutates_packages: false,
+            mutates_system: false,
+            assessment: Default::default(),
+        };
+
+        assert!(is_local_workspace_mutation_effect(&effect));
+        let mut networked = effect;
+        networked.uses_network = true;
+        assert!(!is_local_workspace_mutation_effect(&networked));
     }
 }

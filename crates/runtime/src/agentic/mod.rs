@@ -7,7 +7,9 @@
 
 mod action_service;
 mod execution;
+mod ingress;
 mod program;
+mod read_model;
 mod roster;
 pub(crate) mod supervision;
 mod topic;
@@ -19,6 +21,9 @@ pub(crate) use execution::{start_agentic_claim_heartbeat, AgenticClaimHeartbeatG
 pub use execution::{AgenticDispatchContext, AgenticDispatchReceipt};
 pub use program::{
     AgentMemberProjection, AgenticArtifactProjection, AgenticCompletionRequestProjection,
-    AgenticObjectiveVerdictProjection, AgenticProgramProjection, AgenticProgramStatus,
-    AgenticTaskProjection, AgenticTaskStatus, AgenticTeamProjection, AgenticTopicEntryProjection,
+    AgenticMembershipLifecycle, AgenticMembershipProjection, AgenticObjectiveVerdictProjection,
+    AgenticProgramProjection, AgenticProgramStatus, AgenticTaskProjection, AgenticTaskRetirement,
+    AgenticTaskStatus, AgenticTeamLifecycle, AgenticTeamProjection, AgenticTopicEntryProjection,
 };
+pub(crate) use read_model::AgenticReadModel;
+pub(crate) use work_market::task_dependency_satisfied;

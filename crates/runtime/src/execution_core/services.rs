@@ -4,7 +4,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -50,10 +49,10 @@ use crate::{
     AgentRuntimeResolver, ApprovalConfig, ApprovalCoordinator, ApprovalQueue, CompiledAgentBinding,
     ConflictArbiter, DefinitionRegistryError, DurableRuntimeEvent, ExecutionGraphHost,
     InProcessAgentWorker, ManagedAgentRuntimeDispatchReport, MissionEvidenceBus, MissionRuntime,
-    MissionScheduleStore, ProcessJsonlAdapter, RealityRecallPort, RuntimeDefinitionRegistry,
-    RuntimeEventReplayer, RuntimeEventScope, RuntimeEventStore, RuntimeSessionOutboxFailureClass,
-    RuntimeSessionOutboxHealth, RuntimeSessionOutboxRecord, SessionInputRouter,
-    SessionRelationGraph,
+    MissionScheduleStore, ProcessJsonlAdapter, ProcessJsonlSpec, RealityRecallPort,
+    RuntimeDefinitionRegistry, RuntimeEventReplayer, RuntimeEventScope, RuntimeEventStore,
+    RuntimeSessionOutboxFailureClass, RuntimeSessionOutboxHealth, RuntimeSessionOutboxRecord,
+    SessionInputRouter, SessionRelationGraph,
 };
 
 #[path = "composition.rs"]
@@ -62,25 +61,6 @@ use composition::normalize_provider_fallbacks;
 
 #[path = "lifecycle_services.rs"]
 mod lifecycle_services;
-
-fn unique_agentic_packet_ref<'a>(
-    packet: &'a AgentTaskPacket,
-    prefix: &str,
-    field: &str,
-) -> Result<&'a str, String> {
-    let mut values = packet
-        .context_refs
-        .iter()
-        .filter_map(|reference| reference.strip_prefix(prefix))
-        .filter(|value| !value.trim().is_empty());
-    let value = values
-        .next()
-        .ok_or_else(|| format!("agent_actor_packet_has_no_{field}"))?;
-    if values.next().is_some() {
-        return Err(format!("agent_actor_packet_has_ambiguous_{field}"));
-    }
-    Ok(value)
-}
 
 #[derive(Debug, Error)]
 pub enum RuntimeServicesError {
@@ -114,6 +94,8 @@ pub enum RuntimeServicesError {
     Mission(String),
     #[error("task runtime initialization failed: {0}")]
     Task(String),
+    #[error("runtime composition requires injected PostgreSQL backend `{0}`")]
+    MissingBackend(&'static str),
     #[error("agent runtime initialization failed: {0}")]
     AgentRuntime(String),
     #[error("session input router was concurrently installed")]
@@ -137,6 +119,10 @@ mod tests;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionStartupRecoveryReport {
     pub examined_graphs: usize,
+    /// Graphs deliberately left untouched because their owning Session did
+    /// not finish hydration in this restoration pass.
+    #[serde(default)]
+    pub deferred_graphs: usize,
     pub recovered_graphs: usize,
     pub notified_graphs: usize,
     pub advanced_graphs: usize,
@@ -179,6 +165,7 @@ pub struct RuntimeServicesBuilder {
     provider_fallbacks: Vec<String>,
     provider_transport_pool: Arc<crate::ProviderTransportPool>,
     provider_template_cache: Arc<crate::ProviderClientTemplateCache>,
+    process_jsonl_commands: Vec<ProcessJsonlSpec>,
     tool_execution_host: Option<Arc<dyn crate::RuntimeExecutionHost>>,
     session_query_port: Option<Arc<dyn crate::SessionRuntimeQueryPort>>,
     session_ingress_port: Option<Arc<dyn crate::SessionRuntimeIngressPort>>,
@@ -821,6 +808,7 @@ pub struct RuntimeServices {
     /// durable task claim remains the cross-process owner; this local fence
     /// only suppresses duplicate reconcilers inside this service graph.
     agentic_dispatch_flights: Arc<Mutex<BTreeSet<String>>>,
+    agentic_read_model: Arc<crate::agentic::AgenticReadModel>,
     skill_catalog: Arc<RwLock<crate::RuntimeSkillCatalog>>,
     reality_recall_port: Arc<RealityRecallPort>,
     knowledge_activation: crate::knowledge_activation::KnowledgeActivationRuntime,
@@ -834,7 +822,6 @@ pub struct RuntimeServices {
     session_execution_policy_controls:
         Arc<RwLock<BTreeMap<String, crate::permissions::SessionExecutionPolicyControl>>>,
     session_execution_policy_admission_blocks: Arc<RwLock<BTreeMap<String, String>>>,
-    next_execution_bus_generation: AtomicU64,
     maintenance_supervisor: Arc<RuntimeMaintenanceSupervisor>,
     resource_evidence_writer: Arc<super::evidence_writer::ResourceEvidenceWriter>,
     execution_projection_cache: Mutex<crate::execution_projection::ExecutionProjectionCache>,
@@ -892,11 +879,13 @@ impl Drop for EvolutionEvaluationFlight {
 pub(crate) struct ActiveExecutionBusLease {
     execution_id: String,
     generation: u64,
+    bus: crate::CowdEventBus,
     buses: Arc<Mutex<BTreeMap<String, ActiveExecutionBus>>>,
 }
 
 impl Drop for ActiveExecutionBusLease {
     fn drop(&mut self) {
+        self.bus.unbind_live_telemetry_observer(self.generation);
         let mut buses = self
             .buses
             .lock()
@@ -932,6 +921,7 @@ impl RuntimeServices {
             provider_fallbacks: Vec::new(),
             provider_transport_pool: Arc::new(crate::ProviderTransportPool::default()),
             provider_template_cache: Arc::new(crate::ProviderClientTemplateCache::default()),
+            process_jsonl_commands: Vec::new(),
             tool_execution_host: None,
             session_query_port: None,
             session_ingress_port: None,
@@ -954,6 +944,24 @@ impl RuntimeServices {
         }
     }
 
+    /// Unit-test composition root with all non-durable ports selected
+    /// explicitly. Production callers continue to use [`Self::builder`] and
+    /// must inject PostgreSQL-backed owners before `build` can succeed.
+    #[cfg(test)]
+    pub(crate) fn test_builder(
+        cowd_home: impl Into<PathBuf>,
+        workspace_root: impl Into<PathBuf>,
+    ) -> RuntimeServicesBuilder {
+        let cowd_home = cowd_home.into();
+        let workspace_root = workspace_root.into();
+        Self::builder(&cowd_home, workspace_root)
+            .runtime_event_store(Arc::new(RuntimeEventStore::for_test()))
+            .artifact_store(Arc::new(crate::ArtifactStore::for_test_default(
+                cowd_home.join("test-artifacts"),
+            )))
+            .task_aggregate_service(Arc::new(crate::TaskAggregateService::for_test()))
+    }
+
     pub fn in_memory() -> Result<Arc<Self>, RuntimeServicesError> {
         let workspace_key = format!("in-memory-{}", uuid::Uuid::new_v4());
         let ephemeral_root = tempfile::Builder::new()
@@ -970,19 +978,12 @@ impl RuntimeServices {
             definition_root.join("builtin"),
             &workspace_root,
         )?);
-        let task_scope = storage::StorageScope::workspace_for_root(&workspace_root);
-        let task_handle = storage_registry
-            .endpoint_in_scope(&storage::StorageDomainId::Tasks, &task_scope)?
-            .as_handle();
-        let task_aggregate_service = Arc::new(
-            crate::TaskAggregateService::open_storage_handle(&task_handle)
-                .map_err(RuntimeServicesError::Task)?,
-        );
+        let task_aggregate_service = Arc::new(crate::TaskAggregateService::for_test());
         let services = Arc::new(Self::assemble(
             config_home,
             workspace_root,
             workspace_key.clone(),
-            Arc::new(RuntimeEventStore::try_open_in_memory()?),
+            Arc::new(RuntimeEventStore::for_test()),
             harness_contract::outcome::RuntimeBuildIdentity::unresolved_development(env!(
                 "CARGO_PKG_VERSION"
             )),
@@ -997,7 +998,7 @@ impl RuntimeServices {
             Arc::new(crate::ProviderTransportPool::default()),
             Arc::new(crate::ProviderClientTemplateCache::default()),
             None,
-            Arc::new(crate::ArtifactStore::sqlite_default(
+            Arc::new(crate::ArtifactStore::for_test_default(
                 storage_registry
                     .endpoint(&storage::StorageDomainId::Blobs)?
                     .path
@@ -1018,6 +1019,7 @@ impl RuntimeServices {
             task_aggregate_service,
             Vec::new(),
             Some(ephemeral_root),
+            false,
         )?);
         services.install_graph_settled_observer()?;
         services.agent_runtime.bind_services(Arc::clone(&services));
@@ -1028,7 +1030,8 @@ impl RuntimeServices {
             )));
         services
             .agent_runtime
-            .register_backend(Arc::new(ProcessJsonlAdapter::for_workspace(
+            .register_runtime_process_jsonl_backend(Arc::new(ProcessJsonlAdapter::for_runtime(
+                Arc::downgrade(&services),
                 services.workspace_root(),
             )));
         services
@@ -1036,10 +1039,7 @@ impl RuntimeServices {
             .block_unrecoverable_replayed_runs()
             .map_err(RuntimeServicesError::AgentRuntime)?;
         services.materialize_evolution_release_assignments()?;
-        services
-            .event_reactor
-            .start()
-            .map_err(RuntimeServicesError::Invariant)?;
+        services.start_background_reactors()?;
         Ok(services)
     }
 
@@ -1075,6 +1075,7 @@ impl RuntimeServices {
         task_aggregate_service: Arc<crate::TaskAggregateService>,
         mut projection_lanes: Vec<crate::RuntimeProjectionLane>,
         ephemeral_root: Option<tempfile::TempDir>,
+        defer_graph_producers: bool,
     ) -> Result<Self, RuntimeServicesError> {
         let assembly_started_at = Instant::now();
         let path_identity_resolver = Arc::new(
@@ -1089,6 +1090,7 @@ impl RuntimeServices {
             Arc::clone(&event_store),
             Arc::clone(&hot_state),
         );
+        let agentic_read_model = Arc::new(crate::agentic::AgenticReadModel::default());
         let model_step_executor = Arc::new(ScopedNodeExecutor::new("inline_model"));
         let tool_batch_executor = Arc::new(ScopedNodeExecutor::new("tool_batch"));
         let cross_plane_connector_executor =
@@ -1249,29 +1251,15 @@ impl RuntimeServices {
             Arc::new(crate::RuntimeExecutionSupervisor::with_capacity_profile(
                 graph_runner,
                 &execution_capacity_profile,
+                defer_graph_producers,
             ));
         executor_registry.register(Arc::new(AgenticProgramWaitExecutor::new(
-            crate::AgentActionService::new(Arc::clone(&event_store)),
+            crate::AgentActionService::new(Arc::clone(&event_store))
+                .with_read_model(Arc::clone(&agentic_read_model)),
             graph_state_store.clone(),
             Arc::downgrade(&execution_supervisor),
         )))?;
         tool_execution_plane.bind_supervisor(&execution_supervisor);
-        let deadline_supervisor = Arc::clone(&execution_supervisor);
-        let deadline_approval_coordinator = Arc::clone(&approval_coordinator);
-        approval_queue.install_deadline_scheduler(Arc::new(move |approval_id| {
-            let supervisor = Arc::clone(&deadline_supervisor);
-            let approval_coordinator = Arc::clone(&deadline_approval_coordinator);
-            Box::pin(async move {
-                approval_coordinator.notify_decision(&approval_id);
-                if let Some((graph_id, _)) =
-                    crate::execution_core::graph::executors::parse_graph_approval_id(&approval_id)
-                {
-                    if let Err(error) = supervisor.notify_graph(&graph_id).await {
-                        tracing::warn!(graph_id, %error, "approval deadline could not wake graph");
-                    }
-                }
-            })
-        }));
         let mission_runtime = Arc::new(
             MissionRuntime::event_sourced(Arc::clone(&event_store), workspace_key.clone())
                 .map_err(RuntimeServicesError::Mission)?,
@@ -1327,6 +1315,15 @@ impl RuntimeServices {
                 .ok_or_else(|| "upgrade_recovery_required".to_string())
         });
         let mission_evidence = Arc::new(MissionEvidenceBus::new(Arc::clone(&event_store)));
+        projection_lanes.push(
+            crate::evolution::collaboration_experience::CollaborationExperienceProjector::new(
+                Arc::clone(&event_store),
+                graph_state_store.clone(),
+                workspace_key.clone(),
+            )
+            .projection_lane()
+            .map_err(RuntimeServicesError::Invariant)?,
+        );
         projection_lanes.extend([
             knowledge_candidate_projector
                 .projection_lane()
@@ -1348,11 +1345,13 @@ impl RuntimeServices {
             Arc::clone(&event_store),
             graph_state_store.clone(),
             Arc::clone(&execution_supervisor),
+            Arc::clone(&agentic_read_model),
         )?);
         projection_lanes.push(agentic_program_wait_resolution_lane(
             Arc::clone(&event_store),
             graph_state_store.clone(),
             Arc::clone(&execution_supervisor),
+            Arc::clone(&agentic_read_model),
         )?);
         let event_reactor = Arc::new(
             crate::RuntimeEventReactor::sealed(Arc::clone(&event_store), projection_lanes)
@@ -1462,14 +1461,11 @@ impl RuntimeServices {
             evolution_eval_runner,
             evolution_evaluation_flights: Arc::new(Mutex::new(BTreeSet::new())),
             agentic_dispatch_flights: Arc::new(Mutex::new(BTreeSet::new())),
+            agentic_read_model,
             skill_catalog: Arc::new(RwLock::new(skill_catalog)),
             reality_recall_port,
-            knowledge_activation: knowledge_activation.unwrap_or_else(|| {
-                crate::knowledge_activation::KnowledgeActivationRuntime::for_config_home(&cowd_home)
-                    .unwrap_or_else(|_| {
-                        crate::knowledge_activation::KnowledgeActivationRuntime::new()
-                    })
-            }),
+            knowledge_activation: knowledge_activation
+                .unwrap_or_else(crate::knowledge_activation::KnowledgeActivationRuntime::new),
             session_dispatch_executor,
             session_input_router: OnceLock::new(),
             session_query_port: OnceLock::new(),
@@ -1479,7 +1475,6 @@ impl RuntimeServices {
             active_execution_buses: Arc::new(Mutex::new(BTreeMap::new())),
             session_execution_policy_controls,
             session_execution_policy_admission_blocks,
-            next_execution_bus_generation: AtomicU64::new(0),
             maintenance_supervisor: Arc::new(RuntimeMaintenanceSupervisor::new()),
             resource_evidence_writer,
             execution_projection_cache: Mutex::new(
@@ -1527,6 +1522,56 @@ impl RuntimeServices {
                 });
             })
             .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
+    }
+
+    /// Release every Runtime-owned autonomous writer only after the launcher
+    /// has hydrated Sessions and recovered Graphs and Agentic Programs in
+    /// dependency order. Keeping the event reactor and approval deadline
+    /// scheduler behind one gate prevents either subsystem from advancing
+    /// durable business state during crash recovery.
+    pub(super) fn start_background_reactors(self: &Arc<Self>) -> Result<(), RuntimeServicesError> {
+        let deadline_supervisor = Arc::clone(&self.execution_supervisor);
+        let deadline_approval_coordinator = Arc::clone(&self.approval_coordinator);
+        self.approval_queue
+            .install_deadline_scheduler(Arc::new(move |approval_id| {
+                let supervisor = Arc::clone(&deadline_supervisor);
+                let approval_coordinator = Arc::clone(&deadline_approval_coordinator);
+                Box::pin(async move {
+                    approval_coordinator.notify_decision(&approval_id);
+                    if let Some((graph_id, _)) =
+                        crate::execution_core::graph::executors::parse_graph_approval_id(
+                            &approval_id,
+                        )
+                    {
+                        if let Err(error) = supervisor.notify_graph(&graph_id).await {
+                            tracing::warn!(
+                                graph_id,
+                                %error,
+                                "approval deadline could not wake graph"
+                            );
+                        }
+                    }
+                })
+            }));
+        self.event_reactor
+            .start()
+            .map_err(RuntimeServicesError::Invariant)
+    }
+
+    pub async fn release_recovered_producers(
+        self: &Arc<Self>,
+    ) -> Result<usize, RuntimeServicesError> {
+        let recovered_graphs = self
+            .execution_supervisor
+            .release_recovered_graphs()
+            .await
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+        self.start_background_reactors()?;
+        tracing::info!(
+            recovered_graphs,
+            "ordered Runtime recovery released autonomous producers"
+        );
+        Ok(recovered_graphs)
     }
 
     pub fn install_session_ports(
@@ -2096,6 +2141,7 @@ impl RuntimeServices {
     #[must_use]
     pub fn agent_action_service(&self) -> crate::AgentActionService {
         crate::AgentActionService::new(Arc::clone(&self.event_store))
+            .with_read_model(Arc::clone(&self.agentic_read_model))
             .with_artifact_store(Arc::clone(&self.artifact_store))
     }
 
@@ -2239,16 +2285,26 @@ impl RuntimeServices {
             .validate_cohort_prompt_package()
             .map_err(|error| format!("agent_actor_packet_cohort_mismatch:{error}"))?;
 
-        let program_id = unique_agentic_packet_ref(&packet, "agentic_program:", "agentic_program")?;
-        let team_id = unique_agentic_packet_ref(&packet, "agentic_team:", "agentic_team")?;
-        let task_team_id =
-            unique_agentic_packet_ref(&packet, "agentic_task_team:", "agentic_task_team")?;
-        let agent_id = unique_agentic_packet_ref(&packet, "agentic_member:", "agentic_member")?;
-        let task_id = unique_agentic_packet_ref(&packet, "agentic_task:", "agentic_task")?;
-        let mode = unique_agentic_packet_ref(&packet, "agentic_mode:", "agentic_mode")?;
-        if !matches!(mode, "execute" | "review") {
-            return Err("agent_actor_packet_mode_invalid".to_string());
-        }
+        let agentic = packet
+            .agentic_binding
+            .as_ref()
+            .ok_or_else(|| "agent_actor_packet_has_no_typed_agentic_binding".to_string())?;
+        agentic
+            .validate()
+            .map_err(|error| format!("agent_actor_packet_agentic_binding_invalid:{error}"))?;
+        let (task_id, mode) = match &agentic.focus {
+            harness_contract::agent::AgenticExecutionFocus::TaskExecute { task_ref } => {
+                (task_ref.as_str(), "execute")
+            }
+            harness_contract::agent::AgenticExecutionFocus::TaskReview { task_ref } => {
+                (task_ref.as_str(), "review")
+            }
+            _ => return Err("agent_actor_packet_focus_cannot_mutate_task".to_string()),
+        };
+        let program_id = agentic.program_id.as_str();
+        let team_id = agentic.team_id.as_str();
+        let task_team_id = agentic.task_team_id.as_str();
+        let agent_id = agentic.agent_id.as_str();
 
         let projection = self
             .agent_action_service()
@@ -2264,12 +2320,18 @@ impl RuntimeServices {
         {
             return Err("agent_actor_program_graph_lineage_mismatch".to_string());
         }
-        let member = projection
+        let _member = projection
             .agents
             .get(agent_id)
             .ok_or_else(|| "agent_actor_is_not_in_program_roster".to_string())?;
-        if member.team_id != team_id {
+        if !projection.agent_is_active_in(agent_id, team_id) {
             return Err("agent_actor_agentic_team_mismatch".to_string());
+        }
+        if projection
+            .membership_for(agent_id, team_id)
+            .is_none_or(|membership| membership.membership_id != agentic.membership_id)
+        {
+            return Err("agent_actor_agentic_membership_mismatch".to_string());
         }
         let task = projection
             .tasks
@@ -2277,7 +2339,7 @@ impl RuntimeServices {
             .ok_or_else(|| "agent_actor_task_is_not_in_program".to_string())?;
         if task.team_id != task_team_id
             || packet.task_id() != task_id
-            || (mode == "execute" && member.team_id != task.team_id)
+            || (mode == "execute" && !projection.agent_is_active_in(agent_id, &task.team_id))
         {
             return Err("agent_actor_agentic_task_mismatch".to_string());
         }
@@ -2316,21 +2378,47 @@ impl RuntimeServices {
         &self,
         execution_id: impl Into<String>,
         bus: crate::CowdEventBus,
-    ) -> ActiveExecutionBusLease {
+    ) -> Result<ActiveExecutionBusLease, String> {
         let execution_id = execution_id.into();
         let generation = self
-            .next_execution_bus_generation
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
-        self.active_execution_buses
+            .live_execution_store
+            .allocate_model_usage_generation(&execution_id)?;
+        let mut buses = self
+            .active_execution_buses
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(execution_id.clone(), ActiveExecutionBus { generation, bus });
-        ActiveExecutionBusLease {
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if buses
+            .get(&execution_id)
+            .is_some_and(|active| active.generation >= generation)
+        {
+            return Err(format!(
+                "stale execution bus generation {generation} cannot replace the active binding for `{execution_id}`"
+            ));
+        }
+        let live_execution_store = Arc::clone(&self.live_execution_store);
+        bus.bind_live_telemetry_observer(generation, move |event: &crate::CowdEvent| {
+            if let Some(context) = event.execution_context() {
+                live_execution_store.observe_event_with_generation(
+                    &context.session_id,
+                    event,
+                    generation,
+                );
+            }
+        });
+        buses.insert(
+            execution_id.clone(),
+            ActiveExecutionBus {
+                generation,
+                bus: bus.clone(),
+            },
+        );
+        drop(buses);
+        Ok(ActiveExecutionBusLease {
             execution_id,
             generation,
+            bus,
             buses: Arc::clone(&self.active_execution_buses),
-        }
+        })
     }
 
     #[must_use]
@@ -2582,15 +2670,38 @@ impl RuntimeServices {
         Ok(Some(receipt))
     }
 
-    /// Resolve durable cancellation intents left behind by a process crash.
-    /// Missing executions remain Requested; absence of a process-local token
-    /// is never treated as proof that work is terminal.
+    /// Resolve durable cancellation intents and replay a committed winner's
+    /// derived live projection after a process crash. Missing executions stay
+    /// Requested; absence of a process-local token is never proof of terminal.
     pub fn reconcile_requested_cancellations(
         &self,
         limit: usize,
     ) -> Result<Vec<harness_contract::turn::CancellationReceipt>, RuntimeServicesError> {
         let mut finalized = Vec::new();
-        for receipt in self.pending_cancellation_receipts(limit)? {
+        let candidates = self
+            .latest_cancellation_receipts()?
+            .into_iter()
+            .filter(|receipt| {
+                if receipt.execution_id.is_empty() {
+                    return false;
+                }
+                match receipt.status {
+                    harness_contract::turn::CancellationStatus::Requested => true,
+                    harness_contract::turn::CancellationStatus::Cancelled => {
+                        let terminal_ref = format!("cancellation:{}", receipt.cancellation_id);
+                        self.execution_live(&receipt.execution_id)
+                            .is_none_or(|live| {
+                                live.status
+                                    != harness_contract::projection::ExecutionLiveStatus::Cancelled
+                                    || live.terminal_ref.as_deref() != Some(terminal_ref.as_str())
+                            })
+                    }
+                    harness_contract::turn::CancellationStatus::AlreadyTerminal => false,
+                }
+            })
+            .take(limit)
+            .collect::<Vec<_>>();
+        for receipt in candidates {
             if let Some(receipt) = self.resolve_requested_cancellation(&receipt.cancellation_id)? {
                 finalized.push(receipt);
             }
@@ -2605,10 +2716,25 @@ impl RuntimeServices {
         let Some(mut receipt) = self.cancellation_receipt(cancellation_id)? else {
             return Ok(None);
         };
+        if receipt.status == harness_contract::turn::CancellationStatus::Requested
+            && (receipt.execution_id.is_empty() || receipt.turn_id.is_empty())
+        {
+            // A cancellation against a Session with no execution target has
+            // a deterministic durable outcome. It never needs a synthetic
+            // live record or process-local cancellation side effect.
+            receipt.status = harness_contract::turn::CancellationStatus::AlreadyTerminal;
+            receipt.effective_at_ms = Some(now_ms());
+            receipt.journal_sequence = 0;
+            receipt.projection_revision = 0;
+            return self.commit_cancellation_receipt(receipt).map(Some);
+        }
         if receipt.status != harness_contract::turn::CancellationStatus::Requested {
+            if receipt.status == harness_contract::turn::CancellationStatus::Cancelled {
+                self.finalize_committed_cancellation(&receipt)?;
+            }
             return Ok(Some(receipt));
         }
-        let Some(live) = self.execution_live(&receipt.execution_id) else {
+        let Some(_live) = self.execution_live(&receipt.execution_id) else {
             // A concurrent finalizer releases the live winner checkpoint only
             // after committing the final receipt. Re-read that durable stream
             // before declaring the intent unresolved.
@@ -2617,43 +2743,45 @@ impl RuntimeServices {
                 winner.status != harness_contract::turn::CancellationStatus::Requested
             }));
         };
-        let status = if live.status == harness_contract::projection::ExecutionLiveStatus::Cancelled
-        {
-            harness_contract::turn::CancellationStatus::Cancelled
-        } else if live.status.is_terminal() {
-            harness_contract::turn::CancellationStatus::AlreadyTerminal
-        } else if self
-            .try_cancel_live_execution(
+        let cancellation_ref = format!("cancellation:{cancellation_id}");
+        // The request timestamp is immutable across Requested -> Cancelled
+        // receipt revisions, so a post-commit crash can recover the exact
+        // pending claim. A ledger cursor changes at final commit and therefore
+        // cannot serve as the cancellation claim epoch.
+        let claim_generation = receipt.requested_at_ms.max(1);
+        let (status, finalize_cancellation) = match self
+            .live_execution_store
+            .claim_terminal(
                 &receipt.execution_id,
-                receipt
-                    .reason
-                    .clone()
-                    .unwrap_or_else(|| "user_requested".to_string()),
+                cancellation_ref.clone(),
+                harness_contract::projection::ExecutionLiveStatus::Cancelled,
+                claim_generation,
             )
             .map_err(RuntimeServicesError::Invariant)?
         {
-            harness_contract::turn::CancellationStatus::Cancelled
-        } else {
-            // Another finalizer can win the live CAS just before this call.
-            // Re-read the winner projection: either writer may now commit the
-            // same final receipt, and the event-stream CAS below makes that
-            // commit exactly once.
-            match self.execution_live(&receipt.execution_id) {
-                Some(winner)
-                    if winner.status
-                        == harness_contract::projection::ExecutionLiveStatus::Cancelled =>
-                {
-                    harness_contract::turn::CancellationStatus::Cancelled
-                }
-                Some(winner) if winner.status.is_terminal() => {
-                    harness_contract::turn::CancellationStatus::AlreadyTerminal
-                }
-                _ => {
-                    let winner = self.cancellation_receipt(cancellation_id)?;
-                    return Ok(winner.filter(|winner| {
-                        winner.status != harness_contract::turn::CancellationStatus::Requested
-                    }));
-                }
+            crate::execution_live::TerminalFenceClaim::Claimed
+            | crate::execution_live::TerminalFenceClaim::SamePending => {
+                (harness_contract::turn::CancellationStatus::Cancelled, true)
+            }
+            crate::execution_live::TerminalFenceClaim::SameTerminal => {
+                (harness_contract::turn::CancellationStatus::Cancelled, false)
+            }
+            crate::execution_live::TerminalFenceClaim::ConflictingTerminal => (
+                harness_contract::turn::CancellationStatus::AlreadyTerminal,
+                false,
+            ),
+            crate::execution_live::TerminalFenceClaim::ConflictingPending => {
+                // Completion has prepared its reversible claim. Keep the
+                // durable Requested receipt for reconciliation; whichever
+                // durable carrier commits first will finalize the shared
+                // live arbitration slot.
+                return Ok(None);
+            }
+            crate::execution_live::TerminalFenceClaim::MissingExecution => {
+                let winner = self.cancellation_receipt(cancellation_id)?;
+                return Ok(winner.filter(|winner| {
+                    winner.status != harness_contract::turn::CancellationStatus::Requested
+                }));
             }
         };
         receipt.status = status;
@@ -2661,13 +2789,79 @@ impl RuntimeServices {
         receipt.journal_sequence = 0;
         receipt.projection_revision = 0;
         let receipt = self.commit_cancellation_receipt(receipt)?;
-        self.release_live_terminal_fence(&receipt.execution_id);
+        if finalize_cancellation {
+            self.finalize_committed_cancellation(&receipt)?;
+        }
         Ok(Some(receipt))
+    }
+
+    fn finalize_committed_cancellation(
+        &self,
+        receipt: &harness_contract::turn::CancellationReceipt,
+    ) -> Result<(), RuntimeServicesError> {
+        if receipt.status != harness_contract::turn::CancellationStatus::Cancelled {
+            return Ok(());
+        }
+        if self.execution_live(&receipt.execution_id).is_none() {
+            self.record_live_execution(
+                &receipt.session_id,
+                receipt.execution_id.clone(),
+                receipt.turn_id.clone(),
+            );
+        }
+        let cancellation_ref = format!("cancellation:{}", receipt.cancellation_id);
+        let claim_generation = receipt.requested_at_ms.max(1);
+        match self
+            .live_execution_store
+            .claim_terminal(
+                &receipt.execution_id,
+                cancellation_ref.clone(),
+                harness_contract::projection::ExecutionLiveStatus::Cancelled,
+                claim_generation,
+            )
+            .map_err(RuntimeServicesError::Invariant)?
+        {
+            crate::execution_live::TerminalFenceClaim::Claimed
+            | crate::execution_live::TerminalFenceClaim::SamePending => match self
+                .live_execution_store
+                .finalize_terminal(
+                    &receipt.execution_id,
+                    &cancellation_ref,
+                    harness_contract::projection::ExecutionLiveStatus::Cancelled,
+                    claim_generation,
+                )
+                .map_err(RuntimeServicesError::Invariant)?
+            {
+                crate::execution_live::TerminalFenceClaim::Claimed
+                | crate::execution_live::TerminalFenceClaim::SameTerminal => Ok(()),
+                other => Err(RuntimeServicesError::Invariant(format!(
+                    "durable cancellation committed but live finalization returned {other:?}"
+                ))),
+            },
+            crate::execution_live::TerminalFenceClaim::SameTerminal => Ok(()),
+            other => Err(RuntimeServicesError::Invariant(format!(
+                "durable cancellation conflicts with live terminal arbitration: {other:?}"
+            ))),
+        }
     }
 
     pub fn pending_cancellation_receipts(
         &self,
         limit: usize,
+    ) -> Result<Vec<harness_contract::turn::CancellationReceipt>, RuntimeServicesError> {
+        Ok(self
+            .latest_cancellation_receipts()?
+            .into_iter()
+            .filter(|receipt| {
+                receipt.status == harness_contract::turn::CancellationStatus::Requested
+                    && !receipt.execution_id.is_empty()
+            })
+            .take(limit)
+            .collect())
+    }
+
+    fn latest_cancellation_receipts(
+        &self,
     ) -> Result<Vec<harness_contract::turn::CancellationReceipt>, RuntimeServicesError> {
         const PAGE_SIZE: usize = 256;
         let mut latest =
@@ -2704,14 +2898,7 @@ impl RuntimeServices {
                 break;
             }
         }
-        Ok(latest
-            .into_values()
-            .filter(|receipt| {
-                receipt.status == harness_contract::turn::CancellationStatus::Requested
-                    && !receipt.execution_id.is_empty()
-            })
-            .take(limit)
-            .collect())
+        Ok(latest.into_values().collect())
     }
 
     pub fn latest_cancellation_receipt_for_execution(
@@ -2775,7 +2962,9 @@ impl RuntimeServices {
         self.live_execution_store.observe_event(session_id, event);
     }
 
-    pub fn complete_live_execution(
+    /// Direct lifecycle completion for delegated Agent executions. Session
+    /// roots must use the durable delivery claim/finalize protocol instead.
+    pub(crate) fn complete_agent_live_execution(
         &self,
         execution_id: &str,
         report: &harness_contract::context::ContextTurnReport,
@@ -2786,36 +2975,73 @@ impl RuntimeServices {
             .complete(execution_id, report, write_attempt_paths, terminal_ref);
     }
 
-    /// Re-establish the terminal live projection from an already materialized
-    /// Session terminal during durable replay. Detailed metrics remain those
-    /// captured by the last live checkpoint; the terminal carrier is the
-    /// authority for completion.
-    pub fn complete_recovered_live_execution(&self, execution_id: &str, terminal_ref: String) {
-        let _ = self.try_complete_recovered_live_execution(execution_id, terminal_ref);
-    }
-
-    pub fn try_complete_recovered_live_execution(
-        &self,
-        execution_id: &str,
-        terminal_ref: String,
-    ) -> bool {
-        self.live_execution_store
-            .complete_recovered(execution_id, terminal_ref)
-    }
-
     pub fn claim_live_terminal_fence(
         &self,
         execution_id: &str,
         terminal_ref: String,
         status: harness_contract::projection::ExecutionLiveStatus,
+        session_generation: u64,
     ) -> Result<crate::execution_live::TerminalFenceClaim, String> {
-        self.live_execution_store
-            .claim_terminal(execution_id, terminal_ref, status)
+        self.live_execution_store.claim_terminal(
+            execution_id,
+            terminal_ref,
+            status,
+            session_generation,
+        )
     }
 
-    /// Release the temporary durable live winner only after its canonical
-    /// terminal carrier (Session transcript/outbox or cancellation receipt)
-    /// has committed. Before that boundary it is the crash-recovery fence.
+    pub fn finalize_live_terminal_fence(
+        &self,
+        execution_id: &str,
+        terminal_ref: &str,
+        status: harness_contract::projection::ExecutionLiveStatus,
+        session_generation: u64,
+    ) -> Result<crate::execution_live::TerminalFenceClaim, String> {
+        self.live_execution_store.finalize_terminal(
+            execution_id,
+            terminal_ref,
+            status,
+            session_generation,
+        )
+    }
+
+    /// Add the full Runtime report to an already-finalized Session terminal.
+    /// The store verifies status and terminal identity and cannot perform a
+    /// lifecycle transition through this API.
+    pub fn enrich_finalized_session_live(
+        &self,
+        execution_id: &str,
+        expected_status: harness_contract::projection::ExecutionLiveStatus,
+        terminal_ref: String,
+        report: &harness_contract::context::ContextTurnReport,
+        write_attempt_paths: &[String],
+        error: Option<String>,
+    ) -> Result<(), String> {
+        self.live_execution_store.enrich_finalized_session_terminal(
+            execution_id,
+            expected_status,
+            terminal_ref,
+            report,
+            write_attempt_paths,
+            error,
+        )
+    }
+
+    pub fn abort_live_terminal_fence(
+        &self,
+        execution_id: &str,
+        terminal_ref: &str,
+        session_generation: u64,
+    ) -> Result<bool, String> {
+        self.live_execution_store.abort_terminal_claim(
+            execution_id,
+            terminal_ref,
+            session_generation,
+        )
+    }
+
+    /// Release the derived live checkpoint only after its canonical Session
+    /// terminal has committed and the live projection has finalized.
     pub fn release_live_terminal_fence(&self, execution_id: &str) {
         if !execution_id.trim().is_empty() {
             self.live_execution_store
@@ -2823,11 +3049,13 @@ impl RuntimeServices {
         }
     }
 
-    pub fn fail_live_execution(&self, execution_id: &str, error: String) {
+    /// Direct lifecycle failure for delegated Agent executions only.
+    pub(crate) fn fail_agent_live_execution(&self, execution_id: &str, error: String) {
         self.live_execution_store.fail(execution_id, error);
     }
 
-    pub fn block_live_execution(
+    /// Direct lifecycle blocking for delegated Agent executions only.
+    pub(crate) fn block_agent_live_execution(
         &self,
         execution_id: &str,
         report: &harness_contract::context::ContextTurnReport,
@@ -2847,7 +3075,7 @@ impl RuntimeServices {
     /// Atomically claim cancellation as the live terminal winner. A concurrent
     /// normal terminal transition uses the same sharded record lock; exactly
     /// one transition can leave a non-terminal state.
-    pub fn try_cancel_live_execution(
+    pub(crate) fn try_cancel_agent_live_execution(
         &self,
         execution_id: &str,
         detail: String,
@@ -2855,8 +3083,9 @@ impl RuntimeServices {
         self.live_execution_store.cancel(execution_id, detail)
     }
 
-    pub fn cancel_live_execution(&self, execution_id: &str, detail: String) {
-        let _ = self.try_cancel_live_execution(execution_id, detail);
+    /// Direct lifecycle cancellation for delegated Agent executions only.
+    pub(crate) fn cancel_agent_live_execution(&self, execution_id: &str, detail: String) {
+        let _ = self.try_cancel_agent_live_execution(execution_id, detail);
     }
 
     #[must_use]
@@ -2865,6 +3094,14 @@ impl RuntimeServices {
         execution_id: &str,
     ) -> Option<harness_contract::projection::ExecutionLiveState> {
         self.live_execution_store.execution_live(execution_id)
+    }
+
+    #[must_use]
+    pub(crate) fn execution_model_usage_snapshot(
+        &self,
+        execution_id: &str,
+    ) -> Option<crate::execution_live::ExecutionModelUsageSnapshot> {
+        self.live_execution_store.model_usage_snapshot(execution_id)
     }
 
     #[must_use]
@@ -2962,6 +3199,18 @@ impl RuntimeServices {
     }
     pub fn agent_runtime(&self) -> &Arc<AgentRuntime> {
         &self.agent_runtime
+    }
+
+    /// Install an immutable ProcessJsonl command manifest before compiling
+    /// Agent work that references it. The manifest digest is checked again
+    /// against the frozen Agent Binding at execution time.
+    pub(crate) fn register_process_jsonl_command(
+        &self,
+        spec: ProcessJsonlSpec,
+    ) -> Result<(), RuntimeServicesError> {
+        self.agent_runtime
+            .register_process_jsonl_command(spec)
+            .map_err(RuntimeServicesError::AgentRuntime)
     }
 
     pub(crate) fn agentic_dispatch_flights(&self) -> Arc<Mutex<BTreeSet<String>>> {
@@ -3730,6 +3979,7 @@ impl RuntimeServices {
                 &binding.definition_ref,
                 &evaluation.candidate_id,
                 &evaluation.scenario_ref,
+                evaluation.role,
             )
             .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
     }
@@ -3861,23 +4111,45 @@ impl RuntimeServices {
     }
 }
 
-/// Evaluation evidence must never create an untracked external side effect.
-/// Runtime has a dedicated mutation-sandbox design for future code-change
-/// scenarios; until that executor exists, paired Definition evaluation is
-/// deliberately read-only.  Skills are excluded because a Skill may contain
-/// arbitrary multi-language executable assets and has no per-invocation
-/// effect receipt yet.
+/// Evaluation work uses the normal tool/Skill execution plane, but only after
+/// Runtime has frozen an explicit resource ceiling. Mutating tools are safe
+/// here because each side receives a distinct output lease and every effect
+/// still crosses the scoped ToolHost receipt/fence boundary.
 fn validate_evolution_scenario_isolation(
     scenario: &EvaluationScenarioSpec,
     tool_host: Option<&dyn crate::RuntimeExecutionHost>,
+    skill_catalog: &crate::RuntimeSkillCatalog,
 ) -> Result<(), RuntimeServicesError> {
-    if !scenario.allowed_skills.is_empty() {
-        return Err(RuntimeServicesError::Invariant(
-            "paired evolution evaluation cannot execute Skills until a fenced Skill executor is installed"
-                .to_string(),
-        ));
+    let shared_write_scopes = scenario
+        .resource_scopes
+        .iter()
+        .filter(|scope| scope.starts_with("write:") || scope.starts_with("workspace:"))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !shared_write_scopes.is_empty() {
+        return Err(RuntimeServicesError::Invariant(format!(
+            "paired evolution scenario cannot share writable input scopes: {}",
+            shared_write_scopes.join(", ")
+        )));
     }
-    let unsafe_tools = scenario
+    let installed_skills = skill_catalog
+        .profiles()
+        .into_iter()
+        .map(|profile| profile.skill_id)
+        .collect::<BTreeSet<_>>();
+    let missing_skills = scenario
+        .allowed_skills
+        .iter()
+        .filter(|skill| !installed_skills.contains(*skill))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing_skills.is_empty() {
+        return Err(RuntimeServicesError::Invariant(format!(
+            "paired evolution evaluation has unavailable Skills: {}",
+            missing_skills.join(", ")
+        )));
+    }
+    let unknown_tools = scenario
         .allowed_tools
         .iter()
         .filter(|tool| {
@@ -3885,17 +4157,14 @@ fn validate_evolution_scenario_isolation(
                 .and_then(|host| {
                     host.delegated_tool_effect_descriptor(tool, &serde_json::json!({}))
                 })
-                .is_none_or(|effect| {
-                    crate::ToolSafetyCategory::from_effect(&effect)
-                        != crate::ToolSafetyCategory::ReadOnly
-                })
+                .is_none()
         })
         .cloned()
         .collect::<Vec<_>>();
-    if !unsafe_tools.is_empty() {
+    if !unknown_tools.is_empty() {
         return Err(RuntimeServicesError::Invariant(format!(
-            "paired evolution evaluation permits only read-only tools; unsafe tools: {}",
-            unsafe_tools.join(", ")
+            "paired evolution evaluation has tools without an enforceable effect descriptor: {}",
+            unknown_tools.join(", ")
         )));
     }
     Ok(())
@@ -3918,6 +4187,7 @@ fn agentic_program_wait_resolution_lane(
     event_store: Arc<RuntimeEventStore>,
     graph_store: ExecutionGraphStateStore,
     supervisor: Arc<crate::RuntimeExecutionSupervisor>,
+    read_model: Arc<crate::agentic::AgenticReadModel>,
 ) -> Result<crate::RuntimeProjectionLane, RuntimeServicesError> {
     let descriptor = crate::RuntimeProjectionDescriptor::new(
         AGENTIC_PROGRAM_WAIT_RESOLVER_PROJECTION_ID,
@@ -3941,6 +4211,7 @@ fn agentic_program_wait_resolution_lane(
             let event_store = Arc::clone(&event_store);
             let graph_store = graph_store.clone();
             let supervisor = Arc::clone(&supervisor);
+            let read_model = Arc::clone(&read_model);
             Box::pin(async move {
                 let checkpoint = event_store
                     .projection_checkpoint(AGENTIC_PROGRAM_WAIT_RESOLVER_PROJECTION_ID)
@@ -3991,7 +4262,8 @@ fn agentic_program_wait_resolution_lane(
                         }
                     }
                 }
-                let actions = crate::AgentActionService::new(Arc::clone(&event_store));
+                let actions = crate::AgentActionService::new(Arc::clone(&event_store))
+                    .with_read_model(read_model);
                 let objective_supervisor =
                     crate::execution_core::goal::ObjectiveSupervisor::new(Arc::new(
                         crate::execution_core::goal::GoalStore::new(Arc::clone(&event_store)),
@@ -4041,6 +4313,7 @@ fn agentic_settled_graph_resolution_lane(
     event_store: Arc<RuntimeEventStore>,
     graph_store: ExecutionGraphStateStore,
     supervisor: Arc<crate::RuntimeExecutionSupervisor>,
+    read_model: Arc<crate::agentic::AgenticReadModel>,
 ) -> Result<crate::RuntimeProjectionLane, RuntimeServicesError> {
     let descriptor = crate::RuntimeProjectionDescriptor::new(
         AGENTIC_SETTLED_GRAPH_RESOLVER_PROJECTION_ID,
@@ -4058,6 +4331,7 @@ fn agentic_settled_graph_resolution_lane(
             let event_store = Arc::clone(&event_store);
             let graph_store = graph_store.clone();
             let supervisor = Arc::clone(&supervisor);
+            let read_model = Arc::clone(&read_model);
             Box::pin(async move {
                 let checkpoint = event_store
                     .projection_checkpoint(AGENTIC_SETTLED_GRAPH_RESOLVER_PROJECTION_ID)
@@ -4098,7 +4372,8 @@ fn agentic_settled_graph_resolution_lane(
                 // A graph may settle before or after its Program root commits the
                 // durable wait. Reconcile both the transitioned graph and its
                 // linked Agent children so either event order closes the barrier.
-                let actions = crate::AgentActionService::new(Arc::clone(&event_store));
+                let actions = crate::AgentActionService::new(Arc::clone(&event_store))
+                    .with_read_model(read_model);
                 for graph_id in &touched_graphs {
                     crate::execution_core::graph::executors::reconcile_agentic_program_wait_for_settled_graph(
                     graph_id,

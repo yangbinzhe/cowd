@@ -1697,7 +1697,7 @@ func (s *Server) Start() error {
 
     // -----------------------------------------------------------------------
     // T2: Symbol storage tests
-    //    (implemented in store/sqlite.rs #[cfg(test)] module)
+    //    (covered by the explicit process-local test store)
     // -----------------------------------------------------------------------
 
     // -----------------------------------------------------------------------
@@ -1826,11 +1826,11 @@ fn foo() -> i32 {
 
     #[tokio::test]
     async fn test_impact_analysis_returns_callers() {
-        use crate::store::sqlite::SqliteStore;
+        use crate::store::EphemeralMemoryStore;
         use crate::store::MemoryStore;
 
         let tmp = tempfile::TempDir::new().unwrap();
-        let sqlite = SqliteStore::open_path(&tmp.path().join("impact.db")).unwrap();
+        let store = EphemeralMemoryStore::new();
 
         let caller = CodeSymbol {
             id: "a.rs:caller_fn:1".into(),
@@ -1851,8 +1851,8 @@ fn foo() -> i32 {
             doc: None,
         };
 
-        sqlite.insert_symbol(&caller).await.unwrap();
-        sqlite.insert_symbol(&callee).await.unwrap();
+        store.insert_symbol(&caller).await.unwrap();
+        store.insert_symbol(&callee).await.unwrap();
 
         let edge = SymbolEdge {
             source_id: "a.rs:caller_fn:1".into(),
@@ -1860,12 +1860,12 @@ fn foo() -> i32 {
             edge_type: SymbolEdgeType::Calls,
             file_path: "a.rs".into(),
         };
-        sqlite
+        store
             .index_file_symbols("a.rs", &[caller.clone(), callee.clone()], &[edge])
             .unwrap();
 
         // Wrap in Arc<dyn MemoryStore> for CodeIndexer
-        let store: std::sync::Arc<dyn MemoryStore> = std::sync::Arc::new(sqlite);
+        let store: std::sync::Arc<dyn MemoryStore> = std::sync::Arc::new(store);
 
         let dir = tempfile::TempDir::new().unwrap();
         let indexer = CodeIndexer::new(dir.path()).unwrap().with_store(store);

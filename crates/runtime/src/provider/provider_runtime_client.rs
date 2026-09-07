@@ -251,6 +251,10 @@ pub struct ProviderRequestContext {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderRequestEvidenceContext {
     pub session_id: String,
+    /// Runtime execution that owns this physical Provider attempt.
+    pub execution_id: String,
+    /// Turn epoch that owns this physical Provider attempt.
+    pub turn_id: String,
     pub request_sequence: usize,
     pub request_compiler_cache_hit: bool,
     pub budget: crate::context_ledger::RequestBudgetReport,
@@ -271,6 +275,9 @@ pub struct ProviderAttemptOutcomeEvidence {
     pub logical_attempt: u32,
     pub terminal_status: String,
     pub usage: Option<TokenUsage>,
+    /// True only when the Provider explicitly returned cache dimensions. A
+    /// numeric zero without this receipt is not evidence of a cache miss.
+    pub cache_dimensions_observed: bool,
 }
 
 #[async_trait::async_trait]
@@ -328,10 +335,8 @@ struct ProviderPromptHistory {
     /// journal even when the conversational transcript itself is unchanged.
     immutable_prefix: Vec<InputMessage>,
     session_history: Vec<InputMessage>,
-    /// Exact model-visible messages sent on the last request, including each
-    /// Runtime capsule before the Provider output it governed.
-    wire_messages: Vec<InputMessage>,
-    last_request_context: Vec<InputMessage>,
+    /// Diagnostic generation for a changed immutable prefix or rewritten
+    /// transcript. Request-local Runtime context is deliberately not stored.
     generation: u64,
 }
 
@@ -1102,18 +1107,17 @@ impl ProviderRuntimeClient {
             .prompt
             .cache_cohort_user_prefix_messages()
             .into_iter()
+            .chain(request.prompt.immutable_user_prefix_messages())
             .map(InputMessage::user_text)
             .collect::<Vec<_>>();
-        // Keep cohort-wide immutable material at the beginning of the
-        // model-visible stream, but defer role-private material until after
-        // append-only history. Sibling Agents therefore share the longest
-        // real prefix possible; a different role brief cannot invalidate the
-        // common Team/program cache segment.
+        // Keep all immutable material before append-only history. Sibling
+        // Agents still share the cohort portion, while each Agent's private
+        // role brief becomes a stable prefix for all of its continuations.
+        // Moving that brief behind history makes every new assistant/tool
+        // message splice in front of it and destroys provider prefix reuse.
         let context = request
             .prompt
-            .immutable_user_prefix_messages()
-            .into_iter()
-            .chain(request.prompt.contextual_messages())
+            .contextual_messages()
             .into_iter()
             .map(InputMessage::user_text)
             .collect::<Vec<_>>();
@@ -1133,51 +1137,22 @@ fn compile_provider_input_messages(
 ) -> Vec<InputMessage> {
     if immutable_prefix != state.immutable_prefix {
         state.generation = state.generation.saturating_add(1);
-        state.session_history.clear();
-        state.wire_messages.clear();
-        state.last_request_context.clear();
     }
-    let append_only = history.starts_with(&state.session_history);
-    let context_unchanged = context == state.last_request_context;
-    let mut wire = if append_only {
-        state.wire_messages.clone()
-    } else {
+    if !history.starts_with(&state.session_history) {
         state.generation = state.generation.saturating_add(1);
-        Vec::new()
-    };
-    if wire.is_empty() {
-        wire.extend(immutable_prefix.iter().cloned());
     }
-    if append_only {
-        wire.extend_from_slice(&history[state.session_history.len()..]);
-    } else {
-        wire.extend_from_slice(&history);
-    }
-    // Append only a changed context suffix. Repeating an unchanged role brief
-    // after every assistant turn needlessly grows the prompt and makes the
-    // cache cohort pay for duplicate bytes; a changed runtime capsule still
-    // follows the latest history exactly once.
-    if !context_unchanged || wire.is_empty() {
-        wire.extend(context_delta(&state.last_request_context, &context));
-    }
+    // Provider input is rebuilt from canonical sources on every request:
+    // stable cohort material first, the actual append-only conversation next,
+    // and exactly one current Runtime capsule at the tail. Dynamic clock,
+    // policy, evidence, and checkpoint messages never become history, so old
+    // capsules cannot accumulate or invalidate the reusable prefix.
+    let mut wire = Vec::with_capacity(immutable_prefix.len() + history.len() + context.len());
+    wire.extend(immutable_prefix.iter().cloned());
+    wire.extend(history.iter().cloned());
+    wire.extend(context);
     state.session_history = history;
     state.immutable_prefix = immutable_prefix;
-    state.wire_messages.clone_from(&wire);
-    state.last_request_context = context;
     wire
-}
-
-fn context_delta(previous: &[InputMessage], current: &[InputMessage]) -> Vec<InputMessage> {
-    let common = previous
-        .iter()
-        .zip(current.iter())
-        .take_while(|(left, right)| left == right)
-        .count();
-    if common == current.len() {
-        Vec::new()
-    } else {
-        current[common..].to_vec()
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1285,6 +1260,7 @@ async fn forward_provider_attempt(
     }
     let request_guard = transport_pool.begin_request();
     let mut attempt_usage = None;
+    let mut attempt_cache_dimensions_observed = false;
     let stream_result = forward_provider_stream(
         &entry.client,
         &message_request,
@@ -1295,6 +1271,7 @@ async fn forward_provider_attempt(
         transport_activity,
         &sender,
         &mut attempt_usage,
+        &mut attempt_cache_dimensions_observed,
     )
     .await;
     // Provider transport capacity is unrelated to disk-cache persistence.
@@ -1315,6 +1292,7 @@ async fn forward_provider_attempt(
                     logical_attempt: context.attempt,
                     terminal_status: terminal_status.to_string(),
                     usage: attempt_usage,
+                    cache_dimensions_observed: attempt_cache_dimensions_observed,
                 },
             )
             .await
@@ -1528,6 +1506,7 @@ async fn forward_provider_stream(
     transport_activity: provider::TransportActivity,
     sender: &tokio::sync::mpsc::Sender<Result<AssistantEvent, RuntimeError>>,
     attempt_usage: &mut Option<TokenUsage>,
+    attempt_cache_dimensions_observed: &mut bool,
 ) -> Result<ForwardedProviderStream, ProviderStreamError> {
     let mut stream = client
         .stream_message(message_request)
@@ -1539,6 +1518,7 @@ async fn forward_provider_stream(
     let mut emitted = false;
     let mut provider_model_emitted = false;
     let mut pending_text = String::new();
+    let mut cumulative_usage = None;
 
     while let Some(event) = stream
         .next_event()
@@ -1585,6 +1565,15 @@ async fn forward_provider_stream(
                     .await
                 {
                     return Ok(ForwardedProviderStream::ConsumerDropped);
+                }
+                if start.message.usage_observed {
+                    let usage = merge_provider_usage_max(
+                        cumulative_usage,
+                        start.message.usage.token_usage(),
+                    );
+                    cumulative_usage = Some(usage);
+                    *attempt_usage = Some(usage);
+                    *attempt_cache_dimensions_observed |= start.message.cache_dimensions_observed;
                 }
             }
             ApiStreamEvent::ContentBlockStart(start) => {
@@ -1723,18 +1712,12 @@ async fn forward_provider_stream(
                 {
                     return Ok(ForwardedProviderStream::ConsumerDropped);
                 }
-                let usage = delta.usage.token_usage();
-                *attempt_usage = Some(usage);
-                if !forward_event(
-                    sender,
-                    AssistantEvent::Usage(usage),
-                    emit_output,
-                    &stream_callback,
-                    &mut emitted,
-                )
-                .await
-                {
-                    return Ok(ForwardedProviderStream::ConsumerDropped);
+                if delta.usage_observed {
+                    let usage =
+                        merge_provider_usage_max(cumulative_usage, delta.usage.token_usage());
+                    cumulative_usage = Some(usage);
+                    *attempt_usage = Some(usage);
+                    *attempt_cache_dimensions_observed |= delta.cache_dimensions_observed;
                 }
             }
             ApiStreamEvent::MessageStop(_) => {
@@ -1748,6 +1731,19 @@ async fn forward_provider_stream(
                 .await
                 {
                     return Ok(ForwardedProviderStream::ConsumerDropped);
+                }
+                if let Some(usage) = cumulative_usage {
+                    if !forward_event(
+                        sender,
+                        AssistantEvent::Usage(usage),
+                        emit_output,
+                        &stream_callback,
+                        &mut emitted,
+                    )
+                    .await
+                    {
+                        return Ok(ForwardedProviderStream::ConsumerDropped);
+                    }
                 }
                 saw_stop = true;
                 // Runtime terminal publication is deliberately delayed until
@@ -1789,7 +1785,10 @@ async fn forward_provider_stream(
         })
         .await
         .map_err(|error| ProviderStreamError { error })?;
-    *attempt_usage = Some(response.usage.token_usage());
+    if response.usage_observed {
+        *attempt_usage = Some(response.usage.token_usage());
+        *attempt_cache_dimensions_observed = response.cache_dimensions_observed;
+    }
     let mut events = response_to_events(response);
     events.retain(|event| !matches!(event, AssistantEvent::MessageStop));
     events.insert(
@@ -1802,6 +1801,20 @@ async fn forward_provider_stream(
         Ok(ForwardedProviderStream::Completed)
     } else {
         Ok(ForwardedProviderStream::ConsumerDropped)
+    }
+}
+
+fn merge_provider_usage_max(current: Option<TokenUsage>, next: TokenUsage) -> TokenUsage {
+    let current = current.unwrap_or_default();
+    TokenUsage {
+        input_tokens: current.input_tokens.max(next.input_tokens),
+        output_tokens: current.output_tokens.max(next.output_tokens),
+        cache_creation_input_tokens: current
+            .cache_creation_input_tokens
+            .max(next.cache_creation_input_tokens),
+        cache_read_input_tokens: current
+            .cache_read_input_tokens
+            .max(next.cache_read_input_tokens),
     }
 }
 
@@ -2093,7 +2106,9 @@ fn response_to_events(response: MessageResponse) -> Vec<AssistantEvent> {
         events.push(AssistantEvent::ItemCompleted { index });
     }
 
-    events.push(AssistantEvent::Usage(response.usage.token_usage()));
+    if response.usage_observed {
+        events.push(AssistantEvent::Usage(response.usage.token_usage()));
+    }
     events.push(AssistantEvent::MessageStop);
     events
 }
@@ -2102,9 +2117,10 @@ fn response_to_events(response: MessageResponse) -> Vec<AssistantEvent> {
 mod tests {
     use super::{
         build_provider_entry, commit_provider_cache_before_terminal,
-        compile_provider_input_messages, forward_text_delta, provider_attempt,
-        provider_cache_material, provider_tool_choice, provider_tool_choice_for_required_tool,
-        push_provider_output_block, request_reasoning_effort, tool_definitions_for_exposure,
+        compile_provider_input_messages, forward_text_delta, merge_provider_usage_max,
+        provider_attempt, provider_cache_material, provider_tool_choice,
+        provider_tool_choice_for_required_tool, push_provider_output_block,
+        request_reasoning_effort, response_to_events, tool_definitions_for_exposure,
         ProviderPromptHistory, ProviderRequestContext, ResolvedProviderProfile,
     };
     use crate::config::{ProviderConfig, ProvidersConfig};
@@ -2115,7 +2131,9 @@ mod tests {
     use futures::StreamExt;
     use harness_contract::tool::ToolExposureProjection;
     use model_protocol::provider_capability::{CapabilityState, ProviderCapabilityProfile};
-    use provider::{InputContentBlock, OutputContentBlock, ToolChoice, ToolDefinition};
+    use provider::{
+        InputContentBlock, MessageResponse, OutputContentBlock, ToolChoice, ToolDefinition, Usage,
+    };
     use serde_json::json;
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{
@@ -2123,6 +2141,57 @@ mod tests {
         Arc,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn absent_provider_usage_is_not_promoted_to_known_zero() {
+        let events = response_to_events(MessageResponse {
+            id: "no-usage".to_string(),
+            kind: "message".to_string(),
+            role: "assistant".to_string(),
+            content: vec![OutputContentBlock::Text {
+                text: "completed".to_string(),
+            }],
+            model: "deepseek-v4-flash".to_string(),
+            stop_reason: Some("end_turn".to_string()),
+            stop_sequence: None,
+            usage: Usage::default(),
+            usage_observed: false,
+            cache_dimensions_observed: false,
+            request_id: None,
+        });
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, AssistantEvent::Usage(_))));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, AssistantEvent::MessageStop)));
+    }
+
+    #[test]
+    fn stream_usage_merges_start_and_delta_dimensions_by_max() {
+        let start = model_protocol::usage::TokenUsage {
+            input_tokens: 8,
+            output_tokens: 0,
+            cache_creation_input_tokens: 13,
+            cache_read_input_tokens: 21,
+        };
+        let delta = model_protocol::usage::TokenUsage {
+            input_tokens: 0,
+            output_tokens: 5,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        };
+
+        assert_eq!(
+            merge_provider_usage_max(Some(start), delta),
+            model_protocol::usage::TokenUsage {
+                input_tokens: 8,
+                output_tokens: 5,
+                cache_creation_input_tokens: 13,
+                cache_read_input_tokens: 21,
+            }
+        );
+    }
 
     #[test]
     fn cache_cohort_identity_tracks_stable_first_item_but_not_dynamic_tail() {
@@ -2375,16 +2444,23 @@ mod tests {
             extended_history,
             vec![provider::InputMessage::user_text("runtime-clock-b")],
         );
-        assert_eq!(continuation.len(), 4);
-        assert_eq!(continuation[..2], messages);
+        assert_eq!(continuation.len(), 3);
         assert!(matches!(
-            continuation[2].content.as_slice(),
+            continuation[0].content.as_slice(),
+            [InputContentBlock::Text { text }] if text == "history-entry"
+        ));
+        assert!(matches!(
+            continuation[1].content.as_slice(),
             [InputContentBlock::Text { text }] if text == "provider-output"
         ));
         assert!(matches!(
-            continuation[3].content.as_slice(),
+            continuation[2].content.as_slice(),
             [InputContentBlock::Text { text }] if text == "runtime-clock-b"
         ));
+        assert!(continuation.iter().all(|message| !matches!(
+            message.content.as_slice(),
+            [InputContentBlock::Text { text }] if text.contains("runtime-clock-a")
+        )));
     }
 
     #[test]
@@ -2441,13 +2517,16 @@ mod tests {
     }
 
     #[test]
-    fn role_private_context_is_after_history_for_cache_cohort_reuse() {
+    fn role_private_prefix_precedes_history_after_shared_cohort() {
         let mut state = ProviderPromptHistory::default();
         let first = compile_provider_input_messages(
             &mut state,
-            vec![provider::InputMessage::user_text("shared-cohort")],
+            vec![
+                provider::InputMessage::user_text("shared-cohort"),
+                provider::InputMessage::user_text("private-role"),
+            ],
             vec![provider::InputMessage::user_text("turn-1")],
-            vec![provider::InputMessage::user_text("private-role")],
+            Vec::new(),
         );
         assert_eq!(first.len(), 3);
         assert!(matches!(
@@ -2456,11 +2535,11 @@ mod tests {
         ));
         assert!(matches!(
             first[1].content.as_slice(),
-            [InputContentBlock::Text { text }] if text == "turn-1"
+            [InputContentBlock::Text { text }] if text == "private-role"
         ));
         assert!(matches!(
             first[2].content.as_slice(),
-            [InputContentBlock::Text { text }] if text == "private-role"
+            [InputContentBlock::Text { text }] if text == "turn-1"
         ));
     }
 
@@ -2695,6 +2774,8 @@ mod tests {
     fn runtime_attempt_is_propagated_and_never_zero() {
         let context = super::ProviderRequestEvidenceContext {
             session_id: "session-1".to_string(),
+            execution_id: "execution-1".to_string(),
+            turn_id: "turn-1".to_string(),
             request_sequence: 1,
             request_compiler_cache_hit: false,
             budget: crate::context_ledger::RequestBudgetReport::for_attempt(

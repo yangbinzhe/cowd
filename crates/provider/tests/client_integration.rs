@@ -351,7 +351,7 @@ async fn stream_message_parses_sse_events_with_tool_use() {
         "event: content_block_stop\n",
         "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
         "event: message_delta\n",
-        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":8,\"cache_creation_input_tokens\":34,\"cache_read_input_tokens\":55,\"output_tokens\":1}}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":1}}\n\n",
         "event: message_stop\n",
         "data: {\"type\":\"message_stop\"}\n\n",
         "data: [DONE]\n\n"
@@ -392,7 +392,14 @@ async fn stream_message_parses_sse_events_with_tool_use() {
     drop(server);
 
     assert_eq!(events.len(), 6);
-    assert!(matches!(events[0], StreamEvent::MessageStart(_)));
+    assert!(matches!(
+        &events[0],
+        StreamEvent::MessageStart(start)
+            if start.message.usage.input_tokens == 8
+                && start.message.usage.cache_creation_input_tokens == 13
+                && start.message.usage.cache_read_input_tokens == 21
+                && start.message.cache_dimensions_observed
+    ));
     assert!(matches!(
         events[1],
         StreamEvent::ContentBlockStart(ContentBlockStartEvent {
@@ -409,8 +416,12 @@ async fn stream_message_parses_sse_events_with_tool_use() {
     ));
     assert!(matches!(events[3], StreamEvent::ContentBlockStop(_)));
     assert!(matches!(
-        events[4],
-        StreamEvent::MessageDelta(MessageDeltaEvent { .. })
+        &events[4],
+        StreamEvent::MessageDelta(MessageDeltaEvent {
+            usage,
+            cache_dimensions_observed: false,
+            ..
+        }) if usage.input_tokens == 0 && usage.output_tokens == 1
     ));
     assert!(matches!(events[5], StreamEvent::MessageStop(_)));
 

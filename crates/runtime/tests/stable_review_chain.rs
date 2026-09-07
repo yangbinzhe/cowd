@@ -174,6 +174,7 @@ fn services() -> (tempfile::TempDir, Arc<RuntimeServices>, AgentDefinitionId) {
         })
         .expect("baseline stable");
     let services = RuntimeServices::builder(&home, &workspace)
+        .non_durable_backends_for_testing(root.path())
         .builtin_definitions_root(&builtin)
         .evolution_eval_runner(Arc::new(EligibleRunner))
         .build()

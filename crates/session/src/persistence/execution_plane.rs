@@ -197,9 +197,6 @@ struct BackendConcurrency {
 }
 
 impl BackendConcurrency {
-    const SQLITE: Self = Self {
-        single_writer: true,
-    };
     const CONCURRENT: Self = Self {
         single_writer: false,
     };
@@ -511,21 +508,9 @@ impl StorageExecutionPlane {
         )
     }
 
-    pub(crate) fn sqlite_default_plane() -> Self {
-        Self::from_validated(
-            StorageExecutionPlaneConfig::default(),
-            BackendConcurrency::SQLITE,
-        )
-    }
-
     pub(crate) fn new(config: StorageExecutionPlaneConfig) -> Result<Self> {
         let config = config.validate()?;
         Ok(Self::from_validated(config, BackendConcurrency::CONCURRENT))
-    }
-
-    pub(crate) fn new_sqlite(config: StorageExecutionPlaneConfig) -> Result<Self> {
-        let config = config.validate()?;
-        Ok(Self::from_validated(config, BackendConcurrency::SQLITE))
     }
 
     fn from_validated(config: StorageExecutionPlaneConfig, backend: BackendConcurrency) -> Self {
@@ -815,14 +800,6 @@ mod tests {
         .expect("plane")
     }
 
-    fn sqlite_plane(workers: usize, queue_capacity: usize) -> StorageExecutionPlane {
-        StorageExecutionPlane::new_sqlite(StorageExecutionPlaneConfig {
-            workers,
-            queue_capacity,
-        })
-        .expect("sqlite plane")
-    }
-
     async fn wait_until(predicate: impl Fn() -> bool) {
         tokio::time::timeout(Duration::from_secs(2), async {
             while !predicate() {
@@ -903,53 +880,6 @@ mod tests {
         release.store(true, Ordering::Release);
         first.await.expect("first task").expect("first job");
         second.await.expect("second task").expect("second job");
-    }
-
-    #[tokio::test]
-    async fn sqlite_writes_are_serial_while_reads_can_run_concurrently() {
-        let plane = Arc::new(sqlite_plane(4, 4));
-        let write_active = Arc::new(AtomicUsize::new(0));
-        let write_max = Arc::new(AtomicUsize::new(0));
-        let read_active = Arc::new(AtomicUsize::new(0));
-        let read_max = Arc::new(AtomicUsize::new(0));
-        let mut tasks = Vec::new();
-        for _ in 0..2 {
-            let plane = Arc::clone(&plane);
-            let active = Arc::clone(&write_active);
-            let max = Arc::clone(&write_max);
-            tasks.push(tokio::spawn(async move {
-                plane
-                    .execute(StorageExecutionLane::InteractiveWrite, true, move || {
-                        let now = active.fetch_add(1, Ordering::AcqRel) + 1;
-                        update_max(&max, now);
-                        std::thread::sleep(Duration::from_millis(30));
-                        active.fetch_sub(1, Ordering::AcqRel);
-                        Ok(())
-                    })
-                    .await
-            }));
-        }
-        for _ in 0..2 {
-            let plane = Arc::clone(&plane);
-            let active = Arc::clone(&read_active);
-            let max = Arc::clone(&read_max);
-            tasks.push(tokio::spawn(async move {
-                plane
-                    .execute(StorageExecutionLane::InteractiveRead, false, move || {
-                        let now = active.fetch_add(1, Ordering::AcqRel) + 1;
-                        update_max(&max, now);
-                        std::thread::sleep(Duration::from_millis(30));
-                        active.fetch_sub(1, Ordering::AcqRel);
-                        Ok(())
-                    })
-                    .await
-            }));
-        }
-        for task in tasks {
-            task.await.expect("task").expect("job");
-        }
-        assert_eq!(write_max.load(Ordering::Acquire), 1);
-        assert!(read_max.load(Ordering::Acquire) >= 2);
     }
 
     #[tokio::test]

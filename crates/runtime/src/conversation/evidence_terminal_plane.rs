@@ -1334,7 +1334,6 @@ where
                 state.selected_candidate = recovered.selected_candidate;
                 state.status = recovered.status;
                 state.resource_snapshot = recovered.resource_snapshot;
-                state.collaboration_receipt = recovered.collaboration_receipt;
                 if recovered.collaboration_obligation.is_some() {
                     state.decision.collaboration_obligation = recovered.collaboration_obligation;
                 }
@@ -1467,10 +1466,6 @@ where
                         payload.get("candidate_estimates")?.clone(),
                     )
                     .ok()?,
-                    collaboration_receipt: payload
-                        .get("collaboration_receipt")
-                        .filter(|value| !value.is_null())
-                        .cloned(),
                     collaboration_obligation: payload
                         .get("collaboration_obligation")
                         .filter(|value| !value.is_null())
@@ -1619,7 +1614,17 @@ where
                         | crate::tool_orchestrator::ToolSafetyCategory::Destructive
                 )
         });
-        let target_pattern = if requests_team {
+        // A user-requested Team is a semantic execution obligation, not a
+        // transient property of the latest tool batch. Root Agents commonly
+        // inspect the workspace (and may perform bounded setup) before they
+        // emit the first collaboration action. Deriving the whole turn
+        // strategy only from that batch would therefore retarget an admitted
+        // Team to Direct/Execute and make the next validation reject the
+        // turn. Keep the immutable collaboration contract as the enclosing
+        // strategy while still folding the concrete effects below into its
+        // capabilities, gates, and modifiers.
+        let preserve_collaboration_obligation = current.collaboration_obligation.is_some();
+        let target_pattern = if preserve_collaboration_obligation || requests_team {
             harness_contract::core::ExecutionPattern::Collaborate
         } else if has_mutation {
             harness_contract::core::ExecutionPattern::Execute
@@ -1661,50 +1666,6 @@ where
         )
     }
 
-    pub(crate) fn downgrade_turn_strategy(
-        &self,
-        candidate: harness_contract::strategy::ExecutionCandidateKind,
-        reason: &str,
-    ) -> Result<crate::execution_core::TurnStrategyDecisionState, RuntimeError> {
-        let understanding = self
-            .active_turn_strategy()
-            .map(|state| state.decision.strategy.understanding)
-            .ok_or_else(|| RuntimeError::new("downgraded turn strategy has no owner"))?;
-        let requires_guarded_pattern = understanding.requires_write
-            || matches!(
-                understanding.risk,
-                harness_contract::core::TaskRisk::High | harness_contract::core::TaskRisk::Critical
-            );
-        let pattern = match candidate {
-            harness_contract::strategy::ExecutionCandidateKind::Direct => {
-                if requires_guarded_pattern {
-                    harness_contract::core::ExecutionPattern::Execute
-                } else {
-                    harness_contract::core::ExecutionPattern::Direct
-                }
-            }
-            harness_contract::strategy::ExecutionCandidateKind::ParallelTools => {
-                if requires_guarded_pattern {
-                    harness_contract::core::ExecutionPattern::Execute
-                } else {
-                    harness_contract::core::ExecutionPattern::Explore
-                }
-            }
-            harness_contract::strategy::ExecutionCandidateKind::Team => {
-                harness_contract::core::ExecutionPattern::Collaborate
-            }
-        };
-        self.revise_active_turn_strategy(
-            candidate,
-            pattern,
-            crate::execution_core::TurnStrategyDecisionStatus::Downgraded,
-            reason,
-            Some("runtime.strategy.downgraded"),
-        )?;
-        self.active_turn_strategy()
-            .ok_or_else(|| RuntimeError::new("downgraded turn strategy disappeared"))
-    }
-
     pub(crate) fn record_turn_strategy_early_stop(&self, reason: &str) -> Result<(), RuntimeError> {
         let active = self
             .active_turn_strategy()
@@ -1719,59 +1680,11 @@ where
         Ok(())
     }
 
-    pub(crate) fn set_turn_strategy_collaboration_obligation(
-        &self,
-        automatic_minimum_team_count: u8,
-    ) -> Result<crate::execution_core::TurnStrategyDecisionState, RuntimeError> {
-        let (updated, previous, already_bound) = {
-            let mut guard = self
-                .active_turn_strategy
-                .lock()
-                .map_err(|_| RuntimeError::new("turn strategy owner lock poisoned"))?;
-            let state = guard
-                .as_mut()
-                .ok_or_else(|| RuntimeError::new("focus partitions have no turn strategy owner"))?;
-            let previous = state.clone();
-            let obligation = (state.selected_candidate
-                == harness_contract::strategy::ExecutionCandidateKind::Team)
-                .then(|| {
-                    harness_contract::strategy::CollaborationExecutionObligation::for_selected_team(
-                        &state.decision.strategy.understanding,
-                        automatic_minimum_team_count,
-                        Vec::new(),
-                    )
-                    .map_err(RuntimeError::new)
-                })
-                .transpose()?;
-            state.decision.collaboration_obligation = obligation;
-            (state.clone(), previous, state.execution_graph_ref.is_some())
-        };
-        self.tool_executor
-            .bind_execution_decision(updated.decision.clone());
-        if already_bound {
-            if let Err(error) = self.append_turn_strategy_event(
-                "runtime.strategy.selected",
-                &updated,
-                "collaboration execution obligation frozen",
-            ) {
-                *self
-                    .active_turn_strategy
-                    .lock()
-                    .map_err(|_| RuntimeError::new("turn strategy owner lock poisoned"))? =
-                    Some(previous.clone());
-                self.tool_executor
-                    .bind_execution_decision(previous.decision);
-                return Err(error);
-            }
-        }
-        Ok(updated)
-    }
-
     pub(crate) fn finish_turn_strategy(
         &self,
         turn_ref: &str,
         status: crate::execution_core::TurnStrategyDecisionStatus,
-        mut outcome: crate::execution_core::TurnStrategyActualOutcome,
+        outcome: crate::execution_core::TurnStrategyActualOutcome,
     ) -> Result<(), RuntimeError> {
         let state = {
             let mut guard = self
@@ -1784,66 +1697,6 @@ where
             if state.turn_ref != turn_ref {
                 *guard = Some(state);
                 return Err(RuntimeError::new("turn strategy finish scope mismatch"));
-            }
-            if let Some(receipt) = state.collaboration_receipt.as_ref() {
-                let metric = |name: &str| receipt.get(name).and_then(serde_json::Value::as_u64);
-                // A Session-scoped evaluation lease already includes Team
-                // children and every fallback request bound to that Session.
-                // Adding the receipt a second time inflates projected usage
-                // and breaks the hard budget equality gate. Production turns
-                // have no evaluation lease and still merge child telemetry.
-                if outcome.evaluation_token_limit == 0 {
-                    outcome.input_tokens = outcome
-                        .input_tokens
-                        .saturating_add(metric("child_input_tokens").unwrap_or(0));
-                    outcome.output_tokens = outcome
-                        .output_tokens
-                        .saturating_add(metric("child_output_tokens").unwrap_or(0));
-                    outcome.cached_tokens = outcome
-                        .cached_tokens
-                        .saturating_add(metric("child_cached_tokens").unwrap_or(0));
-                }
-                outcome.tool_calls = outcome
-                    .tool_calls
-                    .saturating_add(metric("child_tool_calls").unwrap_or(0));
-                outcome.duplicate_tool_calls = outcome
-                    .duplicate_tool_calls
-                    .saturating_add(metric("duplicate_tool_calls").unwrap_or(0));
-                outcome.max_tool_concurrency_observed = outcome
-                    .max_tool_concurrency_observed
-                    .max(metric("max_tool_concurrency_observed").unwrap_or(0));
-                outcome.parallel_tool_batches = outcome
-                    .parallel_tool_batches
-                    .saturating_add(metric("parallel_tool_batches").unwrap_or(0));
-                let child_write_attempt_paths = receipt
-                    .get("write_attempt_paths")
-                    .and_then(serde_json::Value::as_array)
-                    .map(|paths| {
-                        paths
-                            .iter()
-                            .filter_map(serde_json::Value::as_str)
-                            .map(str::to_string)
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                outcome
-                    .write_attempt_paths
-                    .extend(child_write_attempt_paths);
-                outcome.write_attempt_paths.sort();
-                outcome.write_attempt_paths.dedup();
-                outcome.evidence_overlap_bp = metric("evidence_overlap_bp")
-                    .and_then(|value| u16::try_from(value).ok())
-                    .unwrap_or(outcome.evidence_overlap_bp);
-                outcome.evidence_overlap_observed = receipt
-                    .get("evidence_overlap_observed")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(outcome.evidence_overlap_observed);
-                // Team working-state verification proves the child
-                // collaboration materialized. It is not the root Goal's
-                // working-state verdict and must not overwrite it here.
-                outcome.actual_speedup_ratio_bp = metric("actual_speedup_ratio_bp")
-                    .and_then(|value| u16::try_from(value).ok())
-                    .or(outcome.actual_speedup_ratio_bp);
             }
             state.revision = state.revision.saturating_add(1);
             state.decision.decision_revision = state.revision;
@@ -1932,7 +1785,6 @@ where
                 "turn_ref": state.turn_ref,
                 "status": state.status,
                 "reason": reason,
-                "collaboration_receipt": state.collaboration_receipt,
                 "collaboration_obligation": state.decision.collaboration_obligation,
                 "outcome": state.outcome,
                 "provider_selection": self.provider_selection_receipt

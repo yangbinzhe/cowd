@@ -92,7 +92,6 @@ use memory::types::{Message as MemMessage, MessageRole as MemMessageRole};
 
 const MAX_RUNTIME_PROVIDER_RETRIES_PER_MODEL: u8 = 1;
 const DEFAULT_RUNTIME_PROVIDER_RETRY_DELAY: Duration = Duration::from_millis(250);
-pub(crate) const MAX_EVALUATION_PROVIDER_TOKEN_LEASE: u64 = 20_000_000;
 use memory::{MemoryKernel, MemoryTurnContext};
 use model_protocol::telemetry::SessionTracer;
 use serde_json::{Map, Value};
@@ -134,7 +133,7 @@ pub(crate) struct EvaluationProviderTokenLease {
 
 impl EvaluationProviderTokenLease {
     fn new(lease_id: &str, limit: u64, enforced: bool) -> Result<Self, RuntimeError> {
-        if lease_id.trim().is_empty() || limit == 0 || limit > MAX_EVALUATION_PROVIDER_TOKEN_LEASE {
+        if lease_id.trim().is_empty() || limit == 0 {
             return Err(RuntimeError::new(
                 "evaluation provider token lease identity/limit is invalid",
             ));
@@ -732,7 +731,6 @@ fn enforce_explicit_team_requirement(
 
     tracing::info!(
         explicit_team = true,
-        obligation_source = ?obligation.source,
         minimum_team_count = obligation.minimum_team_count,
         intent_kind = ?match &intent {
             ModelStepIntent::ToolCalls { .. } => "tool_calls",
@@ -3181,7 +3179,6 @@ struct RecoveredTurnStrategyIdentity {
     status: crate::execution_core::TurnStrategyDecisionStatus,
     resource_snapshot: harness_contract::strategy::StrategyResourceSnapshot,
     candidate_estimates: Vec<harness_contract::strategy::ExecutionCandidateEstimate>,
-    collaboration_receipt: Option<serde_json::Value>,
     collaboration_obligation: Option<harness_contract::strategy::CollaborationExecutionObligation>,
     pattern: harness_contract::core::ExecutionPattern,
 }
@@ -3241,6 +3238,254 @@ pub struct SessionReadHead {
 struct SessionProviderWireEvidenceWriter {
     artifacts: Arc<crate::ArtifactStore>,
     session_port: Arc<dyn crate::SessionRuntimeJournalPort>,
+    cache_dimensions: Arc<std::sync::Mutex<TurnCacheDimensionsObservation>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ProviderAttemptEpoch {
+    execution_id: String,
+    turn_id: String,
+}
+
+impl ProviderAttemptEpoch {
+    fn new(execution_id: impl Into<String>, turn_id: impl Into<String>) -> Option<Self> {
+        let execution_id = execution_id.into();
+        let turn_id = turn_id.into();
+        (!execution_id.trim().is_empty() && !turn_id.trim().is_empty()).then_some(Self {
+            execution_id,
+            turn_id,
+        })
+    }
+
+    fn matches_payload(&self, payload: &serde_json::Value) -> bool {
+        payload
+            .get("execution_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(self.execution_id.as_str())
+            && payload.get("turn_id").and_then(serde_json::Value::as_str)
+                == Some(self.turn_id.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderAttemptCacheState {
+    Pending,
+    Known,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProviderAttemptObservation {
+    cache_state: ProviderAttemptCacheState,
+    usage: Option<model_protocol::usage::TokenUsage>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RecoveredProviderUsage {
+    pub(super) input_tokens: u64,
+    pub(super) output_tokens: u64,
+    pub(super) cache_creation_input_tokens: u64,
+    pub(super) cache_read_input_tokens: u64,
+}
+
+impl ProviderAttemptObservation {
+    const fn pending() -> Self {
+        Self {
+            cache_state: ProviderAttemptCacheState::Pending,
+            usage: None,
+        }
+    }
+}
+
+/// Turn-local projection of the durable ProviderRequestPacked/Outcome pair.
+/// Packed is the physical-attempt fact and starts unknown; only its matching
+/// durable outcome may settle it. Epoch partitioning prevents a late outcome
+/// from a previous turn changing the current terminal's cache truth.
+#[derive(Debug, Default)]
+struct TurnCacheDimensionsObservation {
+    current_epoch: Option<ProviderAttemptEpoch>,
+    current_recovery_authoritative: bool,
+    epochs: std::collections::BTreeMap<
+        ProviderAttemptEpoch,
+        std::collections::BTreeMap<String, ProviderAttemptObservation>,
+    >,
+}
+
+impl TurnCacheDimensionsObservation {
+    #[cfg(test)]
+    fn begin_epoch(
+        &mut self,
+        epoch: Option<ProviderAttemptEpoch>,
+        recovered: std::collections::BTreeMap<String, ProviderAttemptObservation>,
+    ) {
+        self.begin_epoch_with_recovery_authority(epoch, recovered, true);
+    }
+
+    fn begin_epoch_with_recovery_authority(
+        &mut self,
+        epoch: Option<ProviderAttemptEpoch>,
+        recovered: std::collections::BTreeMap<String, ProviderAttemptObservation>,
+        recovery_authoritative: bool,
+    ) {
+        self.current_epoch = epoch.clone();
+        self.current_recovery_authoritative = recovery_authoritative;
+        if let Some(epoch) = epoch {
+            self.epochs.insert(epoch, recovered);
+        }
+        self.prune_settled_old_epochs();
+    }
+
+    fn record_packed(&mut self, epoch: Option<ProviderAttemptEpoch>, request_id: String) {
+        let Some(epoch) = epoch else {
+            return;
+        };
+        self.epochs
+            .entry(epoch)
+            .or_default()
+            .entry(request_id)
+            .or_insert_with(ProviderAttemptObservation::pending);
+    }
+
+    fn record_outcome(
+        &mut self,
+        epoch: Option<ProviderAttemptEpoch>,
+        request_id: String,
+        usage: Option<model_protocol::usage::TokenUsage>,
+        known: bool,
+    ) {
+        let Some(epoch) = epoch else {
+            return;
+        };
+        if let Some(attempt) = self
+            .epochs
+            .get_mut(&epoch)
+            .and_then(|attempts| attempts.get_mut(&request_id))
+        {
+            *attempt = ProviderAttemptObservation {
+                cache_state: if known && usage.is_some() {
+                    ProviderAttemptCacheState::Known
+                } else {
+                    ProviderAttemptCacheState::Unknown
+                },
+                usage,
+            };
+        }
+        self.prune_settled_old_epochs();
+    }
+
+    fn apply_durable_payload(
+        attempts: &mut std::collections::BTreeMap<String, ProviderAttemptObservation>,
+        kind: &str,
+        payload: &serde_json::Value,
+    ) {
+        let Some(request_id) = payload
+            .get("request_id")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+        else {
+            return;
+        };
+        match kind {
+            "context.provider_request_packed" => {
+                attempts
+                    .entry(request_id)
+                    .or_insert_with(ProviderAttemptObservation::pending);
+            }
+            "context.provider_attempt_outcome" => {
+                let usage = payload
+                    .get("usage")
+                    .and_then(provider_attempt_usage_from_value);
+                if let Some(attempt) = attempts.get_mut(&request_id) {
+                    *attempt = ProviderAttemptObservation {
+                        cache_state: if usage.is_some()
+                            && payload
+                                .get("cache_dimensions_status")
+                                .and_then(serde_json::Value::as_str)
+                                == Some("known")
+                        {
+                            ProviderAttemptCacheState::Known
+                        } else {
+                            ProviderAttemptCacheState::Unknown
+                        },
+                        usage,
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn all_known(&self) -> bool {
+        self.current_recovery_authoritative
+            && self
+                .current_epoch
+                .as_ref()
+                .and_then(|epoch| self.epochs.get(epoch))
+                .is_some_and(|attempts| {
+                    !attempts.is_empty()
+                        && attempts
+                            .values()
+                            .all(|attempt| attempt.cache_state == ProviderAttemptCacheState::Known)
+                })
+    }
+
+    fn recovered_usage(&self) -> RecoveredProviderUsage {
+        self.current_epoch
+            .as_ref()
+            .and_then(|epoch| self.epochs.get(epoch))
+            .into_iter()
+            .flat_map(std::collections::BTreeMap::values)
+            .filter_map(|attempt| attempt.usage)
+            .fold(RecoveredProviderUsage::default(), |mut total, usage| {
+                total.input_tokens = total
+                    .input_tokens
+                    .saturating_add(u64::from(usage.input_tokens));
+                total.output_tokens = total
+                    .output_tokens
+                    .saturating_add(u64::from(usage.output_tokens));
+                total.cache_creation_input_tokens = total
+                    .cache_creation_input_tokens
+                    .saturating_add(u64::from(usage.cache_creation_input_tokens));
+                total.cache_read_input_tokens = total
+                    .cache_read_input_tokens
+                    .saturating_add(u64::from(usage.cache_read_input_tokens));
+                total
+            })
+    }
+
+    fn current_attempt_count(&self) -> usize {
+        self.current_epoch
+            .as_ref()
+            .and_then(|epoch| self.epochs.get(epoch))
+            .map_or(0, std::collections::BTreeMap::len)
+    }
+
+    fn prune_settled_old_epochs(&mut self) {
+        let current_epoch = self.current_epoch.as_ref();
+        self.epochs.retain(|epoch, attempts| {
+            Some(epoch) == current_epoch
+                || attempts
+                    .values()
+                    .any(|attempt| attempt.cache_state == ProviderAttemptCacheState::Pending)
+        });
+    }
+}
+
+fn provider_attempt_usage_from_value(
+    usage: &serde_json::Value,
+) -> Option<model_protocol::usage::TokenUsage> {
+    let read = |field: &str| {
+        usage
+            .get(field)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+    };
+    Some(model_protocol::usage::TokenUsage {
+        input_tokens: read("input_tokens")?,
+        output_tokens: read("output_tokens")?,
+        cache_creation_input_tokens: read("cache_creation_input_tokens")?,
+        cache_read_input_tokens: read("cache_read_input_tokens")?,
+    })
 }
 
 #[async_trait::async_trait]
@@ -3250,9 +3495,13 @@ impl crate::ProviderWireEvidenceWriter for SessionProviderWireEvidenceWriter {
         context: &crate::ProviderRequestEvidenceContext,
         evidence: crate::ProviderWireEvidence,
     ) -> Result<(), RuntimeError> {
+        let epoch = ProviderAttemptEpoch::new(&context.execution_id, &context.turn_id);
+        let request_id = evidence.request_context.request_id.clone();
         let payload = serde_json::to_vec(&serde_json::json!({
-            "schema_version": 3,
+            "schema_version": 4,
             "session_id": context.session_id,
+            "execution_id": context.execution_id,
+            "turn_id": context.turn_id,
             "request_sequence": context.request_sequence,
             "request_compiler_cache_hit": context.request_compiler_cache_hit,
             "budget": context.budget,
@@ -3294,7 +3543,9 @@ impl crate::ProviderWireEvidenceWriter for SessionProviderWireEvidenceWriter {
             crate::RuntimeSessionEventKind::ProviderRequestPacked,
             serde_json::json!({
                 "type": "ProviderRequestPacked",
-                "schema_version": 3,
+                "schema_version": 4,
+                "execution_id": context.execution_id,
+                "turn_id": context.turn_id,
                 "request_sequence": context.request_sequence,
                 "request_id": evidence.request_context.request_id,
                 "model": evidence.request_context.profile.model,
@@ -3337,6 +3588,10 @@ impl crate::ProviderWireEvidenceWriter for SessionProviderWireEvidenceWriter {
             }
             return Err(RuntimeError::new(error.to_string()));
         }
+        self.cache_dimensions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_packed(epoch, request_id);
 
         let durable_owner = format!(
             "provider-request:{}:{}",
@@ -3370,6 +3625,9 @@ impl crate::ProviderWireEvidenceWriter for SessionProviderWireEvidenceWriter {
         outcome: crate::ProviderAttemptOutcomeEvidence,
     ) -> Result<(), RuntimeError> {
         let usage_known = outcome.usage.is_some();
+        let cache_dimensions_known = usage_known && outcome.cache_dimensions_observed;
+        let epoch = ProviderAttemptEpoch::new(&context.execution_id, &context.turn_id);
+        let request_id = outcome.request_id.clone();
         let cache_hit_ratio_bp = outcome
             .usage
             .map(model_protocol::usage::TokenUsage::cache_hit_ratio_bp);
@@ -3387,12 +3645,15 @@ impl crate::ProviderWireEvidenceWriter for SessionProviderWireEvidenceWriter {
             crate::RuntimeSessionEventKind::ProviderAttemptOutcome,
             serde_json::json!({
                 "type": "ProviderAttemptOutcome",
-                "schema_version": 1,
+                "schema_version": 2,
+                "execution_id": context.execution_id,
+                "turn_id": context.turn_id,
                 "request_sequence": context.request_sequence,
                 "request_id": outcome.request_id,
                 "logical_attempt": outcome.logical_attempt,
                 "terminal_status": outcome.terminal_status,
                 "usage_status": if usage_known { "known" } else { "unknown" },
+                "cache_dimensions_status": if cache_dimensions_known { "known" } else { "unknown" },
                 "usage": usage,
                 "cache_hit_ratio_bp": cache_hit_ratio_bp,
             }),
@@ -3407,6 +3668,10 @@ impl crate::ProviderWireEvidenceWriter for SessionProviderWireEvidenceWriter {
             .append_event(&event)
             .await
             .map_err(|error| RuntimeError::new(error.to_string()))?;
+        self.cache_dimensions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_outcome(epoch, request_id, outcome.usage, cache_dimensions_known);
         Ok(())
     }
 }
@@ -3426,6 +3691,7 @@ pub struct ConversationRuntime<C, T> {
     permission_fingerprint: u64,
     system_prompt: Vec<String>,
     usage_tracker: UsageTracker,
+    cache_dimensions_observation: Arc<std::sync::Mutex<TurnCacheDimensionsObservation>>,
     hook_runner: HookRunner,
     cowd_bus: Option<Arc<crate::cowd_event::CowdEventBus>>,
     turn_callback: Option<Arc<TurnCallback>>,
@@ -4029,19 +4295,15 @@ pub fn build_cc_memory_config_with_budget(
 
     let mem = feature_config.memory();
     let config_home = crate::cowd_dirs::config_home_dir();
-    let (sqlite_path, blob_dir) = if let Some(store_path) = mem.store_path.as_ref() {
-        (store_path.join("memory.db"), store_path.join("blobs"))
+    let blob_dir = if let Some(store_path) = mem.store_path.as_ref() {
+        store_path.join("blobs")
     } else {
         let registry = storage::StorageRegistry::default_for_config_home(&config_home);
-        let sqlite_path = registry
-            .endpoint(&storage::StorageDomainId::Memory)
-            .map(|endpoint| endpoint.as_handle().path)
-            .unwrap_or_else(|_| registry.layout.root.join("memory.sqlite"));
         let blob_dir = registry
             .endpoint(&storage::StorageDomainId::Blobs)
             .map(|endpoint| endpoint.as_handle().path)
             .unwrap_or_else(|_| registry.layout.blobs.clone());
-        (sqlite_path, blob_dir)
+        blob_dir
     };
 
     let mut vector_config = memory::config::VectorConfig {
@@ -4090,7 +4352,6 @@ pub fn build_cc_memory_config_with_budget(
 
     CcMemoryConfig {
         store: StoreConfig {
-            sqlite_path,
             blob_dir,
             enable_vector_index: mem.store_enable_vector_index && mem.vector.enabled,
             cache_capacity: 512,

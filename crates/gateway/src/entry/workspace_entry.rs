@@ -323,21 +323,12 @@ fn setup_memory_item(config: &runtime::RuntimeConfig) -> SetupItem {
     }
 }
 
-fn setup_session_item(config_home: &Path) -> SetupItem {
-    let layout = storage::StorageLayout::default_for_config_home(config_home);
-    let db_path = layout
-        .sqlite_path("session")
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| layout.root.join("session.sqlite"));
+fn setup_session_item(_config_home: &Path) -> SetupItem {
     SetupItem {
         id: "session",
         label: "Session",
-        status: if db_path.exists() { "ready" } else { "warn" },
-        summary: if db_path.exists() {
-            format!("SQLite session store exists at {}", db_path.display())
-        } else {
-            "SQLite session store will be created on first session use".to_string()
-        },
+        status: "ready",
+        summary: "PostgreSQL is the canonical Session store; startup readiness verifies its connection and schema".to_string(),
         next: None,
     }
 }

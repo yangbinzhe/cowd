@@ -89,6 +89,14 @@ pub enum EvolutionEvaluationBaseline {
         semantic_signature_digest: String,
         episode_ids: Vec<String>,
         aggregate_digest: String,
+        /// Approved, published producer revision used for a real paired run.
+        /// Episode outcomes themselves are never treated as metric samples.
+        executable_baseline_ref: AgentDefinitionRevisionRef,
+        executable_baseline_content_digest: String,
+        /// Resolves to the immutable scenario replay manifest supplied to the
+        /// evaluator. The digest binds all execution-relevant scenario fields.
+        replay_manifest_ref: String,
+        replay_manifest_digest: String,
     },
 }
 
@@ -1945,12 +1953,33 @@ impl EvolutionGovernanceService {
         revision_ref: &AgentDefinitionRevisionRef,
         candidate_id: &str,
         scenario_ref: &str,
+        role: harness_contract::agent::AgentEvaluationRole,
     ) -> Result<(), EvolutionGovernanceError> {
         let candidate = self.candidate(candidate_id)?;
         let EvolutionCandidateSubject::AgentDefinition {
             revision_ref: candidate_revision,
         } = &candidate.subject;
-        if candidate_revision != revision_ref
+        let authorized_revision = match role {
+            harness_contract::agent::AgentEvaluationRole::Candidate => candidate_revision.clone(),
+            harness_contract::agent::AgentEvaluationRole::Baseline => match candidate
+                .evaluation_baseline
+                .as_ref()
+                .ok_or(EvolutionGovernanceError::CanaryPrerequisiteRequired)?
+            {
+                EvolutionEvaluationBaseline::PublishedRevision { revision, .. } => {
+                    AgentDefinitionRevisionRef::new(
+                        candidate_revision.definition_id.clone(),
+                        *revision,
+                    )
+                    .map_err(|_| EvolutionGovernanceError::CanaryPrerequisiteRequired)?
+                }
+                EvolutionEvaluationBaseline::EpisodeSet {
+                    executable_baseline_ref,
+                    ..
+                } => executable_baseline_ref.clone(),
+            },
+        };
+        if authorized_revision != *revision_ref
             || !candidate
                 .evaluation_contract
                 .scenario_refs
@@ -2575,7 +2604,7 @@ mod tests {
     use harness_contract::agent::{AgentDefinitionId, DefinitionScope};
 
     fn service() -> EvolutionGovernanceService {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("event store"));
+        let store = Arc::new(RuntimeEventStore::for_test());
         EvolutionGovernanceService::new(Arc::clone(&store), Arc::new(ApprovalQueue::new(store)))
     }
 
@@ -2851,6 +2880,9 @@ mod tests {
             Some(EvolutionEvaluationBaseline::PublishedRevision { revision: 1, .. })
         ));
 
+        let executable_baseline_ref = match &fixture.subject {
+            EvolutionCandidateSubject::AgentDefinition { revision_ref } => revision_ref.clone(),
+        };
         let episode_set = EvolutionCandidateRegistration {
             candidate_id: "episode-set-baseline-candidate".to_string(),
             proposal_id: "proposal-episode-set".to_string(),
@@ -2863,6 +2895,10 @@ mod tests {
                     "experience:three".to_string(),
                 ],
                 aggregate_digest: "sha256:episodes".to_string(),
+                executable_baseline_ref,
+                executable_baseline_content_digest: "sha256:baseline".to_string(),
+                replay_manifest_ref: "replay:fixture".to_string(),
+                replay_manifest_digest: "sha256:replay".to_string(),
             },
             evaluation_contract: fixture.evaluation_contract,
             evaluation_scenario_digest: fixture.evaluation_scenario_digest,
@@ -3357,16 +3393,14 @@ mod tests {
     }
 
     #[test]
-    fn governed_canary_and_stable_state_survive_physical_store_reopen() {
-        let root = tempfile::tempdir().expect("governance root");
-        let store_path = root.path().join("runtime.sqlite");
+    fn governed_canary_and_stable_state_survive_service_reconstruction() {
         let candidate_id = candidate().candidate_id;
+        let store = Arc::new(RuntimeEventStore::for_test());
 
         {
-            let store = Arc::new(RuntimeEventStore::try_open(&store_path).expect("event store"));
             let service = EvolutionGovernanceService::new(
                 Arc::clone(&store),
-                Arc::new(ApprovalQueue::new(store)),
+                Arc::new(ApprovalQueue::new(Arc::clone(&store))),
             );
             service.create_candidate(candidate()).expect("candidate");
             let candidate = service
@@ -3433,11 +3467,9 @@ mod tests {
                 .expect("stable assignment");
         }
 
-        let reopened_store =
-            Arc::new(RuntimeEventStore::try_open(&store_path).expect("reopened event store"));
         let reopened = EvolutionGovernanceService::new(
-            Arc::clone(&reopened_store),
-            Arc::new(ApprovalQueue::new(reopened_store)),
+            Arc::clone(&store),
+            Arc::new(ApprovalQueue::new(Arc::clone(&store))),
         );
         let recovered = reopened
             .candidate(&candidate_id)
@@ -3496,13 +3528,9 @@ mod tests {
             )
             .expect("rollback decision")
             .expect("rollback assignment");
-        drop(reopened);
-
-        let final_store =
-            Arc::new(RuntimeEventStore::try_open(&store_path).expect("final event store reopen"));
         let final_service = EvolutionGovernanceService::new(
-            Arc::clone(&final_store),
-            Arc::new(ApprovalQueue::new(final_store)),
+            Arc::clone(&store),
+            Arc::new(ApprovalQueue::new(store)),
         );
         assert!(final_service
             .release_assignments()

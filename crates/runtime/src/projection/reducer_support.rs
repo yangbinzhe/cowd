@@ -152,6 +152,8 @@ pub(super) struct ExecutionProjectionScope {
     pub(super) approvals: Vec<ProjectionEntity>,
     pub(super) interventions: Vec<ProjectionEntity>,
     pub(super) child_executions: Vec<ChildExecutionProjection>,
+    pub(super) agentic_collaboration:
+        harness_contract::projection::AgenticCollaborationProjectionV1,
     /// Canonical descendant graph projections used only by the Runtime
     /// reducer to materialize one inclusive Team/Agent activity tree. This is
     /// not serialized as a second public graph owner.
@@ -257,7 +259,8 @@ impl ExecutionProjectionScope {
                 )));
             }
         }
-        let agentic_programs = agentic_programs_for_executions(services, &execution_ids);
+        let agentic_programs = agentic_programs_for_executions(services, &execution_ids)?;
+        let agentic_collaboration = agentic_collaboration_projection(&agentic_programs);
         let collaboration = collaboration_entities(agent_snapshots, &agentic_programs, full);
         let agents = collaboration.agents;
         let teams = collaboration.teams;
@@ -350,6 +353,7 @@ impl ExecutionProjectionScope {
             approvals,
             interventions,
             child_executions,
+            agentic_collaboration,
             descendant_graphs,
         })
     }
@@ -410,67 +414,14 @@ fn collaboration_entities(
         "agent",
         agent_snapshots
             .into_iter()
-            .filter_map(|agent| serde_json::to_value(agent).ok())
-            .chain(programs.iter().flat_map(|program| {
-                program
-                    .agents
-                    .values()
-                    .filter(|member| !physical_agent_ids.contains(&member.agent_id))
-                    .map(|member| {
-                        let task = program.tasks.values().find(|task| {
-                            task.claimant.as_deref() == Some(member.agent_id.as_str())
-                        });
-                        serde_json::json!({
-                            "agent_id": member.agent_id,
-                            "team_id": member.team_id,
-                            "role": member.role,
-                            "mission": member.mission,
-                            "required_capabilities": member.required_capabilities,
-                            "invited_by": member.invited_by,
-                            "program_id": program.program_id,
-                            "program_revision": program.revision,
-                            "task_id": task.map(|task| task.task_id.as_str()),
-                            "execution_id": task.and_then(|task| task.claim_execution_id.as_deref()),
-                            "status": task.map_or("invited", |task| match task.status {
-                                crate::AgenticTaskStatus::Published => "planned",
-                                crate::AgenticTaskStatus::Claimed => "running",
-                                crate::AgenticTaskStatus::Submitted => "submitted",
-                                crate::AgenticTaskStatus::Accepted => "completed",
-                                crate::AgenticTaskStatus::Rework => "rework",
-                                crate::AgenticTaskStatus::Blocked => "blocked",
-                                crate::AgenticTaskStatus::Superseded => "superseded",
-                            }),
-                        })
-                    })
-            })),
+            .filter_map(|agent| serde_json::to_value(agent).ok()),
         full,
     );
     let team_ids = programs
         .iter()
         .flat_map(|program| program.teams.keys().cloned())
         .collect::<BTreeSet<_>>();
-    let teams = entities_from_details(
-        "team",
-        programs.iter().flat_map(|program| {
-            program.teams.values().map(|team| {
-                serde_json::json!({
-                    "team_id": team.team_id,
-                    "name": team.name,
-                    "mission": team.mission,
-                    "objective": team.objective,
-                    "topic_ref": team.topic_ref,
-                    "created_by": team.created_by,
-                    "member_ids": team.member_ids,
-                    "task_ids": team.task_ids,
-                    "program_id": program.program_id,
-                    "program_revision": program.revision,
-                    "status": program.status,
-                    "root_execution_id": program.root_execution_id,
-                })
-            })
-        }),
-        full,
-    );
+    let teams = Vec::new();
     CollaborationEntities {
         agents,
         teams,
@@ -479,22 +430,393 @@ fn collaboration_entities(
     }
 }
 
+fn agentic_collaboration_projection(
+    programs: &[crate::AgenticProgramProjection],
+) -> harness_contract::projection::AgenticCollaborationProjectionV1 {
+    use harness_contract::projection::*;
+
+    AgenticCollaborationProjectionV1 {
+        schema_version: 5,
+        programs: programs
+            .iter()
+            .map(|program| {
+                let status = match program.status {
+                    crate::AgenticProgramStatus::Open => AgenticCollaborationProgramStatus::Open,
+                    crate::AgenticProgramStatus::Waiting => {
+                        AgenticCollaborationProgramStatus::Waiting
+                    }
+                    crate::AgenticProgramStatus::CompletionRequested => {
+                        AgenticCollaborationProgramStatus::CompletionRequested
+                    }
+                    crate::AgenticProgramStatus::Draining => {
+                        AgenticCollaborationProgramStatus::Draining
+                    }
+                    crate::AgenticProgramStatus::Verified => {
+                        AgenticCollaborationProgramStatus::Verified
+                    }
+                    crate::AgenticProgramStatus::Partial => {
+                        AgenticCollaborationProgramStatus::Partial
+                    }
+                    crate::AgenticProgramStatus::Blocked => {
+                        AgenticCollaborationProgramStatus::Blocked
+                    }
+                    crate::AgenticProgramStatus::Failed => {
+                        AgenticCollaborationProgramStatus::Failed
+                    }
+                    crate::AgenticProgramStatus::Cancelled => {
+                        AgenticCollaborationProgramStatus::Cancelled
+                    }
+                };
+                let teams = program
+                    .teams
+                    .values()
+                    .map(|team| AgenticCollaborationTeamProjectionV1 {
+                        team_id: team.team_id.clone(),
+                        name: team.name.clone(),
+                        mission: team.mission.clone(),
+                        objective: team.objective.clone(),
+                        topic_ref: team.topic_ref.clone(),
+                        created_by: team.created_by.clone(),
+                        member_ids: team.member_ids.clone(),
+                        task_ids: team.task_ids.clone(),
+                        lifecycle: match team.lifecycle {
+                            crate::agentic::AgenticTeamLifecycle::Active => {
+                                AgenticCollaborationLifecycle::Active
+                            }
+                            crate::agentic::AgenticTeamLifecycle::Draining => {
+                                AgenticCollaborationLifecycle::Draining
+                            }
+                            crate::agentic::AgenticTeamLifecycle::Retired => {
+                                AgenticCollaborationLifecycle::Retired
+                            }
+                        },
+                    })
+                    .collect();
+                let agents = program
+                    .agents
+                    .values()
+                    .map(|agent| {
+                        let mut active_task_refs = program
+                            .tasks
+                            .values()
+                            .filter(|task| {
+                                task.claimant.as_deref() == Some(agent.agent_id.as_str())
+                                    && matches!(
+                                        task.status,
+                                        crate::AgenticTaskStatus::Claimed
+                                            | crate::AgenticTaskStatus::CancelRequested
+                                    )
+                            })
+                            .map(|task| task.task_id.clone())
+                            .collect::<Vec<_>>();
+                        let mut history_task_refs = program
+                            .tasks
+                            .values()
+                            .filter(|task| {
+                                task.claimant.as_deref() == Some(agent.agent_id.as_str())
+                                    && !matches!(
+                                        task.status,
+                                        crate::AgenticTaskStatus::Claimed
+                                            | crate::AgenticTaskStatus::CancelRequested
+                                    )
+                            })
+                            .map(|task| task.task_id.clone())
+                            .collect::<Vec<_>>();
+                        let mut active_run_refs = program
+                            .tasks
+                            .values()
+                            .flat_map(|task| task.active_attempts.values())
+                            .filter(|attempt| attempt.agent_id == agent.agent_id)
+                            .map(|attempt| attempt.execution_id.clone())
+                            .collect::<Vec<_>>();
+                        active_task_refs.sort();
+                        active_task_refs.dedup();
+                        history_task_refs.sort();
+                        history_task_refs.dedup();
+                        active_run_refs.sort();
+                        active_run_refs.dedup();
+                        AgenticCollaborationAgentProjectionV1 {
+                            agent_id: agent.agent_id.clone(),
+                            display_name: if agent.display_name.trim().is_empty() {
+                                agent.role.clone()
+                            } else {
+                                agent.display_name.clone()
+                            },
+                            membership_ids: agent.membership_ids.clone(),
+                            role: agent.role.clone(),
+                            mission: agent.mission.clone(),
+                            required_capabilities: agent.required_capabilities.clone(),
+                            invited_by: agent.invited_by.clone(),
+                            status: if !active_run_refs.is_empty() {
+                                AgenticCollaborationAgentStatus::Running
+                            } else if !active_task_refs.is_empty() {
+                                AgenticCollaborationAgentStatus::Assigned
+                            } else if program.active_team_ids_for(&agent.agent_id).is_empty() {
+                                AgenticCollaborationAgentStatus::Retired
+                            } else {
+                                AgenticCollaborationAgentStatus::Idle
+                            },
+                            active_task_refs,
+                            history_task_refs,
+                            active_run_refs,
+                        }
+                    })
+                    .collect();
+                let memberships = program
+                    .memberships
+                    .values()
+                    .map(|membership| AgenticCollaborationMembershipProjectionV1 {
+                        membership_id: membership.membership_id.clone(),
+                        agent_id: membership.agent_id.clone(),
+                        team_id: membership.team_id.clone(),
+                        lifecycle: match membership.lifecycle {
+                            crate::agentic::AgenticMembershipLifecycle::Active => {
+                                AgenticCollaborationLifecycle::Active
+                            }
+                            crate::agentic::AgenticMembershipLifecycle::Draining => {
+                                AgenticCollaborationLifecycle::Draining
+                            }
+                            crate::agentic::AgenticMembershipLifecycle::Retired => {
+                                AgenticCollaborationLifecycle::Retired
+                            }
+                        },
+                        delegation_ref: membership.delegation_ref.clone(),
+                        reason_ref: membership.reason_ref.clone(),
+                    })
+                    .collect();
+                let tasks = program
+                    .tasks
+                    .values()
+                    .map(|task| AgenticCollaborationTaskProjectionV1 {
+                        task_id: task.task_id.clone(),
+                        team_id: task.team_id.clone(),
+                        title: task.title.clone(),
+                        objective: task.objective.clone(),
+                        acceptance: task.acceptance.clone(),
+                        required_capabilities: task.required_capabilities.clone(),
+                        obligation_refs: task.obligation_refs.clone(),
+                        purpose: task.purpose,
+                        execution_requirements: task.execution_requirements.clone(),
+                        expertise_hints: task.expertise_hints.clone(),
+                        depends_on: task.depends_on.clone(),
+                        dependency_resolution: task
+                            .depends_on
+                            .iter()
+                            .map(|dependency_ref| {
+                                let (status, blocker_refs) = match program.tasks.get(dependency_ref)
+                                {
+                                    None => (
+                                        AgenticCollaborationDependencyStatus::Invalid,
+                                        vec![dependency_ref.clone()],
+                                    ),
+                                    Some(dependency)
+                                        if dependency.status
+                                            == crate::AgenticTaskStatus::Withdrawn =>
+                                    {
+                                        (
+                                            AgenticCollaborationDependencyStatus::Invalid,
+                                            vec![dependency_ref.clone()],
+                                        )
+                                    }
+                                    Some(_)
+                                        if crate::agentic::task_dependency_satisfied(
+                                            &program,
+                                            dependency_ref,
+                                        ) =>
+                                    {
+                                        (AgenticCollaborationDependencyStatus::Resolved, Vec::new())
+                                    }
+                                    Some(_) => (
+                                        AgenticCollaborationDependencyStatus::Waiting,
+                                        vec![dependency_ref.clone()],
+                                    ),
+                                };
+                                AgenticCollaborationDependencyResolutionV1 {
+                                    dependency_ref: dependency_ref.clone(),
+                                    status,
+                                    blocker_refs,
+                                }
+                            })
+                            .collect(),
+                        status: match task.status {
+                            crate::AgenticTaskStatus::Published => {
+                                AgenticCollaborationTaskStatus::Published
+                            }
+                            crate::AgenticTaskStatus::Claimed => {
+                                AgenticCollaborationTaskStatus::Claimed
+                            }
+                            crate::AgenticTaskStatus::Submitted => {
+                                AgenticCollaborationTaskStatus::Submitted
+                            }
+                            crate::AgenticTaskStatus::Accepted => {
+                                AgenticCollaborationTaskStatus::Accepted
+                            }
+                            crate::AgenticTaskStatus::Rework => {
+                                AgenticCollaborationTaskStatus::Rework
+                            }
+                            crate::AgenticTaskStatus::Blocked => {
+                                AgenticCollaborationTaskStatus::Blocked
+                            }
+                            crate::AgenticTaskStatus::CancelRequested => {
+                                AgenticCollaborationTaskStatus::CancelRequested
+                            }
+                            crate::AgenticTaskStatus::Withdrawn => {
+                                AgenticCollaborationTaskStatus::Withdrawn
+                            }
+                            crate::AgenticTaskStatus::Superseded => {
+                                AgenticCollaborationTaskStatus::Superseded
+                            }
+                        },
+                        claimant: task.claimant.clone(),
+                        claim_generation: task.claim_generation,
+                        claim_execution_id: task.claim_execution_id.clone(),
+                        claimed_at_ms: task.claimed_at_ms,
+                        lease_expires_at_ms: task.lease_expires_at_ms,
+                        active_attempts: task
+                            .active_attempts
+                            .values()
+                            .map(|attempt| AgenticCollaborationTaskAttemptProjectionV1 {
+                                execution_id: attempt.execution_id.clone(),
+                                agent_id: attempt.agent_id.clone(),
+                                membership_id: attempt.membership_id.clone(),
+                                mode: attempt.mode,
+                                generation: attempt.generation,
+                            })
+                            .collect(),
+                        artifact_refs: task.artifact_refs.clone(),
+                        evidence_refs: task.evidence_refs.clone(),
+                        unresolved: task.unresolved.clone(),
+                        review_reason: task.review_reason.clone(),
+                        reviewed_by: task.reviewed_by.clone(),
+                        failed_attempts: task.failed_attempts,
+                        review_generation: task.review_generation,
+                        failed_review_attempts: task.failed_review_attempts,
+                        last_failure: task.last_failure.clone(),
+                        replacement_task_refs: task.replacement_task_refs.clone(),
+                        supersede_evidence_refs: task.supersede_evidence_refs.clone(),
+                        superseded_reason: task.superseded_reason.clone(),
+                        superseded_by: task.superseded_by.clone(),
+                        cancel_requested_by: task.cancel_requested_by.clone(),
+                        cancel_reason_ref: task.cancel_reason_ref.clone(),
+                        cancel_evidence_refs: task.cancel_evidence_refs.clone(),
+                    })
+                    .collect();
+                let topics = program
+                    .topics
+                    .iter()
+                    .map(
+                        |(topic_ref, entries)| AgenticCollaborationTopicProjectionV1 {
+                            topic_ref: topic_ref.clone(),
+                            entries: entries
+                                .iter()
+                                .map(|entry| AgenticCollaborationTopicEntryProjectionV1 {
+                                    entry_id: entry.entry_id.clone(),
+                                    revision: entry.revision,
+                                    actor_id: entry.actor_id.clone(),
+                                    summary: entry.summary.clone(),
+                                    content_ref: entry.content_ref.clone(),
+                                    refs: entry.refs.clone(),
+                                    recipients: entry.recipients.clone(),
+                                    intent: entry.intent.clone(),
+                                })
+                                .collect(),
+                        },
+                    )
+                    .collect();
+                let artifacts = program
+                    .artifacts
+                    .values()
+                    .map(|artifact| AgenticCollaborationArtifactProjectionV1 {
+                        artifact_ref: artifact.artifact_ref.clone(),
+                        content_ref: artifact.content_ref.clone(),
+                        kind: artifact.kind.clone(),
+                        title: artifact.title.clone(),
+                        relates_to: artifact.relates_to.clone(),
+                        committed_by: artifact.committed_by.clone(),
+                    })
+                    .collect();
+                let completion = AgenticCollaborationCompletionProjectionV1 {
+                    final_artifact_ref: program.final_artifact_ref.clone(),
+                    wait: program.completion_request.as_ref().map(|request| {
+                        AgenticCollaborationCompletionWaitProjectionV1 {
+                            action_id: request.action_id.clone(),
+                            requested_by: request.requested_by.clone(),
+                            program_revision: request.program_revision,
+                            result_refs: request.result_refs.clone(),
+                            primary_artifact_ref: request.primary_artifact_ref.clone(),
+                            evidence_refs: request.evidence_refs.clone(),
+                            unresolved: request.unresolved.clone(),
+                        }
+                    }),
+                    verdict: program.objective_verdict.as_ref().map(|verdict| {
+                        AgenticCollaborationObjectiveVerdictProjectionV1 {
+                            goal_id: verdict.goal_id.clone(),
+                            goal_revision: verdict.goal_revision,
+                            terminal_fence: verdict.terminal_fence.clone(),
+                            authority_revision: verdict.authority_revision,
+                            kind: verdict.kind,
+                        }
+                    }),
+                };
+                AgenticCollaborationProgramProjectionV1 {
+                    program_id: program.program_id.clone(),
+                    revision: program.revision,
+                    status,
+                    objective_id: program.objective_id.clone(),
+                    objective_summary: program.objective_summary.clone(),
+                    session_id: program.session_id.clone(),
+                    turn_id: program.turn_id.clone(),
+                    root_execution_id: program.root_execution_id.clone(),
+                    required_team_count: program.required_team_count,
+                    model_lease: program.model_lease.clone(),
+                    permission_ceiling: program.permission_ceiling,
+                    resource_scopes: program.resource_scopes.clone(),
+                    teams,
+                    agents,
+                    memberships,
+                    tasks,
+                    topics,
+                    artifacts,
+                    completion,
+                    semantic_refs: AgenticCollaborationSemanticRefsV1 {
+                        program_ref: program.program_id.clone(),
+                        objective_ref: program.objective_id.clone(),
+                        team_refs: program.teams.keys().cloned().collect(),
+                        agent_refs: program.agents.keys().cloned().collect(),
+                        task_refs: program.tasks.keys().cloned().collect(),
+                        topic_refs: program.topics.keys().cloned().collect(),
+                        artifact_refs: program.artifacts.keys().cloned().collect(),
+                    },
+                    unresolved: program.unresolved.clone(),
+                }
+            })
+            .collect(),
+    }
+}
+
 fn agentic_programs_for_executions(
     services: &RuntimeServices,
     execution_ids: &BTreeSet<String>,
-) -> Vec<crate::AgenticProgramProjection> {
+) -> Result<Vec<crate::AgenticProgramProjection>, RuntimeServicesError> {
     let action_service = services.agent_action_service();
     let mut programs = services
         .event_store()
         .stream_ids_for_scope(RuntimeEventScope::Program)
-        .unwrap_or_default()
+        .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?
         .into_iter()
         .filter_map(|stream| {
             stream
                 .strip_prefix("agentic-program:")
                 .map(ToOwned::to_owned)
         })
-        .filter_map(|program_id| action_service.project_if_exists(&program_id).ok().flatten())
+        .map(|program_id| {
+            action_service
+                .project_if_exists(&program_id)
+                .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
         .filter(|program| {
             program
                 .root_execution_id
@@ -503,7 +825,7 @@ fn agentic_programs_for_executions(
         })
         .collect::<Vec<_>>();
     programs.sort_by(|left, right| left.program_id.cmp(&right.program_id));
-    programs
+    Ok(programs)
 }
 
 fn agent_task_matches_projection_scope(
@@ -747,6 +1069,7 @@ mod tests {
             approvals: Vec::new(),
             interventions: Vec::new(),
             child_executions: Vec::new(),
+            agentic_collaboration: Default::default(),
             descendant_graphs: Vec::new(),
         }
     }

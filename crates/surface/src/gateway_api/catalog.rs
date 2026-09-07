@@ -1203,8 +1203,6 @@ pub mod paths {
         GatewayPathKey::new("api_tasks_mission_preview", "/api/tasks/mission/preview");
     pub const API_TASKS_START: GatewayPathKey =
         GatewayPathKey::new("api_tasks_start", "/api/tasks/start");
-    pub const API_TEAM_TEMPLATES: GatewayPathKey =
-        GatewayPathKey::new("api_team_templates", "/api/team-templates");
     pub const API_TOOLS: GatewayPathKey = GatewayPathKey::new("api_tools", "/api/tools");
     pub const API_TOOLS_BATCH_READONLY: GatewayPathKey =
         GatewayPathKey::new("api_tools_batch_readonly", "/api/tools/batch-readonly");
@@ -2590,11 +2588,6 @@ pub mod routes {
         "get_api_tasks_mission_organization",
         GatewayHttpMethod::Get,
         paths::API_TASKS_MISSION_ORGANIZATION,
-    );
-    pub const GET_API_TEAM_TEMPLATES: GatewayRouteSpec = GatewayRouteSpec::new(
-        "get_api_team_templates",
-        GatewayHttpMethod::Get,
-        paths::API_TEAM_TEMPLATES,
     );
     pub const GET_API_TOOLS: GatewayRouteSpec =
         GatewayRouteSpec::new("get_api_tools", GatewayHttpMethod::Get, paths::API_TOOLS);
@@ -4080,7 +4073,6 @@ pub const GATEWAY_PATHS: &[GatewayPathKey] = &[
     paths::API_TASKS_MISSION_ORGANIZATION,
     paths::API_TASKS_MISSION_PREVIEW,
     paths::API_TASKS_START,
-    paths::API_TEAM_TEMPLATES,
     paths::API_TOOLS,
     paths::API_TOOLS_BATCH_READONLY,
     paths::API_TOOLS_CACHE,
@@ -4377,7 +4369,6 @@ pub const GATEWAY_ROUTES: &[GatewayRouteSpec] = &[
     routes::GET_API_TASKS_BY_ID_EXECUTION_GRAPH,
     routes::GET_API_TASKS_BY_ID_TURNS,
     routes::GET_API_TASKS_MISSION_ORGANIZATION,
-    routes::GET_API_TEAM_TEMPLATES,
     routes::GET_API_TOOLS,
     routes::GET_API_TOOLS_CACHE,
     routes::GET_API_TOOLS_CHECKPOINTS,
@@ -4631,6 +4622,10 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(paths.len(), GATEWAY_PATHS.len());
         assert_eq!(routes.len(), GATEWAY_ROUTES.len());
-        assert_eq!(routes.len(), 476);
+        // The retired `/api/team-templates` endpoint was the last legacy
+        // template-driven collaboration route. Keep the reviewed catalog
+        // cardinality explicit so a future route change must update its
+        // contract and tests deliberately.
+        assert_eq!(routes.len(), 475);
     }
 }

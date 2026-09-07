@@ -218,7 +218,8 @@ pub enum ToolChoice {
     Tool { name: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(from = "MessageResponseWire")]
 pub struct MessageResponse {
     pub id: String,
     #[serde(rename = "type")]
@@ -234,10 +235,110 @@ pub struct MessageResponse {
     pub stop_reason: Option<String>,
     #[serde(default)]
     pub stop_sequence: Option<String>,
-    #[serde(default)]
     pub usage: Usage,
+    /// Whether the Provider actually supplied a usage object. Deserialization
+    /// derives this from field presence; adapters may set it explicitly.
+    pub usage_observed: bool,
+    /// Whether the Provider wire payload explicitly exposed cache-write/read
+    /// dimensions. Zero is meaningful only when this bit is true.
+    #[serde(default)]
+    pub cache_dimensions_observed: bool,
     #[serde(default)]
     pub request_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct InternalObservationWire {
+    schema_version: u8,
+    usage_observed: bool,
+    cache_dimensions_observed: bool,
+}
+
+impl serde::Serialize for MessageResponse {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let mut state = serializer.serialize_struct("MessageResponse", 10)?;
+        state.serialize_field("id", &self.id)?;
+        state.serialize_field("type", &self.kind)?;
+        state.serialize_field("role", &self.role)?;
+        state.serialize_field("content", &self.content)?;
+        state.serialize_field("model", &self.model)?;
+        state.serialize_field("stop_reason", &self.stop_reason)?;
+        state.serialize_field("stop_sequence", &self.stop_sequence)?;
+        state.serialize_field("usage", &self.usage)?;
+        state.serialize_field("request_id", &self.request_id)?;
+        state.serialize_field(
+            "_cowd_observation",
+            &InternalObservationWire {
+                schema_version: 1,
+                usage_observed: self.usage_observed,
+                cache_dimensions_observed: self.cache_dimensions_observed,
+            },
+        )?;
+        state.end()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MessageResponseWire {
+    id: String,
+    #[serde(rename = "type")]
+    kind: String,
+    role: String,
+    #[serde(default)]
+    content: Vec<OutputContentBlock>,
+    model: String,
+    #[serde(default)]
+    stop_reason: Option<String>,
+    #[serde(default)]
+    stop_sequence: Option<String>,
+    #[serde(default)]
+    usage: Option<WireUsage>,
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default, rename = "_cowd_observation")]
+    internal_observation: Option<InternalObservationWire>,
+}
+
+impl From<MessageResponseWire> for MessageResponse {
+    fn from(wire: MessageResponseWire) -> Self {
+        // The versioned receipt exists only on Cowd-owned serialization paths.
+        // Untrusted Provider entrypoints strip it before invoking this decoder,
+        // leaving field presence as the sole external observation authority.
+        let provider_usage_observed = wire.usage.is_some();
+        let provider_cache_dimensions_observed = wire
+            .usage
+            .as_ref()
+            .is_some_and(WireUsage::cache_dimensions_observed);
+        let trusted_internal = wire
+            .internal_observation
+            .filter(|observation| observation.schema_version == 1);
+        let usage_observed = trusted_internal
+            .map(|observation| observation.usage_observed)
+            .unwrap_or(provider_usage_observed);
+        let cache_dimensions_observed = trusted_internal
+            .map(|observation| observation.cache_dimensions_observed)
+            .unwrap_or(provider_cache_dimensions_observed);
+        Self {
+            id: wire.id,
+            kind: wire.kind,
+            role: wire.role,
+            content: wire.content,
+            model: wire.model,
+            stop_reason: wire.stop_reason,
+            stop_sequence: wire.stop_sequence,
+            usage: wire
+                .usage
+                .map_or_else(Usage::default, WireUsage::into_usage),
+            usage_observed,
+            cache_dimensions_observed,
+            request_id: wire.request_id,
+        }
+    }
 }
 
 impl MessageResponse {
@@ -312,11 +413,129 @@ pub struct MessageStartEvent {
     pub message: MessageResponse,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(from = "MessageDeltaEventWire")]
 pub struct MessageDeltaEvent {
     pub delta: MessageDelta,
-    #[serde(default)]
     pub usage: Usage,
+    pub usage_observed: bool,
+    #[serde(default)]
+    pub cache_dimensions_observed: bool,
+}
+
+impl serde::Serialize for MessageDeltaEvent {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let mut state = serializer.serialize_struct("MessageDeltaEvent", 3)?;
+        state.serialize_field("delta", &self.delta)?;
+        state.serialize_field("usage", &self.usage)?;
+        state.serialize_field(
+            "_cowd_observation",
+            &InternalObservationWire {
+                schema_version: 1,
+                usage_observed: self.usage_observed,
+                cache_dimensions_observed: self.cache_dimensions_observed,
+            },
+        )?;
+        state.end()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MessageDeltaEventWire {
+    delta: MessageDelta,
+    #[serde(default)]
+    usage: Option<WireUsage>,
+    #[serde(default, rename = "_cowd_observation")]
+    internal_observation: Option<InternalObservationWire>,
+}
+
+impl From<MessageDeltaEventWire> for MessageDeltaEvent {
+    fn from(wire: MessageDeltaEventWire) -> Self {
+        let provider_usage_observed = wire.usage.is_some();
+        let provider_cache_dimensions_observed = wire
+            .usage
+            .as_ref()
+            .is_some_and(WireUsage::cache_dimensions_observed);
+        let trusted_internal = wire
+            .internal_observation
+            .filter(|observation| observation.schema_version == 1);
+        let usage_observed = trusted_internal
+            .map(|observation| observation.usage_observed)
+            .unwrap_or(provider_usage_observed);
+        let cache_dimensions_observed = trusted_internal
+            .map(|observation| observation.cache_dimensions_observed)
+            .unwrap_or(provider_cache_dimensions_observed);
+        Self {
+            delta: wire.delta,
+            usage: wire
+                .usage
+                .map_or_else(Usage::default, WireUsage::into_usage),
+            usage_observed,
+            cache_dimensions_observed,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct WireUsage {
+    #[serde(default)]
+    input_tokens: Option<u32>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u32>,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u32>,
+    #[serde(default)]
+    output_tokens: Option<u32>,
+}
+
+impl WireUsage {
+    fn cache_dimensions_observed(&self) -> bool {
+        self.cache_creation_input_tokens.is_some() && self.cache_read_input_tokens.is_some()
+    }
+
+    fn into_usage(self) -> Usage {
+        Usage {
+            input_tokens: self.input_tokens.unwrap_or_default(),
+            cache_creation_input_tokens: self.cache_creation_input_tokens.unwrap_or_default(),
+            cache_read_input_tokens: self.cache_read_input_tokens.unwrap_or_default(),
+            output_tokens: self.output_tokens.unwrap_or_default(),
+        }
+    }
+}
+
+/// Decode an untrusted Provider response without accepting Cowd's internal
+/// observation receipt even if an upstream attempts to forge it.
+pub(crate) fn deserialize_provider_message_response(
+    payload: &str,
+) -> Result<MessageResponse, serde_json::Error> {
+    let mut value: serde_json::Value = serde_json::from_str(payload)?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove("_cowd_observation");
+    }
+    serde_json::from_value(value)
+}
+
+/// Decode an untrusted Anthropic SSE event. Internal observation receipts are
+/// valid only on Cowd-owned serialization paths, never on Provider input.
+pub(crate) fn deserialize_provider_stream_event(
+    payload: &str,
+) -> Result<StreamEvent, serde_json::Error> {
+    let mut value: serde_json::Value = serde_json::from_str(payload)?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove("_cowd_observation");
+        if let Some(message) = object
+            .get_mut("message")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            message.remove("_cowd_observation");
+        }
+    }
+    serde_json::from_value(value)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -371,8 +590,9 @@ pub enum StreamEvent {
 #[cfg(test)]
 mod tests {
     use super::{
-        InputContentBlock, InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
-        StreamEvent, Usage,
+        deserialize_provider_message_response, deserialize_provider_stream_event,
+        InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent, MessageRequest,
+        MessageResponse, OutputContentBlock, StreamEvent, Usage,
     };
 
     #[test]
@@ -404,7 +624,174 @@ mod tests {
 
         assert!(matches!(
             event,
-            StreamEvent::MessageStart(start) if start.message.content.is_empty()
+            StreamEvent::MessageStart(start)
+                if start.message.content.is_empty()
+                    && start.message.usage_observed
+                    && !start.message.cache_dimensions_observed
+        ));
+    }
+
+    #[test]
+    fn missing_start_usage_is_unknown_instead_of_known_zero() {
+        let event: StreamEvent = serde_json::from_value(serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "id": "resp-no-usage",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-6"
+            }
+        }))
+        .expect("a usage-free message_start remains structurally valid");
+
+        assert!(matches!(
+            event,
+            StreamEvent::MessageStart(start)
+                if !start.message.usage_observed
+                    && !start.message.cache_dimensions_observed
+                    && start.message.usage == Usage::default()
+        ));
+    }
+
+    #[test]
+    fn provider_cannot_self_declare_missing_usage_or_cache_as_observed() {
+        let start: StreamEvent = serde_json::from_value(serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "id": "resp-forged-observation",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "usage_observed": true,
+                "cache_dimensions_observed": true
+            }
+        }))
+        .expect("unknown Provider extensions are structurally harmless");
+        let delta: StreamEvent = serde_json::from_value(serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn"},
+            "usage_observed": true,
+            "cache_dimensions_observed": true
+        }))
+        .expect("unknown Provider extensions are structurally harmless");
+
+        assert!(matches!(
+            start,
+            StreamEvent::MessageStart(start)
+                if !start.message.usage_observed
+                    && !start.message.cache_dimensions_observed
+        ));
+        assert!(matches!(
+            delta,
+            StreamEvent::MessageDelta(delta)
+                if !delta.usage_observed && !delta.cache_dimensions_observed
+        ));
+    }
+
+    #[test]
+    fn internal_roundtrip_preserves_unknown_response_and_delta_usage() {
+        let response = MessageResponse {
+            id: "internal-response".to_string(),
+            kind: "message".to_string(),
+            role: "assistant".to_string(),
+            content: Vec::new(),
+            model: "model".to_string(),
+            stop_reason: None,
+            stop_sequence: None,
+            usage: Usage::default(),
+            usage_observed: false,
+            cache_dimensions_observed: false,
+            request_id: None,
+        };
+        let response: MessageResponse = serde_json::from_value(
+            serde_json::to_value(response).expect("serialize internal response"),
+        )
+        .expect("deserialize internal response");
+        assert!(!response.usage_observed);
+        assert!(!response.cache_dimensions_observed);
+
+        let event = StreamEvent::MessageDelta(MessageDeltaEvent {
+            delta: MessageDelta {
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+            },
+            usage: Usage::default(),
+            usage_observed: false,
+            cache_dimensions_observed: false,
+        });
+        let event: StreamEvent =
+            serde_json::from_value(serde_json::to_value(event).expect("serialize internal delta"))
+                .expect("deserialize internal delta");
+        assert!(matches!(
+            event,
+            StreamEvent::MessageDelta(delta)
+                if !delta.usage_observed && !delta.cache_dimensions_observed
+        ));
+    }
+
+    #[test]
+    fn provider_entrypoints_ignore_forged_internal_observation_receipts() {
+        let response = deserialize_provider_message_response(
+            r#"{
+                "id":"forged-response","type":"message","role":"assistant","model":"model",
+                "_cowd_observation":{"schema_version":1,"usage_observed":true,"cache_dimensions_observed":true}
+            }"#,
+        )
+        .expect("provider response");
+        assert!(!response.usage_observed);
+        assert!(!response.cache_dimensions_observed);
+
+        for payload in [
+            r#"{
+                "type":"message_start",
+                "message":{
+                    "id":"forged-start","type":"message","role":"assistant","model":"model",
+                    "_cowd_observation":{"schema_version":1,"usage_observed":true,"cache_dimensions_observed":true}
+                }
+            }"#,
+            r#"{
+                "type":"message_delta","delta":{"stop_reason":"end_turn"},
+                "_cowd_observation":{"schema_version":1,"usage_observed":true,"cache_dimensions_observed":true}
+            }"#,
+        ] {
+            let event = deserialize_provider_stream_event(payload).expect("provider event");
+            match event {
+                StreamEvent::MessageStart(start) => {
+                    assert!(!start.message.usage_observed);
+                    assert!(!start.message.cache_dimensions_observed);
+                }
+                StreamEvent::MessageDelta(delta) => {
+                    assert!(!delta.usage_observed);
+                    assert!(!delta.cache_dimensions_observed);
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_zero_cache_dimensions_remain_observed() {
+        let event: StreamEvent = serde_json::from_value(serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "id": "resp-explicit-cache-zero",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "usage": {
+                    "input_tokens": 12,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0
+                }
+            }
+        }))
+        .expect("explicit cache zeroes should deserialize");
+
+        assert!(matches!(
+            event,
+            StreamEvent::MessageStart(start)
+                if start.message.usage_observed && start.message.cache_dimensions_observed
         ));
     }
 
@@ -444,6 +831,8 @@ mod tests {
                 cache_read_input_tokens: 200_000,
                 output_tokens: 500_000,
             },
+            usage_observed: true,
+            cache_dimensions_observed: true,
             request_id: None,
         };
 

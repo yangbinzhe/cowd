@@ -5,10 +5,10 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use memory::store::{sqlite::SqliteStore, MemoryStore};
+use memory::store::MemoryStore;
 use memory::{
-    AgentVisibility, L4PromotionCommand, MemoryCategory, MemoryEntry, MemoryError, MemoryLayer,
-    MemoryOrchestrator, MemoryScope, MemorySource, Priority,
+    AgentVisibility, EphemeralMemoryStore, L4PromotionCommand, MemoryCategory, MemoryEntry,
+    MemoryError, MemoryLayer, MemoryOrchestrator, MemoryScope, MemorySource, Priority,
 };
 
 fn entry(layer: MemoryLayer) -> MemoryEntry {
@@ -38,7 +38,7 @@ fn entry(layer: MemoryLayer) -> MemoryEntry {
 
 #[tokio::test]
 async fn ordinary_writers_cannot_bypass_the_governed_l4_promotion_command() {
-    let store: Arc<dyn MemoryStore> = Arc::new(SqliteStore::open_in_memory().expect("sqlite"));
+    let store: Arc<dyn MemoryStore> = Arc::new(EphemeralMemoryStore::new());
     let mut config = memory::MemoryConfig::default();
     config.layers.l4_enabled = true;
     let orchestrator = MemoryOrchestrator::from_store(config, store, None).expect("orchestrator");

@@ -1,24 +1,14 @@
+use super::super::program::AgenticTaskAttemptProjection;
 use super::*;
 use super::{admission::*, heartbeat::agentic_graph_is_terminal, helpers::*};
-use harness_contract::agent::{CohortPromptPackage, CohortPromptPacket};
+use harness_contract::agent::{
+    AgenticExecutionBinding, AgenticExecutionFocus, CohortPromptPackage, CohortPromptPacket,
+};
 
 // Accounting prediction only. `ParentExecutionBudgetLedger::reserve_provider`
 // records overruns and borrowing but never rejects or shrinks an Agent model
 // request, so this estimate cannot become a business-execution budget gate.
 const AGENTIC_TASK_CAPACITY_ESTIMATE_TOKENS: u64 = 1_000_000;
-const AGENTIC_SHARED_OBJECTIVE_MAX_CHARS: usize = 12_000;
-const AGENTIC_SHARED_TEAM_FIELD_MAX_CHARS: usize = 4_000;
-
-fn bounded_shared_context(value: &str, max_chars: usize) -> String {
-    let trimmed = value.trim();
-    if trimmed.chars().count() <= max_chars {
-        return trimmed.to_string();
-    }
-    let mut bounded = trimmed.chars().take(max_chars).collect::<String>();
-    bounded.push_str("\n[bounded by Runtime]");
-    bounded
-}
-
 pub(super) fn agentic_shared_prompt_package(
     projection: &AgenticProgramProjection,
     team_id: &str,
@@ -33,14 +23,11 @@ pub(super) fn agentic_shared_prompt_package(
         .unwrap_or("not separately declared");
     let content = format!(
         "Program objective:\n{}\n\nTeam name:\n{}\n\nTeam mission:\n{}\n\nTeam objective:\n{}\n\nPublic Team topic reference:\n{}",
-        bounded_shared_context(
-            &projection.objective_summary,
-            AGENTIC_SHARED_OBJECTIVE_MAX_CHARS,
-        ),
-        bounded_shared_context(&team.name, AGENTIC_SHARED_TEAM_FIELD_MAX_CHARS),
-        bounded_shared_context(&team.mission, AGENTIC_SHARED_TEAM_FIELD_MAX_CHARS),
-        bounded_shared_context(team_objective, AGENTIC_SHARED_TEAM_FIELD_MAX_CHARS),
-        bounded_shared_context(&team.topic_ref, AGENTIC_SHARED_TEAM_FIELD_MAX_CHARS),
+        projection.objective_summary.trim(),
+        team.name.trim(),
+        team.mission.trim(),
+        team_objective.trim(),
+        team.topic_ref.trim(),
     );
     let package = CohortPromptPackage::for_agentic_program(
         projection.session_id.clone(),
@@ -80,6 +67,29 @@ impl Drop for DispatchFlight {
     }
 }
 
+fn agentic_supervisor_actor(
+    projection: &AgenticProgramProjection,
+    execution_id: Option<String>,
+) -> harness_contract::agent_action::AgentActorBinding {
+    harness_contract::agent_action::AgentActorBinding {
+        objective_id: projection.objective_id.clone(),
+        program_id: projection.program_id.clone(),
+        session_id: projection.session_id.clone(),
+        turn_id: projection.turn_id.clone(),
+        root_execution_id: projection.root_execution_id.clone(),
+        required_team_count: projection.required_team_count,
+        objective_summary: projection.objective_summary.clone(),
+        model_lease: projection.model_lease.clone(),
+        permission_ceiling: Some(projection.permission_ceiling),
+        resource_scopes: projection.resource_scopes.clone(),
+        actor_id: "runtime.program-supervisor".to_string(),
+        kind: harness_contract::agent_action::AgentActorKind::Supervisor,
+        execution_id,
+        team_id: None,
+        agent_id: None,
+    }
+}
+
 impl RuntimeServices {
     /// Translate committed semantic collaboration work into real Agent
     /// execution graphs. Runtime selects one eligible low-load member per
@@ -96,6 +106,7 @@ impl RuntimeServices {
             .project(&envelope.actor.program_id)
             .map_err(|error| error.to_string())?;
         let mut requests = Vec::new();
+        let mut cancellation_tasks = Vec::new();
         let observed_at_ms = now_ms();
         match &envelope.action {
             // Queries never create provider work. Mutations and startup
@@ -133,6 +144,7 @@ impl RuntimeServices {
                 requests.push((input.task_ref.clone(), DispatchMode::Execute));
             }
             AgentAction::TaskSupersede(input) => {
+                cancellation_tasks.push(input.task_ref.clone());
                 requests.extend(
                     input
                         .replacement_task_refs
@@ -141,6 +153,9 @@ impl RuntimeServices {
                         .cloned()
                         .map(|task_ref| (task_ref, DispatchMode::Execute)),
                 );
+            }
+            AgentAction::TaskWithdraw(input) => {
+                cancellation_tasks.push(input.task_ref.clone());
             }
             AgentAction::TaskReview(input) => match input.decision {
                 harness_contract::agent_action::TaskReviewDecision::Accept => {
@@ -178,10 +193,40 @@ impl RuntimeServices {
                     }
                 }
             }
+            AgentAction::MessagePublish(input) => {
+                if let Some(intent) = input.intent.as_ref() {
+                    // Intent is a typed wake signal, not an inferred prose
+                    // command. Runtime merely re-runs normal readiness and
+                    // admission; the receiving Agent still owns claim/replan.
+                    if task_is_ready(&projection, &intent.task_ref) {
+                        requests.push((intent.task_ref.clone(), DispatchMode::Execute));
+                    }
+                }
+            }
             _ => {}
         }
         requests.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
         requests.dedup();
+
+        // A retirement action is durable before this point.  A cancellation
+        // command that races a restart therefore leaves the Task explicitly
+        // `CancelRequested` and is retried by startup recovery; it must never
+        // be reported as if the semantic retirement itself had failed.
+        cancellation_tasks.sort();
+        cancellation_tasks.dedup();
+        for task_ref in cancellation_tasks {
+            if let Err(error) = self
+                .reconcile_agentic_task_cancellation(&projection, &task_ref)
+                .await
+            {
+                tracing::warn!(
+                    program_id = projection.program_id,
+                    task_ref,
+                    %error,
+                    "durable Agent Task cancellation awaits recovery reconciliation"
+                );
+            }
+        }
 
         let mut receipts = Vec::new();
         let mut deferred = Vec::new();
@@ -194,21 +239,129 @@ impl RuntimeServices {
                 Err(error) => deferred.push(format!("{}:{}:{error}", mode.as_str(), task_ref)),
             }
         }
-        if receipts.is_empty() && !deferred.is_empty() {
+        if !deferred.is_empty() {
             return Err(format!(
-                "Agent execution dispatch deferred after durable action commit: {}",
+                "Agent execution dispatch deferred after durable action commit; {} idempotent dispatch receipt(s) were committed and will be reused on retry: {}",
+                receipts.len(),
                 deferred.join(" | ")
             ));
         }
-        if !deferred.is_empty() {
-            tracing::warn!(
-                program_id = %projection.program_id,
-                deferred = %deferred.join(" | "),
-                dispatched = receipts.len(),
-                "some Agent-first followups were deferred while independent work was admitted"
-            );
-        }
         Ok(receipts)
+    }
+
+    /// Make a semantic Task retirement control every physical execution that
+    /// Runtime admitted for it.  The Program's attempt records cover both
+    /// the pre-claim interval and independent review, so a retirement cannot
+    /// leave a model or tool effect running behind a `Withdrawn` projection.
+    async fn reconcile_agentic_task_cancellation(
+        self: &Arc<Self>,
+        projection: &AgenticProgramProjection,
+        task_ref: &str,
+    ) -> Result<(), String> {
+        let Some(task) = projection.tasks.get(task_ref) else {
+            return Err(format!("agentic_task_not_found:{task_ref}"));
+        };
+        if task.status != AgenticTaskStatus::CancelRequested {
+            return Ok(());
+        }
+        let mut attempts = task.active_attempts.values().cloned().collect::<Vec<_>>();
+        // Old journals written before the effect outbox was introduced still
+        // carry the execute fence.  This one-time recovery path does not make
+        // that legacy representation authoritative for new work.
+        if attempts.is_empty() {
+            if let Some(execution_id) = task.claim_execution_id.as_ref() {
+                attempts.push(AgenticTaskAttemptProjection {
+                    execution_id: execution_id.clone(),
+                    agent_id: task.claimant.clone().unwrap_or_default(),
+                    membership_id: String::new(),
+                    mode: harness_contract::agent_action::AgentAttemptMode::Execute,
+                    generation: task.claim_generation,
+                });
+            }
+        }
+        for attempt in attempts {
+            let terminal = match self
+                .graph_state_store()
+                .load_async(&attempt.execution_id)
+                .await
+            {
+                Ok(graph) if agentic_graph_is_terminal(&graph) => true,
+                Ok(_) => {
+                    self.cancel_execution_tree(
+                        &attempt.execution_id,
+                        "Agentic Task was withdrawn or superseded",
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                    self.graph_state_store()
+                        .load_async(&attempt.execution_id)
+                        .await
+                        .map(|graph| agentic_graph_is_terminal(&graph))
+                        .map_err(|error| error.to_string())?
+                }
+                Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound(_)) => {
+                    // Supervisor registration is durable before the executor
+                    // can start.  No graph means no effect was admitted.
+                    true
+                }
+                Err(error) => return Err(error.to_string()),
+            };
+            if !terminal {
+                return Err(format!(
+                    "agentic_task_cancellation_not_terminal:{}:{}",
+                    task_ref, attempt.execution_id
+                ));
+            }
+            self.settle_agentic_task_attempt(
+                projection,
+                task_ref,
+                &attempt.execution_id,
+                attempt.mode,
+                "physical Agent execution cancelled after Task retirement",
+                false,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn settle_agentic_task_attempt(
+        self: &Arc<Self>,
+        projection: &AgenticProgramProjection,
+        task_ref: &str,
+        execution_id: &str,
+        mode: harness_contract::agent_action::AgentAttemptMode,
+        reason: &str,
+        retryable: bool,
+    ) -> Result<(), String> {
+        let envelope = AgentActionEnvelope {
+            action_id: format!(
+                "runtime-attempt-settle:{}:{}:{}",
+                projection.program_id, task_ref, execution_id
+            ),
+            actor: agentic_supervisor_actor(projection, Some(execution_id.to_string())),
+            expected_revision: None,
+            action: AgentAction::TaskAttemptFail(
+                harness_contract::agent_action::TaskAttemptFailInput {
+                    task_ref: task_ref.to_string(),
+                    execution_id: execution_id.to_string(),
+                    mode,
+                    reason: reason.to_string(),
+                    retryable,
+                },
+            ),
+        };
+        let observation = self.submit_agent_action(&envelope).await?;
+        if observation.status != harness_contract::agent_action::AgentActionStatus::Applied {
+            return Err(format!(
+                "agentic_attempt_settlement_rejected:{}",
+                observation
+                    .error
+                    .map(|error| error.code)
+                    .unwrap_or_else(|| "unknown".to_string())
+            ));
+        }
+        Ok(())
     }
 
     /// Reconcile all durable open Programs after graph recovery. This closes
@@ -217,11 +370,23 @@ impl RuntimeServices {
     pub async fn recover_agentic_programs_on_startup(
         self: &Arc<Self>,
     ) -> Result<Vec<AgenticDispatchReceipt>, String> {
+        let excluded_sessions = BTreeSet::new();
+        self.recover_agentic_programs_on_startup_excluding_sessions(&excluded_sessions)
+            .await
+    }
+
+    /// Reconcile open Programs only after their owning Session has hydrated.
+    /// Programs for excluded Sessions remain durable and untouched for retry.
+    pub async fn recover_agentic_programs_on_startup_excluding_sessions(
+        self: &Arc<Self>,
+        excluded_sessions: &BTreeSet<String>,
+    ) -> Result<Vec<AgenticDispatchReceipt>, String> {
         let streams = self
             .event_store()
             .stream_ids_for_scope(crate::RuntimeEventScope::Program)
             .map_err(|error| error.to_string())?;
         let mut receipts = Vec::new();
+        let mut failures = Vec::new();
         for stream in streams {
             let Some(program_id) = stream.strip_prefix("agentic-program:") else {
                 continue;
@@ -230,8 +395,81 @@ impl RuntimeServices {
                 .agent_action_service()
                 .project(program_id)
                 .map_err(|error| error.to_string())?;
+            if excluded_sessions.contains(&projection.session_id) {
+                continue;
+            }
+            let cancellation_tasks = projection
+                .tasks
+                .values()
+                .filter(|task| task.status == AgenticTaskStatus::CancelRequested)
+                .map(|task| task.task_id.clone())
+                .collect::<Vec<_>>();
+            let mut cancellation_reconciled = false;
+            for task_ref in cancellation_tasks {
+                self.reconcile_agentic_task_cancellation(&projection, &task_ref)
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "startup cancellation reconciliation failed for Program {program_id}, Task {task_ref}: {error}"
+                        )
+                    })?;
+                cancellation_reconciled = true;
+            }
+            if cancellation_reconciled {
+                projection = self
+                    .agent_action_service()
+                    .project(program_id)
+                    .map_err(|error| error.to_string())?;
+            }
             if projection.status != super::super::program::AgenticProgramStatus::Open {
                 continue;
+            }
+            // An admitted graph that is terminal (or was never persisted)
+            // cannot remain an invisible outbox entry.  Settle it through the
+            // same Supervisor action used by normal worker failure so later
+            // dispatch is based on durable Task truth, never stale memory.
+            let stranded_attempts = projection
+                .tasks
+                .values()
+                .flat_map(|task| {
+                    task.active_attempts
+                        .values()
+                        .cloned()
+                        .map(move |attempt| (task.task_id.clone(), attempt))
+                })
+                .collect::<Vec<_>>();
+            let mut settled_attempt = false;
+            for (task_ref, attempt) in stranded_attempts {
+                let reason = match self
+                    .graph_state_store()
+                    .load_async(&attempt.execution_id)
+                    .await
+                {
+                    Ok(graph) if !agentic_graph_is_terminal(&graph) => continue,
+                    Ok(_) => {
+                        "startup recovered a terminal Agent graph with an unsettled Task attempt"
+                    }
+                    Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound(_)) => {
+                        "startup recovered an Agent attempt whose graph was never admitted"
+                    }
+                    Err(error) => return Err(error.to_string()),
+                };
+                self.settle_agentic_task_attempt(
+                    &projection,
+                    &task_ref,
+                    &attempt.execution_id,
+                    attempt.mode,
+                    reason,
+                    true,
+                )
+                .await?;
+                settled_attempt = true;
+            }
+            if settled_attempt {
+                projection = self
+                    .agent_action_service()
+                    .project(program_id)
+                    .map_err(|error| error.to_string())?;
             }
             // An Agent claim is the durable reservation for its physical
             // execution. If Runtime died after that model-authored claim was
@@ -243,6 +481,7 @@ impl RuntimeServices {
                 .tasks
                 .values()
                 .filter(|task| task.status == AgenticTaskStatus::Claimed)
+                .filter(|task| task.active_attempts.is_empty())
                 .filter_map(|task| {
                     task.claim_execution_id
                         .as_ref()
@@ -287,10 +526,7 @@ impl RuntimeServices {
                         },
                     ),
                 };
-                let observation = self
-                    .agent_action_service()
-                    .apply(&release)
-                    .map_err(|error| error.to_string())?;
+                let observation = self.submit_agent_action(&release).await?;
                 if observation.status != harness_contract::agent_action::AgentActionStatus::Applied
                 {
                     return Err(format!(
@@ -337,6 +573,8 @@ impl RuntimeServices {
                     harness_contract::agent_action::StateInspectInput {
                         scope_ref: None,
                         after_revision: None,
+                        page_cursor: None,
+                        entry_ref: None,
                     },
                 ),
             };
@@ -365,15 +603,29 @@ impl RuntimeServices {
                     .await
                 {
                     Ok(dispatched) => receipts.extend(dispatched),
-                    Err(error) => tracing::warn!(
-                        program_id,
-                        task_ref,
-                        mode = mode.as_str(),
-                        %error,
-                        "startup recovery deferred one Agent-first followup"
-                    ),
+                    Err(error) => {
+                        tracing::warn!(
+                            program_id,
+                            task_ref,
+                            mode = mode.as_str(),
+                            %error,
+                            "startup recovery failed one Agent-first followup"
+                        );
+                        failures.push(format!(
+                            "program={program_id},task={task_ref},mode={}: {error}",
+                            mode.as_str()
+                        ));
+                    }
                 }
             }
+        }
+        if !failures.is_empty() {
+            return Err(format!(
+                "Agent-first startup dispatch reconciliation failed for {} followup(s) after {} idempotent dispatch receipt(s): {}",
+                failures.len(),
+                receipts.len(),
+                failures.join("; ")
+            ));
         }
         Ok(receipts)
     }
@@ -419,10 +671,18 @@ impl RuntimeServices {
         members.truncate(1);
         let mut receipts = Vec::new();
         for member in members {
+            let member_team_id = projection
+                .dispatch_team_id_for(&member.agent_id, task, mode == DispatchMode::Review)
+                .ok_or_else(|| {
+                    format!(
+                        "agentic_member_has_no_active_dispatch_membership:{}:{}",
+                        member.agent_id, task.task_id
+                    )
+                })?;
             // The executing Agent receives its own Team's stable shared
             // context. Cross-Team review keeps the source Team as a separate
             // task provenance ref and must not forge the reviewer's scope.
-            let cohort_prompt_package = agentic_shared_prompt_package(projection, &member.team_id)?;
+            let cohort_prompt_package = agentic_shared_prompt_package(projection, member_team_id)?;
             let admission = resolve_agentic_execution_admission(self, member, task, context)?;
             let catalog_entry = &admission.catalog_entry;
             let graph_id = deterministic_graph_id(
@@ -482,7 +742,7 @@ impl RuntimeServices {
                     .default_mission_id()
                     .to_string(),
                 // Agent-first Teams are dynamic semantic scopes. They are not
-                // legacy immutable TeamTemplate executions.
+                // immutable Agent Definition executions.
                 team_id: None,
                 graph_id: graph_id.clone(),
                 node_id: node_id.clone(),
@@ -498,7 +758,6 @@ impl RuntimeServices {
                 // receipt can literally satisfy arbitrary prose.
                 required_acceptance: RequiredAcceptance::default(),
                 output_acceptance: Vec::new(),
-                requires_managed_collaboration_escalation: false,
                 acceptance: Vec::new(),
                 constraints: vec![
                     "Use Agent actions for collaboration state; prose never changes Program truth"
@@ -507,13 +766,28 @@ impl RuntimeServices {
                         .to_string(),
                 ],
                 context_refs: vec![
-                    format!("agentic_program:{}", projection.program_id),
-                    format!("agentic_team:{}", member.team_id),
-                    format!("agentic_task_team:{}", task.team_id),
-                    format!("agentic_member:{}", member.agent_id),
-                    format!("agentic_task:{}", task.task_id),
-                    format!("agentic_mode:{}", mode.as_str()),
+                    format!("program:{}", projection.program_id),
+                    format!("task:{}", task.task_id),
                 ],
+                agentic_binding: Some(AgenticExecutionBinding {
+                    program_id: projection.program_id.clone(),
+                    agent_id: member.agent_id.clone(),
+                    membership_id: AgenticProgramProjection::membership_id(
+                        &member.agent_id,
+                        member_team_id,
+                    ),
+                    team_id: member_team_id.to_string(),
+                    task_team_id: task.team_id.clone(),
+                    source_spec_revision: projection.revision,
+                    focus: match mode {
+                        DispatchMode::Execute => AgenticExecutionFocus::TaskExecute {
+                            task_ref: task.task_id.clone(),
+                        },
+                        DispatchMode::Review => AgenticExecutionFocus::TaskReview {
+                            task_ref: task.task_id.clone(),
+                        },
+                    },
+                }),
                 evidence_refs: Vec::new(),
                 resource_scopes,
                 allowed_tools: admission.allowed_tools,
@@ -589,6 +863,47 @@ impl RuntimeServices {
             compiled_node.payload_ref =
                 serde_json::to_string(&packet).map_err(|error| error.to_string())?;
             attach_agentic_display(&mut graph, member, task, &projection.program_id)?;
+            let attempt = AgentActionEnvelope {
+                action_id: format!(
+                    "runtime-attempt-dispatch:{}:{}:{}:{}",
+                    projection.program_id,
+                    task_ref,
+                    mode.as_str(),
+                    attempt_generation
+                ),
+                actor: agentic_supervisor_actor(projection, Some(graph_id.clone())),
+                expected_revision: None,
+                action: AgentAction::TaskAttemptDispatch(
+                    harness_contract::agent_action::TaskAttemptDispatchInput {
+                        task_ref: task_ref.to_string(),
+                        execution_id: graph_id.clone(),
+                        agent_ref: member.agent_id.clone(),
+                        membership_id: AgenticProgramProjection::membership_id(
+                            &member.agent_id,
+                            member_team_id,
+                        ),
+                        mode: match mode {
+                            DispatchMode::Execute => {
+                                harness_contract::agent_action::AgentAttemptMode::Execute
+                            }
+                            DispatchMode::Review => {
+                                harness_contract::agent_action::AgentAttemptMode::Review
+                            }
+                        },
+                        generation: attempt_generation,
+                    },
+                ),
+            };
+            let observation = self.submit_agent_action(&attempt).await?;
+            if observation.status != harness_contract::agent_action::AgentActionStatus::Applied {
+                return Err(format!(
+                    "agentic_attempt_registration_rejected:{}",
+                    observation
+                        .error
+                        .map(|error| error.code)
+                        .unwrap_or_else(|| "unknown".to_string())
+                ));
+            }
             if let Err(error) = self
                 .execution_supervisor()
                 .submit(
@@ -599,7 +914,24 @@ impl RuntimeServices {
                 )
                 .await
             {
-                return Err(error.to_string());
+                let reason = format!("physical Agent graph admission failed: {error}");
+                self.settle_agentic_task_attempt(
+                    projection,
+                    task_ref,
+                    &graph_id,
+                    match mode {
+                        DispatchMode::Execute => {
+                            harness_contract::agent_action::AgentAttemptMode::Execute
+                        }
+                        DispatchMode::Review => {
+                            harness_contract::agent_action::AgentAttemptMode::Review
+                        }
+                    },
+                    &reason,
+                    true,
+                )
+                .await?;
+                return Ok(Vec::new());
             }
             receipts.push(AgenticDispatchReceipt {
                 graph_id,
@@ -631,6 +963,7 @@ mod cohort_tests {
                 created_by: "root:session-cache".to_string(),
                 member_ids: Vec::new(),
                 task_ids: Vec::new(),
+                lifecycle: Default::default(),
             },
         );
         projection
@@ -647,11 +980,16 @@ mod cohort_tests {
             "agent-dynamic".to_string(),
             AgentMemberProjection {
                 agent_id: "agent-dynamic".to_string(),
-                team_id: "team-cache".to_string(),
+                display_name: "Reviewer".to_string(),
                 role: "Reviewer".to_string(),
                 mission: "Review one task".to_string(),
                 required_capabilities: vec!["read".to_string()],
                 invited_by: "root:session-cache".to_string(),
+                membership_ids: Vec::new(),
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
             },
         );
         dynamic.tasks.insert(
@@ -670,6 +1008,7 @@ mod cohort_tests {
                 claim_execution_id: Some("execution-dynamic".to_string()),
                 claimed_at_ms: Some(1),
                 lease_expires_at_ms: Some(2),
+                active_attempts: Default::default(),
                 artifact_refs: Vec::new(),
                 evidence_refs: Vec::new(),
                 unresolved: Vec::new(),
@@ -683,6 +1022,14 @@ mod cohort_tests {
                 supersede_evidence_refs: Vec::new(),
                 superseded_reason: None,
                 superseded_by: None,
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
+                cancel_requested_by: None,
+                cancel_reason_ref: None,
+                cancel_evidence_refs: Vec::new(),
+                pending_retirement: None,
             },
         );
 
@@ -718,7 +1065,7 @@ mod cohort_tests {
     }
 
     #[test]
-    fn shared_prefix_body_is_bounded_before_provider_dispatch() {
+    fn shared_prefix_preserves_complete_stable_semantics_before_provider_dispatch() {
         let mut oversized = program();
         oversized.objective_summary = "o".repeat(100_000);
         let team = oversized.teams.get_mut("team-cache").expect("team");
@@ -727,9 +1074,14 @@ mod cohort_tests {
         team.objective = Some("x".repeat(50_000));
         team.topic_ref = "t".repeat(50_000);
 
-        let package =
-            agentic_shared_prompt_package(&oversized, "team-cache").expect("bounded package");
-        assert!(package.packets[0].content.chars().count() < 30_000);
-        assert!(package.packets[0].content.contains("[bounded by Runtime]"));
+        let package = agentic_shared_prompt_package(&oversized, "team-cache")
+            .expect("lossless shared package");
+        let content = &package.packets[0].content;
+        assert!(content.contains(&"o".repeat(100_000)));
+        assert!(content.contains(&"n".repeat(50_000)));
+        assert!(content.contains(&"m".repeat(50_000)));
+        assert!(content.contains(&"x".repeat(50_000)));
+        assert!(content.contains(&"t".repeat(50_000)));
+        assert!(!content.contains("[bounded by Runtime]"));
     }
 }

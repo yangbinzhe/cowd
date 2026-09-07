@@ -18,8 +18,11 @@ use crate::strategy::{
 };
 use crate::turn::CancellationReceipt;
 
-pub const EXECUTION_PROJECTION_SCHEMA_VERSION: u32 = 3;
-pub const EXECUTION_PROJECTION_REDUCER_VERSION: u32 = 3;
+// The collaboration projection now carries Runtime-owned dependency
+// resolution, so an outer projection reader must not silently combine a
+// schema-3 envelope with schema-4 collaboration semantics.
+pub const EXECUTION_PROJECTION_SCHEMA_VERSION: u32 = 4;
+pub const EXECUTION_PROJECTION_REDUCER_VERSION: u32 = 4;
 pub const STRATEGY_DECISION_PROJECTION_SCHEMA_VERSION: u32 = 1;
 
 #[derive(
@@ -368,6 +371,17 @@ pub struct RunMetricsProjection {
     pub input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
+    /// Provider-reported prompt tokens used to populate the native cache.
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+    /// Provider-reported prompt tokens served from the native cache.
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    /// Distinguishes an explicitly reported zero from absent Provider cache
+    /// telemetry for the aggregate represented by these counters.
+    #[serde(default)]
+    pub cache_dimensions_known: bool,
+    /// Sum of uncached input, output, cache creation and cache-read tokens.
     #[serde(default)]
     pub total_tokens: u64,
 }
@@ -699,6 +713,349 @@ pub struct SessionHistoryIndexProjection {
     pub cards: Vec<SessionHistoryCardProjection>,
 }
 
+/// Canonical, versioned Agentic Program read model owned by the Runtime.
+///
+/// Surfaces consume this aggregate directly. Generic projection entities and
+/// graph orchestration metadata are deliberately not alternate owners of the
+/// Agentic collaboration domain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgenticCollaborationProjectionV1 {
+    pub schema_version: u32,
+    #[serde(default)]
+    pub programs: Vec<AgenticCollaborationProgramProjectionV1>,
+}
+
+impl Default for AgenticCollaborationProjectionV1 {
+    fn default() -> Self {
+        Self {
+            schema_version: 5,
+            programs: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgenticCollaborationProgramProjectionV1 {
+    pub program_id: String,
+    pub revision: u64,
+    pub status: AgenticCollaborationProgramStatus,
+    pub objective_id: String,
+    pub objective_summary: String,
+    pub session_id: String,
+    pub turn_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_execution_id: Option<String>,
+    pub required_team_count: u8,
+    pub model_lease: String,
+    pub permission_ceiling: crate::policy::PermissionMode,
+    #[serde(default)]
+    pub resource_scopes: Vec<String>,
+    #[serde(default)]
+    pub teams: Vec<AgenticCollaborationTeamProjectionV1>,
+    #[serde(default)]
+    pub agents: Vec<AgenticCollaborationAgentProjectionV1>,
+    #[serde(default)]
+    pub memberships: Vec<AgenticCollaborationMembershipProjectionV1>,
+    #[serde(default)]
+    pub tasks: Vec<AgenticCollaborationTaskProjectionV1>,
+    #[serde(default)]
+    pub topics: Vec<AgenticCollaborationTopicProjectionV1>,
+    #[serde(default)]
+    pub artifacts: Vec<AgenticCollaborationArtifactProjectionV1>,
+    pub completion: AgenticCollaborationCompletionProjectionV1,
+    pub semantic_refs: AgenticCollaborationSemanticRefsV1,
+    #[serde(default)]
+    pub unresolved: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgenticCollaborationProgramStatus {
+    Open,
+    Waiting,
+    CompletionRequested,
+    Draining,
+    Verified,
+    Partial,
+    Blocked,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgenticCollaborationTeamProjectionV1 {
+    pub team_id: String,
+    pub name: String,
+    pub mission: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective: Option<String>,
+    pub topic_ref: String,
+    pub created_by: String,
+    #[serde(default)]
+    pub member_ids: Vec<String>,
+    #[serde(default)]
+    pub task_ids: Vec<String>,
+    #[serde(default)]
+    pub lifecycle: AgenticCollaborationLifecycle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgenticCollaborationAgentProjectionV1 {
+    pub agent_id: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub membership_ids: Vec<String>,
+    pub role: String,
+    pub mission: String,
+    #[serde(default)]
+    pub required_capabilities: Vec<String>,
+    pub invited_by: String,
+    #[serde(default)]
+    pub status: AgenticCollaborationAgentStatus,
+    /// Authoritative currently executable/settling work. Surfaces must not
+    /// infer this set from historical claimants or graph node counts.
+    #[serde(default)]
+    pub active_task_refs: Vec<String>,
+    /// Completed, submitted, reviewed or otherwise non-live work previously
+    /// owned by this Agent. Kept separate from active work for honest UI.
+    #[serde(default)]
+    pub history_task_refs: Vec<String>,
+    /// Physical Runtime executions still attached to this Agent.
+    #[serde(default)]
+    pub active_run_refs: Vec<String>,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AgenticCollaborationAgentStatus {
+    #[default]
+    Idle,
+    Assigned,
+    Running,
+    Retired,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AgenticCollaborationLifecycle {
+    #[default]
+    Active,
+    Draining,
+    Retired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgenticCollaborationMembershipProjectionV1 {
+    pub membership_id: String,
+    pub agent_id: String,
+    pub team_id: String,
+    #[serde(default)]
+    pub lifecycle: AgenticCollaborationLifecycle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgenticCollaborationTaskStatus {
+    Published,
+    Claimed,
+    Submitted,
+    Accepted,
+    Rework,
+    Blocked,
+    CancelRequested,
+    Withdrawn,
+    Superseded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgenticCollaborationTaskProjectionV1 {
+    pub task_id: String,
+    pub team_id: String,
+    pub title: String,
+    pub objective: String,
+    pub acceptance: String,
+    #[serde(default)]
+    pub required_capabilities: Vec<String>,
+    #[serde(default)]
+    pub obligation_refs: Vec<String>,
+    #[serde(default)]
+    pub purpose: crate::agent_action::TaskPurpose,
+    #[serde(default)]
+    pub execution_requirements: Vec<String>,
+    #[serde(default)]
+    pub expertise_hints: Vec<String>,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    /// Runtime's authoritative resolution of each direct dependency.  Surfaces
+    /// must render this rather than equating a retired task with completed
+    /// work or trying to walk replacement chains themselves.
+    #[serde(default)]
+    pub dependency_resolution: Vec<AgenticCollaborationDependencyResolutionV1>,
+    pub status: AgenticCollaborationTaskStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimant: Option<String>,
+    pub claim_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_execution_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at_ms: Option<u64>,
+    /// Runtime-admitted physical effects. A task cannot become withdrawn or
+    /// superseded while this collection still contains an unsettled attempt.
+    #[serde(default)]
+    pub active_attempts: Vec<AgenticCollaborationTaskAttemptProjectionV1>,
+    #[serde(default)]
+    pub artifact_refs: Vec<String>,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    #[serde(default)]
+    pub unresolved: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed_by: Option<String>,
+    pub failed_attempts: u8,
+    pub review_generation: u64,
+    pub failed_review_attempts: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure: Option<String>,
+    #[serde(default)]
+    pub replacement_task_refs: Vec<String>,
+    #[serde(default)]
+    pub supersede_evidence_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_requested_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_reason_ref: Option<String>,
+    #[serde(default)]
+    pub cancel_evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgenticCollaborationDependencyStatus {
+    Resolved,
+    Waiting,
+    Invalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgenticCollaborationDependencyResolutionV1 {
+    pub dependency_ref: String,
+    pub status: AgenticCollaborationDependencyStatus,
+    #[serde(default)]
+    pub blocker_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgenticCollaborationTaskAttemptProjectionV1 {
+    pub execution_id: String,
+    pub agent_id: String,
+    #[serde(default)]
+    pub membership_id: String,
+    pub mode: crate::agent_action::AgentAttemptMode,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgenticCollaborationTopicProjectionV1 {
+    pub topic_ref: String,
+    #[serde(default)]
+    pub entries: Vec<AgenticCollaborationTopicEntryProjectionV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgenticCollaborationTopicEntryProjectionV1 {
+    pub entry_id: String,
+    pub revision: u64,
+    pub actor_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_ref: Option<String>,
+    #[serde(default)]
+    pub refs: Vec<String>,
+    #[serde(default)]
+    pub recipients: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<crate::agent_action::TaskIntent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgenticCollaborationArtifactProjectionV1 {
+    pub artifact_ref: String,
+    pub content_ref: String,
+    pub kind: String,
+    pub title: String,
+    #[serde(default)]
+    pub relates_to: Vec<String>,
+    pub committed_by: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgenticCollaborationCompletionProjectionV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_artifact_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait: Option<AgenticCollaborationCompletionWaitProjectionV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<AgenticCollaborationObjectiveVerdictProjectionV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgenticCollaborationCompletionWaitProjectionV1 {
+    pub action_id: String,
+    pub requested_by: String,
+    pub program_revision: u64,
+    #[serde(default)]
+    pub result_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_artifact_ref: Option<String>,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    #[serde(default)]
+    pub unresolved: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgenticCollaborationObjectiveVerdictProjectionV1 {
+    pub goal_id: String,
+    pub goal_revision: u64,
+    pub terminal_fence: String,
+    pub authority_revision: u64,
+    pub kind: crate::goal::ObjectiveTerminalKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgenticCollaborationSemanticRefsV1 {
+    pub program_ref: String,
+    pub objective_ref: String,
+    #[serde(default)]
+    pub team_refs: Vec<String>,
+    #[serde(default)]
+    pub agent_refs: Vec<String>,
+    #[serde(default)]
+    pub task_refs: Vec<String>,
+    #[serde(default)]
+    pub topic_refs: Vec<String>,
+    #[serde(default)]
+    pub artifact_refs: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ExecutionProjection {
     pub schema_version: u32,
@@ -727,6 +1084,8 @@ pub struct ExecutionProjection {
     pub concurrency: ExecutionConcurrencyProjection,
     #[serde(default)]
     pub child_executions: Vec<ChildExecutionProjection>,
+    #[serde(default)]
+    pub agentic_collaboration: AgenticCollaborationProjectionV1,
     #[serde(default)]
     pub goals: Vec<ProjectionEntity>,
     #[serde(default)]

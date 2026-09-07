@@ -3,11 +3,10 @@
 //! The adapter is constructed only from the host-owned, bounded
 //! [`storage::PostgresExecutor`]. It never accepts a path or a database URL.
 
-use std::{collections::BTreeMap, fs, path::Path};
+use std::collections::BTreeMap;
 
 use harness_contract::turn::InputRoutingDecision;
 use postgres::{types::ToSql, Row};
-use serde::{Deserialize, Serialize};
 use session::persistence::domain::{
     ingress::{
         applied_input_projection, decision_requires_target_turn, input_decision_as_str,
@@ -21,361 +20,27 @@ use session::{
     build_context_index_cards, context_index_card_digest, context_index_source_digest,
     ContextIndexCard, ContextIndexCoverage, OutboxFailureClass, SessionBranchActivation,
     SessionBranchActivationPhase, SessionBranchActivationTransition, SessionBranchRequest,
-    SessionBranchResult, SessionCloseDisposition, SessionEvent, SessionInputAdmission,
-    SessionLifecycleFenceRequest, SessionLifecycleIntent, SessionLifecyclePhase,
-    SessionLifecyclePlan, SessionLifecycleTombstoneRequest, SessionLifecycleTransition,
-    SessionListOptions, SessionListPage, SessionMessage, SessionMessageMetadata,
-    SessionPresenceProjection, SessionRecord, SessionRecoveryManifest, SessionRecoverySignal,
-    SessionRuntimeInputStatus, SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord,
-    SessionRuntimeOutboxRequest, SessionSearchResult, SessionSnapshot,
-    SessionTerminalTranscriptCommit, SessionTerminalTranscriptReceipt, SessionUsageBucket,
-    SessionUsageSummary, SqliteSessionStore,
+    SessionBranchResult, SessionEvent, SessionInputAdmission, SessionLifecycleFenceRequest,
+    SessionLifecycleIntent, SessionLifecyclePhase, SessionLifecyclePlan,
+    SessionLifecycleTombstoneRequest, SessionLifecycleTransition, SessionListOptions,
+    SessionListPage, SessionMessage, SessionMessageMetadata, SessionPresenceProjection,
+    SessionRecord, SessionRecoveryManifest, SessionRecoverySignal, SessionRuntimeInputStatus,
+    SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest,
+    SessionSearchResult, SessionSnapshot, SessionTerminalTranscriptCommit,
+    SessionTerminalTranscriptReceipt, SessionUsageBucket, SessionUsageSummary,
 };
 use session::{SessionDomainEvent, SessionDomainRef, SessionDomainScope};
-use sha2::{Digest, Sha256};
 use storage::{
     PostgresConnection, PostgresConnectionConfig, PostgresExecutor, PostgresMigrationSpec,
     PostgresTransaction, SecretRefResolver,
 };
 
+const SESSION_DOMAIN: &str = "session";
+
 mod ingress;
 mod lifecycle;
 mod query;
 mod terminal;
-
-const SESSION_DOMAIN: &str = "session";
-
-/// Portable, complete durable Session state used only by a quiesced cutover.
-/// It is deliberately absent from normal request paths: there is no dual
-/// write or background replication between selected owners.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SessionMigrationSnapshot {
-    pub schema_version: u32,
-    pub sessions: Vec<SessionRecord>,
-    pub input_admissions: Vec<SessionInputAdmission>,
-    pub lifecycle_intents: Vec<SessionLifecycleIntent>,
-    pub branch_activations: Vec<SessionBranchActivation>,
-    pub associations: Vec<SessionMemoryAssociation>,
-    pub messages: Vec<SessionMessage>,
-    pub events: Vec<SessionEvent>,
-    pub checkpoints: Vec<SessionEventCheckpoint>,
-    pub snapshots: Vec<SessionSnapshot>,
-    pub runtime_outbox: Vec<SessionRuntimeOutboxRecord>,
-    pub runtime_history: Vec<SessionOutboxHistory>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Ord, PartialOrd)]
-pub struct SessionMemoryAssociation {
-    pub session_id: String,
-    pub memory_id: String,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Ord, PartialOrd)]
-pub struct SessionEventCheckpoint {
-    pub session_id: String,
-    pub checkpoint_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Ord, PartialOrd)]
-pub struct SessionOutboxHistory {
-    pub request_id: String,
-    pub action: String,
-    pub actor: Option<String>,
-    pub reason: Option<String>,
-    pub from_status: String,
-    pub to_status: String,
-    pub attempts: u32,
-    pub created_at_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionMigrationManifest {
-    pub domain: String,
-    pub source_digest: String,
-    pub target_digest: String,
-    pub schema_version: u32,
-    pub session_count: usize,
-    pub message_count: usize,
-    pub event_count: usize,
-}
-
-impl SessionMigrationSnapshot {
-    pub fn canonical_digest(&self) -> session::SessionResult<String> {
-        let bytes = serde_json::to_vec(self).map_err(|error| {
-            session::SessionError::Store(format!("encode session migration snapshot: {error}"))
-        })?;
-        Ok(format!("{:x}", Sha256::digest(bytes)))
-    }
-}
-
-/// Export every durable Session table from a quiesced SQLite owner.
-pub fn export_sqlite_session_snapshot(
-    source: &SqliteSessionStore,
-) -> session::SessionResult<SessionMigrationSnapshot> {
-    let connection = source.conn()?;
-    let sessions = sqlite_rows(&connection, "SELECT session_id,platform,chat_id,user_id,model,created_at,last_activity,message_count,reset_policy,metadata_json,input_tokens,output_tokens,status FROM sessions ORDER BY session_id", sqlite_row_to_session)?;
-    let input_admissions = sqlite_rows(
-        &connection,
-        "SELECT session_id,input_generation,input_admission_open FROM sessions ORDER BY session_id",
-        |row| {
-            Ok(SessionInputAdmission {
-                session_id: row.get(0)?,
-                generation: u64::try_from(row.get::<_, i64>(1)?)
-                    .map_err(sqlite_conversion_error)?,
-                open: row.get(2)?,
-            })
-        },
-    )?;
-    let lifecycle_intents = sqlite_rows(
-        &connection,
-        "SELECT operation_id,session_id,disposition,phase,last_stable_phase,
-                expected_generation,created_at_ms,updated_at_ms,last_error,revision
-           FROM session_lifecycle_intents ORDER BY operation_id",
-        sqlite_row_to_lifecycle_intent,
-    )?;
-    let branch_activations = sqlite_rows(
-        &connection,
-        "SELECT operation_id,source_session_id,target_session_id,source_message_count,
-                phase,created_at_ms,updated_at_ms,last_error,revision
-           FROM session_branch_activations ORDER BY operation_id",
-        sqlite_row_to_branch_activation,
-    )?;
-    let associations = sqlite_rows(&connection, "SELECT session_id,memory_id,created_at FROM session_memories ORDER BY session_id,memory_id", |row| {
-        Ok(SessionMemoryAssociation { session_id: row.get(0)?, memory_id: row.get(1)?, created_at: row.get(2)? })
-    })?;
-    let messages = sqlite_rows(&connection, "SELECT stable_message_id,session_id,sequence,role,content_json,blocks_count,tool_use_id,tool_name,token_usage_json,created_at_ms FROM messages ORDER BY session_id,sequence", sqlite_row_to_message)?;
-    let events = sqlite_rows(&connection, "SELECT session_id,event_type,event_json,sequence,created_at_ms FROM session_events ORDER BY session_id,sequence", sqlite_row_to_event)?;
-    // SQLite checkpoint dedupe is encoded in semantic events. Materialize the
-    // same identity into PostgreSQL's indexed checkpoint table at cutover.
-    let checkpoints = events
-        .iter()
-        .filter_map(|event| {
-            checkpoint_from_event(event).map(|checkpoint_id| SessionEventCheckpoint {
-                session_id: event.session_id.clone(),
-                checkpoint_id,
-            })
-        })
-        .collect::<Vec<_>>();
-    let snapshots = sqlite_rows(&connection, "SELECT session_id,event_idx,messages_json,created_at_ms FROM session_snapshots ORDER BY session_id,event_idx", sqlite_row_to_snapshot)?;
-    let runtime_outbox = sqlite_rows(&connection, "SELECT input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,decision,target_turn_id,classification_json,task_route_hint_json,status,runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch,application_receipt_json FROM session_runtime_outbox ORDER BY request_id", sqlite_row_to_runtime_outbox)?;
-    let runtime_history = sqlite_rows(&connection, "SELECT request_id,action,actor,reason,from_status,to_status,attempts,created_at_ms FROM session_runtime_outbox_history ORDER BY id", sqlite_row_to_history)?;
-    Ok(SessionMigrationSnapshot {
-        schema_version: 6,
-        sessions,
-        input_admissions,
-        lifecycle_intents,
-        branch_activations,
-        associations,
-        messages,
-        events,
-        checkpoints,
-        snapshots,
-        runtime_outbox,
-        runtime_history,
-    })
-}
-
-fn sqlite_rows<T>(
-    connection: &rusqlite::Connection,
-    statement: &str,
-    map: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
-) -> session::SessionResult<Vec<T>> {
-    let mut prepared = connection
-        .prepare(statement)
-        .map_err(|error| session::SessionError::Store(error.to_string()))?;
-    let rows = prepared
-        .query_map([], map)
-        .map_err(|error| session::SessionError::Store(error.to_string()))?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|error| session::SessionError::Store(error.to_string()))
-}
-
-fn sqlite_row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMessage> {
-    Ok(SessionMessage {
-        stable_message_id: row.get(0)?,
-        session_id: row.get(1)?,
-        sequence: usize::try_from(row.get::<_, i64>(2)?).map_err(sqlite_conversion_error)?,
-        role: row.get(3)?,
-        content_json: row.get(4)?,
-        blocks_count: usize::try_from(row.get::<_, i64>(5)?).map_err(sqlite_conversion_error)?,
-        tool_use_id: row.get(6)?,
-        tool_name: row.get(7)?,
-        token_usage_json: row.get(8)?,
-        created_at_ms: u64::try_from(row.get::<_, i64>(9)?).map_err(sqlite_conversion_error)?,
-    })
-}
-
-fn sqlite_row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
-    Ok(SessionRecord {
-        session_id: row.get(0)?,
-        platform: row.get(1)?,
-        chat_id: row.get(2)?,
-        user_id: row.get(3)?,
-        model: row.get(4)?,
-        created_at: row.get(5)?,
-        last_activity: row.get(6)?,
-        message_count: row.get(7)?,
-        reset_policy: row.get(8)?,
-        metadata_json: row.get(9)?,
-        input_tokens: row.get(10)?,
-        output_tokens: row.get(11)?,
-        status: row.get(12)?,
-    })
-}
-
-fn sqlite_row_to_lifecycle_intent(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<SessionLifecycleIntent> {
-    Ok(SessionLifecycleIntent {
-        operation_id: row.get(0)?,
-        session_id: row.get(1)?,
-        disposition: SessionCloseDisposition::parse(&row.get::<_, String>(2)?)
-            .map_err(sqlite_text_conversion_error)?,
-        phase: SessionLifecyclePhase::parse(&row.get::<_, String>(3)?)
-            .map_err(sqlite_text_conversion_error)?,
-        last_stable_phase: SessionLifecyclePhase::parse(&row.get::<_, String>(4)?)
-            .map_err(sqlite_text_conversion_error)?,
-        expected_generation: u64::try_from(row.get::<_, i64>(5)?)
-            .map_err(sqlite_conversion_error)?,
-        created_at_ms: u64::try_from(row.get::<_, i64>(6)?).map_err(sqlite_conversion_error)?,
-        updated_at_ms: u64::try_from(row.get::<_, i64>(7)?).map_err(sqlite_conversion_error)?,
-        last_error: row.get(8)?,
-        revision: u64::try_from(row.get::<_, i64>(9)?).map_err(sqlite_conversion_error)?,
-    })
-}
-
-fn sqlite_row_to_branch_activation(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<SessionBranchActivation> {
-    Ok(SessionBranchActivation {
-        operation_id: row.get(0)?,
-        source_session_id: row.get(1)?,
-        target_session_id: row.get(2)?,
-        source_message_count: usize::try_from(row.get::<_, i64>(3)?)
-            .map_err(sqlite_conversion_error)?,
-        phase: SessionBranchActivationPhase::parse(&row.get::<_, String>(4)?)
-            .map_err(sqlite_text_conversion_error)?,
-        created_at_ms: u64::try_from(row.get::<_, i64>(5)?).map_err(sqlite_conversion_error)?,
-        updated_at_ms: u64::try_from(row.get::<_, i64>(6)?).map_err(sqlite_conversion_error)?,
-        last_error: row.get(7)?,
-        revision: u64::try_from(row.get::<_, i64>(8)?).map_err(sqlite_conversion_error)?,
-    })
-}
-
-fn sqlite_row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEvent> {
-    Ok(SessionEvent {
-        session_id: row.get(0)?,
-        event_type: row.get(1)?,
-        event_json: row.get(2)?,
-        sequence: usize::try_from(row.get::<_, i64>(3)?).map_err(sqlite_conversion_error)?,
-        created_at_ms: u64::try_from(row.get::<_, i64>(4)?).map_err(sqlite_conversion_error)?,
-    })
-}
-
-fn sqlite_row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSnapshot> {
-    Ok(SessionSnapshot {
-        session_id: row.get(0)?,
-        event_idx: usize::try_from(row.get::<_, i64>(1)?).map_err(sqlite_conversion_error)?,
-        messages_json: row.get(2)?,
-        created_at_ms: u64::try_from(row.get::<_, i64>(3)?).map_err(sqlite_conversion_error)?,
-    })
-}
-
-fn sqlite_row_to_runtime_outbox(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<SessionRuntimeOutboxRecord> {
-    Ok(SessionRuntimeOutboxRecord {
-        input_id: row.get(0)?,
-        request_id: row.get(1)?,
-        turn_id: row.get(2)?,
-        message_id: row.get(3)?,
-        session_id: row.get(4)?,
-        sequence: usize::try_from(row.get::<_, i64>(5)?).map_err(sqlite_conversion_error)?,
-        session_generation: u64::try_from(row.get::<_, i64>(6)?)
-            .map_err(sqlite_conversion_error)?,
-        decision: parse_input_decision_sqlite(&row.get::<_, String>(7)?)?,
-        target_turn_id: row.get(8)?,
-        classification_json: row.get(9)?,
-        task_route_hint: row
-            .get::<_, Option<String>>(10)?
-            .map(|value| serde_json::from_str(&value).map_err(sqlite_conversion_error))
-            .transpose()?,
-        status: SessionRuntimeInputStatus::parse(&row.get::<_, String>(11)?)?,
-        runtime_commit_cursor: row
-            .get::<_, Option<i64>>(12)?
-            .map(|value| u64::try_from(value).map_err(sqlite_conversion_error))
-            .transpose()?,
-        attempts: u32::try_from(row.get::<_, i64>(13)?).map_err(sqlite_conversion_error)?,
-        next_attempt_at_ms: u64::try_from(row.get::<_, i64>(14)?)
-            .map_err(sqlite_conversion_error)?,
-        claim_owner: row.get(15)?,
-        claim_token: row.get(16)?,
-        claim_expires_at_ms: row
-            .get::<_, Option<i64>>(17)?
-            .map(|value| u64::try_from(value).map_err(sqlite_conversion_error))
-            .transpose()?,
-        failure_class: row
-            .get::<_, Option<String>>(18)?
-            .as_deref()
-            .map(OutboxFailureClass::parse)
-            .transpose()?,
-        last_error: row.get(19)?,
-        revision: u64::try_from(row.get::<_, i64>(20)?).map_err(sqlite_conversion_error)?,
-        created_at_ms: u64::try_from(row.get::<_, i64>(21)?).map_err(sqlite_conversion_error)?,
-        updated_at_ms: u64::try_from(row.get::<_, i64>(22)?).map_err(sqlite_conversion_error)?,
-        terminal_at_ms: row
-            .get::<_, Option<i64>>(23)?
-            .map(|value| u64::try_from(value).map_err(sqlite_conversion_error))
-            .transpose()?,
-        runtime_options_json: row.get(24)?,
-        claim_fence_epoch: row
-            .get::<_, Option<i64>>(25)?
-            .map(|value| u64::try_from(value).map_err(sqlite_conversion_error))
-            .transpose()?,
-        application_receipt: row
-            .get::<_, Option<String>>(26)?
-            .map(|value| serde_json::from_str(&value).map_err(sqlite_conversion_error))
-            .transpose()?,
-    })
-}
-
-fn sqlite_row_to_history(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionOutboxHistory> {
-    Ok(SessionOutboxHistory {
-        request_id: row.get(0)?,
-        action: row.get(1)?,
-        actor: row.get(2)?,
-        reason: row.get(3)?,
-        from_status: row.get(4)?,
-        to_status: row.get(5)?,
-        attempts: u32::try_from(row.get::<_, i64>(6)?).map_err(sqlite_conversion_error)?,
-        created_at_ms: u64::try_from(row.get::<_, i64>(7)?).map_err(sqlite_conversion_error)?,
-    })
-}
-
-fn sqlite_conversion_error(
-    error: impl std::error::Error + Send + Sync + 'static,
-) -> rusqlite::Error {
-    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Integer, Box::new(error))
-}
-
-fn sqlite_text_conversion_error(error: session::SessionError) -> rusqlite::Error {
-    rusqlite::Error::FromSqlConversionFailure(
-        0,
-        rusqlite::types::Type::Text,
-        error.to_string().into(),
-    )
-}
-
-fn parse_input_decision_sqlite(value: &str) -> rusqlite::Result<InputRoutingDecision> {
-    parse_input_decision(value).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Text,
-            error.to_string().into(),
-        )
-    })
-}
 
 const SESSION_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
     id: "session.0001.durable-session-owner",
@@ -1510,6 +1175,95 @@ const SESSION_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
              )
              WHERE target_turn_id IS NOT NULL",
     ],
+}, PostgresMigrationSpec {
+    id: "session.0020.provider-attempt-epoch-index",
+    domain: SESSION_DOMAIN,
+    version: 20,
+    description: "index provider attempt evidence by execution and turn epoch",
+    statements: &[
+        "CREATE INDEX IF NOT EXISTS idx_session_domain_epoch_kind_sequence
+             ON session_events(
+                 session_id,
+                 (event_json::jsonb ->> 'kind'),
+                 (event_json::jsonb #>> '{payload,execution_id}'),
+                 (event_json::jsonb #>> '{payload,turn_id}'),
+                 sequence
+             )
+             WHERE event_type='SessionDomainEvent'",
+    ],
+}, PostgresMigrationSpec {
+    id: "session.0021.recovery-refresh-uses-presence-projection",
+    domain: SESSION_DOMAIN,
+    version: 21,
+    description: "keep attachment recovery state when Session metadata refreshes",
+    statements: &[
+        "CREATE OR REPLACE FUNCTION cowd_refresh_session_recovery_manifest(
+             target_session_id TEXT,
+             bump_history BOOLEAN
+         )
+         RETURNS VOID
+         LANGUAGE plpgsql
+         AS $$
+         BEGIN
+             INSERT INTO session_recovery_manifest(
+                 session_id,durable_cursor,history_revision,
+                 transcript_messages,transcript_bytes,in_flight_turn,
+                 active_writer_or_attachment,
+                 mission_agent_team_continuation,last_activity_ms,
+                 manifest_revision
+             )
+             SELECT
+                 record.session_id,
+                 COALESCE((SELECT MAX(sequence)+1 FROM session_messages
+                            WHERE session_id=record.session_id),0),
+                 CASE WHEN bump_history THEN 1 ELSE 0 END,
+                 COALESCE((SELECT COUNT(*) FROM session_messages
+                            WHERE session_id=record.session_id),0),
+                 COALESCE((
+                     SELECT SUM(
+                         octet_length(stable_message_id)
+                         + octet_length(session_id)
+                         + octet_length(role)
+                         + octet_length(content_json)
+                         + octet_length(COALESCE(token_usage_json,''))
+                         + octet_length(COALESCE(tool_use_id,''))
+                         + octet_length(COALESCE(tool_name,''))
+                     ) FROM session_messages WHERE session_id=record.session_id
+                 ),0),
+                 EXISTS(
+                     SELECT 1 FROM session_runtime_outbox
+                      WHERE session_id=record.session_id
+                        AND status IN (
+                            'accepted','classified','queued','claimed',
+                            'running','reclassified','blocked'
+                        )
+                 ),
+                 COALESCE((
+                     SELECT jsonb_array_length(presence.attachments_json) > 0
+                       FROM session_presence_projection AS presence
+                      WHERE presence.session_id=record.session_id
+                 ),FALSE),
+                 FALSE,
+                 GREATEST(record.created_at_ms,record.updated_at_ms),
+                 1
+             FROM session_records AS record
+             WHERE record.session_id=target_session_id
+             ON CONFLICT(session_id) DO UPDATE SET
+                 durable_cursor=EXCLUDED.durable_cursor,
+                 history_revision=session_recovery_manifest.history_revision
+                     + CASE WHEN bump_history THEN 1 ELSE 0 END,
+                 transcript_messages=EXCLUDED.transcript_messages,
+                 transcript_bytes=EXCLUDED.transcript_bytes,
+                 in_flight_turn=EXCLUDED.in_flight_turn,
+                 active_writer_or_attachment=EXCLUDED.active_writer_or_attachment,
+                 last_activity_ms=GREATEST(
+                     session_recovery_manifest.last_activity_ms,
+                     EXCLUDED.last_activity_ms
+                 ),
+                 manifest_revision=session_recovery_manifest.manifest_revision+1;
+         END
+         $$",
+    ],
 }];
 
 #[derive(Clone, Debug)]
@@ -1659,30 +1413,6 @@ fn session_params(session: &SessionRecord) -> [&(dyn ToSql + Sync); 13] {
         &session.output_tokens,
         &session.status,
     ]
-}
-
-fn upsert_session_tx(
-    transaction: &mut PostgresTransaction<'_>,
-    session: &SessionRecord,
-) -> session::SessionResult<()> {
-    transaction.execute(
-        "INSERT INTO session_records(
-            session_id,platform,chat_id,user_id,model,created_at,last_activity,message_count,
-            reset_policy,metadata_json,input_tokens,output_tokens,status,
-            created_at_ms,updated_at_ms
-         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,
-            cowd_safe_session_epoch_ms($6),cowd_safe_session_epoch_ms($7))
-         ON CONFLICT(session_id) DO UPDATE SET
-            platform=EXCLUDED.platform,chat_id=EXCLUDED.chat_id,user_id=EXCLUDED.user_id,
-            model=EXCLUDED.model,created_at=EXCLUDED.created_at,last_activity=EXCLUDED.last_activity,
-            message_count=EXCLUDED.message_count,reset_policy=EXCLUDED.reset_policy,
-            metadata_json=EXCLUDED.metadata_json,input_tokens=EXCLUDED.input_tokens,
-            output_tokens=EXCLUDED.output_tokens,
-            status=EXCLUDED.status,created_at_ms=EXCLUDED.created_at_ms,
-            updated_at_ms=EXCLUDED.updated_at_ms",
-        &session_params(session),
-    ).map_err(postgres_error)?;
-    Ok(())
 }
 
 fn parse_input_decision(value: &str) -> session::SessionResult<InputRoutingDecision> {
@@ -2388,197 +2118,6 @@ fn row_to_runtime_outbox(row: &Row) -> session::SessionResult<SessionRuntimeOutb
     })
 }
 
-fn pg_history_rows(
-    connection: &mut PostgresConnection,
-    table: &str,
-) -> session::SessionResult<Vec<SessionOutboxHistory>> {
-    debug_assert_eq!(table, "session_runtime_outbox_history");
-    connection.query(
-        &format!("SELECT request_id,action,actor,COALESCE(reason,detail),COALESCE(from_status,previous_status),COALESCE(to_status,next_status),attempts,created_at_ms FROM {table} ORDER BY history_id"),
-        &[],
-    ).map_err(postgres_error)?.iter().map(|row| Ok(SessionOutboxHistory {
-        request_id: row.try_get(0).map_err(postgres_error)?, action: row.try_get(1).map_err(postgres_error)?,
-        actor: row.try_get(2).map_err(postgres_error)?, reason: row.try_get(3).map_err(postgres_error)?,
-        from_status: row.try_get(4).map_err(postgres_error)?, to_status: row.try_get(5).map_err(postgres_error)?,
-        attempts: i64_to_u32(row.try_get(6).map_err(postgres_error)?,"history attempts")?,
-        created_at_ms: i64_to_u64(row.try_get(7).map_err(postgres_error)?,"history time")?,
-    })).collect()
-}
-
-fn snapshot_is_empty(snapshot: &SessionMigrationSnapshot) -> bool {
-    snapshot.sessions.is_empty()
-        && snapshot.input_admissions.is_empty()
-        && snapshot.lifecycle_intents.is_empty()
-        && snapshot.branch_activations.is_empty()
-        && snapshot.associations.is_empty()
-        && snapshot.messages.is_empty()
-        && snapshot.events.is_empty()
-        && snapshot.checkpoints.is_empty()
-        && snapshot.snapshots.is_empty()
-        && snapshot.runtime_outbox.is_empty()
-        && snapshot.runtime_history.is_empty()
-}
-
-fn import_lifecycle_intent_tx(
-    transaction: &mut PostgresTransaction<'_>,
-    intent: &SessionLifecycleIntent,
-) -> session::SessionResult<()> {
-    transaction
-        .execute(
-            "INSERT INTO session_lifecycle_intents(
-                 operation_id,session_id,disposition,phase,last_stable_phase,
-                 expected_generation,created_at_ms,updated_at_ms,last_error,revision
-             ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
-            &[
-                &intent.operation_id,
-                &intent.session_id,
-                &intent.disposition.as_str(),
-                &intent.phase.as_str(),
-                &intent.last_stable_phase.as_str(),
-                &to_u64_i64(intent.expected_generation, "lifecycle expected generation")?,
-                &to_u64_i64(intent.created_at_ms, "lifecycle created time")?,
-                &to_u64_i64(intent.updated_at_ms, "lifecycle updated time")?,
-                &intent.last_error,
-                &to_u64_i64(intent.revision, "lifecycle revision")?,
-            ],
-        )
-        .map_err(postgres_error)?;
-    Ok(())
-}
-
-fn import_branch_activation_tx(
-    transaction: &mut PostgresTransaction<'_>,
-    activation: &SessionBranchActivation,
-) -> session::SessionResult<()> {
-    transaction
-        .execute(
-            "INSERT INTO session_branch_activations(
-                 operation_id,source_session_id,target_session_id,source_message_count,
-                 phase,created_at_ms,updated_at_ms,last_error,revision
-             ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)",
-            &[
-                &activation.operation_id,
-                &activation.source_session_id,
-                &activation.target_session_id,
-                &to_i64(
-                    activation.source_message_count,
-                    "branch activation source cutoff",
-                )?,
-                &activation.phase.as_str(),
-                &to_u64_i64(activation.created_at_ms, "branch activation created time")?,
-                &to_u64_i64(activation.updated_at_ms, "branch activation updated time")?,
-                &activation.last_error,
-                &to_u64_i64(activation.revision, "branch activation revision")?,
-            ],
-        )
-        .map_err(postgres_error)?;
-    Ok(())
-}
-
-fn import_runtime_outbox_tx(
-    transaction: &mut PostgresTransaction<'_>,
-    item: &SessionRuntimeOutboxRecord,
-) -> session::SessionResult<()> {
-    let task_route_hint_json = item
-        .task_route_hint
-        .as_ref()
-        .map(serde_json::to_string)
-        .transpose()
-        .map_err(|error| session::SessionError::Store(error.to_string()))?;
-    let application_receipt_json = item
-        .application_receipt
-        .as_ref()
-        .map(serde_json::to_string)
-        .transpose()
-        .map_err(|error| session::SessionError::Store(error.to_string()))?;
-    transaction.execute(
-        "INSERT INTO session_runtime_outbox(
-             input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,
-             decision,target_turn_id,classification_json,task_route_hint_json,status,runtime_commit_cursor,attempts,
-             next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,last_error,
-             revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch,application_receipt_json
-         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)",
-        &[&item.input_id,&item.request_id,&item.turn_id,&item.message_id,&item.session_id,
-          &to_i64(item.sequence,"runtime sequence")?,
-          &to_u64_i64(item.session_generation,"session generation")?,
-          &input_decision_as_str(item.decision),&item.target_turn_id,&item.classification_json,
-          &task_route_hint_json,&item.status.as_str(),
-          &item.runtime_commit_cursor.map(|value| to_u64_i64(value,"runtime cursor")).transpose()?,
-          &to_i64(item.attempts as usize,"runtime attempts")?,
-          &to_u64_i64(item.next_attempt_at_ms,"runtime next")?,&item.claim_owner,&item.claim_token,
-          &item.claim_expires_at_ms.map(|value|to_u64_i64(value,"runtime lease")).transpose()?,
-          &item.failure_class.map(OutboxFailureClass::as_str),&item.last_error,
-          &to_u64_i64(item.revision,"runtime revision")?,
-          &to_u64_i64(item.created_at_ms,"runtime created")?,
-          &to_u64_i64(item.updated_at_ms,"runtime updated")?,
-          &item.terminal_at_ms.map(|value|to_u64_i64(value,"runtime terminal")).transpose()?,
-          &item.runtime_options_json,
-          &item.claim_fence_epoch.map(|value|to_u64_i64(value,"runtime claim fence epoch")).transpose()?,
-          &application_receipt_json],
-    ).map_err(postgres_error)?;
-    Ok(())
-}
-
-fn import_history_tx(
-    transaction: &mut PostgresTransaction<'_>,
-    table: &str,
-    item: &SessionOutboxHistory,
-) -> session::SessionResult<()> {
-    debug_assert_eq!(table, "session_runtime_outbox_history");
-    transaction.execute(
-        &format!("INSERT INTO {table}(request_id,action,actor,previous_status,next_status,detail,reason,from_status,to_status,attempts,created_at_ms) VALUES($1,$2,$3,$4,$5,$6,$6,$4,$5,$7,$8)"),
-        &[&item.request_id,&item.action,&item.actor,&item.from_status,&item.to_status,&item.reason,&to_i64(item.attempts as usize,"history attempts")?,&to_u64_i64(item.created_at_ms,"history time")?],
-    ).map_err(postgres_error)?;
-    Ok(())
-}
-
-/// Quiesced SQLite-to-PG copy with source/target digest proof and an atomic,
-/// redacted manifest. It never changes selected topology itself.
-pub fn copy_quiesced_session_store(
-    source: &SqliteSessionStore,
-    target: &PostgresSessionStore,
-    manifest_path: impl AsRef<Path>,
-) -> session::SessionResult<SessionMigrationManifest> {
-    let snapshot = export_sqlite_session_snapshot(source)?;
-    let source_digest = snapshot.canonical_digest()?;
-    target.import_migration_snapshot(&snapshot)?;
-    if export_sqlite_session_snapshot(source)?.canonical_digest()? != source_digest {
-        return Err(session::SessionError::Store(
-            "session SQLite source changed during quiesced copy".to_string(),
-        ));
-    }
-    let target_digest = target.export_migration_snapshot()?.canonical_digest()?;
-    if target_digest != source_digest {
-        return Err(session::SessionError::Store(
-            "session PostgreSQL target digest differs from source".to_string(),
-        ));
-    }
-    let manifest = SessionMigrationManifest {
-        domain: SESSION_DOMAIN.to_string(),
-        source_digest,
-        target_digest,
-        schema_version: snapshot.schema_version,
-        session_count: snapshot.sessions.len(),
-        message_count: snapshot.messages.len(),
-        event_count: snapshot.events.len(),
-    };
-    let path = manifest_path.as_ref();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| session::SessionError::Store(error.to_string()))?;
-    }
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    fs::write(
-        &temporary,
-        serde_json::to_vec_pretty(&manifest)
-            .map_err(|error| session::SessionError::Store(error.to_string()))?,
-    )
-    .map_err(|error| session::SessionError::Store(error.to_string()))?;
-    fs::rename(&temporary, path)
-        .map_err(|error| session::SessionError::Store(error.to_string()))?;
-    Ok(manifest)
-}
-
 fn runtime_outbox_tx(
     transaction: &mut PostgresTransaction<'_>,
     request_id: &str,
@@ -3186,20 +2725,6 @@ fn context_envelope_id(event_json: &str) -> session::SessionResult<String> {
         })
 }
 
-fn checkpoint_from_event(event: &SessionEvent) -> Option<String> {
-    if event.event_type != session::SESSION_DOMAIN_EVENT_TYPE {
-        return None;
-    }
-    let payload = serde_json::from_str::<serde_json::Value>(&event.event_json).ok()?;
-    if payload.get("kind")?.as_str()? != "memory.semantic_checkpoint.created" {
-        return None;
-    }
-    payload
-        .pointer("/payload/checkpoint/checkpoint_id")?
-        .as_str()
-        .map(str::to_string)
-}
-
 fn storage_error(error: storage::StorageError) -> session::SessionError {
     match error {
         storage::StorageError::Postgres(error) => postgres_error(error),
@@ -3219,10 +2744,6 @@ fn postgres_error(error: postgres::Error) -> session::SessionError {
         },
     );
     session::SessionError::Store(detail)
-}
-
-fn migration_export_error(table: &str, error: session::SessionError) -> session::SessionError {
-    session::SessionError::Store(format!("export PostgreSQL `{table}` snapshot: {error}"))
 }
 
 fn to_i64(value: usize, label: &str) -> session::SessionResult<i64> {
@@ -3512,6 +3033,15 @@ impl session::SessionStoreBackend for PostgresSessionStore {
         limit: usize,
     ) -> session::SessionResult<Vec<SessionEvent>> {
         self.get_session_domain_events_by_kind_limited(session_id, kind, from_seq, limit)
+    }
+    fn get_session_domain_events_for_epoch(
+        &self,
+        session_id: &str,
+        kind: &str,
+        execution_id: &str,
+        turn_id: &str,
+    ) -> session::SessionResult<Vec<SessionEvent>> {
+        self.get_session_domain_events_for_epoch(session_id, kind, execution_id, turn_id)
     }
     fn get_latest_session_domain_event_by_kind(
         &self,

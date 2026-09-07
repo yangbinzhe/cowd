@@ -405,7 +405,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_store_adapter_roundtrips_verified_raw_payload() {
-        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::test_support::session_store());
         store
             .create_session(&session::SessionRecord {
                 session_id: "s1".to_string(),
@@ -425,7 +425,7 @@ mod tests {
             .await
             .unwrap();
         let artifacts = Arc::new(
-            crate::ArtifactStore::sqlite(
+            crate::ArtifactStore::for_test(
                 tempfile::tempdir().unwrap().keep(),
                 crate::ArtifactStoreConfig::default(),
             )
@@ -444,7 +444,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_scoped_raw_evidence_cannot_be_read_through_a_sibling_scope() {
-        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::test_support::session_store());
         store
             .create_session(&session::SessionRecord {
                 session_id: "s1".to_string(),
@@ -464,7 +464,7 @@ mod tests {
             .await
             .unwrap();
         let artifacts = Arc::new(
-            crate::ArtifactStore::sqlite(
+            crate::ArtifactStore::for_test(
                 tempfile::tempdir().unwrap().keep(),
                 crate::ArtifactStoreConfig::default(),
             )
@@ -486,7 +486,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_staged_artifact_publishes_receipt_without_rematerializing_payload() {
-        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::test_support::session_store());
         store
             .create_session(&session::SessionRecord {
                 session_id: "s1".to_string(),
@@ -506,7 +506,7 @@ mod tests {
             .await
             .unwrap();
         let artifacts = Arc::new(
-            crate::ArtifactStore::sqlite(
+            crate::ArtifactStore::for_test(
                 tempfile::tempdir().unwrap().keep(),
                 crate::ArtifactStoreConfig::default(),
             )

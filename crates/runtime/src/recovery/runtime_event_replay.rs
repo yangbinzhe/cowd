@@ -135,7 +135,6 @@ pub fn candidate_from_action(action: &RuntimeRecoveryAction) -> Option<RuntimeRe
         RuntimeEventScope::Team => "runtime.agentic_program",
         RuntimeEventScope::Agent => "runtime.agent_lifecycle",
         RuntimeEventScope::AgentDefinition => "runtime.agent_definition",
-        RuntimeEventScope::TeamTemplate => "runtime.team_template",
         RuntimeEventScope::Approval => "runtime.approval_queue",
         RuntimeEventScope::Evolution => "runtime.evolution",
         RuntimeEventScope::Knowledge => "runtime.knowledge_candidate_projector",
@@ -233,7 +232,7 @@ mod tests {
 
     #[test]
     fn replay_report_preserves_pending_and_marks_running_recovery() {
-        let store = RuntimeEventStore::open_in_memory().expect("store");
+        let store = RuntimeEventStore::for_test();
         store
             .append(RuntimeEventInput {
                 stream_id: "approval:a".to_string(),

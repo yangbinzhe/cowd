@@ -4160,6 +4160,7 @@ mod tests {
             projection: ExecutionProjection {
                 schema_version: harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION,
                 execution_id: "execution-old".to_string(),
+                agentic_collaboration: Default::default(),
                 revision: 9,
                 cursor: 9,
                 detail_scope: harness_contract::projection::ProjectionDetailScope::Summary,

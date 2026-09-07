@@ -522,7 +522,7 @@ mod tests {
     #[tokio::test]
     async fn writes_rereads_and_attests_exact_digest() {
         let workspace = tempfile::tempdir().unwrap();
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let state = ExecutionGraphStateStore::new(Arc::clone(&event_store));
         let commits = ExecutionCommitService::new(event_store);
         let materialize = node("reports/final.md");
@@ -561,7 +561,7 @@ mod tests {
         tokio::fs::write(workspace.path().join("blocked"), b"not a directory")
             .await
             .unwrap();
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let state = ExecutionGraphStateStore::new(Arc::clone(&event_store));
         let commits = ExecutionCommitService::new(event_store);
         let materialize = node("blocked/final.md");
@@ -602,7 +602,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let state = ExecutionGraphStateStore::new(Arc::clone(&event_store));
         let commits = ExecutionCommitService::new(event_store);
         let materialize = node("reports/final.md");

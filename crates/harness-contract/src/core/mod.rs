@@ -184,6 +184,10 @@ impl ExecutionPattern {
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionModifier {
     Parallel,
+    /// A planning hint that encourages a focused change. It is never a
+    /// negative authorization grant: concrete governed effects remain
+    /// authorized by their descriptor, session policy, and explicit user
+    /// constraints.
     BoundedChange,
     Background,
     WithExternalResearch,

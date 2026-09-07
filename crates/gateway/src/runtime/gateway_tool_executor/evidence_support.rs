@@ -144,6 +144,17 @@ fn write_file_evidence(
     output: &serde_json::Value,
     sequence: u64,
 ) -> Option<harness_contract::context::ObservedEvidence> {
+    // The model-facing tool context intentionally replaces a full file body
+    // with this compact receipt before it reaches the RuntimeExecutionHost:
+    // `{operation, path, content_sha256, prior_bytes, prior_sha256}`. It is
+    // still adapter-authenticated output, and carries the exact identity and
+    // post-write digest required by the evidence contract. Treating only the
+    // pre-compaction shape below as evidence silently loses successful writes
+    // at the governed-host boundary, causing root acceptance to replan and
+    // eventually report a false missing-artifact failure.
+    if let Some(evidence) = compact_write_file_evidence(resolver, tool_name, output, sequence) {
+        return Some(evidence);
+    }
     let content = output.get("content")?.as_str()?;
     let prior_state = match (
         output.get("type").and_then(serde_json::Value::as_str),
@@ -166,6 +177,62 @@ fn write_file_evidence(
             harness_contract::context::WorkspaceAccessMode::Write,
             output.get("filePath")?.as_str()?,
             &format!("{:x}", Sha256::digest(content.as_bytes())),
+            sequence,
+        )
+        .ok()
+        .map(|mut evidence| {
+            evidence.workspace_prior_state = Some(prior_state);
+            evidence
+        })
+}
+
+/// Reconstitute typed write evidence from the trusted compact mutation receipt
+/// produced by `runtime::context::evidence::summarize_file_mutation`.
+///
+/// This accepts no model-authored claims: the caller has already received the
+/// JSON from an authorized tool adapter, and every identity/digest field is
+/// validated before it can close a workspace obligation.
+fn compact_write_file_evidence(
+    resolver: &runtime::path_identity::WorkspacePathIdentityResolver,
+    tool_name: &str,
+    output: &serde_json::Value,
+    sequence: u64,
+) -> Option<harness_contract::context::ObservedEvidence> {
+    let operation = output.get("operation")?.as_str()?;
+    let path = output.get("path")?.as_str()?;
+    let digest = output.get("content_sha256")?.as_str()?;
+    if !is_sha256_hex(digest) {
+        return None;
+    }
+    let prior_state = match operation {
+        "create"
+            if output
+                .get("prior_bytes")
+                .and_then(serde_json::Value::as_u64)
+                == Some(0)
+                && output
+                    .get("prior_sha256")
+                    .is_some_and(serde_json::Value::is_null) =>
+        {
+            harness_contract::context::WorkspacePriorState::Absent
+        }
+        "update" => {
+            let sha256 = output.get("prior_sha256")?.as_str()?;
+            if !is_sha256_hex(sha256) {
+                return None;
+            }
+            harness_contract::context::WorkspacePriorState::Existing {
+                sha256: sha256.to_string(),
+            }
+        }
+        _ => return None,
+    };
+    resolver
+        .observe_trusted_tool_output_file(
+            tool_name,
+            harness_contract::context::WorkspaceAccessMode::Write,
+            path,
+            digest,
             sequence,
         )
         .ok()
@@ -349,4 +416,3 @@ fn network_evidence(
         workspace_prior_state: None,
     }
 }
-

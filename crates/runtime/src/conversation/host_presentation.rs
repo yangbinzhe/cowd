@@ -519,6 +519,80 @@ where
     C: ApiClient + Send + Sync + 'static,
     T: ToolExecutor,
 {
+    #[allow(clippy::too_many_arguments)]
+    async fn record_terminal_provider_usage(
+        &self,
+        usage: model_protocol::usage::TokenUsage,
+        model: Option<String>,
+        models_used: Vec<String>,
+        first_token_latency_ms: Option<u64>,
+        active_stream_duration_ms: Option<u64>,
+        wall_duration_ms: u64,
+        output_chars: u64,
+    ) {
+        let (cache_dimensions_known, bus) = {
+            let runtime = self.runtime.lock().await;
+            (
+                runtime.turn_cache_dimensions_known(),
+                runtime.cowd_bus().cloned(),
+            )
+        };
+        let telemetry = {
+            let mut state = self.state.lock().await;
+            state.record_root_model_usage(RootModelUsageDelta {
+                usage,
+                model,
+                models_used,
+                first_token_latency_ms,
+                active_stream_duration_ms,
+                wall_duration_ms,
+                output_chars,
+                output_chunks: 1,
+                cache_dimensions_known,
+            });
+            state.root_model_telemetry()
+        };
+        if let Some(bus) = bus {
+            bus.emit(CowdEvent::RunModelTelemetry { telemetry });
+        }
+    }
+
+    async fn record_terminal_provider_failure(&self, error: &RuntimeError) {
+        let (cache_dimensions_known, bus) = {
+            let runtime = self.runtime.lock().await;
+            (
+                runtime.turn_cache_dimensions_known(),
+                runtime.cowd_bus().cloned(),
+            )
+        };
+        let telemetry = {
+            let mut state = self.state.lock().await;
+            if let Some(usage) = error.provider_usage() {
+                state.record_root_model_usage(RootModelUsageDelta {
+                    usage,
+                    model: None,
+                    models_used: Vec::new(),
+                    first_token_latency_ms: None,
+                    active_stream_duration_ms: None,
+                    wall_duration_ms: 0,
+                    output_chars: 0,
+                    output_chunks: 0,
+                    cache_dimensions_known,
+                });
+            } else {
+                // The durable attempt tracker may have observed a failed
+                // physical request without token counts. Preserve that cache
+                // dimensions are unknown even though there is no numeric
+                // delta to add.
+                state.cache_dimensions_known = cache_dimensions_known;
+            }
+            state.root_model_telemetry()
+        };
+        if let Some(bus) = bus {
+            bus.emit(CowdEvent::RunModelTelemetry { telemetry });
+        }
+    }
+
     /// Produce the user-facing explanation for a partial/blocked terminal.
     /// Uses one bounded zero-tool provider request so the model can explain
     /// what happened, why it failed, and what to do next; falls back to the
@@ -545,9 +619,12 @@ where
                 TerminalFailureNarration::Local(answer) => {
                     (answer, None, Vec::new(), attempt_id.to_string())
                 }
-                TerminalFailureNarration::Provider { answer, attempt_id } => {
-                    (answer, None, Vec::new(), attempt_id)
-                }
+                TerminalFailureNarration::Provider {
+                    answer,
+                    model,
+                    models_used,
+                    attempt_id,
+                } => (answer, model, models_used, attempt_id),
             });
         }
         // The same provider already received its single governed protocol
@@ -583,15 +660,32 @@ where
                 .await
         };
         match narration {
-            Ok((explanation, model, models_used, provider_attempt_id)) => {
+            Ok(answer) => {
+                self.record_terminal_provider_usage(
+                    answer.usage,
+                    answer.model.clone(),
+                    answer.models_used.clone(),
+                    answer.first_token_latency_ms,
+                    answer.active_stream_duration_ms,
+                    answer.wall_duration_ms,
+                    answer.text.chars().count() as u64,
+                )
+                .await;
+                let explanation = answer.text;
+                let model = answer.model;
+                let models_used = answer.models_used;
+                let provider_attempt_id = answer.provider_attempt_id;
                 let mut state = self.state.lock().await;
                 state.terminal_failure_narration = Some(TerminalFailureNarration::Provider {
                     answer: explanation.clone(),
+                    model: model.clone(),
+                    models_used: models_used.clone(),
                     attempt_id: provider_attempt_id.clone(),
                 });
                 Ok((explanation, model, models_used, provider_attempt_id))
             }
             Err(error) => {
+                self.record_terminal_provider_failure(&error).await;
                 if cancellation.is_cancelled() {
                     return Err("terminal_presentation_cancelled".to_string());
                 }
@@ -661,8 +755,27 @@ where
                                 )
                                 .await
                         };
-                        let (answer, _model, models_used, _provider_attempt_id) =
-                            narration.map_err(|error| error.to_string())?;
+                        let answer = match narration {
+                            Ok(answer) => {
+                                self.record_terminal_provider_usage(
+                                    answer.usage,
+                                    answer.model.clone(),
+                                    answer.models_used.clone(),
+                                    answer.first_token_latency_ms,
+                                    answer.active_stream_duration_ms,
+                                    answer.wall_duration_ms,
+                                    answer.text.chars().count() as u64,
+                                )
+                                .await;
+                                answer
+                            }
+                            Err(error) => {
+                                self.record_terminal_provider_failure(&error).await;
+                                return Err(error.to_string());
+                            }
+                        };
+                        let models_used = answer.models_used;
+                        let answer = answer.text;
                         for model in models_used {
                             if !all_models_used.contains(&model) {
                                 all_models_used.push(model);
@@ -718,7 +831,21 @@ where
                     .await
             };
             match narration {
-                Ok((answer, model, models_used, provider_attempt_id)) => {
+                Ok(answer) => {
+                    self.record_terminal_provider_usage(
+                        answer.usage,
+                        answer.model.clone(),
+                        answer.models_used.clone(),
+                        answer.first_token_latency_ms,
+                        answer.active_stream_duration_ms,
+                        answer.wall_duration_ms,
+                        answer.text.chars().count() as u64,
+                    )
+                    .await;
+                    let model = answer.model;
+                    let models_used = answer.models_used;
+                    let provider_attempt_id = answer.provider_attempt_id;
+                    let answer = answer.text;
                     for attempted in models_used {
                         if !all_models_used.contains(&attempted) {
                             all_models_used.push(attempted);
@@ -746,6 +873,7 @@ where
                     ));
                 }
                 Err(error) => {
+                    self.record_terminal_provider_failure(&error).await;
                     if self
                         .runtime
                         .lock()
@@ -876,8 +1004,6 @@ where
             terminal_override,
             objective,
             terminal_model,
-            input_tokens,
-            output_tokens,
             turn_transcript_start,
             session_id,
             turn_id,
@@ -890,8 +1016,6 @@ where
                 state.terminal_override.clone(),
                 state.content.clone(),
                 state.model.clone(),
-                state.input_tokens,
-                state.output_tokens,
                 state.turn_transcript_start,
                 state.session_id.clone(),
                 state.turn_id.clone(),
@@ -1362,10 +1486,25 @@ where
                         .map_err(|error| format!("encode terminal transcript: {error}"))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let (terminal_input_tokens, terminal_output_tokens) = terminal_aggregate_usage(
-                input_tokens,
-                output_tokens,
-                self.services.execution_live(&ticket.graph_id).as_ref(),
+            // Terminal narration and hierarchical Team synthesis may perform
+            // several Provider calls after the initial graph projection was
+            // loaded. Snapshot the cumulative root owner only at artifact
+            // encoding, after every success/failure path has been accounted.
+            let latest_root_usage = {
+                let state = self.state.lock().await;
+                TerminalTokenUsage {
+                    input_tokens: state.input_tokens,
+                    output_tokens: state.output_tokens,
+                    cache_creation_input_tokens: state.cache_create_tokens,
+                    cache_read_input_tokens: state.cache_read_tokens,
+                    cache_dimensions_known: state.cache_dimensions_known,
+                }
+            };
+            let terminal_usage = terminal_aggregate_usage(
+                latest_root_usage,
+                self.services
+                    .execution_model_usage_snapshot(&ticket.graph_id)
+                    .as_ref(),
             );
             let terminal_id = format!("turn-terminal:{}", ingress.request_id);
             let collaboration_evidence = terminal_override
@@ -1392,12 +1531,7 @@ where
                 "ingress_message_id": ingress.message_id,
                 "consumed_input_sequence": consumed_input_sequence,
                 "transcript": transcript,
-                "token_usage": {
-                    "input_tokens": terminal_input_tokens,
-                    "output_tokens": terminal_output_tokens,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0,
-                }
+                "token_usage": terminal_usage,
             }))
             .map_err(|error| format!("encode terminal artifact: {error}"))?;
             let terminal_artifact = self
@@ -1871,17 +2005,216 @@ pub(super) fn sha256_digest(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
+/// Complete Provider usage sealed into the durable Session terminal.
+///
+/// Host state is the latest inline-root cumulative usage. ExecutionLiveStore
+/// retains that root and each descendant by execution ID. Terminal therefore
+/// selects one root snapshot and adds each exact descendant once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct TerminalTokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    /// True distinguishes explicit Provider zeros from missing cache usage.
+    #[serde(default)]
+    pub cache_dimensions_known: bool,
+}
+
 pub(super) fn terminal_aggregate_usage(
-    own_input_tokens: u64,
-    own_output_tokens: u64,
-    live: Option<&harness_contract::projection::ExecutionLiveState>,
-) -> (u64, u64) {
-    live.map_or((own_input_tokens, own_output_tokens), |live| {
-        (
-            own_input_tokens.max(live.metrics.input_tokens),
-            own_output_tokens.max(live.metrics.output_tokens),
-        )
-    })
+    own: TerminalTokenUsage,
+    live: Option<&crate::execution_live::ExecutionModelUsageSnapshot>,
+) -> TerminalTokenUsage {
+    let own_observed = own.input_tokens > 0
+        || own.output_tokens > 0
+        || own.cache_creation_input_tokens > 0
+        || own.cache_read_input_tokens > 0
+        || own.cache_dimensions_known;
+    let mut aggregate = own;
+    let mut usage_count = u64::from(own_observed);
+    let mut all_cache_dimensions_known = !own_observed || own.cache_dimensions_known;
+    let Some(live) = live else {
+        aggregate.cache_dimensions_known = usage_count > 0 && all_cache_dimensions_known;
+        return aggregate;
+    };
+
+    // Host state is the latest root snapshot at terminal time. A store-own
+    // value is used only when that host carried no observed usage at all; the
+    // two cumulative snapshots are never added to each other.
+    if !own_observed {
+        if let Some(stored_own) = live.own.as_ref() {
+            aggregate.input_tokens = stored_own.input_tokens;
+            aggregate.output_tokens = stored_own.output_tokens;
+            aggregate.cache_creation_input_tokens = stored_own.cache_create_tokens;
+            aggregate.cache_read_input_tokens = stored_own.cache_read_tokens;
+            usage_count = 1;
+            all_cache_dimensions_known = stored_own.cache_dimensions_known;
+        }
+    }
+    for descendant in live.descendants.values() {
+        aggregate.input_tokens = aggregate
+            .input_tokens
+            .saturating_add(descendant.input_tokens);
+        aggregate.output_tokens = aggregate
+            .output_tokens
+            .saturating_add(descendant.output_tokens);
+        aggregate.cache_creation_input_tokens = aggregate
+            .cache_creation_input_tokens
+            .saturating_add(descendant.cache_create_tokens);
+        aggregate.cache_read_input_tokens = aggregate
+            .cache_read_input_tokens
+            .saturating_add(descendant.cache_read_tokens);
+        usage_count = usage_count.saturating_add(1);
+        all_cache_dimensions_known &= descendant.cache_dimensions_known;
+    }
+    aggregate.cache_dimensions_known = usage_count > 0 && all_cache_dimensions_known;
+    aggregate
+}
+
+#[cfg(test)]
+mod terminal_usage_tests {
+    use super::*;
+
+    fn telemetry(
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_create_tokens: u64,
+        cache_read_tokens: u64,
+        cache_dimensions_known: bool,
+    ) -> crate::RunModelTelemetry {
+        crate::RunModelTelemetry {
+            model: Some("model-a".to_string()),
+            models_used: vec!["model-a".to_string()],
+            first_token_latency_ms: Some(1),
+            active_stream_duration_ms: Some(2),
+            wall_duration_ms: 3,
+            output_chars: output_tokens,
+            output_chunks: 1,
+            input_tokens,
+            output_tokens,
+            cache_create_tokens,
+            cache_read_tokens,
+            cache_dimensions_known,
+            total_tokens: input_tokens
+                .saturating_add(output_tokens)
+                .saturating_add(cache_create_tokens)
+                .saturating_add(cache_read_tokens),
+            usage_source: "provider".to_string(),
+            wall_chars_per_second: None,
+            wall_tokens_per_second: None,
+            active_chars_per_second: None,
+            active_tokens_per_second: None,
+            chars_per_second: None,
+            tokens_per_second: None,
+        }
+    }
+
+    #[test]
+    fn terminal_usage_uses_live_root_and_descendant_union_without_counting_inline_root_twice() {
+        let live = crate::execution_live::ExecutionModelUsageSnapshot {
+            own: Some(telemetry(100, 40, 17, 80, true)),
+            descendants: [("child-1".to_string(), telemetry(20, 5, 3, 11, true))]
+                .into_iter()
+                .collect(),
+        };
+
+        let aggregate = terminal_aggregate_usage(
+            TerminalTokenUsage {
+                input_tokens: 100,
+                output_tokens: 40,
+                cache_creation_input_tokens: 17,
+                cache_read_input_tokens: 80,
+                cache_dimensions_known: true,
+            },
+            Some(&live),
+        );
+
+        assert_eq!(aggregate.input_tokens, 120);
+        assert_eq!(aggregate.output_tokens, 45);
+        assert_eq!(aggregate.cache_creation_input_tokens, 20);
+        assert_eq!(aggregate.cache_read_input_tokens, 91);
+        assert!(aggregate.cache_dimensions_known);
+    }
+
+    #[test]
+    fn terminal_usage_adds_descendant_when_live_root_is_lagging() {
+        let live = crate::execution_live::ExecutionModelUsageSnapshot {
+            own: None,
+            descendants: [(
+                "child-visible-first".to_string(),
+                telemetry(20, 5, 0, 0, true),
+            )]
+            .into_iter()
+            .collect(),
+        };
+
+        let aggregate = terminal_aggregate_usage(
+            TerminalTokenUsage {
+                input_tokens: 100,
+                output_tokens: 40,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_dimensions_known: true,
+            },
+            Some(&live),
+        );
+
+        assert_eq!(aggregate.input_tokens, 120);
+        assert_eq!(aggregate.output_tokens, 45);
+        assert!(aggregate.cache_dimensions_known);
+    }
+
+    #[test]
+    fn terminal_usage_marks_cache_unknown_when_any_descendant_attempt_is_unknown() {
+        let live = crate::execution_live::ExecutionModelUsageSnapshot {
+            own: None,
+            descendants: [("child-unknown".to_string(), telemetry(20, 5, 0, 0, false))]
+                .into_iter()
+                .collect(),
+        };
+        let aggregate = terminal_aggregate_usage(
+            TerminalTokenUsage {
+                input_tokens: 100,
+                output_tokens: 40,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_dimensions_known: true,
+            },
+            Some(&live),
+        );
+        assert!(!aggregate.cache_dimensions_known);
+    }
+
+    #[test]
+    fn terminal_usage_json_round_trip_preserves_complete_cache_telemetry() {
+        let usage = TerminalTokenUsage {
+            input_tokens: 1_024,
+            output_tokens: 128,
+            cache_creation_input_tokens: 256,
+            cache_read_input_tokens: 768,
+            cache_dimensions_known: true,
+        };
+
+        let encoded = serde_json::to_value(usage).expect("serialize terminal usage");
+        assert_eq!(encoded["cache_creation_input_tokens"], 256);
+        assert_eq!(encoded["cache_read_input_tokens"], 768);
+        assert_eq!(encoded["cache_dimensions_known"], true);
+        assert_eq!(
+            serde_json::from_value::<TerminalTokenUsage>(encoded).expect("replay terminal usage"),
+            usage
+        );
+        let legacy = serde_json::json!({
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
+        });
+        assert!(
+            !serde_json::from_value::<TerminalTokenUsage>(legacy)
+                .expect("replay legacy terminal usage")
+                .cache_dimensions_known
+        );
+    }
 }
 
 pub(super) fn runtime_observation_identity(
@@ -3299,7 +3632,7 @@ pub(super) fn focus_action_rejection_outcome(
     state.focus_action_rejections = state.focus_action_rejections.saturating_add(1);
     let pending = pending_writes.join(", ");
     if state.focus_action_rejections <= 2 {
-        state.force_tool_allowlist_next_model = Some(required_mutation_tool_allowlist());
+        state.force_tool_allowlist_next_model = None;
         let reason = format!(
             "the delegated mutation role already has its required pre-write read receipt; the next accepted action must invoke an authorized write tool for [{pending}]. Do not reread, search, glob, synthesize, or claim the change in prose before the committed write receipt exists"
         );
@@ -3420,7 +3753,7 @@ pub(super) fn evaluation_scope_rejection_outcome(
         state.required_write_for_completion,
         &state.write_attempt_paths,
     ) {
-        state.force_tool_allowlist_next_model = Some(required_mutation_tool_allowlist());
+        state.force_tool_allowlist_next_model = None;
         let reason = "exact-path evidence is already retained, but the mutation objective has not attempted its authorized write. Do not read the workspace broadly again. Invoke the smallest authorized exact-path write now, or return an honest blocked result if the retained evidence is insufficient".to_string();
         return (
             RuntimeIntervention {
@@ -3531,10 +3864,6 @@ pub(super) fn post_write_exact_read_recovery_allowed(
         && violation == "read:."
         && required_write_for_completion
         && successful_write_observed
-}
-
-pub(super) fn required_mutation_tool_allowlist() -> BTreeSet<String> {
-    BTreeSet::from(["edit_file".to_string(), "write_file".to_string()])
 }
 
 /// Compile a repeated broad evaluation read into bounded exact-path calls.

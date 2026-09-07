@@ -10,14 +10,14 @@
 //! Tests project registration, idempotent re-registration, active-project
 //! switching, and the always-available global store.
 
-use memory::{store::MemoryStore, ProjectScopeManager};
+use memory::ProjectScopeManager;
 
 /// Helper: create a temporary directory and a `ProjectScopeManager` using
 /// `memory.db` inside it.
 fn setup() -> (tempfile::TempDir, ProjectScopeManager) {
     let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("memory.db");
-    let manager = ProjectScopeManager::new(db_path).unwrap();
+    let manager =
+        ProjectScopeManager::with_store(std::sync::Arc::new(memory::EphemeralMemoryStore::new()));
     (tmp, manager)
 }
 

@@ -272,7 +272,7 @@ mod tests {
 
     #[test]
     fn canonical_receipt_is_non_blocking_scoped_and_idempotent() {
-        let store = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let store = Arc::new(RuntimeEventStore::for_test());
         let recorder = RuntimeSkillUsageRecorder::new(Arc::clone(&store));
         let first = recorder
             .observe(&invocation(), "1.0.0", &context(), SkillUsageKind::Hit)
@@ -310,7 +310,7 @@ mod tests {
 
     #[test]
     fn incomplete_context_is_dropped_before_persistence() {
-        let store = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let store = Arc::new(RuntimeEventStore::for_test());
         let recorder = RuntimeSkillUsageRecorder::new(Arc::clone(&store));
         let mut invalid = context();
         invalid.execution_id.clear();

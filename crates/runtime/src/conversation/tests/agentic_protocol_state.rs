@@ -3,11 +3,11 @@ use super::host_backend::{
     DelegatedAgenticProtocolState,
 };
 use super::agentic_program_owns_root_terminal;
-use harness_contract::agent::AgentTaskPacket;
+use harness_contract::agent::{AgenticExecutionBinding, AgenticExecutionFocus, AgentTaskPacket};
 use harness_contract::agent_action::{
-    AgentAction, AgentActionEnvelope, AgentActorBinding, AgentActorKind, AgentInviteInput,
-    ArtifactCommitInput, TaskClaimInput, TaskPublishInput, TaskReviewDecision, TaskReviewInput,
-    TaskSubmitInput, TeamCreateInput,
+    AgentAction, AgentActionEnvelope, AgentActionStatus, AgentActorBinding, AgentActorKind,
+    AgentInviteInput, ArtifactCommitInput, TaskClaimInput, TaskPublishInput,
+    TaskReviewDecision, TaskReviewInput, TaskSubmitInput, TeamCreateInput,
 };
 use harness_contract::context::{ArtifactWriteDescriptor, ChildExecutionBudgetReservation};
 use harness_contract::execution_graph::{
@@ -162,7 +162,12 @@ fn protocol_fixture() -> AgenticProtocolFixture {
                 role: "Author".to_string(),
                 mission: "produce evidence".to_string(),
                 required_capabilities: vec!["read".to_string()],
-            }),
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
+}),
         ),
     );
     let reviewer_ref = applied_ref(
@@ -174,7 +179,12 @@ fn protocol_fixture() -> AgenticProtocolFixture {
                 role: "Reviewer".to_string(),
                 mission: "independently verify evidence".to_string(),
                 required_capabilities: vec!["read".to_string()],
-            }),
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
+}),
         ),
     );
     let task_ref = applied_ref(
@@ -188,7 +198,12 @@ fn protocol_fixture() -> AgenticProtocolFixture {
                 acceptance: "an independent reviewer accepts the submitted artifact".to_string(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
-            }),
+
+            obligation_refs: Vec::new(),
+            purpose: Default::default(),
+            execution_requirements: Vec::new(),
+            expertise_hints: Vec::new(),
+}),
         ),
     );
     AgenticProtocolFixture {
@@ -220,7 +235,7 @@ fn register_protocol_graph(
     let packet = AgentTaskPacket {
         assignment: crate::test_support::agent_assignment(
             None,
-            agent_ref,
+            &format!("instance:{agent_ref}"),
             &format!("run:{parent_graph_id}"),
             &fixture.task_ref,
             &fixture.root.session_id,
@@ -235,17 +250,10 @@ fn register_protocol_graph(
         objective: "close the assigned Agent-first task".to_string(),
         required_acceptance: Default::default(),
         output_acceptance: Vec::new(),
-        requires_managed_collaboration_escalation: false,
         acceptance: vec!["durable submission".to_string()],
         cohort_prompt_package: None,
         constraints: Vec::new(),
-        context_refs: vec![
-            format!("agentic_program:{}", fixture.root.program_id),
-            format!("agentic_team:{}", fixture.team_ref),
-            format!("agentic_member:{agent_ref}"),
-            format!("agentic_task:{}", fixture.task_ref),
-            format!("agentic_mode:{mode}"),
-        ],
+        context_refs: vec![format!("task:{}", fixture.task_ref)],
         evidence_refs: Vec::new(),
         resource_scopes: fixture.root.resource_scopes.clone(),
         allowed_tools: vec![
@@ -269,6 +277,23 @@ fn register_protocol_graph(
         binding: None,
         managed_invocation: None,
         idempotency_key: format!("protocol:{parent_graph_id}"),
+        agentic_binding: Some(AgenticExecutionBinding {
+            program_id: fixture.root.program_id.clone(),
+            agent_id: agent_ref.to_string(),
+            membership_id: format!("membership:{agent_ref}:{}", fixture.team_ref),
+            team_id: fixture.team_ref.clone(),
+            task_team_id: fixture.team_ref.clone(),
+            source_spec_revision: 1,
+            focus: match mode {
+                "execute" => AgenticExecutionFocus::TaskExecute {
+                    task_ref: fixture.task_ref.clone(),
+                },
+                "review" => AgenticExecutionFocus::TaskReview {
+                    task_ref: fixture.task_ref.clone(),
+                },
+                _ => panic!("unsupported protocol fixture mode {mode}"),
+            },
+        }),
     };
     let mut parent_node = ExecutionNodeSpec::new(
         ExecutionNodeKind::AgentTask,
@@ -487,15 +512,123 @@ async fn delegated_protocol_reads_real_parent_and_selects_all_runtime_bound_task
     assert_eq!(state.artifact_evidence_refs, expected_evidence);
     assert!(state.artifact_refs.contains(&auto_bound_ref));
     assert!(!state.artifact_refs.contains(&foreign_ref));
-    assert_eq!(
-        state.required_terminal_tools(),
-        std::collections::BTreeSet::from([
-            harness_contract::agent_action::TASK_SUBMIT_TOOL_ID.to_string()
-        ])
-    );
     let instruction = state.continuation_instruction();
     assert!(instruction.contains(&included_ref));
     assert!(instruction.contains(&included_evidence));
+}
+
+#[tokio::test]
+async fn rework_attempt_cannot_reuse_artifacts_from_an_earlier_claim() {
+    let fixture = protocol_fixture();
+    let first_execution = "agent-attempt-one";
+    fixture
+        .services
+        .agent_action_service()
+        .apply(&fixture.agent_envelope(
+            "claim-attempt-one",
+            &fixture.author_ref,
+            first_execution,
+            AgentAction::TaskClaim(TaskClaimInput {
+                task_ref: fixture.task_ref.clone(),
+                reason: Some("first attempt".to_string()),
+            }),
+        ))
+        .expect("claim first attempt");
+    let (stale_artifact, stale_evidence) = commit_protocol_artifact(
+        &fixture,
+        "attempt-one-artifact",
+        &fixture.author_ref,
+        first_execution,
+        vec![fixture.task_ref.clone()],
+        "first attempt evidence",
+    )
+    .await;
+    fixture
+        .services
+        .agent_action_service()
+        .apply(&fixture.agent_envelope(
+            "submit-attempt-one",
+            &fixture.author_ref,
+            first_execution,
+            AgentAction::TaskSubmit(TaskSubmitInput {
+                task_ref: fixture.task_ref.clone(),
+                artifact_refs: vec![stale_artifact.clone()],
+                evidence_refs: vec![stale_evidence.clone()],
+                unresolved: Vec::new(),
+            }),
+        ))
+        .expect("submit first attempt");
+    fixture
+        .services
+        .agent_action_service()
+        .apply(&fixture.agent_envelope(
+            "rework-attempt-one",
+            &fixture.reviewer_ref,
+            "review-attempt-one",
+            AgentAction::TaskReview(TaskReviewInput {
+                task_ref: fixture.task_ref.clone(),
+                decision: TaskReviewDecision::Rework,
+                reason: "the first attempt lacks a required acceptance item".to_string(),
+                evidence_refs: vec![stale_evidence],
+            }),
+        ))
+        .expect("review requires rework");
+
+    let second_execution = "agent-attempt-two";
+    fixture
+        .services
+        .agent_action_service()
+        .apply(&fixture.agent_envelope(
+            "claim-attempt-two",
+            &fixture.author_ref,
+            second_execution,
+            AgentAction::TaskClaim(TaskClaimInput {
+                task_ref: fixture.task_ref.clone(),
+                reason: Some("rework the rejected first attempt".to_string()),
+            }),
+        ))
+        .expect("claim rework attempt");
+
+    let stale_submit = fixture
+        .services
+        .agent_action_service()
+        .apply(&fixture.agent_envelope(
+            "submit-stale-attempt-one-artifact",
+            &fixture.author_ref,
+            second_execution,
+            AgentAction::TaskSubmit(TaskSubmitInput {
+                task_ref: fixture.task_ref.clone(),
+                artifact_refs: vec![stale_artifact],
+                evidence_refs: vec!["artifact://not-needed-for-rejection".to_string()],
+                unresolved: Vec::new(),
+            }),
+        ))
+        .expect("stale submission returns a receipt");
+    assert_eq!(stale_submit.status, AgentActionStatus::Rejected);
+    assert_eq!(
+        stale_submit.error.expect("rejection detail").code,
+        "artifact_not_bound_to_active_claim"
+    );
+
+    let ticket = register_protocol_graph(
+        &fixture,
+        "execute",
+        &fixture.author_ref,
+        second_execution,
+        "conversation-attempt-two",
+        2,
+    );
+    let state = delegated_agentic_protocol_state(fixture.services.as_ref(), &ticket)
+        .expect("derive rework protocol")
+        .expect("Agent-first protocol");
+    assert!(state.owns_active_attempt);
+    assert!(state.artifact_refs.is_empty());
+    assert_eq!(
+        state.closure_tool_ids(),
+        std::collections::BTreeSet::from([
+            harness_contract::agent_action::ARTIFACT_COMMIT_TOOL_ID.to_string()
+        ])
+    );
 }
 
 #[test]
@@ -539,10 +672,6 @@ fn saturated_delegated_work_commits_its_next_action_without_text_only_detour() {
         true,
         true,
     ));
-    assert_eq!(
-        pending_review.convergence_action_tools(),
-        std::collections::BTreeSet::from(["task_review".to_string()])
-    );
     assert!(!pending_delegated_action_is_ready(
         Some(&pending_review),
         false,
@@ -566,17 +695,39 @@ fn saturated_delegated_work_commits_its_next_action_without_text_only_detour() {
         true,
         true,
     ));
-    assert_eq!(
-        executing.required_terminal_tools(),
-        std::collections::BTreeSet::from(["task_submit".to_string()])
-    );
-    let mut executing_before_artifact = executing;
-    executing_before_artifact.artifact_refs.clear();
-    assert_eq!(
-        executing_before_artifact.required_terminal_tools(),
-        std::collections::BTreeSet::from(["artifact_commit".to_string()])
-    );
     assert!(!pending_delegated_action_is_ready(None, true, true));
+}
+
+#[test]
+fn active_delegated_protocol_exposes_only_its_irreducible_closure_action() {
+    let state = |mode: &str, artifact_refs: Vec<String>| DelegatedAgenticProtocolState {
+        program_id: "program".to_string(),
+        task_id: "task".to_string(),
+        mode: mode.to_string(),
+        status: crate::AgenticTaskStatus::Claimed,
+        artifact_refs,
+        artifact_evidence_refs: Vec::new(),
+        owns_active_attempt: true,
+    };
+
+    assert_eq!(
+        state("execute", Vec::new()).closure_tool_ids(),
+        std::collections::BTreeSet::from([
+            harness_contract::agent_action::ARTIFACT_COMMIT_TOOL_ID.to_string()
+        ])
+    );
+    assert_eq!(
+        state("execute", vec!["artifact:ready".to_string()]).closure_tool_ids(),
+        std::collections::BTreeSet::from([
+            harness_contract::agent_action::TASK_SUBMIT_TOOL_ID.to_string()
+        ])
+    );
+    assert_eq!(
+        state("review", vec!["artifact:submitted".to_string()]).closure_tool_ids(),
+        std::collections::BTreeSet::from([
+            harness_contract::agent_action::TASK_REVIEW_TOOL_ID.to_string()
+        ])
+    );
 }
 
 #[test]
@@ -704,13 +855,6 @@ async fn delegated_review_is_pending_only_until_its_durable_verdict() {
     assert!(!pending.is_terminal());
     assert_eq!(pending.artifact_refs, vec![artifact_ref]);
     assert_eq!(pending.artifact_evidence_refs, vec![content_ref.clone()]);
-    assert_eq!(
-        pending.required_terminal_tools(),
-        std::collections::BTreeSet::from([
-            "evidence_retrieve".to_string(),
-            harness_contract::agent_action::TASK_REVIEW_TOOL_ID.to_string(),
-        ])
-    );
 
     fixture
         .services

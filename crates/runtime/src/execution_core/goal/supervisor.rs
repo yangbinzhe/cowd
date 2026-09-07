@@ -103,6 +103,7 @@ impl ObjectiveSupervisor {
         durable_evidence.dedup();
         let criteria_need_update = goal.criteria.iter().any(|criterion| {
             criterion.status == harness_contract::goal::AcceptanceStatus::Open
+                && !criterion.required_evidence.is_empty()
                 && criterion
                     .required_evidence
                     .iter()
@@ -124,6 +125,7 @@ impl ObjectiveSupervisor {
                     current.evidence_refs = durable_evidence.clone();
                     for criterion in &mut current.criteria {
                         if criterion.status == harness_contract::goal::AcceptanceStatus::Open
+                            && !criterion.required_evidence.is_empty()
                             && criterion
                                 .required_evidence
                                 .iter()
@@ -132,15 +134,10 @@ impl ObjectiveSupervisor {
                             criterion.status = harness_contract::goal::AcceptanceStatus::Satisfied;
                         }
                     }
-                    current.program_ref = current
-                        .program_ref
-                        .clone()
-                        .or_else(|| Some(goal_id.to_string()));
                     vec![
                         "obligations".to_string(),
                         "evidence_refs".to_string(),
                         "criteria".to_string(),
-                        "program_ref".to_string(),
                     ]
                 },
             )?;
@@ -203,6 +200,8 @@ mod tests {
             criteria: vec![AcceptanceCriterion {
                 id: "result".to_string(),
                 statement: "result exists".to_string(),
+                statement_ref: None,
+                source_refs: Vec::new(),
                 required_evidence: Vec::new(),
                 status: AcceptanceStatus::Satisfied,
                 waiver: None,
@@ -212,20 +211,29 @@ mod tests {
             evidence_refs: Vec::new(),
             unresolved: Vec::new(),
             blockers: Vec::new(),
+            scope: harness_contract::goal::GoalScope::Internal,
+            user_intent_criterion_id: Some("result".to_string()),
+            source_intent_ref: Some("session_message:test".to_string()),
+            execution_binding: None,
+            spec_revision: 1,
+            spec_digest: "test".to_string(),
+            review_refs: Vec::new(),
+            waiting: None,
+            participation_requirement: None,
             obligations: Vec::new(),
-            program_ref: None,
             recovery: None,
             terminal: None,
             completion: GoalCompletion::Open,
             revision: 1,
             user_sequence: 1,
+            reviews: Vec::new(),
         }
     }
 
     #[test]
     fn terminal_is_committed_only_after_required_obligation_is_satisfied() {
         let store = Arc::new(GoalStore::new(Arc::new(
-            crate::RuntimeEventStore::try_open_in_memory().expect("event store"),
+            crate::RuntimeEventStore::for_test(),
         )));
         store.create(goal()).expect("create goal");
         let supervisor = ObjectiveSupervisor::new(store.clone());
@@ -266,7 +274,7 @@ mod tests {
     #[test]
     fn direct_terminal_event_cannot_bypass_objective_obligation_verification() {
         let store = Arc::new(GoalStore::new(Arc::new(
-            crate::RuntimeEventStore::try_open_in_memory().expect("event store"),
+            crate::RuntimeEventStore::for_test(),
         )));
         let mut contract = goal();
         contract.obligations = vec![ObjectiveObligation {
@@ -299,7 +307,7 @@ mod tests {
     #[test]
     fn recovery_reservation_is_idempotent_and_budgeted() {
         let store = Arc::new(GoalStore::new(Arc::new(
-            crate::RuntimeEventStore::try_open_in_memory().expect("event store"),
+            crate::RuntimeEventStore::for_test(),
         )));
         store.create(goal()).expect("create goal");
         let first = store
@@ -367,7 +375,7 @@ mod tests {
     #[test]
     fn recovery_graph_state_is_durable_and_failure_is_terminal() {
         let store = Arc::new(GoalStore::new(Arc::new(
-            crate::RuntimeEventStore::try_open_in_memory().expect("event store"),
+            crate::RuntimeEventStore::for_test(),
         )));
         store.create(goal()).expect("create goal");
         let reserved = store
@@ -456,12 +464,14 @@ mod tests {
     #[test]
     fn program_projection_closes_the_root_execution_graph_criterion() {
         let store = Arc::new(GoalStore::new(Arc::new(
-            crate::RuntimeEventStore::try_open_in_memory().expect("event store"),
+            crate::RuntimeEventStore::for_test(),
         )));
         let mut contract = goal();
         contract.criteria = vec![AcceptanceCriterion {
             id: "terminal_synthesis".to_string(),
             statement: "produce one durable terminal synthesis".to_string(),
+            statement_ref: None,
+            source_refs: Vec::new(),
             required_evidence: vec!["execution_graph:graph-1".to_string()],
             status: AcceptanceStatus::Open,
             waiver: None,

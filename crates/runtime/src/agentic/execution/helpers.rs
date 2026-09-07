@@ -100,8 +100,13 @@ pub(super) fn eligible_members<'a>(
             // trusted physical grant or an exact-string scheduling fence.
             // Concrete effect capabilities and ToolHost availability are
             // resolved later by Runtime admission for the selected member.
-            DispatchMode::Execute => member.team_id == task.team_id,
-            DispatchMode::Review => task.claimant.as_deref() != Some(member.agent_id.as_str()),
+            DispatchMode::Execute => projection.agent_is_active_in(&member.agent_id, &task.team_id),
+            DispatchMode::Review => {
+                task.claimant.as_deref() != Some(member.agent_id.as_str())
+                    && projection
+                        .dispatch_team_id_for(&member.agent_id, task, true)
+                        .is_some()
+            }
         })
         .collect()
 }
@@ -114,7 +119,10 @@ pub(super) fn member_dispatch_rank(
 ) -> (u8, usize, Reverse<usize>, String) {
     // Independence is a semantic topology fact; role labels are presentation
     // authored by the model and must never act as a hidden scheduler policy.
-    let preferred_reviewer = mode == DispatchMode::Review && member.team_id != task.team_id;
+    let preferred_reviewer = mode == DispatchMode::Review
+        && projection
+            .dispatch_team_id_for(&member.agent_id, task, true)
+            .is_some_and(|team_id| team_id != task.team_id);
     let active_execution_load = projection
         .tasks
         .values()
@@ -123,10 +131,18 @@ pub(super) fn member_dispatch_rank(
                 && candidate.claimant.as_deref() == Some(member.agent_id.as_str())
         })
         .count();
-    let member_terms = semantic_terms(&format!("{} {}", member.role, member.mission));
-    let task_terms = semantic_terms(&format!(
+    let member_terms = semantic_terms(&format!(
         "{} {} {}",
-        task.title, task.objective, task.acceptance
+        member.role,
+        member.mission,
+        member.expertise_hints.join(" "),
+    ));
+    let task_terms = semantic_terms(&format!(
+        "{} {} {} {}",
+        task.title,
+        task.objective,
+        task.acceptance,
+        task.expertise_hints.join(" "),
     ));
     let semantic_relevance = member_terms.intersection(&task_terms).count();
     let digest = Sha256::digest(

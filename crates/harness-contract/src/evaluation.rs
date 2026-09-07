@@ -225,6 +225,22 @@ pub struct EvaluationScenarioSpec {
     pub resource_scopes: Vec<String>,
     pub permission_ceiling: PermissionMode,
     pub model_lease: String,
+    /// Immutable input/environment identity for an EpisodeSet comparison.
+    /// Historical outcomes are deliberately absent: both sides are executed
+    /// again and measured by the normal evaluator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_manifest: Option<FrozenEvaluationReplayManifest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenEvaluationReplayManifest {
+    pub manifest_ref: String,
+    pub source_episode_set_digest: String,
+    pub input_digest: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachment_refs: Vec<String>,
+    pub environment_fingerprint: String,
+    pub rubric_digest: String,
 }
 
 /// Durable, minimized observation of a real paired scenario run. Full
@@ -287,8 +303,88 @@ impl EvaluationScenarioSpec {
                 }
             }
         }
+        if let Some(replay) = &self.replay_manifest {
+            validate_reference(
+                "evaluation.scenario.replay.manifest_ref",
+                &replay.manifest_ref,
+            )?;
+            for (field, digest) in [
+                (
+                    "source_episode_set_digest",
+                    &replay.source_episode_set_digest,
+                ),
+                ("input_digest", &replay.input_digest),
+                ("environment_fingerprint", &replay.environment_fingerprint),
+                ("rubric_digest", &replay.rubric_digest),
+            ] {
+                validate_prefixed_digest(&format!("evaluation.scenario.replay.{field}"), digest)?;
+            }
+            let expected_input = stable_digest(&self.objective);
+            let expected_rubric = stable_digest(&self.acceptance);
+            if replay.input_digest != expected_input || replay.rubric_digest != expected_rubric {
+                return Err(ValidationError::InvalidContract {
+                    message: "frozen evaluation replay does not bind the scenario input and rubric"
+                        .to_string(),
+                });
+            }
+            let mut attachments = BTreeSet::new();
+            for reference in &replay.attachment_refs {
+                validate_reference("evaluation.scenario.replay.attachment_refs", reference)?;
+                if !attachments.insert(reference) {
+                    return Err(ValidationError::DuplicateValue {
+                        field: "evaluation.scenario.replay.attachment_refs".to_string(),
+                        value: reference.clone(),
+                    });
+                }
+            }
+        }
         Ok(())
     }
+
+    /// Digest of every execution-relevant field. EpisodeSet stores this value
+    /// when the candidate is registered, preventing later scenario assets
+    /// from silently changing tools, Skills, model, permissions or inputs.
+    #[must_use]
+    pub fn executable_replay_digest(&self) -> String {
+        stable_digest(&(
+            &self.scenario_ref,
+            &self.objective,
+            &self.acceptance,
+            &self.allowed_tools,
+            &self.allowed_skills,
+            &self.resource_scopes,
+            &self.permission_ceiling,
+            &self.model_lease,
+            &self.replay_manifest,
+        ))
+    }
+}
+
+fn stable_digest(value: &impl Serialize) -> String {
+    let bytes = serde_json::to_vec(value).unwrap_or_default();
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn validate_prefixed_digest(field: &str, value: &str) -> Result<(), ValidationError> {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return Err(ValidationError::InvalidReference {
+            field: field.to_string(),
+            value: value.to_string(),
+            reason: "must be a sha256:-prefixed lowercase digest".to_string(),
+        });
+    };
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(ValidationError::InvalidReference {
+            field: field.to_string(),
+            value: value.to_string(),
+            reason: "must be a sha256:-prefixed lowercase digest".to_string(),
+        });
+    }
+    Ok(())
 }
 
 impl EvaluationStoppingRule {
@@ -627,5 +723,48 @@ impl EvaluationContract {
                         .any(|candidate| candidate == scenario)
                 })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn replay_scenario() -> EvaluationScenarioSpec {
+        let objective = "inspect the frozen fixture".to_string();
+        let acceptance = vec!["report observed result".to_string()];
+        EvaluationScenarioSpec {
+            scenario_ref: "scenario:episode-replay".to_string(),
+            objective: objective.clone(),
+            acceptance: acceptance.clone(),
+            allowed_tools: vec!["read_file".to_string()],
+            allowed_skills: vec!["skill:analysis".to_string()],
+            resource_scopes: vec!["read:fixtures/input".to_string()],
+            permission_ceiling: PermissionMode::WorkspaceWrite,
+            model_lease: "model:test".to_string(),
+            replay_manifest: Some(FrozenEvaluationReplayManifest {
+                manifest_ref: "replay:episode-set:v1".to_string(),
+                source_episode_set_digest: stable_digest(&"episodes"),
+                input_digest: stable_digest(&objective),
+                attachment_refs: vec!["artifact:fixture".to_string()],
+                environment_fingerprint: stable_digest(&"environment"),
+                rubric_digest: stable_digest(&acceptance),
+            }),
+        }
+    }
+
+    #[test]
+    fn frozen_replay_binds_input_rubric_and_execution_conditions() {
+        let scenario = replay_scenario();
+        scenario.validate().expect("valid frozen replay");
+        let original = scenario.executable_replay_digest();
+
+        let mut changed = scenario.clone();
+        changed.allowed_skills.push("skill:review".to_string());
+        assert_ne!(changed.executable_replay_digest(), original);
+
+        let mut forged = scenario;
+        forged.objective.push_str(" with changed input");
+        assert!(forged.validate().is_err());
     }
 }

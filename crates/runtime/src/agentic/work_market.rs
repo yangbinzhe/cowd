@@ -1,9 +1,13 @@
 use harness_contract::agent_action::{
-    AgentActionEnvelope, AgentAttemptMode, TaskAttemptFailInput, TaskClaimInput, TaskPublishInput,
-    TaskReleaseInput, TaskReviewDecision, TaskReviewInput, TaskSubmitInput, TaskSupersedeInput,
+    AgentActionEnvelope, AgentAttemptMode, TaskAttemptDispatchInput, TaskAttemptFailInput,
+    TaskClaimInput, TaskPublishInput, TaskReleaseInput, TaskReviewDecision, TaskReviewInput,
+    TaskSubmitInput, TaskSupersedeInput, TaskWithdrawInput,
 };
 
-use super::program::{AgenticProgramProjection, AgenticTaskProjection, AgenticTaskStatus};
+use super::program::{
+    AgenticProgramProjection, AgenticTaskAttemptProjection, AgenticTaskProjection,
+    AgenticTaskRetirement, AgenticTaskStatus,
+};
 
 // Claims use a short rolling fence. Runtime renews the fence while the
 // corresponding physical Agent graph is active; after a crash the absence of
@@ -29,6 +33,10 @@ pub(crate) fn apply_task_publish(
             objective: input.objective.trim().to_string(),
             acceptance: input.acceptance.trim().to_string(),
             required_capabilities: input.required_capabilities.clone(),
+            obligation_refs: input.obligation_refs.clone(),
+            purpose: input.purpose,
+            execution_requirements: input.execution_requirements.clone(),
+            expertise_hints: input.expertise_hints.clone(),
             depends_on: input.depends_on.clone(),
             status: AgenticTaskStatus::Published,
             claimant: None,
@@ -36,6 +44,7 @@ pub(crate) fn apply_task_publish(
             claim_execution_id: None,
             claimed_at_ms: None,
             lease_expires_at_ms: None,
+            active_attempts: Default::default(),
             artifact_refs: Vec::new(),
             evidence_refs: Vec::new(),
             unresolved: Vec::new(),
@@ -49,6 +58,10 @@ pub(crate) fn apply_task_publish(
             supersede_evidence_refs: Vec::new(),
             superseded_reason: None,
             superseded_by: None,
+            cancel_requested_by: None,
+            cancel_reason_ref: None,
+            cancel_evidence_refs: Vec::new(),
+            pending_retirement: None,
         },
     );
     if let Some(team) = projection.teams.get_mut(&input.team_ref) {
@@ -56,11 +69,51 @@ pub(crate) fn apply_task_publish(
     }
 }
 
+/// Persist executor admission before a physical graph is started.  This is
+/// an effect-outbox record, not a model claim: the Agent still decides whether
+/// to claim, submit, review, release, or replan when it runs.
+pub(crate) fn apply_task_attempt_dispatch(
+    projection: &mut AgenticProgramProjection,
+    input: &TaskAttemptDispatchInput,
+) {
+    let Some(task) = projection.tasks.get_mut(&input.task_ref) else {
+        return;
+    };
+    task.active_attempts.insert(
+        input.execution_id.clone(),
+        AgenticTaskAttemptProjection {
+            execution_id: input.execution_id.clone(),
+            agent_id: input.agent_ref.clone(),
+            membership_id: input.membership_id.clone(),
+            mode: input.mode,
+            generation: input.generation,
+        },
+    );
+}
+
 pub(crate) fn apply_task_attempt_fail(
     projection: &mut AgenticProgramProjection,
     input: &TaskAttemptFailInput,
 ) {
     if let Some(task) = projection.tasks.get_mut(&input.task_ref) {
+        task.active_attempts.remove(&input.execution_id);
+        if task.status == AgenticTaskStatus::CancelRequested {
+            if task.active_attempts.is_empty() {
+                finalize_pending_retirement(task);
+            }
+            return;
+        }
+        // Retries are controlled by evidence of progress, not an arbitrary
+        // attempt counter.  A second identical durable failure has supplied
+        // no new fact or strategy, so re-dispatching it would spend provider
+        // capacity in a loop.  Keep the Task visibly blocked for an Agent to
+        // replan/supersede; a materially different failure can receive one
+        // new runtime retry opportunity.
+        let repeats_same_failure = input.retryable
+            && task
+                .last_failure
+                .as_deref()
+                .is_some_and(|previous| previous == input.reason);
         task.last_failure = Some(input.reason.clone());
         match input.mode {
             AgentAttemptMode::Execute => {
@@ -69,24 +122,26 @@ pub(crate) fn apply_task_attempt_fail(
                 task.claim_execution_id = None;
                 task.claimed_at_ms = None;
                 task.lease_expires_at_ms = None;
-                task.status = if input.retryable && task.failed_attempts < 3 {
+                task.status = if input.retryable && !repeats_same_failure {
                     AgenticTaskStatus::Rework
+                } else if input.retryable {
+                    AgenticTaskStatus::Blocked
                 } else {
-                    // Exhausting the automatic retry window is a scheduling
-                    // checkpoint, not a business terminal. Returning the work
-                    // to Published lets the root change the assignee, split
-                    // the work or publish replacement work without making one
-                    // provider/tool failure permanently Block the Program.
+                    // A non-retryable physical failure is a scheduling
+                    // checkpoint, not a business terminal. Returning the
+                    // work to Published lets the root change the assignee,
+                    // split the work or publish replacement work.
                     AgenticTaskStatus::Published
                 };
             }
             AgentAttemptMode::Review => {
                 task.failed_review_attempts = task.failed_review_attempts.saturating_add(1);
                 task.review_generation = task.review_generation.saturating_add(1);
-                task.status = if input.retryable && task.failed_review_attempts < 3 {
+                task.status = if input.retryable && !repeats_same_failure {
                     AgenticTaskStatus::Submitted
+                } else if input.retryable {
+                    AgenticTaskStatus::Blocked
                 } else {
-                    // Stop automatic review redispatch at the retry boundary.
                     // The root can invite a new reviewer or replan the work;
                     // only ObjectiveSupervisor may create a business terminal.
                     AgenticTaskStatus::Published
@@ -131,9 +186,19 @@ pub(crate) fn apply_task_claim(
 
 pub(crate) fn apply_task_release(
     projection: &mut AgenticProgramProjection,
+    envelope: &AgentActionEnvelope,
     input: &TaskReleaseInput,
 ) {
     if let Some(task) = projection.tasks.get_mut(&input.task_ref) {
+        if let Some(execution_id) = envelope.actor.execution_id.as_deref() {
+            task.active_attempts.remove(execution_id);
+        }
+        if task.status == AgenticTaskStatus::CancelRequested {
+            if task.active_attempts.is_empty() {
+                finalize_pending_retirement(task);
+            }
+            return;
+        }
         task.status = AgenticTaskStatus::Published;
         task.claimant = None;
         task.claim_execution_id = None;
@@ -148,11 +213,16 @@ pub(crate) fn apply_task_supersede(
     input: &TaskSupersedeInput,
 ) {
     if let Some(task) = projection.tasks.get_mut(&input.task_ref) {
-        task.status = AgenticTaskStatus::Superseded;
-        task.claimant = None;
-        task.claim_execution_id = None;
-        task.claimed_at_ms = None;
-        task.lease_expires_at_ms = None;
+        if task.status == AgenticTaskStatus::Claimed || !task.active_attempts.is_empty() {
+            task.claim_generation = task.claim_generation.saturating_add(1);
+            task.status = AgenticTaskStatus::CancelRequested;
+            task.pending_retirement = Some(AgenticTaskRetirement::Superseded);
+            task.cancel_requested_by = Some(envelope.actor.actor_id.clone());
+            task.cancel_reason_ref = None;
+            task.cancel_evidence_refs.clone_from(&input.evidence_refs);
+        } else {
+            task.status = AgenticTaskStatus::Superseded;
+        }
         task.replacement_task_refs
             .clone_from(&input.replacement_task_refs);
         task.supersede_evidence_refs
@@ -160,6 +230,51 @@ pub(crate) fn apply_task_supersede(
         task.superseded_reason = Some(input.reason.clone());
         task.superseded_by = Some(envelope.actor.actor_id.clone());
     }
+}
+
+/// Withdrawal preserves the Task and all downstream dependency diagnostics.
+/// It never converts removal into a successful dependency result.
+pub(crate) fn apply_task_withdraw(
+    projection: &mut AgenticProgramProjection,
+    envelope: &AgentActionEnvelope,
+    input: &TaskWithdrawInput,
+) {
+    if let Some(task) = projection.tasks.get_mut(&input.task_ref) {
+        if task.status == AgenticTaskStatus::Claimed || !task.active_attempts.is_empty() {
+            task.claim_generation = task.claim_generation.saturating_add(1);
+            task.status = AgenticTaskStatus::CancelRequested;
+            task.pending_retirement = Some(AgenticTaskRetirement::Withdrawn);
+            task.cancel_requested_by = Some(envelope.actor.actor_id.clone());
+            task.cancel_reason_ref = Some(input.reason_ref.clone());
+            task.cancel_evidence_refs.clone_from(&input.evidence_refs);
+        } else {
+            task.status = AgenticTaskStatus::Withdrawn;
+            task.claimant = None;
+            task.claim_execution_id = None;
+            task.claimed_at_ms = None;
+            task.lease_expires_at_ms = None;
+            task.last_failure = Some(format!("withdrawn: {}", input.reason_ref));
+            task.cancel_evidence_refs.clone_from(&input.evidence_refs);
+            task.cancel_requested_by = Some(envelope.actor.actor_id.clone());
+            task.cancel_reason_ref = Some(input.reason_ref.clone());
+        }
+    }
+}
+
+fn finalize_pending_retirement(task: &mut AgenticTaskProjection) {
+    if !task.active_attempts.is_empty() {
+        return;
+    }
+    let retirement = task.pending_retirement.take();
+    task.status = match retirement {
+        Some(AgenticTaskRetirement::Withdrawn) => AgenticTaskStatus::Withdrawn,
+        Some(AgenticTaskRetirement::Superseded) => AgenticTaskStatus::Superseded,
+        None => AgenticTaskStatus::Blocked,
+    };
+    task.claimant = None;
+    task.claim_execution_id = None;
+    task.claimed_at_ms = None;
+    task.lease_expires_at_ms = None;
 }
 
 /// A superseded dependency is satisfied only when every concrete successor is
@@ -236,6 +351,7 @@ pub(crate) fn task_depends_on(
 
 pub(crate) fn apply_task_submit(
     projection: &mut AgenticProgramProjection,
+    envelope: &AgentActionEnvelope,
     input: &TaskSubmitInput,
 ) {
     let mut evidence_refs = input.evidence_refs.clone();
@@ -248,6 +364,9 @@ pub(crate) fn apply_task_submit(
     evidence_refs.sort();
     evidence_refs.dedup();
     if let Some(task) = projection.tasks.get_mut(&input.task_ref) {
+        if let Some(execution_id) = envelope.actor.execution_id.as_deref() {
+            task.active_attempts.remove(execution_id);
+        }
         task.status = AgenticTaskStatus::Submitted;
         task.artifact_refs.clone_from(&input.artifact_refs);
         task.evidence_refs = evidence_refs;
@@ -261,6 +380,9 @@ pub(crate) fn apply_task_review(
     input: &TaskReviewInput,
 ) {
     if let Some(task) = projection.tasks.get_mut(&input.task_ref) {
+        if let Some(execution_id) = envelope.actor.execution_id.as_deref() {
+            task.active_attempts.remove(execution_id);
+        }
         task.reviewed_by = Some(envelope.actor.actor_id.clone());
         task.review_reason = Some(input.reason.clone());
         task.evidence_refs
@@ -283,7 +405,8 @@ pub(crate) fn apply_task_review(
 #[cfg(test)]
 mod tests {
     use harness_contract::agent_action::{
-        AgentAction, AgentActorBinding, AgentActorKind, TaskClaimInput,
+        AgentAction, AgentActorBinding, AgentActorKind, AgentAttemptMode, TaskAttemptDispatchInput,
+        TaskAttemptFailInput, TaskClaimInput, TaskWithdrawInput,
     };
 
     use super::*;
@@ -335,6 +458,7 @@ mod tests {
                 claim_execution_id: None,
                 claimed_at_ms: None,
                 lease_expires_at_ms: None,
+                active_attempts: Default::default(),
                 artifact_refs: Vec::new(),
                 evidence_refs: Vec::new(),
                 unresolved: Vec::new(),
@@ -348,6 +472,14 @@ mod tests {
                 supersede_evidence_refs: Vec::new(),
                 superseded_reason: None,
                 superseded_by: None,
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
+                cancel_requested_by: None,
+                cancel_reason_ref: None,
+                cancel_evidence_refs: Vec::new(),
+                pending_retirement: None,
             },
         );
         let envelope = claim_envelope("execution");
@@ -383,6 +515,7 @@ mod tests {
             claim_execution_id: None,
             claimed_at_ms: None,
             lease_expires_at_ms: None,
+            active_attempts: Default::default(),
             artifact_refs: Vec::new(),
             evidence_refs: Vec::new(),
             unresolved: Vec::new(),
@@ -396,6 +529,14 @@ mod tests {
             supersede_evidence_refs: vec!["tool://failure".to_string()],
             superseded_reason: Some("split".to_string()),
             superseded_by: Some("lead".to_string()),
+            obligation_refs: Vec::new(),
+            purpose: Default::default(),
+            execution_requirements: Vec::new(),
+            expertise_hints: Vec::new(),
+            cancel_requested_by: None,
+            cancel_reason_ref: None,
+            cancel_evidence_refs: Vec::new(),
+            pending_retirement: None,
         };
         projection.tasks.insert("source".to_string(), base.clone());
         for (id, status) in [
@@ -415,5 +556,109 @@ mod tests {
         assert!(!task_dependency_satisfied(&projection, "source"));
         projection.tasks.get_mut("part-b").expect("part b").status = AgenticTaskStatus::Accepted;
         assert!(task_dependency_satisfied(&projection, "source"));
+    }
+
+    #[test]
+    fn retirement_waits_for_every_admitted_physical_attempt_to_settle() {
+        let mut projection = AgenticProgramProjection::empty("program", "objective");
+        let task = AgenticTaskProjection {
+            task_id: "task".to_string(),
+            team_id: "team".to_string(),
+            title: "cancel safely".to_string(),
+            objective: "prove effect fencing".to_string(),
+            acceptance: "no orphaned execution".to_string(),
+            required_capabilities: Vec::new(),
+            obligation_refs: Vec::new(),
+            purpose: Default::default(),
+            execution_requirements: Vec::new(),
+            expertise_hints: Vec::new(),
+            depends_on: Vec::new(),
+            status: AgenticTaskStatus::Published,
+            claimant: None,
+            claim_generation: 0,
+            claim_execution_id: None,
+            claimed_at_ms: None,
+            lease_expires_at_ms: None,
+            active_attempts: Default::default(),
+            artifact_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            unresolved: Vec::new(),
+            review_reason: None,
+            reviewed_by: None,
+            failed_attempts: 0,
+            review_generation: 0,
+            failed_review_attempts: 0,
+            last_failure: None,
+            replacement_task_refs: Vec::new(),
+            supersede_evidence_refs: Vec::new(),
+            superseded_reason: None,
+            superseded_by: None,
+            cancel_requested_by: None,
+            cancel_reason_ref: None,
+            cancel_evidence_refs: Vec::new(),
+            pending_retirement: None,
+        };
+        projection.tasks.insert(task.task_id.clone(), task.clone());
+        for execution_id in ["execute-graph", "review-graph"] {
+            apply_task_attempt_dispatch(
+                &mut projection,
+                &TaskAttemptDispatchInput {
+                    task_ref: "task".to_string(),
+                    execution_id: execution_id.to_string(),
+                    agent_ref: "agent".to_string(),
+                    membership_id: "membership:agent:team".to_string(),
+                    mode: if execution_id == "execute-graph" {
+                        AgentAttemptMode::Execute
+                    } else {
+                        AgentAttemptMode::Review
+                    },
+                    generation: 0,
+                },
+            );
+        }
+        let withdrawal = TaskWithdrawInput {
+            task_ref: "task".to_string(),
+            reason_ref: "artifact://withdrawal-reason".to_string(),
+            evidence_refs: Vec::new(),
+        };
+        apply_task_withdraw(
+            &mut projection,
+            &claim_envelope("execute-graph"),
+            &withdrawal,
+        );
+        assert_eq!(
+            projection.tasks["task"].status,
+            AgenticTaskStatus::CancelRequested
+        );
+        apply_task_attempt_fail(
+            &mut projection,
+            &TaskAttemptFailInput {
+                task_ref: "task".to_string(),
+                execution_id: "execute-graph".to_string(),
+                mode: AgentAttemptMode::Execute,
+                reason: "cancelled".to_string(),
+                retryable: false,
+            },
+        );
+        assert_eq!(
+            projection.tasks["task"].status,
+            AgenticTaskStatus::CancelRequested
+        );
+        assert_eq!(projection.tasks["task"].active_attempts.len(), 1);
+        apply_task_attempt_fail(
+            &mut projection,
+            &TaskAttemptFailInput {
+                task_ref: "task".to_string(),
+                execution_id: "review-graph".to_string(),
+                mode: AgentAttemptMode::Review,
+                reason: "cancelled".to_string(),
+                retryable: false,
+            },
+        );
+        assert_eq!(
+            projection.tasks["task"].status,
+            AgenticTaskStatus::Withdrawn
+        );
+        assert!(projection.tasks["task"].active_attempts.is_empty());
     }
 }

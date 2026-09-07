@@ -22,6 +22,11 @@ pub const TASK_REVIEW_TOOL_ID: &str = "task_review";
 pub const MESSAGE_PUBLISH_TOOL_ID: &str = "message_publish";
 pub const ARTIFACT_COMMIT_TOOL_ID: &str = "artifact_commit";
 pub const OBJECTIVE_COMPLETE_REQUEST_TOOL_ID: &str = "objective_complete_request";
+pub const OBJECTIVE_UPDATE_TOOL_ID: &str = "objective_update";
+pub const OBJECTIVE_REVIEW_TOOL_ID: &str = "objective_review";
+pub const TASK_WITHDRAW_TOOL_ID: &str = "task_withdraw";
+pub const MEMBERSHIP_UPDATE_TOOL_ID: &str = "membership_update";
+pub const TEAM_UPDATE_TOOL_ID: &str = "team_update";
 
 pub const AGENT_ACTION_TOOL_IDS: &[&str] = &[
     STATE_INSPECT_TOOL_ID,
@@ -36,6 +41,11 @@ pub const AGENT_ACTION_TOOL_IDS: &[&str] = &[
     MESSAGE_PUBLISH_TOOL_ID,
     ARTIFACT_COMMIT_TOOL_ID,
     OBJECTIVE_COMPLETE_REQUEST_TOOL_ID,
+    OBJECTIVE_UPDATE_TOOL_ID,
+    OBJECTIVE_REVIEW_TOOL_ID,
+    TASK_WITHDRAW_TOOL_ID,
+    MEMBERSHIP_UPDATE_TOOL_ID,
+    TEAM_UPDATE_TOOL_ID,
 ];
 
 /// Stable Objective identity for one conversational turn. The trusted host
@@ -60,6 +70,10 @@ pub struct StateInspectInput {
     pub scope_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -84,6 +98,31 @@ pub struct AgentInviteInput {
     /// into a concrete Agent definition and least-privilege tool grant.
     #[serde(default)]
     pub required_capabilities: Vec<String>,
+    /// Existing configured identity to attach to this Program. Runtime still
+    /// creates a distinct membership/run scope, never a second hidden Agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub existing_agent_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_profile_ref: Option<String>,
+    #[serde(default)]
+    pub expertise_hints: Vec<String>,
+    #[serde(default)]
+    pub execution_requirements: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPurpose {
+    Delivery,
+    Exploration,
+}
+
+impl Default for TaskPurpose {
+    fn default() -> Self {
+        Self::Delivery
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -101,6 +140,14 @@ pub struct TaskPublishInput {
     pub required_capabilities: Vec<String>,
     #[serde(default)]
     pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub obligation_refs: Vec<String>,
+    #[serde(default)]
+    pub purpose: TaskPurpose,
+    #[serde(default)]
+    pub execution_requirements: Vec<String>,
+    #[serde(default)]
+    pub expertise_hints: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -131,6 +178,17 @@ pub struct TaskSupersedeInput {
     pub evidence_refs: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TaskWithdrawInput {
+    pub task_ref: String,
+    /// Durable explanation of the withdrawal.  A free-form string here used
+    /// to let a model claim a plan change without a readable record.
+    pub reason_ref: String,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+}
+
 /// Runtime-only result of a physical Agent attempt. It uses the same durable
 /// Program journal but is intentionally not registered as a model tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -148,6 +206,21 @@ pub struct TaskAttemptFailInput {
     pub mode: AgentAttemptMode,
     pub reason: String,
     pub retryable: bool,
+}
+
+/// Runtime-only admission record for one physical Agent graph. This closes
+/// the interval between executor admission and the Agent's first semantic
+/// action, so cancellation and recovery can always find the exact effect.
+/// It is not exposed as a model tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TaskAttemptDispatchInput {
+    pub task_ref: String,
+    pub execution_id: String,
+    pub agent_ref: String,
+    pub membership_id: String,
+    pub mode: AgentAttemptMode,
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -201,6 +274,102 @@ pub struct MessagePublishInput {
     pub content_ref: Option<String>,
     #[serde(default)]
     pub refs: Vec<String>,
+    #[serde(default)]
+    pub recipients: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<TaskIntent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskIntentKind {
+    Offer,
+    Decline,
+    RequestHelp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TaskIntent {
+    pub task_ref: String,
+    pub kind: TaskIntentKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_ref: Option<String>,
+    #[serde(default)]
+    pub requested_capability_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectiveUpdateOperation {
+    Add,
+    Replace,
+    Retire,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectiveUpdateInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub criterion_ref: Option<String>,
+    pub operation: ObjectiveUpdateOperation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statement_ref: Option<String>,
+    #[serde(default)]
+    pub source_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_ref: Option<String>,
+    #[serde(default)]
+    pub evidence_requirements: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectiveReviewDecision {
+    Satisfied,
+    Gap,
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectiveReviewInput {
+    pub criterion_ref: String,
+    pub decision: ObjectiveReviewDecision,
+    #[serde(default)]
+    pub result_refs: Vec<String>,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    pub reason_ref: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MembershipOperation {
+    Join,
+    Leave,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MembershipUpdateInput {
+    pub agent_ref: String,
+    pub team_ref: String,
+    pub operation: MembershipOperation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TeamUpdateInput {
+    pub team_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_ref: Option<String>,
+    #[serde(default)]
+    pub request_retire: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -222,7 +391,11 @@ pub struct ArtifactCommitInput {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectiveCompleteRequestInput {
-    pub final_artifact_ref: String,
+    /// Result references are typed by their durable selector prefix. Runtime
+    /// may derive a display artifact, but a report artifact is not mandatory
+    /// for effects, structured data, or a user decision.
+    #[serde(default)]
+    pub result_refs: Vec<String>,
     #[serde(default)]
     pub evidence_refs: Vec<String>,
     /// Objective-level delivery blockers only. Accepted Task disclosures stay
@@ -286,11 +459,17 @@ pub enum AgentAction {
     TaskClaim(TaskClaimInput),
     TaskRelease(TaskReleaseInput),
     TaskSupersede(TaskSupersedeInput),
+    TaskWithdraw(TaskWithdrawInput),
+    TaskAttemptDispatch(TaskAttemptDispatchInput),
     TaskAttemptFail(TaskAttemptFailInput),
     TaskSubmit(TaskSubmitInput),
     TaskReview(TaskReviewInput),
     MessagePublish(MessagePublishInput),
     ArtifactCommit(ArtifactCommitInput),
+    ObjectiveUpdate(ObjectiveUpdateInput),
+    ObjectiveReview(ObjectiveReviewInput),
+    MembershipUpdate(MembershipUpdateInput),
+    TeamUpdate(TeamUpdateInput),
     ObjectiveCompleteRequest(ObjectiveCompleteRequestInput),
 }
 
@@ -305,11 +484,17 @@ impl AgentAction {
             Self::TaskClaim(_) => TASK_CLAIM_TOOL_ID,
             Self::TaskRelease(_) => TASK_RELEASE_TOOL_ID,
             Self::TaskSupersede(_) => TASK_SUPERSEDE_TOOL_ID,
+            Self::TaskWithdraw(_) => TASK_WITHDRAW_TOOL_ID,
+            Self::TaskAttemptDispatch(_) => "task_attempt_dispatch_internal",
             Self::TaskAttemptFail(_) => "task_attempt_fail_internal",
             Self::TaskSubmit(_) => TASK_SUBMIT_TOOL_ID,
             Self::TaskReview(_) => TASK_REVIEW_TOOL_ID,
             Self::MessagePublish(_) => MESSAGE_PUBLISH_TOOL_ID,
             Self::ArtifactCommit(_) => ARTIFACT_COMMIT_TOOL_ID,
+            Self::ObjectiveUpdate(_) => OBJECTIVE_UPDATE_TOOL_ID,
+            Self::ObjectiveReview(_) => OBJECTIVE_REVIEW_TOOL_ID,
+            Self::MembershipUpdate(_) => MEMBERSHIP_UPDATE_TOOL_ID,
+            Self::TeamUpdate(_) => TEAM_UPDATE_TOOL_ID,
             Self::ObjectiveCompleteRequest(_) => OBJECTIVE_COMPLETE_REQUEST_TOOL_ID,
         }
     }
@@ -317,8 +502,23 @@ impl AgentAction {
     pub fn validate(&self) -> Result<(), AgentActionValidationError> {
         match self {
             Self::StateInspect(input) => {
-                if input.scope_ref.as_deref().is_some_and(str::is_empty) {
-                    return Err(AgentActionValidationError::Empty("scope_ref"));
+                optional_nonempty("scope_ref", input.scope_ref.as_deref())?;
+                optional_nonempty("entry_ref", input.entry_ref.as_deref())?;
+                optional_nonempty("page_cursor", input.page_cursor.as_deref())?;
+                if let Some(cursor) = input.page_cursor.as_deref() {
+                    if cursor
+                        .strip_prefix("state:")
+                        .is_none_or(|offset| offset.is_empty() || offset.parse::<usize>().is_err())
+                    {
+                        return Err(AgentActionValidationError::Invalid("page_cursor"));
+                    }
+                }
+                if input.page_cursor.is_some()
+                    && (input.scope_ref.is_some() || input.entry_ref.is_some())
+                {
+                    return Err(AgentActionValidationError::Invalid(
+                        "page_cursor_with_exact_ref",
+                    ));
                 }
             }
             Self::TeamCreate(input) => {
@@ -369,6 +569,17 @@ impl AgentAction {
                     ));
                 }
             }
+            Self::TaskWithdraw(input) => {
+                required("task_ref", &input.task_ref)?;
+                required("reason_ref", &input.reason_ref)?;
+                unique_nonempty("evidence_refs", &input.evidence_refs)?;
+            }
+            Self::TaskAttemptDispatch(input) => {
+                required("task_ref", &input.task_ref)?;
+                required("execution_id", &input.execution_id)?;
+                required("agent_ref", &input.agent_ref)?;
+                required("membership_id", &input.membership_id)?;
+            }
             Self::TaskAttemptFail(input) => {
                 required("task_ref", &input.task_ref)?;
                 required("execution_id", &input.execution_id)?;
@@ -398,6 +609,15 @@ impl AgentAction {
                     ));
                 }
                 unique_nonempty("refs", &input.refs)?;
+                unique_nonempty("recipients", &input.recipients)?;
+                if let Some(intent) = &input.intent {
+                    required("intent.task_ref", &intent.task_ref)?;
+                    optional_nonempty("intent.reason_ref", intent.reason_ref.as_deref())?;
+                    unique_nonempty(
+                        "intent.requested_capability_refs",
+                        &intent.requested_capability_refs,
+                    )?;
+                }
             }
             Self::ArtifactCommit(input) => {
                 required("content_ref", &input.content_ref)?;
@@ -405,8 +625,70 @@ impl AgentAction {
                 required("title", &input.title)?;
                 unique_nonempty("relates_to", &input.relates_to)?;
             }
+            Self::ObjectiveUpdate(input) => {
+                optional_nonempty("criterion_ref", input.criterion_ref.as_deref())?;
+                optional_nonempty("statement_ref", input.statement_ref.as_deref())?;
+                optional_nonempty("reason_ref", input.reason_ref.as_deref())?;
+                unique_nonempty("source_refs", &input.source_refs)?;
+                unique_nonempty("evidence_requirements", &input.evidence_requirements)?;
+                if matches!(input.operation, ObjectiveUpdateOperation::Add)
+                    && input.statement_ref.is_none()
+                {
+                    return Err(AgentActionValidationError::Missing("statement_ref"));
+                }
+                if matches!(input.operation, ObjectiveUpdateOperation::Add)
+                    && input.source_refs.is_empty()
+                {
+                    return Err(AgentActionValidationError::Missing("source_refs"));
+                }
+                if matches!(
+                    input.operation,
+                    ObjectiveUpdateOperation::Replace | ObjectiveUpdateOperation::Retire
+                ) && input.criterion_ref.is_none()
+                {
+                    return Err(AgentActionValidationError::Missing("criterion_ref"));
+                }
+                if matches!(
+                    input.operation,
+                    ObjectiveUpdateOperation::Replace | ObjectiveUpdateOperation::Retire
+                ) && input.source_refs.is_empty()
+                {
+                    return Err(AgentActionValidationError::Missing("source_refs"));
+                }
+                if matches!(
+                    input.operation,
+                    ObjectiveUpdateOperation::Replace | ObjectiveUpdateOperation::Retire
+                ) && input.reason_ref.is_none()
+                {
+                    return Err(AgentActionValidationError::Missing("reason_ref"));
+                }
+            }
+            Self::ObjectiveReview(input) => {
+                required("criterion_ref", &input.criterion_ref)?;
+                required("reason_ref", &input.reason_ref)?;
+                unique_nonempty("result_refs", &input.result_refs)?;
+                unique_nonempty("evidence_refs", &input.evidence_refs)?;
+                if input.result_refs.is_empty() && input.evidence_refs.is_empty() {
+                    return Err(AgentActionValidationError::Missing(
+                        "result_refs_or_evidence_refs",
+                    ));
+                }
+            }
+            Self::MembershipUpdate(input) => {
+                required("agent_ref", &input.agent_ref)?;
+                required("team_ref", &input.team_ref)?;
+                optional_nonempty("reason_ref", input.reason_ref.as_deref())?;
+            }
+            Self::TeamUpdate(input) => {
+                required("team_ref", &input.team_ref)?;
+                optional_nonempty("mission_ref", input.mission_ref.as_deref())?;
+                optional_nonempty("reason_ref", input.reason_ref.as_deref())?;
+            }
             Self::ObjectiveCompleteRequest(input) => {
-                required("final_artifact_ref", &input.final_artifact_ref)?;
+                if input.result_refs.is_empty() {
+                    return Err(AgentActionValidationError::Missing("result_refs"));
+                }
+                unique_nonempty("result_refs", &input.result_refs)?;
                 unique_nonempty("evidence_refs", &input.evidence_refs)?;
                 unique_nonempty("unresolved", &input.unresolved)?;
             }
@@ -496,6 +778,8 @@ pub enum AgentActionValidationError {
     Empty(&'static str),
     #[error("agent action field `{0}` contains duplicate values")]
     Duplicate(&'static str),
+    #[error("agent action field `{0}` has an invalid canonical form")]
+    Invalid(&'static str),
 }
 
 fn required(field: &'static str, value: &str) -> Result<(), AgentActionValidationError> {
@@ -568,6 +852,8 @@ mod tests {
             action: AgentAction::StateInspect(StateInspectInput {
                 scope_ref: None,
                 after_revision: None,
+                page_cursor: None,
+                entry_ref: None,
             }),
         };
         assert_eq!(
@@ -599,6 +885,11 @@ mod tests {
             role: "Domain operator".to_string(),
             mission: "use a workspace-defined capability".to_string(),
             required_capabilities: vec!["custom_domain_operation".to_string()],
+            existing_agent_ref: None,
+            definition_ref: None,
+            model_profile_ref: None,
+            expertise_hints: Vec::new(),
+            execution_requirements: Vec::new(),
         });
 
         assert_eq!(action.validate(), Ok(()));
@@ -630,5 +921,28 @@ mod tests {
             evidence_refs: vec!["tool://failure-receipt".to_string()],
         });
         assert_eq!(split.validate(), Ok(()));
+    }
+
+    #[test]
+    fn objective_scope_changes_need_evidence_and_a_reason() {
+        let mut replace = ObjectiveUpdateInput {
+            criterion_ref: Some("criterion:derived".to_string()),
+            operation: ObjectiveUpdateOperation::Replace,
+            statement_ref: Some("artifact://replacement".to_string()),
+            source_refs: Vec::new(),
+            reason_ref: None,
+            evidence_requirements: Vec::new(),
+        };
+        assert_eq!(
+            AgentAction::ObjectiveUpdate(replace.clone()).validate(),
+            Err(AgentActionValidationError::Missing("source_refs"))
+        );
+        replace.source_refs = vec!["tool://scope-change-evidence".to_string()];
+        assert_eq!(
+            AgentAction::ObjectiveUpdate(replace.clone()).validate(),
+            Err(AgentActionValidationError::Missing("reason_ref"))
+        );
+        replace.reason_ref = Some("artifact://scope-change-rationale".to_string());
+        assert_eq!(AgentAction::ObjectiveUpdate(replace).validate(), Ok(()));
     }
 }

@@ -411,15 +411,6 @@ fn agent_team_modules() -> Vec<RuntimeModuleDescriptor> {
             &[projector("agent.evaluation", "runtime.agent.execution")],
         ),
         RuntimeModuleDescriptor::public(
-            "collaboration_template",
-            Agent,
-            "runtime",
-            &[adapter(
-                "agent.collaboration.template",
-                "runtime.agent.definition",
-            )],
-        ),
-        RuntimeModuleDescriptor::public(
             "definition_registry",
             Agent,
             "runtime",

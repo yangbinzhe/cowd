@@ -1,4 +1,4 @@
-//! Tool output sandbox — derived in-memory FTS5 index over tool evidence.
+//! Tool output sandbox — derived process-local index over tool evidence.
 //!
 //! This index is never the lifecycle truth. Durable chunks carry a canonical
 //! evidence reference from the session ledger; a failed durable write may
@@ -8,7 +8,6 @@
 //!
 //! Inspired by context-mode's "batch→index→search→inject" pipeline.
 
-use rusqlite::{params, Connection};
 use std::collections::HashMap;
 
 use crate::types::CanonicalRawEvidence;
@@ -50,24 +49,21 @@ pub struct ToolOutputSummary {
 /// Each [`ConversationRuntime`] instance owns one sandbox. Indexed outputs
 /// are automatically discarded when the runtime is dropped.
 pub struct ToolOutputSandbox {
-    conn: Connection,
+    chunks: parking_lot::Mutex<Vec<IndexedChunk>>,
+}
+
+#[derive(Debug, Clone)]
+struct IndexedChunk {
+    call_id: String,
+    snippet: SearchSnippet,
 }
 
 impl ToolOutputSandbox {
-    /// Create a new sandbox with an in-memory SQLite connection and an FTS5
-    /// virtual table.
-    ///
-    /// # Errors
-    ///
-    /// Returns `rusqlite::Error` if the connection or table creation fails.
-    pub fn new() -> rusqlite::Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        conn.execute_batch(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS tool_output_fts \
-             USING fts5(call_id, evidence_ref UNINDEXED, content_hash UNINDEXED, \
-                        line_range, content, tokenize='porter unicode61');",
-        )?;
-        Ok(Self { conn })
+    /// Create an isolated, process-local derived index.
+    pub fn new() -> Result<Self, std::convert::Infallible> {
+        Ok(Self {
+            chunks: parking_lot::Mutex::new(Vec::new()),
+        })
     }
 
     /// Index a tool output.
@@ -153,37 +149,33 @@ impl ToolOutputSandbox {
         let total_lines = lines.len();
         let full_size_bytes = output.len();
 
-        // Chunk by 50 lines and insert into FTS5.
+        // Chunk by 50 lines and insert into the derived index.
         let chunk_size = 50;
-        if let Ok(tx) = self.conn.transaction() {
-            if total_lines < threshold_min_lines {
-                let chars = output.chars().collect::<Vec<_>>();
-                for (chunk_index, chunk) in chars.chunks(8_000).enumerate() {
-                    let chunk_content = chunk.iter().collect::<String>();
-                    let line_range = format!(
-                        "C{}-C{}",
-                        chunk_index * 8_000,
-                        (chunk_index * 8_000) + chunk.len()
-                    );
-                    let _ = tx.execute(
-                        "INSERT INTO tool_output_fts(call_id, evidence_ref, content_hash, line_range, content) \
-                         VALUES (?1, ?2, ?3, ?4, ?5)",
-                        params![tool_call_id, evidence_ref, content_hash, line_range, chunk_content],
-                    );
-                }
-            } else {
-                for chunk_start in (0..total_lines).step_by(chunk_size) {
-                    let chunk_end = (chunk_start + chunk_size).min(total_lines);
-                    let chunk_content: String = lines[chunk_start..chunk_end].join("\n");
-                    let line_range = format!("L{}-L{}", chunk_start + 1, chunk_end);
-                    let _ = tx.execute(
-                        "INSERT INTO tool_output_fts(call_id, evidence_ref, content_hash, line_range, content) \
-                         VALUES (?1, ?2, ?3, ?4, ?5)",
-                        params![tool_call_id, evidence_ref, content_hash, line_range, chunk_content],
-                    );
-                }
+        let mut indexed = self.chunks.lock();
+        if total_lines < threshold_min_lines {
+            let chars = output.chars().collect::<Vec<_>>();
+            for (chunk_index, chunk) in chars.chunks(8_000).enumerate() {
+                indexed.push(indexed_chunk(
+                    tool_call_id,
+                    evidence_ref,
+                    content_hash,
+                    chunk_index * 8_000,
+                    (chunk_index * 8_000) + chunk.len(),
+                    chunk.iter().collect(),
+                ));
             }
-            let _ = tx.commit();
+        } else {
+            for chunk_start in (0..total_lines).step_by(chunk_size) {
+                let chunk_end = (chunk_start + chunk_size).min(total_lines);
+                indexed.push(indexed_chunk(
+                    tool_call_id,
+                    evidence_ref,
+                    content_hash,
+                    chunk_start + 1,
+                    chunk_end,
+                    lines[chunk_start..chunk_end].join("\n"),
+                ));
+            }
         }
 
         // Extract keyword highlights (top 10 by frequency).
@@ -213,154 +205,105 @@ impl ToolOutputSandbox {
     /// Returns up to `limit` [`SearchSnippet`]s ordered by FTS5 relevance.
     #[must_use]
     pub fn search(&self, tool_call_id: &str, query: &str, limit: usize) -> Vec<SearchSnippet> {
-        let sql = "SELECT evidence_ref, content_hash, line_range, content FROM tool_output_fts \
-                   WHERE call_id = ?1 AND content MATCH ?2 \
-                   LIMIT ?3";
-        let mut stmt = match self.conn.prepare(sql) {
-            Ok(s) => s,
-            Err(_) => return vec![],
-        };
-
-        let rows = stmt.query_map(params![tool_call_id, query, limit as i64], |row| {
-            let evidence_ref: String = row.get(0)?;
-            let content_hash: String = row.get(1)?;
-            let line_range: String = row.get(2)?;
-            let content: String = row.get(3)?;
-            let (start, end) = parse_range(&line_range);
-            Ok(SearchSnippet {
-                evidence_ref,
-                content_hash,
-                line_start: start,
-                line_end: end,
-                content,
-            })
-        });
-
-        match rows {
-            Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
-            Err(_) => vec![],
-        }
+        search_chunks(&self.chunks.lock(), Some(tool_call_id), query, limit)
     }
 
     /// Read the first indexed chunks for an evidence reference without an FTS query.
     #[must_use]
     pub fn read(&self, tool_call_id: &str, limit: usize) -> Vec<SearchSnippet> {
-        let mut stmt = match self.conn.prepare(
-            "SELECT evidence_ref, content_hash, line_range, content FROM tool_output_fts \
-             WHERE call_id = ?1 ORDER BY rowid LIMIT ?2",
-        ) {
-            Ok(statement) => statement,
-            Err(_) => return vec![],
-        };
-        let rows = stmt.query_map(params![tool_call_id, limit as i64], |row| {
-            let evidence_ref: String = row.get(0)?;
-            let content_hash: String = row.get(1)?;
-            let range: String = row.get(2)?;
-            let content: String = row.get(3)?;
-            let (line_start, line_end) = parse_range(&range);
-            Ok(SearchSnippet {
-                evidence_ref,
-                content_hash,
-                line_start,
-                line_end,
-                content,
-            })
-        });
-        rows.map(|mapped| mapped.filter_map(Result::ok).collect())
-            .unwrap_or_default()
+        self.chunks
+            .lock()
+            .iter()
+            .filter(|chunk| chunk.call_id == tool_call_id)
+            .take(limit)
+            .map(|chunk| chunk.snippet.clone())
+            .collect()
     }
 
     /// Search across ALL indexed tool outputs (not restricted to a specific call_id).
     /// Returns matching snippets ordered by FTS5 relevance.
     #[must_use]
     pub fn search_all(&self, query: &str, limit: usize) -> Vec<SearchSnippet> {
-        let sql = "SELECT evidence_ref, content_hash, line_range, content FROM tool_output_fts \
-                   WHERE content MATCH ?1 \
-                   LIMIT ?2";
-        let mut stmt = match self.conn.prepare(sql) {
-            Ok(s) => s,
-            Err(_) => return vec![],
-        };
-        let rows = stmt.query_map(params![query, limit as i64], |row| {
-            let evidence_ref: String = row.get(0)?;
-            let content_hash: String = row.get(1)?;
-            let line_range: String = row.get(2)?;
-            let content: String = row.get(3)?;
-            let (start, end) = parse_range(&line_range);
-            Ok(SearchSnippet {
-                evidence_ref,
-                content_hash,
-                line_start: start,
-                line_end: end,
-                content,
-            })
-        });
-        match rows {
-            Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
-            Err(_) => vec![],
-        }
+        search_chunks(&self.chunks.lock(), None, query, limit)
     }
 
     /// Return total count of indexed tool output entries.
     #[must_use]
     pub fn entry_count(&self) -> usize {
-        self.conn
-            .query_row("SELECT count(*) FROM tool_output_fts", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .map(|n| n as usize)
-            .unwrap_or(0)
+        self.chunks.lock().len()
     }
 
     /// Remove all indexed entries for the given tool call ID.
     pub fn clear(&self, tool_call_id: &str) {
-        let _ = self.conn.execute(
-            "DELETE FROM tool_output_fts WHERE call_id = ?1",
-            params![tool_call_id],
-        );
+        self.chunks
+            .lock()
+            .retain(|chunk| chunk.call_id != tool_call_id);
     }
 
     /// Remove all indexed entries (reset the sandbox).
     pub fn clear_all(&self) {
-        let _ = self.conn.execute("DELETE FROM tool_output_fts", []);
+        self.chunks.lock().clear();
     }
 
     /// Delete oldest entries when count exceeds limit (LRU).
     pub fn clear_oldest(&self, max_entries: usize) {
-        let count: i64 = self
-            .conn
-            .query_row(
-                "SELECT COUNT(DISTINCT call_id) FROM tool_output_fts",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        if count as usize > max_entries {
-            let excess = count as usize - max_entries;
-            let _ = self.conn.execute(
-                "DELETE FROM tool_output_fts WHERE call_id IN (SELECT call_id FROM tool_output_fts GROUP BY call_id ORDER BY MIN(rowid) LIMIT ?1)",
-                rusqlite::params![excess as i64],
-            );
+        let mut chunks = self.chunks.lock();
+        let mut call_ids = Vec::new();
+        for chunk in chunks.iter() {
+            if !call_ids.contains(&chunk.call_id) {
+                call_ids.push(chunk.call_id.clone());
+            }
+        }
+        if call_ids.len() > max_entries {
+            let remove = &call_ids[..call_ids.len() - max_entries];
+            chunks.retain(|chunk| !remove.contains(&chunk.call_id));
         }
     }
 }
 
-fn parse_range(range: &str) -> (usize, usize) {
-    let normalized = range
-        .trim_start_matches('L')
-        .trim_start_matches('C')
-        .replace("-L", "-")
-        .replace("-C", "-");
-    let mut parts = normalized.split('-');
-    let start = parts
-        .next()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0);
-    let end = parts
-        .next()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(start);
-    (start, end)
+fn indexed_chunk(
+    call_id: &str,
+    evidence_ref: &str,
+    content_hash: &str,
+    line_start: usize,
+    line_end: usize,
+    content: String,
+) -> IndexedChunk {
+    IndexedChunk {
+        call_id: call_id.to_string(),
+        snippet: SearchSnippet {
+            evidence_ref: evidence_ref.to_string(),
+            content_hash: content_hash.to_string(),
+            line_start,
+            line_end,
+            content,
+        },
+    }
+}
+
+fn search_chunks(
+    chunks: &[IndexedChunk],
+    call_id: Option<&str>,
+    query: &str,
+    limit: usize,
+) -> Vec<SearchSnippet> {
+    let terms: Vec<String> = query
+        .split(|character: char| !character.is_alphanumeric() && character != '_')
+        .filter(|term| {
+            !term.is_empty() && !matches!(term.to_ascii_uppercase().as_str(), "OR" | "AND" | "NOT")
+        })
+        .map(str::to_lowercase)
+        .collect();
+    chunks
+        .iter()
+        .filter(|chunk| call_id.is_none_or(|expected| chunk.call_id == expected))
+        .filter(|chunk| {
+            let content = chunk.snippet.content.to_lowercase();
+            terms.is_empty() || terms.iter().any(|term| content.contains(term))
+        })
+        .take(limit)
+        .map(|chunk| chunk.snippet.clone())
+        .collect()
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

@@ -107,6 +107,7 @@ async fn snapshot_with_graph(
         graph,
         concurrency,
         child_executions: scope.child_executions,
+        agentic_collaboration: scope.agentic_collaboration,
         goals: scope.goals,
         agents: scope.agents,
         teams: scope.teams,
@@ -516,36 +517,10 @@ pub(super) fn strategy_entity(
         .cloned()
         .and_then(|value| serde_json::from_value::<crate::TurnStrategyActualOutcome>(value).ok())
         .map(|outcome| strategy_actual_projection(outcome, context));
-    let latest_receipt = decision_events.iter().rev().find_map(|event| {
-        event
-            .payload
-            .get("collaboration_receipt")
-            .filter(|receipt| !receipt.is_null())
-    });
-    let receipt_team_id = latest_receipt
-        .and_then(|receipt| {
-            receipt
-                .get("team_id")
-                .or_else(|| receipt.pointer("/evidence/team_id"))
-        })
-        .and_then(serde_json::Value::as_str)
-        .and_then(safe_public_ref);
-    let receipt_team_execution_id = latest_receipt
-        .and_then(|receipt| {
-            receipt
-                .pointer("/execution/graph_id")
-                .or_else(|| receipt.pointer("/evidence/graph_id"))
-        })
-        .and_then(serde_json::Value::as_str)
-        .and_then(safe_public_ref);
-    // A Team graph becomes durable before its terminal collaboration receipt
-    // is available and remains evidence after a downgrade. Preserve that
-    // authoritative topology independently of the latest fallback candidate.
+    // Preserve canonical live Team topology independently of strategy state.
     let live_team = live_team_topology(scope);
-    let team_id =
-        receipt_team_id.or_else(|| live_team.as_ref().map(|(team_id, _)| team_id.clone()));
-    let team_execution_id =
-        receipt_team_execution_id.or_else(|| live_team.map(|(_, execution_id)| execution_id));
+    let team_id = live_team.as_ref().map(|(team_id, _)| team_id.clone());
+    let team_execution_id = live_team.map(|(_, execution_id)| execution_id);
     let source = payload_value::<StrategyDecisionSource>(latest, "decision_source")
         .or_else(|| payload_value(selected, "decision_source"));
     let confidence = latest

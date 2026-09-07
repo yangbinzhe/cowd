@@ -17,7 +17,6 @@ pub struct RuntimeExecutionPatternSpec {
     pub summary: String,
     pub suitable_for: Vec<String>,
     pub avoid_when: Vec<String>,
-    pub default_templates: Vec<String>,
     pub required_runtime_capabilities: Vec<String>,
     pub supported_modifiers: Vec<ExecutionModifier>,
     pub supported_gates: Vec<ExecutionPolicyGate>,
@@ -49,7 +48,6 @@ impl ExecutionPatternCatalog {
                         "workspace mutation",
                         "unresolved conflict",
                     ],
-                    &[],
                     &["inline_model"],
                     RuntimeCompileTarget::InlineModel,
                 ),
@@ -62,7 +60,6 @@ impl ExecutionPatternCatalog {
                         "multi-file audit",
                     ],
                     &["irreversible mutation", "evidence already sufficient"],
-                    &["cowd/parallel-research-synthesis"],
                     &["tool_intents", "evidence_ledger"],
                     RuntimeCompileTarget::EvidenceGraph,
                 ),
@@ -76,11 +73,6 @@ impl ExecutionPatternCatalog {
                         "configuration change",
                     ],
                     &["pure factual answer", "unapproved critical mutation"],
-                    &[
-                        "single_executor",
-                        "execute_review",
-                        "implementation_review_fix",
-                    ],
                     &["tool_intents", "agent_runtime", "verification"],
                     RuntimeCompileTarget::ExecutionGraph,
                 ),
@@ -89,7 +81,6 @@ impl ExecutionPatternCatalog {
                     "Compare competing proposals and resolve material evidence conflicts.",
                     &["architecture tradeoff", "what-if", "conflicting evidence"],
                     &["straightforward factual answer", "no material uncertainty"],
-                    &["debate@1", "jps@1"],
                     &["agent_runtime", "evidence_ledger", "verification"],
                     RuntimeCompileTarget::EvidenceGraph,
                 ),
@@ -105,10 +96,6 @@ impl ExecutionPatternCatalog {
                         "simple task",
                         "negative collaboration lift",
                         "no agent backend",
-                    ],
-                    &[
-                        "cowd/parallel-research-synthesis",
-                        "implementation_review_fix",
                     ],
                     &["agentic_program", "agent_runtime", "evidence_ledger"],
                     // Collaboration is an ownership/topology choice, not a
@@ -129,7 +116,6 @@ impl ExecutionPatternCatalog {
                         "immediate simple answer",
                         "unbounded objective without acceptance criteria",
                     ],
-                    &["long_running_project", "incident_response"],
                     &["mission_runtime", "checkpoint", "recovery"],
                     RuntimeCompileTarget::EvidenceGraph,
                 ),
@@ -149,7 +135,6 @@ impl ExecutionPatternCatalog {
                 "id": spec.id,
                 "summary": spec.summary,
                 "compile_target": spec.compile_target,
-                "default_templates": spec.default_templates,
                 "required_runtime_capabilities": spec.required_runtime_capabilities,
                 "supported_modifiers": spec.supported_modifiers,
                 "supported_gates": spec.supported_gates,
@@ -163,13 +148,11 @@ pub fn execution_pattern_catalog_response() -> Value {
     ExecutionPatternCatalog::current().summary()
 }
 
-#[allow(clippy::too_many_arguments)]
 fn spec(
     pattern: ExecutionPattern,
     summary: &str,
     suitable_for: &[&str],
     avoid_when: &[&str],
-    default_templates: &[&str],
     required_runtime_capabilities: &[&str],
     compile_target: RuntimeCompileTarget,
 ) -> RuntimeExecutionPatternSpec {
@@ -182,10 +165,6 @@ fn spec(
             .map(|item| (*item).to_string())
             .collect(),
         avoid_when: avoid_when.iter().map(|item| (*item).to_string()).collect(),
-        default_templates: default_templates
-            .iter()
-            .map(|item| (*item).to_string())
-            .collect(),
         required_runtime_capabilities: required_runtime_capabilities
             .iter()
             .map(|item| (*item).to_string())

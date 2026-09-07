@@ -223,7 +223,6 @@ fn proposal(pattern: ExecutionPattern, modifiers: Vec<ExecutionModifier>) -> Str
     StrategyProposal {
         pattern,
         modifiers,
-        template: None,
         confidence: 90,
         rationale: "test proposal".to_string(),
     }
@@ -416,8 +415,19 @@ fn explicit_read_only_language_suppresses_incidental_write_terms() {
     ));
 
     assert!(!decision.understanding.requires_write);
+    assert!(decision.understanding.forbids_workspace_write);
     assert!(!decision.understanding.requires_external_facts);
     assert!(decision.understanding.requests_parallelism);
+}
+
+#[test]
+fn chinese_persisted_experiment_is_planned_as_write_without_becoming_an_authorization_ceiling() {
+    let decision = decide_strategy(&StrategyInput::from_prompt(
+        "请在当前工作区创建隔离目录 .cowd-e2e/core-preflight。编写并运行 Python 脚本 symmetry_check.py，写入 README.md，并验证实际产物。",
+    ));
+
+    assert!(decision.understanding.requires_write);
+    assert!(!decision.understanding.forbids_workspace_write);
 }
 
 #[test]
@@ -1346,16 +1356,16 @@ fn negative_benefit_is_exact_profile_scoped_expiring_and_veto_only() {
 }
 
 #[test]
-fn independent_evidence_obligation_materializes_automatic_team_without_history() {
+fn independent_evidence_without_explicit_team_constraint_stays_topology_neutral() {
     let decision = decide_strategy(&StrategyInput::from_prompt(
         "全面审查 runtime gateway frontend 三个独立责任域，分别给出工具证据后综合",
     ));
-    assert_eq!(decision.selected_candidate, ExecutionCandidateKind::Team);
-    assert_eq!(decision.pattern, ExecutionPattern::Collaborate);
+    assert_ne!(decision.selected_candidate, ExecutionCandidateKind::Team);
+    assert_ne!(decision.pattern, ExecutionPattern::Collaborate);
     assert!(decision
         .reasons
         .iter()
-        .any(|reason| { reason.contains("independently verifiable responsibility domains") }));
+        .any(|reason| { reason.contains("does not turn inferred workstreams") }));
     let team = decision
         .candidate_estimates
         .iter()
@@ -1477,39 +1487,20 @@ fn explicit_collaboration_obligation_freezes_exact_cardinality() {
     let understanding = understand(&StrategyInput::from_prompt(
         "启动三个研究团队，分别检查三个证据域",
     ));
-    let obligation = CollaborationExecutionObligation::for_selected_team(
-        &understanding,
-        1,
-        ["zeta", "alpha", "alpha"].map(str::to_string),
-    )
-    .expect("explicit Team obligation");
-    assert_eq!(
-        obligation.source,
-        CollaborationObligationSource::ExplicitRequest
-    );
+    let obligation = CollaborationExecutionObligation::for_explicit_request(&understanding)
+        .expect("explicit Team obligation");
     assert_eq!(obligation.minimum_team_count, 3);
     assert_eq!(obligation.exact_team_count, Some(3));
-    assert_eq!(obligation.required_focus_ids, vec!["alpha", "zeta"]);
 }
 
 #[test]
-fn automatic_collaboration_obligation_is_a_nonzero_minimum() {
+fn inferred_workstreams_cannot_create_a_collaboration_obligation() {
     let understanding = understand(&StrategyInput::from_prompt(
         "全面审查 runtime、gateway、frontend 三个独立责任域，分别取得工具证据后汇总",
     ));
     assert_eq!(understanding.required_team_count, 0);
-    let obligation = CollaborationExecutionObligation::for_selected_team(
-        &understanding,
-        3,
-        ["runtime", "gateway", "frontend"].map(str::to_string),
-    )
-    .expect("automatic Team obligation");
-    assert_eq!(
-        obligation.source,
-        CollaborationObligationSource::AutomaticStrategy
-    );
-    assert_eq!(obligation.minimum_team_count, 3);
-    assert_eq!(obligation.exact_team_count, None);
+    let obligation = CollaborationExecutionObligation::for_explicit_request(&understanding);
+    assert!(obligation.is_err());
 }
 
 #[test]
@@ -1519,19 +1510,14 @@ fn singular_explicit_team_freezes_one_exact_team() {
     ));
     assert_eq!(understanding.required_team_count, 1);
     assert!(understanding.requests_multi_agent);
-    let obligation =
-        CollaborationExecutionObligation::for_selected_team(&understanding, 1, std::iter::empty())
-            .expect("uncounted explicit Team obligation");
-    assert_eq!(
-        obligation.source,
-        CollaborationObligationSource::ExplicitRequest
-    );
+    let obligation = CollaborationExecutionObligation::for_explicit_request(&understanding)
+        .expect("uncounted explicit Team obligation");
     assert_eq!(obligation.minimum_team_count, 1);
     assert_eq!(obligation.exact_team_count, Some(1));
 }
 
 #[test]
-fn automatic_team_width_uses_generic_responsibility_units_not_product_names() {
+fn inferred_responsibility_units_do_not_force_team_topology() {
     let input = StrategyInput::from_prompt(
         "请对三个独立责任域分别取得工具证据并交叉核验，最后统一综合结论",
     );
@@ -1539,7 +1525,7 @@ fn automatic_team_width_uses_generic_responsibility_units_not_product_names() {
     assert_eq!(decision.understanding.required_team_count, 0);
     assert_eq!(decision.understanding.independent_workstreams, 3);
     assert!(decision.understanding.requires_tool_evidence);
-    assert_eq!(decision.selected_candidate, ExecutionCandidateKind::Team);
+    assert_ne!(decision.selected_candidate, ExecutionCandidateKind::Team);
 }
 
 #[test]
@@ -1550,7 +1536,7 @@ fn topology_non_prescription_does_not_become_a_singular_team_obligation() {
     assert_eq!(decision.understanding.required_team_count, 0);
     assert_eq!(decision.understanding.independent_workstreams, 3);
     assert!(!decision.understanding.requests_multi_agent);
-    assert_eq!(decision.selected_candidate, ExecutionCandidateKind::Team);
+    assert_ne!(decision.selected_candidate, ExecutionCandidateKind::Team);
     assert_eq!(explicit_team_count(prompt), 0);
     assert!(!explicit_team_execution_required(prompt));
 }
@@ -1566,21 +1552,39 @@ fn positive_team_cardinality_survives_a_separate_topology_non_prescription() {
 
 #[test]
 fn collaboration_obligation_rejects_zero_or_forbidden_team() {
-    let automatic = understand(&StrategyInput::from_prompt(
+    let inferred = understand(&StrategyInput::from_prompt(
         "全面审查 runtime、gateway、frontend 三个独立责任域，分别取得工具证据后汇总",
     ));
-    assert!(CollaborationExecutionObligation::for_selected_team(
-        &automatic,
-        0,
-        ["runtime".to_string()],
-    )
-    .is_err());
+    assert!(CollaborationExecutionObligation::for_explicit_request(&inferred).is_err());
 
     let forbidden = understand(&StrategyInput::from_prompt(
         "不要组队，也不要启动多 Agent；只检查 runtime、gateway、frontend 三个责任域",
     ));
-    assert!(
-        CollaborationExecutionObligation::for_selected_team(&forbidden, 3, std::iter::empty(),)
-            .is_err()
-    );
+    assert!(CollaborationExecutionObligation::for_explicit_request(&forbidden).is_err());
+}
+
+#[test]
+fn execution_verbs_cannot_borrow_team_objects_from_another_clause() {
+    for prompt in [
+        "审计当前 Team 设计是否合理，但不要启动任何执行",
+        "创建一个说明文件；解释 Team 的优缺点",
+        "创建一个说明文件\n解释 Team 的优缺点",
+        "创建一个说明文件. Explain Teams",
+        "Explain team organization; create a documentation file",
+        "Discuss team design, do not start execution",
+    ] {
+        assert!(!explicit_team_execution_required(prompt), "{prompt}");
+        assert_eq!(
+            understand(&StrategyInput::from_prompt(prompt)).required_team_count,
+            0,
+            "{prompt}"
+        );
+    }
+    for prompt in [
+        "启动一个团队进行研究，但不要创建文件",
+        "Start a team for review; do not create files",
+        "先分析风险；创建团队开展复核",
+    ] {
+        assert!(explicit_team_execution_required(prompt), "{prompt}");
+    }
 }

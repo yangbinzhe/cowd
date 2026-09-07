@@ -42,7 +42,6 @@ pub mod security;
 pub mod skill;
 pub mod strategy;
 pub mod task;
-pub mod team;
 pub mod tool;
 pub mod turn;
 pub mod verification;

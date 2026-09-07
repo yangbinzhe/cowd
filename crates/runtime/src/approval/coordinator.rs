@@ -542,7 +542,7 @@ mod tests {
     fn coordinator(profile: ApprovalProfile) -> Arc<ApprovalCoordinator> {
         Arc::new(ApprovalCoordinator::new(
             Arc::new(ApprovalQueue::new(Arc::new(
-                crate::RuntimeEventStore::try_open_in_memory().expect("event store"),
+                crate::RuntimeEventStore::for_test(),
             ))),
             ApprovalConfig::default().with_profile(profile),
         ))

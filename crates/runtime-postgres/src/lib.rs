@@ -13,8 +13,6 @@
 //! The `runtime` crate itself remains free of PostgreSQL drivers.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fs;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -31,7 +29,7 @@ use postgres::Row;
 use runtime::task::{
     validate_backend_mutation, validate_task_aggregate_for_backend, TaskAggregate,
     TaskAggregateService, TaskEvidenceOutboxRecord, TaskMissionAssignmentOutboxRecord,
-    TaskMutation, TaskMutationResult, TaskStoreBackend, TaskStoreSnapshot, TaskTurnBinding,
+    TaskMutation, TaskMutationResult, TaskStoreBackend, TaskTurnBinding,
 };
 use runtime::{
     runtime_event_request_hash_with_terminal as request_hash_with_terminal,
@@ -41,10 +39,8 @@ use runtime::{
     validate_runtime_fenced_terminal as validate_fenced_terminal, AppendTransactionReceipt,
     AppendTransactionRequest, CommittedEventBatch, CommittedStreamRevision, DurableRuntimeEvent,
     ExpectedStreamRevision, MissionOrganizationDecision, MissionOrganizationStatus,
-    RuntimeDecisionLeaseSnapshot, RuntimeEventCommitSnapshot, RuntimeEventInput,
-    RuntimeEventRecord, RuntimeEventScope, RuntimeEventStore, RuntimeEventStoreBackend,
-    RuntimeEventStoreError, RuntimeEventStoreResult, RuntimeEventStoreSnapshot,
-    RuntimeEventStreamHeadSnapshot, RuntimeEventTransactionStreamSnapshot,
+    RuntimeEventInput, RuntimeEventRecord, RuntimeEventScope, RuntimeEventStore,
+    RuntimeEventStoreBackend, RuntimeEventStoreError, RuntimeEventStoreResult,
     RuntimeProjectionCheckpoint, RuntimeProjectionInterest, RuntimeProjectionScanPage,
     RuntimeProjectionWorkClass, RuntimeSessionOutboxFailureClass, RuntimeSessionOutboxHealth,
     RuntimeSessionOutboxRecord, RuntimeSessionTerminalFenceAdoption, RuntimeTransactionEventInput,
@@ -606,11 +602,9 @@ const ARTIFACT_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
 }];
 
 mod event_store;
-pub use event_store::{
-    copy_quiesced_runtime_event_store, PostgresRuntimeEventStore, RuntimeEventMigrationManifest,
-};
+pub use event_store::PostgresRuntimeEventStore;
 mod task_store;
-pub use task_store::{copy_quiesced_task_service, PostgresTaskStore, TaskMigrationManifest};
+pub use task_store::PostgresTaskStore;
 mod artifact_store;
 pub use artifact_store::PostgresArtifactRepository;
 

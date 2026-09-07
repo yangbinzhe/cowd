@@ -18,10 +18,6 @@ pub enum ExecutionGraphValidationError {
     MissingNode(String),
     #[error("execution graph contains a dependency cycle")]
     Cycle,
-    #[error("execution completion contract references missing node `{0}`")]
-    MissingCompletionNode(String),
-    #[error("execution orchestration mutation id is empty")]
-    MissingMutationId,
     #[error("timer executor is unavailable before schedule support is installed")]
     TimerUnavailable,
     #[error("execution node `{node_id}` has invalid dependency policy: {reason}")]
@@ -70,18 +66,6 @@ pub fn validate_execution_graph(
                     node_id: node.id.clone(),
                     reason: "evidence and artifact contract values must be non-empty".to_string(),
                 });
-            }
-        }
-    }
-    if let Some(orchestration) = &graph.orchestration {
-        if orchestration.mutation_id.trim().is_empty() {
-            return Err(ExecutionGraphValidationError::MissingMutationId);
-        }
-        for node_id in &orchestration.completion.required_node_ids {
-            if !ids.contains(node_id) {
-                return Err(ExecutionGraphValidationError::MissingCompletionNode(
-                    node_id.clone(),
-                ));
             }
         }
     }

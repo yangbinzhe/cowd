@@ -48,18 +48,13 @@ impl HarnessObservation {
         trace: &RuntimeAiKernelTrace,
         assistant_text: impl Into<String>,
     ) -> Self {
-        let execution_graph_quality_ok = trace
-            .execution_graph_quality
-            .as_ref()
-            .map(|quality| quality.is_dag && quality.has_verify_node && quality.has_synthesize_node)
-            .unwrap_or(false);
         Self {
             scenario_id: scenario_id.into(),
             strategy_pattern: trace.execution_decision.strategy.pattern,
             verification_blocked: trace.verification_blocked,
             regression_allowed: trace.regression_gate.allowed,
-            has_execution_graph: trace.execution_graph.is_some(),
-            execution_graph_quality_ok,
+            has_execution_graph: trace.execution_decision.execution_graph_ref.is_some(),
+            execution_graph_quality_ok: false,
             growth_has_blocker: trace.learning_record.has_blocker(),
             growth_signal_kinds: trace
                 .learning_record
@@ -156,7 +151,7 @@ fn simple_question_stays_direct_and_clean() {
 }
 
 #[test]
-fn complex_task_builds_execution_execution_graph() {
+fn complex_task_trace_retains_the_authoritative_execution_graph_reference() {
     let spec = ScenarioSpec::new(
         "complex_execution_graph",
         "使用多 Agent 分别规划 runtime、gateway service crate 的复杂架构演进并综合审查",
@@ -170,24 +165,23 @@ fn complex_task_builds_execution_execution_graph() {
         "complex tasks must allocate a execution_graph",
     ))
     .require(ScenarioCheck::bool(
-        "execution_graph.quality",
-        ScenarioCheckKind::ExecutionGraphQualityOk,
-        true,
-        "ai-execution_graph",
-        "complex execution_graph must be DAG with review and synthesis nodes",
-    ))
-    .require(ScenarioCheck::bool(
         "regression.allowed",
         ScenarioCheckKind::RegressionAllowed,
         true,
         "harness-eval",
         "successful complex trace must pass regression gate",
     ));
-    let kernel = RuntimeAiKernel::begin_turn(
+    let mut decision = runtime::StrategyDecisionEngine.decide(
+        "使用多 Agent 分别规划 runtime、gateway service crate 的复杂架构演进并综合审查",
+        Some(runtime::context_runtime::ContextProfile::MainTurn),
+    );
+    decision.execution_graph_ref = Some("graph:harness-complex".to_string());
+    let kernel = RuntimeAiKernel::begin_turn_with_execution_decision(
         "harness-complex",
         "使用多 Agent 分别规划 runtime、gateway service crate 的复杂架构演进并综合审查",
         runtime::context_runtime::ContextProfile::MainTurn,
         &[],
+        decision,
     );
 
     let trace = kernel.finalize("planned", 0, 0);

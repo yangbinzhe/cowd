@@ -409,8 +409,6 @@ impl Default for TuningConfig {
 /// Storage backend configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreConfig {
-    /// Path to the SQLite database file.
-    pub sqlite_path: PathBuf,
     /// Directory for blob / file-system storage.
     pub blob_dir: PathBuf,
     /// Whether to enable the in-process vector index.
@@ -424,16 +422,11 @@ pub struct StoreConfig {
 impl Default for StoreConfig {
     fn default() -> Self {
         let registry = storage::StorageRegistry::default_for_config_home(default_config_home());
-        let sqlite_path = registry
-            .endpoint(&storage::StorageDomainId::Memory)
-            .map(|endpoint| endpoint.as_handle().path)
-            .unwrap_or_else(|_| registry.layout.root.join("memory.sqlite"));
         let blob_dir = registry
             .endpoint(&storage::StorageDomainId::Blobs)
             .map(|endpoint| endpoint.as_handle().path)
             .unwrap_or_else(|_| registry.layout.blobs.clone());
         Self {
-            sqlite_path,
             blob_dir,
             enable_vector_index: false,
             cache_capacity: 512,

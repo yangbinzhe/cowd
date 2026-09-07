@@ -139,6 +139,7 @@ pub async fn services_with_canonical_agent(
             .expect("workspace identity resolver"),
     });
     let services = RuntimeServices::builder(&root, &workspace)
+        .non_durable_backends_for_testing(&root)
         .provider_registry(Arc::new(
             runtime::ProviderRegistry::new(providers).expect("provider registry"),
         ))

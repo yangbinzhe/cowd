@@ -21,9 +21,8 @@ async fn services_with_memory() -> (
     let workspace = root.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
     let memory = Arc::new(
-        CognitiveContextManager::new(MemoryConfig {
+        CognitiveContextManager::new_ephemeral(MemoryConfig {
             store: StoreConfig {
-                sqlite_path: root.path().join("memory.sqlite"),
                 blob_dir: root.path().join("memory-blobs"),
                 enable_vector_index: false,
                 ..Default::default()
@@ -44,6 +43,7 @@ async fn services_with_memory() -> (
         .expect("memory manager"),
     );
     let services = RuntimeServices::builder(root.path(), &workspace)
+        .non_durable_backends_for_testing(root.path())
         .memory_manager(Arc::clone(&memory))
         .build()
         .expect("runtime services");

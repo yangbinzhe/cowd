@@ -8,19 +8,6 @@ pub struct PostgresRuntimeEventStore {
     executor: PostgresExecutor,
 }
 
-/// Immutable proof written only after a domain-owned RuntimeEvent copy has
-/// reached digest equality. It intentionally contains no backend URL or path.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct RuntimeEventMigrationManifest {
-    pub domain: String,
-    pub source_digest: String,
-    pub target_digest: String,
-    pub commit_count: usize,
-    pub event_count: usize,
-    pub terminal_count: usize,
-    pub decision_lease_count: usize,
-}
-
 impl PostgresRuntimeEventStore {
     pub fn new(executor: PostgresExecutor) -> RuntimeEventStoreResult<Self> {
         executor.apply_migrations(RUNTIME_EVENT_DOMAIN, RUNTIME_EVENT_MIGRATIONS)?;
@@ -608,6 +595,49 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         ))
         .and_then(rows_to_events)
         .map_err(|error| error.to_string())
+    }
+
+    fn list_stream_after(
+        &self,
+        stream_id: &str,
+        after_sequence: u64,
+        through_sequence: u64,
+        max_events: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        if max_events == 0 || max_bytes == 0 || through_sequence <= after_sequence {
+            return Ok(Vec::new());
+        }
+        let mut connection = self
+            .checkout_event_read()
+            .map_err(|error| error.to_string())?;
+        let after_sequence =
+            to_i64(after_sequence, "after_sequence").map_err(|error| error.to_string())?;
+        let through_sequence =
+            to_i64(through_sequence, "through_sequence").map_err(|error| error.to_string())?;
+        let limit = to_i64(max_events as u64, "max_events").map_err(|error| error.to_string())?;
+        let events = pg(connection.query(
+            &format!(
+                "SELECT {EVENT_COLUMNS} FROM runtime_events \
+                 WHERE stream_id=$1 AND sequence>$2 AND sequence<=$3 \
+                 ORDER BY sequence ASC LIMIT $4"
+            ),
+            &[&stream_id, &after_sequence, &through_sequence, &limit],
+        ))
+        .and_then(rows_to_events)
+        .map_err(|error| error.to_string())?;
+        let mut bytes = 0usize;
+        Ok(events
+            .into_iter()
+            .take_while(|event| {
+                let event_bytes = serde_json::to_vec(event).map_or(0, |value| value.len());
+                let keep = bytes == 0 || bytes.saturating_add(event_bytes) <= max_bytes;
+                if keep {
+                    bytes = bytes.saturating_add(event_bytes);
+                }
+                keep
+            })
+            .collect())
     }
 
     fn list_stream_page_desc(
@@ -1575,19 +1605,6 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
             now_ms,
         )
     }
-
-    fn export_migration_snapshot(&self) -> RuntimeEventStoreResult<RuntimeEventStoreSnapshot> {
-        let mut connection = self.executor.checkout_background()?;
-        export_postgres_migration_snapshot(&mut connection)
-    }
-
-    fn import_migration_snapshot(
-        &self,
-        snapshot: &RuntimeEventStoreSnapshot,
-    ) -> RuntimeEventStoreResult<()> {
-        let mut connection = self.executor.checkout_background()?;
-        import_postgres_migration_snapshot(&mut connection, snapshot)
-    }
 }
 
 impl PostgresRuntimeEventStore {
@@ -1654,341 +1671,6 @@ impl PostgresRuntimeEventStore {
 
 /// Copy a quiesced RuntimeEvent ledger exactly once, prove canonical digest
 /// equality, then atomically write a backend-neutral cutover manifest.
-pub fn copy_quiesced_runtime_event_store(
-    source: &RuntimeEventStore,
-    target: &RuntimeEventStore,
-    manifest_path: impl AsRef<Path>,
-) -> RuntimeEventStoreResult<RuntimeEventMigrationManifest> {
-    let snapshot = source.export_migration_snapshot()?;
-    snapshot.validate()?;
-    let source_digest = snapshot.canonical_digest()?;
-    target.import_migration_snapshot(&snapshot)?;
-    let target_snapshot = target.export_migration_snapshot()?;
-    let target_digest = target_snapshot.canonical_digest()?;
-    if source_digest != target_digest {
-        return Err(RuntimeEventStoreError::Corrupt(
-            "runtime event migration digest mismatch".to_string(),
-        ));
-    }
-    let manifest = RuntimeEventMigrationManifest {
-        domain: RUNTIME_EVENT_DOMAIN.to_string(),
-        source_digest,
-        target_digest,
-        commit_count: snapshot.commits.len(),
-        event_count: snapshot.events.len(),
-        terminal_count: snapshot.session_outbox.len(),
-        decision_lease_count: snapshot.decision_leases.len(),
-    };
-    write_migration_manifest(manifest_path.as_ref(), &manifest)?;
-    Ok(manifest)
-}
-
-fn write_migration_manifest(
-    manifest_path: &Path,
-    manifest: &RuntimeEventMigrationManifest,
-) -> RuntimeEventStoreResult<()> {
-    if let Some(parent) = manifest_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let temporary_path = PathBuf::from(format!(
-        "{}.{}.tmp",
-        manifest_path.display(),
-        uuid::Uuid::new_v4()
-    ));
-    fs::write(&temporary_path, serde_json::to_vec_pretty(manifest)?)?;
-    fs::rename(temporary_path, manifest_path)?;
-    Ok(())
-}
-
-fn export_postgres_migration_snapshot(
-    connection: &mut PostgresConnection,
-) -> RuntimeEventStoreResult<RuntimeEventStoreSnapshot> {
-    let commits = pg(connection.query(
-        "SELECT commit_cursor, transaction_id, request_hash, created_at_ms
-           FROM runtime_commits ORDER BY commit_cursor ASC",
-        &[],
-    ))?
-    .iter()
-    .map(|row| {
-        Ok(RuntimeEventCommitSnapshot {
-            commit_cursor: from_i64(pg(row.try_get(0))?, "commit_cursor")?,
-            transaction_id: pg(row.try_get(1))?,
-            request_hash: pg(row.try_get(2))?,
-            created_at_ms: from_i64(pg(row.try_get(3))?, "created_at_ms")?,
-        })
-    })
-    .collect::<RuntimeEventStoreResult<Vec<_>>>()?;
-    let events = rows_to_events(pg(connection.query(
-        &format!("SELECT {EVENT_COLUMNS} FROM runtime_events ORDER BY commit_cursor ASC, transaction_index ASC"),
-        &[],
-    ))?)?;
-    let transaction_streams = pg(connection.query(
-        "SELECT transaction_id, stream_id, expected_revision, committed_revision
-           FROM runtime_transaction_streams ORDER BY transaction_id ASC, stream_id ASC",
-        &[],
-    ))?
-    .iter()
-    .map(|row| {
-        Ok(RuntimeEventTransactionStreamSnapshot {
-            transaction_id: pg(row.try_get(0))?,
-            stream_id: pg(row.try_get(1))?,
-            expected_revision: from_i64(pg(row.try_get(2))?, "expected_revision")?,
-            committed_revision: from_i64(pg(row.try_get(3))?, "committed_revision")?,
-        })
-    })
-    .collect::<RuntimeEventStoreResult<Vec<_>>>()?;
-    let stream_heads = pg(connection.query(
-        "SELECT stream_id, revision FROM runtime_stream_heads ORDER BY stream_id ASC",
-        &[],
-    ))?
-    .iter()
-    .map(|row| {
-        Ok(RuntimeEventStreamHeadSnapshot {
-            stream_id: pg(row.try_get(0))?,
-            revision: from_i64(pg(row.try_get(1))?, "revision")?,
-        })
-    })
-    .collect::<RuntimeEventStoreResult<Vec<_>>>()?;
-    let session_outbox = pg(connection.query(
-        "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id,
-                request_id, session_generation, input_sequence, input_claim_owner, input_claim_token,
-                input_claim_revision, status,
-                attempts, next_attempt_at, claim_owner, claim_expires_at, failure_class,
-                last_error, materialized_at, revision
-           FROM runtime_session_outbox ORDER BY terminal_id ASC",
-        &[],
-    ))?
-    .iter()
-    .map(row_to_runtime_session_outbox)
-    .collect::<RuntimeEventStoreResult<Vec<_>>>()?;
-    let decision_leases = pg(connection.query(
-        "SELECT lease_id, principal_id, review_id, action, scope, evidence_digest,
-                credential_epoch, consumed_at_ms
-           FROM runtime_consumed_decision_leases ORDER BY lease_id ASC",
-        &[],
-    ))?
-    .iter()
-    .map(|row| {
-        Ok(RuntimeDecisionLeaseSnapshot {
-            lease_id: pg(row.try_get(0))?,
-            principal_id: pg(row.try_get(1))?,
-            review_id: pg(row.try_get(2))?,
-            action: pg(row.try_get(3))?,
-            scope: pg(row.try_get(4))?,
-            evidence_digest: pg(row.try_get(5))?,
-            credential_epoch: from_i64(pg(row.try_get(6))?, "credential_epoch")?,
-            consumed_at_ms: from_i64(pg(row.try_get(7))?, "consumed_at_ms")?,
-        })
-    })
-    .collect::<RuntimeEventStoreResult<Vec<_>>>()?;
-    let snapshot = RuntimeEventStoreSnapshot {
-        commits,
-        events,
-        transaction_streams,
-        stream_heads,
-        session_outbox,
-        decision_leases,
-    };
-    snapshot.validate()?;
-    Ok(snapshot)
-}
-
-fn import_postgres_migration_snapshot(
-    connection: &mut PostgresConnection,
-    snapshot: &RuntimeEventStoreSnapshot,
-) -> RuntimeEventStoreResult<()> {
-    snapshot.validate()?;
-    let snapshot = canonical_snapshot(snapshot);
-    let mut tx = pg(connection.transaction())?;
-    for table in [
-        "runtime_commits",
-        "runtime_events",
-        "runtime_transaction_streams",
-        "runtime_stream_heads",
-        "runtime_session_outbox",
-        "runtime_consumed_decision_leases",
-    ] {
-        let row = pg(tx.query_one(&format!("SELECT COUNT(*) FROM {table}"), &[]))?;
-        let count = from_i64(pg(row.try_get(0))?, "target row count")?;
-        if count != 0 {
-            return Err(RuntimeEventStoreError::InvalidTransaction(format!(
-                "runtime event migration target table `{table}` is not empty"
-            )));
-        }
-    }
-    for commit in &snapshot.commits {
-        pg(tx.execute(
-            "INSERT INTO runtime_commits(commit_cursor, transaction_id, request_hash, created_at_ms)
-             VALUES ($1,$2,$3,$4)",
-            &[
-                &to_i64(commit.commit_cursor, "commit_cursor")?,
-                &commit.transaction_id,
-                &commit.request_hash,
-                &to_i64(commit.created_at_ms, "created_at_ms")?,
-            ],
-        ))?;
-    }
-    for event in &snapshot.events {
-        let refs = serde_json::to_value(&event.refs)?;
-        let activity_binding = event.activity_binding();
-        let root_execution_id = activity_binding
-            .as_ref()
-            .map(|binding| binding.root_execution_id.as_str());
-        let activity_id = activity_binding
-            .as_ref()
-            .map(|binding| binding.activity_id.as_str());
-        pg(tx.execute(
-            "INSERT INTO runtime_events (event_id, stream_id, sequence, scope, kind, status, actor,
-                payload, refs, created_at_ms, commit_cursor, transaction_id, transaction_index,
-                schema_version, idempotency_key, root_execution_id, activity_id)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)",
-            &[
-                &event.event_id,
-                &event.stream_id,
-                &to_i64(event.sequence, "sequence")?,
-                &event.scope.as_str(),
-                &event.kind,
-                &event.status,
-                &event.actor,
-                &event.payload,
-                &refs,
-                &to_i64(event.created_at_ms, "created_at_ms")?,
-                &to_i64(event.commit_cursor, "commit_cursor")?,
-                &event.transaction_id,
-                &i64::from(event.transaction_index),
-                &i64::from(event.schema_version),
-                &event.idempotency_key,
-                &root_execution_id,
-                &activity_id,
-            ],
-        ))?;
-    }
-    for stream in &snapshot.transaction_streams {
-        pg(tx.execute(
-            "INSERT INTO runtime_transaction_streams
-             (transaction_id, stream_id, expected_revision, committed_revision)
-             VALUES ($1,$2,$3,$4)",
-            &[
-                &stream.transaction_id,
-                &stream.stream_id,
-                &to_i64(stream.expected_revision, "expected_revision")?,
-                &to_i64(stream.committed_revision, "committed_revision")?,
-            ],
-        ))?;
-    }
-    for head in &snapshot.stream_heads {
-        pg(tx.execute(
-            "INSERT INTO runtime_stream_heads(stream_id, revision) VALUES ($1,$2)",
-            &[&head.stream_id, &to_i64(head.revision, "revision")?],
-        ))?;
-    }
-    for terminal in &snapshot.session_outbox {
-        let next_attempt_at = terminal
-            .next_attempt_at_ms
-            .map(|value| to_i64(value, "next_attempt_at"))
-            .transpose()?;
-        let claim_expires_at = terminal
-            .claim_expires_at_ms
-            .map(|value| to_i64(value, "claim_expires_at"))
-            .transpose()?;
-        let materialized_at = terminal
-            .materialized_at_ms
-            .map(|value| to_i64(value, "materialized_at"))
-            .transpose()?;
-        let session_generation = terminal
-            .session_generation
-            .map(|value| to_i64(value, "session_generation"))
-            .transpose()?;
-        let input_claim_revision = terminal
-            .input_claim_revision
-            .map(|value| to_i64(value, "input_claim_revision"))
-            .transpose()?;
-        let input_sequence = terminal
-            .input_sequence
-            .map(|value| to_i64(value, "input_sequence"))
-            .transpose()?;
-        pg(tx.execute(
-            "INSERT INTO runtime_session_outbox
-             (terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id,
-              request_id, session_generation, input_sequence, input_claim_owner, input_claim_token,
-              input_claim_revision, status, attempts,
-              next_attempt_at, claim_owner, claim_expires_at, failure_class, last_error,
-              materialized_at, revision)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)",
-            &[
-                &terminal.terminal_id,
-                &terminal.message_id,
-                &terminal.session_id,
-                &to_i64(terminal.commit_cursor, "commit_cursor")?,
-                &terminal.payload_ref,
-                &terminal.execution_id,
-                &terminal.turn_id,
-                &terminal.request_id,
-                &session_generation,
-                &input_sequence,
-                &terminal.input_claim_owner,
-                &terminal.input_claim_token,
-                &input_claim_revision,
-                &terminal.status,
-                &i64::from(terminal.attempts),
-                &next_attempt_at,
-                &terminal.claim_owner,
-                &claim_expires_at,
-                &terminal.failure_class,
-                &terminal.last_error,
-                &materialized_at,
-                &to_i64(terminal.revision, "revision")?,
-            ],
-        ))?;
-    }
-    for lease in &snapshot.decision_leases {
-        pg(tx.execute(
-            "INSERT INTO runtime_consumed_decision_leases
-             (lease_id, principal_id, review_id, action, scope, evidence_digest, credential_epoch, consumed_at_ms)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
-            &[
-                &lease.lease_id,
-                &lease.principal_id,
-                &lease.review_id,
-                &lease.action,
-                &lease.scope,
-                &lease.evidence_digest,
-                &to_i64(lease.credential_epoch, "credential_epoch")?,
-                &to_i64(lease.consumed_at_ms, "consumed_at_ms")?,
-            ],
-        ))?;
-    }
-    if let Some(commit) = snapshot.commits.last() {
-        pg(tx.query_one(
-            "SELECT setval(pg_get_serial_sequence('runtime_commits', 'commit_cursor'), $1, true)",
-            &[&to_i64(commit.commit_cursor, "commit_cursor")?],
-        ))?;
-    }
-    pg(tx.commit())?;
-    Ok(())
-}
-
-fn canonical_snapshot(snapshot: &RuntimeEventStoreSnapshot) -> RuntimeEventStoreSnapshot {
-    let mut canonical = snapshot.clone();
-    canonical.commits.sort_by_key(|commit| commit.commit_cursor);
-    canonical
-        .events
-        .sort_by_key(|event| (event.commit_cursor, event.transaction_index));
-    canonical.transaction_streams.sort_by(|left, right| {
-        (&left.transaction_id, &left.stream_id).cmp(&(&right.transaction_id, &right.stream_id))
-    });
-    canonical
-        .stream_heads
-        .sort_by(|left, right| left.stream_id.cmp(&right.stream_id));
-    canonical
-        .session_outbox
-        .sort_by(|left, right| left.terminal_id.cmp(&right.terminal_id));
-    canonical
-        .decision_leases
-        .sort_by(|left, right| left.lease_id.cmp(&right.lease_id));
-    canonical
-}
-
 fn append_transaction_in_tx(
     tx: &mut PostgresTransaction<'_>,
     request: &AppendTransactionRequest,

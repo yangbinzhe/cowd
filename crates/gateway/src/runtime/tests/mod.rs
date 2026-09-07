@@ -92,13 +92,60 @@ fn test_runtime_service_with_services(
     .expect("test runtime service")
 }
 
+async fn write_test_session_terminal_artifact(
+    services: &runtime::RuntimeServices,
+    terminal_id: &str,
+    session_id: &str,
+    ingress_message_id: &str,
+    consumed_input_sequence: usize,
+) -> String {
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "text": "done",
+        "goal_completion": "satisfied",
+        "ingress_message_id": ingress_message_id,
+        "consumed_input_sequence": consumed_input_sequence,
+        "token_usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
+        },
+        "transcript": [{
+            "role": "assistant",
+            "blocks": [{"type": "text", "text": "done"}]
+        }]
+    }))
+    .unwrap();
+    let artifact = services
+        .artifact_store()
+        .write_bytes(
+            harness_contract::context::ArtifactWriteDescriptor {
+                media_type: "application/vnd.cowd.session-terminal+json".to_string(),
+                visibility_scope: format!("session:{session_id}"),
+                expected_bytes: Some(payload.len() as u64),
+                original_name: Some(format!("{terminal_id}.json")),
+            },
+            &payload,
+        )
+        .await
+        .unwrap();
+    services
+        .artifact_store()
+        .pin(
+            &artifact,
+            terminal_id,
+            runtime::ARTIFACT_PERMANENT_PIN_UNTIL_MS,
+        )
+        .unwrap();
+    runtime::encode_session_terminal_artifact_ref(&artifact).unwrap()
+}
+
 fn test_runtime_service(
     active_sessions: Arc<ActiveSessionDirectory>,
     store: Option<Arc<session::UnifiedSessionStore>>,
 ) -> RuntimeService {
-    let store = store.unwrap_or_else(|| {
-        Arc::new(session::UnifiedSessionStore::open_in_memory().expect("test session store"))
-    });
+    let store = store.unwrap_or_else(|| Arc::new(crate::pg_test_support::session_store()));
     let runtime_services = runtime::RuntimeServices::in_memory().expect("test runtime services");
     test_runtime_service_with_services(active_sessions, store, runtime_services)
 }
@@ -167,7 +214,7 @@ fn test_bound_runtime_service(
 
 #[tokio::test]
 async fn activation_materializes_default_policy_without_reentrant_session_lock() {
-    let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+    let store = Arc::new(crate::pg_test_support::session_store());
     let (_runtime, session_service) = test_bound_runtime_service(
         Arc::new(ActiveSessionDirectory::default()),
         Arc::clone(&store),
@@ -197,7 +244,7 @@ async fn activation_materializes_default_policy_without_reentrant_session_lock()
 
 #[tokio::test]
 async fn session_execution_policy_persists_and_restores_permission_and_autonomy() {
-    let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+    let store = Arc::new(crate::pg_test_support::session_store());
     let active_sessions = Arc::new(ActiveSessionDirectory::default());
     let projection_hub = crate::event_bus::SessionProjectionHub::new();
     let repository = Arc::new(SessionRepository::new(
@@ -339,7 +386,7 @@ async fn session_execution_policy_persists_and_restores_permission_and_autonomy(
 
 #[tokio::test]
 async fn policy_transition_pins_started_attempts_and_fences_both_posture_directions() {
-    let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+    let store = Arc::new(crate::pg_test_support::session_store());
     let (service, _session_service) = test_bound_runtime_service(
         Arc::new(ActiveSessionDirectory::default()),
         Arc::clone(&store),
@@ -487,7 +534,7 @@ async fn policy_transition_pins_started_attempts_and_fences_both_posture_directi
 
 #[tokio::test]
 async fn policy_transition_never_force_cancels_an_admitted_background_task() {
-    let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+    let store = Arc::new(crate::pg_test_support::session_store());
     let (service, _session_service) = test_bound_runtime_service(
         Arc::new(ActiveSessionDirectory::default()),
         Arc::clone(&store),
@@ -631,7 +678,11 @@ async fn policy_transition_never_force_cancels_an_admitted_background_task() {
 
 #[tokio::test]
 async fn consecutive_desired_revisions_activate_only_the_latest_snapshot() {
-    let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+    let store = Arc::new(crate::pg_test_support::session_store());
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let session_id = format!("policy-latest-wins-{suffix}");
+    let turn_id = format!("turn-latest-wins-{suffix}");
+    let execution_id = format!("execution-latest-wins-{suffix}");
     let (service, _session_service) = test_bound_runtime_service(
         Arc::new(ActiveSessionDirectory::default()),
         Arc::clone(&store),
@@ -646,9 +697,9 @@ async fn consecutive_desired_revisions_activate_only_the_latest_snapshot() {
     );
     store
         .create_session(&session::SessionRecord {
-            session_id: "policy-latest-wins".to_string(),
+            session_id: session_id.clone(),
             platform: "test".to_string(),
-            chat_id: "policy-latest-wins".to_string(),
+            chat_id: session_id.clone(),
             user_id: None,
             model: None,
             created_at: now.clone(),
@@ -662,22 +713,18 @@ async fn consecutive_desired_revisions_activate_only_the_latest_snapshot() {
         })
         .await
         .unwrap();
-    service.install_test_session_policy("policy-latest-wins", initial.clone());
+    service.install_test_session_policy(&session_id, initial.clone());
     let live_control = service
         .sessions
-        .session("policy-latest-wins")
+        .session(&session_id)
         .and_then(|session| session.policy_control())
         .expect("test aggregate policy control");
     let (_, guard) = service
-        .install_active_turn_control(
-            "turn-latest-wins",
-            "policy-latest-wins",
-            Some("execution-latest-wins".to_string()),
-        )
+        .install_active_turn_control(&turn_id, &session_id, Some(execution_id))
         .unwrap();
     let first = service
         .set_session_execution_policy(
-            "policy-latest-wins",
+            &session_id,
             runtime::AutonomyProfileId::Cautious,
             1,
             runtime::SessionExecutionPolicyOrigin::SurfaceCommand,
@@ -687,7 +734,7 @@ async fn consecutive_desired_revisions_activate_only_the_latest_snapshot() {
     assert_eq!(first.policy.revision, 2);
     let latest = service
         .set_session_execution_policy(
-            "policy-latest-wins",
+            &session_id,
             runtime::AutonomyProfileId::Yolo,
             2,
             runtime::SessionExecutionPolicyOrigin::SurfaceCommand,
@@ -716,11 +763,7 @@ async fn consecutive_desired_revisions_activate_only_the_latest_snapshot() {
         live_control.snapshot().autonomy_profile,
         runtime::AutonomyProfileId::Yolo
     );
-    let stored = store
-        .get_session("policy-latest-wins")
-        .await
-        .unwrap()
-        .unwrap();
+    let stored = store.get_session(&session_id).await.unwrap().unwrap();
     let state = stored_session_execution_policy_state(&stored).expect("policy state");
     assert_eq!(state.effective.revision, 3);
     assert!(state.desired.is_none());
@@ -730,7 +773,7 @@ async fn consecutive_desired_revisions_activate_only_the_latest_snapshot() {
 
 #[tokio::test]
 async fn restart_recovers_a_durable_draining_policy_transition() {
-    let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+    let store = Arc::new(crate::pg_test_support::session_store());
     let effective = runtime::SessionExecutionPolicy::from_profile(
         runtime::AutonomyProfileId::Supervised,
         4,
@@ -806,7 +849,7 @@ async fn restart_recovers_a_durable_draining_policy_transition() {
 
 #[tokio::test]
 async fn policy_transition_waits_for_the_active_turn_and_never_cancels_it() {
-    let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+    let store = Arc::new(crate::pg_test_support::session_store());
     let (service, _session_service) = test_bound_runtime_service(
         Arc::new(ActiveSessionDirectory::default()),
         Arc::clone(&store),
@@ -914,7 +957,7 @@ fn policy_update_lock_hot_set_does_not_grow_with_session_history() {
 
 #[tokio::test]
 async fn config_default_reload_updates_only_default_owned_sessions_and_live_controls() {
-    let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+    let store = Arc::new(crate::pg_test_support::session_store());
     let (service, _session_service) = test_bound_runtime_service(
         Arc::new(ActiveSessionDirectory::default()),
         Arc::clone(&store),
@@ -1011,7 +1054,7 @@ async fn config_default_reload_updates_only_default_owned_sessions_and_live_cont
 
 #[tokio::test]
 async fn unchanged_config_reload_retries_a_default_owned_session_after_persistence_recovers() {
-    let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+    let store = Arc::new(crate::pg_test_support::session_store());
     let (service, _session_service) = test_bound_runtime_service(
         Arc::new(ActiveSessionDirectory::default()),
         Arc::clone(&store),
@@ -1087,7 +1130,7 @@ async fn unchanged_config_reload_retries_a_default_owned_session_after_persisten
 
 #[tokio::test]
 async fn first_policy_read_materializes_the_current_config_default() {
-    let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+    let store = Arc::new(crate::pg_test_support::session_store());
     let (service, _session_service) = test_bound_runtime_service(
         Arc::new(ActiveSessionDirectory::default()),
         Arc::clone(&store),
@@ -1199,7 +1242,11 @@ async fn restart_reuses_terminal_receipt_before_provider_runtime_lookup() {
     let home = temp.path().join("home");
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
-    let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+    let topology = Arc::new(
+        crate::selected_storage::SelectedStorageTopology::compose_for_test(&home, &workspace)
+            .expect("isolated PostgreSQL topology"),
+    );
+    let store = Arc::clone(&topology.session_store);
     let now = chrono::Utc::now().to_rfc3339();
     store
         .create_session(&session::SessionRecord {
@@ -1260,13 +1307,46 @@ async fn restart_reuses_terminal_receipt_before_provider_runtime_lookup() {
         )
         .await
         .unwrap();
-    let event_store_path = temp.path().join("runtime-events.sqlite");
-    let runtime_event_store =
-        Arc::new(runtime::RuntimeEventStore::try_open(&event_store_path).unwrap());
+    let runtime_event_store = Arc::clone(&topology.runtime_event_store);
     let services = runtime::RuntimeServices::builder(&home, &workspace)
         .runtime_event_store(Arc::clone(&runtime_event_store))
+        .task_aggregate_service(Arc::clone(&topology.task_service))
+        .artifact_store(Arc::clone(&topology.artifact_store))
         .build()
         .unwrap();
+    let graph_id =
+        runtime::session_ingress_graph_id("restart-session", "restart-request", "restart-turn");
+    services.record_live_execution(
+        "restart-session",
+        graph_id.clone(),
+        "restart-turn".to_string(),
+    );
+    let first = test_runtime_service_with_services(
+        Arc::new(ActiveSessionDirectory::new()),
+        Arc::clone(&store),
+        Arc::clone(&services),
+    );
+    let transient = first
+        .execute_ingress_record(&record, "must not run before recovery")
+        .await
+        .expect_err("an inactive process-local Session is retryable before a carrier exists");
+    assert!(transient.contains("is not active"), "{transient}");
+    assert!(
+        !services
+            .execution_live(&graph_id)
+            .expect("retryable ingress retains its live diagnostic record")
+            .status
+            .is_terminal(),
+        "pre-carrier ingress errors must never fabricate a terminal live winner"
+    );
+    let terminal_payload_ref = write_test_session_terminal_artifact(
+        services.as_ref(),
+        "turn-terminal:restart-request",
+        "restart-session",
+        "restart-message",
+        record.sequence,
+    )
+    .await;
     let terminal_receipt = runtime_event_store
         .append_transaction_with_terminal(
             runtime::AppendTransactionRequest {
@@ -1306,7 +1386,7 @@ async fn restart_reuses_terminal_receipt_before_provider_runtime_lookup() {
                 input_claim_token: record.claim_token.clone(),
                 input_claim_revision: record.claim_fence_epoch,
                 controlled_recovery_claim_fingerprints: Vec::new(),
-                payload_ref: "assistant_json:\"done\"".to_string(),
+                payload_ref: terminal_payload_ref,
             },
         )
         .unwrap();
@@ -1358,11 +1438,6 @@ async fn restart_reuses_terminal_receipt_before_provider_runtime_lookup() {
             claim_at,
         )
         .unwrap();
-    let first = test_runtime_service_with_services(
-        Arc::new(ActiveSessionDirectory::new()),
-        Arc::clone(&store),
-        services,
-    );
     assert_eq!(
         first
             .execute_ingress_record(&record, "must not run")
@@ -1371,13 +1446,16 @@ async fn restart_reuses_terminal_receipt_before_provider_runtime_lookup() {
             .commit_cursor,
         terminal_receipt.commit_cursor
     );
+    drop(terminal_port);
     drop(first);
+    drop(services);
     drop(runtime_event_store);
 
-    let restarted_event_store =
-        Arc::new(runtime::RuntimeEventStore::try_open(&event_store_path).unwrap());
+    let restarted_event_store = Arc::clone(&topology.runtime_event_store);
     let restarted_services = runtime::RuntimeServices::builder(&home, &workspace)
         .runtime_event_store(restarted_event_store)
+        .task_aggregate_service(Arc::clone(&topology.task_service))
+        .artifact_store(Arc::clone(&topology.artifact_store))
         .build()
         .unwrap();
     let restarted = test_runtime_service_with_services(
@@ -1390,22 +1468,25 @@ async fn restart_reuses_terminal_receipt_before_provider_runtime_lookup() {
         .await
         .unwrap();
     assert_eq!(receipt.commit_cursor, terminal_receipt.commit_cursor);
-    assert_eq!(
-        receipt.graph_id,
-        runtime::session_ingress_graph_id("restart-session", "restart-request", "restart-turn")
-    );
+    assert_eq!(receipt.graph_id, graph_id);
 }
 
 #[tokio::test]
 async fn recovered_terminal_settles_the_exact_primary_input_projection() {
-    let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
-    let runtime_event_store = Arc::new(runtime::RuntimeEventStore::try_open_in_memory().unwrap());
+    let topology = Arc::new(
+        crate::selected_storage::SelectedStorageTopology::compose_for_test(&home, &workspace)
+            .expect("isolated PostgreSQL topology"),
+    );
+    let store = Arc::clone(&topology.session_store);
+    let runtime_event_store = Arc::clone(&topology.runtime_event_store);
     let runtime_services = runtime::RuntimeServices::builder(&home, &workspace)
         .runtime_event_store(Arc::clone(&runtime_event_store))
+        .task_aggregate_service(Arc::clone(&topology.task_service))
+        .artifact_store(Arc::clone(&topology.artifact_store))
         .build()
         .unwrap();
     let service = test_runtime_service_with_services(
@@ -1476,6 +1557,15 @@ async fn recovered_terminal_settles_the_exact_primary_input_projection() {
         )
         .await
         .expect("mark claimed ingress running");
+    let recovery_services = service.runtime_services();
+    let terminal_payload_ref = write_test_session_terminal_artifact(
+        recovery_services.as_ref(),
+        &admission.terminal_id,
+        &record.session_id,
+        &record.message_id,
+        record.sequence,
+    )
+    .await;
     let terminal_commit = runtime_event_store
         .append_transaction_with_terminal(
             runtime::AppendTransactionRequest {
@@ -1511,7 +1601,7 @@ async fn recovered_terminal_settles_the_exact_primary_input_projection() {
                 input_claim_token: record.claim_token.clone(),
                 input_claim_revision: record.claim_fence_epoch,
                 controlled_recovery_claim_fingerprints: Vec::new(),
-                payload_ref: "assistant_json:\"done\"".to_string(),
+                payload_ref: terminal_payload_ref.clone(),
             },
         )
         .expect("terminal and its exact Session fence commit atomically");
@@ -1553,7 +1643,7 @@ async fn recovered_terminal_settles_the_exact_primary_input_projection() {
         persisted_terminal.message_id,
         "assistant-projection-primary"
     );
-    assert_eq!(persisted_terminal.payload_ref, "assistant_json:\"done\"");
+    assert_eq!(persisted_terminal.payload_ref, terminal_payload_ref);
     assert_eq!(persisted_terminal.status, "pending");
     assert_eq!(persisted_terminal.revision, 0);
     assert_eq!(persisted_terminal.attempts, 0);
@@ -1690,7 +1780,7 @@ async fn runtime_service_snapshot_reports_lease_projection() {
 
 #[tokio::test]
 async fn runtime_service_records_durable_turn_journal() {
-    let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+    let store = Arc::new(crate::pg_test_support::session_store());
     let now = chrono::Utc::now().to_rfc3339();
     store
         .create_session(&session::SessionRecord {
@@ -1739,7 +1829,7 @@ async fn runtime_service_records_durable_turn_journal() {
 
 #[tokio::test]
 async fn runtime_service_persists_session_input_runtime_event() {
-    let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+    let store = Arc::new(crate::pg_test_support::session_store());
     let now = chrono::Utc::now().to_rfc3339();
     store
         .create_session(&session::SessionRecord {
@@ -2150,12 +2240,34 @@ fn session_execution_index_exposes_running_only_and_retains_terminal_reference()
         "turn-finished",
         harness_contract::context::ContextPressureState::new("default", 32_000, 8_000),
     );
-    service.complete_live_execution(
-        "execution-finished",
-        &report,
-        &[],
-        "terminal-finished".to_string(),
-    );
+    assert!(matches!(
+        service.runtime_services.claim_live_terminal_fence(
+            "execution-finished",
+            "terminal-finished".to_string(),
+            ExecutionLiveStatus::Complete,
+            1,
+        ),
+        Ok(runtime::execution_live::TerminalFenceClaim::Claimed)
+    ));
+    assert!(matches!(
+        service.runtime_services.finalize_live_terminal_fence(
+            "execution-finished",
+            "terminal-finished",
+            ExecutionLiveStatus::Complete,
+            1,
+        ),
+        Ok(runtime::execution_live::TerminalFenceClaim::Claimed)
+    ));
+    service
+        .enrich_finalized_session_live(
+            "execution-finished",
+            ExecutionLiveStatus::Complete,
+            &report,
+            &[],
+            "terminal-finished".to_string(),
+            None,
+        )
+        .unwrap();
 
     let index = service.session_execution_index("session-index");
     assert_eq!(index.active_execution_ids, vec!["execution-running"]);
@@ -2203,7 +2315,7 @@ fn session_cancel_reaches_the_runtime_turn_control_instead_of_only_emitting_ui_s
 
 #[tokio::test]
 async fn user_cancelled_primary_ingress_does_not_write_ingress_failed() {
-    let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+    let store = Arc::new(crate::pg_test_support::session_store());
     let now = chrono::Utc::now().to_rfc3339();
     store
         .create_session(&session::SessionRecord {
@@ -2268,7 +2380,7 @@ async fn user_cancelled_primary_ingress_does_not_write_ingress_failed() {
 
 #[tokio::test]
 async fn durable_requested_cancellation_stops_ingress_before_provider_or_tool_work() {
-    let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+    let store = Arc::new(crate::pg_test_support::session_store());
     let now = chrono::Utc::now().to_rfc3339();
     store
         .create_session(&session::SessionRecord {
@@ -2406,6 +2518,39 @@ async fn process_shutdown_rejects_new_turns_and_waits_for_active_turn_guard() {
     assert_eq!(report.drained, 1);
     assert!(report.remaining_turn_ids.is_empty());
     assert_eq!(service.active_turn_count(), 0);
+    service.gateway_tasks.shutdown().await;
+}
+
+#[tokio::test]
+async fn process_restart_quiesce_preserves_active_turn_without_business_cancellation() {
+    let service = Arc::new(test_runtime_service(
+        Arc::new(ActiveSessionDirectory::default()),
+        None,
+    ));
+    let (cancellation, guard) = service
+        .install_active_turn_control(
+            "turn-restart",
+            "session-restart",
+            Some("execution-restart".to_string()),
+        )
+        .unwrap();
+
+    let preserved = service.stop_accepting_for_recovery();
+    assert_eq!(preserved, vec!["execution-restart"]);
+    assert!(
+        !cancellation.is_cancelled(),
+        "host lifecycle must not manufacture a user/business cancellation"
+    );
+    assert!(service
+        .install_active_turn_control("turn-late", "session-restart", None)
+        .is_err());
+
+    drop(guard);
+    let report = service
+        .wait_for_active_turns(0, Duration::from_secs(1))
+        .await;
+    assert_eq!(report.cancelled, 0);
+    assert!(report.remaining_turn_ids.is_empty());
     service.gateway_tasks.shutdown().await;
 }
 

@@ -1932,7 +1932,7 @@ fn handoff_resume_packet_summarizes_handoff_state() {
 
 #[test]
 fn semantic_checkpoint_resume_restores_all_runtime_critical_fields() {
-    let store = std::sync::Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+    let store = std::sync::Arc::new(crate::pg_test_support::session_store());
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
         store
@@ -2886,6 +2886,8 @@ fn response_to_events_preserves_empty_object_json_input_outside_streaming() {
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 0,
             },
+            usage_observed: true,
+            cache_dimensions_observed: false,
             request_id: None,
         },
         &mut out,
@@ -2921,6 +2923,8 @@ fn response_to_events_preserves_non_empty_json_input_outside_streaming() {
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 0,
             },
+            usage_observed: true,
+            cache_dimensions_observed: false,
             request_id: None,
         },
         &mut out,
@@ -2960,6 +2964,8 @@ fn response_to_events_keeps_private_thinking_out_of_public_reasoning() {
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 0,
             },
+            usage_observed: true,
+            cache_dimensions_observed: false,
             request_id: None,
         },
         &mut out,

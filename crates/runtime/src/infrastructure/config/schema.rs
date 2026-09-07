@@ -591,6 +591,41 @@ pub struct RuntimeFeatureConfig {
     pub(super) runtime_control: RuntimeControlConfig,
     pub(super) hot_state: crate::execution_core::hot_state::HotStateConfig,
     pub(super) provider_resources: crate::ProviderResourceConfig,
+    /// Commands eligible to back an external ProcessJsonl Agent. These are
+    /// parsed only from the operator-owned configuration layer; Agent
+    /// Definitions bind one by its digest but cannot introduce a command.
+    pub(super) agent_executor_commands: Vec<AgentExecutorCommandConfig>,
+}
+
+/// One operator-approved ProcessJsonl command manifest. The digest is derived
+/// from every execution-relevant field and is copied into an Agent Binding at
+/// compile time. `environment_refs` deliberately contains references, never
+/// values, so config diagnostics and projections cannot disclose credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentExecutorCommandConfig {
+    pub command_ref: String,
+    pub executable: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub working_directory: Option<String>,
+    #[serde(default)]
+    pub environment_refs: BTreeMap<String, String>,
+    #[serde(default)]
+    pub sandbox_profile: AgentExecutorSandboxProfile,
+    pub manifest_digest: String,
+}
+
+/// Small, explicit sandbox profiles for an external Agent executable. This
+/// is a capability boundary, not an Agent-authored preference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentExecutorSandboxProfile {
+    #[default]
+    WorkspaceReadWrite,
+    WorkspaceReadOnly,
+    IsolatedReadWrite,
+    IsolatedReadOnly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -608,12 +643,7 @@ pub enum RoutingMode {
 #[serde(rename_all = "snake_case")]
 pub enum StorageBackendSelection {
     #[default]
-    Sqlite,
     Postgres,
-    /// PostgreSQL is preferred; SQLite is used automatically when PostgreSQL
-    /// is not configured or unavailable at cold start. Runtime fallback is
-    /// deliberately process-scoped: no hot switching, no dual writes.
-    Auto,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -723,12 +753,6 @@ impl From<ArtifactStorageConfig> for crate::ArtifactStoreConfig {
 #[serde(rename_all = "camelCase")]
 pub struct StorageTopologyConfig {
     pub backend: StorageBackendSelection,
-    /// Preferred backend for `backend=auto`. Only `postgres` is supported.
-    pub preferred: StorageBackendSelection,
-    /// Fallback backend for `backend=auto`. Only `sqlite` is supported.
-    pub fallback: StorageBackendSelection,
-    /// PostgreSQL cold-start probe timeout used by `backend=auto`.
-    pub fallback_probe_timeout_ms: u64,
     pub postgres: Option<PostgresTopologyConfig>,
     pub session_execution: SessionStorageExecutionConfig,
     pub artifacts: ArtifactStorageConfig,
@@ -737,10 +761,7 @@ pub struct StorageTopologyConfig {
 impl Default for StorageTopologyConfig {
     fn default() -> Self {
         Self {
-            backend: StorageBackendSelection::Auto,
-            preferred: StorageBackendSelection::Postgres,
-            fallback: StorageBackendSelection::Sqlite,
-            fallback_probe_timeout_ms: 3_000,
+            backend: StorageBackendSelection::Postgres,
             postgres: None,
             session_execution: SessionStorageExecutionConfig::default(),
             artifacts: ArtifactStorageConfig::default(),

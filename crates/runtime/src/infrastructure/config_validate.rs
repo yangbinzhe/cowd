@@ -282,6 +282,33 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "network",
         expected: FieldType::Object,
     },
+    FieldSpec {
+        name: "agent_executor_commands",
+        expected: FieldType::Object,
+    },
+];
+
+const AGENT_EXECUTOR_COMMAND_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "executable",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "args",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "working_directory",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "environment_refs",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "sandbox_profile",
+        expected: FieldType::String,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[
@@ -954,6 +981,22 @@ pub fn validate_config_file(
             source,
             &path_display,
         ));
+    }
+    if let Some(commands) = object
+        .get("agent_executor_commands")
+        .and_then(JsonValue::as_object)
+    {
+        for (command_ref, command) in commands {
+            if let Some(command) = command.as_object() {
+                result.merge(validate_object_keys(
+                    command,
+                    AGENT_EXECUTOR_COMMAND_FIELDS,
+                    &format!("agent_executor_commands.{command_ref}"),
+                    source,
+                    &path_display,
+                ));
+            }
+        }
     }
     if let Some(runtime) = object.get("runtime").and_then(JsonValue::as_object) {
         result.merge(validate_object_keys(

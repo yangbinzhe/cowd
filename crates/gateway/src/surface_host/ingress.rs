@@ -1782,7 +1782,7 @@ mod tests {
     #[test]
     fn surface_ingress_durable_idempotency_key_normalizes_surface_aliases() {
         assert_eq!(
-            crate::surface_host::message_store::inbound_idempotency_key("lark", "msg-1"),
+            format!("{}:{}", surface::normalize_surface_id("lark"), "msg-1"),
             "feishu:msg-1"
         );
     }
@@ -1883,7 +1883,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let image_path = temp.path().join("img_001.png");
         std::fs::write(&image_path, b"fake-png").expect("image writes");
-        let store = runtime::ResourceStore::default_for_config_home(&temp.path().join("home"));
+        let store = runtime::ResourceStore::for_test_config_home(&temp.path().join("home"));
         let resource = store
             .register_resource_from_path(
                 &image_path,
@@ -1916,7 +1916,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let image_path = temp.path().join("img_002.jpg");
         std::fs::write(&image_path, b"fake-jpg").expect("image writes");
-        let store = runtime::ResourceStore::default_for_config_home(&temp.path().join("home"));
+        let store = runtime::ResourceStore::for_test_config_home(&temp.path().join("home"));
         let resource = store
             .register_resource_from_path(
                 &image_path,
@@ -1949,7 +1949,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let audio_path = temp.path().join("voice.mp3");
         std::fs::write(&audio_path, b"fake-mp3").expect("audio writes");
-        let store = runtime::ResourceStore::default_for_config_home(&temp.path().join("home"));
+        let store = runtime::ResourceStore::for_test_config_home(&temp.path().join("home"));
         let resource = store
             .register_resource_from_path(
                 &audio_path,
@@ -2057,7 +2057,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let resource_path = temp.path().join("replay-resource.txt");
         std::fs::write(&resource_path, b"stable resource payload").expect("resource writes");
-        let store = runtime::ResourceStore::default_for_config_home(&temp.path().join("home"));
+        let store = runtime::ResourceStore::for_test_config_home(&temp.path().join("home"));
 
         let first = store
             .register_resource_from_path_idempotent(

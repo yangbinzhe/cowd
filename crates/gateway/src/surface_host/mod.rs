@@ -12,10 +12,10 @@ use surface::{
 use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
 mod edge_h2;
+mod ephemeral_message_store;
 mod ingress;
 mod invocation;
 mod ledger;
-mod message_store;
 mod monitor;
 mod registry;
 mod repair;
@@ -23,9 +23,9 @@ mod static_assets;
 mod supervisor;
 mod types;
 
+pub(crate) use ephemeral_message_store::EphemeralSurfaceMessageLedger;
 pub(crate) use ingress::spawn_surface_ingress_dispatcher;
-pub(crate) use message_store::SqliteSurfaceMessageStore;
-pub(crate) use message_store::{
+pub(crate) use surface::{
     SurfaceDeliveryEvent, SurfaceInboxReceipt, SurfaceInboxRecord, SurfaceIngressClaim,
     SurfaceMessageSnapshot, SurfaceOutboxRecord, SurfaceSessionProjectionDraft,
     SurfaceTriggerEventReceipt, SurfaceTriggerEventRecord, SurfaceTurnCorrelation,
@@ -91,10 +91,10 @@ impl SurfaceHost {
         Self::with_configs_and_message_store(
             roots,
             configs,
-            Arc::new(
-                SqliteSurfaceMessageStore::try_new(message_root)
-                    .expect("isolated Surface test store"),
-            ),
+            Arc::new({
+                let _ = message_root;
+                EphemeralSurfaceMessageLedger::new()
+            }),
         )
     }
 
@@ -141,9 +141,7 @@ impl SurfaceHost {
         Ok(Self::with_configs_and_message_store(
             Vec::new(),
             BTreeMap::new(),
-            Arc::new(SqliteSurfaceMessageStore::in_memory(
-                "gateway-surface-baseline",
-            )?),
+            Arc::new(EphemeralSurfaceMessageLedger::new()),
         ))
     }
 
@@ -236,17 +234,13 @@ mod tests {
     }
 
     #[test]
-    fn surface_host_empty_roots_message_store_does_not_use_current_directory() {
+    fn surface_host_empty_roots_uses_explicit_ephemeral_ledger() {
         let host = SurfaceHost::with_configs(Vec::new(), BTreeMap::new());
-        assert_ne!(
+        assert_eq!(
             host.message_store_root(),
-            Path::new("."),
-            "surface message store must not default to the source/current directory"
+            Path::new("ephemeral://surface-ledger"),
+            "test host must identify its non-durable ledger explicitly"
         );
-        assert!(host
-            .message_store_root()
-            .components()
-            .any(|component| component.as_os_str() == "cowd-surface-messages"));
     }
 
     #[test]
@@ -256,16 +250,19 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let messages: Arc<dyn SurfaceMessageLedger> =
-            Arc::new(SqliteSurfaceMessageStore::new(&root));
+            Arc::new(EphemeralSurfaceMessageLedger::new());
         let host = SurfaceHost::with_configs_and_message_store(
             Vec::new(),
             BTreeMap::new(),
             messages.clone(),
         );
 
-        assert_eq!(host.message_store_root(), root);
+        assert_eq!(
+            host.message_store_root(),
+            PathBuf::from("ephemeral://surface-ledger")
+        );
         assert!(messages.list_inbox("fixture").unwrap().is_empty());
-        let _ = fs::remove_dir_all(host.message_store_root());
+        let _ = root;
     }
 
     #[tokio::test]

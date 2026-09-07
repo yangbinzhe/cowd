@@ -3,6 +3,48 @@ use harness_contract::{
     execution::ExecutionIdentity,
     execution_graph::{ExecutionGraph, ExecutionGraphLineage},
 };
+use std::sync::{Arc, OnceLock};
+
+use session::UnifiedSessionStore;
+use storage::{PostgresConnectionConfig, PostgresExecutor, StaticSecretRefResolver};
+
+fn postgres_executor() -> PostgresExecutor {
+    static EXECUTOR: OnceLock<Result<PostgresExecutor, String>> = OnceLock::new();
+    EXECUTOR
+        .get_or_init(|| {
+            let url = std::env::var("COWD_TEST_POSTGRES_URL")
+                .map_err(|_| "COWD_TEST_POSTGRES_URL is required".to_string())?;
+            let resolver = StaticSecretRefResolver::new([("runtime.test.pg".to_string(), url)]);
+            let mut config = PostgresConnectionConfig::new(
+                "runtime-test",
+                "runtime.test.pg",
+                "cowd-runtime-test",
+            );
+            config.max_connections = 8;
+            config.min_idle_connections = None;
+            PostgresExecutor::connect(config, &resolver).map_err(|error| error.to_string())
+        })
+        .clone()
+        .unwrap_or_else(|error| panic!("isolated PostgreSQL test executor: {error}"))
+}
+
+/// Build a complete Session contract over an isolated PostgreSQL schema.
+/// Test runners remove `cowdrt_*` schemas after the process exits.
+pub(crate) fn session_store() -> UnifiedSessionStore {
+    let executor = postgres_executor();
+    let schema = format!("cowdrt_{}", uuid::Uuid::new_v4().simple());
+    executor
+        .checkout_critical()
+        .expect("PostgreSQL test connection")
+        .batch_execute(&format!("CREATE SCHEMA \"{schema}\""))
+        .expect("create isolated Runtime test schema");
+    let scoped = executor
+        .scoped_namespace(&schema)
+        .expect("scope Runtime test schema");
+    let backend = session_postgres::PostgresSessionStore::new(scoped)
+        .expect("initialize Session PostgreSQL test adapter");
+    UnifiedSessionStore::from_backend(Arc::new(backend))
+}
 
 pub(crate) fn execution_graph_lineage(graph_id: &str) -> ExecutionGraphLineage {
     let task_id = format!("test-task:{graph_id}");

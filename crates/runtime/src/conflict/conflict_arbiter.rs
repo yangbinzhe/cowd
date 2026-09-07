@@ -198,8 +198,7 @@ mod tests {
     use super::*;
 
     fn arbiter() -> ConflictArbiter {
-        let event_store =
-            Arc::new(RuntimeEventStore::try_open_in_memory().expect("runtime event store"));
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let evidence_bus = Arc::new(MissionEvidenceBus::new(Arc::clone(&event_store)));
         ConflictArbiter::new(evidence_bus, event_store)
     }

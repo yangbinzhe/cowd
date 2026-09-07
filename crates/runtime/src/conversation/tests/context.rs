@@ -1,6 +1,6 @@
     #[test]
     fn recovered_strategy_restores_frozen_candidate_cost_estimates() {
-        let store = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let store = Arc::new(RuntimeEventStore::for_test());
         let first_runtime = ConversationRuntime::new(
             Session::new(),
             MockApi,
@@ -467,7 +467,7 @@
 
     #[tokio::test]
     async fn first_model_step_activates_skill_persists_bridge_and_injects_asset() {
-        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::test_support::session_store());
         let session = Session::new();
         let session_id = session.session_id.clone();
         store
@@ -1332,7 +1332,7 @@
         };
         let artifact_root = tempfile::tempdir().unwrap();
         let session = Session::new();
-        let session_store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let session_store = Arc::new(crate::test_support::session_store());
         session_store
             .create_session(&session::SessionRecord {
                 session_id: session.session_id.clone(),
@@ -1359,12 +1359,12 @@
             vec!["system".to_string()],
         )
         .without_memory()
-        .with_runtime_event_store(Arc::new(RuntimeEventStore::try_open_in_memory().unwrap()))
+        .with_runtime_event_store(Arc::new(RuntimeEventStore::for_test()))
         .with_session_journal_port(crate::session_runtime_port::TestSessionPortAdapter::new(
             session_store,
         ))
         .with_artifact_store(Arc::new(
-            crate::ArtifactStore::sqlite(
+            crate::ArtifactStore::for_test(
                 artifact_root.path(),
                 crate::ArtifactStoreConfig::default(),
             )
@@ -1537,14 +1537,11 @@
         )
         .without_memory()
         .with_runtime_event_store(Arc::new(
-            RuntimeEventStore::try_open_in_memory().expect("event store"),
+            RuntimeEventStore::for_test(),
         ));
         runtime
             .begin_turn_strategy("orchestration-gate-turn", "必须实际启动协作团队完成分析")
             .expect("turn strategy admission");
-        runtime
-            .set_turn_strategy_collaboration_obligation(1)
-            .expect("freeze root collaboration obligation");
         runtime.require_next_agent_action();
         runtime
             .execute_model_step("必须实际启动协作团队完成分析", true)
@@ -1692,7 +1689,7 @@
     #[tokio::test]
     async fn governed_tool_results_persist_raw_evidence_and_bound_model_receipt() {
         let artifact_root = tempfile::tempdir().unwrap();
-        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::test_support::session_store());
         let session = Session::new();
         let session_id = session.session_id.clone();
         store
@@ -1722,7 +1719,7 @@
         )
         .without_memory()
         .with_artifact_store(Arc::new(
-            crate::ArtifactStore::sqlite(
+            crate::ArtifactStore::for_test(
                 artifact_root.path(),
                 crate::ArtifactStoreConfig::default(),
             )
@@ -1808,7 +1805,7 @@
         // fail instead of fabricating an evidence receipt.
         .with_session_journal_port(
             crate::session_runtime_port::TestSessionPortAdapter::new(Arc::new(
-                session::UnifiedSessionStore::open_in_memory().unwrap(),
+                crate::test_support::session_store(),
             )),
         );
         let raw = "raw output retained only in the active runtime when durable write fails\n"
@@ -1830,7 +1827,7 @@
 
     #[tokio::test]
     async fn context_turn_report_is_durable_before_runtime_exposes_it() {
-        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::test_support::session_store());
         let session = Session::new();
         let session_id = session.session_id.clone();
         store
@@ -1881,7 +1878,7 @@
 
     #[tokio::test]
     async fn large_context_envelope_is_canonical_and_artifact_backed() {
-        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::test_support::session_store());
         let session = Session::new();
         let session_id = session.session_id.clone();
         store
@@ -1904,7 +1901,7 @@
             .unwrap();
         let artifact_root = tempfile::tempdir().unwrap();
         let artifacts = Arc::new(
-            crate::ArtifactStore::sqlite(
+            crate::ArtifactStore::for_test(
                 artifact_root.path(),
                 crate::ArtifactStoreConfig {
                     compact_threshold_bytes: 1,
@@ -1978,7 +1975,7 @@
 
     #[tokio::test]
     async fn context_turn_report_write_failure_does_not_expose_a_successful_report() {
-        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::test_support::session_store());
         let runtime = ConversationRuntime::new(
             Session::new(),
             MockApi,
@@ -2004,7 +2001,7 @@
 
     #[tokio::test]
     async fn compaction_event_failure_is_terminal_and_does_not_claim_durable_recovery() {
-        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(crate::test_support::session_store());
         let runtime = ConversationRuntime::new(
             Session::new(),
             MockApi,
@@ -2401,20 +2398,22 @@
     #[tokio::test(flavor = "multi_thread")]
     async fn prepare_reality_context_suppresses_memory_conflicting_with_current_turn() {
         let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("memory.db");
         let blob_dir = tmp.path().join("blobs");
         std::fs::create_dir_all(&blob_dir).unwrap();
 
         let mem_cfg = memory::config::MemoryConfig {
             store: memory::config::StoreConfig {
-                sqlite_path: db_path,
                 blob_dir,
                 enable_vector_index: false,
                 ..Default::default()
             },
             ..Default::default()
         };
-        let mgr = Arc::new(CognitiveContextManager::new(mem_cfg).await.unwrap());
+        let mgr = Arc::new(
+            CognitiveContextManager::new_ephemeral(mem_cfg)
+                .await
+                .unwrap(),
+        );
         let session = Session::new().with_workspace_root(tmp.path());
         let project_id = memory_project_id_for_session(&session).expect("workspace project id");
         let now = chrono::Utc::now();
@@ -2587,11 +2586,7 @@
     #[tokio::test(flavor = "multi_thread")]
     async fn runtime_reality_binding_injects_only_leased_fact_evidence_into_the_prompt() {
         let home = tempfile::tempdir().expect("temporary config home");
-        let registry = StorageRegistry::default_for_config_home(home.path());
-        let endpoint = registry
-            .endpoint(&storage::StorageDomainId::Fact)
-            .expect("fact endpoint");
-        let fact_ledger = fact_sqlite::SqliteFactLedger::open(endpoint).expect("fact ledger");
+        let fact_ledger = fact_kernel::EphemeralFactLedger::new();
         let mut fact = fact_kernel::FactRecord::new(
             "supply.policy",
             "east allocation requires expedited approval",
@@ -2647,7 +2642,10 @@
             vec!["system".to_string()],
         )
         .without_memory()
-        .with_reality_binding(RealityRecallPort::for_config_home(home.path()), binding);
+        .with_reality_binding(
+            RealityRecallPort::with_fact_ledger(home.path(), Arc::new(fact_ledger)),
+            binding,
+        );
 
         let prompt = runtime
             .prepare_reality_context("how should east allocation proceed")
@@ -2701,7 +2699,7 @@
             }),
         );
         let mut receiver = bus.subscribe();
-        let store = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let store = Arc::new(RuntimeEventStore::for_test());
         let events = vec![
             Ok(AssistantEvent::ItemStarted {
                 index: 0,
@@ -2884,7 +2882,7 @@
                 generation: 1,
             }),
         );
-        let store = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let store = Arc::new(RuntimeEventStore::for_test());
         let stream = Box::pin(futures::stream::iter(vec![
             Ok(AssistantEvent::PrivateReasoningDelta(
                 "provider-private-secret".to_string(),
@@ -2957,7 +2955,7 @@
             turn_id: "turn-partial".to_string(),
         });
         let mut receiver = bus.subscribe();
-        let store = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let store = Arc::new(RuntimeEventStore::for_test());
         let stream = Box::pin(futures::stream::iter(vec![
             Ok(AssistantEvent::ItemStarted {
                 index: 0,
@@ -3123,7 +3121,7 @@
     #[tokio::test]
     async fn provider_interruption_retains_completed_early_read_receipt() {
         let dispatcher = Arc::new(RecordingEarlyDispatcher::default());
-        let store = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let store = Arc::new(RuntimeEventStore::for_test());
         let events = vec![
             Ok(early_enabled_provider_event()),
             Ok(AssistantEvent::ItemStarted {

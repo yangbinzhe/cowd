@@ -137,6 +137,7 @@ impl DefinitionEvolutionScenarioCatalog for FileDefinitionEvolutionScenarioCatal
                 resource_scopes: Vec::new(),
                 permission_ceiling: PermissionMode::ReadOnly,
                 model_lease: "evaluation/default".to_string(),
+                replay_manifest: None,
             }
         } else {
             let raw = fs::read_to_string(&path).map_err(|error| {
@@ -1203,6 +1204,7 @@ mod tests {
             resource_scopes: Vec::new(),
             permission_ceiling: PermissionMode::ReadOnly,
             model_lease: "evaluation/default".to_string(),
+            replay_manifest: None,
         };
         fs::write(&path, serde_json::to_vec(&scenario).expect("json")).expect("write");
         let catalog = FileDefinitionEvolutionScenarioCatalog::new(&root);

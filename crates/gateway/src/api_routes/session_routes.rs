@@ -1948,7 +1948,18 @@ async fn cancel_session_turn_handler(
         .as_ref()
         .filter(|receipt| receipt.status != harness_contract::turn::CancellationStatus::Requested)
     {
-        return Ok(Json(receipt.clone()));
+        let reconciled = runtime_services
+            .resolve_requested_cancellation(&receipt.cancellation_id)
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("failed to reconcile cancellation receipt: {error}"),
+                    }),
+                )
+            })?
+            .unwrap_or_else(|| receipt.clone());
+        return Ok(Json(reconciled));
     }
     if persisted.is_none()
         && (expected_execution_id
@@ -1993,35 +2004,13 @@ async fn cancel_session_turn_handler(
                 )
             })?
     };
-    let cancelled_by_control = if intent.execution_id.is_empty() || intent.turn_id.is_empty() {
+    let _cancel_signal_delivered = if intent.execution_id.is_empty() || intent.turn_id.is_empty() {
         false
     } else {
         required_session_service(&state)?
             .cancel_active_execution(&id, &intent.turn_id, &intent.execution_id, reason)
             .map_err(session_service_error)?
     };
-    // After a Gateway restart the durable live execution can be recovered
-    // before the process-local cancellation-token registry. Resolve the same
-    // winner directly in that crash window; a later execution recovery sees
-    // Cancelled and must not resume provider work.
-    if !intent.execution_id.is_empty() && !cancelled_by_control {
-        runtime_services
-            .try_cancel_live_execution(&intent.execution_id, reason.to_string())
-            .map_err(|error| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("failed to persist cancellation winner: {error}"),
-                    }),
-                )
-            })?;
-    }
-    let cancellation_won = cancelled_by_control
-        || runtime_services
-            .execution_live(&intent.execution_id)
-            .is_some_and(|live| {
-                live.status == harness_contract::projection::ExecutionLiveStatus::Cancelled
-            });
     if !intent.execution_id.is_empty() {
         runtime_services
             .cancel_execution_tree(
@@ -2038,35 +2027,28 @@ async fn cancel_session_turn_handler(
                 )
             })?;
     }
-    let mut receipt = intent;
-    receipt.effective_at_ms = Some(session_route_now_ms());
-    receipt.status = if cancellation_won {
-        harness_contract::turn::CancellationStatus::Cancelled
-    } else {
-        harness_contract::turn::CancellationStatus::AlreadyTerminal
-    };
-    receipt.journal_sequence = 0;
-    receipt.projection_revision = 0;
     let receipt = runtime_services
-        .commit_cancellation_receipt(receipt)
+        .resolve_requested_cancellation(&intent.cancellation_id)
         .map_err(|error| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
-                    error: format!("failed to commit cancellation receipt: {error}"),
+                    error: format!("failed to resolve cancellation receipt: {error}"),
                 }),
             )
-        })?;
-    runtime_services.release_live_terminal_fence(&receipt.execution_id);
-    let event = crate::event_bus::SessionProjectionEvent::TerminalDelivery {
-        delivery: harness_contract::live::TerminalDeliveryEvent::CancellationCommitted {
-            receipt: receipt.clone(),
-        },
-        session_id: Some(receipt.session_id.clone()),
-        execution_id: (!receipt.execution_id.is_empty()).then(|| receipt.execution_id.clone()),
-        turn_id: (!receipt.turn_id.is_empty()).then(|| receipt.turn_id.clone()),
-    };
-    state.event_bus().publish(&id, event).await;
+        })?
+        .unwrap_or(intent);
+    if receipt.status != harness_contract::turn::CancellationStatus::Requested {
+        let event = crate::event_bus::SessionProjectionEvent::TerminalDelivery {
+            delivery: harness_contract::live::TerminalDeliveryEvent::CancellationCommitted {
+                receipt: receipt.clone(),
+            },
+            session_id: Some(receipt.session_id.clone()),
+            execution_id: (!receipt.execution_id.is_empty()).then(|| receipt.execution_id.clone()),
+            turn_id: (!receipt.turn_id.is_empty()).then(|| receipt.turn_id.clone()),
+        };
+        state.event_bus().publish(&id, event).await;
+    }
 
     Ok(Json(receipt))
 }

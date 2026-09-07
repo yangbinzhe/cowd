@@ -460,6 +460,14 @@ impl ApprovalQueue {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn deadline_scheduler_running(&self) -> bool {
+        self.deadline_worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
     #[must_use]
     pub fn active_deadline_count(&self) -> usize {
         self.deadlines
@@ -1882,9 +1890,7 @@ mod tests {
     use harness_contract::policy::{ApprovalDomain, ApprovalProfile};
 
     fn queue() -> ApprovalQueue {
-        ApprovalQueue::new(Arc::new(
-            RuntimeEventStore::try_open_in_memory().expect("event store"),
-        ))
+        ApprovalQueue::new(Arc::new(RuntimeEventStore::for_test()))
     }
 
     fn session_source() -> ApprovalSource {
@@ -2265,7 +2271,7 @@ mod tests {
 
     #[test]
     fn pending_timeout_writes_typed_terminal_marker_and_closes_request() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let queue = ApprovalQueue::new(store.clone());
         let held = queue
             .submit(SubmitGlobalApprovalRequest {
@@ -2568,7 +2574,7 @@ mod tests {
 
     #[test]
     fn decided_approval_is_restored_after_restart() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = Arc::new(RuntimeEventStore::for_test());
         let queue = ApprovalQueue::new(Arc::clone(&store));
         let request = queue
             .submit_scoped(
@@ -2825,8 +2831,7 @@ mod tests {
 
     #[test]
     fn global_grant_restores_with_the_same_scope_boundaries() {
-        let event_store =
-            Arc::new(crate::RuntimeEventStore::try_open_in_memory().expect("event store"));
+        let event_store = Arc::new(crate::RuntimeEventStore::for_test());
         let queue = ApprovalQueue::new(Arc::clone(&event_store));
         let request = queue
             .submit(SubmitGlobalApprovalRequest {

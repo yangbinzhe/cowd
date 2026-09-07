@@ -4,10 +4,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use chrono::Utc;
-use memory::store::{sqlite::SqliteStore, MemoryStore};
+use memory::store::MemoryStore;
 use memory::{
-    AgentVisibility, MemoryCategory, MemoryEntry, MemoryLayer, MemoryOrchestrator, MemoryScope,
-    MemorySource, Priority,
+    AgentVisibility, EphemeralMemoryStore, MemoryCategory, MemoryEntry, MemoryLayer,
+    MemoryOrchestrator, MemoryScope, MemorySource, Priority,
 };
 
 fn entry(instance: &str, index: usize) -> MemoryEntry {
@@ -38,7 +38,7 @@ fn entry(instance: &str, index: usize) -> MemoryEntry {
 #[tokio::test]
 async fn concurrent_instance_writes_preserve_explicit_agent_instance_scope_without_ambient_identity(
 ) {
-    let store: Arc<dyn MemoryStore> = Arc::new(SqliteStore::open_in_memory().expect("sqlite"));
+    let store: Arc<dyn MemoryStore> = Arc::new(EphemeralMemoryStore::new());
     let memory =
         Arc::new(MemoryOrchestrator::from_store(Default::default(), store, None).expect("memory"));
     let mut tasks = Vec::new();

@@ -388,7 +388,7 @@ mod tests {
 
     #[test]
     fn event_sourced_projection_rebuilds_after_runtime_restart() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("event store"));
+        let store = Arc::new(RuntimeEventStore::for_test());
         let relations = SessionRelationGraph::event_sourced(Arc::clone(&store), "workspace-a")
             .expect("relation projection");
         let relation = relations

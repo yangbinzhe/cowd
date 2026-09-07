@@ -351,7 +351,58 @@ where
     /// boundary: receipts and governed plans created before the first Provider
     /// request must remain live so the packed request can attest their actual
     /// delivery.
-    pub(crate) fn begin_turn_runtime_epoch(&self) {
+    pub(crate) async fn begin_turn_runtime_epoch(&self) {
+        let epoch = self
+            .cowd_bus
+            .as_ref()
+            .and_then(|bus| bus.current_execution_context())
+            .and_then(|context| {
+                super::ProviderAttemptEpoch::new(context.execution_id, context.turn_id)
+            });
+        let mut recovered = std::collections::BTreeMap::new();
+        let mut recovery_authoritative = true;
+        if let (Some(reader), Some(epoch)) = (self.session_history_reader.as_ref(), epoch.as_ref())
+        {
+            for kind in [
+                "context.provider_request_packed",
+                "context.provider_attempt_outcome",
+            ] {
+                let events = match reader
+                    .domain_events_for_epoch(
+                        self.session_id(),
+                        kind,
+                        &epoch.execution_id,
+                        &epoch.turn_id,
+                    )
+                    .await
+                {
+                    Ok(events) => events,
+                    Err(error) => {
+                        recovery_authoritative = false;
+                        tracing::warn!(
+                            session_id = self.session_id(),
+                            execution_id = %epoch.execution_id,
+                            turn_id = %epoch.turn_id,
+                            %error,
+                            "provider attempt epoch recovery failed closed"
+                        );
+                        break;
+                    }
+                };
+                for event in events {
+                    debug_assert!(epoch.matches_payload(&event.payload));
+                    super::TurnCacheDimensionsObservation::apply_durable_payload(
+                        &mut recovered,
+                        &event.kind,
+                        &event.payload,
+                    );
+                }
+            }
+        }
+        self.cache_dimensions_observation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .begin_epoch_with_recovery_authority(epoch, recovered, recovery_authoritative);
         if let Ok(mut guard) = self.turn_tool_observations.lock() {
             guard.clear();
         }
@@ -386,6 +437,27 @@ where
                 budget.tool_result_budget.max_total_tokens as u64,
             );
         }
+    }
+
+    pub(crate) fn turn_cache_dimensions_known(&self) -> bool {
+        self.cache_dimensions_observation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .all_known()
+    }
+
+    pub(crate) fn turn_recovered_provider_usage(&self) -> super::RecoveredProviderUsage {
+        self.cache_dimensions_observation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recovered_usage()
+    }
+
+    pub(crate) fn turn_recovered_provider_attempt_count(&self) -> usize {
+        self.cache_dimensions_observation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .current_attempt_count()
     }
 
     pub(super) fn push_turn_tool_observation(&self, observation: ToolObservation) {

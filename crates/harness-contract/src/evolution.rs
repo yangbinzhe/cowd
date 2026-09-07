@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 
 pub const EVOLUTION_ANALYSIS_CONTRACT_VERSION: &str = "evolution-analysis-draft/v1";
 pub const COLLABORATION_EXPERIENCE_SCHEMA_VERSION: u16 = 1;
-pub const COLLABORATION_SIGNATURE_NORMALIZER_REVISION: u16 = 1;
+pub const COLLABORATION_SIGNATURE_NORMALIZER_REVISION: u16 = 2;
 pub const COLLABORATION_PATTERN_SCHEMA_VERSION: u16 = 1;
 pub const MINIMUM_PATTERN_DISTINCT_TURNS: usize = 3;
 pub const MAX_COLLABORATION_EPISODE_EVIDENCE_REFS: usize = 64;
@@ -88,6 +88,12 @@ impl CollaborationSemanticSignature {
             normalize_strings(&mut workstream.result_field_shapes);
         }
         self.workstream_shapes.sort_by_key(|shape| shape.ordinal);
+        let ordinal_map = self
+            .workstream_shapes
+            .iter()
+            .enumerate()
+            .map(|(index, shape)| (shape.ordinal, index.min(u16::MAX as usize) as u16))
+            .collect::<std::collections::BTreeMap<_, _>>();
         for (ordinal, workstream) in self.workstream_shapes.iter_mut().enumerate() {
             workstream.ordinal = ordinal.min(u16::MAX as usize) as u16;
             workstream.multiplicity_min = workstream.multiplicity_min.max(1);
@@ -96,6 +102,12 @@ impl CollaborationSemanticSignature {
             }
         }
         for dependency in &mut self.dependency_shapes {
+            if let Some(ordinal) = ordinal_map.get(&dependency.producer_ordinal) {
+                dependency.producer_ordinal = *ordinal;
+            }
+            if let Some(ordinal) = ordinal_map.get(&dependency.consumer_ordinal) {
+                dependency.consumer_ordinal = *ordinal;
+            }
             normalize_strings(&mut dependency.required_artifact_kinds);
             normalize_strings(&mut dependency.required_fact_kinds);
         }
@@ -157,9 +169,11 @@ pub struct CollaborationEvidenceCoverage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollaborationResourceSummary {
+    /// Structural demand, not observed provider concurrency.
     pub parallel_demand: u16,
-    pub context_reservation_tokens: u64,
-    pub output_reservation_tokens: u64,
+    /// None when admission records only a combined token reservation.
+    pub context_reservation_tokens: Option<u64>,
+    pub output_reservation_tokens: Option<u64>,
 }
 
 /// Durable terminal-only episode. Identity inputs are opaque digests and
@@ -239,8 +253,8 @@ pub struct CollaborationSemanticPattern {
     pub latest_completed_at_ms: u64,
 }
 
-/// Safe, structural advice returned to the compiler after lower-precedence
-/// intent sources have been evaluated. It has no label, Definition ref,
+/// Safe, structural advice offered to the model, never executed by a compiler.
+/// It has no label, Definition ref,
 /// permission, approval, or executable graph field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SemanticCollaborationSuggestion {
@@ -278,7 +292,21 @@ impl CollaborationSemanticPattern {
 
     #[must_use]
     pub fn is_actionable(&self) -> bool {
+        let episode_count = self
+            .qualifying_episode_ids
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let turn_count = self
+            .distinct_turn_ref_hashes
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
         self.schema_version == COLLABORATION_PATTERN_SCHEMA_VERSION
+            && self.pattern_revision > 0
+            && self.latest_completed_at_ms > 0
+            && self.signature_digest == self.semantic_signature.digest()
+            && self.pattern_id == Self::deterministic_id(&self.signature_digest)
             && matches!(
                 self.lifecycle,
                 SemanticPatternLifecycle::Advisory | SemanticPatternLifecycle::CandidateCreated
@@ -286,6 +314,18 @@ impl CollaborationSemanticPattern {
             && self.qualifying_episode_ids.len() >= MINIMUM_PATTERN_DISTINCT_TURNS
             && self.distinct_turn_ref_hashes.len() >= MINIMUM_PATTERN_DISTINCT_TURNS
             && self.support_count as usize == self.qualifying_episode_ids.len()
+            && episode_count == self.qualifying_episode_ids.len()
+            && turn_count == self.distinct_turn_ref_hashes.len()
+            && turn_count <= episode_count
+            && self
+                .qualifying_episode_ids
+                .iter()
+                .chain(&self.distinct_turn_ref_hashes)
+                .all(|id| !id.trim().is_empty())
+            && self.evidence_summary.eligible_episode_count as usize == episode_count
+            && self.evidence_summary.distinct_turn_count as usize == turn_count
+            && self.evidence_summary.coverage_basis_points == 10_000
+            && self.evidence_summary.evidence_ref_count > 0
     }
 }
 
@@ -293,7 +333,6 @@ impl CollaborationSemanticPattern {
 #[serde(rename_all = "snake_case")]
 pub enum EvolutionAnalysisCandidateKind {
     AgentDefinition,
-    TeamTemplate,
     Strategy,
     Skill,
     Tool,
@@ -443,6 +482,20 @@ mod tests {
     }
 
     #[test]
+    fn signature_normalization_remaps_dependency_endpoints_and_is_idempotent() {
+        let mut value = signature();
+        let mut second = value.workstream_shapes[0].clone();
+        second.ordinal = 7;
+        value.workstream_shapes.push(second);
+        value.dependency_shapes[0].producer_ordinal = 42;
+        value.dependency_shapes[0].consumer_ordinal = 7;
+        let normalized = value.normalized();
+        assert_eq!(normalized.dependency_shapes[0].producer_ordinal, 1);
+        assert_eq!(normalized.dependency_shapes[0].consumer_ordinal, 0);
+        assert_eq!(normalized.clone().normalized(), normalized);
+    }
+
+    #[test]
     fn collaboration_signature_captures_cardinality_acceptance_and_result_shape() {
         let baseline = signature().normalized();
         let baseline_digest = baseline.digest();
@@ -491,8 +544,8 @@ mod tests {
             latency_ms: 42,
             resource_summary: CollaborationResourceSummary {
                 parallel_demand: 2,
-                context_reservation_tokens: 100,
-                output_reservation_tokens: 20,
+                context_reservation_tokens: Some(100),
+                output_reservation_tokens: Some(20),
             },
             completed_at_ms: 99,
         };
@@ -562,6 +615,18 @@ mod tests {
             latest_completed_at_ms: 10,
         };
         assert!(pattern.is_actionable());
+        let mut repeated = pattern.clone();
+        repeated.distinct_turn_ref_hashes[1] = repeated.distinct_turn_ref_hashes[0].clone();
+        assert!(
+            !repeated.is_actionable(),
+            "vector length is not distinct support"
+        );
+        let mut repeated = pattern.clone();
+        repeated.qualifying_episode_ids[1] = repeated.qualifying_episode_ids[0].clone();
+        assert!(!repeated.is_actionable());
+        let mut forged = pattern.clone();
+        forged.signature_digest = "sha256:forged".into();
+        assert!(!forged.is_actionable());
         let mut duplicate_turn = pattern.clone();
         duplicate_turn.distinct_turn_ref_hashes.pop();
         assert!(!duplicate_turn.is_actionable());

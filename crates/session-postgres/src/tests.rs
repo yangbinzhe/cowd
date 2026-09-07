@@ -1,6 +1,5 @@
 use std::sync::{Arc, Barrier, Mutex, MutexGuard, OnceLock};
 
-use session::{SessionStoreBackend, UnifiedSessionStore};
 use storage::StaticSecretRefResolver;
 
 use super::*;
@@ -286,7 +285,7 @@ fn postgres_message_batch_eliminates_round_trips_and_beats_legacy_by_fifteen_per
 
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
-fn postgres_activation_index_and_manifest_repair_match_sqlite_semantics() {
+fn postgres_activation_index_and_manifest_repair_preserve_session_contract() {
     let _guard = postgres_test_guard();
     let store = real_store();
     clear_isolated_store(&store);
@@ -449,196 +448,8 @@ fn existing_postgres_outbox_schema_migrates_claim_fence_epoch_in_place() {
 }
 
 #[test]
-fn sqlite_snapshot_contains_full_session_truth_and_is_stable() {
-    let source = SqliteSessionStore::open_in_memory().expect("SQLite source opens");
-    source
-        .create_session(&session("migration-session"))
-        .expect("session");
-    source
-        .insert_message(&SessionMessage {
-            stable_message_id: "m-1".to_string(),
-            session_id: "migration-session".to_string(),
-            sequence: 0,
-            role: "user".to_string(),
-            content_json: r#"[{"type":"text","text":"hello"}]"#.to_string(),
-            blocks_count: 1,
-            tool_use_id: None,
-            tool_name: None,
-            token_usage_json: None,
-            created_at_ms: 1,
-        })
-        .expect("message");
-    source
-        .append_event(&SessionEvent {
-            session_id: "migration-session".to_string(),
-            event_type: "SessionCreated".to_string(),
-            event_json: r#"{"kind":"session.created"}"#.to_string(),
-            sequence: 0,
-            created_at_ms: 2,
-        })
-        .expect("event");
-    source
-            .append_event(&SessionEvent {
-                session_id: "migration-session".to_string(),
-                event_type: session::SESSION_DOMAIN_EVENT_TYPE.to_string(),
-                event_json: r#"{"kind":"memory.semantic_checkpoint.created","payload":{"checkpoint":{"checkpoint_id":"checkpoint-1"}}}"#.to_string(),
-                sequence: 1,
-                created_at_ms: 3,
-            })
-            .expect("checkpoint event");
-    source
-        .save_snapshot(&SessionSnapshot {
-            session_id: "migration-session".to_string(),
-            event_idx: 0,
-            messages_json: "[]".to_string(),
-            created_at_ms: 4,
-        })
-        .expect("snapshot");
-    source
-        .plan_session_lifecycle(&SessionLifecyclePlan {
-            operation_id: "lifecycle-copy".to_string(),
-            session_id: "migration-session".to_string(),
-            disposition: SessionCloseDisposition::Archive,
-            expected_generation: 1,
-            created_at_ms: 5,
-        })
-        .expect("lifecycle intent");
-    source
-        .branch_session_at_cutoff(&SessionBranchRequest {
-            operation_id: "branch-copy".to_string(),
-            source_session_id: "migration-session".to_string(),
-            source_message_count: 1,
-            target: session("migration-branch"),
-            source_event_json: r#"{"kind":"session.branch.source"}"#.to_string(),
-            target_event_json: r#"{"kind":"session.branch.target"}"#.to_string(),
-            created_at_ms: 6,
-        })
-        .expect("branch activation");
-    let first = export_sqlite_session_snapshot(&source).expect("first snapshot");
-    let second = export_sqlite_session_snapshot(&source).expect("second snapshot");
-    assert_eq!(
-        first.canonical_digest().unwrap(),
-        second.canonical_digest().unwrap()
-    );
-    assert_eq!(first.schema_version, 6);
-    assert_eq!(first.sessions.len(), 2);
-    assert_eq!(first.messages.len(), 2);
-    assert_eq!(first.events.len(), 4);
-    assert_eq!(first.checkpoints.len(), 1);
-    assert_eq!(first.snapshots.len(), 1);
-    assert_eq!(first.lifecycle_intents.len(), 1);
-    assert_eq!(first.branch_activations.len(), 1);
-}
-
-#[tokio::test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
-async fn postgres_adapter_real_copy_fences_and_injected_facade() {
-    let _guard = postgres_test_guard();
-    let target = real_store();
-    clear_isolated_store(&target);
-    let source = SqliteSessionStore::open_in_memory().expect("SQLite source opens");
-    source
-        .create_session(&session("migration-session"))
-        .expect("session");
-    source
-        .insert_message(&SessionMessage {
-            stable_message_id: "m-copy".to_string(),
-            session_id: "migration-session".to_string(),
-            sequence: 0,
-            role: "user".to_string(),
-            content_json: "[]".to_string(),
-            blocks_count: 1,
-            tool_use_id: None,
-            tool_name: None,
-            token_usage_json: None,
-            created_at_ms: 1,
-        })
-        .expect("message");
-    source
-        .plan_session_lifecycle(&SessionLifecyclePlan {
-            operation_id: "lifecycle-copy".to_string(),
-            session_id: "migration-session".to_string(),
-            disposition: SessionCloseDisposition::Archive,
-            expected_generation: 1,
-            created_at_ms: 2,
-        })
-        .expect("lifecycle intent");
-    source
-        .branch_session_at_cutoff(&SessionBranchRequest {
-            operation_id: "branch-copy".to_string(),
-            source_session_id: "migration-session".to_string(),
-            source_message_count: 1,
-            target: session("migration-branch"),
-            source_event_json: r#"{"kind":"session.branch.source"}"#.to_string(),
-            target_event_json: r#"{"kind":"session.branch.target"}"#.to_string(),
-            created_at_ms: 3,
-        })
-        .expect("branch activation");
-    let root = tempfile::tempdir().expect("manifest root");
-    let manifest = copy_quiesced_session_store(&source, &target, root.path().join("session.json"))
-        .expect("copy");
-    assert_eq!(manifest.source_digest, manifest.target_digest);
-    let copied = target
-        .export_migration_snapshot()
-        .expect("export copied PostgreSQL snapshot");
-    assert_eq!(copied.lifecycle_intents.len(), 1);
-    assert_eq!(copied.branch_activations.len(), 1);
-    let initial_source_events = copied
-        .events
-        .iter()
-        .filter(|event| event.session_id == "migration-session")
-        .count();
-    let injected = UnifiedSessionStore::from_backend(Arc::new(target.clone()));
-    assert_eq!(
-        injected
-            .list_sessions()
-            .await
-            .expect("injected facade read")
-            .len(),
-        target.list_sessions().unwrap().len()
-    );
-    let seed = SessionEvent {
-        session_id: "migration-session".to_string(),
-        event_type: "parallel".to_string(),
-        event_json: "{}".to_string(),
-        sequence: 0,
-        created_at_ms: 5,
-    };
-    let backend: Arc<dyn SessionStoreBackend> = Arc::new(target.clone());
-    let gate = Arc::new(Barrier::new(2));
-    let workers = (0..2)
-        .map(|_| {
-            let backend = Arc::clone(&backend);
-            let gate = Arc::clone(&gate);
-            let seed = seed.clone();
-            std::thread::spawn(move || {
-                gate.wait();
-                backend
-                    .append_event_allocating_sequence(&seed)
-                    .expect("allocated")
-            })
-        })
-        .collect::<Vec<_>>();
-    let mut sequences = workers
-        .into_iter()
-        .map(|worker| worker.join().expect("worker").sequence)
-        .collect::<Vec<_>>();
-    sequences.sort_unstable();
-    assert_eq!(
-        sequences,
-        vec![initial_source_events, initial_source_events + 1]
-    );
-    target
-        .delete_session("migration-session")
-        .expect("delete isolated migration session");
-    target
-        .delete_session("migration-branch")
-        .expect("delete isolated migration branch");
-}
-
-#[test]
-#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
-fn postgres_fenced_terminal_commit_matches_sqlite_atomic_identity_contract() {
+fn postgres_fenced_terminal_commit_preserves_atomic_identity_contract() {
     let _guard = postgres_test_guard();
     let store = real_store();
     let session_id = unique_id("terminal-fence");

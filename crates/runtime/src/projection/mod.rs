@@ -914,6 +914,7 @@ mod tests {
             approvals: Vec::new(),
             interventions: Vec::new(),
             child_executions: Vec::new(),
+            agentic_collaboration: Default::default(),
             descendant_graphs: Vec::new(),
         };
 
@@ -1410,6 +1411,505 @@ mod tests {
             )
         }));
     }
+    #[tokio::test]
+    async fn agentic_program_reducer_exports_canonical_typed_collaboration() {
+        use std::sync::Arc;
+
+        use harness_contract::agent_action::{
+            AgentAction, AgentActionEnvelope, AgentActorBinding, AgentActorKind, AgentInviteInput,
+            ArtifactCommitInput, MessagePublishInput, ObjectiveCompleteRequestInput,
+            TaskClaimInput, TaskPublishInput, TaskReviewDecision, TaskReviewInput, TaskSubmitInput,
+            TeamCreateInput,
+        };
+        use harness_contract::goal::{
+            AcceptanceCriterion, AcceptanceStatus, GoalCompletion, GoalContract,
+        };
+
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        let execution_id = "execution-1";
+        let mut graph = graph_with_lineage(
+            "Agentic projection authority",
+            "session-agentic-projection",
+            "turn-agentic-projection",
+            "task-agentic-projection",
+        );
+        graph.id = execution_id.to_string();
+        services
+            .execution_supervisor()
+            .register_graph(graph)
+            .await
+            .expect("register Agentic projection graph");
+
+        let root = |action_id: &str, action: AgentAction| AgentActionEnvelope {
+            action_id: action_id.to_string(),
+            actor: AgentActorBinding {
+                objective_id: "objective-agentic-projection".to_string(),
+                program_id: "program-agentic-projection".to_string(),
+                session_id: "session-agentic-projection".to_string(),
+                turn_id: "turn-agentic-projection".to_string(),
+                root_execution_id: Some(execution_id.to_string()),
+                required_team_count: 2,
+                objective_summary: "Produce an evidence-backed manufacturing report".to_string(),
+                model_lease: "projection-test".to_string(),
+                permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
+                resource_scopes: Vec::new(),
+                actor_id: "root-agentic-projection".to_string(),
+                kind: AgentActorKind::Root,
+                execution_id: None,
+                team_id: None,
+                agent_id: None,
+            },
+            expected_revision: None,
+            action,
+        };
+        let managed = |action_id: &str,
+                       team_id: &str,
+                       agent_id: &str,
+                       execution: &str,
+                       action: AgentAction| {
+            let mut envelope = root(action_id, action);
+            envelope.actor.actor_id = agent_id.to_string();
+            envelope.actor.kind = AgentActorKind::Agent;
+            envelope.actor.execution_id = Some(execution.to_string());
+            envelope.actor.team_id = Some(team_id.to_string());
+            envelope.actor.agent_id = Some(agent_id.to_string());
+            envelope
+        };
+        let actions = crate::AgentActionService::new(Arc::clone(services.event_store()));
+        let research_team_id = actions
+            .apply(&root(
+                "create-research-team",
+                AgentAction::TeamCreate(TeamCreateInput {
+                    name: "Evidence Research Team".to_string(),
+                    mission: "Research manufacturing evidence".to_string(),
+                    objective: Some("Ground every conclusion".to_string()),
+                }),
+            ))
+            .expect("create research Team")
+            .changed_refs[0]
+            .clone();
+        let synthesis_team_id = actions
+            .apply(&root(
+                "create-synthesis-team",
+                AgentAction::TeamCreate(TeamCreateInput {
+                    name: "Decision Synthesis Team".to_string(),
+                    mission: "Challenge and synthesize the evidence".to_string(),
+                    objective: Some("Deliver a reviewed decision".to_string()),
+                }),
+            ))
+            .expect("create synthesis Team")
+            .changed_refs[0]
+            .clone();
+        let analyst_id = actions
+            .apply(&root(
+                "invite-evidence-analyst",
+                AgentAction::AgentInvite(AgentInviteInput {
+                    team_ref: research_team_id.clone(),
+                    role: "Evidence Analyst".to_string(),
+                    mission: "Inspect the source evidence".to_string(),
+                    required_capabilities: vec!["read".to_string()],
+                    existing_agent_ref: None,
+                    definition_ref: None,
+                    model_profile_ref: None,
+                    expertise_hints: Vec::new(),
+                    execution_requirements: Vec::new(),
+                }),
+            ))
+            .expect("invite analyst")
+            .changed_refs[0]
+            .clone();
+        let reviewer_id = actions
+            .apply(&root(
+                "invite-decision-reviewer",
+                AgentAction::AgentInvite(AgentInviteInput {
+                    team_ref: synthesis_team_id.clone(),
+                    role: "Decision Reviewer".to_string(),
+                    mission: "Independently verify and synthesize findings".to_string(),
+                    required_capabilities: vec!["read".to_string()],
+                    existing_agent_ref: None,
+                    definition_ref: None,
+                    model_profile_ref: None,
+                    expertise_hints: Vec::new(),
+                    execution_requirements: Vec::new(),
+                }),
+            ))
+            .expect("invite reviewer")
+            .changed_refs[0]
+            .clone();
+        let research_task_id = actions
+            .apply(&root(
+                "publish-research-task",
+                AgentAction::TaskPublish(TaskPublishInput {
+                    team_ref: research_team_id.clone(),
+                    title: "Collect source evidence".to_string(),
+                    objective: "Establish the production baseline source".to_string(),
+                    acceptance: "Record the source revision".to_string(),
+                    required_capabilities: vec!["read".to_string()],
+                    depends_on: Vec::new(),
+
+                    obligation_refs: Vec::new(),
+                    purpose: Default::default(),
+                    execution_requirements: Vec::new(),
+                    expertise_hints: Vec::new(),
+                }),
+            ))
+            .expect("publish research Task")
+            .changed_refs[0]
+            .clone();
+        let synthesis_task_id = actions
+            .apply(&root(
+                "publish-synthesis-task",
+                AgentAction::TaskPublish(TaskPublishInput {
+                    team_ref: synthesis_team_id.clone(),
+                    title: "Validate production baseline".to_string(),
+                    objective: "Compare the live metric with its source evidence".to_string(),
+                    acceptance: "Cite the source and state uncertainty".to_string(),
+                    required_capabilities: vec!["read".to_string()],
+                    depends_on: vec![research_task_id.clone()],
+
+                    obligation_refs: Vec::new(),
+                    purpose: Default::default(),
+                    execution_requirements: Vec::new(),
+                    expertise_hints: Vec::new(),
+                }),
+            ))
+            .expect("publish synthesis Task")
+            .changed_refs[0]
+            .clone();
+
+        actions
+            .apply(&managed(
+                "claim-research-task",
+                &research_team_id,
+                &analyst_id,
+                "execution-agentic-analyst",
+                AgentAction::TaskClaim(TaskClaimInput {
+                    task_ref: research_task_id.clone(),
+                    reason: Some("matched evidence capability".to_string()),
+                }),
+            ))
+            .expect("claim research Task");
+        let research_artifact = actions
+            .apply(&managed(
+                "commit-research-artifact",
+                &research_team_id,
+                &analyst_id,
+                "execution-agentic-analyst",
+                AgentAction::ArtifactCommit(ArtifactCommitInput {
+                    content_ref: "artifact://manufacturing-source".to_string(),
+                    kind: "research".to_string(),
+                    title: "Manufacturing source evidence".to_string(),
+                    relates_to: Vec::new(),
+                }),
+            ))
+            .expect("commit research artifact")
+            .changed_refs[0]
+            .clone();
+        actions
+            .apply(&managed(
+                "publish-research-topic",
+                &research_team_id,
+                &analyst_id,
+                "execution-agentic-analyst",
+                AgentAction::MessagePublish(MessagePublishInput {
+                    topic_ref: format!("topic:{research_team_id}"),
+                    summary: Some("Source baseline is ready for independent review".to_string()),
+                    content_ref: Some(research_artifact.clone()),
+                    refs: vec![research_artifact.clone()],
+                    recipients: Vec::new(),
+                    intent: None,
+                }),
+            ))
+            .expect("publish topic");
+        actions
+            .apply(&managed(
+                "submit-research-task",
+                &research_team_id,
+                &analyst_id,
+                "execution-agentic-analyst",
+                AgentAction::TaskSubmit(TaskSubmitInput {
+                    task_ref: research_task_id.clone(),
+                    artifact_refs: vec![research_artifact.clone()],
+                    evidence_refs: vec!["tool://source-observation".to_string()],
+                    unresolved: Vec::new(),
+                }),
+            ))
+            .expect("submit research Task");
+        actions
+            .apply(&managed(
+                "review-research-task",
+                &synthesis_team_id,
+                &reviewer_id,
+                "execution-agentic-reviewer",
+                AgentAction::TaskReview(TaskReviewInput {
+                    task_ref: research_task_id.clone(),
+                    decision: TaskReviewDecision::Accept,
+                    reason: "source independently verified".to_string(),
+                    evidence_refs: vec!["tool://research-review".to_string()],
+                }),
+            ))
+            .expect("review research Task");
+
+        actions
+            .apply(&managed(
+                "claim-synthesis-task",
+                &synthesis_team_id,
+                &reviewer_id,
+                "execution-agentic-reviewer",
+                AgentAction::TaskClaim(TaskClaimInput {
+                    task_ref: synthesis_task_id.clone(),
+                    reason: Some("dependency is accepted".to_string()),
+                }),
+            ))
+            .expect("claim dependent Task");
+        let final_artifact = actions
+            .apply(&managed(
+                "commit-final-artifact",
+                &synthesis_team_id,
+                &reviewer_id,
+                "execution-agentic-reviewer",
+                AgentAction::ArtifactCommit(ArtifactCommitInput {
+                    content_ref: "artifact://manufacturing-decision".to_string(),
+                    kind: "report".to_string(),
+                    title: "Reviewed manufacturing decision".to_string(),
+                    relates_to: vec![research_artifact.clone()],
+                }),
+            ))
+            .expect("commit final artifact")
+            .changed_refs[0]
+            .clone();
+        actions
+            .apply(&managed(
+                "submit-synthesis-task",
+                &synthesis_team_id,
+                &reviewer_id,
+                "execution-agentic-reviewer",
+                AgentAction::TaskSubmit(TaskSubmitInput {
+                    task_ref: synthesis_task_id.clone(),
+                    artifact_refs: vec![final_artifact.clone()],
+                    evidence_refs: vec!["tool://decision-validation".to_string()],
+                    unresolved: Vec::new(),
+                }),
+            ))
+            .expect("submit synthesis Task");
+        actions
+            .apply(&managed(
+                "review-synthesis-task",
+                &research_team_id,
+                &analyst_id,
+                "execution-agentic-analyst",
+                AgentAction::TaskReview(TaskReviewInput {
+                    task_ref: synthesis_task_id.clone(),
+                    decision: TaskReviewDecision::Accept,
+                    reason: "decision is traceable to source".to_string(),
+                    evidence_refs: vec!["tool://decision-review".to_string()],
+                }),
+            ))
+            .expect("review synthesis Task");
+
+        services
+            .goal_store()
+            .create(GoalContract {
+                id: format!("goal:{execution_id}"),
+                session_id: "session-agentic-projection".to_string(),
+                objective: "Produce an evidence-backed manufacturing report".to_string(),
+                criteria: vec![AcceptanceCriterion {
+                    id: "terminal_synthesis".to_string(),
+                    statement: "produce reviewed evidence".to_string(),
+                    statement_ref: None,
+                    source_refs: Vec::new(),
+                    required_evidence: vec![format!("execution_graph:{execution_id}")],
+                    status: AcceptanceStatus::Open,
+                    waiver: None,
+                }],
+                constraints: Vec::new(),
+                phase: "execution".to_string(),
+                evidence_refs: Vec::new(),
+                unresolved: Vec::new(),
+                blockers: Vec::new(),
+                scope: harness_contract::goal::GoalScope::UserObjective,
+                user_intent_criterion_id: Some("terminal_synthesis".to_string()),
+                source_intent_ref: Some("session_message:projection-test".to_string()),
+                execution_binding: Some(harness_contract::goal::GoalExecutionBinding {
+                    objective_id: "objective-agentic-projection".to_string(),
+                    session_id: "session-agentic-projection".to_string(),
+                    turn_id: "turn-agentic-projection".to_string(),
+                    root_execution_id: execution_id.to_string(),
+                    agentic_program_id: "program-agentic-projection".to_string(),
+                }),
+                spec_revision: 1,
+                spec_digest: "projection-test".to_string(),
+                review_refs: Vec::new(),
+                waiting: None,
+                participation_requirement: None,
+                obligations: Vec::new(),
+                recovery: None,
+                terminal: None,
+                completion: GoalCompletion::Open,
+                revision: 1,
+                user_sequence: 1,
+                reviews: Vec::new(),
+            })
+            .expect("create objective goal");
+        let before_completion = snapshot(&services, execution_id, &context(&services))
+            .await
+            .expect("project open Program");
+        assert!(before_completion.agentic_collaboration.programs[0]
+            .completion
+            .wait
+            .is_none());
+        actions
+            .apply(&root(
+                "request-program-completion",
+                AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
+                    result_refs: vec![final_artifact.clone()],
+                    evidence_refs: vec![research_artifact.clone(), final_artifact.clone()],
+                    unresolved: Vec::new(),
+                }),
+            ))
+            .expect("request completion");
+
+        services
+            .reconcile_agentic_completion_request("program-agentic-projection")
+            .expect("reconcile completion")
+            .expect("verified Program");
+        let projection = snapshot(&services, execution_id, &context(&services))
+            .await
+            .expect("project Agentic Program");
+        let collaboration = &projection.agentic_collaboration;
+        assert_eq!(collaboration.schema_version, 5);
+        assert_eq!(collaboration.programs.len(), 1);
+        let program = &collaboration.programs[0];
+        assert_eq!(program.teams.len(), 2);
+        assert_eq!(program.agents.len(), 2);
+        assert_eq!(program.tasks.len(), 2);
+        assert!(program
+            .teams
+            .iter()
+            .any(|team| team.name == "Evidence Research Team"));
+        assert!(program
+            .agents
+            .iter()
+            .any(|agent| agent.role == "Decision Reviewer"));
+        assert!(program.tasks.iter().any(|task| {
+            task.task_id == synthesis_task_id && task.depends_on == vec![research_task_id.clone()]
+        }));
+        let synthesis = program
+            .tasks
+            .iter()
+            .find(|task| task.task_id == synthesis_task_id)
+            .expect("synthesis task");
+        assert_eq!(synthesis.dependency_resolution.len(), 1);
+        assert_eq!(
+            synthesis.dependency_resolution[0].dependency_ref,
+            research_task_id
+        );
+        assert_eq!(
+            synthesis.dependency_resolution[0].status,
+            harness_contract::projection::AgenticCollaborationDependencyStatus::Resolved
+        );
+        assert!(!program.topics.is_empty());
+        assert_eq!(program.artifacts.len(), 2);
+        assert!(program.completion.wait.is_some());
+        assert!(program.completion.verdict.is_some());
+        assert!(
+            projection.teams.is_empty(),
+            "generic Team is not an Agentic owner"
+        );
+        assert!(
+            projection.agents.is_empty(),
+            "generic Agent is not an Agentic owner"
+        );
+
+        let update = delta(
+            &services,
+            execution_id,
+            before_completion.revision,
+            before_completion.cursor,
+            &context(&services),
+        )
+        .expect("completion verdict delta");
+        assert!(update.operations.iter().any(|operation| matches!(
+            operation,
+            ProjectionOperation::ReplaceAgenticCollaboration { collaboration }
+                if collaboration.programs[0].completion.verdict.is_some()
+        )));
+        let reduced =
+            harness_contract::projection::reduce_projection_delta(&before_completion, &update)
+                .expect("apply contiguous Agentic delta");
+        assert_eq!(
+            reduced.agentic_collaboration,
+            projection.agentic_collaboration
+        );
+        assert!(harness_contract::projection::reduce_projection_delta(&reduced, &update).is_err());
+        let mut gap = update.clone();
+        gap.base_cursor = gap.base_cursor.saturating_add(1);
+        assert!(
+            harness_contract::projection::reduce_projection_delta(&before_completion, &gap)
+                .is_err()
+        );
+
+        if let Some(path) = std::env::var_os("COWD_EXPORT_AGENTIC_PROGRAM_PROJECTION_FIXTURE") {
+            let fixture = serde_json::json!({
+                "schema_version": projection.schema_version,
+                "execution_id": projection.execution_id,
+                "revision": projection.revision,
+                "cursor": projection.cursor,
+                "detail_scope": projection.detail_scope,
+                "authorization_revision": 1_000_001,
+                "redaction_revision": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                "source_health": "fresh",
+                "session_id": projection.session_id,
+                "task_id": projection.task_id,
+                "turn_id": projection.turn_id,
+                "activities": [],
+                "activity_relations": [],
+                "graph": projection.graph,
+                "agentic_collaboration": projection.agentic_collaboration,
+                "agents": [],
+                "teams": [],
+            });
+            std::fs::write(
+                path,
+                serde_json::to_vec_pretty(&fixture).expect("encode projection fixture"),
+            )
+            .expect("write projection fixture");
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupt_agentic_program_stream_fails_projection_closed() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        let mut graph = graph_with_lineage(
+            "corrupt Program must not become empty collaboration",
+            "session-corrupt-agentic",
+            "turn-corrupt-agentic",
+            "task-corrupt-agentic",
+        );
+        graph.id = "execution-corrupt-agentic".to_string();
+        services
+            .execution_supervisor()
+            .register_graph(graph)
+            .await
+            .expect("register graph");
+        services
+            .event_store()
+            .append(crate::RuntimeEventInput {
+                stream_id: "agentic-program:corrupt".to_string(),
+                scope: crate::RuntimeEventScope::Program,
+                kind: "agentic.invalid_fixture".to_string(),
+                status: Some("corrupt".to_string()),
+                actor: Some("fault-injection".to_string()),
+                refs: Vec::new(),
+                payload: serde_json::json!({"missing": "program_opened"}),
+            })
+            .expect("append corrupt Program stream");
+
+        let error = snapshot(&services, "execution-corrupt-agentic", &context(&services))
+            .await
+            .expect_err("corrupt Program stream must fail closed");
+        assert!(error.to_string().contains("program_not_found"));
+    }
 
     #[test]
     fn linked_team_topology_supplies_strategy_identity_without_terminal_receipt() {
@@ -1447,6 +1947,7 @@ mod tests {
                 status: "running".to_string(),
                 objective: "live delegated work".to_string(),
             }],
+            agentic_collaboration: Default::default(),
             descendant_graphs: Vec::new(),
         };
 
@@ -1954,6 +2455,8 @@ mod tests {
                     criteria: vec![AcceptanceCriterion {
                         id: format!("criterion-{id}"),
                         statement: "produce evidence".to_string(),
+                        statement_ref: None,
+                        source_refs: Vec::new(),
                         required_evidence: Vec::new(),
                         status: AcceptanceStatus::Open,
                         waiver: None,
@@ -1963,13 +2466,22 @@ mod tests {
                     evidence_refs: Vec::new(),
                     unresolved: Vec::new(),
                     blockers: Vec::new(),
+                    scope: harness_contract::goal::GoalScope::Internal,
+                    user_intent_criterion_id: Some(format!("criterion-{id}")),
+                    source_intent_ref: Some(format!("session_message:{session_id}")),
+                    execution_binding: None,
+                    spec_revision: 1,
+                    spec_digest: "projection-test".to_string(),
+                    review_refs: Vec::new(),
+                    waiting: None,
+                    participation_requirement: None,
                     obligations: Vec::new(),
-                    program_ref: None,
                     recovery: None,
                     terminal: None,
                     completion: GoalCompletion::Open,
                     revision: 1,
                     user_sequence: 1,
+                    reviews: Vec::new(),
                 })
                 .expect("goal creates");
         }

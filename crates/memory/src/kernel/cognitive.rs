@@ -63,7 +63,6 @@ use crate::{
     search::HybridSearcher,
     seeds::{DecisionThreadStore, SeedRegistry},
     state_rebuilder::StateRebuilder,
-    store::sqlite::SqliteStore,
     store::vector::VectorIndex,
     store::{
         AuthorityLookup, FtsSearchOptions, FtsSearchResult, MemoryKeyValue, MemoryScanCursor,
@@ -1082,7 +1081,26 @@ impl CognitiveContextManager {
 
     /// Initialise the manager from `config`, opening all storage backends.
     pub async fn new(config: MemoryConfig) -> Result<Self> {
-        Self::new_with_workspace_and_session_history(config, None, None).await
+        let _ = config;
+        Err(MemoryError::Store(
+            "CognitiveContextManager requires an injected MemoryStore".to_string(),
+        ))
+    }
+
+    /// Construct an explicitly process-local manager for tests, examples, and
+    /// other callers that deliberately do not require durable memory.
+    ///
+    /// Keeping this constructor visibly ephemeral prevents production
+    /// composition roots from silently falling back when PostgreSQL wiring is
+    /// missing while still giving deterministic tests a first-class store.
+    pub async fn new_ephemeral(config: MemoryConfig) -> Result<Self> {
+        Self::new_with_selected_store(
+            config,
+            None,
+            None,
+            Arc::new(crate::store::EphemeralMemoryStore::new()),
+        )
+        .await
     }
 
     /// Initialise the manager with an explicit workspace root for L2 project
@@ -1091,7 +1109,10 @@ impl CognitiveContextManager {
         config: MemoryConfig,
         workspace_root: Option<PathBuf>,
     ) -> Result<Self> {
-        Self::new_with_workspace_and_session_history(config, workspace_root, None).await
+        let _ = (config, workspace_root);
+        Err(MemoryError::Store(
+            "CognitiveContextManager requires an injected MemoryStore".to_string(),
+        ))
     }
 
     /// Initialise standalone Memory with a host-owned model summarizer.
@@ -1099,8 +1120,10 @@ impl CognitiveContextManager {
         config: MemoryConfig,
         llm_summarizer: Arc<dyn LlmSummarizer>,
     ) -> Result<Self> {
-        Self::new_with_storage_selection(config, None, None, None, true, None, Some(llm_summarizer))
-            .await
+        let _ = (config, llm_summarizer);
+        Err(MemoryError::Store(
+            "CognitiveContextManager requires an injected MemoryStore".to_string(),
+        ))
     }
 
     /// Initialise with the selected durable session owner.  Session recovery
@@ -1110,16 +1133,10 @@ impl CognitiveContextManager {
         workspace_root: Option<PathBuf>,
         session_history: Option<Arc<SessionHistoryReader>>,
     ) -> Result<Self> {
-        Self::new_with_storage_selection(
-            config,
-            workspace_root,
-            session_history,
-            None,
-            true,
-            None,
-            None,
-        )
-        .await
+        let _ = (config, workspace_root, session_history);
+        Err(MemoryError::Store(
+            "CognitiveContextManager requires an injected MemoryStore".to_string(),
+        ))
     }
 
     /// Initialise the complete cognitive runtime over a host-selected durable
@@ -1133,27 +1150,17 @@ impl CognitiveContextManager {
         session_history: Option<Arc<SessionHistoryReader>>,
         store: Arc<dyn MemoryStore>,
     ) -> Result<Self> {
-        Self::new_with_storage_selection(
-            config,
-            workspace_root,
-            session_history,
-            Some(store),
-            false,
-            None,
-            None,
-        )
-        .await
+        Self::new_with_storage_selection(config, workspace_root, session_history, store, None, None)
+            .await
     }
 
-    /// Variant used by a composition root that selected SQLite and therefore
-    /// may retain the existing SQLite-backed maintenance/vector auxiliaries.
-    /// PostgreSQL composition passes `false` so no business SQLite is opened.
+    /// Variant used by a composition root that also owns the durable
+    /// maintenance queue.
     pub async fn new_with_selected_store_and_auxiliaries(
         config: MemoryConfig,
         workspace_root: Option<PathBuf>,
         session_history: Option<Arc<SessionHistoryReader>>,
         store: Arc<dyn MemoryStore>,
-        sqlite_auxiliaries: bool,
         maintenance_queue: Option<MaintenanceQueue>,
     ) -> Result<Self> {
         Self::new_with_selected_store_auxiliaries_and_summarizer(
@@ -1161,7 +1168,6 @@ impl CognitiveContextManager {
             workspace_root,
             session_history,
             store,
-            sqlite_auxiliaries,
             maintenance_queue,
             None,
         )
@@ -1174,7 +1180,6 @@ impl CognitiveContextManager {
         workspace_root: Option<PathBuf>,
         session_history: Option<Arc<SessionHistoryReader>>,
         store: Arc<dyn MemoryStore>,
-        sqlite_auxiliaries: bool,
         maintenance_queue: Option<MaintenanceQueue>,
         llm_summarizer: Option<Arc<dyn LlmSummarizer>>,
     ) -> Result<Self> {
@@ -1182,8 +1187,7 @@ impl CognitiveContextManager {
             config,
             workspace_root,
             session_history,
-            Some(store),
-            sqlite_auxiliaries,
+            store,
             maintenance_queue,
             llm_summarizer,
         )
@@ -1194,25 +1198,16 @@ impl CognitiveContextManager {
         config: MemoryConfig,
         workspace_root: Option<PathBuf>,
         session_history: Option<Arc<SessionHistoryReader>>,
-        selected_store: Option<Arc<dyn MemoryStore>>,
-        sqlite_auxiliaries: bool,
+        selected_store: Arc<dyn MemoryStore>,
         selected_maintenance_queue: Option<MaintenanceQueue>,
         llm_summarizer: Option<Arc<dyn LlmSummarizer>>,
     ) -> Result<Self> {
-        let orchestrator = Arc::new(match &selected_store {
-            Some(store) => MemoryOrchestrator::from_store(
-                config.clone(),
-                Arc::clone(store),
-                workspace_root.clone(),
-            )?,
-            None => {
-                MemoryOrchestrator::init_with_workspace(config.clone(), workspace_root.clone())
-                    .await?
-            }
-        });
-        if let Some(store) = selected_store.as_ref() {
-            MemoryOrchestrator::bootstrap_identity(store, &config).await?;
-        }
+        let orchestrator = Arc::new(MemoryOrchestrator::from_store(
+            config.clone(),
+            Arc::clone(&selected_store),
+            workspace_root.clone(),
+        )?);
+        MemoryOrchestrator::bootstrap_identity(&selected_store, &config).await?;
 
         // Build the vector index with persistence support.
         // Use VectorIndex::load to restore previously persisted vectors.
@@ -1220,26 +1215,19 @@ impl CognitiveContextManager {
         // falling back to the store default only when the index is empty.
         let dimension = config.store.vector.dimension as u32;
         let persist_path = config.store.blob_dir.join("vector_index.json");
-        let vector_sqlite_store = sqlite_auxiliaries
-            .then(|| SqliteStore::open(&config.store).ok())
-            .flatten();
-        let (loaded_vector_index, vector_load_error) = match VectorIndex::load_with_store(
-            persist_path.clone(),
-            dimension,
-            vector_sqlite_store.clone(),
-        ) {
-            Ok(index) => (index, None),
-            Err(error) => {
-                // The durable Memory store remains authoritative. A corrupt
-                // rebuildable vector artifact must degrade to FTS instead of
-                // preventing Gateway startup or returning a false empty result.
-                let mut empty = VectorIndex::new(persist_path, dimension)?;
-                if let Some(store) = vector_sqlite_store {
-                    empty.set_sqlite_store(store);
+        let (loaded_vector_index, vector_load_error) =
+            match VectorIndex::load(persist_path.clone(), dimension) {
+                Ok(index) => (index, None),
+                Err(error) => {
+                    // The durable Memory store remains authoritative. A corrupt
+                    // rebuildable vector artifact must degrade to FTS instead of
+                    // preventing Gateway startup or returning a false empty result.
+                    (
+                        VectorIndex::new(persist_path, dimension)?,
+                        Some(error.to_string()),
+                    )
                 }
-                (empty, Some(error.to_string()))
-            }
-        };
+            };
         let vector_index = Arc::new(RwLock::new(loaded_vector_index));
 
         // Build the context window monitor.
@@ -1765,22 +1753,7 @@ impl CognitiveContextManager {
             }
         };
 
-        let maintenance_queue = if let Some(queue) = selected_maintenance_queue {
-            queue
-        } else if sqlite_auxiliaries {
-            match MaintenanceQueue::open_sqlite(&config.store.sqlite_path) {
-                Ok(queue) => queue,
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "memory maintenance: durable queue unavailable, using in-memory fallback"
-                    );
-                    MaintenanceQueue::new()
-                }
-            }
-        } else {
-            MaintenanceQueue::new()
-        };
+        let maintenance_queue = selected_maintenance_queue.unwrap_or_else(MaintenanceQueue::new);
 
         Ok(Self {
             drift: DriftDetector::new(config.drift.clone()),

@@ -589,7 +589,7 @@ impl ExecutionGraphRunner {
         &self,
         graph_id: &str,
     ) -> Result<Option<ExecutionRunReport>, ExecutionRunnerError> {
-        let graph = self.state_store.load_async(graph_id).await?;
+        let graph = self.state_store.load_current_async(graph_id).await?;
         Ok(graph
             .node_statuses
             .values()

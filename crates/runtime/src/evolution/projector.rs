@@ -1339,7 +1339,7 @@ mod tests {
     #[test]
     fn ten_minutes_of_idle_projection_passes_create_zero_commits() {
         const TEN_MINUTES_AT_ONE_SECOND_POLL: usize = 600;
-        let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let events = Arc::new(RuntimeEventStore::for_test());
         let discovery = Arc::new(EvolutionDiscoveryService::new(Arc::clone(&events)));
         let evolution = EvolutionSignalProjector::new(Arc::clone(&events), discovery);
         let skill = crate::SkillMaintenanceProjector::new(Arc::clone(&events));
@@ -1397,8 +1397,7 @@ mod tests {
     }
 
     fn baseline_probe(backlog: usize, samples: usize, prefix: &str) -> (Duration, Vec<u128>) {
-        let root = tempfile::tempdir().unwrap();
-        let events = RuntimeEventStore::open(root.path().join("runtime.sqlite")).unwrap();
+        let events = RuntimeEventStore::for_test();
         if backlog > 0 {
             append_foreground_probe(&events, &format!("{prefix}-backlog"), backlog);
         }
@@ -1410,8 +1409,7 @@ mod tests {
         samples: usize,
         prefix: &str,
     ) -> (Duration, Vec<u128>) {
-        let root = tempfile::tempdir().unwrap();
-        let events = Arc::new(RuntimeEventStore::open(root.path().join("runtime.sqlite")).unwrap());
+        let events = Arc::new(RuntimeEventStore::for_test());
         if backlog > 0 {
             append_foreground_probe(&events, &format!("{prefix}-backlog"), backlog);
         }
@@ -1566,7 +1564,7 @@ mod tests {
 
     #[test]
     fn projector_replays_source_once_and_crosses_its_own_checkpoint() {
-        let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let events = Arc::new(RuntimeEventStore::for_test());
         let discovery = Arc::new(EvolutionDiscoveryService::new(Arc::clone(&events)));
         let projector = EvolutionSignalProjector::new(Arc::clone(&events), Arc::clone(&discovery));
         events
@@ -1661,7 +1659,7 @@ mod tests {
 
     #[test]
     fn projector_replay_keeps_existing_deterministic_signal_when_payload_evolved() {
-        let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let events = Arc::new(RuntimeEventStore::for_test());
         let discovery = Arc::new(EvolutionDiscoveryService::new(Arc::clone(&events)));
         let projector = EvolutionSignalProjector::new(Arc::clone(&events), Arc::clone(&discovery));
         events
@@ -1708,7 +1706,7 @@ mod tests {
 
     #[test]
     fn projector_checkpoint_is_mutable_and_does_not_emit_a_commit() {
-        let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let events = Arc::new(RuntimeEventStore::for_test());
         let discovery = Arc::new(EvolutionDiscoveryService::new(Arc::clone(&events)));
         let projector = EvolutionSignalProjector::new(Arc::clone(&events), discovery);
         events
@@ -1744,7 +1742,7 @@ mod tests {
 
     #[test]
     fn legacy_signal_bootstrap_is_bounded_replayable_and_does_not_duplicate_case() {
-        let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let events = Arc::new(RuntimeEventStore::for_test());
         let discovery = Arc::new(EvolutionDiscoveryService::new(Arc::clone(&events)));
         let projector = EvolutionSignalProjector::new(Arc::clone(&events), Arc::clone(&discovery));
         let mut signal = EvolutionSignal::low_novelty_tool_loop(
@@ -1777,7 +1775,7 @@ mod tests {
 
     #[test]
     fn malformed_legacy_signal_does_not_block_the_following_valid_signal() {
-        let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let events = Arc::new(RuntimeEventStore::for_test());
         let discovery = Arc::new(EvolutionDiscoveryService::new(Arc::clone(&events)));
         let projector = EvolutionSignalProjector::new(Arc::clone(&events), Arc::clone(&discovery));
         events
@@ -1823,7 +1821,7 @@ mod tests {
 
     #[test]
     fn canonical_outcome_enters_governed_evolution_without_direct_promotion() {
-        let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let events = Arc::new(RuntimeEventStore::for_test());
         let discovery = Arc::new(EvolutionDiscoveryService::new(Arc::clone(&events)));
         let projector = EvolutionSignalProjector::new(Arc::clone(&events), Arc::clone(&discovery));
         crate::execution_core::OutcomeService::new(Arc::clone(&events))
@@ -1845,7 +1843,7 @@ mod tests {
 
     #[test]
     fn projector_repairs_historical_dead_letter_after_checkpoint_advanced() {
-        let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let events = Arc::new(RuntimeEventStore::for_test());
         let discovery = Arc::new(EvolutionDiscoveryService::new(Arc::clone(&events)));
         let projector = EvolutionSignalProjector::new(Arc::clone(&events), Arc::clone(&discovery));
         let source = events

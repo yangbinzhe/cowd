@@ -802,18 +802,6 @@ impl ValidatedGovernedToolDag {
             }
         }
 
-        if has_mutation
-            && decision
-                .modifiers()
-                .contains(&ExecutionModifier::BoundedChange)
-            && !has_single_known_mutation_path(&governed_tasks)
-        {
-            push_finding(
-                &mut findings,
-                "bounded_change_requires_single_known_path_scope",
-            );
-        }
-
         GovernedToolPolicyValidationReport {
             allowed: findings.is_empty(),
             findings,
@@ -902,26 +890,6 @@ fn uses_inner_runtime_validator(tool_name: &str) -> bool {
                     .collect::<String>()
                     == normalized
             })
-}
-
-fn has_single_known_mutation_path(tasks: &[&GovernedToolPlanTask]) -> bool {
-    let mut bounded_path: Option<&str> = None;
-    for task in tasks.iter().copied().filter(|task| is_mutation(task)) {
-        if task.resource_scope.unknown || task.resource_scope.kind != "paths" {
-            return false;
-        }
-        let [path] = task.resource_scope.paths.as_slice() else {
-            return false;
-        };
-        if path.is_empty() || path == "." {
-            return false;
-        }
-        if bounded_path.is_some_and(|known| known != path) {
-            return false;
-        }
-        bounded_path = Some(path);
-    }
-    bounded_path.is_some()
 }
 
 fn push_finding(findings: &mut Vec<String>, finding: &str) {
@@ -2526,7 +2494,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_change_requires_one_known_mutation_path_scope() {
+    fn bounded_change_is_a_planning_hint_not_a_negative_effect_authority() {
         let decision = execution_decision(
             RuntimeCompileTarget::ExecutionGraph,
             TaskRisk::Medium,
@@ -2570,20 +2538,18 @@ mod tests {
                 Vec::new(),
             ),
         ]);
-        assert_eq!(
+        assert!(
             multiple_paths
                 .validate_against_execution_decision(&decision)
-                .findings,
-            vec!["bounded_change_requires_single_known_path_scope"]
+                .allowed
         );
 
         let unknown_path =
             GovernedToolPlan::from_requests(&[request("custom-1", "custom_mutation", Vec::new())]);
-        assert_eq!(
+        assert!(
             unknown_path
                 .validate_against_execution_decision(&decision)
-                .findings,
-            vec!["bounded_change_requires_single_known_path_scope"]
+                .allowed
         );
     }
 

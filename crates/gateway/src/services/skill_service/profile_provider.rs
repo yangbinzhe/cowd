@@ -1114,9 +1114,7 @@ mod tests {
             "---\nname: Research\ndescription: Investigate evidence.\n---\n\nInvestigate.",
         )
         .expect("skill");
-        let store = Arc::new(
-            runtime::RuntimeEventStore::try_open_in_memory().expect("runtime event store"),
-        );
+        let store = Arc::new(runtime::RuntimeEventStore::for_test());
         let usage_sink: Arc<dyn runtime::RuntimeSkillUsageSink> =
             Arc::new(runtime::RuntimeSkillUsageRecorder::new(Arc::clone(&store)));
         attach_workspace_skill_usage_sink(&temp.root, usage_sink);

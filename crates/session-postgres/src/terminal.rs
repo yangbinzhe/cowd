@@ -1191,15 +1191,13 @@ impl PostgresSessionStore {
         if session_ids.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let scope = serde_json::to_string(session_ids).map_err(|error| {
-            session::SessionError::Store(format!("encode search session scope: {error}"))
-        })?;
+        let scope = session_ids.to_vec();
         let limit = to_i64(limit.min(500), "message search limit")?;
         self.query_messages(
             "SELECT stable_message_id, session_id, sequence, role, content_json, blocks_count,
                     tool_use_id, tool_name, token_usage_json, created_at_ms
                FROM session_messages
-              WHERE session_id IN (SELECT value FROM jsonb_array_elements_text($2::jsonb))
+              WHERE session_id=ANY($2::text[])
                 AND (to_tsvector('simple', coalesce(role,'') || ' ' || coalesce(content_json,'') || ' ' || coalesce(tool_name,''))
                       @@ websearch_to_tsquery('simple', $1)
                      OR content_json ILIKE '%' || $1 || '%')
@@ -1679,6 +1677,32 @@ impl PostgresSessionStore {
                 &kind,
                 &to_i64(from_seq, "event sequence")?,
                 &to_i64(limit, "event limit")?,
+            ],
+        )
+    }
+
+    pub fn get_session_domain_events_for_epoch(
+        &self,
+        session_id: &str,
+        kind: &str,
+        execution_id: &str,
+        turn_id: &str,
+    ) -> session::SessionResult<Vec<SessionEvent>> {
+        self.query_events(
+            "SELECT session_id, event_type, event_json, sequence, created_at_ms
+               FROM session_events
+              WHERE session_id=$1
+                AND event_type=$2
+                AND event_json::jsonb ->> 'kind'=$3
+                AND event_json::jsonb #>> '{payload,execution_id}'=$4
+                AND event_json::jsonb #>> '{payload,turn_id}'=$5
+              ORDER BY sequence ASC",
+            &[
+                &session_id,
+                &session::SESSION_DOMAIN_EVENT_TYPE,
+                &kind,
+                &execution_id,
+                &turn_id,
             ],
         )
     }

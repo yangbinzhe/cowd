@@ -743,7 +743,7 @@ mod tests {
 
     #[test]
     fn receipt_outcome_projection_is_replay_stable_and_legacy_is_non_authoritative() {
-        let store = Arc::new(RuntimeEventStore::open_in_memory().expect("store"));
+        let store = Arc::new(RuntimeEventStore::for_test());
         for index in 1..=3 {
             append_receipt(&store, &receipt(index, SkillUsageKind::Failure));
             store

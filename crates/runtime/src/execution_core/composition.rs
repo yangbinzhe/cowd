@@ -3,6 +3,21 @@
 use super::*;
 
 impl RuntimeServicesBuilder {
+    /// Select explicit process-local backend adapters for test harnesses.
+    ///
+    /// This is intentionally opt-in and conspicuously non-durable: installed
+    /// composition roots must inject PostgreSQL-backed owners instead.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn non_durable_backends_for_testing(self, root: impl AsRef<Path>) -> Self {
+        let root = root.as_ref();
+        self.runtime_event_store(Arc::new(RuntimeEventStore::for_test()))
+            .artifact_store(Arc::new(crate::ArtifactStore::for_test_default(
+                root.join("artifacts"),
+            )))
+            .task_aggregate_service(Arc::new(crate::TaskAggregateService::for_test()))
+    }
+
     #[must_use]
     pub fn resource_quotas(
         mut self,
@@ -47,6 +62,18 @@ impl RuntimeServicesBuilder {
         cache: Arc<crate::ProviderClientTemplateCache>,
     ) -> Self {
         self.provider_template_cache = cache;
+        self
+    }
+
+    /// Install the complete, operator-approved ProcessJsonl command manifest
+    /// before Runtime accepts executable Agent work. Definitions only bind a
+    /// `command_ref` plus digest; they never provide process launch data.
+    #[must_use]
+    pub fn process_jsonl_commands(
+        mut self,
+        commands: impl IntoIterator<Item = crate::ProcessJsonlSpec>,
+    ) -> Self {
+        self.process_jsonl_commands = commands.into_iter().collect();
         self
     }
 
@@ -230,10 +257,23 @@ impl RuntimeServicesBuilder {
             (None, None, None, None) => None,
             _ => return Err(RuntimeServicesError::IncompleteSessionPorts),
         };
+        let defer_recovered_producers = session_ports.is_some();
+        let process_jsonl_commands = self.process_jsonl_commands;
         let workspace_root = canonical_workspace_root(&self.workspace_root)?;
         let workspace_key = workspace_key(&workspace_root);
-        let storage_registry = storage::StorageRegistry::default_for_config_home(&self.cowd_home)
-            .with_workspace(&workspace_root)?;
+        let externally_owned_postgres = self.runtime_event_store.is_some()
+            || self.task_aggregate_service.is_some()
+            || self.artifact_store.is_some();
+        let storage_registry = if externally_owned_postgres {
+            storage::StorageRegistry::postgres_for_config_home(&self.cowd_home)
+                .with_postgres_workspace(&workspace_root)?
+        } else {
+            // Standalone test/development builders still provide their own
+            // explicit ephemeral backends. Installed Gateway composition
+            // always enters the PostgreSQL branch above.
+            storage::StorageRegistry::default_for_config_home(&self.cowd_home)
+                .with_workspace(&workspace_root)?
+        };
         let builtin_definitions_root = self.builtin_definitions_root.unwrap_or_else(|| {
             // An unconfigured installation has no runnable builtin Definitions
             // yet. This explicit empty bundle root preserves scope separation;
@@ -246,33 +286,15 @@ impl RuntimeServicesBuilder {
             builtin_definitions_root,
             &workspace_root,
         )?);
-        let event_store = if let Some(store) = self.runtime_event_store {
-            store
-        } else {
-            let event_scope = storage::StorageScope::workspace_for_root(&workspace_root);
-            let runtime_event_handle = storage_registry
-                .endpoint_in_scope(&storage::StorageDomainId::RuntimeEvents, &event_scope)?
-                .as_handle();
-            Arc::new(RuntimeEventStore::try_open(runtime_event_handle.path)?)
-        };
-        let artifact_store = self.artifact_store.unwrap_or_else(|| {
-            Arc::new(crate::ArtifactStore::sqlite_default(
-                storage_registry.layout.blobs.clone(),
-            ))
-        });
-        let task_aggregate_service = match self.task_aggregate_service {
-            Some(service) => service,
-            None => {
-                let task_scope = storage::StorageScope::workspace_for_root(&workspace_root);
-                let task_handle = storage_registry
-                    .endpoint_in_scope(&storage::StorageDomainId::Tasks, &task_scope)?
-                    .as_handle();
-                Arc::new(
-                    crate::TaskAggregateService::open_storage_handle(&task_handle)
-                        .map_err(RuntimeServicesError::Task)?,
-                )
-            }
-        };
+        let event_store = self
+            .runtime_event_store
+            .ok_or(RuntimeServicesError::MissingBackend("runtime_events"))?;
+        let artifact_store = self
+            .artifact_store
+            .ok_or(RuntimeServicesError::MissingBackend("artifacts"))?;
+        let task_aggregate_service = self
+            .task_aggregate_service
+            .ok_or(RuntimeServicesError::MissingBackend("tasks"))?;
         let resource_state_root = std::env::temp_dir()
             .join("cowd-runtime-resource-locks")
             .join(&workspace_key);
@@ -317,6 +339,7 @@ impl RuntimeServicesBuilder {
             task_aggregate_service,
             self.projection_lanes,
             None,
+            defer_recovered_producers,
         )?);
         tracing::info!(
             elapsed_ms = assemble_started_at.elapsed().as_millis() as u64,
@@ -340,9 +363,13 @@ impl RuntimeServicesBuilder {
             )));
         services
             .agent_runtime
-            .register_backend(Arc::new(ProcessJsonlAdapter::for_workspace(
+            .register_runtime_process_jsonl_backend(Arc::new(ProcessJsonlAdapter::for_runtime(
+                Arc::downgrade(&services),
                 services.workspace_root(),
             )));
+        for command in process_jsonl_commands {
+            services.register_process_jsonl_command(command)?;
+        }
         let agent_recovery_started_at = Instant::now();
         services
             .agent_runtime
@@ -358,12 +385,13 @@ impl RuntimeServicesBuilder {
             elapsed_ms = evolution_projection_started_at.elapsed().as_millis() as u64,
             "Runtime evolution release projection completed"
         );
-        services
-            .event_reactor
-            .start()
-            .map_err(RuntimeServicesError::Invariant)?;
         if let Some((query, ingress, journal, application)) = session_ports {
             services.install_session_ports(query, ingress, journal, application)?;
+        } else {
+            // A standalone Runtime has no external Session recovery boundary.
+            // Integrated launchers install Session ports and explicitly open
+            // this gate after their ordered durable recovery succeeds.
+            services.start_background_reactors()?;
         }
         Ok(services)
     }

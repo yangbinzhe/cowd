@@ -857,12 +857,14 @@ impl SessionService {
                 source_event_json: serde_json::json!({
                     "source_session_id": source_session_id,
                     "branch_session_id": target_session_id,
+                    "copied_message_count": source_message_count,
                     "status": "created",
                 })
                 .to_string(),
                 target_event_json: serde_json::json!({
                     "source_session_id": source_session_id,
                     "branch_session_id": target_session_id,
+                    "copied_message_count": source_message_count,
                     "status": "created",
                 })
                 .to_string(),
@@ -1317,14 +1319,11 @@ impl SessionService {
         runtime.cancel_active_session(session_id, reason);
         let drained = tokio::time::timeout(DRAIN_TIMEOUT, async {
             loop {
-                let active =
-                    runtime
-                        .running_session_execution_indices()
-                        .into_iter()
-                        .any(|execution| {
-                            execution.session_id == session_id
-                                && !execution.active_execution_ids.is_empty()
-                        });
+                // Lifecycle drain waits for process-owned work to release its
+                // guard. A non-terminal live projection is durable diagnostic
+                // state, not proof that a process is still running, and must
+                // never force a synthetic terminal winner during deletion.
+                let active = runtime.has_active_turn_for_session(session_id);
                 let inputs = self
                     .kernel()
                     .runtime_inputs(session_id, 500)
@@ -2165,6 +2164,16 @@ impl SessionService {
         event.event_id = event_id.to_string();
         let (stored, _replayed) = self.append_runtime_domain_event_if_absent(&event).await?;
         Ok(stored)
+    }
+
+    pub(crate) async fn stored_session_input_journal(
+        &self,
+        session_id: &str,
+        event_id: &str,
+    ) -> Result<Option<session::SessionDomainEvent>, SessionError> {
+        self.kernel()
+            .stored_domain_event_by_id(session_id, event_id)
+            .await
     }
 
     pub(crate) async fn append_runtime_context_envelope_if_absent(

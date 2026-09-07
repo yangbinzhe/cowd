@@ -292,8 +292,11 @@ pub struct ResourceStore {
 
 impl ResourceStore {
     #[must_use]
-    pub fn default_for_config_home(config_home: &Path) -> Self {
-        Self::for_config_home_with_capabilities(config_home, ResourceCapabilityIndex::default())
+    pub fn for_test_config_home(config_home: &Path) -> Self {
+        Self::for_test_config_home_with_capabilities(
+            config_home,
+            ResourceCapabilityIndex::default(),
+        )
     }
 
     /// Builds a resource store backed by the Gateway-owned capability index.
@@ -302,7 +305,7 @@ impl ResourceStore {
     /// creating a fresh one. That keeps attachment rendering free of discovery
     /// I/O while allowing lifecycle reloads to atomically publish a new view.
     #[must_use]
-    pub fn for_config_home_with_capabilities(
+    pub fn for_test_config_home_with_capabilities(
         config_home: &Path,
         capabilities: ResourceCapabilityIndex,
     ) -> Self {
@@ -313,7 +316,7 @@ impl ResourceStore {
             .unwrap_or_else(|_| config_home.join("storage").join("blobs"));
         Self::from_artifact_store(
             config_home,
-            Arc::new(ArtifactStore::sqlite_default(blob_root)),
+            Arc::new(ArtifactStore::for_test_default(blob_root)),
             capabilities,
         )
     }
@@ -329,11 +332,6 @@ impl ResourceStore {
             artifact_store,
             capabilities,
         }
-    }
-
-    #[must_use]
-    pub fn default_user() -> Self {
-        Self::default_for_config_home(&cowd_dirs::config_home_dir())
     }
 
     #[must_use]
@@ -930,23 +928,6 @@ impl ResourceStore {
     }
 }
 
-pub fn register_resource_from_path(
-    config_home: &Path,
-    path: impl AsRef<Path>,
-    source: impl Into<String>,
-    source_message_id: Option<String>,
-    session_id: Option<String>,
-    declared_mime: Option<String>,
-) -> Result<(ResourceProjection, ResourceHint), String> {
-    ResourceStore::default_for_config_home(config_home).register_resource_from_path(
-        path,
-        source,
-        source_message_id,
-        session_id,
-        declared_mime,
-    )
-}
-
 #[must_use]
 pub fn resource_hint(
     envelope: &ResourceProjection,
@@ -1347,7 +1328,7 @@ mod tests {
         let input = temp.path().join("voice.mp3");
         fs::write(&input, b"fake mp3").expect("write mp3");
 
-        let store = ResourceStore::default_for_config_home(&config_home);
+        let store = ResourceStore::for_test_config_home(&config_home);
         let (envelope, hint) = store
             .register_resource_from_path(
                 &input,
@@ -1428,7 +1409,7 @@ mod tests {
         )
         .unwrap();
 
-        let store = ResourceStore::default_for_config_home(&config_home);
+        let store = ResourceStore::for_test_config_home(&config_home);
         let dry_run = store.migrate_legacy_resources(ResourceMigrationOptions {
             dry_run: true,
             resume_after: None,
@@ -1470,7 +1451,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let input = temp.path().join("voice.mp3");
         fs::write(&input, b"fake mp3").expect("write mp3");
-        let store = ResourceStore::default_for_config_home(&temp.path().join("home"));
+        let store = ResourceStore::for_test_config_home(&temp.path().join("home"));
         let pair = store
             .register_resource_from_path(&input, "test", None, None, None)
             .expect("register resource");
@@ -1489,7 +1470,7 @@ mod tests {
     #[test]
     fn classifies_core_resource_scenarios() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let store = ResourceStore::default_for_config_home(&temp.path().join("home"));
+        let store = ResourceStore::for_test_config_home(&temp.path().join("home"));
         let scenarios = [
             ("image.png", b"fake png".as_slice(), ResourceKind::Image),
             ("voice.mp3", b"fake mp3".as_slice(), ResourceKind::Audio),
@@ -1574,7 +1555,7 @@ mod tests {
     #[test]
     fn rejects_resource_above_runtime_limit_before_reading() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let store = ResourceStore::default_for_config_home(&temp.path().join("home"));
+        let store = ResourceStore::for_test_config_home(&temp.path().join("home"));
         let path = temp.path().join("huge.bin");
         let file = fs::File::create(&path).expect("create sparse file");
         file.set_len(store.artifact_store().config().max_object_bytes + 1)

@@ -64,6 +64,10 @@ pub struct RuntimeExecutionShutdownReport {
     pub accepted: u64,
     pub completed: u64,
     pub failed: u64,
+    /// Non-terminal graphs deliberately left durable for the next process to
+    /// recover. Process shutdown is not a business cancellation.
+    #[serde(default)]
+    pub preserved_graphs: usize,
     pub cancelled_graphs: usize,
     pub forced_aborts: u64,
     pub remaining_keys: usize,
@@ -105,6 +109,12 @@ struct DriverSlotState {
 struct DriverSlot {
     state: StdMutex<DriverSlotState>,
     changed: tokio::sync::Notify,
+}
+
+#[derive(Debug)]
+struct GraphProducerGate {
+    released: bool,
+    deferred_graphs: std::collections::BTreeSet<String>,
 }
 
 impl DriverSlot {
@@ -323,6 +333,7 @@ pub struct RuntimeExecutionSupervisor {
     queue_partitions: u16,
     shutdown_timeout: Duration,
     graph_settled_observer: Arc<OnceLock<GraphSettledObserver>>,
+    graph_producer_gate: StdMutex<GraphProducerGate>,
 }
 
 impl RuntimeExecutionSupervisor {
@@ -384,12 +395,14 @@ impl RuntimeExecutionSupervisor {
             max_parallel_graphs,
             max_parallel_graphs.saturating_mul(4),
             shutdown_timeout,
+            true,
         )
     }
 
     pub(crate) fn with_capacity_profile(
         runner: Arc<ExecutionGraphRunner>,
         profile: &crate::ExecutionCapacityProfile,
+        defer_graph_producers: bool,
     ) -> Self {
         let agent_capacity = profile.max_parallel_agents.max(1);
         Self::with_capacity_limits(
@@ -401,6 +414,7 @@ impl RuntimeExecutionSupervisor {
                 .saturating_mul(4)
                 .min(profile.max_pending_per_class.max(1)),
             Duration::from_secs(20),
+            !defer_graph_producers,
         )
     }
 
@@ -411,6 +425,7 @@ impl RuntimeExecutionSupervisor {
         max_active_nodes_per_graph: usize,
         max_parallel_owned_tasks: usize,
         shutdown_timeout: Duration,
+        graph_producers_released: bool,
     ) -> Self {
         let queue_capacity = queue_capacity.max(1);
         let (sender, receiver) = mpsc::channel(queue_capacity);
@@ -432,6 +447,10 @@ impl RuntimeExecutionSupervisor {
             queue_partitions: DEFAULT_QUEUE_PARTITIONS,
             shutdown_timeout,
             graph_settled_observer: Arc::new(OnceLock::new()),
+            graph_producer_gate: StdMutex::new(GraphProducerGate {
+                released: graph_producers_released,
+                deferred_graphs: std::collections::BTreeSet::new(),
+            }),
         }
     }
 
@@ -536,13 +555,41 @@ impl RuntimeExecutionSupervisor {
         )
     }
 
+    pub(crate) fn graph_producers_released(&self) -> bool {
+        self.graph_producer_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .released
+    }
+
+    fn require_graph_producers_released(&self) -> Result<(), ExecutionRunnerError> {
+        self.graph_producers_released()
+            .then_some(())
+            .ok_or_else(|| {
+                ExecutionRunnerError::SupervisorUnavailable(
+                    "ordered Runtime recovery has not released graph execution".to_string(),
+                )
+            })
+    }
+
     async fn enqueue(
         &self,
         graph_id: &str,
     ) -> Result<(Arc<DriverSlot>, u64), ExecutionRunnerError> {
-        self.ensure_dispatcher()?;
         let slot = self.slot(graph_id);
         let generation = slot.request(now_ms());
+        {
+            let mut gate = self
+                .graph_producer_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !gate.released {
+                gate.deferred_graphs.insert(graph_id.to_string());
+                self.metrics.accepted.fetch_add(1, Ordering::Relaxed);
+                return Ok((slot, generation));
+            }
+        }
+        self.ensure_dispatcher()?;
         self.sender
             .send(SupervisorMessage::Wake(graph_id.to_string()))
             .await
@@ -553,6 +600,38 @@ impl RuntimeExecutionSupervisor {
             })?;
         self.metrics.accepted.fetch_add(1, Ordering::Relaxed);
         Ok((slot, generation))
+    }
+
+    /// Open the sole graph-driver gate after ordered durable recovery and
+    /// wake every graph admitted while the gate was closed exactly once.
+    pub(crate) async fn release_recovered_graphs(&self) -> Result<usize, ExecutionRunnerError> {
+        let deferred = {
+            let mut gate = self
+                .graph_producer_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if gate.released {
+                return Ok(0);
+            }
+            gate.released = true;
+            std::mem::take(&mut gate.deferred_graphs)
+        };
+        if deferred.is_empty() {
+            return Ok(0);
+        }
+        self.ensure_dispatcher()?;
+        let count = deferred.len();
+        for graph_id in deferred {
+            self.sender
+                .send(SupervisorMessage::Wake(graph_id))
+                .await
+                .map_err(|_| {
+                    ExecutionRunnerError::SupervisorUnavailable(
+                        "execution recovery admission queue is closed".to_string(),
+                    )
+                })?;
+        }
+        Ok(count)
     }
 
     pub(crate) async fn spawn_owned(
@@ -576,6 +655,7 @@ impl RuntimeExecutionSupervisor {
         owner: impl Into<String>,
         work: OwnedWork,
     ) -> Result<RuntimeWorkAdmissionReceipt, ExecutionRunnerError> {
+        self.require_graph_producers_released()?;
         self.ensure_dispatcher()?;
         let owner = owner.into();
         self.sender
@@ -662,6 +742,7 @@ impl RuntimeExecutionSupervisor {
         &self,
         graph_id: &str,
     ) -> Result<(ExecutionGraphHostReceipt, ExecutionRunReport), ExecutionRunnerError> {
+        self.require_graph_producers_released()?;
         let graph = self
             .runner
             .state_store()
@@ -762,6 +843,7 @@ impl RuntimeExecutionSupervisor {
         graph: ExecutionGraph,
         command: ExecutionGraphCommand,
     ) -> Result<(ExecutionGraphHostReceipt, ExecutionRunReport), ExecutionRunnerError> {
+        self.require_graph_producers_released()?;
         let (receipt, slot, generation) = self.admit(graph, command).await?;
         let report = self.await_slot(&receipt.graph_id, slot, generation).await?;
         Ok((receipt, report))
@@ -789,6 +871,7 @@ impl RuntimeExecutionSupervisor {
         graph: ExecutionGraph,
         command: ExecutionGraphCommand,
     ) -> Result<(ExecutionGraphHostReceipt, ExecutionRunReport), ExecutionRunnerError> {
+        self.require_graph_producers_released()?;
         let (receipt, slot, generation) = self.admit(graph, command).await?;
         self.await_slot(&receipt.graph_id, slot, generation).await?;
         let report = self.wait_for_terminal(&receipt.graph_id).await?;
@@ -844,6 +927,7 @@ impl RuntimeExecutionSupervisor {
         graph_id: &str,
         command: ExecutionGraphCommand,
     ) -> Result<(ExecutionGraphHostReceipt, ExecutionRunReport), ExecutionRunnerError> {
+        self.require_graph_producers_released()?;
         let receipt = self.command_graph(graph_id, command).await?;
         let report = self.wait_for_quiescence(graph_id).await?;
         Ok((receipt, report))
@@ -916,7 +1000,7 @@ impl RuntimeExecutionSupervisor {
             )
             .unwrap_or_else(|current| current);
         if prior == LIFECYCLE_CLOSED {
-            return self.shutdown_report(0, Vec::new());
+            return self.shutdown_report(0, 0, Vec::new());
         }
 
         let graph_ids = self
@@ -926,34 +1010,27 @@ impl RuntimeExecutionSupervisor {
             .keys()
             .cloned()
             .collect::<Vec<_>>();
-        let mut cancelled_graphs = 0;
+        // Stop process-local drivers without changing durable business truth.
+        // A SIGTERM, rolling deploy, evaluator disconnect, or host failure is
+        // not evidence that the user cancelled the work. Running nodes remain
+        // recoverable and ExecutionGraphRecovery reattaches their idempotent
+        // attempts in the next process. Explicit operator/user cancellation
+        // continues to use the typed graph/Session cancellation commands.
+        let preserved_graphs = graph_ids
+            .iter()
+            .filter(|graph_id| {
+                self.runner
+                    .state_store()
+                    .load(graph_id.as_str())
+                    .is_ok_and(|graph| {
+                        graph
+                            .node_statuses
+                            .values()
+                            .any(|status| !status.is_terminal())
+                    })
+            })
+            .count();
         let mut errors = Vec::new();
-        for graph_id in graph_ids {
-            let Ok(projection) = self.runner.projection(&graph_id).await else {
-                continue;
-            };
-            if projection
-                .nodes
-                .iter()
-                .all(|node| node.status.is_terminal())
-            {
-                continue;
-            }
-            match self
-                .runner
-                .command(
-                    &graph_id,
-                    ExecutionGraphCommand::Cancel {
-                        expected_revision: projection.revision,
-                        reason: "Runtime execution supervisor shutdown".to_string(),
-                    },
-                )
-                .await
-            {
-                Ok(_) => cancelled_graphs += 1,
-                Err(error) => errors.push(format!("{graph_id}: {error}")),
-            }
-        }
         self.cancellation.cancel();
         let dispatcher = self
             .dispatcher
@@ -979,11 +1056,12 @@ impl RuntimeExecutionSupervisor {
         self.metrics
             .lifecycle
             .store(LIFECYCLE_CLOSED, Ordering::Release);
-        self.shutdown_report(cancelled_graphs, errors)
+        self.shutdown_report(preserved_graphs, 0, errors)
     }
 
     fn shutdown_report(
         &self,
+        preserved_graphs: usize,
         cancelled_graphs: usize,
         errors: Vec<String>,
     ) -> RuntimeExecutionShutdownReport {
@@ -991,6 +1069,7 @@ impl RuntimeExecutionSupervisor {
             accepted: self.metrics.accepted.load(Ordering::Relaxed),
             completed: self.metrics.completed.load(Ordering::Relaxed),
             failed: self.metrics.failed.load(Ordering::Relaxed),
+            preserved_graphs,
             cancelled_graphs,
             forced_aborts: self.metrics.forced_aborts.load(Ordering::Relaxed),
             remaining_keys: self
@@ -1824,7 +1903,7 @@ mod completion_pump_tests {
         resource_capacity: usize,
         active_nodes_per_graph: usize,
     ) -> RuntimeExecutionSupervisor {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("event store"));
+        let event_store = Arc::new(RuntimeEventStore::for_test());
         let registry = Arc::new(NodeExecutorRegistry::new());
         registry.register(executor).expect("register executor");
         let workspace_id = format!("completion-pump-{}", uuid::Uuid::new_v4());
@@ -2186,5 +2265,51 @@ mod completion_pump_tests {
         assert_eq!(report.completed, 1);
         assert_eq!(executor.calls.lock().unwrap().as_slice(), &["recovered"]);
         supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_preserves_nonterminal_graph_for_process_recovery() {
+        let executor = Arc::new(PumpTestExecutor::new([(
+            "survives-restart".to_string(),
+            Duration::from_secs(30),
+        )]));
+        let supervisor = test_supervisor(executor);
+        let mut graph = ExecutionGraph::new("restart is not cancellation");
+        graph.id = "completion-pump-process-restart".to_string();
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
+        graph.nodes.push(test_node("survives-restart"));
+        supervisor.register_graph(graph).await.unwrap();
+        supervisor
+            .notify_graph("completion-pump-process-restart")
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let graph = supervisor
+                .runner
+                .state_store()
+                .load("completion-pump-process-restart")
+                .unwrap();
+            if graph.node_statuses["survives-restart"] == ExecutionNodeStatus::Running {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let report = supervisor.shutdown().await;
+        assert_eq!(report.cancelled_graphs, 0);
+        assert_eq!(report.preserved_graphs, 1);
+        let graph = supervisor
+            .runner
+            .state_store()
+            .load("completion-pump-process-restart")
+            .unwrap();
+        assert_eq!(
+            graph.node_statuses["survives-restart"],
+            ExecutionNodeStatus::Running,
+            "the next process must recover the interrupted idempotent attempt"
+        );
     }
 }
