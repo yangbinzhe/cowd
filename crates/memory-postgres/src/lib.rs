@@ -58,6 +58,13 @@ const MEMORY_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
         "CREATE INDEX IF NOT EXISTS idx_memory_entries_category_created ON memory_entries(category, created_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_memory_entries_session ON memory_entries(session_id)",
         "CREATE INDEX IF NOT EXISTS idx_memory_entries_fts ON memory_entries USING GIN(to_tsvector('simple', title || ' ' || content || ' ' || coalesce(payload ->> 'tags', '')))",
+        "CREATE TABLE IF NOT EXISTS memory_scope_migration_reports (
+            memory_id TEXT PRIMARY KEY,
+            raw_scope TEXT,
+            held_scope TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            migrated_at TEXT NOT NULL
+        )",
         "CREATE TABLE IF NOT EXISTS memory_entities (id TEXT PRIMARY KEY, payload JSONB NOT NULL)",
         "CREATE TABLE IF NOT EXISTS memory_triples (id TEXT PRIMARY KEY, subject_key TEXT NOT NULL, object_key TEXT NOT NULL, payload JSONB NOT NULL)",
         "CREATE INDEX IF NOT EXISTS idx_memory_triples_subject ON memory_triples(subject_key)",
