@@ -3,6 +3,7 @@ use super::host_backend::{
     persist_agentic_content_draft_for_scope, resolve_preceding_agentic_content_refs,
     AgenticContentDraftScope,
 };
+use super::agentic_checkpoint_artifact_content;
 
 fn agentic_content_bridge_ticket(graph_id: &str, node_id: &str, attempt: u32) -> NodeExecutionTicket {
     NodeExecutionTicket {
@@ -29,6 +30,32 @@ fn preceding_content_commit_call(id: &str) -> ModelToolCall {
         .to_string(),
         depends_on: Vec::new(),
     }
+}
+
+#[tokio::test]
+async fn parent_checkpoint_receives_consumable_agent_artifact_content() {
+    let services = crate::RuntimeServices::in_memory().expect("runtime services");
+    let artifact = services
+        .artifact_store()
+        .write_bytes(
+            harness_contract::context::ArtifactWriteDescriptor {
+                media_type: "text/markdown; charset=utf-8".to_string(),
+                visibility_scope: "session:parent-checkpoint".to_string(),
+                expected_bytes: None,
+                original_name: Some("agent-result.md".to_string()),
+            },
+            b"Agent finding: the dependency direction is valid.",
+        )
+        .await
+        .expect("write agent result");
+
+    let content = agentic_checkpoint_artifact_content(services.as_ref(), &artifact.selector)
+        .expect("checkpoint content");
+    assert!(content.complete);
+    assert_eq!(
+        content.text,
+        "Agent finding: the dependency direction is valid."
+    );
 }
 
 #[tokio::test]

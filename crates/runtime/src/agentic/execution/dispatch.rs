@@ -705,6 +705,25 @@ impl RuntimeServices {
             // fence remain authoritative Runtime controls.
             let deadline_at_ms = u64::MAX;
             let objective = task_objective(projection, task, member, mode);
+            // Natural-language acceptance remains a semantic review
+            // contract, but explicit workspace paths in an execution Task
+            // are mechanically knowable evidence obligations. Compile those
+            // exact paths so the delegated runtime can prefetch them once and
+            // stop the Agent from rediscovering the same files through
+            // repeated glob/search rounds. Reviewers intentionally retain an
+            // empty physical contract: they inspect the submitted Artifact
+            // and choose any genuinely independent evidence they need.
+            let required_acceptance = if mode == DispatchMode::Execute {
+                let scopes = crate::workspace_scopes::explicit_workspace_resource_scopes(
+                    self.workspace_root(),
+                    &objective,
+                    false,
+                );
+                self.path_identity_resolver()
+                    .compile_required_acceptance(&[], &scopes)
+            } else {
+                RequiredAcceptance::default()
+            };
             let root_graph = projection
                 .root_execution_id
                 .as_deref()
@@ -756,7 +775,7 @@ impl RuntimeServices {
                 // Agent terminal field. Treating it as one makes every valid
                 // action-driven worker terminal fail because no Runtime
                 // receipt can literally satisfy arbitrary prose.
-                required_acceptance: RequiredAcceptance::default(),
+                required_acceptance,
                 output_acceptance: Vec::new(),
                 acceptance: Vec::new(),
                 constraints: vec![

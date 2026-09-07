@@ -118,7 +118,8 @@ where
                 let terminal_action = root_agentic_terminal_action(&program);
                 let mut state = self.state.lock().await;
                 if state.agentic_program_context_revision != Some(program.revision) {
-                    let checkpoint = compact_agentic_program_checkpoint(&program);
+                    let checkpoint =
+                        compact_agentic_program_checkpoint(self.services.as_ref(), &program);
                     let mut item = ContextItem::new(
                         format!(
                             "agentic-program-checkpoint:{}:{}",
@@ -1127,7 +1128,12 @@ where
                                 "Agent-first collaboration is not yet verified: observed {verified_team_executions} verified Team(s), required at least {required_team_executions}. Current Program state: {}. Continue through the small Team/Agent/Task/Artifact actions; do not resubmit a full graph or repeat this final answer. The model owns the next semantic decision and Runtime will return a receipt for each action.",
                                 agentic_program.as_ref().map_or_else(
                                     || "not_started".to_string(),
-                                    compact_agentic_program_checkpoint
+                                    |program| {
+                                        compact_agentic_program_checkpoint(
+                                            self.services.as_ref(),
+                                            program,
+                                        )
+                                    }
                                 )
                             );
                             state.force_tool_allowlist_next_model = None;

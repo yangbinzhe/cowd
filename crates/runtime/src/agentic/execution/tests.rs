@@ -305,6 +305,13 @@ async fn root_actor_inherits_the_immutable_graph_delegation_scope() {
 #[tokio::test]
 async fn task_publish_admits_real_agent_graph_with_human_display_identity() {
     let services = Arc::new(RuntimeServices::in_memory().expect("runtime"));
+    std::fs::create_dir_all(services.workspace_root().join("crates/runtime"))
+        .expect("create bounded test workspace");
+    std::fs::write(
+        services.workspace_root().join("crates/runtime/Cargo.toml"),
+        "[package]\nname = \"runtime-test\"\n",
+    )
+    .expect("write bounded test manifest");
     let mut root_graph = ExecutionGraph::new("root Agent-first Program");
     root_graph.id = "root-agentic-execution".to_string();
     root_graph.lineage = Some(ExecutionGraphLineage {
@@ -401,7 +408,7 @@ async fn task_publish_admits_real_agent_graph_with_human_display_identity() {
         AgentAction::TaskPublish(TaskPublishInput {
             team_ref: team_ref.clone(),
             title: "Evidence review".to_string(),
-            objective: "review the source".to_string(),
+            objective: "review crates/runtime/Cargo.toml".to_string(),
             acceptance: "cite evidence".to_string(),
             required_capabilities: vec!["python".to_string(), "verification".to_string()],
             depends_on: Vec::new(),
@@ -465,6 +472,15 @@ async fn task_publish_admits_real_agent_graph_with_human_display_identity() {
     assert!(packet.objective.contains("First call state_inspect"));
     assert!(packet.objective.contains("actively call task_claim"));
     assert!(packet.objective.contains("Never submit before claiming"));
+    assert_eq!(
+        packet
+            .required_acceptance
+            .evidence_obligations
+            .iter()
+            .map(crate::path_identity::obligation_scope_key)
+            .collect::<Vec<_>>(),
+        ["read:crates/runtime/Cargo.toml"]
+    );
     assert!(!packet
         .objective
         .contains("already committed this exact work"));
