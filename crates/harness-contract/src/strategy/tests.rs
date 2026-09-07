@@ -409,6 +409,29 @@ fn narrative_generation_without_an_artifact_is_not_a_workspace_write() {
 }
 
 #[test]
+fn artifact_actions_cannot_borrow_objects_from_another_clause() {
+    for prompt in [
+        "请用一句话说明当前工作目录的名称；这是连通性检查，不需要创建团队。",
+        "Describe the current directory; there is no need to create a team.",
+        "检查当前文件夹；不要创建团队",
+    ] {
+        let understanding = understand(&StrategyInput::from_prompt(prompt));
+        assert!(!understanding.requires_write, "{prompt}");
+        assert!(understanding.forbids_team, "{prompt}");
+    }
+
+    for prompt in [
+        "检查当前目录；创建一个说明文件",
+        "Inspect the directory; create a documentation file",
+    ] {
+        assert!(
+            understand(&StrategyInput::from_prompt(prompt)).requires_write,
+            "{prompt}"
+        );
+    }
+}
+
+#[test]
 fn explicit_read_only_language_suppresses_incidental_write_terms() {
     let decision = decide_strategy(&StrategyInput::from_prompt(
         "并行阅读当前工作区 README.md 并审查架构，不要修改文件",

@@ -3023,7 +3023,17 @@ fn requests_persisted_artifact(normalized: &str) -> bool {
         "webpage",
         "source code",
     ];
-    contains_any(normalized, ACTIONS) && contains_any(normalized, ARTIFACTS)
+    // Bind the mutation verb to its artifact inside the same clause. A
+    // prompt such as "describe the current directory; do not create a team"
+    // contains both `create` and `directory`, but they describe unrelated
+    // objects. Cross-clause bag-of-words matching turns that read-only task
+    // into a hard write obligation and can make an otherwise correct answer
+    // loop until the safety fuse fires.
+    normalized
+        .split([
+            '，', ',', '。', '.', '；', ';', '！', '!', '？', '?', '\n', '\r',
+        ])
+        .any(|clause| contains_any(clause, ACTIONS) && contains_any(clause, ARTIFACTS))
 }
 
 /// Returns whether an explicitly requested Team, rather than the parent
