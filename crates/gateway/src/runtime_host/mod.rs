@@ -2300,9 +2300,11 @@ pub(crate) async fn restore_runtime_before_admission(
                 }
             }
         }
-        // Every durable Session partition must hydrate before global producers
-        // are released. A failed local partition is retried with the same
-        // bounded ordered pass; after three failures startup remains fenced.
+        // Global recovery authority must be healthy before producers are
+        // released. A corrupt Session is quarantined by id and excluded from
+        // graph/program replay, so it must not take unrelated Sessions or new
+        // work offline. Backend-wide and Runtime recovery failures still fence
+        // admission.
         let complete = startup_recovery_pass_is_complete(&summary, runtime_recovery_failed);
         last_failures.clone_from(&summary.failures);
         let recovery_state = if complete {
@@ -2334,10 +2336,7 @@ fn startup_recovery_pass_is_complete(
     summary: &crate::services::session_service::activation::SessionRecoverySummary,
     runtime_recovery_failed: bool,
 ) -> bool {
-    summary.failed == 0
-        && summary.global_failures == 0
-        && summary.failed_session_ids.is_empty()
-        && !runtime_recovery_failed
+    summary.global_failures == 0 && !runtime_recovery_failed
 }
 
 async fn reconcile_agentic_startup(
@@ -2509,7 +2508,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
-    fn ordered_recovery_requires_every_session_and_runtime_partition() {
+    fn ordered_recovery_quarantines_local_sessions_but_fences_global_failures() {
         let summary = crate::services::session_service::activation::SessionRecoverySummary {
             failed: 1,
             global_failures: 0,
@@ -2518,7 +2517,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(!startup_recovery_pass_is_complete(&summary, false));
+        assert!(startup_recovery_pass_is_complete(&summary, false));
         assert!(!startup_recovery_pass_is_complete(&summary, true));
 
         assert!(startup_recovery_pass_is_complete(

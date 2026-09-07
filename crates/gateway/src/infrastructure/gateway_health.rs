@@ -292,8 +292,6 @@ fn session_workers_healthy(health: &crate::session_runtime_bridge::SessionWorker
         && health.recovery_completed_at_ms > 0
         && health.recovery_state
             == crate::session_runtime_bridge::SessionStartupRecoveryState::Completed
-        && health.recovery.failed == 0
-        && health.recovery.failed_session_ids.is_empty()
         && health.recovery.global_failures == 0
         && crate::session_runtime_bridge::REQUIRED_SESSION_WORKERS
             .iter()
@@ -394,14 +392,16 @@ mod tests {
     }
 
     #[test]
-    fn session_local_recovery_failure_is_never_ready() {
+    fn session_local_recovery_failure_is_quarantined_without_global_outage() {
         let mut health = complete_worker_health();
         health.recovery.failed = 1;
         health
             .recovery
             .failed_session_ids
             .insert("bad-session".to_string());
-        health.recovery_state = crate::session_runtime_bridge::SessionStartupRecoveryState::Failed;
+        assert!(session_workers_healthy(&health));
+
+        health.recovery.global_failures = 1;
         assert!(!session_workers_healthy(&health));
     }
 
