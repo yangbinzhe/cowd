@@ -1567,6 +1567,8 @@ fn collaboration_obligation_rejects_zero_or_forbidden_team() {
 fn execution_verbs_cannot_borrow_team_objects_from_another_clause() {
     for prompt in [
         "审计当前 Team 设计是否合理，但不要启动任何执行",
+        "请用一句话说明当前工作目录的名称；这是连通性检查，不需要创建团队。",
+        "检查连通性，无需创建团队",
         "创建一个说明文件；解释 Team 的优缺点",
         "创建一个说明文件\n解释 Team 的优缺点",
         "创建一个说明文件. Explain Teams",
