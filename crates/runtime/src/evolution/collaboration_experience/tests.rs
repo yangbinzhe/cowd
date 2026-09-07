@@ -315,6 +315,7 @@ fn model_can_read_advice_without_mutating_program_or_gaining_permissions() {
             actor,
             expected_revision: None,
             action: AgentAction::StateInspect(StateInspectInput {
+                wait_for_workers: false,
                 scope_ref: Some("collaboration_patterns".into()),
                 after_revision: Some(0),
                 page_cursor: None,

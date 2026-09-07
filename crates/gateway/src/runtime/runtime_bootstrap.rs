@@ -373,7 +373,7 @@ fn agent_action_tool_definitions() -> Vec<RuntimeToolDefinition> {
     vec![
         agent_action_definition::<action::StateInspectInput>(
             action::STATE_INSPECT_TOOL_ID,
-            "Inspect the current Program, Team, roster, work, topic and artifact facts. Runtime binds the Objective, Program and actor; provide only an optional scope reference and cursor. Optional scope_ref=collaboration_patterns returns evidence-backed structural suggestions from previous completed Turns; they are advice, not execution rules or capability grants.",
+            "Inspect the current Program, Team, roster, work, topic and artifact facts. Runtime binds the Objective, Program and actor. Root: leave wait_for_workers=false to continue planning and publishing tasks while members execute; set it true only when ready to yield to workers until their work settles. Do not poll unchanged state. Optional scope_ref=collaboration_patterns returns evidence-backed structural suggestions from previous completed Turns; they are advice, not execution rules or capability grants.",
         ),
         agent_action_definition::<action::TeamCreateInput>(
             action::TEAM_CREATE_TOOL_ID,

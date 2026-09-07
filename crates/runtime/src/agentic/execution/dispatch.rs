@@ -571,6 +571,7 @@ impl RuntimeServices {
                 expected_revision: None,
                 action: AgentAction::StateInspect(
                     harness_contract::agent_action::StateInspectInput {
+                        wait_for_workers: false,
                         scope_ref: None,
                         after_revision: None,
                         page_cursor: None,

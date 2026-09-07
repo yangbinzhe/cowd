@@ -26,15 +26,16 @@ pub struct AgenticProgramWaitRequest {
 }
 
 impl AgenticProgramWaitRequest {
-    /// Build a barrier request only from durable post-action truth. Tool names
-    /// and call ordering are intentionally absent: any action that leaves a
-    /// bound root with dispatched execution or review work must park it.
+    /// Resolve an explicit root yield against durable execution truth. Child
+    /// activity alone must never suspend unfinished root planning.
     pub(crate) async fn for_active_root(
         program: &crate::AgenticProgramProjection,
         root_execution_id: &str,
         state_store: &ExecutionGraphStateStore,
+        wait_requested: bool,
     ) -> Result<Option<Self>, String> {
-        if program.status != crate::AgenticProgramStatus::Open
+        if !wait_requested
+            || program.status != crate::AgenticProgramStatus::Open
             || program.root_execution_id.as_deref() != Some(root_execution_id)
         {
             return Ok(None);
@@ -579,7 +580,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_before_invite_becomes_waitable_after_child_dispatch_without_runtime_claim() {
+    async fn root_can_publish_dependencies_while_child_runs_and_yield_explicitly() {
         let services = RuntimeServices::in_memory().expect("runtime");
         let program_id = "program-publish-before-invite";
         let root_execution_id = "root-publish-before-invite";
@@ -606,7 +607,7 @@ mod tests {
         )
         .changed_refs[0]
             .clone();
-        apply_root(
+        let first_task_ref = apply_root(
             "publish-before-staffing",
             AgentAction::TaskPublish(TaskPublishInput {
                 team_ref: team_ref.clone(),
@@ -621,7 +622,9 @@ mod tests {
                 execution_requirements: Vec::new(),
                 expertise_hints: Vec::new(),
             }),
-        );
+        )
+        .changed_refs[0]
+            .clone();
         let published = services
             .agent_action_service()
             .project(program_id)
@@ -630,6 +633,7 @@ mod tests {
             &published,
             root_execution_id,
             services.graph_state_store(),
+            true,
         )
         .await
         .expect("derive pre-dispatch wait")
@@ -661,11 +665,48 @@ mod tests {
             .agent_action_service()
             .project(program_id)
             .expect("dispatched projection");
+        assert!(AgenticProgramWaitRequest::for_active_root(
+            &dispatched,
+            root_execution_id,
+            services.graph_state_store(),
+            false,
+        )
+        .await
+        .expect("continue publishing while a child is active")
+        .is_none());
+        let downstream = apply_root(
+            "publish-dependent-work-while-child-runs",
+            AgentAction::TaskPublish(TaskPublishInput {
+                team_ref: team_ref.clone(),
+                title: "Consume the first result".into(),
+                objective: "plan downstream without waiting for the first execution".into(),
+                acceptance: "consume predecessor evidence".into(),
+                required_capabilities: Vec::new(),
+                depends_on: vec![first_task_ref.clone()],
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
+            }),
+        );
+        assert_eq!(
+            downstream.status,
+            harness_contract::agent_action::AgentActionStatus::Applied
+        );
+        let planned = services
+            .agent_action_service()
+            .project(program_id)
+            .expect("expanded plan");
+        assert_eq!(
+            planned.tasks[&downstream.changed_refs[0]].depends_on,
+            vec![first_task_ref]
+        );
         assert_eq!(
             AgenticProgramWaitRequest::for_active_root(
                 &dispatched,
                 root_execution_id,
                 services.graph_state_store(),
+                true,
             )
             .await
             .expect("derive dispatched wait"),

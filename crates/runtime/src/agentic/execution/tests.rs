@@ -607,6 +607,7 @@ async fn task_publish_admits_real_agent_graph_with_human_display_identity() {
     let inspect = bind_root(root(
         "inspect",
         AgentAction::StateInspect(harness_contract::agent_action::StateInspectInput {
+            wait_for_workers: false,
             scope_ref: None,
             after_revision: None,
             page_cursor: None,

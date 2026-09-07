@@ -259,6 +259,7 @@ fn state_inspect_pages_indexes_and_never_falls_back_to_full_program_dump() {
         .apply(&root(
             "inspect-first-page",
             AgentAction::StateInspect(StateInspectInput {
+                wait_for_workers: false,
                 scope_ref: None,
                 after_revision: None,
                 page_cursor: None,
@@ -278,6 +279,7 @@ fn state_inspect_pages_indexes_and_never_falls_back_to_full_program_dump() {
         .apply(&root(
             "inspect-second-page",
             AgentAction::StateInspect(StateInspectInput {
+                wait_for_workers: false,
                 scope_ref: None,
                 after_revision: None,
                 page_cursor: Some("state:32".to_string()),
@@ -294,6 +296,7 @@ fn state_inspect_pages_indexes_and_never_falls_back_to_full_program_dump() {
         .apply(&root(
             "inspect-malformed-cursor",
             AgentAction::StateInspect(StateInspectInput {
+                wait_for_workers: false,
                 scope_ref: None,
                 after_revision: None,
                 page_cursor: Some("state:not-a-number".to_string()),

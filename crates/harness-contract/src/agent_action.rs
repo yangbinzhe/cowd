@@ -66,6 +66,10 @@ pub fn program_id_for_objective(objective_id: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StateInspectInput {
+    /// Root only: yield to active workers after inspecting state. Leave false
+    /// to keep planning, publishing dependent tasks or doing useful work.
+    #[serde(default)]
+    pub wait_for_workers: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -820,6 +824,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn state_inspection_does_not_implicitly_yield_the_planner() {
+        let inspect: StateInspectInput = serde_json::from_str("{}").expect("ordinary inspection");
+        assert!(!inspect.wait_for_workers);
+        let wait: StateInspectInput =
+            serde_json::from_str(r#"{"wait_for_workers":true}"#).expect("explicit worker wait");
+        assert!(wait.wait_for_workers);
+        assert!(
+            serde_json::from_str::<StateInspectInput>(r#"{"wait_for_workers":"true"}"#).is_err()
+        );
+    }
+
+    #[test]
     fn long_content_is_not_part_of_the_artifact_action_contract() {
         let schema = schemars::schema_for!(ArtifactCommitInput);
         let encoded = serde_json::to_value(schema).expect("schema").to_string();
@@ -850,6 +866,7 @@ mod tests {
             },
             expected_revision: None,
             action: AgentAction::StateInspect(StateInspectInput {
+                wait_for_workers: false,
                 scope_ref: None,
                 after_revision: None,
                 page_cursor: None,

@@ -2245,7 +2245,7 @@ fn compact_agentic_program_checkpoint(
         "unresolved": program.unresolved,
         "next_actions": next_actions,
         "terminal_action": terminal_action.as_ref().map(RootAgenticTerminalAction::checkpoint_detail),
-        "instruction": "Use this Runtime projection as current truth. Decide the next semantic action; do not poll unchanged state or recreate committed entities.",
+        "instruction": "Use this Runtime projection as current truth. You may continue planning, publish dependent or independent Tasks, and coordinate while members execute. When ready to wait for active workers, call state_inspect with wait_for_workers=true; Runtime waits without provider polling. Do not recreate committed entities.",
     })
     .to_string()
 }

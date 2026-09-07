@@ -6,6 +6,20 @@ use super::host_backend::{
 use super::agentic_checkpoint_artifact_content;
 use super::retain_agentic_program_checkpoint;
 
+#[test]
+fn worker_wait_requires_an_explicit_successful_inspection() {
+    let mut call = preceding_content_commit_call("inspect");
+    call.name = harness_contract::agent_action::STATE_INSPECT_TOOL_ID.into();
+    call.input = "{}".into();
+    let successful = [call.id.clone()].into_iter().collect();
+    assert!(!super::host_backend::requested_agentic_worker_wait(std::slice::from_ref(&call), &successful));
+    call.input = r#"{"wait_for_workers":true}"#.into();
+    assert!(super::host_backend::requested_agentic_worker_wait(std::slice::from_ref(&call), &successful));
+    assert!(!super::host_backend::requested_agentic_worker_wait(std::slice::from_ref(&call), &BTreeSet::new()));
+    call.name = harness_contract::agent_action::TASK_PUBLISH_TOOL_ID.into();
+    assert!(!super::host_backend::requested_agentic_worker_wait(std::slice::from_ref(&call), &successful));
+}
+
 #[tokio::test]
 async fn current_program_evidence_survives_allocator_and_reaches_provider_request() {
     let mut program = crate::AgenticProgramProjection::empty("program:continuity", "objective:continuity");

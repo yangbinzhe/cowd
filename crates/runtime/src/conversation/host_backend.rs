@@ -2,6 +2,20 @@
 
 use super::*;
 
+pub(super) fn requested_agentic_worker_wait(
+    calls: &[ModelToolCall],
+    successful: &BTreeSet<String>,
+) -> bool {
+    calls.iter().any(|call| {
+        successful.contains(&call.id)
+            && call.name == harness_contract::agent_action::STATE_INSPECT_TOOL_ID
+            && serde_json::from_str::<harness_contract::agent_action::StateInspectInput>(
+                &call.input,
+            )
+            .is_ok_and(|input| input.wait_for_workers)
+    })
+}
+
 fn terminal_provider_route_intervention(
     goal_id: &str,
     ticket: &NodeExecutionTicket,
@@ -3508,10 +3522,9 @@ where
                 .get(call_id)
                 .is_some_and(|invocation| is_local_workspace_mutation_effect(&invocation.effect))
         });
-        // Parking is a post-action state invariant, not a special consequence
-        // of `task_publish`. In particular, a Task may be published before its
-        // Team is staffed; the later `agent_invite` dispatches it and must park
-        // the root immediately instead of paying for state-inspect polling.
+        // Active workers do not mean the root has finished planning. A root
+        // needs each published Task ref before it can wire downstream work.
+        // Only its explicit yield requests a durable, event-driven barrier.
         let (session_id, turn_id, delegated) = {
             let state = self.state.lock().await;
             (
@@ -3529,6 +3542,7 @@ where
                 &program,
                 &ticket.graph_id,
                 self.services.graph_state_store(),
+                requested_agentic_worker_wait(&calls, &successful_call_ids),
             )
             .await
             .map_err(|reason| NodeExecutorError::Poll {
