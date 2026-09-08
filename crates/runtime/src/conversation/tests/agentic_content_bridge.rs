@@ -1,6 +1,6 @@
 use super::host_backend::{
     latest_agentic_content_draft, persist_agentic_content_draft,
-    persist_agentic_content_draft_for_scope, resolve_preceding_agentic_content_refs,
+    persist_agentic_content_draft_for_scope, resolve_explicit_agentic_content_refs,
     AgenticContentDraftScope,
 };
 use super::agentic_checkpoint_artifact_content;
@@ -8,7 +8,7 @@ use super::retain_agentic_program_checkpoint;
 
 #[test]
 fn worker_wait_requires_an_explicit_successful_inspection() {
-    let mut call = preceding_content_commit_call("inspect");
+    let mut call = explicit_content_commit_call("inspect");
     call.name = harness_contract::agent_action::STATE_INSPECT_TOOL_ID.into();
     call.input = "{}".into();
     let successful = [call.id.clone()].into_iter().collect();
@@ -77,14 +77,14 @@ fn agentic_content_bridge_ticket(graph_id: &str, node_id: &str, attempt: u32) ->
     }
 }
 
-fn preceding_content_commit_call(id: &str) -> ModelToolCall {
+fn explicit_content_commit_call(id: &str) -> ModelToolCall {
     ModelToolCall {
         id: id.to_string(),
         name: harness_contract::agent_action::ARTIFACT_COMMIT_TOOL_ID.to_string(),
         input: serde_json::json!({
             "title": "authored report",
             "kind": "report",
-            "content_ref": "preceding_content",
+            "content_ref": "current_message_block:0",
             "evidence_refs": [],
         })
         .to_string(),
@@ -157,12 +157,12 @@ async fn same_frame_text_and_artifact_commit_resolve_to_durable_content() {
         .await
         .expect("persist current content")
         .expect("current content ref");
-    let mut calls = vec![preceding_content_commit_call("commit-current")];
+    let mut calls = vec![explicit_content_commit_call("commit-current")];
 
-    resolve_preceding_agentic_content_refs(
+    resolve_explicit_agentic_content_refs(
         services.as_ref(),
         &ticket,
-        Some(&current),
+        &message,
         &mut calls,
     )
     .await
@@ -170,7 +170,8 @@ async fn same_frame_text_and_artifact_commit_resolve_to_durable_content() {
 
     let input: serde_json::Value = serde_json::from_str(&calls[0].input).expect("resolved input");
     let content_ref = input["content_ref"].as_str().expect("content ref");
-    assert_eq!(content_ref, current);
+    assert_ne!(content_ref, "current_message_block:0");
+    let _retained_draft = current;
     let artifact = services
         .artifact_store()
         .resolve(content_ref)
@@ -187,7 +188,7 @@ async fn same_frame_text_and_artifact_commit_resolve_to_durable_content() {
 }
 
 #[tokio::test]
-async fn tool_only_artifact_commit_uses_latest_text_in_the_same_attempt() {
+async fn tool_only_artifact_commit_never_selects_a_previous_draft() {
     let services = crate::RuntimeServices::in_memory().expect("runtime services");
     let ticket = agentic_content_bridge_ticket("continuation-graph", "model-step-1", 2);
     let older = ConversationMessage::assistant(vec![ContentBlock::Text {
@@ -199,18 +200,18 @@ async fn tool_only_artifact_commit_uses_latest_text_in_the_same_attempt() {
     let latest = ConversationMessage::assistant(vec![ContentBlock::Text {
         text: "latest complete draft".to_string(),
     }]);
-    let expected = persist_agentic_content_draft(services.as_ref(), &ticket, &latest)
+    let _retained = persist_agentic_content_draft(services.as_ref(), &ticket, &latest)
         .await
         .expect("persist latest draft")
         .expect("latest content ref");
-    let mut calls = vec![preceding_content_commit_call("commit-later")];
+    let mut calls = vec![explicit_content_commit_call("commit-later")];
 
-    resolve_preceding_agentic_content_refs(services.as_ref(), &ticket, None, &mut calls)
+    resolve_explicit_agentic_content_refs(services.as_ref(), &ticket, &ConversationMessage::assistant(vec![]), &mut calls)
         .await
         .expect("resolve prior frame");
 
     let input: serde_json::Value = serde_json::from_str(&calls[0].input).expect("resolved input");
-    assert_eq!(input["content_ref"].as_str(), Some(expected.as_str()));
+    assert_eq!(input["content_ref"].as_str(), Some("current_message_block:0"));
 }
 
 #[tokio::test]
@@ -254,4 +255,26 @@ async fn durable_content_drafts_never_cross_actor_or_attempt_fences() {
             .expect("read next attempt"),
         None
     );
+}
+
+#[tokio::test]
+async fn explicit_block_publication_excludes_preamble_and_rejects_out_of_range() {
+    let services = crate::RuntimeServices::in_memory().unwrap();
+    let ticket = agentic_content_bridge_ticket("selected-block-graph", "model", 1);
+    let body = "<html>正文\r\n</html>\r\n";
+    let message = ConversationMessage::assistant(vec![
+        ContentBlock::Text { text: "I will prepare a report.".into() },
+        ContentBlock::Text { text: body.into() },
+    ]);
+    let mut calls = vec![explicit_content_commit_call("body")];
+    calls[0].input = calls[0].input.replace("current_message_block:0", "current_message_block:1");
+    resolve_explicit_agentic_content_refs(services.as_ref(), &ticket, &message, &mut calls).await.unwrap();
+    let value: serde_json::Value = serde_json::from_str(&calls[0].input).unwrap();
+    let artifact = services.artifact_store().resolve(value["content_ref"].as_str().unwrap()).unwrap();
+    assert_eq!(services.artifact_store().read(&artifact, "execution:selected-block-graph", None).await.unwrap(), body.as_bytes());
+    let mut missing = vec![explicit_content_commit_call("missing")];
+    missing[0].input = missing[0].input.replace("current_message_block:0", "current_message_block:999");
+    let unchanged = missing[0].input.clone();
+    resolve_explicit_agentic_content_refs(services.as_ref(), &ticket, &message, &mut missing).await.unwrap();
+    assert_eq!(missing[0].input, unchanged);
 }

@@ -14,10 +14,10 @@ use memory::{
     project_scope::MemoryScope,
     same_memory_key,
     store::{
-        AuthorityLookup, FtsSearchOptions, FtsSearchResult, MemoryKeyValue, MemoryLayerAggregate,
-        MemoryScanCursor, MemoryScanPage, MemoryStore, MemoryStoreAggregate,
-        MemoryStoreCapabilities, Result as MemoryResult, SymbolMemoryReference, TaggedLookup,
-        VerbatimEntry,
+        AuthorityLookup, FtsSearchOptions, FtsSearchResult, MemoryDiscoveryPage,
+        MemoryDiscoveryQuery, MemoryKeyValue, MemoryLayerAggregate, MemoryScanCursor,
+        MemoryScanPage, MemoryStore, MemoryStoreAggregate, MemoryStoreCapabilities,
+        Result as MemoryResult, SymbolMemoryReference, TaggedLookup, VerbatimEntry,
     },
     MaintenanceCandidate, MaintenanceCandidateFilter, MaintenanceCandidateStatus,
     MaintenanceQueueBackend, MemoryCategory, MemoryEntry, MemoryError, MemoryId, MemoryLayer,
@@ -139,6 +139,43 @@ const MEMORY_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
             ON memory_maintenance_candidates(kind, updated_at DESC, id)",
         "CREATE INDEX IF NOT EXISTS idx_memory_maintenance_source_updated
             ON memory_maintenance_candidates(source, updated_at DESC, id)",
+    ],
+}, PostgresMigrationSpec {
+    id: "memory.0005.discovery-revisions",
+    domain: MEMORY_DOMAIN,
+    version: 5,
+    description: "atomically version scoped memory content and lifecycle discovery",
+    statements: &[
+        "CREATE TABLE IF NOT EXISTS memory_discovery_revisions (scope_key TEXT PRIMARY KEY, revision BIGINT NOT NULL)",
+        "CREATE OR REPLACE FUNCTION memory_discovery_entry_changed() RETURNS trigger LANGUAGE plpgsql AS $$
+         DECLARE old_scope TEXT; new_scope TEXT; affected_scope TEXT;
+         BEGIN
+           IF TG_OP='UPDATE' AND (OLD.payload - 'access_count' - 'last_accessed_at') = (NEW.payload - 'access_count' - 'last_accessed_at') AND OLD.scope_key=NEW.scope_key THEN RETURN NEW; END IF;
+           IF TG_OP <> 'INSERT' THEN old_scope := OLD.scope_key; END IF;
+           IF TG_OP <> 'DELETE' THEN new_scope := NEW.scope_key; END IF;
+           FOR affected_scope IN SELECT DISTINCT scope FROM unnest(ARRAY[old_scope,new_scope]) AS scope WHERE scope IS NOT NULL ORDER BY scope LOOP
+             INSERT INTO memory_discovery_revisions(scope_key,revision) VALUES(affected_scope,1)
+             ON CONFLICT(scope_key) DO UPDATE SET revision=memory_discovery_revisions.revision+1;
+           END LOOP;
+           RETURN NULL;
+         END $$",
+        "CREATE TRIGGER memory_discovery_entry_revision AFTER INSERT OR UPDATE OR DELETE ON memory_entries FOR EACH ROW EXECUTE FUNCTION memory_discovery_entry_changed()",
+        "CREATE OR REPLACE FUNCTION memory_discovery_lifecycle_changed() RETURNS trigger LANGUAGE plpgsql AS $$
+         DECLARE old_key TEXT; new_key TEXT; affected_scope TEXT;
+         BEGIN
+           IF TG_OP='UPDATE' AND OLD.key=NEW.key AND OLD.value=NEW.value THEN RETURN NEW; END IF;
+           IF TG_OP <> 'INSERT' THEN old_key := OLD.key; END IF;
+           IF TG_OP <> 'DELETE' THEN new_key := NEW.key; END IF;
+           FOR affected_scope IN SELECT DISTINCT scope_key FROM memory_entries WHERE id IN (
+             SELECT substr(key, length('memory_lifecycle:')+1) FROM unnest(ARRAY[old_key,new_key]) AS key WHERE starts_with(key,'memory_lifecycle:')
+           ) ORDER BY scope_key LOOP
+             INSERT INTO memory_discovery_revisions(scope_key,revision) VALUES(affected_scope,1)
+             ON CONFLICT(scope_key) DO UPDATE SET revision=memory_discovery_revisions.revision+1;
+           END LOOP;
+           RETURN NULL;
+         END $$",
+        "CREATE TRIGGER memory_discovery_lifecycle_revision AFTER INSERT OR UPDATE OR DELETE ON memory_kv FOR EACH ROW EXECUTE FUNCTION memory_discovery_lifecycle_changed()",
+        "CREATE INDEX IF NOT EXISTS idx_memory_discovery_scope_id ON memory_entries(scope_key,id)",
     ],
 }];
 
@@ -688,6 +725,41 @@ impl MemoryStore for PostgresMemoryStore {
         run_memory_blocking(move || store.search_memory(&query, Some(scope), None, None, limit))
             .await
     }
+    async fn discover_page(
+        &self,
+        query: MemoryDiscoveryQuery,
+    ) -> MemoryResult<MemoryDiscoveryPage> {
+        let store = self.clone();
+        run_memory_blocking(move || {
+            let scopes = query.scopes.iter().map(MemoryScope::scope_key).collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>();
+            let mut connection = store.executor.checkout_online_read().map_err(storage_memory_error)?;
+            let mut transaction = connection.transaction().map_err(postgres_memory_error)?;
+            transaction.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY").map_err(postgres_memory_error)?;
+            let revisions = transaction.query("SELECT s.scope_key, coalesce(r.revision,0)::BIGINT FROM unnest($1::TEXT[]) AS s(scope_key) LEFT JOIN memory_discovery_revisions r USING(scope_key) ORDER BY s.scope_key", &[&scopes])
+                .map_err(postgres_memory_error)?.into_iter().map(|row| (row.get::<_,String>(0), row.get::<_,i64>(1))).collect::<std::collections::BTreeMap<_,_>>();
+            if query.expected_revisions.as_ref().is_some_and(|expected| expected != &revisions) {
+                return Err(MemoryError::Store("memory discovery source changed; start a new search".into()));
+            }
+            let limit = query.limit.clamp(1,128); let sql_limit = (limit+1) as i64;
+            let sql_skip = i64::try_from(query.skip).map_err(|_| MemoryError::Store("memory cursor skip is out of range".into()))?;
+            let mut rows = transaction.query(
+                "SELECT e.payload, k.key, k.value FROM memory_entries e LEFT JOIN memory_kv k ON k.key='memory_lifecycle:'||e.id
+                 WHERE e.scope_key=ANY($1) AND ($2::TEXT IS NULL OR e.id > $2)
+                   AND ($3='' OR to_tsvector('simple',e.title||' '||e.content||' '||coalesce(e.payload->>'tags','')) @@ websearch_to_tsquery('simple',$3)
+                        OR e.title ILIKE '%'||$3||'%' OR e.content ILIKE '%'||$3||'%')
+                 ORDER BY e.id ASC LIMIT $4 OFFSET $5", &[&scopes,&query.after_id,&query.query,&sql_limit,&sql_skip]).map_err(postgres_memory_error)?;
+            let has_more = rows.len() > limit; rows.truncate(limit);
+            let mut entries = Vec::with_capacity(rows.len()); let mut lifecycle = Vec::new();
+            for row in rows {
+                entries.push(serde_json::from_value::<MemoryEntry>(row.get(0)).map_err(json_memory_error)?);
+                if let (Some(key),Some(value)) = (row.get::<_,Option<String>>(1),row.get::<_,Option<String>>(2)) { lifecycle.push(MemoryKeyValue {key,value}); }
+            }
+            let next_id = has_more.then(|| entries.last().expect("nonempty page").id.to_string());
+            transaction.commit().map_err(postgres_memory_error)?;
+            Ok(MemoryDiscoveryPage {entries,lifecycle,revisions,next_id})
+        }).await
+    }
+
     async fn search_fts_advanced(
         &self,
         query: &str,

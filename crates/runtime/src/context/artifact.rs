@@ -21,6 +21,12 @@ use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
+#[path = "artifact_catalog.rs"]
+mod catalog;
+pub use catalog::{
+    ArtifactCatalogPage, ArtifactCatalogQuery, ArtifactCatalogSnapshot, ArtifactDirectoryPage,
+};
+
 const ARTIFACT_SELECTOR_PREFIX: &str = "artifact://";
 pub const ARTIFACT_PERMANENT_PIN_UNTIL_MS: u64 = i64::MAX as u64;
 pub const ARTIFACT_STAGING_PIN_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
@@ -78,6 +84,21 @@ pub struct ArtifactRecord {
     pub tier: ArtifactObjectTier,
     pub created_at_ms: u64,
     pub last_access_at_ms: u64,
+}
+
+impl ArtifactRecord {
+    /// The physical content identity comes only from the metadata owner.
+    #[must_use]
+    pub fn content_reference(&self) -> ArtifactRef {
+        ArtifactRef {
+            selector: format!("{ARTIFACT_SELECTOR_PREFIX}{}", self.artifact_id),
+            sha256: self.sha256.clone(),
+            bytes: self.bytes,
+            media_type: self.media_type.clone(),
+            durability: harness_contract::context::EvidenceDurability::Durable,
+            visibility_scope: self.visibility_scope.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +168,7 @@ pub trait ArtifactMetadataRepository: Send + Sync {
     fn object(&self, sha256: &str) -> Result<Option<ArtifactObjectRecord>, String>;
     fn put_record(&self, record: &ArtifactRecord) -> Result<(), String>;
     fn record(&self, artifact_id: &str) -> Result<Option<ArtifactRecord>, String>;
+    fn catalog_page(&self, query: ArtifactCatalogQuery) -> Result<ArtifactCatalogPage, String>;
     fn touch(&self, artifact_id: &str, at_ms: u64) -> Result<(), String>;
     fn remove_record(&self, artifact_id: &str) -> Result<(), String>;
     fn unreferenced_objects_before(
@@ -269,14 +291,7 @@ impl ArtifactStore {
             .record(id)
             .map_err(ArtifactError::Metadata)?
             .ok_or(ArtifactError::NotFound)?;
-        Ok(ArtifactRef {
-            selector: selector.to_string(),
-            sha256: record.sha256,
-            bytes: record.bytes,
-            media_type: record.media_type,
-            durability: harness_contract::context::EvidenceDurability::Durable,
-            visibility_scope: record.visibility_scope,
-        })
+        Ok(record.content_reference())
     }
 
     pub async fn begin(
@@ -773,6 +788,9 @@ pub struct EphemeralArtifactRepository {
 struct EphemeralArtifactState {
     objects: HashMap<String, ArtifactObjectRecord>,
     records: HashMap<String, ArtifactRecord>,
+    catalog_sequence: u64,
+    creation_sequence: HashMap<String, u64>,
+    catalog_invalidations: std::collections::BTreeMap<String, i64>,
     pins: HashMap<(String, String), u64>,
 }
 
@@ -804,10 +822,86 @@ impl ArtifactMetadataRepository for EphemeralArtifactRepository {
         if state.records.contains_key(&record.artifact_id) {
             return Err("artifact record already exists".to_string());
         }
+        state.catalog_sequence += 1;
+        let sequence = state.catalog_sequence;
+        state
+            .creation_sequence
+            .insert(record.artifact_id.clone(), sequence);
         state
             .records
             .insert(record.artifact_id.clone(), record.clone());
         Ok(())
+    }
+
+    fn catalog_page(&self, query: ArtifactCatalogQuery) -> Result<ArtifactCatalogPage, String> {
+        let state = self.state.lock().map_err(|error| error.to_string())?;
+        let revisions = query
+            .scopes
+            .iter()
+            .map(|scope| {
+                (
+                    scope.clone(),
+                    *state.catalog_invalidations.get(scope).unwrap_or(&0),
+                )
+            })
+            .collect();
+        let snapshot = query.snapshot.unwrap_or(ArtifactCatalogSnapshot {
+            fence: format!("ephemeral:{}", state.catalog_sequence),
+            revisions,
+        });
+        let current = query
+            .scopes
+            .iter()
+            .map(|scope| {
+                (
+                    scope.clone(),
+                    *state.catalog_invalidations.get(scope).unwrap_or(&0),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        if snapshot.revisions != current {
+            return Err("Artifact catalog source changed; start a fresh discovery".into());
+        }
+        let through = snapshot
+            .fence
+            .strip_prefix("ephemeral:")
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|sequence| *sequence <= state.catalog_sequence)
+            .ok_or("invalid Artifact catalog snapshot")?;
+        let needle = query.query.to_lowercase();
+        let mut records = state
+            .records
+            .values()
+            .filter(|record| {
+                query.scopes.contains(&record.visibility_scope)
+                    && state
+                        .creation_sequence
+                        .get(&record.artifact_id)
+                        .is_some_and(|sequence| *sequence <= through)
+                    && query
+                        .after_id
+                        .as_ref()
+                        .is_none_or(|after| record.artifact_id > *after)
+                    && (needle.is_empty()
+                        || format!(
+                            "{} {} {}",
+                            record.artifact_id, record.sha256, record.media_type
+                        )
+                        .to_lowercase()
+                        .contains(&needle))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        records.sort_by(|a, b| a.artifact_id.cmp(&b.artifact_id));
+        let limit = query.limit.clamp(1, 128);
+        let has_more = records.len() > limit;
+        records.truncate(limit);
+        let next_id = has_more.then(|| records.last().expect("nonempty page").artifact_id.clone());
+        Ok(ArtifactCatalogPage {
+            records,
+            snapshot,
+            next_id,
+        })
     }
 
     fn record(&self, artifact_id: &str) -> Result<Option<ArtifactRecord>, String> {
@@ -835,7 +929,13 @@ impl ArtifactMetadataRepository for EphemeralArtifactRepository {
 
     fn remove_record(&self, artifact_id: &str) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        state.records.remove(artifact_id);
+        if let Some(record) = state.records.remove(artifact_id) {
+            *state
+                .catalog_invalidations
+                .entry(record.visibility_scope)
+                .or_default() += 1;
+            state.creation_sequence.remove(artifact_id);
+        }
         state.pins.retain(|(id, _), _| id != artifact_id);
         Ok(())
     }

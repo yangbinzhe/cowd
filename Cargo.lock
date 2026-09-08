@@ -60,7 +60,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "auth-broker"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "base64",
  "cowd-app-protocol",
@@ -182,6 +182,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bstr"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6bb31b46c14244e20ee9984b11bf5c992b91fb6939fea616e3512c8baecdbe5f"
+dependencies = [
+ "memchr",
+ "serde_core",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -273,7 +283,7 @@ dependencies = [
 
 [[package]]
 name = "cli"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "auth-broker",
  "cowd-app-protocol",
@@ -313,7 +323,7 @@ dependencies = [
 
 [[package]]
 name = "connector"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "chrono",
  "harness-contract",
@@ -328,7 +338,7 @@ dependencies = [
 
 [[package]]
 name = "connector-postgres"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "chrono",
  "connector",
@@ -359,7 +369,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "cowd-app-host"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "base64",
  "cowd-app-protocol",
@@ -430,6 +440,25 @@ name = "crossbeam-channel"
 version = "0.5.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d85363c37faeca707aef026efa9f3b34d077bce547e48f770770625c6013679e"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-deque"
+version = "0.8.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "622f3fc73690be383c7214310406f28a90e6edeadc3cea882f9d71e495b9711a"
+dependencies = [
+ "crossbeam-epoch",
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-epoch"
+version = "0.9.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc74980687109a3b14c72fd458107bf0baa1da1a1a805e178d15501ba9b86d9d"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -660,7 +689,7 @@ dependencies = [
 
 [[package]]
 name = "fact-kernel"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "chrono",
  "harness-contract",
@@ -672,7 +701,7 @@ dependencies = [
 
 [[package]]
 name = "fact-postgres"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "chrono",
  "fact-kernel",
@@ -852,7 +881,7 @@ dependencies = [
 
 [[package]]
 name = "gateway"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "async-trait",
  "auth-broker",
@@ -968,6 +997,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
+name = "globset"
+version = "0.4.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07c34a9410465b45bd9787443bc7370f37735bad04b0f0cd57ff1a3186c98988"
+dependencies = [
+ "aho-corasick",
+ "bstr",
+ "log",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "h2"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -988,7 +1030,7 @@ dependencies = [
 
 [[package]]
 name = "harness-contract"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "chrono",
  "schemars",
@@ -1001,7 +1043,7 @@ dependencies = [
 
 [[package]]
 name = "harness-eval"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "async-trait",
  "fact-kernel",
@@ -1321,6 +1363,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ignore"
+version = "0.4.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00b69833ed729dc5aa7d19541d96d6cf8e9137194207a04916d658e43168402f"
+dependencies = [
+ "crossbeam-deque",
+ "globset",
+ "log",
+ "memchr",
+ "regex-automata",
+ "same-file",
+ "walkdir",
+ "winapi-util",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1547,7 +1605,7 @@ dependencies = [
 
 [[package]]
 name = "managed-worker-launcher"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "landlock",
  "libc",
@@ -1560,7 +1618,7 @@ dependencies = [
 
 [[package]]
 name = "managed-worker-runtime"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "base64",
  "bytes",
@@ -1596,7 +1654,7 @@ checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
 name = "matrix-core"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "chrono",
  "fact-kernel",
@@ -1609,7 +1667,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-repository"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "chrono",
  "matrix-core",
@@ -1626,7 +1684,7 @@ dependencies = [
 
 [[package]]
 name = "mcp"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "serde",
  "serde_json",
@@ -1651,7 +1709,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "memory"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1682,7 +1740,7 @@ dependencies = [
 
 [[package]]
 name = "memory-postgres"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1754,7 +1812,7 @@ dependencies = [
 
 [[package]]
 name = "model-protocol"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "serde",
  "serde_json",
@@ -2014,7 +2072,7 @@ dependencies = [
 
 [[package]]
 name = "plugins"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "serde",
  "serde_json",
@@ -2107,7 +2165,7 @@ dependencies = [
 
 [[package]]
 name = "provider"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "httpdate",
  "model-protocol",
@@ -2492,7 +2550,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "async-trait",
  "base64",
@@ -2536,7 +2594,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-postgres"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "harness-contract",
  "postgres",
@@ -2636,7 +2694,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-launcher"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "landlock",
  "libc",
@@ -2827,7 +2885,7 @@ dependencies = [
 
 [[package]]
 name = "session"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "chrono",
  "harness-contract",
@@ -2845,7 +2903,7 @@ dependencies = [
 
 [[package]]
 name = "session-postgres"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "chrono",
  "harness-contract",
@@ -2947,7 +3005,7 @@ checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "skill"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "fs2",
  "harness-contract",
@@ -3005,7 +3063,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "storage"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "postgres",
  "r2d2",
@@ -3071,7 +3129,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "surface"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "chrono",
  "harness-contract",
@@ -3084,7 +3142,7 @@ dependencies = [
 
 [[package]]
 name = "surface-postgres"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "chrono",
  "harness-contract",
@@ -3409,13 +3467,14 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "tools"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "base64",
  "flate2",
  "futures",
  "glob",
  "harness-contract",
+ "ignore",
  "libc",
  "mcp",
  "plugins",
@@ -3655,7 +3714,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tui"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "chrono",
  "cowd-app-protocol",
@@ -4250,7 +4309,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.9.723"
+version = "0.9.724"
 dependencies = [
  "base64",
  "cowd-app-protocol",

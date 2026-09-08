@@ -23,6 +23,7 @@ use crate::{
 macro_rules! session_store_backend_contract {
     ($macro:ident) => {
         $macro! {
+            (discover_context_page, (request: &crate::SessionDiscoveryRequest), Result<crate::SessionDiscoveryPage>),
             (create_session, (session: &SessionRecord), Result<()>),
             (get_session, (session_id: &str), Result<Option<SessionRecord>>),
             (get_sessions_by_ids, (session_ids: &[String]), Result<Vec<SessionRecord>>),

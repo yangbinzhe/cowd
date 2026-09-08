@@ -599,6 +599,29 @@ const ARTIFACT_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
         "CREATE INDEX IF NOT EXISTS idx_artifact_pins_expiry
             ON artifact_pins(until_ms)",
     ],
+}, PostgresMigrationSpec {
+    id: "runtime_artifact.0002.snapshot-catalog",
+    domain: ARTIFACT_DOMAIN,
+    version: 2,
+    description: "scope-fenced metadata discovery across immutable creation snapshots",
+    statements: &[
+        "ALTER TABLE artifact_records ADD COLUMN catalog_creation_xid xid8 NOT NULL DEFAULT pg_current_xact_id()",
+        "CREATE TABLE artifact_catalog_invalidations(scope_key TEXT PRIMARY KEY, revision BIGINT NOT NULL)",
+        "CREATE INDEX idx_artifact_catalog_scope_id ON artifact_records(visibility_scope,artifact_id)",
+        "CREATE FUNCTION artifact_catalog_record_changed() RETURNS trigger LANGUAGE plpgsql AS $$
+         DECLARE old_scope TEXT; new_scope TEXT; affected_scope TEXT;
+         BEGIN
+           IF TG_OP='UPDATE' AND (to_jsonb(OLD)-'last_access_at_ms')=(to_jsonb(NEW)-'last_access_at_ms') THEN RETURN NULL; END IF;
+           old_scope := OLD.visibility_scope;
+           IF TG_OP='UPDATE' THEN new_scope := NEW.visibility_scope; END IF;
+           FOR affected_scope IN SELECT DISTINCT scope FROM unnest(ARRAY[old_scope,new_scope]) AS scope WHERE scope IS NOT NULL ORDER BY scope LOOP
+             INSERT INTO artifact_catalog_invalidations(scope_key,revision) VALUES(affected_scope,1)
+             ON CONFLICT(scope_key) DO UPDATE SET revision=artifact_catalog_invalidations.revision+1;
+           END LOOP;
+           RETURN NULL;
+         END $$",
+        "CREATE TRIGGER artifact_catalog_revision AFTER UPDATE OR DELETE ON artifact_records FOR EACH ROW EXECUTE FUNCTION artifact_catalog_record_changed()",
+    ],
 }];
 
 mod event_store;

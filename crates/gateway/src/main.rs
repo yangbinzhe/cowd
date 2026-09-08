@@ -152,7 +152,9 @@ pub(crate) mod pg_test_support {
                 // tests into artificial admission failures and masks the
                 // business invariants they exercise.
                 config.max_connections = 64;
-                config.min_idle_connections = None;
+                // Acquire connections on demand; eager creation of all 64
+                // slots can exhaust a shared development PostgreSQL server.
+                config.min_idle_connections = Some(0);
                 PostgresExecutor::connect(config, &resolver).map_err(|error| error.to_string())
             })
             .clone()

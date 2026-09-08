@@ -1800,3 +1800,82 @@ fn tool_batch_readonly_rejects_non_readonly_tools_before_execution() {
     assert!(output.contains("write_file"));
     assert!(output.contains("not allowed"));
 }
+
+#[test]
+fn workspace_snapshot_discovers_real_roots_and_every_continuation_is_executable() {
+    let root = temp_path("workspace-discovery-pages");
+    for project in ["MFG", "cowd-edge", "nested"] {
+        fs::create_dir_all(root.join(project).join("docs")).unwrap();
+        fs::write(root.join(project).join("README.md"), format!("{project} actual documentation")).unwrap();
+        fs::write(root.join(project).join("docs/index.md"), "entry").unwrap();
+    }
+    fs::create_dir_all(root.join("MFG/.git")).unwrap();
+    fs::write(root.join("MFG/.git/HEAD"), "ref: refs/heads/mfg-source\n").unwrap();
+    fs::write(root.join("MFG/Cargo.toml"), "[workspace]\n").unwrap();
+    fs::write(root.join("cowd-edge/package.json"), "{}").unwrap();
+    let host = crate::ToolHost::builtin("workspace-discovery", &root);
+    let lease = host.pin_snapshot();
+    let mut pending = std::collections::VecDeque::from([json!({"name":"workspace_snapshot", "input":{"page_size":1,"max_files":2}})]);
+    let mut directories = std::collections::BTreeSet::new();
+    let mut files = std::collections::BTreeSet::new();
+    let mut first_cursor = None;
+    let mut calls = 0;
+    while let Some(call) = pending.pop_front() {
+        calls += 1; assert!(calls < 30);
+        let name = call["name"].as_str().unwrap();
+        lease.validate_input(name, &call["input"]).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&crate::executor::execute_with_lease(&lease, name, &call["input"]).unwrap()).unwrap();
+        if name == "workspace_snapshot" {
+            assert_eq!(value["cwd"], root.to_string_lossy().as_ref());
+            if first_cursor.is_none() { first_cursor = value["next_cursor"].as_str().map(str::to_owned); }
+            for directory in value["directories"].as_array().unwrap() {
+                assert!(directories.insert(directory["name"].as_str().unwrap().to_owned()));
+                for key in ["read_request", "files_request"] {
+                    lease.validate_input(directory[key]["name"].as_str().unwrap(), &directory[key]["input"]).unwrap();
+                }
+                if directory["name"] == "MFG" {
+                    assert_eq!(directory["repository_kind"], "git");
+                    assert_eq!(directory["git"]["head_file"], "ref: refs/heads/mfg-source");
+                    let document = &directory["documents"][0]["read_request"];
+                    lease.validate_input("read_file", &document["input"]).unwrap();
+                    let read = crate::executor::execute_with_lease(&lease, "read_file", &document["input"]).unwrap();
+                    assert!(read.contains("MFG actual documentation"));
+                }
+            }
+            if let Some(page) = value["files"].as_array() {
+                for file in page { assert!(files.insert(file.as_str().unwrap().to_owned())); }
+            }
+            pending.extend(value["next_requests"].as_array().unwrap().iter().cloned());
+        } else {
+            for file in value["filenames"].as_array().unwrap() { assert!(files.insert(file.as_str().unwrap().to_owned())); }
+            if !value["next_request"].is_null() { pending.push_back(json!({"name":"glob_search", "input":value["next_request"]})); }
+        }
+    }
+    assert_eq!(directories, ["MFG", "cowd-edge", "nested"].into_iter().map(String::from).collect());
+    assert_eq!(files.len(), 8);
+    assert!(crate::executor::execute_with_lease(&lease, "workspace_snapshot", &json!({"cursor":first_cursor, "query":"changed"})).is_err());
+    assert!(crate::executor::execute_with_lease(&lease, "workspace_snapshot", &json!({"roots":["../"]})).is_err());
+    assert!(crate::executor::execute_with_lease(&lease, "workspace_snapshot", &json!({"roots":["missing"]})).is_err());
+    let nested: serde_json::Value = serde_json::from_str(&crate::executor::execute_with_lease(&lease, "workspace_snapshot", &json!({"roots":["MFG"],"include_files":false})).unwrap()).unwrap();
+    assert!(nested["directories"].as_array().unwrap().iter().any(|entry| entry["name"] == "docs"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn workspace_snapshot_observes_ignore_overrides_and_external_changes() {
+    let root = temp_path("workspace-discovery-ignore");
+    fs::create_dir_all(root.join("build")).unwrap();
+    fs::write(root.join("build/Cargo.toml"), "[workspace]").unwrap();
+    fs::write(root.join(".gitignore"), "build/\n").unwrap();
+    let host = crate::ToolHost::builtin("workspace-ignore", &root); let lease = host.pin_snapshot();
+    let inspect = |input: serde_json::Value| -> serde_json::Value { serde_json::from_str(&crate::executor::execute_with_lease(&lease,"workspace_snapshot",&input).unwrap()).unwrap() };
+    assert_eq!(inspect(json!({"include_files":false}))["directories"].as_array().unwrap().len(), 0);
+    assert_eq!(inspect(json!({"include_files":false,"include_ignored":true}))["directories"][0]["name"], "build");
+    assert_eq!(inspect(json!({"roots":["build"],"include_files":false}))["roots"][0]["repository_kind"], "project_manifest");
+    fs::create_dir_all(root.join("new-project")).unwrap();
+    fs::write(root.join("new-project/README.md"), "new externally").unwrap();
+    let fresh = inspect(json!({"include_files":false}));
+    assert_eq!(fresh["directories"][0]["name"], "new-project");
+    assert_eq!(fresh["directories"][0]["documents"].as_array().unwrap().len(), 1);
+    fs::remove_dir_all(root).unwrap();
+}

@@ -28,6 +28,10 @@ pub struct SessionHistoryReader {
 }
 
 impl SessionHistoryReader {
+    pub(super) fn discovery_repository(&self) -> &UnifiedSessionStore {
+        &self.repository
+    }
+
     pub(super) fn new(repository: UnifiedSessionStore) -> Self {
         Self { repository }
     }

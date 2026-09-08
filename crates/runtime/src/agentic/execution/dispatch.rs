@@ -391,12 +391,16 @@ impl RuntimeServices {
             let Some(program_id) = stream.strip_prefix("agentic-program:") else {
                 continue;
             };
+            // A corrupt or unavailable Program is not authority to suppress
+            // independent Programs. Keep reconciliation ordered within one
+            // Program and report aggregate failure only after checking all.
+            let recovered: Result<(), String> = async {
             let mut projection = self
                 .agent_action_service()
                 .project(program_id)
                 .map_err(|error| error.to_string())?;
             if excluded_sessions.contains(&projection.session_id) {
-                continue;
+                return Ok(());
             }
             let cancellation_tasks = projection
                 .tasks
@@ -422,7 +426,7 @@ impl RuntimeServices {
                     .map_err(|error| error.to_string())?;
             }
             if projection.status != super::super::program::AgenticProgramStatus::Open {
-                continue;
+                return Ok(());
             }
             // An admitted graph that is terminal (or was never persisted)
             // cannot remain an invisible outbox entry.  Settle it through the
@@ -571,6 +575,7 @@ impl RuntimeServices {
                 expected_revision: None,
                 action: AgentAction::StateInspect(
                     harness_contract::agent_action::StateInspectInput {
+                        query: None,
                         wait_for_workers: false,
                         scope_ref: None,
                         after_revision: None,
@@ -618,6 +623,11 @@ impl RuntimeServices {
                         ));
                     }
                 }
+            }
+            Ok(())
+            }.await;
+            if let Err(error) = recovered {
+                failures.push(format!("program={program_id}: {error}"));
             }
         }
         if !failures.is_empty() {
@@ -685,9 +695,27 @@ impl RuntimeServices {
         // one independent reviewer; task-level concurrency remains unbounded
         // by this selection and naturally spreads across roster members.
         members.sort_by_key(|member| member_dispatch_rank(projection, member, task, mode));
-        members.truncate(1);
-        let mut receipts = Vec::new();
+        let mut rejected_members = Vec::new();
+        let mut selected = None;
         for member in members {
+            match resolve_agentic_execution_admission(self, member, task, context, mode) {
+                Ok(admission) => {
+                    selected = Some((member, admission));
+                    break;
+                }
+                Err(error) => rejected_members.push(format!("{}: {error}", member.agent_id)),
+            }
+        }
+        let selected = selected.ok_or_else(|| {
+            format!(
+                "agentic_no_admissible_member:{}:{}: {}",
+                task.task_id,
+                mode.as_str(),
+                rejected_members.join("; ")
+            )
+        })?;
+        let mut receipts = Vec::new();
+        for (member, admission) in std::iter::once(selected) {
             let member_team_id = projection
                 .dispatch_team_id_for(&member.agent_id, task, mode == DispatchMode::Review)
                 .ok_or_else(|| {
@@ -700,7 +728,6 @@ impl RuntimeServices {
             // context. Cross-Team review keeps the source Team as a separate
             // task provenance ref and must not forge the reviewer's scope.
             let cohort_prompt_package = agentic_shared_prompt_package(projection, member_team_id)?;
-            let admission = resolve_agentic_execution_admission(self, member, task, context, mode)?;
             let catalog_entry = &admission.catalog_entry;
             let graph_id = deterministic_graph_id(
                 &projection.program_id,
@@ -758,6 +785,20 @@ impl RuntimeServices {
                     resource_scopes.push(shared_scope);
                 }
             }
+            // Business Task references survive continuation. Physical Task
+            // aggregates have immutable ingress/root lineage and need their
+            // own identity in the newly authorized execution generation.
+            let execution_task_id = if projection.continuation.is_some() {
+                format!(
+                    "agentic-authorization-task:{:x}",
+                    sha2::Sha256::digest(
+                        serde_json::to_vec(&(&projection.program_id, task_ref))
+                            .map_err(|error| error.to_string())?
+                    )
+                )
+            } else {
+                task_ref.to_string()
+            };
             let intent = AgentTaskIntent {
                 selected_agent_id: Some(catalog_entry.agent_id.clone()),
                 definition_ref: Some(catalog_entry.definition_ref.clone()),
@@ -765,7 +806,7 @@ impl RuntimeServices {
                 principal_id: "runtime.agentic".to_string(),
                 source_turn_id: context.turn_id.clone(),
                 run_id,
-                task_id: task_ref.to_string(),
+                task_id: execution_task_id.clone(),
                 root_task_id: root_task_id.clone(),
                 parent_task_id,
                 session_id: context.session_id.clone(),
@@ -860,7 +901,7 @@ impl RuntimeServices {
                 session_id: context.session_id.clone(),
                 turn_id: context.turn_id.clone(),
                 root_task_id,
-                task_id: task_ref.to_string(),
+                task_id: execution_task_id,
                 generation: 1,
             });
             if let (Some(root_execution_id), Some(root_graph)) =

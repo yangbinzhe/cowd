@@ -1,6 +1,39 @@
 use super::*;
 
 #[test]
+fn bare_continuation_is_referential_but_new_business_text_is_not() {
+    for prompt in [
+        "继续",
+        " 请继续。 ",
+        "继续吧！",
+        "Continue",
+        "please continue.",
+        "resume",
+        "keep going",
+    ] {
+        assert_eq!(
+            understand(&StrategyInput::from_prompt(prompt)).collaboration_reference,
+            CollaborationReference::LatestEligible,
+            "{prompt}"
+        );
+    }
+    for prompt in [
+        "继续解释傅里叶变换",
+        "如何让任务继续",
+        "continue explaining a new subject",
+        "resume parser bug",
+        "不要继续",
+        "stop, do not continue",
+    ] {
+        assert_eq!(
+            understand(&StrategyInput::from_prompt(prompt)).collaboration_reference,
+            CollaborationReference::None,
+            "{prompt}"
+        );
+    }
+}
+
+#[test]
 fn continuation_phrases_produce_typed_latest_eligible_reference() {
     let continued = understand(&StrategyInput::from_prompt("继续上一组团队处理剩余问题"));
     assert_eq!(

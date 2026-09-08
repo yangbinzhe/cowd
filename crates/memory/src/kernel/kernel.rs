@@ -4,7 +4,9 @@
 //! [`CognitiveContextManager`]. It establishes the v0.8.12 control boundary
 //! without rewriting the mature memory subsystems underneath it.
 
+mod discovery;
 pub mod reality_recall;
+pub use discovery::{MemoryDiscoveryItem, MemoryDiscoveryResult};
 
 use std::{
     collections::{HashMap, HashSet},
@@ -1148,7 +1150,11 @@ impl MemoryKernel {
             let atom = self
                 .atom_with_lifecycle_state(&entry, MemoryInformationState::Orientation)
                 .await;
-            let item_tokens = (entry.content.len() as u64 / 4).max(1);
+            // This packet carries a preview and a durable locator, not the
+            // full source. Charging the original bytes makes long memories
+            // undiscoverable even when their preview fits comfortably.
+            let content_preview = truncate_memory_content_preview(&entry.content);
+            let item_tokens = (content_preview.len() as u64).div_ceil(4).max(1);
             if let Some(layer_cap) = layer_budget_cap(budget, entry.layer) {
                 let used = layer_tokens.get(&entry.layer).copied().unwrap_or_default();
                 if used.saturating_add(item_tokens) > layer_cap {
@@ -1189,7 +1195,7 @@ impl MemoryKernel {
                 atom,
                 role,
                 reason,
-                content_preview: truncate_memory_content_preview(&entry.content),
+                content_preview,
             });
             token_estimate = token_estimate.saturating_add(item_tokens);
         }

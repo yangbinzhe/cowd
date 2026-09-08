@@ -20,6 +20,7 @@ use crate::{
 #[derive(Debug, Default)]
 struct State {
     entries: BTreeMap<String, MemoryEntry>,
+    discovery_revisions: BTreeMap<String, i64>,
     entities: BTreeMap<String, Entity>,
     triples: BTreeMap<String, Triple>,
     verbatim: BTreeMap<String, VerbatimEntry>,
@@ -50,6 +51,33 @@ impl EphemeralMemoryStore {
         self.state
             .write()
             .map_err(|_| MemoryError::Store("ephemeral Memory write lock poisoned".into()))
+    }
+}
+
+fn discovery_content(entry: &MemoryEntry) -> serde_json::Value {
+    let mut value = serde_json::to_value(entry).expect("serializable memory");
+    if let Some(value) = value.as_object_mut() {
+        value.remove("access_count");
+        value.remove("last_accessed_at");
+    }
+    value
+}
+fn bump_discovery(state: &mut State, scope: &MemoryScope) {
+    *state
+        .discovery_revisions
+        .entry(scope.scope_key())
+        .or_default() += 1;
+}
+fn put_discovery_entry(state: &mut State, entry: &MemoryEntry) {
+    let previous = state.entries.insert(entry.id.to_string(), entry.clone());
+    if previous
+        .as_ref()
+        .is_none_or(|old| discovery_content(old) != discovery_content(entry))
+    {
+        if let Some(old) = previous.filter(|old| old.scope != entry.scope) {
+            bump_discovery(state, &old.scope);
+        }
+        bump_discovery(state, &entry.scope);
     }
 }
 
@@ -127,9 +155,7 @@ impl MemoryStore for EphemeralMemoryStore {
     }
 
     async fn insert(&self, entry: &MemoryEntry) -> Result<MemoryId> {
-        self.write()?
-            .entries
-            .insert(entry.id.to_string(), entry.clone());
+        put_discovery_entry(&mut *self.write()?, entry);
         Ok(entry.id)
     }
     async fn get(&self, id: &MemoryId) -> Result<Option<MemoryEntry>> {
@@ -140,11 +166,14 @@ impl MemoryStore for EphemeralMemoryStore {
         if !state.entries.contains_key(&entry.id.to_string()) {
             return Err(MemoryError::NotFound(entry.id.to_string()));
         }
-        state.entries.insert(entry.id.to_string(), entry.clone());
+        put_discovery_entry(&mut state, entry);
         Ok(())
     }
     async fn delete(&self, id: &MemoryId) -> Result<()> {
-        self.write()?.entries.remove(&id.to_string());
+        let mut state = self.write()?;
+        if let Some(entry) = state.entries.remove(&id.to_string()) {
+            bump_discovery(&mut state, &entry.scope);
+        }
         Ok(())
     }
 
@@ -175,6 +204,68 @@ impl MemoryStore for EphemeralMemoryStore {
             limit,
         ))
     }
+    async fn discover_page(&self, query: MemoryDiscoveryQuery) -> Result<MemoryDiscoveryPage> {
+        let state = self.read()?;
+        let scopes = query
+            .scopes
+            .iter()
+            .map(MemoryScope::scope_key)
+            .collect::<std::collections::BTreeSet<_>>();
+        let revisions = scopes
+            .iter()
+            .map(|scope| {
+                (
+                    scope.clone(),
+                    *state.discovery_revisions.get(scope).unwrap_or(&0),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        if query
+            .expected_revisions
+            .as_ref()
+            .is_some_and(|expected| expected != &revisions)
+        {
+            return Err(MemoryError::Store(
+                "memory discovery source changed; start a new search".into(),
+            ));
+        }
+        let limit = query.limit.clamp(1, 128);
+        let mut entries = state
+            .entries
+            .values()
+            .filter(|entry| {
+                scopes.contains(&entry.scope.scope_key())
+                    && query
+                        .after_id
+                        .as_ref()
+                        .is_none_or(|after| entry.id.to_string() > *after)
+                    && matches_text(entry, &query.query)
+            })
+            .skip(query.skip)
+            .take(limit + 1)
+            .cloned()
+            .collect::<Vec<_>>();
+        let has_more = entries.len() > limit;
+        entries.truncate(limit);
+        let next_id = has_more.then(|| entries.last().expect("nonempty page").id.to_string());
+        let lifecycle = entries
+            .iter()
+            .filter_map(|entry| {
+                let key = format!("memory_lifecycle:{}", entry.id);
+                state.kv.get(&key).map(|value| MemoryKeyValue {
+                    key,
+                    value: value.clone(),
+                })
+            })
+            .collect();
+        Ok(MemoryDiscoveryPage {
+            entries,
+            lifecycle,
+            revisions,
+            next_id,
+        })
+    }
+
     async fn search_fts_advanced(
         &self,
         query: &str,
@@ -570,7 +661,17 @@ impl MemoryStore for EphemeralMemoryStore {
         Ok(self.read()?.symbol_memory.clone())
     }
     async fn kv_put(&self, k: &str, v: &str) -> Result<()> {
-        self.write()?.kv.insert(k.into(), v.into());
+        let mut state = self.write()?;
+        let previous = state.kv.insert(k.into(), v.into());
+        if previous.as_deref() != Some(v) {
+            if let Some(scope) = k
+                .strip_prefix("memory_lifecycle:")
+                .and_then(|id| state.entries.get(id))
+                .map(|entry| entry.scope.clone())
+            {
+                bump_discovery(&mut state, &scope);
+            }
+        }
         Ok(())
     }
     async fn kv_get(&self, k: &str) -> Result<Option<String>> {

@@ -49,6 +49,7 @@ fn request(id: &str) -> crate::RuntimeToolExecutionRequest {
         policy_revision: 0,
         authorized_scopes: Vec::new(),
         memory_context: None,
+        reality_context: None,
         model_lease: None,
         parent_execution: None,
         parent_execution_attempt: None,
@@ -475,4 +476,86 @@ fn scoped_cancel_changes_only_the_authorized_node() {
         cancelled.node_statuses["peer-agent-node"],
         ExecutionNodeStatus::Planned
     );
+}
+
+#[test]
+fn agentic_child_registration_and_parent_cancel_have_one_atomic_order() {
+    for iteration in 0..16 {
+        let store = Arc::new(RuntimeEventStore::for_test());
+        let commits = ExecutionCommitService::new(Arc::clone(&store));
+        let mut root = ExecutionGraph::new("parent cancellation race");
+        crate::test_support::attach_execution_graph_lineage(&mut root);
+        let node = harness_contract::execution_graph::ExecutionNodeSpec::new(
+            ExecutionNodeKind::InlineModel,
+            "inline_model",
+            "test",
+        );
+        let parent_node = node.id.clone();
+        root.nodes.push(node);
+        let root = commits.register_graph(root).unwrap().graph;
+        let mut child = ExecutionGraph::new("Agentic child");
+        child.lineage = root.lineage.clone();
+        child.parent_execution = Some(harness_contract::execution_graph::ExecutionParentBinding {
+            execution_id: root.id.clone(),
+            node_id: parent_node,
+        });
+        let mut agent = harness_contract::execution_graph::ExecutionNodeSpec::new(
+            ExecutionNodeKind::AgentTask,
+            "agent_task",
+            "test",
+        );
+        agent.resource_scopes.push("program:cancel-race".into());
+        child.nodes.push(agent);
+        let child_id = child.id.clone();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let worker = {
+            let commits = commits.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                commits.register_graph(child)
+            })
+        };
+        barrier.wait();
+        commits
+            .apply_command(
+                &root,
+                &ExecutionGraphCommand::Cancel {
+                    expected_revision: root.revision,
+                    reason: format!("cancel race {iteration}"),
+                },
+            )
+            .unwrap();
+        let admitted = worker.join().unwrap();
+        let graphs = crate::ExecutionGraphStateStore::new(Arc::clone(&store));
+        if admitted.is_ok() {
+            assert!(
+                graphs
+                    .child_links(&root.id)
+                    .unwrap()
+                    .iter()
+                    .any(|link| link.child_execution_id == child_id),
+                "child admitted before cancel remains visible to the post-cancel tree scan"
+            );
+        } else {
+            assert!(
+                store.list_stream(&child_id).unwrap().is_empty(),
+                "losing child cannot leave an orphan graph"
+            );
+        }
+        let mut late = ExecutionGraph::new("late Agentic child");
+        late.lineage = root.lineage.clone();
+        late.parent_execution = Some(harness_contract::execution_graph::ExecutionParentBinding {
+            execution_id: root.id.clone(),
+            node_id: root.nodes[0].id.clone(),
+        });
+        let mut agent = harness_contract::execution_graph::ExecutionNodeSpec::new(
+            ExecutionNodeKind::AgentTask,
+            "agent_task",
+            "test",
+        );
+        agent.resource_scopes.push("program:cancel-race".into());
+        late.nodes.push(agent);
+        assert!(commits.register_graph(late).is_err());
+    }
 }

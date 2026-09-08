@@ -664,6 +664,7 @@ where
                     policy_revision: authorization.authorization.policy_revision,
                     authorized_scopes: vec![format!("session:{}", self.session_id())],
                     memory_context: Some(self.memory_turn_context()),
+                    reality_context: self.reality_data_lease(),
                     model_lease: None,
                     parent_execution: None,
                     parent_execution_attempt: None,

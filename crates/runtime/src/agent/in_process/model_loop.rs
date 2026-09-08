@@ -183,6 +183,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             sandbox_posture: live_session_policy.sandbox_posture,
             policy_revision: live_session_policy.revision,
             memory_context,
+            reality_context: Some(binding.data_lease.clone()),
             model_lease: selection.model.clone(),
             execution_id: packet.graph_id().to_string(),
             node_id: packet.node_id().to_string(),

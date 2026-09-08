@@ -180,11 +180,11 @@ pub use kernel::reality_recall::{
     RecallSourceResult, RecallSourceStatus,
 };
 pub use kernel::{
-    MemoryAtomView, MemoryContextPacket, MemoryContextPacketMode, MemoryDegradation, MemoryHealth,
-    MemoryInformationState, MemoryKernel, MemoryKernelError, MemoryKernelResult, MemoryLayerView,
-    MemoryLifecycleEvent, MemoryLink, MemoryLinkKind, MemoryPacketItem, MemoryPacketRole,
-    MemoryPath, MemoryPrimitive, MemoryRuntimeSnapshot, MemoryState, MemoryTurnContext,
-    OmittedMemory,
+    MemoryAtomView, MemoryContextPacket, MemoryContextPacketMode, MemoryDegradation,
+    MemoryDiscoveryItem, MemoryDiscoveryResult, MemoryHealth, MemoryInformationState, MemoryKernel,
+    MemoryKernelError, MemoryKernelResult, MemoryLayerView, MemoryLifecycleEvent, MemoryLink,
+    MemoryLinkKind, MemoryPacketItem, MemoryPacketRole, MemoryPath, MemoryPrimitive,
+    MemoryRuntimeSnapshot, MemoryState, MemoryTurnContext, OmittedMemory,
 };
 pub use knowledge::{
     ActivationGovernor, CanonExtractor, ClassificationResult, ConflictGovernor, ConflictStrategy,

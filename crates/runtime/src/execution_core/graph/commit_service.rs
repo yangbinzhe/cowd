@@ -510,7 +510,15 @@ impl ExecutionCommitService {
 
     pub fn register_graph(
         &self,
+        graph: ExecutionGraph,
+    ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
+        self.register_graph_with_continuation(graph, None)
+    }
+
+    pub(crate) fn register_graph_with_continuation(
+        &self,
         mut graph: ExecutionGraph,
+        continuation_actor: Option<harness_contract::agent_action::AgentActorBinding>,
     ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
         graph.revision = 1;
         graph.node_statuses.clear();
@@ -581,13 +589,68 @@ impl ExecutionCommitService {
                 return Err(ExecutionCommitError::AlreadyAppliedSame { graph_id });
             }
         }
+        let (seed_event, continuation_revisions) = match continuation_actor.as_ref() {
+            Some(actor) => {
+                let (event, revisions) =
+                    crate::agentic::continuation::prepare(&self.event_store, &graph, actor)
+                        .map_err(ExecutionCommitError::InvalidCommand)?;
+                (event, revisions)
+            }
+            None => {
+                if let Some(source_id) = graph
+                    .continuation_binding
+                    .as_ref()
+                    .and_then(|binding| binding.team_set_ref.strip_prefix("agentic_program:"))
+                {
+                    if crate::AgentActionService::new(Arc::clone(&self.event_store))
+                        .project_if_exists(source_id)
+                        .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))?
+                        .is_some_and(|source| {
+                            source.status != crate::AgenticProgramStatus::Verified
+                        })
+                    {
+                        return Err(ExecutionCommitError::InvalidCommand(
+                            "unfinished continuation requires an atomic Program seed".into(),
+                        ));
+                    }
+                }
+                (Vec::new(), BTreeMap::new())
+            }
+        };
         let domain_events = lineage_event
             .into_iter()
             .chain(continuation_event.clone())
+            .chain(seed_event)
             .collect::<Vec<_>>();
+        let fenced_parent = graph.parent_execution.as_ref().filter(|_| {
+            graph.nodes.iter().any(|node| {
+                node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask
+                    && node
+                        .resource_scopes
+                        .iter()
+                        .any(|scope| scope.starts_with("program:"))
+            })
+        });
         let mut last_lineage_conflict = None;
         for _ in 0..8 {
-            match self.append_graph_event(
+            let mut expected_revisions = continuation_revisions.clone();
+            if let Some(parent) = fenced_parent {
+                let source = super::ExecutionGraphStateStore::new(Arc::clone(&self.event_store))
+                    .load(&parent.execution_id)
+                    .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))?;
+                if !source.node_statuses.is_empty()
+                    && source
+                        .node_statuses
+                        .values()
+                        .all(|status| status.is_terminal())
+                {
+                    return Err(ExecutionCommitError::InvalidCommand(
+                        "Agentic parent is terminal; dispatch authority has ended".into(),
+                    ));
+                }
+                expected_revisions.insert(source.id, source.revision);
+            }
+            match self.append_graph_event_with_expected_domain_revisions(
                 &graph,
                 0,
                 transaction_id.clone(),
@@ -595,10 +658,15 @@ impl ExecutionCommitService {
                     graph: graph.clone(),
                 },
                 domain_events.clone(),
+                &expected_revisions,
             ) {
                 Ok(receipt) => return Ok(receipt),
                 Err(error)
-                    if is_lineage_registration_conflict(&error, lineage_stream.as_deref()) =>
+                    if is_lineage_registration_conflict(&error, lineage_stream.as_deref())
+                        || is_lineage_registration_conflict(
+                            &error,
+                            fenced_parent.map(|parent| parent.execution_id.as_str()),
+                        ) =>
                 {
                     last_lineage_conflict = Some(error);
                 }
@@ -658,6 +726,17 @@ impl ExecutionCommitService {
     ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
         let service = self.clone();
         tokio::task::spawn_blocking(move || service.register_graph(graph))
+            .await
+            .map_err(|error| ExecutionCommitError::BlockingTask(error.to_string()))?
+    }
+
+    pub(crate) async fn register_continuation_graph_async(
+        &self,
+        graph: ExecutionGraph,
+        actor: Option<harness_contract::agent_action::AgentActorBinding>,
+    ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || service.register_graph_with_continuation(graph, actor))
             .await
             .map_err(|error| ExecutionCommitError::BlockingTask(error.to_string()))?
     }
@@ -1546,6 +1625,17 @@ impl ExecutionCommitService {
                             idempotency_key,
                         )?,
                     },
+                });
+            }
+        }
+        // Include read-only causal dependencies (source Program/graphs) in
+        // the same transaction fence even when this command appends no event
+        // to their streams.
+        for (stream_id, revision) in expected_domain_revisions {
+            if seen.insert(stream_id.clone()) {
+                expected_streams.push(ExpectedStreamRevision {
+                    stream_id: stream_id.clone(),
+                    expected_revision: *revision,
                 });
             }
         }

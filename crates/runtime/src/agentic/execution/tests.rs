@@ -304,6 +304,15 @@ async fn root_actor_inherits_the_immutable_graph_delegation_scope() {
 
 #[tokio::test]
 async fn task_publish_admits_real_agent_graph_with_human_display_identity() {
+    exercise_reviewed_goal_delivery(false).await;
+}
+
+#[tokio::test]
+async fn issue_disposition_gates_independent_reviewed_delivery_through_the_same_goal_verifier() {
+    exercise_reviewed_goal_delivery(true).await;
+}
+
+async fn exercise_reviewed_goal_delivery(with_disclosure: bool) {
     let services = Arc::new(RuntimeServices::in_memory().expect("runtime"));
     let root_mission_id = "mission:auto:dispatch-regression";
     services
@@ -607,6 +616,7 @@ async fn task_publish_admits_real_agent_graph_with_human_display_identity() {
     let inspect = bind_root(root(
         "inspect",
         AgentAction::StateInspect(harness_contract::agent_action::StateInspectInput {
+            query: None,
             wait_for_workers: false,
             scope_ref: None,
             after_revision: None,
@@ -654,7 +664,7 @@ async fn task_publish_admits_real_agent_graph_with_human_display_identity() {
                 expected_bytes: None,
                 original_name: Some("result.md".into()),
             },
-            b"Source-backed findings for independent review",
+            if with_disclosure { b"Source-backed findings. Limitation: performance estimate is illustrative, not an enterprise measurement. Disclose this limitation; no measured-performance claim is made.".as_slice() } else { b"Source-backed findings for independent review".as_slice() },
         )
         .await
         .expect("persist content");
@@ -705,7 +715,11 @@ async fn task_publish_admits_real_agent_graph_with_human_display_identity() {
             task_ref: task_ref.clone(),
             artifact_refs: vec![artifact.clone()],
             evidence_refs: vec![content.selector.clone()],
-            unresolved: vec![],
+            unresolved: if with_disclosure {
+                vec!["Performance estimate lacks enterprise measurement".into()]
+            } else {
+                vec![]
+            },
         }),
     };
     assert_eq!(
@@ -804,6 +818,73 @@ async fn task_publish_admits_real_agent_graph_with_human_display_identity() {
             reviews: Vec::new(),
         })
         .expect("Objective creation");
+    if with_disclosure {
+        use harness_contract::agent_action::{
+            AgentActionStatus, IssueDisposition, IssueDispositionKind, MessagePublishInput,
+            ObjectiveCompleteRequestInput,
+        };
+        let issue =
+            crate::agentic::issues::issues(&action_service.project("program-dispatch").unwrap())
+                .remove(0);
+        let try_complete = |id: &str| {
+            action_service
+                .apply(&bind_root(root(
+                    id,
+                    AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
+                        result_refs: vec![artifact.clone()],
+                        evidence_refs: vec![content.selector.clone()],
+                        unresolved: vec![],
+                    }),
+                )))
+                .unwrap()
+        };
+        assert_eq!(
+            try_complete("unclassified-completion").status,
+            AgentActionStatus::Rejected
+        );
+        for (id, disposition) in [
+            ("must-resolve", IssueDispositionKind::MustResolve),
+            ("explicit-disclosure", IssueDispositionKind::Disclose),
+        ] {
+            let receipt = action_service
+                .apply(&bind_root(root(
+                    id,
+                    AgentAction::MessagePublish(MessagePublishInput {
+                        topic_ref: "topic:program-dispatch".into(),
+                        summary: Some(
+                            "Explicitly retain the unmeasured estimate limitation".into(),
+                        ),
+                        content_ref: Some(content.selector.clone()),
+                        refs: vec![task_ref.clone()],
+                        recipients: vec![],
+                        intent: None,
+                        issue_dispositions: vec![IssueDisposition {
+                            issue_ref: issue.issue_ref.clone(),
+                            disposition,
+                            reason_ref: content.selector.clone(),
+                            evidence_refs: vec![content.selector.clone()],
+                        }],
+                    }),
+                )))
+                .unwrap();
+            assert_eq!(receipt.status, AgentActionStatus::Applied, "{receipt:?}");
+            if disposition == IssueDispositionKind::MustResolve {
+                assert_eq!(
+                    try_complete("must-resolve-completion").status,
+                    AgentActionStatus::Rejected
+                );
+                assert_eq!(
+                    services
+                        .goal_store()
+                        .get("goal:root-agentic-execution")
+                        .unwrap()
+                        .unwrap()
+                        .completion,
+                    GoalCompletion::Open
+                );
+            }
+        }
+    }
     let completion = action_service
         .apply(&bind_root(root(
             "experience-complete",
@@ -829,6 +910,27 @@ async fn task_publish_admits_real_agent_graph_with_human_display_identity() {
         "program-dispatch",
     )
     .expect("verified Objective");
+    if with_disclosure {
+        let goal = services
+            .goal_store()
+            .get("goal:root-agentic-execution")
+            .unwrap()
+            .unwrap();
+        assert_eq!(goal.completion, GoalCompletion::Satisfied);
+        let program = action_service.project("program-dispatch").unwrap();
+        assert_eq!(program.status, crate::AgenticProgramStatus::Verified);
+        assert_eq!(
+            program.tasks[&task_ref].unresolved,
+            vec!["Performance estimate lacks enterprise measurement"]
+        );
+        let issue = crate::agentic::issues::issues(&program).remove(0);
+        assert_eq!(
+            issue.disposition.unwrap().disposition,
+            harness_contract::agent_action::IssueDispositionKind::Disclose
+        );
+        assert!(issue.adjudication_ref.is_some());
+        return;
+    }
     let projector =
         crate::evolution::collaboration_experience::CollaborationExperienceProjector::new(
             Arc::clone(services.event_store()),
@@ -884,6 +986,146 @@ fn dispatch_single_flight_is_owned_by_each_runtime_instance() {
         DispatchFlight::acquire(right.agentic_dispatch_flights(), key).is_some(),
         "one Runtime instance must never suppress another instance's reconciler"
     );
+}
+
+#[tokio::test]
+async fn dispatch_tries_admissible_members_without_duplicate_model_work() {
+    let services = Arc::new(RuntimeServices::in_memory().unwrap());
+    services.publish_session_execution_policy(
+        "session-dispatch",
+        crate::permissions::SessionExecutionPolicyControl::from_policy(
+            harness_contract::policy::SessionExecutionPolicy::from_profile(
+                harness_contract::policy::AutonomyProfileId::Autonomous,
+                1,
+                harness_contract::policy::SessionExecutionPolicyOrigin::ConfigDefault,
+            ),
+        ),
+    );
+    let actions = services.agent_action_service();
+    let team = actions
+        .apply(&root(
+            "candidate-team",
+            AgentAction::TeamCreate(TeamCreateInput {
+                name: "Candidates".into(),
+                mission: "read evidence".into(),
+                objective: None,
+            }),
+        ))
+        .unwrap()
+        .changed_refs[0]
+        .clone();
+    for index in 0..2 {
+        actions
+            .apply(&root(
+                &format!("candidate-{index}"),
+                AgentAction::AgentInvite(AgentInviteInput {
+                    team_ref: team.clone(),
+                    role: "Reader".into(),
+                    mission: "read evidence".into(),
+                    required_capabilities: vec!["read".into()],
+                    existing_agent_ref: None,
+                    definition_ref: None,
+                    model_profile_ref: None,
+                    expertise_hints: vec![],
+                    execution_requirements: vec![],
+                }),
+            ))
+            .unwrap();
+    }
+    let task = actions
+        .apply(&root(
+            "candidate-task",
+            AgentAction::TaskPublish(TaskPublishInput {
+                team_ref: team,
+                title: "Read evidence".into(),
+                objective: "read evidence".into(),
+                acceptance: "evidence inspected".into(),
+                required_capabilities: vec!["read".into()],
+                depends_on: vec![],
+                obligation_refs: vec![],
+                purpose: Default::default(),
+                execution_requirements: vec![],
+                expertise_hints: vec![],
+            }),
+        ))
+        .unwrap()
+        .changed_refs[0]
+        .clone();
+    let mut projection = actions.project("program-dispatch").unwrap();
+    let mut ordered =
+        helpers::eligible_members(&projection, &projection.tasks[&task], DispatchMode::Execute);
+    ordered.sort_by_key(|member| {
+        helpers::member_dispatch_rank(
+            &projection,
+            member,
+            &projection.tasks[&task],
+            DispatchMode::Execute,
+        )
+    });
+    let invalid = ordered[0].agent_id.clone();
+    let valid = ordered[1].agent_id.clone();
+    drop(ordered);
+    projection
+        .agents
+        .get_mut(&invalid)
+        .unwrap()
+        .model_profile_ref = Some("missing-profile".into());
+    let context = AgenticDispatchContext {
+        session_id: "session-dispatch".into(),
+        turn_id: "turn-dispatch".into(),
+        model_lease: "test".into(),
+        permission_ceiling: PermissionMode::ReadOnly,
+        resource_scopes: vec!["workspace:.".into()],
+    };
+    let trigger = root(
+        "candidate-wake",
+        AgentAction::StateInspect(harness_contract::agent_action::StateInspectInput {
+            query: None,
+            wait_for_workers: false,
+            scope_ref: None,
+            after_revision: None,
+            page_cursor: None,
+            entry_ref: None,
+        }),
+    );
+    let receipts = services
+        .dispatch_agentic_task(
+            &projection,
+            &task,
+            DispatchMode::Execute,
+            &context,
+            &trigger,
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].agent_ref, valid);
+    assert!(services
+        .dispatch_agentic_task(
+            &projection,
+            &task,
+            DispatchMode::Execute,
+            &context,
+            &trigger
+        )
+        .await
+        .unwrap()
+        .is_empty());
+    projection.agents.get_mut(&valid).unwrap().model_profile_ref =
+        Some("also-missing-profile".into());
+    let error = services
+        .dispatch_agentic_task(
+            &projection,
+            &task,
+            DispatchMode::Execute,
+            &context,
+            &trigger,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("agentic_no_admissible_member"));
+    assert!(error.contains(&invalid));
+    assert!(error.contains(&valid));
 }
 
 #[test]
@@ -1174,7 +1416,30 @@ fn dispatch_rank_spreads_independent_tasks_to_idle_members() {
 
 #[tokio::test]
 async fn startup_reconcile_admits_committed_unstarted_work_once() {
+    verify_startup_reconciliation(false).await;
+}
+
+#[tokio::test]
+async fn startup_reconcile_isolates_a_corrupt_program_without_duplicate_work() {
+    verify_startup_reconciliation(true).await;
+}
+
+async fn verify_startup_reconciliation(with_corrupt_program: bool) {
     let services = Arc::new(RuntimeServices::in_memory().expect("runtime"));
+    if with_corrupt_program {
+        services
+            .event_store()
+            .append(crate::RuntimeEventInput {
+                stream_id: "agentic-program:aaa-corrupt".into(),
+                scope: crate::RuntimeEventScope::Program,
+                kind: "agentic.action_applied".into(),
+                status: None,
+                actor: None,
+                refs: vec![],
+                payload: serde_json::json!({"envelope": "not an action envelope"}),
+            })
+            .unwrap();
+    }
     services.publish_session_execution_policy(
         "session-dispatch",
         crate::permissions::SessionExecutionPolicyControl::from_policy(
@@ -1233,14 +1498,38 @@ async fn startup_reconcile_admits_committed_unstarted_work_once() {
         ))
         .expect("task");
 
-    let first = services
-        .recover_agentic_programs_on_startup()
-        .await
-        .expect("first recovery");
-    assert_eq!(first.len(), 1);
+    let first = services.recover_agentic_programs_on_startup().await;
+    let graph_id = if with_corrupt_program {
+        let error = first.expect_err("partial recovery must remain a reported failure");
+        assert!(error.contains("aaa-corrupt"), "{error}");
+        let projection = actions.project("program-dispatch").unwrap();
+        let attempts = projection
+            .tasks
+            .values()
+            .flat_map(|task| task.active_attempts.values())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            attempts.len(),
+            1,
+            "healthy work must still be physically admitted"
+        );
+        attempts[0].execution_id.clone()
+    } else {
+        let first = first.expect("first recovery");
+        assert_eq!(first.len(), 1);
+        first[0].graph_id.clone()
+    };
+    let task_ref = actions
+        .project("program-dispatch")
+        .unwrap()
+        .tasks
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
     let graph = services
         .graph_state_store()
-        .load(&first[0].graph_id)
+        .load(&graph_id)
         .expect("admitted Agent-first graph");
     let packet = serde_json::from_str::<AgentTaskPacket>(&graph.nodes[0].payload_ref)
         .expect("compiled Agent-first packet");
@@ -1249,14 +1538,30 @@ async fn startup_reconcile_admits_committed_unstarted_work_once() {
         "natural-language Program Task acceptance must stay in the Program review contract, not become an unsatisfiable physical Agent terminal field"
     );
     assert!(graph.nodes[0].acceptance.criteria.is_empty());
-    let second = services
-        .recover_agentic_programs_on_startup()
-        .await
-        .expect("idempotent recovery");
-    assert!(
-        second.is_empty(),
-        "active graph must suppress duplicate paid work"
-    );
+    let second = services.recover_agentic_programs_on_startup().await;
+    if with_corrupt_program {
+        assert!(second.unwrap_err().contains("aaa-corrupt"));
+        let projection = actions.project("program-dispatch").unwrap();
+        let attempts = projection
+            .tasks
+            .values()
+            .flat_map(|task| task.active_attempts.values())
+            .collect::<Vec<_>>();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].execution_id, graph_id);
+        assert_eq!(
+            services
+                .event_store()
+                .stream_revision("agentic-program:aaa-corrupt")
+                .unwrap(),
+            1
+        );
+    } else {
+        assert!(
+            second.expect("idempotent recovery").is_empty(),
+            "active graph must suppress duplicate paid work"
+        );
+    }
 
     // An unresolved Program must not authorize new work after its root ended.
     let mut projection = actions.project("program-dispatch").expect("projection");
@@ -1271,6 +1576,7 @@ async fn startup_reconcile_admits_committed_unstarted_work_once() {
     let trigger = root(
         "root-fence-inspect",
         AgentAction::StateInspect(harness_contract::agent_action::StateInspectInput {
+            query: None,
             scope_ref: None,
             after_revision: None,
             page_cursor: None,
@@ -1281,7 +1587,7 @@ async fn startup_reconcile_admits_committed_unstarted_work_once() {
     let missing = services
         .dispatch_agentic_task(
             &projection,
-            &first[0].task_ref,
+            &task_ref,
             DispatchMode::Review,
             &context,
             &trigger,
@@ -1323,7 +1629,7 @@ async fn startup_reconcile_admits_committed_unstarted_work_once() {
         .expect("cancel root");
     for mode in [DispatchMode::Execute, DispatchMode::Review] {
         assert!(services
-            .dispatch_agentic_task(&projection, &first[0].task_ref, mode, &context, &trigger,)
+            .dispatch_agentic_task(&projection, &task_ref, mode, &context, &trigger,)
             .await
             .expect("terminal root is not an admission error")
             .is_empty());

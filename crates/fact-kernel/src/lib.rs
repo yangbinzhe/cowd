@@ -43,8 +43,9 @@ pub use indexer::FactSearchHit;
 #[cfg(any(test, feature = "test-support"))]
 pub use ledger::EphemeralFactLedger;
 pub use ledger::{
-    FactGrowthBatch, FactLedger, FactLedgerError, FactLedgerResult, FactLedgerSnapshot,
-    FactRecallQuery, GrowthPromotionRecord, UnavailableFactLedger,
+    FactCatalogPage, FactCatalogQuery, FactCatalogSnapshot, FactGrowthBatch, FactLedger,
+    FactLedgerError, FactLedgerResult, FactLedgerSnapshot, FactRecallQuery, GrowthPromotionRecord,
+    UnavailableFactLedger,
 };
 pub use review::{FactConflict, FactReviewDecision, FactReviewDecisionKind, FactReviewReceipt};
 pub use service::{FactKernelService, PromotionReceipt};

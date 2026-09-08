@@ -58,6 +58,46 @@ impl FactRecallQuery {
     }
 }
 
+/// First-page creation fence plus invalidations for the exact granted scopes/ids.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FactCatalogSnapshot {
+    pub fence: String,
+    pub revisions: std::collections::BTreeMap<String, i64>,
+}
+#[derive(Debug, Clone)]
+pub struct FactCatalogQuery {
+    pub authorization: FactRecallQuery,
+    /// A requested id restricts authorized rows; it never grants access.
+    pub exact_id: Option<String>,
+    pub after_id: Option<String>,
+    pub snapshot: Option<FactCatalogSnapshot>,
+}
+#[derive(Debug, Clone)]
+pub struct FactCatalogPage {
+    pub records: Vec<FactRecord>,
+    pub snapshot: FactCatalogSnapshot,
+    pub next_id: Option<String>,
+}
+impl FactCatalogQuery {
+    #[must_use]
+    pub fn revision_keys(&self) -> Vec<String> {
+        self.authorization
+            .authorized_fact_ids
+            .iter()
+            .map(|id| format!("fact:{id}"))
+            .chain(
+                self.authorization
+                    .authorized_scope_keys
+                    .iter()
+                    .map(|scope| format!("scope:{scope}")),
+            )
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+}
+
 fn normalized_values(values: Vec<String>) -> Vec<String> {
     values
         .into_iter()
@@ -211,6 +251,7 @@ pub trait FactLedger: Send + Sync {
     /// Query only Binding-authorized candidates with a storage-enforced
     /// result bound and deterministic confidence/time/id ordering.
     fn recall_facts(&self, query: &FactRecallQuery) -> FactLedgerResult<Vec<FactRecord>>;
+    fn catalog_page(&self, query: &FactCatalogQuery) -> FactLedgerResult<FactCatalogPage>;
     fn upsert_evidence(&self, evidence: EvidencePacket) -> FactLedgerResult<EvidencePacket>;
     fn get_evidence(&self, evidence_id: &str) -> FactLedgerResult<Option<EvidencePacket>>;
     fn list_evidence(&self) -> FactLedgerResult<Vec<EvidencePacket>>;
@@ -298,6 +339,10 @@ impl FactLedger for UnavailableFactLedger {
         self.unavailable()
     }
 
+    fn catalog_page(&self, _query: &FactCatalogQuery) -> FactLedgerResult<FactCatalogPage> {
+        Err(FactLedgerError::backend(self.reason.clone()))
+    }
+
     fn recall_facts(&self, _query: &FactRecallQuery) -> FactLedgerResult<Vec<FactRecord>> {
         self.unavailable()
     }
@@ -344,6 +389,15 @@ impl FactLedger for UnavailableFactLedger {
 #[derive(Debug, Default)]
 pub struct EphemeralFactLedger {
     snapshot: std::sync::Mutex<FactLedgerSnapshot>,
+    catalog: std::sync::Mutex<EphemeralFactCatalog>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Default)]
+struct EphemeralFactCatalog {
+    sequence: u64,
+    created: std::collections::BTreeMap<String, u64>,
+    revisions: std::collections::BTreeMap<String, i64>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -357,16 +411,131 @@ impl EphemeralFactLedger {
 #[cfg(any(test, feature = "test-support"))]
 impl FactLedger for EphemeralFactLedger {
     fn upsert_fact(&self, fact: FactRecord) -> FactLedgerResult<FactRecord> {
+        // Both writers and directory readers take catalog before snapshot.
+        let mut catalog = self
+            .catalog
+            .lock()
+            .map_err(|error| FactLedgerError::backend(error.to_string()))?;
         let mut state = self
             .snapshot
             .lock()
             .map_err(|error| FactLedgerError::backend(error.to_string()))?;
         if let Some(existing) = state.facts.iter_mut().find(|item| item.id == fact.id) {
+            if serde_json::to_value(&*existing)
+                .map_err(|e| FactLedgerError::backend(e.to_string()))?
+                != serde_json::to_value(&fact)
+                    .map_err(|e| FactLedgerError::backend(e.to_string()))?
+            {
+                let mut keys = BTreeSet::from([format!("fact:{}", fact.id.as_str())]);
+                for scope in [existing.scope_key.as_ref(), fact.scope_key.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    keys.insert(format!("scope:{scope}"));
+                }
+                for key in keys {
+                    *catalog.revisions.entry(key).or_default() += 1;
+                }
+            }
             *existing = fact.clone();
         } else {
+            catalog.sequence += 1;
+            let sequence = catalog.sequence;
+            catalog
+                .created
+                .insert(fact.id.as_str().to_owned(), sequence);
             state.facts.push(fact.clone());
         }
         Ok(fact)
+    }
+
+    fn catalog_page(&self, query: &FactCatalogQuery) -> FactLedgerResult<FactCatalogPage> {
+        let catalog = self
+            .catalog
+            .lock()
+            .map_err(|error| FactLedgerError::backend(error.to_string()))?;
+        let state = self
+            .snapshot
+            .lock()
+            .map_err(|error| FactLedgerError::backend(error.to_string()))?;
+        let revisions = query
+            .revision_keys()
+            .into_iter()
+            .map(|key| {
+                let revision = catalog.revisions.get(&key).copied().unwrap_or_default();
+                (key, revision)
+            })
+            .collect();
+        let snapshot = query.snapshot.clone().unwrap_or(FactCatalogSnapshot {
+            fence: format!("ephemeral:{}", catalog.sequence),
+            revisions,
+        });
+        let current: std::collections::BTreeMap<_, _> = query
+            .revision_keys()
+            .into_iter()
+            .map(|key| {
+                let rev = catalog.revisions.get(&key).copied().unwrap_or_default();
+                (key, rev)
+            })
+            .collect();
+        if snapshot.revisions != current {
+            return Err(FactLedgerError::backend(
+                "Fact directory source changed; restart discovery",
+            ));
+        }
+        let fence: u64 = snapshot
+            .fence
+            .strip_prefix("ephemeral:")
+            .and_then(|v| v.parse().ok())
+            .filter(|v| *v <= catalog.sequence)
+            .ok_or_else(|| FactLedgerError::backend("invalid Fact snapshot"))?;
+        let auth = &query.authorization;
+        let mut records = state
+            .facts
+            .iter()
+            .filter(|fact| {
+                (auth
+                    .authorized_fact_ids
+                    .iter()
+                    .any(|id| id == fact.id.as_str())
+                    || (fact
+                        .scope_key
+                        .as_ref()
+                        .is_some_and(|scope| auth.authorized_scope_keys.contains(scope))
+                        && auth
+                            .authorized_boundaries
+                            .iter()
+                            .any(|boundary| boundary == fact.boundary.as_str())))
+                    && query
+                        .exact_id
+                        .as_ref()
+                        .is_none_or(|id| id == fact.id.as_str())
+                    && query
+                        .after_id
+                        .as_ref()
+                        .is_none_or(|id| fact.id.as_str() > id.as_str())
+                    && catalog
+                        .created
+                        .get(fact.id.as_str())
+                        .is_some_and(|sequence| *sequence <= fence)
+                    && (auth.terms.is_empty()
+                        || auth
+                            .terms
+                            .iter()
+                            .any(|term| fact.statement.to_lowercase().contains(term)))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        records.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+        let limit = auth.limit.clamp(1, 65);
+        let more = records.len() > limit;
+        records.truncate(limit);
+        let next_id = more.then(|| records.last().unwrap().id.as_str().to_owned());
+        Ok(FactCatalogPage {
+            records,
+            snapshot,
+            next_id,
+        })
     }
 
     fn get_fact(&self, fact_id: &str) -> FactLedgerResult<Option<FactRecord>> {

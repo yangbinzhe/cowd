@@ -863,6 +863,29 @@ async fn runtime_managed_memory_packet_enforces_layer_budget() {
 }
 
 #[tokio::test]
+async fn long_memory_discovery_charges_preview_not_durable_source() {
+    let temporary = tempfile::tempdir().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new_ephemeral(test_config(&temporary.path().join("memory")))
+            .await
+            .unwrap(),
+    );
+    let kernel = MemoryKernel::new(manager);
+    let mut long = entry(MemoryLayer::L2, MemorySource::UserExplicit, "long source");
+    long.content = "甲🙂乙".repeat(100_000);
+    let expected_id = long.id;
+    let packet = kernel
+        .context_packet_from_entries(vec![long], 1, 1_000)
+        .await
+        .unwrap();
+    assert_eq!(packet.selected.len(), 1);
+    assert_eq!(packet.selected[0].atom.id, expected_id);
+    assert!(packet.selected[0].content_preview.chars().count() <= 483);
+    assert!(packet.token_estimate <= 1_000);
+    assert!(packet.omitted.is_empty());
+}
+
+#[tokio::test]
 async fn l0_requires_user_or_system_write() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
@@ -1302,4 +1325,119 @@ async fn concurrent_kernel_turns_do_not_cross_write_or_recall_identity() {
     let visible_to_a = kernel.prepare(&ctx_a, "turn evidence", &[]).await.unwrap();
     assert!(visible_to_a.entries.iter().any(|item| item.id == a_id));
     assert!(!visible_to_a.entries.iter().any(|item| item.id == b_id));
+}
+
+#[tokio::test]
+async fn memory_discovery_pages_all_matches_without_leaking_hidden_cursor_ids() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("discovery")))
+            .await
+            .unwrap(),
+    );
+    let kernel = MemoryKernel::new(manager.clone());
+    let orchestrator = manager.orchestrator();
+    let store = orchestrator.store();
+    let ctx = MemoryTurnContext::new("catalog-session", "catalog-agent")
+        .with_project_id(Some("catalog-project".into()))
+        .with_cognitive_read_scopes(vec![
+            harness_contract::agent::CognitiveReadScope::Project,
+            harness_contract::agent::CognitiveReadScope::WorkspaceKnowledge,
+        ]);
+    let mut expected = std::collections::BTreeSet::new();
+    let mut hidden_ids = Vec::new();
+    for index in 0..140u128 {
+        let mut visible = entry(MemoryLayer::L3, MemorySource::Import, "catalog needle");
+        visible.id = uuid::Uuid::from_u128(index * 2 + 2);
+        visible.scope = MemoryScope::Project("catalog-project".into());
+        visible.content = format!("needle {}", "中文".repeat(500));
+        expected.insert(visible.id);
+        store.insert(&visible).await.unwrap();
+        let mut hidden = visible.clone();
+        hidden.id = uuid::Uuid::from_u128(index * 2 + 1);
+        hidden.scope = MemoryScope::Global;
+        hidden.source = MemorySource::AutoExtracted;
+        hidden.visibility = AgentVisibility::Private;
+        hidden_ids.push(hidden.id.to_string());
+        store.insert(&hidden).await.unwrap();
+    }
+    let first = kernel.discover_page(&ctx, "needle", None, 7).await.unwrap();
+    let first_cursor = first.next_cursor.clone().unwrap();
+    assert!(kernel
+        .discover_page(&ctx, "other", Some(&first_cursor), 7)
+        .await
+        .is_err());
+    let other = MemoryTurnContext::new("other-session", "other-agent");
+    assert!(kernel
+        .discover_page(&other, "needle", Some(&first_cursor), 7)
+        .await
+        .is_err());
+    let mut cursor = None;
+    let mut actual = std::collections::BTreeSet::new();
+    let mut pages = 0;
+    loop {
+        let page = kernel
+            .discover_page(&ctx, "needle", cursor.as_deref(), 7)
+            .await
+            .unwrap();
+        pages += 1;
+        assert!(pages < 100);
+        for item in page.selected {
+            assert!(actual.insert(item.atom.id));
+            assert_eq!(item.preview.chars().count(), 480);
+        }
+        cursor = page.next_cursor;
+        let Some(value) = &cursor else {
+            break;
+        };
+        assert!(
+            hidden_ids.iter().all(|id| !value.contains(id)),
+            "cursor must not expose private global IDs"
+        );
+    }
+    assert_eq!(actual, expected);
+    let id = *expected.first().unwrap();
+    let mut saved = store.get(&id).await.unwrap().unwrap();
+    saved.access_count += 1;
+    saved.last_accessed_at = Some(Utc::now());
+    store.update(&saved).await.unwrap();
+    kernel
+        .discover_page(&ctx, "needle", Some(&first_cursor), 7)
+        .await
+        .unwrap();
+    let mut unrelated = saved.clone();
+    unrelated.id = uuid::Uuid::new_v4();
+    unrelated.scope = MemoryScope::Project("unrelated".into());
+    store.insert(&unrelated).await.unwrap();
+    kernel
+        .discover_page(&ctx, "needle", Some(&first_cursor), 7)
+        .await
+        .unwrap();
+    saved
+        .content
+        .push_str(" changed without changing timestamp");
+    store.update(&saved).await.unwrap();
+    assert!(kernel
+        .discover_page(&ctx, "needle", Some(&first_cursor), 7)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("source changed"));
+    let fresh = kernel.discover_page(&ctx, "needle", None, 7).await.unwrap();
+    kernel
+        .transition_state(&ctx, id, MemoryState::Archived, "source retired")
+        .await
+        .unwrap();
+    assert!(kernel
+        .discover_page(&ctx, "needle", fresh.next_cursor.as_deref(), 7)
+        .await
+        .is_err());
+    let active = kernel.discover_page(&ctx, "needle", None, 7).await.unwrap();
+    assert!(active.selected.iter().all(|item| item.atom.id != id));
+    let cursor = active.next_cursor.unwrap();
+    store.delete(&id).await.unwrap();
+    assert!(kernel
+        .discover_page(&ctx, "needle", Some(&cursor), 7)
+        .await
+        .is_err());
 }

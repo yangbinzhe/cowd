@@ -385,6 +385,12 @@ impl crate::store::MemoryStore for NoopStore {
     ) -> crate::store::Result<Vec<MemoryEntry>> {
         Self::unavailable()
     }
+    async fn discover_page(
+        &self,
+        _query: crate::store::MemoryDiscoveryQuery,
+    ) -> crate::store::Result<crate::store::MemoryDiscoveryPage> {
+        Self::unavailable()
+    }
     async fn search_fts_advanced(
         &self,
         _query: &str,

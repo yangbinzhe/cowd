@@ -901,3 +901,118 @@ async fn postgres_artifact_repository_preserves_selector_and_scope_contract() {
         .delete(&repeated, &scope)
         .expect("second PostgreSQL artifact record delete");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+async fn postgres_artifact_catalog_excludes_inflight_and_later_receipts() {
+    use sha2::Digest;
+    let url = std::env::var("COWD_TEST_POSTGRES_URL").unwrap();
+    let resolver = StaticSecretRefResolver::new([("catalog.pg".to_string(), url)]);
+    let base = PostgresExecutor::connect(
+        PostgresConnectionConfig::new(
+            "artifact-catalog-test",
+            "catalog.pg",
+            "artifact-catalog-test",
+        ),
+        &resolver,
+    )
+    .unwrap();
+    let schema = format!("artifact_catalog_{}", uuid::Uuid::new_v4().simple());
+    base.checkout_critical()
+        .unwrap()
+        .batch_execute(&format!("CREATE SCHEMA \"{schema}\""))
+        .unwrap();
+    let scoped = base.scoped_namespace(&schema).unwrap();
+    let repository = Arc::new(PostgresArtifactRepository::new(scoped.clone()).unwrap());
+    let root = tempfile::tempdir().unwrap();
+    let store = runtime::ArtifactStore::new(
+        root.path(),
+        repository.clone(),
+        runtime::ArtifactStoreConfig::default(),
+    )
+    .unwrap();
+    let descriptor = harness_contract::context::ArtifactWriteDescriptor {
+        media_type: "text/plain".into(),
+        visibility_scope: "session:catalog-pg".into(),
+        expected_bytes: None,
+        original_name: None,
+    };
+    let scopes = vec![descriptor.visibility_scope.clone()];
+    let mut expected = std::collections::BTreeSet::new();
+    let mut sample = None;
+    for index in 0..140 {
+        let reference = store
+            .write_bytes(
+                descriptor.clone(),
+                format!("catalog source {index}").as_bytes(),
+            )
+            .await
+            .unwrap();
+        expected.insert(reference.selector.clone());
+        sample = Some(reference);
+    }
+    let sample = sample.unwrap();
+    // This transaction has inserted its row before the first page, but has
+    // not committed. Committing later must not inject it into that snapshot.
+    let mut pending_connection = scoped.checkout_critical().unwrap();
+    let mut pending = pending_connection.transaction().unwrap();
+    pending.execute("INSERT INTO artifact_records(artifact_id,sha256,bytes,media_type,visibility_scope,tier,created_at_ms,last_access_at_ms)
+        SELECT 'art_inflight',sha256,bytes,media_type,visibility_scope,tier,created_at_ms,last_access_at_ms FROM artifact_records WHERE artifact_id=$1", &[&sample.selector.strip_prefix("artifact://").unwrap()]).unwrap();
+    let mut page = store
+        .discover_page(&scopes, "text/plain", None, 7)
+        .await
+        .unwrap();
+    let first_cursor = page.next_cursor.clone().unwrap();
+    pending.commit().unwrap();
+    drop(pending_connection);
+    let mut actual = std::collections::BTreeSet::new();
+    let mut pages = 0;
+    loop {
+        pages += 1;
+        assert!(pages < 30);
+        for record in page.records {
+            let reference = record.content_reference();
+            assert!(actual.insert(reference.selector.clone()));
+            let bytes = store.read(&reference, &scopes[0], None).await.unwrap();
+            assert_eq!(
+                format!("sha256:{:x}", sha2::Sha256::digest(&bytes)),
+                reference.sha256
+            );
+        }
+        let Some(cursor) = page.next_cursor else {
+            break;
+        };
+        store
+            .write_bytes(descriptor.clone(), b"own catalog tool receipt")
+            .await
+            .unwrap();
+        page = store
+            .discover_page(&scopes, "text/plain", Some(&cursor), 7)
+            .await
+            .unwrap();
+    }
+    assert_eq!(actual, expected);
+    let fresh = store
+        .discover_page(&scopes, "art_inflight", None, 7)
+        .await
+        .unwrap();
+    assert_eq!(fresh.records.len(), 1);
+    assert_eq!(
+        fresh.records[0].content_reference().selector,
+        "artifact://art_inflight"
+    );
+    store.delete(&sample, &scopes[0]).unwrap();
+    assert!(store
+        .discover_page(&scopes, "text/plain", Some(&first_cursor), 7)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("source changed"));
+    drop(store);
+    drop(repository);
+    drop(scoped);
+    base.checkout_critical()
+        .unwrap()
+        .batch_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
+        .unwrap();
+}

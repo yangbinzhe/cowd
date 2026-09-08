@@ -5,3 +5,5 @@ include!("agentic_protocol_state.rs");
 // Retired one-shot collaboration admission tests intentionally are not
 // included. Agent-first coverage lives with `agentic::{action_service,
 // execution}` and exercises incremental actions and durable projections.
+
+include!("continuation.rs");

@@ -44,6 +44,14 @@ pub struct UnifiedSessionStore {
 }
 
 impl UnifiedSessionStore {
+    pub async fn discover_context_page(
+        &self,
+        request: crate::SessionDiscoveryRequest,
+    ) -> Result<crate::SessionDiscoveryPage> {
+        self.execute_read(move |backend| backend.discover_context_page(&request))
+            .await
+    }
+
     // -----------------------------------------------------------------------
     // Construction
     // -----------------------------------------------------------------------

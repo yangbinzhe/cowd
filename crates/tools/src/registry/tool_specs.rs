@@ -397,13 +397,15 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "glob_search",
-            description: "Find files by glob pattern with bounded depth, entry, duration, and result limits. The response reports scanComplete=false when the safety bound or an inaccessible subtree prevents a full scan; refine the path/pattern and continue when complete coverage is required.",
+            description: "Find files by glob pattern. A full result page includes continuationCursor: copy it unchanged with the same path and pattern to continue without dropping matches. scanComplete=false and omissions report inaccessible or depth-limited subtrees; refine those paths separately without the old cursor. Never infer absence from an incomplete scan. Project .gitignore/.ignore rules apply; include_ignored and ignore_patterns explicitly alter that scope. Explicit directory roots remain searchable. Results describe a live filesystem, not a frozen repository snapshot.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "pattern": { "type": "string" },
+                    "include_ignored": { "type": "boolean", "description": "Include hidden and project-ignored paths; workspace protection still applies." },
+                    "ignore_patterns": { "type": "array", "items": { "type": "string" }, "description": "Additional exclusion globs relative to the search root." },
                     "path": { "type": "string" },
-                    "cursor": { "type": "string", "description": "Continuation cursor returned by an incomplete scan." }
+                    "cursor": { "type": "string", "description": "Opaque query-bound cursor; prefer copying next_request unchanged." }
                 },
                 "required": ["pattern"],
                 "additionalProperties": false
@@ -412,7 +414,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "glob_many",
-            description: "Run multiple bounded glob searches in one ordered read-only batch. Each result reports scanComplete=false when its safety bound prevents full coverage; refine incomplete searches instead of assuming the result set is exhaustive.",
+            description: "Run independent glob searches in one ordered read-only batch. Continue each result with its own continuationCursor and unchanged path/pattern. Inspect omissions when scanComplete=false; refine an omitted subtree as a new search without the old cursor. Partial results never prove absence.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -422,8 +424,10 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                             "type": "object",
                             "properties": {
                                 "pattern": { "type": "string" },
+                    "include_ignored": { "type": "boolean", "description": "Include hidden and project-ignored paths; workspace protection still applies." },
+                    "ignore_patterns": { "type": "array", "items": { "type": "string" }, "description": "Additional exclusion globs relative to the search root." },
                                 "path": { "type": "string" },
-                                "cursor": { "type": "string", "description": "Continuation cursor returned by an incomplete scan." }
+                                "cursor": { "type": "string", "description": "Opaque query-bound cursor; prefer copying next_request unchanged." }
                             },
                             "required": ["pattern"],
                             "additionalProperties": false
@@ -438,14 +442,16 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "grep_search",
-            description: "Preferred locator for symbols, text, or logic in large files. Search workspace file contents with a regex and return exact matching lines with optional context; scans are bounded by depth, entries, duration, and file size and report scanComplete=false when incomplete. Refine the path/glob and continue before concluding no match exists; use it before bounded read_file calls to avoid expensive full-file scans.",
+            description: "Preferred locator for symbols, text, or logic in large files. Search workspace file contents with a regex and return exact matching lines with optional context; scans are bounded by depth, entries, duration, and file size and report scanComplete=false when incomplete. Use next_request to continue even when one file has more than a page of matches; source changes during a file continuation are rejected. Context overlaps are emitted once. Project ignore rules apply unless include_ignored=true. Refine omissions before concluding no match exists; use it before bounded read_file calls to avoid expensive full-file scans.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "pattern": { "type": "string" },
+                    "include_ignored": { "type": "boolean", "description": "Include hidden and project-ignored paths; workspace protection still applies." },
+                    "ignore_patterns": { "type": "array", "items": { "type": "string" }, "description": "Additional exclusion globs relative to the search root." },
                     "path": { "type": "string" },
                     "glob": { "type": "string" },
-                    "output_mode": { "type": "string" },
+                    "output_mode": { "type": "string", "enum": ["content", "files_with_matches", "count"] },
                     "-B": { "type": "integer", "minimum": 0 },
                     "-A": { "type": "integer", "minimum": 0 },
                     "-C": { "type": "integer", "minimum": 0 },
@@ -456,7 +462,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "head_limit": { "type": "integer", "minimum": 1 },
                     "offset": { "type": "integer", "minimum": 0 },
                     "multiline": { "type": "boolean" }
-                    ,"cursor": { "type": "string", "description": "Continuation cursor returned by an incomplete scan." }
+                    ,"cursor": { "type": "string", "description": "Opaque query-bound cursor; prefer copying next_request unchanged." }
                 },
                 "required": ["pattern"],
                 "additionalProperties": false
@@ -493,9 +499,11 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                             "type": "object",
                             "properties": {
                                 "pattern": { "type": "string" },
+                    "include_ignored": { "type": "boolean", "description": "Include hidden and project-ignored paths; workspace protection still applies." },
+                    "ignore_patterns": { "type": "array", "items": { "type": "string" }, "description": "Additional exclusion globs relative to the search root." },
                                 "path": { "type": "string" },
                                 "glob": { "type": "string" },
-                                "output_mode": { "type": "string" },
+                                "output_mode": { "type": "string", "enum": ["content", "files_with_matches", "count"] },
                                 "-B": { "type": "integer", "minimum": 0 },
                                 "-A": { "type": "integer", "minimum": 0 },
                                 "-C": { "type": "integer", "minimum": 0 },
@@ -505,7 +513,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                                 "type": { "type": "string" },
                                 "head_limit": { "type": "integer", "minimum": 1 },
                                 "offset": { "type": "integer", "minimum": 0 },
-                                "multiline": { "type": "boolean" }
+                                "multiline": { "type": "boolean" },
+                                "cursor": { "type": "string", "description": "Copy next_request or continuationCursor for this search." }
                             },
                             "required": ["pattern"],
                             "additionalProperties": false
@@ -520,13 +529,18 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "workspace_snapshot",
-            description: "Collect a compact read-only snapshot of the current workspace state.",
+            description: "Discover actual workspace and repository roots, verified document entries, and executable expand/read/search requests before guessing paths. Directory and file pages report live-filesystem coverage and continuations; query filters directory metadata, not file contents.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "include_git": { "type": "boolean" },
                     "include_files": { "type": "boolean" },
-                    "roots": { "type": "array", "items": { "type": "string" } },
+                    "roots": { "type": "array", "minItems": 1, "maxItems": 32, "items": { "type": "string" } },
+                    "query": { "type": "string" },
+                    "cursor": { "type": "string" },
+                    "page_size": { "type": "integer", "minimum": 1, "maximum": 100 },
+                    "include_ignored": { "type": "boolean" },
+                    "ignore_patterns": { "type": "array", "items": { "type": "string" } },
                     "max_files": { "type": "integer", "minimum": 1, "maximum": 5000 }
                 },
                 "additionalProperties": false

@@ -6,8 +6,10 @@
 //! existing scheduler and ToolHost.
 
 mod action_service;
+pub(crate) mod continuation;
 mod execution;
 mod ingress;
+pub(crate) mod issues;
 mod program;
 mod read_model;
 mod roster;

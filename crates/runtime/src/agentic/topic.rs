@@ -29,6 +29,7 @@ pub(crate) fn apply_message_publish(
             refs: input.refs.clone(),
             recipients: input.recipients.clone(),
             intent: input.intent.clone(),
+            issue_dispositions: input.issue_dispositions.clone(),
         });
 }
 

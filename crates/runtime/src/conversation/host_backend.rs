@@ -570,6 +570,7 @@ where
                             ticket: ticket.clone(),
                             session_id: early_session_id.clone(),
                             memory_context: runtime.memory_turn_context(),
+                            reality_context: runtime.reality_data_lease(),
                             model_lease: early_model_lease.clone(),
                             observation_wave_sequence,
                             decision: strategy.decision,
@@ -1039,8 +1040,8 @@ where
                 let mut committed_result_ref = format!("{}:model-result", ticket.graph_id);
                 let agentic_content_bridge_active = state.collaboration_obligation.is_some()
                     || state.execution_role.is_delegated_leaf()
-                    || intent_requests_preceding_content(&intent);
-                let current_agentic_content_ref =
+                    || intent_requests_explicit_content(&intent);
+                let _retained_agentic_content_ref =
                     if late_inputs || input_update_applied || !agentic_content_bridge_active {
                         None
                     } else {
@@ -1879,10 +1880,10 @@ where
                         }
                     }
                     ModelStepIntent::ToolCalls { mut calls } => {
-                        resolve_preceding_agentic_content_refs(
+                        resolve_explicit_agentic_content_refs(
                             self.services.as_ref(),
                             ticket,
-                            current_agentic_content_ref.as_deref(),
+                            &step.assistant_message,
                             &mut calls,
                         )
                         .await?;
@@ -2619,7 +2620,7 @@ impl DelegatedAgenticProtocolState {
                 self.program_id
             ),
             _ if self.artifact_refs.is_empty() => format!(
-                "Runtime collaboration protocol: execute Task `{}` is still {:?}. Your substantive content is retained. Commit it with `artifact_commit` related to this exact Task, then call `task_submit` with its returned `artifact:...` changed_ref plus real durable source/test/tool evidence refs. Runtime binds artifact content automatically; do not duplicate the internal artifact:// selector as evidence. Do not return prose before durable submission succeeds. Program `{}`.",
+                "Runtime collaboration protocol: execute Task `{}` is still {:?}. Publish an explicit file/hash via `artifact_publish`, or select an exact text block in the current response with `artifact_commit` content_ref=current_message_block:<zero-based-index>. Never assume a prior draft is selected. Commit the returned content_ref related to this exact Task, then call `task_submit` with its returned `artifact:...` changed_ref plus real durable source/test/tool evidence refs. Runtime binds artifact content automatically; do not duplicate the internal artifact:// selector as evidence. Do not return prose before durable submission succeeds. Program `{}`.",
                 self.task_id, self.status, self.program_id
             ),
             _ => format!(
@@ -2781,7 +2782,7 @@ pub(super) fn delegated_agentic_protocol_state(
     }))
 }
 
-// Artifact pin timestamps are stored as SQLite INTEGERs. This is effectively
+// Artifact pin timestamps use signed 64-bit durable values. This is effectively
 // permanent while still remaining representable by the durable repository.
 const AGENTIC_CONTENT_DRAFT_PIN_UNTIL_MS: u64 = i64::MAX as u64;
 
@@ -3043,29 +3044,14 @@ pub(super) async fn persist_agentic_content_draft(
     .map(Some)
 }
 
-/// Provider protocols place ordinary assistant content and native tool calls
-/// in the same message. Keep long authored content out of JSON by replacing
-/// only the sentinel in `artifact_commit`. A tool-only continuation resolves
-/// the latest durable draft in the exact logical Agent attempt; it never reads
-/// a session-global or Program-global "last message".
-pub(super) async fn resolve_preceding_agentic_content_refs(
+/// A current-message source names an exact block. Never substitute a nearby
+/// paragraph or a previous draft when that block is absent.
+pub(super) async fn resolve_explicit_agentic_content_refs(
     services: &crate::RuntimeServices,
     ticket: &NodeExecutionTicket,
-    current_content_ref: Option<&str>,
+    message: &ConversationMessage,
     calls: &mut [ModelToolCall],
 ) -> Result<(), NodeExecutorError> {
-    let needs_content = calls.iter().any(agentic_call_requests_preceding_content);
-    if !needs_content {
-        return Ok(());
-    }
-    let scope = agentic_content_draft_scope(services, ticket);
-    let content_ref = match current_content_ref {
-        Some(reference) => Some(reference.to_string()),
-        None => latest_agentic_content_draft(services, &scope)?.map(|draft| draft.content_ref),
-    };
-    let Some(content_ref) = content_ref else {
-        return Ok(());
-    };
     for call in calls {
         if call.name != harness_contract::agent_action::ARTIFACT_COMMIT_TOOL_ID {
             continue;
@@ -3073,40 +3059,39 @@ pub(super) async fn resolve_preceding_agentic_content_refs(
         let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&call.input) else {
             continue;
         };
-        if value.get("content_ref").and_then(serde_json::Value::as_str) != Some("preceding_content")
-        {
+        let Some(index) = value
+            .get("content_ref")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|reference| reference.strip_prefix("current_message_block:"))
+            .and_then(|index| index.parse::<usize>().ok())
+        else {
             continue;
-        }
-        if let Some(object) = value.as_object_mut() {
-            object.insert(
-                "content_ref".to_string(),
-                serde_json::Value::String(content_ref.clone()),
-            );
-            call.input =
-                serde_json::to_string(&value).map_err(|error| NodeExecutorError::Poll {
-                    node_id: ticket.node_id.clone(),
-                    reason: format!("encode resolved artifact_commit input: {error}"),
-                })?;
-        }
+        };
+        let Some(ContentBlock::Text { text }) = message.blocks.get(index) else {
+            continue;
+        };
+        let mut scope = agentic_content_draft_scope(services, ticket);
+        scope.node_id = format!("{}:selected-block:{index}", scope.node_id);
+        let content_ref = persist_agentic_content_draft_for_scope(
+            services,
+            &scope,
+            message_artifact_visibility(services, message, ticket),
+            text,
+        )
+        .await?;
+        value["content_ref"] = serde_json::Value::String(content_ref);
+        call.input = serde_json::to_string(&value).map_err(|error| NodeExecutorError::Poll {
+            node_id: ticket.node_id.clone(),
+            reason: format!("encode selected content: {error}"),
+        })?;
     }
     Ok(())
 }
 
-fn intent_requests_preceding_content(intent: &ModelStepIntent) -> bool {
-    matches!(intent, ModelStepIntent::ToolCalls { calls } if calls.iter().any(agentic_call_requests_preceding_content))
-}
-
-fn agentic_call_requests_preceding_content(call: &ModelToolCall) -> bool {
-    call.name == harness_contract::agent_action::ARTIFACT_COMMIT_TOOL_ID
-        && serde_json::from_str::<serde_json::Value>(&call.input)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("content_ref")
-                    .and_then(serde_json::Value::as_str)
-                    .map(|value| value == "preceding_content")
-            })
-            .unwrap_or(false)
+fn intent_requests_explicit_content(intent: &ModelStepIntent) -> bool {
+    matches!(intent, ModelStepIntent::ToolCalls { calls } if calls.iter().any(|call| {
+        call.name == harness_contract::agent_action::ARTIFACT_COMMIT_TOOL_ID
+    }))
 }
 
 fn message_artifact_visibility(
@@ -3369,11 +3354,12 @@ where
                 node_id: ticket.node_id.clone(),
                 reason: "governed ToolHost is missing its compiled execution bundle".to_string(),
             })?;
-            let (event_bus, memory_context, execution_policy) = {
+            let (event_bus, memory_context, reality_context, execution_policy) = {
                 let runtime = self.runtime.lock().await;
                 (
                     runtime.cowd_bus().cloned(),
                     runtime.memory_turn_context(),
+                    runtime.reality_data_lease(),
                     runtime
                         .permission_policy()
                         .execution_policy_control()
@@ -3388,6 +3374,7 @@ where
                 execution_policy.sandbox_posture,
                 execution_policy.revision,
                 Some(&memory_context),
+                reality_context.as_ref(),
                 model_lease.as_deref(),
                 ticket,
                 u64::try_from(iteration).unwrap_or(u64::MAX).max(1),

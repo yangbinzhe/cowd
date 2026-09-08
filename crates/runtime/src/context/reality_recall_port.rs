@@ -11,7 +11,7 @@ use fact_kernel::{
     Confidence, FactCandidate, FactLedger, FactRecallQuery, FactScope, FactSource, SourceKind,
     UnavailableFactLedger,
 };
-use harness_contract::agent::{AgentBindingSnapshot, CognitiveReadScope};
+use harness_contract::agent::{AgentBindingSnapshot, AgentDataLease, CognitiveReadScope};
 use harness_contract::reality::RealityBoundary;
 use matrix_core::{MatrixScenarioResult, MatrixScenarioRun, MatrixScenarioSpec, MatrixSnapshotRef};
 use matrix_repository::{MatrixRecallQuery, MatrixStore};
@@ -19,6 +19,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{ContextItem, ContextRole, ContextSourceKind, ContextVisibility};
+
+#[path = "reality_discovery.rs"]
+mod discovery;
+pub use discovery::{MatrixDirectoryPage, RealityDirectoryPage, RealityExactContent};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RealityRecallSourceStatus {
@@ -234,22 +238,7 @@ impl RealityRecallPort {
         }
     }
 
-    fn recall_facts(
-        &self,
-        binding: &AgentBindingSnapshot,
-        query: &str,
-        limit: usize,
-    ) -> (Vec<ContextItem>, RealityRecallSourceStatus) {
-        let lease = &binding.data_lease;
-        if lease.fact_refs.is_empty() && lease.fact_boundaries.is_empty() {
-            return (
-                Vec::new(),
-                disabled_status(
-                    ContextSourceKind::Fact,
-                    "Binding grants no Fact references or boundaries",
-                ),
-            );
-        }
+    fn fact_query(&self, lease: &AgentDataLease, query: &str, limit: usize) -> FactRecallQuery {
         // The current task is the irreducible execution boundary. Wider Fact
         // scopes require the matching cognitive read grant as well as a
         // Reality boundary grant.
@@ -271,7 +260,7 @@ impl RealityRecallPort {
                 authorized_scope_keys.push(project_scope_key.clone());
             }
         }
-        let recall_query = FactRecallQuery::new(
+        FactRecallQuery::new(
             lease
                 .fact_refs
                 .iter()
@@ -281,8 +270,27 @@ impl RealityRecallPort {
             authorized_scope_keys,
             lease.fact_boundaries.clone(),
             query,
-            limit.saturating_add(1),
-        );
+            limit,
+        )
+    }
+
+    fn recall_facts(
+        &self,
+        binding: &AgentBindingSnapshot,
+        query: &str,
+        limit: usize,
+    ) -> (Vec<ContextItem>, RealityRecallSourceStatus) {
+        let lease = &binding.data_lease;
+        if lease.fact_refs.is_empty() && lease.fact_boundaries.is_empty() {
+            return (
+                Vec::new(),
+                disabled_status(
+                    ContextSourceKind::Fact,
+                    "Binding grants no Fact references or boundaries",
+                ),
+            );
+        }
+        let recall_query = self.fact_query(lease, query, limit.saturating_add(1));
         let facts = match self.fact_ledger.recall_facts(&recall_query) {
             Ok(facts) => facts,
             Err(error) => {
@@ -308,19 +316,22 @@ impl RealityRecallPort {
         )
     }
 
+    fn matrix_snapshot_ids(lease: &AgentDataLease) -> Vec<String> {
+        lease
+            .matrix_snapshot_refs
+            .iter()
+            .filter_map(|reference| reference.strip_prefix("matrix:source_snapshot:"))
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    }
+
     fn recall_matrix(
         &self,
         binding: &AgentBindingSnapshot,
         query: &str,
         limit: usize,
     ) -> (Vec<ContextItem>, RealityRecallSourceStatus) {
-        let granted_snapshots = binding
-            .data_lease
-            .matrix_snapshot_refs
-            .iter()
-            .filter_map(|reference| reference.strip_prefix("matrix:source_snapshot:"))
-            .map(str::to_string)
-            .collect::<Vec<_>>();
+        let granted_snapshots = Self::matrix_snapshot_ids(&binding.data_lease);
         if granted_snapshots.is_empty() {
             return (
                 Vec::new(),

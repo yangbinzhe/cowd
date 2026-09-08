@@ -2438,19 +2438,36 @@ pub fn understand(input: &StrategyInput) -> TaskUnderstanding {
     let requests_multi_agent = (contains_any(&affirmative_collaboration, MULTI_AGENT_TERMS)
         || required_team_count > 0)
         && !forbids_team;
-    let collaboration_reference = if contains_any(
-        &normalized,
-        &[
-            "继续上一组",
-            "继续团队",
-            "上一组团队",
-            "继续上次",
-            "继续处理",
-            "continue with the previous",
-            "continue the previous team",
-            "resume the previous team",
-        ],
-    ) {
+    // A standalone continuation is referential; a longer new business request
+    // is not made referential merely because it contains the word continue.
+    let standalone_continuation = matches!(
+        normalized
+            .trim()
+            .trim_end_matches(['。', '！', '!', '.', '？', '?'])
+            .trim(),
+        "继续"
+            | "请继续"
+            | "继续吧"
+            | "接着做"
+            | "continue"
+            | "please continue"
+            | "resume"
+            | "keep going"
+    );
+    let collaboration_reference = if standalone_continuation
+        || contains_any(
+            &normalized,
+            &[
+                "继续上一组",
+                "继续团队",
+                "上一组团队",
+                "继续上次",
+                "继续处理",
+                "continue with the previous",
+                "continue the previous team",
+                "resume the previous team",
+            ],
+        ) {
         CollaborationReference::LatestEligible
     } else {
         CollaborationReference::None

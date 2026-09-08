@@ -16,7 +16,8 @@ use crate::checkpoint::{
     CheckpointCreateInput, CheckpointDiffInput, CheckpointRestoreInput,
 };
 use crate::file_ops::{
-    edit_file, glob_search, grep_search, read_file, write_file, GrepSearchInput,
+    edit_file, glob_search_with_options, grep_search, read_file, write_file, GrepSearchInput,
+    SearchOptions,
 };
 use crate::lane_events::{LaneEvent, LaneEventName, LaneEventStatus, LaneFailureClass};
 use crate::lane_policy::{iso8601_now, LaneContext};
@@ -532,17 +533,19 @@ fn run_glob_search(lease: &ToolHostLease, input: GlobSearchInputValue) -> Result
         .as_deref()
         .filter(|path| !path.trim().is_empty())
         .unwrap_or(".");
-    let fingerprint = scope_fingerprint(lease.path_policy(), Some(resolved_path))?;
-    let scope = directory_cache_scope(lease.path_policy(), Some(resolved_path))?;
-    cached_json_tool(lease, "glob_search", &input, &fingerprint, &scope, || {
-        glob_search(
+    // Live filesystem pages carry their own source cursor. The old scope
+    // fingerprint excludes fixed directory names and cannot certify these
+    // user-overridable search scopes.
+    to_pretty_json(
+        glob_search_with_options(
             lease.path_policy(),
             &input.pattern,
             Some(resolved_path),
             input.cursor.as_deref(),
+            &input.search_options,
         )
-        .map_err(io_to_string)
-    })
+        .map_err(io_to_string)?,
+    )
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -556,11 +559,7 @@ fn run_glob_many(lease: &ToolHostLease, input: GlobManyInput) -> Result<String, 
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_grep_search(lease: &ToolHostLease, input: GrepSearchInput) -> Result<String, String> {
-    let fingerprint = scope_fingerprint(lease.path_policy(), input.path.as_deref())?;
-    let scope = directory_cache_scope(lease.path_policy(), input.path.as_deref())?;
-    cached_json_tool(lease, "grep_search", &input, &fingerprint, &scope, || {
-        grep_search(lease.path_policy(), &input).map_err(io_to_string)
-    })
+    to_pretty_json(grep_search(lease.path_policy(), &input).map_err(io_to_string)?)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -572,75 +571,9 @@ fn run_grep_many(lease: &ToolHostLease, input: GrepManyInput) -> Result<String, 
     to_pretty_json(batch_output("grep_many", results))
 }
 
-#[allow(clippy::needless_pass_by_value)]
-fn run_workspace_snapshot(
-    lease: &ToolHostLease,
-    input: WorkspaceSnapshotInput,
-) -> Result<String, String> {
-    let snapshot_input = input.clone();
-    let fingerprint = workspace_snapshot_fingerprint(lease.path_policy(), &input)?;
-    cached_json_tool(
-        lease,
-        "workspace_snapshot",
-        &input,
-        &fingerprint,
-        "workspace:.",
-        || workspace_snapshot_value(lease, snapshot_input),
-    )
-}
-
-fn workspace_snapshot_value(
-    lease: &ToolHostLease,
-    input: WorkspaceSnapshotInput,
-) -> Result<Value, String> {
-    let include_git = input.include_git.unwrap_or(true);
-    let include_files = input.include_files.unwrap_or(true);
-    let max_files = input.max_files.unwrap_or(500).clamp(1, 5000);
-    let cwd = lease.path_policy().workspace_root().to_path_buf();
-
-    let git = if include_git {
-        Some(json!({
-            "branch": git_stdout(&["rev-parse", "--abbrev-ref", "HEAD"]),
-            "status": git_stdout(&["status", "--short", "--branch"]),
-            "head": git_stdout(&["rev-parse", "--short", "HEAD"])
-        }))
-    } else {
-        None
-    };
-
-    let roots = input.roots.unwrap_or_else(|| vec![String::from(".")]);
-    let mut resolved_roots = Vec::new();
-    let mut scan_complete = include_files;
-    let files = if include_files {
-        let mut files = Vec::new();
-        for root in roots {
-            if files.len() >= max_files {
-                scan_complete = false;
-                break;
-            }
-            let root_path = lease.path_policy().resolve(&root).map_err(io_to_string)?;
-            resolved_roots.push(root_path.to_string_lossy().into_owned());
-            scan_complete &=
-                collect_snapshot_files(lease.path_policy(), &root_path, max_files, &mut files);
-        }
-        files.sort();
-        files.dedup();
-        files.truncate(max_files);
-        Some(files)
-    } else {
-        None
-    };
-
-    Ok(json!({
-        "type": "workspace_snapshot",
-        "cwd": cwd.to_string_lossy(),
-        "git": git,
-        "files": files,
-        "maxFiles": max_files,
-        "resolvedRoots": resolved_roots,
-        "scanComplete": scan_complete
-    }))
-}
+#[path = "workspace_snapshot.rs"]
+mod workspace_snapshot;
+use workspace_snapshot::{run_workspace_snapshot, WorkspaceSnapshotInput};
 
 fn cached_json_tool<T, F, O>(
     lease: &ToolHostLease,
@@ -686,22 +619,6 @@ fn file_cache_scope(path: &Path) -> String {
     format!("file:{}", path.to_string_lossy())
 }
 
-fn directory_cache_scope(
-    policy: &WorkspacePathPolicy,
-    path: Option<&str>,
-) -> Result<String, String> {
-    match path {
-        Some(path) => Ok(format!(
-            "directory:{}",
-            policy
-                .resolve(path)
-                .map_err(io_to_string)?
-                .to_string_lossy()
-        )),
-        None => Ok("workspace:.".to_string()),
-    }
-}
-
 fn file_fingerprint(resolved: &Path) -> String {
     let content_hash = match std::fs::File::open(resolved) {
         Ok(mut file) => {
@@ -732,111 +649,6 @@ fn file_fingerprint(resolved: &Path) -> String {
         metadata.len(),
         modified
     ) + &format!(":{content_hash}")
-}
-
-fn scope_fingerprint(policy: &WorkspacePathPolicy, path: Option<&str>) -> Result<String, String> {
-    let root = match path {
-        Some(path) => policy.resolve(path).map_err(io_to_string)?,
-        None => policy.workspace_root().to_path_buf(),
-    };
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    root.to_string_lossy().hash(&mut hasher);
-    let complete = hash_path_scope(&root, &mut hasher, &mut 0usize);
-    if !complete {
-        return Ok(String::from("uncacheable"));
-    }
-    Ok(format!("scope:{:016x}", hasher.finish()))
-}
-
-fn workspace_snapshot_fingerprint(
-    policy: &WorkspacePathPolicy,
-    input: &WorkspaceSnapshotInput,
-) -> Result<String, String> {
-    let mut parts = Vec::new();
-    if input.include_git.unwrap_or(true) {
-        parts.push(git_stdout(&["rev-parse", "HEAD"]).unwrap_or_default());
-        parts.push(git_stdout(&["status", "--short"]).unwrap_or_default());
-    }
-    if input.include_files.unwrap_or(true) {
-        let roots = input
-            .roots
-            .clone()
-            .unwrap_or_else(|| vec![String::from(".")]);
-        for root in roots {
-            parts.push(scope_fingerprint(policy, Some(&root))?);
-        }
-    }
-    Ok(parts.join("\n"))
-}
-
-fn hash_path_scope(
-    root: &Path,
-    hasher: &mut std::collections::hash_map::DefaultHasher,
-    seen: &mut usize,
-) -> bool {
-    const MAX_FINGERPRINT_FILES: usize = 2048;
-    if *seen >= MAX_FINGERPRINT_FILES || should_skip_cache_fingerprint(root) {
-        return *seen < MAX_FINGERPRINT_FILES;
-    }
-    let Ok(metadata) = std::fs::metadata(root) else {
-        "missing".hash(hasher);
-        root.to_string_lossy().hash(hasher);
-        return true;
-    };
-    root.to_string_lossy().hash(hasher);
-    metadata.len().hash(hasher);
-    metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default()
-        .hash(hasher);
-    if metadata.is_file() {
-        if let Ok(mut file) = std::fs::File::open(root) {
-            let mut buffer = [0_u8; 8192];
-            loop {
-                match file.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(read) => buffer[..read].hash(hasher),
-                    Err(_) => {
-                        "unreadable".hash(hasher);
-                        break;
-                    }
-                }
-            }
-        }
-        *seen += 1;
-        return *seen <= MAX_FINGERPRINT_FILES;
-    }
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return true;
-    };
-    let mut paths = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .collect::<Vec<_>>();
-    paths.sort();
-    for path in paths {
-        if !hash_path_scope(&path, hasher, seen) {
-            return false;
-        }
-        if *seen >= MAX_FINGERPRINT_FILES {
-            return false;
-        }
-    }
-    true
-}
-
-fn should_skip_cache_fingerprint(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            matches!(
-                name,
-                ".git" | ".cowd" | "target" | "node_modules" | "dist" | "build" | ".cache"
-            )
-        })
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -936,64 +748,6 @@ fn is_allowed_readonly_batch_tool(name: &str) -> bool {
             | "edit_many_preview"
             | "patch_plan"
     )
-}
-
-fn collect_snapshot_files(
-    policy: &WorkspacePathPolicy,
-    root: &Path,
-    max_files: usize,
-    files: &mut Vec<String>,
-) -> bool {
-    if files.len() >= max_files {
-        return false;
-    }
-    let Ok(resolved_root) = policy.ensure_resolved_path(root) else {
-        return false;
-    };
-    let Ok(metadata) = std::fs::metadata(&resolved_root) else {
-        return false;
-    };
-    if metadata.is_file() {
-        files.push(resolved_root.to_string_lossy().into_owned());
-        return true;
-    }
-    if !metadata.is_dir() || should_skip_snapshot_dir(&resolved_root) {
-        return true;
-    }
-    let Ok(entries) = std::fs::read_dir(&resolved_root) else {
-        return false;
-    };
-    let mut complete = true;
-    for entry in entries {
-        let Ok(entry) = entry else {
-            complete = false;
-            continue;
-        };
-        if files.len() >= max_files {
-            complete = false;
-            break;
-        }
-        complete &= collect_snapshot_files(policy, &entry.path(), max_files, files);
-    }
-    complete
-}
-
-fn should_skip_snapshot_dir(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            matches!(
-                name,
-                ".git"
-                    | ".cowd"
-                    | "target"
-                    | "node_modules"
-                    | "dist"
-                    | "build"
-                    | ".cache"
-                    | "coverage"
-            )
-        })
 }
 
 #[derive(Debug, Serialize)]
@@ -1435,6 +1189,8 @@ struct GlobSearchInputValue {
     path: Option<String>,
     #[serde(default)]
     cursor: Option<String>,
+    #[serde(flatten)]
+    search_options: SearchOptions,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1447,14 +1203,6 @@ struct GlobManyInput {
 struct GrepManyInput {
     searches: Vec<GrepSearchInput>,
     max_concurrency: Option<usize>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WorkspaceSnapshotInput {
-    include_git: Option<bool>,
-    include_files: Option<bool>,
-    roots: Option<Vec<String>>,
-    max_files: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

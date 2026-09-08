@@ -98,6 +98,7 @@ impl ToolSafetyCategory {
             | "memory_search"
             | "context_retrieve"
             | "evidence_retrieve"
+            | "artifact_publish"
             | "memory_list"
             | "memory_get"
             | "session_list"
@@ -115,6 +116,7 @@ impl ToolSafetyCategory {
 
             "write"
             | "write_file"
+            | "artifact_materialize"
             | "edit"
             | "edit_file"
             | "create_file"

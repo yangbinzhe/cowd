@@ -217,16 +217,9 @@ fn explicit_workspace_paths(
             let candidate = if token.starts_with('/') {
                 PathBuf::from(&token)
             } else {
-                let rooted = workspace_root.join(token.trim_start_matches("./"));
-                std::env::current_dir()
-                    .ok()
-                    .and_then(|cwd| {
-                        cwd.canonicalize()
-                            .ok()
-                            .map(|cwd| cwd.join(token.trim_start_matches("./")))
-                    })
-                    .filter(|cwd_candidate| cwd_candidate.exists())
-                    .unwrap_or(rooted)
+                // Relative targets belong to the authorized workspace. The
+                // server's process cwd is not a Session path authority.
+                workspace_root.join(token.trim_start_matches("./"))
             };
             workspace_relative_explicit_path(
                 workspace_root,
@@ -276,11 +269,7 @@ fn is_probable_workspace_path_token(workspace_root: &Path, token: &str) -> bool 
     if token.starts_with('/') || token.starts_with("./") || !token.is_ascii() {
         return token.starts_with('/') || token.starts_with("./");
     }
-    if workspace_root.join(token).exists()
-        || std::env::current_dir()
-            .map(|cwd| cwd.join(token).exists())
-            .unwrap_or(false)
-    {
+    if workspace_root.join(token).exists() {
         return true;
     }
     token.rsplit('/').next().is_some_and(|leaf| {
@@ -343,10 +332,7 @@ fn is_definition_like_token(workspace_root: &Path, token: &str) -> bool {
     if !NAMESPACES.contains(&namespace) || rest.is_empty() || rest.contains('.') {
         return false;
     }
-    let exists = workspace_root.join(token).exists()
-        || std::env::current_dir()
-            .map(|cwd| cwd.join(token).exists())
-            .unwrap_or(false);
+    let exists = workspace_root.join(token).exists();
     !exists
 }
 
@@ -398,6 +384,38 @@ fn workspace_relative_explicit_path(
 #[cfg(test)]
 mod tests {
     use super::explicit_workspace_resource_scopes;
+
+    #[test]
+    fn explicit_targets_use_session_workspace_even_when_process_cwd_has_same_file() {
+        let workspace = tempfile::tempdir().unwrap();
+        // Both Cargo's crate cwd and direct binary execution at repository
+        // root have this manifest. Never mutate the process-global cwd.
+        assert!(std::env::current_dir()
+            .unwrap()
+            .join("Cargo.toml")
+            .is_file());
+        std::fs::write(workspace.path().join("Cargo.toml"), "session manifest").unwrap();
+        assert_eq!(
+            explicit_workspace_resource_scopes(workspace.path(), "read ./Cargo.toml", false),
+            vec!["read:Cargo.toml"]
+        );
+        std::fs::remove_file(workspace.path().join("Cargo.toml")).unwrap();
+        assert!(
+            explicit_workspace_resource_scopes(workspace.path(), "read ./Cargo.toml", false)
+                .is_empty()
+        );
+        assert_eq!(
+            explicit_workspace_resource_scopes(workspace.path(), "create ./Cargo.toml", true),
+            vec!["write:Cargo.toml"]
+        );
+        let outside = std::env::current_dir().unwrap().join("Cargo.toml");
+        assert!(explicit_workspace_resource_scopes(
+            workspace.path(),
+            &format!("read {}", outside.display()),
+            false
+        )
+        .is_empty());
+    }
 
     #[test]
     fn binds_bare_artifacts_to_one_declared_delivery_directory() {

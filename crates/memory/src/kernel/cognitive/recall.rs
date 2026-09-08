@@ -982,6 +982,13 @@ impl CognitiveContextManager {
         Ok(entries)
     }
 
+    pub(crate) async fn discover_memory_page(
+        &self,
+        query: crate::store::MemoryDiscoveryQuery,
+    ) -> Result<crate::store::MemoryDiscoveryPage> {
+        self.orchestrator.store().discover_page(query).await
+    }
+
     /// Quick FTS5 search with just a query string.
     ///
     /// Convenience method that creates a default request with the given query.

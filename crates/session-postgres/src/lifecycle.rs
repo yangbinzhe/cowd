@@ -2,6 +2,29 @@
 
 use super::*;
 
+/// Canonical current actor/workspace predicate shared by catalog and active search.
+pub(super) const BROWSABLE_SESSION_AUTHORITY: &str = r"(
+                    s.session_id=current.session_id
+                 OR (
+                        NULLIF(current.metadata_json::jsonb ->> 'workspace_root', '') IS NOT NULL
+                    AND s.metadata_json::jsonb ->> 'workspace_root'
+                        = current.metadata_json::jsonb ->> 'workspace_root'
+                    AND (
+                           (
+                               NULLIF(current.metadata_json::jsonb ->> 'owner_principal_id', '') IS NOT NULL
+                           AND s.metadata_json::jsonb ->> 'owner_principal_id'
+                               = current.metadata_json::jsonb ->> 'owner_principal_id'
+                           )
+                        OR (
+                               NULLIF(current.metadata_json::jsonb ->> 'owner_principal_id', '') IS NULL
+                           AND NULLIF(current.user_id, '') IS NOT NULL
+                           AND s.platform=current.platform
+                           AND s.user_id=current.user_id
+                           )
+                       )
+                    )
+                 )";
+
 impl PostgresSessionStore {
     pub fn new(executor: PostgresExecutor) -> session::SessionResult<Self> {
         prepare_legacy_session_usage_for_migration(&executor)?;
@@ -821,27 +844,7 @@ impl PostgresSessionStore {
             FROM session_records s
             JOIN session_records current ON current.session_id=$1
            WHERE s.status NOT IN ('deleted', 'deleting')
-             AND (
-                    s.session_id=current.session_id
-                 OR (
-                        NULLIF(current.metadata_json::jsonb ->> 'workspace_root', '') IS NOT NULL
-                    AND s.metadata_json::jsonb ->> 'workspace_root'
-                        = current.metadata_json::jsonb ->> 'workspace_root'
-                    AND (
-                           (
-                               NULLIF(current.metadata_json::jsonb ->> 'owner_principal_id', '') IS NOT NULL
-                           AND s.metadata_json::jsonb ->> 'owner_principal_id'
-                               = current.metadata_json::jsonb ->> 'owner_principal_id'
-                           )
-                        OR (
-                               NULLIF(current.metadata_json::jsonb ->> 'owner_principal_id', '') IS NULL
-                           AND NULLIF(current.user_id, '') IS NOT NULL
-                           AND s.platform=current.platform
-                           AND s.user_id=current.user_id
-                           )
-                       )
-                    )
-                 )
+             AND $BROWSABLE_AUTHORITY
              AND (
                     $2::text IS NULL
                  OR to_tsvector('simple',
@@ -861,7 +864,8 @@ impl PostgresSessionStore {
                                coalesce(m.tool_name, ''))
                                @@ websearch_to_tsquery('simple', $2)
                     )
-                 )";
+                 )"
+        .replace("$BROWSABLE_AUTHORITY", BROWSABLE_SESSION_AUTHORITY);
         let mut connection = self
             .executor
             .checkout_online_read()

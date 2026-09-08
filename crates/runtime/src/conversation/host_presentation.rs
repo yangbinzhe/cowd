@@ -54,6 +54,7 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
                 self.sandbox_posture,
                 self.policy_revision,
                 self.memory_context,
+                self.reality_context,
                 self.model_lease,
                 self.ticket,
                 self.execution_decision,
@@ -200,6 +201,7 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
                     self.sandbox_posture,
                     self.policy_revision,
                     self.memory_context,
+                    self.reality_context,
                     self.model_lease,
                     self.ticket,
                     self.execution_decision,
@@ -321,6 +323,7 @@ pub(super) async fn execute_governed_runtime_tool_batch(
     sandbox_posture: harness_contract::policy::SandboxPosture,
     policy_revision: u64,
     memory_context: Option<&memory::MemoryTurnContext>,
+    reality_context: Option<&harness_contract::agent::AgentDataLease>,
     model_lease: Option<&str>,
     ticket: &NodeExecutionTicket,
     observation_wave_sequence: u64,
@@ -452,6 +455,7 @@ pub(super) async fn execute_governed_runtime_tool_batch(
         sandbox_posture,
         policy_revision,
         memory_context,
+        reality_context,
         model_lease,
         ticket,
         execution_decision: Some(decision),
@@ -1820,7 +1824,7 @@ where
 /// Resolve terminal ownership before emitting a Goal event. Agent-first
 /// supervision and a previously committed Objective verdict are both durable
 /// authorities; presentation must never race either one.
-fn root_terminal_owned_elsewhere(
+pub(super) fn root_terminal_owned_elsewhere(
     services: &crate::RuntimeServices,
     root_presentation: bool,
     session_id: &str,
@@ -1844,6 +1848,12 @@ fn root_terminal_owned_elsewhere(
             ));
         }
         return Ok(true);
+    }
+    if agentic_supervisor && completion == GoalCompletion::Satisfied {
+        return Err(
+            "Agent-first Objective has no verified terminal; presentation cannot declare success"
+                .into(),
+        );
     }
     Ok(agentic_supervisor)
 }

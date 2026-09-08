@@ -70,6 +70,10 @@ pub struct RuntimeToolExecutionRequest {
     /// runtimes carry the same lease that passive context assembly uses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_context: Option<memory::MemoryTurnContext>,
+    /// Validated Runtime Binding data lease shared with passive Fact/Matrix recall.
+    /// Never populated from the model tool input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reality_context: Option<harness_contract::agent::AgentDataLease>,
     /// Selected parent model lease. Runtime control tools inherit this binding
     /// for any child AgentTask graph instead of resolving an imaginary default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -125,6 +129,7 @@ impl RuntimeToolExecutionRequest {
             policy_revision: 0,
             authorized_scopes: Vec::new(),
             memory_context: None,
+            reality_context: None,
             model_lease: None,
             parent_execution: None,
             parent_execution_attempt: None,

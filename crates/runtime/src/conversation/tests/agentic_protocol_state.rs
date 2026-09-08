@@ -61,6 +61,14 @@ fn bound_agentic_program_exclusively_owns_the_root_goal_terminal() {
         root_execution_id,
     )
     .expect("terminal owner"));
+    assert!(super::host_presentation::root_terminal_owned_elsewhere(
+        services.as_ref(), true, session_id, turn_id, root_execution_id,
+        "goal:root-terminal-owner", harness_contract::goal::GoalCompletion::Satisfied,
+    ).is_err(), "presentation cannot turn an Open Program into visible success");
+    assert!(super::host_presentation::root_terminal_owned_elsewhere(
+        services.as_ref(), true, session_id, turn_id, root_execution_id,
+        "goal:root-terminal-owner", harness_contract::goal::GoalCompletion::Partial,
+    ).unwrap(), "failure presentation preserves Program terminal ownership");
     assert!(!agentic_program_owns_root_terminal(
         services.as_ref(),
         "session-direct",

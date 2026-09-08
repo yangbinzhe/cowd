@@ -100,6 +100,56 @@ impl runtime::ArtifactMetadataRepository for PostgresArtifactRepository {
             .transpose()
     }
 
+    fn catalog_page(
+        &self,
+        query: runtime::ArtifactCatalogQuery,
+    ) -> Result<runtime::ArtifactCatalogPage, String> {
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(|error| error.to_string())?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        transaction
+            .batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .map_err(|error| error.to_string())?;
+        let revisions = transaction.query("SELECT s.scope_key, coalesce(r.revision,0)::BIGINT FROM unnest($1::TEXT[]) AS s(scope_key) LEFT JOIN artifact_catalog_invalidations r USING(scope_key) ORDER BY s.scope_key", &[&query.scopes])
+            .map_err(|error| error.to_string())?.into_iter().map(|row| (row.get::<_,String>(0),row.get::<_,i64>(1))).collect::<std::collections::BTreeMap<_,_>>();
+        let snapshot = match query.snapshot {
+            Some(snapshot) if snapshot.revisions == revisions => snapshot,
+            Some(_) => {
+                return Err("Artifact catalog source changed; start a fresh discovery".into())
+            }
+            None => runtime::ArtifactCatalogSnapshot {
+                fence: transaction
+                    .query_one("SELECT pg_current_snapshot()::TEXT", &[])
+                    .map_err(|error| error.to_string())?
+                    .get(0),
+                revisions,
+            },
+        };
+        let limit = query.limit.clamp(1, 128);
+        let sql_limit = (limit + 1) as i64;
+        let mut records = transaction.query(
+            "SELECT artifact_id,sha256,bytes,media_type,visibility_scope,tier,created_at_ms,last_access_at_ms
+             FROM artifact_records WHERE visibility_scope=ANY($1)
+               AND pg_visible_in_snapshot(catalog_creation_xid,$2::TEXT::pg_snapshot)
+               AND ($3::TEXT IS NULL OR artifact_id > $3)
+               AND ($4='' OR strpos(lower(artifact_id||' '||sha256||' '||media_type),lower($4))>0)
+             ORDER BY artifact_id LIMIT $5", &[&query.scopes,&snapshot.fence,&query.after_id,&query.query,&sql_limit])
+            .map_err(|error| error.to_string())?.iter().map(artifact_record_from_row).collect::<Result<Vec<_>,_>>()?;
+        let has_more = records.len() > limit;
+        records.truncate(limit);
+        let next_id = has_more.then(|| records.last().expect("nonempty page").artifact_id.clone());
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(runtime::ArtifactCatalogPage {
+            records,
+            snapshot,
+            next_id,
+        })
+    }
+
     fn touch(&self, artifact_id: &str, at_ms: u64) -> Result<(), String> {
         self.executor
             .checkout_critical()

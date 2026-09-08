@@ -32,7 +32,7 @@
             action_id: Some("root-action"),
             session_id: Some("session-root"),
             authorized_scopes: &admitted_scopes,
-            memory_context: None,
+            memory_context: None, reality_context: None,
             model_lease: Some("deepseek-v4-flash"),
             parent_execution: None,
             execution_decision: Some(&decision),

@@ -221,8 +221,14 @@ pub(crate) fn capability_mapping_authorizes_tool(
         .to_ascii_lowercase();
     if capability == AgentCapability::Read
         && (AGENT_ACTION_TOOL_IDS.contains(&tool.as_str())
-            || matches!(tool.as_str(), "context_retrieve" | "evidence_retrieve"))
+            || matches!(
+                tool.as_str(),
+                "context_retrieve" | "evidence_retrieve" | "artifact_publish"
+            ))
     {
+        return true;
+    }
+    if capability == AgentCapability::Write && tool == "artifact_materialize" {
         return true;
     }
     capability_mapping(capability.as_str())
@@ -238,7 +244,10 @@ pub(crate) fn runtime_capability_map_contains_tool(tool_ref: &str) -> bool {
         .unwrap_or(tool_ref)
         .to_ascii_lowercase();
     if AGENT_ACTION_TOOL_IDS.contains(&tool.as_str())
-        || matches!(tool.as_str(), "context_retrieve" | "evidence_retrieve")
+        || matches!(
+            tool.as_str(),
+            "context_retrieve" | "evidence_retrieve" | "artifact_publish"
+        )
     {
         return true;
     }
@@ -268,7 +277,7 @@ fn required_host_tool_alternatives(capability: &str) -> &'static [&'static str] 
 
 pub(crate) fn agent_tool_permission(tool: &str) -> PermissionMode {
     match tool {
-        "write_file" | "edit_file" => PermissionMode::WorkspaceWrite,
+        "write_file" | "edit_file" | "artifact_materialize" => PermissionMode::WorkspaceWrite,
         "execute_code" => PermissionMode::ReadOnly,
         "bash" | "checkpoint_restore" | "mcp_tool" => PermissionMode::DangerFullAccess,
         _ => PermissionMode::ReadOnly,

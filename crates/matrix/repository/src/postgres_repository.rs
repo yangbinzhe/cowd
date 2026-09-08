@@ -32,9 +32,13 @@ use storage::{
 
 use crate::port::matrix_store_operations;
 use crate::{
-    MatrixHealth, MatrixLocalDataPlane, MatrixMetricRecomputeResult, MatrixRecallQuery,
-    MatrixRevisioned, MatrixStore, MatrixStoreError, MatrixStoreResult,
+    MatrixCatalogPage, MatrixCatalogQuery, MatrixHealth, MatrixLocalDataPlane,
+    MatrixMetricRecomputeResult, MatrixRecallQuery, MatrixRevisioned, MatrixStore,
+    MatrixStoreError, MatrixStoreResult,
 };
+
+#[path = "postgres_catalog.rs"]
+mod catalog;
 
 const MATRIX_DOMAIN: &str = "matrix";
 const MATRIX_MIGRATIONS: &[PostgresMigrationSpec] = &[
@@ -255,6 +259,35 @@ const MATRIX_MIGRATIONS: &[PostgresMigrationSpec] = &[
         SET schema_version = GREATEST(schema_version, 21), updated_at = NOW()
         WHERE id = 1;
     "#],
+    },
+    PostgresMigrationSpec {
+        id: "matrix.0005.snapshot-catalog",
+        domain: MATRIX_DOMAIN,
+        version: 5,
+        description: "scope-fenced creation snapshots for active Matrix discovery",
+        statements: &[r#"
+            ALTER TABLE matrix_fact ADD COLUMN catalog_creation_xid xid8 NOT NULL DEFAULT pg_current_xact_id();
+            ALTER TABLE matrix_source_snapshot ADD COLUMN catalog_creation_xid xid8 NOT NULL DEFAULT pg_current_xact_id();
+            CREATE TABLE matrix_catalog_invalidations (snapshot_id TEXT PRIMARY KEY, revision BIGINT NOT NULL);
+            CREATE INDEX idx_matrix_catalog_scope_id ON matrix_fact ((payload->>'snapshot_id'),id);
+            CREATE FUNCTION matrix_catalog_invalidate() RETURNS trigger LANGUAGE plpgsql AS $$
+            DECLARE old_scope TEXT; new_scope TEXT; changed_scope TEXT;
+            BEGIN
+                IF TG_OP='UPDATE' AND OLD.payload IS NOT DISTINCT FROM NEW.payload THEN RETURN NEW; END IF;
+                old_scope := CASE WHEN TG_TABLE_NAME='matrix_source_snapshot' THEN OLD.id ELSE OLD.payload->>'snapshot_id' END;
+                IF TG_OP='UPDATE' THEN
+                    new_scope := CASE WHEN TG_TABLE_NAME='matrix_source_snapshot' THEN NEW.id ELSE NEW.payload->>'snapshot_id' END;
+                END IF;
+                FOR changed_scope IN SELECT DISTINCT s FROM unnest(ARRAY[old_scope,new_scope]) s WHERE s IS NOT NULL ORDER BY s LOOP
+                    INSERT INTO matrix_catalog_invalidations(snapshot_id,revision) VALUES(changed_scope,1)
+                    ON CONFLICT(snapshot_id) DO UPDATE SET revision=matrix_catalog_invalidations.revision+1;
+                END LOOP;
+                RETURN CASE WHEN TG_OP='DELETE' THEN OLD ELSE NEW END;
+            END $$;
+            CREATE TRIGGER matrix_fact_catalog_invalidation AFTER UPDATE OR DELETE ON matrix_fact FOR EACH ROW EXECUTE FUNCTION matrix_catalog_invalidate();
+            CREATE TRIGGER matrix_snapshot_catalog_invalidation AFTER UPDATE OR DELETE ON matrix_source_snapshot FOR EACH ROW EXECUTE FUNCTION matrix_catalog_invalidate();
+            UPDATE matrix_schema SET schema_version=GREATEST(schema_version,22),updated_at=NOW() WHERE id=1;
+        "#],
     },
 ];
 

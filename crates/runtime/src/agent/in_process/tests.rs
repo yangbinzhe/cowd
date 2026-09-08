@@ -604,6 +604,7 @@ fn concurrency_test_executor(
         sandbox_posture: harness_contract::policy::SandboxPosture::ReadOnlySandbox,
         policy_revision: 1,
         memory_context: memory::MemoryTurnContext::new("session", "agent"),
+        reality_context: None,
         model_lease: "model".to_string(),
         execution_id: "graph".to_string(),
         node_id: "node".to_string(),
@@ -903,6 +904,7 @@ fn exact_model_delivery_policy_is_scoped_to_the_matching_invocation() {
         sandbox_posture: harness_contract::policy::SandboxPosture::ReadOnlySandbox,
         policy_revision: 1,
         memory_context: memory::MemoryTurnContext::new("session", "agent"),
+        reality_context: None,
         model_lease: "model".to_string(),
         execution_id: "graph".to_string(),
         node_id: "node".to_string(),
@@ -1255,6 +1257,7 @@ fn sandboxed_process_requires_and_accepts_only_a_whole_workspace_read_lease() {
         sandbox_posture: harness_contract::policy::SandboxPosture::ReadOnlySandbox,
         policy_revision: 1,
         memory_context: memory::MemoryTurnContext::new("session", "agent"),
+        reality_context: None,
         model_lease: "model".to_string(),
         execution_id: "graph".to_string(),
         node_id: "node".to_string(),
@@ -1304,6 +1307,7 @@ async fn team_tool_boundary_enforces_the_exact_focus_scope() {
         sandbox_posture: harness_contract::policy::SandboxPosture::ReadOnlySandbox,
         policy_revision: 1,
         memory_context: memory::MemoryTurnContext::new("session", "agent"),
+        reality_context: None,
         model_lease: "model".to_string(),
         execution_id: "graph".to_string(),
         node_id: "node".to_string(),
@@ -1433,6 +1437,7 @@ async fn absolute_path_authorization_and_execution_share_the_normalized_descript
         sandbox_posture: harness_contract::policy::SandboxPosture::ReadOnlySandbox,
         policy_revision: 1,
         memory_context: memory::MemoryTurnContext::new("session", "agent"),
+        reality_context: None,
         model_lease: "model".to_string(),
         execution_id: "graph".to_string(),
         node_id: "node".to_string(),
@@ -1500,6 +1505,7 @@ fn team_tool_boundary_rejects_symlink_escape_for_existing_and_new_targets() {
         sandbox_posture: harness_contract::policy::SandboxPosture::ReadOnlySandbox,
         policy_revision: 1,
         memory_context: memory::MemoryTurnContext::new("session", "agent"),
+        reality_context: None,
         model_lease: "model".to_string(),
         execution_id: "graph".to_string(),
         node_id: "node".to_string(),
@@ -1544,6 +1550,7 @@ async fn scoped_executor_advertises_only_packet_authorized_tools() {
         sandbox_posture: harness_contract::policy::SandboxPosture::ReadOnlySandbox,
         policy_revision: 1,
         memory_context: memory::MemoryTurnContext::new("session", "agent"),
+        reality_context: None,
         model_lease: "model".to_string(),
         execution_id: "graph".to_string(),
         node_id: "node".to_string(),
@@ -1607,6 +1614,7 @@ async fn scoped_executor_routes_hidden_checkpoint_for_runtime_guard_only() {
         sandbox_posture: harness_contract::policy::SandboxPosture::ReadOnlySandbox,
         policy_revision: 1,
         memory_context: memory::MemoryTurnContext::new("session", "agent"),
+        reality_context: None,
         model_lease: "model".to_string(),
         execution_id: "graph".to_string(),
         node_id: "node".to_string(),
@@ -1683,6 +1691,7 @@ fn root_write_scope_compiles_to_the_checkpoint_whole_workspace_form() {
         sandbox_posture: harness_contract::policy::SandboxPosture::WorkspaceWriteSandbox,
         policy_revision: 1,
         memory_context: memory::MemoryTurnContext::new("session", "agent"),
+        reality_context: None,
         model_lease: "model".to_string(),
         execution_id: "graph".to_string(),
         node_id: "node".to_string(),
@@ -1980,13 +1989,42 @@ fn terminal_structured_acceptance_is_single_pass_and_never_invents_missing_field
 
 #[tokio::test]
 async fn scoped_executor_propagates_runtime_authorization_for_normal_agent_tools() {
+    struct LeaseCheckingHost(harness_contract::agent::AgentDataLease);
+    #[async_trait::async_trait]
+    impl crate::RuntimeExecutionHost for LeaseCheckingHost {
+        async fn execute_runtime_tool(
+            &self,
+            request: &crate::RuntimeToolExecutionRequest,
+        ) -> crate::RuntimeToolExecutionOutcome {
+            assert_eq!(request.reality_context.as_ref(), Some(&self.0));
+            EchoRuntimeExecutionHost.execute_runtime_tool(request).await
+        }
+        fn delegated_tool_effect_descriptor(
+            &self,
+            name: &str,
+            input: &serde_json::Value,
+        ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+            test_tool_descriptor_for_input(name, input)
+        }
+    }
+    let reality_lease = harness_contract::agent::AgentDataLease {
+        session_id: "session".into(),
+        task_id: "task".into(),
+        team_id: None,
+        read_scopes: vec![harness_contract::agent::CognitiveReadScope::Session],
+        write_mode: harness_contract::agent::CognitiveWriteMode::CandidateOnly,
+        fact_boundaries: vec!["observed".into()],
+        fact_refs: vec!["fact:exact".into()],
+        matrix_snapshot_refs: vec!["matrix:source_snapshot:exact".into()],
+    };
     let executor = ScopedRuntimeToolExecutor {
-        host: Arc::new(EchoRuntimeExecutionHost),
+        host: Arc::new(LeaseCheckingHost(reality_lease.clone())),
         allowed_tools: BTreeSet::from(["read_file".to_string()]),
         session_id: "session".to_string(),
         sandbox_posture: harness_contract::policy::SandboxPosture::ReadOnlySandbox,
         policy_revision: 1,
         memory_context: memory::MemoryTurnContext::new("session", "agent"),
+        reality_context: Some(reality_lease),
         model_lease: "model".to_string(),
         execution_id: "graph".to_string(),
         node_id: "node".to_string(),

@@ -48,10 +48,11 @@ pub(crate) fn completion_gap(
     if !input.unresolved.is_empty() {
         return Some("completion_has_unresolved_items".to_string());
     }
-    // Task acceptance is the independent reviewer's completion verdict.
-    // A Task's `unresolved` field remains a durable disclosure for the
-    // supervisor and final synthesis; it is not a second completion veto.
-    // Objective-level blockers belong exclusively to `input.unresolved`.
+    // Accepted work keeps its source disclosures. The root must classify
+    // them with durable reasons rather than silently dropping or redoing them.
+    if let Some(gap) = super::issues::completion_gap(projection) {
+        return Some(gap);
+    }
     let incomplete = projection
         .tasks
         .values()

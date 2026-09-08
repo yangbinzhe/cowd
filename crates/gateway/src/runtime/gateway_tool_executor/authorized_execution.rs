@@ -29,6 +29,7 @@ impl GatewayToolExecutor {
                         session_id: self.runtime_session_id.as_deref(),
                         authorized_scopes: &[],
                         memory_context: self.runtime_memory_context.as_ref(),
+                reality_context: None,
                         model_lease: self.runtime_model_lease.as_deref(),
                         parent_execution: None,
                         execution_decision: None,
@@ -158,59 +159,30 @@ impl GatewayToolExecutor {
             .read(&artifact, &artifact.visibility_scope, None)
             .await
             .map_err(|error| ToolError::new(format!("evidence_retrieve read failed: {error}")))?;
-        let content = String::from_utf8_lossy(&bytes);
-        let limit = input.limit.unwrap_or(8).clamp(1, 16);
-        let query_terms = input
-            .query
-            .as_deref()
-            .unwrap_or_default()
-            .split(|character: char| !character.is_alphanumeric())
-            .filter(|term| !term.trim().is_empty())
-            .map(str::to_lowercase)
-            .collect::<Vec<_>>();
-        let all_chunks = content
-            .chars()
-            .collect::<Vec<_>>()
-            .chunks(1_500)
-            .map(|chunk| chunk.iter().collect::<String>())
-            .collect::<Vec<_>>();
-        let mut selected = all_chunks
-            .iter()
-            .enumerate()
-            .filter(|(_, chunk)| {
-                if query_terms.is_empty() {
-                    true
-                } else {
-                    let normalized = chunk.to_lowercase();
-                    query_terms.iter().any(|term| normalized.contains(term))
-                }
-            })
-            .take(limit)
-            .map(|(index, content)| {
-                serde_json::json!({
-                    "index": index,
-                    "content": content,
-                })
-            })
-            .collect::<Vec<_>>();
-        if selected.is_empty() && !all_chunks.is_empty() {
-            selected.push(serde_json::json!({
-                "index": 0,
-                "content": all_chunks[0],
-                "query_match": false,
-            }));
-        }
-        let selected_count = selected.len();
+        let (content, encoding) = match std::str::from_utf8(&bytes) {
+            Ok(text) => (text.to_string(), "utf8"),
+            Err(_) => {
+                if input.query.is_some() { return Err(ToolError::new("binary evidence does not support a text query; read without query or materialize the exact artifact")); }
+                use base64::Engine;
+                (base64::engine::general_purpose::STANDARD.encode(&bytes), "base64")
+            }
+        };
+        let page = evidence_content_page(&content, &artifact.sha256, &input)?;
         serde_json::to_string_pretty(&serde_json::json!({
             "kind": "evidence_retrieve",
             "evidence_ref": input.evidence_ref,
             "available": true,
             "bytes": bytes.len(),
             "media_type": artifact.media_type,
+            "encoding": encoding,
             "query": input.query,
-            "chunks": selected,
-            "total_chunks": all_chunks.len(),
-            "truncated": selected_count < all_chunks.len(),
+            "sha256": artifact.sha256,
+            "chunks": page["chunks"],
+            "total_chunks": page["total_chunks"],
+            "truncated": page["truncated"],
+            "next_cursor": page["next_cursor"],
+            "next_request": page["next_request"],
+            "coverage": page["coverage"],
         }))
         .map_err(|error| ToolError::new(error.to_string()))
     }

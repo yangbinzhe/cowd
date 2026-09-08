@@ -3,12 +3,14 @@
         let request: EvidenceRetrieveToolRequest = serde_json::from_value(serde_json::json!({
             "evidence_ref": "artifact://sha256:abc",
             "query": "acceptance evidence",
+            "cursor": "opaque-page-cursor",
             "limit": 4
         }))
         .expect("published evidence_retrieve schema must deserialize");
         assert_eq!(request.evidence_ref, "artifact://sha256:abc");
         assert_eq!(request.query.as_deref(), Some("acceptance evidence"));
         assert_eq!(request.limit, Some(4));
+        assert_eq!(request.cursor.as_deref(), Some("opaque-page-cursor"));
         assert!(
             serde_json::from_value::<EvidenceRetrieveToolRequest>(serde_json::json!({
                 "evidence_ref": "artifact://sha256:abc",
@@ -130,16 +132,76 @@
             .bind_runtime_services(Arc::clone(&services))
             .expect("bind Runtime services");
 
+        // A durable Session selector publishes exactly the chosen block, never
+        // the assistant preamble or a neighbouring message.
+        let blocks = serde_json::json!([
+            {"type": "text", "text": "publication preamble"},
+            {"type": "text", "text": "<html>正文\r\n</html>\n"},
+            {"type": "tool_use", "id": "tool-block", "name": "read_file", "input": {}}
+        ]);
+        store.insert_message(&session::SessionMessage {
+            stable_message_id: "publication-message".to_string(),
+            session_id: session_id.to_string(), sequence: 0, role: "assistant".to_string(),
+            content_json: blocks.to_string(), blocks_count: 3,
+            tool_use_id: None, tool_name: None, token_usage_json: None, created_at_ms: 2,
+        }).await.expect("durable source blocks");
+        let binding = RuntimeToolExecutionBinding {
+            action_id: None, session_id: Some(session_id), authorized_scopes: &[],
+            memory_context: None, reality_context: None, model_lease: Some("test"), parent_execution: None,
+            execution_decision: None,
+            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+        };
+        use sha2::{Digest, Sha256};
+        let block_hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&blocks[1]).unwrap()));
+        let request = serde_json::json!({
+            "source": "message_block", "message_id": "publication-message",
+            "block_index": 1, "sha256": block_hash, "media_type": "text/html"
+        });
+        let published: serde_json::Value = serde_json::from_str(
+            &executor.execute_content_publication("artifact_publish", request.clone(), binding)
+                .await.expect("publish selected durable block")
+        ).unwrap();
+        let (_, body) = services.read_authorized_publication(
+            published["content_ref"].as_str().unwrap(), published["sha256"].as_str().unwrap(),
+            session_id, &[],
+        ).await.expect("published body");
+        assert_eq!(body, blocks[1]["text"].as_str().unwrap().as_bytes());
+        let mut other_session = binding;
+        other_session.session_id = Some("unrelated-session");
+        assert!(executor.execute_content_publication("artifact_publish", request.clone(), other_session).await.is_err());
+        for index in [0, 2, 3] {
+            let mut wrong = request.clone();
+            wrong["block_index"] = serde_json::json!(index);
+            if index == 2 {
+                wrong["sha256"] = serde_json::json!(format!("{:x}", Sha256::digest(serde_json::to_vec(&blocks[2]).unwrap())));
+            }
+            assert!(executor.execute_content_publication("artifact_publish", wrong, binding).await.is_err());
+        }
+
         let actor = root_agent_action_actor(RuntimeToolExecutionBinding {
             action_id: None,
             session_id: Some(session_id),
             authorized_scopes: &[],
-            memory_context: None,
+            memory_context: None, reality_context: None,
             model_lease: Some("deepseek-v4-flash"),
             parent_execution: None,
             execution_decision: None,
             permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
         });
+        let mut adjudication = harness_contract::agent_action::MessagePublishInput {
+            topic_ref: "topic:program".into(), summary: Some("disclose the sourced limitation".into()),
+            content_ref: None, refs: Vec::new(), recipients: Vec::new(), intent: None,
+            issue_dispositions: vec![harness_contract::agent_action::IssueDisposition {
+                issue_ref: "issue:source-validated-by-program".into(),
+                disposition: harness_contract::agent_action::IssueDispositionKind::Disclose,
+                reason_ref: artifact.selector.clone(), evidence_refs: vec![format!("tool://{evidence_id}")],
+            }],
+        };
+        services.validate_agent_action_evidence(&actor, &harness_contract::agent_action::AgentAction::MessagePublish(adjudication.clone()))
+            .await.expect("adjudication reasons and evidence use real Session authority");
+        adjudication.issue_dispositions[0].reason_ref = "artifact://missing-disposition-reason".into();
+        assert!(services.validate_agent_action_evidence(&actor, &harness_contract::agent_action::AgentAction::MessagePublish(adjudication)).await.is_err());
+
         let action = harness_contract::agent_action::AgentAction::TaskSubmit(
             harness_contract::agent_action::TaskSubmitInput {
                 task_ref: "task:any".to_string(),
@@ -159,6 +221,7 @@
                     evidence_ref: format!("tool://{evidence_id}"),
                     query: Some("mapped".to_string()),
                     limit: Some(2),
+                    cursor: None,
                 },
                 Some(session_id),
                 &["workspace:.".to_string()],
@@ -218,7 +281,7 @@
             action_id: Some("bound-root-create-team"),
             session_id: Some("session-root-agent-first"),
             authorized_scopes: &[],
-            memory_context: None,
+            memory_context: None, reality_context: None,
             model_lease: Some("deepseek-v4-flash"),
             parent_execution: Some(&parent),
             execution_decision: Some(&decision),
@@ -330,7 +393,7 @@
             action_id: Some("create-team"),
             session_id: Some("session-agentic-gateway"),
             authorized_scopes: &[],
-            memory_context: None,
+            memory_context: None, reality_context: None,
             model_lease: Some("default"),
             parent_execution: None,
             execution_decision: None,
@@ -492,7 +555,7 @@
             action_id: Some("deferred-team"),
             session_id: Some("session-deferred-dispatch"),
             authorized_scopes: &[],
-            memory_context: None,
+            memory_context: None, reality_context: None,
             model_lease: Some("deepseek-v4-flash"),
             parent_execution: None,
             execution_decision: None,
@@ -858,3 +921,141 @@
     use serde_json::json;
     use tools::permissions::PermissionMode as ToolPermissionMode;
     use tools::RuntimeToolDefinition;
+
+    #[tokio::test]
+    async fn explicit_publication_roundtrip_and_scope_checks() {
+        use sha2::{Digest, Sha256};
+        let temp = tempfile::tempdir().unwrap();
+        let registry = GatewayToolRegistry::builtin().with_runtime_tools(
+            crate::runtime_bootstrap::runtime_capability_tool_definitions()
+        ).unwrap();
+        let host = Arc::new(ToolHost::new("publication-test", temp.path(), ToolHostSnapshot::new(
+            Arc::new(registry), Arc::new(tools::lsp_client::LspRegistry::new()), None,
+        )));
+        let executor = GatewayToolExecutor::from_tool_host(None, false, host.clone())
+            .with_runtime_session_id("publication-session");
+        let services = runtime::RuntimeServices::builder(temp.path().join("home"), temp.path())
+            .runtime_event_store(Arc::new(runtime::RuntimeEventStore::for_test()))
+            .task_aggregate_service(Arc::new(runtime::TaskAggregateService::for_test()))
+            .artifact_store(Arc::new(runtime::ArtifactStore::for_test_default(temp.path().join("artifacts"))))
+            .build().unwrap();
+        executor.bind_runtime_services(services.clone()).unwrap();
+        let body = "<html>中文\r\n完整正文</html>\r\n";
+        std::fs::write(temp.path().join("source.html"), body).unwrap();
+        let hash = format!("{:x}", Sha256::digest(body.as_bytes()));
+        let input = serde_json::json!({"source":"file","path":"source.html","sha256":hash,"media_type":"text/html"});
+        host.pin_snapshot().validate_input("artifact_publish", &input).unwrap();
+        let binding = RuntimeToolExecutionBinding { action_id: Some("publish"), session_id: Some("publication-session"),
+            authorized_scopes: &[], memory_context: None, reality_context: None, model_lease: None, parent_execution: None,
+            execution_decision: None, permission_ceiling: harness_contract::policy::PermissionMode::WorkspaceWrite };
+        let published: serde_json::Value = serde_json::from_str(&executor.execute_runtime_tool_with_binding(
+            "artifact_publish", input, binding,
+        ).await.unwrap()).unwrap();
+        assert_eq!(published["bytes"], body.len());
+        assert_eq!(published["sha256"], format!("sha256:{hash}"));
+        let export = serde_json::json!({"content_ref": published["content_ref"], "sha256": published["sha256"], "path":"result.html"});
+        host.pin_snapshot().validate_input("artifact_materialize", &export).unwrap();
+        for index in 0..2 {
+            let result: serde_json::Value = serde_json::from_str(&executor.execute_runtime_tool_with_binding("artifact_materialize", export.clone(), binding).await.unwrap()).unwrap();
+            assert_eq!(result["created"], index == 0);
+            let evidence = materialized_artifact_evidence(services.path_identity_resolver(), &result, index + 1).unwrap();
+            assert_eq!(evidence.workspace_prior_state.is_some(), index == 0);
+        }
+        assert_eq!(std::fs::read(temp.path().join("result.html")).unwrap(), body.as_bytes());
+        let denied = RuntimeToolExecutionBinding { session_id: Some("other-session"), ..binding };
+        assert!(executor.execute_runtime_tool_with_binding("artifact_materialize", export.clone(), denied).await.is_err());
+        let parent = harness_contract::execution_graph::ExecutionParentBinding { execution_id:"parent".into(), node_id:"agent".into() };
+        let scopes = vec!["write:unrelated".to_string(), "session:publication-session".to_string()];
+        let scoped = RuntimeToolExecutionBinding { parent_execution: Some(&parent), authorized_scopes: &scopes, ..binding };
+        assert!(executor.execute_runtime_tool_with_binding("artifact_materialize", export, scoped).await.is_err());
+        std::fs::write(temp.path().join("source.html"), "changed").unwrap();
+        assert!(executor.execute_runtime_tool_with_binding("artifact_publish", serde_json::json!({
+            "source":"file","path":"source.html","sha256":hash,"media_type":"text/html"
+        }), binding).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn context_program_discovery_uses_one_authorized_revision_and_real_requests() {
+        let services = runtime::RuntimeServices::in_memory().unwrap();
+        let registry = GatewayToolRegistry::builtin().with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions()).unwrap();
+        let executor = GatewayToolExecutor::new(None,false,registry);
+        executor.bind_runtime_services(services.clone()).unwrap();
+        let binding = RuntimeToolExecutionBinding {action_id:Some("program-discovery"),session_id:Some("program-directory-session"),
+            authorized_scopes:&[],memory_context: None, reality_context: None,model_lease:Some("test-model"),parent_execution:None,execution_decision:None,
+            permission_ceiling:harness_contract::policy::PermissionMode::ReadOnly};
+        let actor = root_agent_action_actor(binding);
+        let actions = services.agent_action_service();
+        for index in 0..35 {
+            let result = services.submit_agent_action(&harness_contract::agent_action::AgentActionEnvelope {action_id:format!("directory-team-{index}"),actor:actor.clone(),expected_revision:None,
+                action:harness_contract::agent_action::AgentAction::TeamCreate(harness_contract::agent_action::TeamCreateInput {name:format!("Directory Team {index:02}"),mission:"directory test".into(),objective:None})}).await.unwrap();
+            assert_eq!(result.status,harness_contract::agent_action::AgentActionStatus::Applied);
+        }
+        let revision = actions.project(&actor.program_id).unwrap().revision;
+        let mut request = serde_json::json!({"source":"program"});
+        let mut refs = std::collections::BTreeSet::new(); let mut first_next = None;
+        loop {
+            executor.tool_host.pin_snapshot().validate_input("context_retrieve",&request).unwrap();
+            let output = executor.execute_runtime_tool_with_binding("context_retrieve",request,binding).await.unwrap();
+            let page:serde_json::Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(page["revision"],revision);
+            for item in page["selected"].as_array().unwrap() {
+                assert!(refs.insert(item["ref"].as_str().unwrap().to_owned()));
+                executor.tool_host.pin_snapshot().validate_input("context_retrieve",&item["read_request"]).unwrap();
+                let exact = executor.execute_runtime_tool_with_binding("context_retrieve",item["read_request"].clone(),binding).await.unwrap();
+                assert!(exact.contains("Directory Team"));
+            }
+            if page["next_request"].is_null() { assert_eq!(page["coverage"]["complete"],true); break; }
+            first_next = Some(page["next_request"].clone()); request = page["next_request"].clone();
+        }
+        assert_eq!(refs.len(),35); assert_eq!(actions.project(&actor.program_id).unwrap().revision,revision);
+        let other = RuntimeToolExecutionBinding {session_id:Some("other-session"),..binding};
+        assert!(executor.execute_runtime_tool_with_binding("context_retrieve",first_next.clone().unwrap(),other).await.is_err());
+        let focused:serde_json::Value=serde_json::from_str(&executor.execute_runtime_tool_with_binding("context_retrieve",serde_json::json!({"source":"program","query":"Directory Team 34"}),binding).await.unwrap()).unwrap();
+        assert_eq!(focused["selected_count"],1);
+        let changed = serde_json::json!({"source":"program","query":"changed","cursor":first_next.unwrap()["cursor"]});
+        assert!(executor.execute_runtime_tool_with_binding("context_retrieve",changed,binding).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn context_artifact_catalog_returns_readable_scoped_content_and_lossless_binary() {
+        use base64::Engine;
+        let services=runtime::RuntimeServices::in_memory().unwrap();
+        let registry=GatewayToolRegistry::builtin().with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions()).unwrap();
+        let executor=GatewayToolExecutor::new(None,false,registry);
+        executor.bind_runtime_services(services.clone()).unwrap();
+        let binding=RuntimeToolExecutionBinding {action_id:Some("artifact-directory"),session_id:Some("artifact-directory-session"),
+            authorized_scopes:&[],memory_context: None, reality_context: None,model_lease:None,parent_execution:None,execution_decision:None,
+            permission_ceiling:harness_contract::policy::PermissionMode::ReadOnly};
+        let descriptor=harness_contract::context::ArtifactWriteDescriptor {media_type:"text/plain".into(),visibility_scope:"session:artifact-directory-session".into(),expected_bytes:None,original_name:None};
+        let mut expected=std::collections::BTreeSet::new();
+        for index in 0..35 { expected.insert(services.artifact_store().write_bytes(descriptor.clone(),format!("published {index}").as_bytes()).await.unwrap().selector); }
+        let hidden=services.artifact_store().write_bytes(harness_contract::context::ArtifactWriteDescriptor {visibility_scope:"session:private".into(),..descriptor.clone()},b"private").await.unwrap();
+        let mut request=serde_json::json!({"source":"artifact","query":"text/plain","limit":3});
+        let mut actual=std::collections::BTreeSet::new(); let mut pages=0;
+        loop {
+            executor.tool_host.pin_snapshot().validate_input("context_retrieve",&request).unwrap();
+            let page:serde_json::Value=serde_json::from_str(&executor.execute_runtime_tool_with_binding("context_retrieve",request,binding).await.unwrap()).unwrap();
+            pages+=1; assert!(pages<20);
+            for item in page["selected"].as_array().unwrap() {
+                assert!(actual.insert(item["ref"].as_str().unwrap().to_string()));
+                executor.tool_host.pin_snapshot().validate_input("evidence_retrieve",&item["read_request"]).unwrap();
+                let read:serde_json::Value=serde_json::from_str(&executor.execute_runtime_tool_with_binding("evidence_retrieve",item["read_request"].clone(),binding).await.unwrap()).unwrap();
+                assert_eq!(read["available"],true); assert_eq!(read["sha256"],item["sha256"]);
+            }
+            if page["next_request"].is_null() { break; }
+            services.artifact_store().write_bytes(descriptor.clone(),b"own tool receipt").await.unwrap();
+            request=page["next_request"].clone();
+        }
+        assert_eq!(actual,expected); assert!(!actual.contains(&hidden.selector));
+        let bytes=(0..50_000).map(|index| (index%256) as u8).collect::<Vec<_>>();
+        let binary=services.artifact_store().write_bytes(harness_contract::context::ArtifactWriteDescriptor {media_type:"application/octet-stream".into(),..descriptor},&bytes).await.unwrap();
+        let mut request=serde_json::json!({"evidence_ref":binary.selector,"limit":1}); let mut encoded=String::new();
+        loop {
+            let read:serde_json::Value=serde_json::from_str(&executor.execute_runtime_tool_with_binding("evidence_retrieve",request,binding).await.unwrap()).unwrap();
+            assert_eq!(read["encoding"],"base64"); assert_eq!(read["sha256"],binary.sha256);
+            for chunk in read["chunks"].as_array().unwrap() { encoded.push_str(chunk["content"].as_str().unwrap()); }
+            if read["next_request"].is_null() { break; } request=read["next_request"].clone();
+        }
+        assert_eq!(base64::engine::general_purpose::STANDARD.decode(encoded).unwrap(),bytes);
+        assert!(executor.execute_runtime_tool_with_binding("evidence_retrieve",serde_json::json!({"evidence_ref":binary.selector,"query":"needle"}),binding).await.is_err());
+    }

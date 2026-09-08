@@ -471,6 +471,10 @@ where
                     provider_queue_wait,
                     stream_started.elapsed(),
                     stream_run.resource_result_class,
+                    stream_run
+                        .failure
+                        .as_ref()
+                        .map(RuntimeError::provider_failure_scope),
                 );
                 drop(provider_lease);
                 let CollectedProviderStream {
@@ -894,10 +898,25 @@ where
         queue_wait: Duration,
         service_time: Duration,
         result_class: crate::execution_core::graph::ResourceResultClass,
+        failure_scope: Option<model_protocol::provider_failure::ProviderFailureScope>,
     ) {
         let (Some(manager), Some(lease)) = (&self.provider_admission, lease) else {
             return;
         };
+        // Balance/credentials/configuration are route availability, not
+        // evidence that the shared provider pool is overloaded. Preserve the
+        // failure in provider/turn evidence without teaching the capacity
+        // controller to throttle unrelated, healthy accounts. Explicit
+        // overload and timeout signals remain authoritative even with scope.
+        if failure_scope.is_some_and(|scope| scope.route_is_unavailable())
+            && result_class == crate::execution_core::graph::ResourceResultClass::Failed
+        {
+            crate::execution_core::performance::observe_count(
+                "provider_noncapacity_failure_excluded_total",
+                1,
+            );
+            return;
+        }
         let observation = crate::execution_core::graph::ResourceObservation::terminal(
             queue_wait,
             service_time,
@@ -1499,6 +1518,10 @@ where
                 provider_queue_wait,
                 provider_started.elapsed(),
                 resource_result_class,
+                stream_run
+                    .failure
+                    .as_ref()
+                    .map(RuntimeError::provider_failure_scope),
             );
             drop(provider_lease);
             token_reservations

@@ -37,6 +37,7 @@ use storage::{
 
 const SESSION_DOMAIN: &str = "session";
 
+mod discovery;
 mod ingress;
 mod lifecycle;
 mod query;
@@ -1264,6 +1265,57 @@ const SESSION_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
          END
          $$",
     ],
+}, PostgresMigrationSpec {
+    id: "session.0022.context-discovery-snapshots",
+    domain: SESSION_DOMAIN,
+    version: 22,
+    description: "stable authorized Session and message discovery without offset or scope truncation",
+    statements: &[r#"
+        ALTER TABLE session_records ADD COLUMN discovery_creation_xid xid8 NOT NULL DEFAULT pg_current_xact_id();
+        ALTER TABLE session_messages ADD COLUMN discovery_creation_xid xid8 NOT NULL DEFAULT pg_current_xact_id();
+        CREATE TABLE session_discovery_invalidations (key TEXT PRIMARY KEY, revision BIGINT NOT NULL);
+        CREATE FUNCTION session_discovery_actor_key(platform TEXT,user_id TEXT,metadata_json TEXT) RETURNS TEXT LANGUAGE SQL IMMUTABLE AS $$
+            SELECT CASE WHEN NULLIF(metadata_json::JSONB->>'workspace_root','') IS NULL THEN NULL
+                WHEN NULLIF(metadata_json::JSONB->>'owner_principal_id','') IS NOT NULL
+                    THEN 'actor:'||jsonb_build_array(metadata_json::JSONB->>'workspace_root','owner',metadata_json::JSONB->>'owner_principal_id')::TEXT
+                WHEN NULLIF(user_id,'') IS NOT NULL
+                    THEN 'actor:'||jsonb_build_array(metadata_json::JSONB->>'workspace_root','channel',platform,user_id)::TEXT
+                ELSE NULL END
+        $$;
+        CREATE FUNCTION session_discovery_record_invalidate() RETURNS trigger LANGUAGE plpgsql AS $$
+        DECLARE changed_key TEXT; old_actor TEXT; new_actor TEXT;
+        BEGIN
+            IF TG_OP='UPDATE' AND ROW(OLD.platform,OLD.chat_id,OLD.user_id,OLD.model,OLD.reset_policy,OLD.metadata_json,OLD.status,OLD.created_at)
+                IS NOT DISTINCT FROM ROW(NEW.platform,NEW.chat_id,NEW.user_id,NEW.model,NEW.reset_policy,NEW.metadata_json,NEW.status,NEW.created_at) THEN RETURN NEW; END IF;
+            old_actor := session_discovery_actor_key(OLD.platform,OLD.user_id,OLD.metadata_json);
+            IF TG_OP='UPDATE' THEN new_actor := session_discovery_actor_key(NEW.platform,NEW.user_id,NEW.metadata_json); END IF;
+            FOR changed_key IN SELECT DISTINCT k FROM unnest(ARRAY['session:'||OLD.session_id,old_actor,new_actor,
+                CASE WHEN TG_OP='UPDATE' THEN 'session:'||NEW.session_id END]) k WHERE k IS NOT NULL ORDER BY k LOOP
+                INSERT INTO session_discovery_invalidations(key,revision) VALUES(changed_key,1)
+                    ON CONFLICT(key) DO UPDATE SET revision=session_discovery_invalidations.revision+1;
+            END LOOP;
+            RETURN CASE WHEN TG_OP='DELETE' THEN OLD ELSE NEW END;
+        END $$;
+        CREATE FUNCTION session_discovery_message_invalidate() RETURNS trigger LANGUAGE plpgsql AS $$
+        DECLARE changed_key TEXT;
+        BEGIN
+            IF TG_OP='UPDATE' AND (to_jsonb(OLD)-'token_usage_json') IS NOT DISTINCT FROM (to_jsonb(NEW)-'token_usage_json') THEN RETURN NEW; END IF;
+            FOR changed_key IN
+                SELECT DISTINCT k FROM (
+                    SELECT 'session:'||OLD.session_id AS k
+                    UNION ALL SELECT CASE WHEN TG_OP='UPDATE' THEN 'session:'||NEW.session_id END
+                    UNION ALL SELECT session_discovery_actor_key(s.platform,s.user_id,s.metadata_json)
+                    FROM session_records s WHERE s.session_id=OLD.session_id OR (TG_OP='UPDATE' AND s.session_id=NEW.session_id)
+                ) keys WHERE k IS NOT NULL ORDER BY k
+            LOOP
+                INSERT INTO session_discovery_invalidations(key,revision) VALUES(changed_key,1)
+                    ON CONFLICT(key) DO UPDATE SET revision=session_discovery_invalidations.revision+1;
+            END LOOP;
+            RETURN CASE WHEN TG_OP='DELETE' THEN OLD ELSE NEW END;
+        END $$;
+        CREATE TRIGGER session_discovery_record_invalidation AFTER UPDATE OR DELETE ON session_records FOR EACH ROW EXECUTE FUNCTION session_discovery_record_invalidate();
+        CREATE TRIGGER session_discovery_message_invalidation AFTER UPDATE OR DELETE ON session_messages FOR EACH ROW EXECUTE FUNCTION session_discovery_message_invalidate();
+    "#],
 }];
 
 #[derive(Clone, Debug)]
@@ -2770,6 +2822,12 @@ fn i64_to_u32(value: i64, label: &str) -> session::SessionResult<u32> {
 // Session operation fails compilation until PostgreSQL has a real owner.
 #[allow(clippy::too_many_arguments)]
 impl session::SessionStoreBackend for PostgresSessionStore {
+    fn discover_context_page(
+        &self,
+        request: &session::SessionDiscoveryRequest,
+    ) -> session::SessionResult<session::SessionDiscoveryPage> {
+        self.discover_context_page(request)
+    }
     fn create_session(&self, v: &SessionRecord) -> session::SessionResult<()> {
         self.create_session(v)
     }

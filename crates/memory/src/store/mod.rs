@@ -125,6 +125,26 @@ pub struct TaggedLookup {
     pub limit: usize,
 }
 
+/// An authorized lexical catalog page. The kernel owns visibility and lifecycle
+/// interpretation; stores return lifecycle bytes from the same snapshot as rows.
+#[derive(Debug, Clone)]
+pub struct MemoryDiscoveryQuery {
+    pub scopes: Vec<MemoryScope>,
+    pub query: String,
+    pub after_id: Option<String>,
+    /// Hidden rows after the last externally visible key; avoids leaking their IDs in cursors.
+    pub skip: usize,
+    pub expected_revisions: Option<std::collections::BTreeMap<String, i64>>,
+    pub limit: usize,
+}
+#[derive(Debug, Clone)]
+pub struct MemoryDiscoveryPage {
+    pub entries: Vec<MemoryEntry>,
+    pub lifecycle: Vec<MemoryKeyValue>,
+    pub revisions: std::collections::BTreeMap<String, i64>,
+    pub next_id: Option<String>,
+}
+
 /// Stable keyset cursor for bounded maintenance scans.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MemoryScanCursor {
@@ -194,6 +214,10 @@ pub trait MemoryStore: Send + Sync {
         options: FtsSearchOptions,
         limit: usize,
     ) -> Result<FtsSearchResult>;
+
+    /// Snapshot-bound, scoped lexical discovery. Reject changed scope revisions;
+    /// never silently continue a cursor across content or lifecycle mutations.
+    async fn discover_page(&self, query: MemoryDiscoveryQuery) -> Result<MemoryDiscoveryPage>;
 
     /// Approximate nearest-neighbour search using a pre-computed embedding.
     async fn search_vector(&self, embedding: &[f32], limit: usize) -> Result<Vec<MemoryEntry>>;

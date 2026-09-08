@@ -15,6 +15,8 @@ use storage::{
     SecretRefResolver,
 };
 
+mod catalog;
+
 const FACT_LEDGER_DOMAIN: &str = "fact";
 const FACT_LEDGER_MIGRATIONS: &[PostgresMigrationSpec] = &[
     PostgresMigrationSpec {
@@ -78,6 +80,34 @@ const FACT_LEDGER_MIGRATIONS: &[PostgresMigrationSpec] = &[
                 OR boundary IS DISTINCT FROM payload->>'boundary'",
             "CREATE INDEX IF NOT EXISTS idx_fact_records_recall
              ON fact_records(scope_key, boundary, updated_at DESC, fact_id ASC)",
+        ],
+    },
+    PostgresMigrationSpec {
+        id: "fact.0005.snapshot-catalog",
+        domain: FACT_LEDGER_DOMAIN,
+        version: 5,
+        description: "scoped stable Fact discovery with first-page creation snapshot and mutation fences",
+        statements: &[
+            "ALTER TABLE fact_records ADD COLUMN catalog_creation_xid xid8 NOT NULL DEFAULT pg_current_xact_id()",
+            "CREATE TABLE fact_catalog_invalidations (key TEXT PRIMARY KEY, revision BIGINT NOT NULL)",
+            "CREATE INDEX idx_fact_catalog_scope_id ON fact_records(scope_key,boundary,fact_id)",
+            "CREATE FUNCTION fact_catalog_invalidate() RETURNS trigger LANGUAGE plpgsql AS $$
+             DECLARE changed_key TEXT;
+             BEGIN
+               IF TG_OP='UPDATE' AND OLD.payload IS NOT DISTINCT FROM NEW.payload
+                   AND OLD.scope_key IS NOT DISTINCT FROM NEW.scope_key
+                   AND OLD.boundary IS NOT DISTINCT FROM NEW.boundary THEN RETURN NEW; END IF;
+               FOR changed_key IN SELECT DISTINCT k FROM unnest(ARRAY[
+                 'fact:'||OLD.fact_id, 'scope:'||OLD.scope_key,
+                 CASE WHEN TG_OP='UPDATE' THEN 'fact:'||NEW.fact_id END,
+                 CASE WHEN TG_OP='UPDATE' THEN 'scope:'||NEW.scope_key END]) k WHERE k IS NOT NULL ORDER BY k
+               LOOP
+                 INSERT INTO fact_catalog_invalidations(key,revision) VALUES(changed_key,1)
+                   ON CONFLICT(key) DO UPDATE SET revision=fact_catalog_invalidations.revision+1;
+               END LOOP;
+               RETURN CASE WHEN TG_OP='DELETE' THEN OLD ELSE NEW END;
+             END $$",
+            "CREATE TRIGGER fact_catalog_invalidation AFTER UPDATE OR DELETE ON fact_records FOR EACH ROW EXECUTE FUNCTION fact_catalog_invalidate()",
         ],
     },
 ];
@@ -173,6 +203,13 @@ impl FactLedger for PostgresFactLedger {
                 .map_err(storage_error)?,
             "SELECT payload FROM fact_records ORDER BY updated_at DESC, fact_id ASC",
         )
+    }
+
+    fn catalog_page(
+        &self,
+        query: &fact_kernel::FactCatalogQuery,
+    ) -> FactLedgerResult<fact_kernel::FactCatalogPage> {
+        self.read_catalog_page(query)
     }
 
     fn recall_facts(&self, query: &FactRecallQuery) -> FactLedgerResult<Vec<FactRecord>> {

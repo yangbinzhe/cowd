@@ -174,6 +174,7 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
                 refs: vec!["artifact://finding".to_string()],
                 recipients: Vec::new(),
                 intent: None,
+                issue_dispositions: Vec::new(),
             }),
         ))
         .expect("Program broadcast");
@@ -189,6 +190,7 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
                 refs: Vec::new(),
                 recipients: Vec::new(),
                 intent: None,
+                issue_dispositions: Vec::new(),
             }),
         ))
         .expect("Team message");
@@ -237,6 +239,139 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
         .entries
         .iter()
         .any(|entry| entry.entry.summary.as_deref() == Some("Team-only implementation note")));
+
+    let own_topic = format!("topic:{team_a}");
+    for index in 0..37 {
+        service
+            .apply(&root(
+                &format!("old-topic-{index}"),
+                AgentAction::MessagePublish(MessagePublishInput {
+                    topic_ref: own_topic.clone(),
+                    summary: Some(format!("archived discussion {index}")),
+                    content_ref: None,
+                    refs: Vec::new(),
+                    recipients: Vec::new(),
+                    intent: None,
+                    issue_dispositions: Vec::new(),
+                }),
+            ))
+            .unwrap();
+    }
+    let detail = service
+        .apply(&root(
+            "topic-detail",
+            AgentAction::StateInspect(StateInspectInput {
+                entry_ref: Some(own_topic.clone()),
+                ..StateInspectInput::default()
+            }),
+        ))
+        .unwrap()
+        .projection
+        .unwrap();
+    assert_eq!(detail["coverage"]["total"], 38);
+    assert_eq!(detail["coverage"]["complete"], false);
+    let mut request: StateInspectInput =
+        serde_json::from_value(detail["directory_request"].clone()).unwrap();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut first_cursor = None;
+    loop {
+        let page = service
+            .apply(&root("topic-directory", AgentAction::StateInspect(request)))
+            .unwrap()
+            .projection
+            .unwrap();
+        for item in page["entries"].as_array().unwrap() {
+            if item["kind"] != "topic_entry" {
+                continue;
+            }
+            assert!(seen.insert(item["entry_ref"].as_str().unwrap().to_string()));
+            let input: StateInspectInput =
+                serde_json::from_value(item["inspect_request"].clone()).unwrap();
+            let exact = service
+                .apply(&root("topic-exact", AgentAction::StateInspect(input)))
+                .unwrap()
+                .projection
+                .unwrap();
+            assert_eq!(exact["entry"]["entry_id"], item["entry_ref"]);
+        }
+        if page["next_request"].is_null() {
+            break;
+        }
+        first_cursor = page["next_page_cursor"].as_str().map(str::to_owned);
+        request = serde_json::from_value(page["next_request"].clone()).unwrap();
+    }
+    assert_eq!(seen.len(), 38);
+    let foreign = service
+        .apply(&managed(
+            "foreign-topic",
+            &team_b,
+            &cross_team_peer,
+            AgentAction::StateInspect(StateInspectInput {
+                entry_ref: Some(own_topic.clone()),
+                ..StateInspectInput::default()
+            }),
+        ))
+        .unwrap()
+        .projection
+        .unwrap();
+    assert_eq!(foreign["not_found"], true);
+    assert!(!foreign.to_string().contains("Team-only"));
+    let replay = service
+        .apply(&managed(
+            "foreign-cursor",
+            &team_a,
+            &peer,
+            AgentAction::StateInspect(StateInspectInput {
+                query: Some(own_topic.clone()),
+                page_cursor: first_cursor,
+                ..StateInspectInput::default()
+            }),
+        ))
+        .unwrap();
+    assert_eq!(replay.status, AgentActionStatus::Rejected);
+    let private = service
+        .apply(&root(
+            "direct-message",
+            AgentAction::MessagePublish(MessagePublishInput {
+                topic_ref: "topic:program-1".into(),
+                summary: Some("recipient-only detail".into()),
+                content_ref: None,
+                refs: Vec::new(),
+                recipients: vec![author.clone()],
+                intent: None,
+                issue_dispositions: Vec::new(),
+            }),
+        ))
+        .unwrap()
+        .changed_refs[0]
+        .clone();
+    let denied = service
+        .apply(&managed(
+            "private-inspect",
+            &team_a,
+            &peer,
+            AgentAction::StateInspect(StateInspectInput {
+                entry_ref: Some(private),
+                ..StateInspectInput::default()
+            }),
+        ))
+        .unwrap()
+        .projection
+        .unwrap();
+    assert_eq!(denied["not_found"], true);
+    let membership = AgenticProgramProjection::membership_id(&peer, &team_a);
+    let member = service
+        .apply(&root(
+            "membership-exact",
+            AgentAction::StateInspect(StateInspectInput {
+                entry_ref: Some(membership.clone()),
+                ..StateInspectInput::default()
+            }),
+        ))
+        .unwrap()
+        .projection
+        .unwrap();
+    assert_eq!(member["membership"]["membership_id"], membership);
 }
 
 #[test]
@@ -259,6 +394,7 @@ fn state_inspect_pages_indexes_and_never_falls_back_to_full_program_dump() {
         .apply(&root(
             "inspect-first-page",
             AgentAction::StateInspect(StateInspectInput {
+                query: None,
                 wait_for_workers: false,
                 scope_ref: None,
                 after_revision: None,
@@ -269,7 +405,8 @@ fn state_inspect_pages_indexes_and_never_falls_back_to_full_program_dump() {
         .expect("first page");
     let first = first.projection.expect("bounded index page");
     assert_eq!(first["entries"].as_array().map(Vec::len), Some(32));
-    assert_eq!(first["next_page_cursor"], "state:32");
+    let cursor = first["next_page_cursor"].as_str().unwrap().to_string();
+    assert!(cursor.contains("revision"));
     assert!(
         first.get("tasks").is_none(),
         "index must not expose a full Program"
@@ -279,10 +416,11 @@ fn state_inspect_pages_indexes_and_never_falls_back_to_full_program_dump() {
         .apply(&root(
             "inspect-second-page",
             AgentAction::StateInspect(StateInspectInput {
+                query: None,
                 wait_for_workers: false,
                 scope_ref: None,
                 after_revision: None,
-                page_cursor: Some("state:32".to_string()),
+                page_cursor: Some(cursor.clone()),
                 entry_ref: None,
             }),
         ))
@@ -296,6 +434,7 @@ fn state_inspect_pages_indexes_and_never_falls_back_to_full_program_dump() {
         .apply(&root(
             "inspect-malformed-cursor",
             AgentAction::StateInspect(StateInspectInput {
+                query: None,
                 wait_for_workers: false,
                 scope_ref: None,
                 after_revision: None,
@@ -305,7 +444,51 @@ fn state_inspect_pages_indexes_and_never_falls_back_to_full_program_dump() {
         ))
         .expect("invalid inspect is an observation");
     assert_eq!(malformed.status, AgentActionStatus::Rejected);
-    assert_eq!(malformed.error.expect("error").code, "invalid_action");
+    assert_eq!(malformed.error.expect("error").code, "invalid_state_cursor");
+    let changed_query = service
+        .apply(&root(
+            "inspect-query-change",
+            AgentAction::StateInspect(StateInspectInput {
+                query: Some("Team".into()),
+                page_cursor: Some(cursor.clone()),
+                ..StateInspectInput::default()
+            }),
+        ))
+        .unwrap();
+    assert_eq!(changed_query.status, AgentActionStatus::Rejected);
+    let focused = service
+        .apply(&root(
+            "inspect-query",
+            AgentAction::StateInspect(StateInspectInput {
+                query: Some("Team 32".into()),
+                ..StateInspectInput::default()
+            }),
+        ))
+        .unwrap()
+        .projection
+        .unwrap();
+    assert_eq!(focused["entries"].as_array().unwrap().len(), 1);
+    service
+        .apply(&root(
+            "inspect-update",
+            AgentAction::TeamCreate(TeamCreateInput {
+                name: "new team".into(),
+                mission: "changed directory".into(),
+                objective: None,
+            }),
+        ))
+        .unwrap();
+    let stale = service
+        .apply(&root(
+            "inspect-stale",
+            AgentAction::StateInspect(StateInspectInput {
+                page_cursor: Some(cursor),
+                ..StateInspectInput::default()
+            }),
+        ))
+        .unwrap();
+    assert_eq!(stale.status, AgentActionStatus::Rejected);
+    assert!(stale.error.unwrap().message.contains("revision"));
 }
 
 #[test]
@@ -748,7 +931,7 @@ async fn production_artifact_authority_closes_submit_review_and_completion_chain
             }),
         ))
         .expect("claim");
-    let artifact = service
+    let artifact_receipt = service
         .apply(&managed(
             "durable-commit",
             &team,
@@ -760,9 +943,16 @@ async fn production_artifact_authority_closes_submit_review_and_completion_chain
                 relates_to: vec![task.clone()],
             }),
         ))
-        .expect("commit")
-        .changed_refs[0]
-        .clone();
+        .expect("commit");
+    let artifact = artifact_receipt.changed_refs[0].clone();
+    let access = &artifact_receipt.projection.as_ref().unwrap()["artifact_access"];
+    assert_eq!(access["submit_ref"], artifact);
+    assert_eq!(access["read_request"]["evidence_ref"], content.selector);
+    let inspect = AgentActionService::compact_projection(
+        &service.project("program-1").unwrap(),
+        Some(&artifact),
+    );
+    assert_eq!(inspect["read_request"]["evidence_ref"], content.selector);
     let durable_submit = service
         .apply(&managed(
             "durable-submit",
@@ -791,7 +981,7 @@ async fn production_artifact_authority_closes_submit_review_and_completion_chain
                 &team,
                 &reviewer,
                 AgentAction::TaskReview(TaskReviewInput {
-                    task_ref: task,
+                    task_ref: task.clone(),
                     decision: TaskReviewDecision::Accept,
                     reason: "content resolved and acceptance was met".to_string(),
                     evidence_refs: vec![content.selector.clone()],
@@ -816,6 +1006,92 @@ async fn production_artifact_authority_closes_submit_review_and_completion_chain
         AgentActionStatus::Rejected,
         "objective-level blockers remain authoritative even after Task acceptance"
     );
+    let before = service.project("program-1").unwrap();
+    let issue = super::super::issues::issues(&before).remove(0);
+    assert!(super::super::issues::completion_gap(&before)
+        .unwrap()
+        .starts_with("issue_requires_classification:"));
+    let classify = |action_id: &str, disposition| {
+        root(
+            action_id,
+            AgentAction::MessagePublish(MessagePublishInput {
+                topic_ref: "topic:program-1".into(),
+                summary: Some("Adjudicate the retained limitation".into()),
+                content_ref: None,
+                refs: Vec::new(),
+                recipients: Vec::new(),
+                intent: None,
+                issue_dispositions: vec![harness_contract::agent_action::IssueDisposition {
+                    issue_ref: issue.issue_ref.clone(),
+                    disposition,
+                    reason_ref: content.selector.clone(),
+                    evidence_refs: vec![content.selector.clone()],
+                }],
+            }),
+        )
+    };
+    let mut forged = classify(
+        "forged-source",
+        harness_contract::agent_action::IssueDispositionKind::Disclose,
+    );
+    if let AgentAction::MessagePublish(input) = &mut forged.action {
+        input.issue_dispositions[0].issue_ref = "issue:missing".into();
+    }
+    assert_eq!(
+        service.apply(&forged).unwrap().status,
+        AgentActionStatus::Rejected
+    );
+    let mut unprivileged = classify(
+        "member-cannot-adjudicate",
+        harness_contract::agent_action::IssueDispositionKind::Disclose,
+    );
+    unprivileged.actor = managed("member", &team, &reviewer, unprivileged.action.clone()).actor;
+    assert_eq!(
+        service.apply(&unprivileged).unwrap().status,
+        AgentActionStatus::Rejected
+    );
+    assert_eq!(
+        service
+            .apply(&classify(
+                "must-resolve",
+                harness_contract::agent_action::IssueDispositionKind::MustResolve
+            ))
+            .unwrap()
+            .status,
+        AgentActionStatus::Applied
+    );
+    assert!(
+        super::super::issues::completion_gap(&service.project("program-1").unwrap())
+            .unwrap()
+            .starts_with("issue_must_resolve:")
+    );
+    assert_eq!(
+        service
+            .apply(&classify(
+                "allow-disclosure",
+                harness_contract::agent_action::IssueDispositionKind::Disclose
+            ))
+            .unwrap()
+            .status,
+        AgentActionStatus::Applied
+    );
+    let adjudicated = service.project("program-1").unwrap();
+    assert!(super::super::issues::completion_gap(&adjudicated).is_none());
+    assert_eq!(adjudicated.tasks[&task].status, AgenticTaskStatus::Accepted);
+    assert_eq!(
+        adjudicated.tasks[&task].unresolved,
+        before.tasks[&task].unresolved
+    );
+    let mut changed = adjudicated.clone();
+    changed.tasks.get_mut(&task).unwrap().unresolved[0].push_str(" revised source");
+    assert!(super::super::issues::completion_gap(&changed)
+        .unwrap()
+        .starts_with("issue_requires_classification:"));
+    let restarted = AgentActionService::new(Arc::clone(&service.store));
+    let recovered =
+        super::super::issues::issues(&restarted.project("program-1").unwrap()).remove(0);
+    assert_eq!(recovered.adjudicated_by.as_deref(), Some("root-1"));
+    assert_eq!(recovered.disposition.unwrap().reason_ref, content.selector);
     assert_eq!(
         service
             .apply(&root(
@@ -829,7 +1105,7 @@ async fn production_artifact_authority_closes_submit_review_and_completion_chain
             .expect("completion")
             .status,
         AgentActionStatus::Applied,
-        "an independent Task accept verdict is authoritative; disclosed limitations must not be re-litigated by the Objective supervisor"
+        "accepted work and evidence-backed disclosure survive without repeating the task"
     );
 }
 

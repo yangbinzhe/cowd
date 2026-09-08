@@ -1,14 +1,10 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
-use glob::Pattern;
-use regex::RegexBuilder;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
-use walkdir::WalkDir;
 
 use crate::path_policy::WorkspacePathPolicy;
 
@@ -140,6 +136,21 @@ pub struct GlobSearchOutput {
     pub truncated: bool,
     #[serde(rename = "continuationCursor", skip_serializing_if = "Option::is_none")]
     pub continuation_cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub omissions: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_request: Option<serde_json::Value>,
+    pub coverage: serde_json::Value,
+}
+
+/// Explicit overrides for project search rules. Additional patterns exclude
+/// matches; include_ignored also admits hidden/project-ignored paths.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SearchOptions {
+    #[serde(default)]
+    pub include_ignored: bool,
+    #[serde(default)]
+    pub ignore_patterns: Vec<String>,
 }
 
 /// Parameters accepted by the grep-style search tool.
@@ -177,6 +188,8 @@ pub struct GrepSearchInput {
     pub multiline: Option<bool>,
     #[serde(default)]
     pub cursor: Option<String>,
+    #[serde(flatten)]
+    pub search_options: SearchOptions,
 }
 
 fn deserialize_optional_boolish<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
@@ -221,6 +234,175 @@ pub struct GrepSearchOutput {
     pub applied_offset: Option<usize>,
     #[serde(rename = "continuationCursor", skip_serializing_if = "Option::is_none")]
     pub continuation_cursor: Option<String>,
+    #[serde(default)]
+    pub omissions: Vec<String>,
+    pub truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_request: Option<serde_json::Value>,
+    pub coverage: serde_json::Value,
+}
+
+/// Read exact bytes from one opened file, including CRLF and trailing newlines.
+/// The caller supplies the revision it observed; a changing source is not published.
+pub fn snapshot_file(
+    policy: &WorkspacePathPolicy,
+    path: &str,
+    expected_sha256: &str,
+) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let resolved = policy.resolve(path)?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(&resolved)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source must be a regular file",
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        policy.ensure_resolved_path(&PathBuf::from(format!(
+            "/proc/self/fd/{}",
+            file.as_raw_fd()
+        )))?;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_READ_SIZE + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_READ_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "source exceeds file snapshot resource limit",
+        ));
+    }
+    if format!("{:x}", Sha256::digest(&bytes)) != expected_sha256.trim_start_matches("sha256:") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "source_version_conflict",
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Pin each parent component so replacing a path with a symlink cannot
+/// redirect publication between validation and the atomic link operation.
+#[cfg(target_os = "linux")]
+fn publication_parent(
+    policy: &WorkspacePathPolicy,
+    parent: &Path,
+) -> io::Result<(fs::File, PathBuf)> {
+    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+    let open_dir = |path: &Path| {
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)
+    };
+    let mut directory = open_dir(policy.workspace_root())?;
+    let relative = parent.strip_prefix(policy.workspace_root()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "publication parent outside workspace",
+        )
+    })?;
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid publication parent component",
+            ));
+        };
+        let pinned = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+        policy.ensure_resolved_path(&pinned)?;
+        let next = pinned.join(name);
+        match fs::create_dir(&next) {
+            Ok(()) => directory.sync_all()?,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        directory = open_dir(&next)?;
+    }
+    let pinned = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+    policy.ensure_resolved_path(&pinned)?;
+    Ok((directory, pinned))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn publication_parent(
+    policy: &WorkspacePathPolicy,
+    parent: &Path,
+) -> io::Result<(fs::File, PathBuf)> {
+    fs::create_dir_all(parent)?;
+    let resolved = policy.ensure_resolved_path(parent)?;
+    Ok((fs::File::open(&resolved)?, resolved))
+}
+
+/// Publish fully written bytes without replacing an existing different file.
+/// Hard-link creation is atomic and does not overwrite a racing writer.
+pub fn materialize_file(
+    policy: &WorkspacePathPolicy,
+    path: &str,
+    bytes: &[u8],
+) -> io::Result<(PathBuf, bool)> {
+    use std::io::Write;
+    if bytes.len() > MAX_WRITE_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "content exceeds file write resource limit",
+        ));
+    }
+    let resolved = policy.resolve(path)?;
+    let hash = format!("{:x}", Sha256::digest(bytes));
+    if resolved.exists() {
+        snapshot_file(policy, path, &hash)?;
+        return Ok((resolved, false));
+    }
+    let parent = resolved
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "destination has no parent"))?;
+    let (parent_handle, pinned_parent) = publication_parent(policy, parent)?;
+    let destination = pinned_parent.join(resolved.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "destination has no filename")
+    })?);
+    static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let (temp, mut file) = loop {
+        let sequence = NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp = pinned_parent.join(format!(".cowd-publish-{}-{sequence}", std::process::id()));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+        {
+            Ok(file) => break (temp, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        match fs::hard_link(&temp, &destination) {
+            Ok(()) => {
+                parent_handle.sync_all()?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                snapshot_file(policy, path, &hash).map(|_| false)
+            }
+            Err(error) => Err(error),
+        }
+    })();
+    let _ = fs::remove_file(&temp);
+    let created = result?;
+    // A renamed parent cannot produce a successful receipt for a stale path.
+    snapshot_file(policy, path, &hash)?;
+    Ok((resolved, created))
 }
 
 /// Reads a text file and returns a line-windowed payload.
@@ -376,373 +558,10 @@ pub fn edit_file(
 }
 
 /// Expands a glob pattern and returns matching filenames.
-fn non_glob_root(pattern: &Path, fallback: &Path) -> PathBuf {
-    let mut root = PathBuf::new();
-    for component in pattern.components() {
-        let value = component.as_os_str().to_string_lossy();
-        if value.contains(['*', '?', '[', '{']) {
-            break;
-        }
-        root.push(component.as_os_str());
-    }
-    if root.as_os_str().is_empty() {
-        fallback.to_path_buf()
-    } else if root.is_dir() {
-        root
-    } else {
-        root.parent().unwrap_or(fallback).to_path_buf()
-    }
-}
-
-pub fn glob_search(
-    policy: &WorkspacePathPolicy,
-    pattern: &str,
-    path: Option<&str>,
-    cursor: Option<&str>,
-) -> io::Result<GlobSearchOutput> {
-    let started = Instant::now();
-    let base_dir = path
-        .map(|path| policy.resolve(path))
-        .transpose()?
-        .unwrap_or_else(|| policy.workspace_root().to_path_buf());
-    let search_pattern = if Path::new(pattern).is_absolute() {
-        policy.resolve_glob_pattern(pattern)?
-    } else {
-        policy.resolve_glob_pattern(&base_dir.join(pattern).to_string_lossy())?
-    };
-
-    // The `glob` crate does not support brace expansion ({a,b,c}).
-    // Expand braces into multiple patterns so patterns like
-    // `Assets/**/*.{cs,uxml,uss}` work correctly.
-    let expanded = expand_braces(&search_pattern.to_string_lossy());
-
-    let mut seen = std::collections::HashSet::new();
-    let mut matches = Vec::new();
-    let mut scan_complete = true;
-    let mut visited = 0usize;
-    let mut last_visited = None;
-    'walk: for root_pattern in &expanded {
-        let matcher = Pattern::new(root_pattern)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        let walk_root = non_glob_root(Path::new(root_pattern), &base_dir);
-        let skip_dirs = [
-            "target",
-            "node_modules",
-            ".git",
-            ".cowd",
-            ".cargo",
-            ".gitnexus",
-        ];
-        for entry in WalkDir::new(walk_root)
-            .max_depth(MAX_SEARCH_DEPTH)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|entry| !skip_dirs.iter().any(|name| entry.file_name() == *name))
-        {
-            if visited >= MAX_SEARCH_ENTRIES
-                || started.elapsed().as_millis() >= MAX_SEARCH_DURATION_MS
-            {
-                scan_complete = false;
-                break 'walk;
-            }
-            visited = visited.saturating_add(1);
-            let Ok(entry) = entry else {
-                scan_complete = false;
-                continue;
-            };
-            let entry_path = entry.path().to_string_lossy().into_owned();
-            last_visited = Some(entry_path.clone());
-            if cursor.is_some_and(|cursor| entry_path.as_str() <= cursor) {
-                continue;
-            }
-            if entry.depth() >= MAX_SEARCH_DEPTH && entry.file_type().is_dir() {
-                // WalkDir intentionally stops descending at the safety depth;
-                // report that omission instead of presenting a false full scan.
-                scan_complete = false;
-                continue;
-            }
-            if !entry.file_type().is_file() || !matcher.matches_path(entry.path()) {
-                continue;
-            }
-            match policy.ensure_resolved_path(entry.path()) {
-                Ok(resolved) if seen.insert(resolved.clone()) => matches.push(resolved),
-                Ok(_) => {}
-                Err(_) => scan_complete = false,
-            }
-        }
-    }
-
-    // Lexical ordering is deterministic and avoids an unbounded metadata pass
-    // over the workspace. Callers can refine the pattern when scan_complete is
-    // false rather than relying on an implicit full-tree sort.
-    matches.sort();
-
-    let truncated = matches.len() > MAX_SEARCH_RESULTS;
-    let filenames = matches
-        .into_iter()
-        .take(MAX_SEARCH_RESULTS)
-        .map(|path| path.to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-
-    Ok(GlobSearchOutput {
-        base_path: base_dir.to_string_lossy().into_owned(),
-        pattern: pattern.to_string(),
-        scan_complete,
-        duration_ms: started.elapsed().as_millis(),
-        num_files: filenames.len(),
-        filenames,
-        truncated,
-        continuation_cursor: (!scan_complete).then_some(last_visited).flatten(),
-    })
-}
-
-/// Runs a regex search over workspace files with optional context lines.
-pub fn grep_search(
-    policy: &WorkspacePathPolicy,
-    input: &GrepSearchInput,
-) -> io::Result<GrepSearchOutput> {
-    let pattern = match &input.pattern {
-        Some(p) if !p.trim().is_empty() => p.as_str(),
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "pattern is required — please provide a regex pattern to search for",
-            ));
-        }
-    };
-
-    let base_path = input
-        .path
-        .as_deref()
-        .map(|path| policy.resolve(path))
-        .transpose()?
-        .unwrap_or_else(|| policy.workspace_root().to_path_buf());
-
-    let regex = RegexBuilder::new(pattern)
-        .case_insensitive(input.case_insensitive.unwrap_or(false))
-        .dot_matches_new_line(input.multiline.unwrap_or(false))
-        .build()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-
-    let glob_filter = input
-        .glob
-        .as_deref()
-        .map(Pattern::new)
-        .transpose()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-    let file_type = input.file_type.as_deref();
-    let output_mode = input
-        .output_mode
-        .clone()
-        .unwrap_or_else(|| String::from("content"));
-    let context = input.context.or(input.context_short).unwrap_or(0);
-
-    let mut filenames = Vec::new();
-    let mut content_lines = Vec::new();
-    let mut total_matches = 0usize;
-    let (search_files, mut scan_complete, mut continuation_cursor) =
-        collect_search_files(policy, &base_path, input.cursor.as_deref())?;
-
-    for file_path in search_files {
-        if scan_complete {
-            continuation_cursor = Some(file_path.to_string_lossy().into_owned());
-        }
-        if !matches_optional_filters(&file_path, glob_filter.as_ref(), file_type) {
-            continue;
-        }
-
-        if std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0) > MAX_READ_SIZE {
-            scan_complete = false;
-            continue;
-        }
-
-        let Ok(file_contents) = fs::read_to_string(&file_path) else {
-            scan_complete = false;
-            continue;
-        };
-
-        if output_mode == "count" {
-            let count = regex.find_iter(&file_contents).count();
-            if count > 0 {
-                filenames.push(file_path.to_string_lossy().into_owned());
-                total_matches += count;
-            }
-            continue;
-        }
-
-        let lines: Vec<&str> = file_contents.lines().collect();
-        let mut matched_lines = Vec::new();
-        for (index, line) in lines.iter().enumerate() {
-            if regex.is_match(line) {
-                total_matches += 1;
-                matched_lines.push(index);
-            }
-        }
-
-        if matched_lines.is_empty() {
-            continue;
-        }
-
-        filenames.push(file_path.to_string_lossy().into_owned());
-        if output_mode == "content" {
-            for index in matched_lines {
-                let start = index.saturating_sub(input.before.unwrap_or(context));
-                let end = (index + input.after.unwrap_or(context) + 1).min(lines.len());
-                for (current, line) in lines.iter().enumerate().take(end).skip(start) {
-                    let prefix = if input.line_numbers.unwrap_or(true) {
-                        format!("{}:{}:", file_path.to_string_lossy(), current + 1)
-                    } else {
-                        format!("{}:", file_path.to_string_lossy())
-                    };
-                    content_lines.push(format!("{prefix}{line}"));
-                }
-            }
-        }
-    }
-
-    let (filenames, applied_limit, applied_offset) =
-        apply_limit(filenames, input.head_limit, input.offset);
-    let content_output = if output_mode == "content" {
-        let (lines, limit, offset) = apply_limit(content_lines, input.head_limit, input.offset);
-        return Ok(GrepSearchOutput {
-            base_path: base_path.to_string_lossy().into_owned(),
-            scan_complete,
-            mode: Some(output_mode),
-            num_files: filenames.len(),
-            filenames,
-            num_lines: Some(lines.len()),
-            content: Some(lines.join("\n")),
-            num_matches: None,
-            applied_limit: limit,
-            applied_offset: offset,
-            continuation_cursor: (!scan_complete)
-                .then_some(continuation_cursor.clone())
-                .flatten(),
-        });
-    } else {
-        None
-    };
-
-    Ok(GrepSearchOutput {
-        base_path: base_path.to_string_lossy().into_owned(),
-        scan_complete,
-        mode: Some(output_mode.clone()),
-        num_files: filenames.len(),
-        filenames,
-        content: content_output,
-        num_lines: None,
-        num_matches: (output_mode == "count").then_some(total_matches),
-        applied_limit,
-        applied_offset,
-        continuation_cursor: (!scan_complete).then_some(continuation_cursor).flatten(),
-    })
-}
-
-fn collect_search_files(
-    policy: &WorkspacePathPolicy,
-    base_path: &Path,
-    cursor: Option<&str>,
-) -> io::Result<(Vec<PathBuf>, bool, Option<String>)> {
-    if base_path.is_file() {
-        return Ok((vec![policy.ensure_resolved_path(base_path)?], true, None));
-    }
-
-    let skip_dirs = [
-        "target",
-        "node_modules",
-        ".git",
-        ".cowd",
-        ".cargo",
-        ".gitnexus",
-    ];
-    let mut files = Vec::new();
-    let mut complete = true;
-    let started = Instant::now();
-    let mut visited = 0usize;
-    let mut last_visited = None;
-    for entry in WalkDir::new(base_path)
-        .max_depth(MAX_SEARCH_DEPTH)
-        .into_iter()
-        .filter_entry(|e| !skip_dirs.iter().any(|d| e.file_name().to_str() == Some(d)))
-    {
-        if visited >= MAX_SEARCH_ENTRIES || started.elapsed().as_millis() >= MAX_SEARCH_DURATION_MS
-        {
-            complete = false;
-            break;
-        }
-        visited = visited.saturating_add(1);
-        // A workspace may contain mounted service data or other unreadable
-        // subtrees. One inaccessible path must not invalidate the whole search.
-        let Ok(entry) = entry else {
-            complete = false;
-            continue;
-        };
-        let entry_path = entry.path().to_string_lossy().into_owned();
-        last_visited = Some(entry_path.clone());
-        if cursor.is_some_and(|cursor| entry_path.as_str() <= cursor) {
-            continue;
-        }
-        if entry.depth() >= MAX_SEARCH_DEPTH && entry.file_type().is_dir() {
-            complete = false;
-            continue;
-        }
-        if entry.file_type().is_file() {
-            if let Ok(resolved) = policy.ensure_resolved_path(entry.path()) {
-                files.push(resolved);
-            } else {
-                complete = false;
-            }
-        }
-    }
-    Ok((
-        files,
-        complete,
-        (!complete).then_some(last_visited).flatten(),
-    ))
-}
-
-fn matches_optional_filters(
-    path: &Path,
-    glob_filter: Option<&Pattern>,
-    file_type: Option<&str>,
-) -> bool {
-    if let Some(glob_filter) = glob_filter {
-        let path_string = path.to_string_lossy();
-        if !glob_filter.matches(&path_string) && !glob_filter.matches_path(path) {
-            return false;
-        }
-    }
-
-    if let Some(file_type) = file_type {
-        let extension = path.extension().and_then(|extension| extension.to_str());
-        if extension != Some(file_type) {
-            return false;
-        }
-    }
-
-    true
-}
-
-fn apply_limit<T>(
-    items: Vec<T>,
-    limit: Option<usize>,
-    offset: Option<usize>,
-) -> (Vec<T>, Option<usize>, Option<usize>) {
-    let offset_value = offset.unwrap_or(0);
-    let mut items = items.into_iter().skip(offset_value).collect::<Vec<_>>();
-    let explicit_limit = limit.unwrap_or(250);
-    if explicit_limit == 0 {
-        return (items, None, (offset_value > 0).then_some(offset_value));
-    }
-
-    let truncated = items.len() > explicit_limit;
-    items.truncate(explicit_limit);
-    (
-        items,
-        truncated.then_some(explicit_limit),
-        (offset_value > 0).then_some(offset_value),
-    )
-}
+#[path = "search.rs"]
+mod search;
+pub(crate) use search::glob_search_page;
+pub use search::{glob_search, glob_search_with_options, grep_search};
 
 fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
     let mut lines = Vec::new();
@@ -805,6 +624,78 @@ mod tests {
 
     fn policy_for(path: &std::path::Path) -> WorkspacePathPolicy {
         WorkspacePathPolicy::new(path.parent().expect("temporary path parent"))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn publication_pinned_parent_cannot_be_redirected_by_symlink_replacement() {
+        let temp = temp_path("pinned-publication");
+        std::fs::create_dir_all(&temp).unwrap();
+        let outside = temp_path("outside-publication");
+        std::fs::create_dir_all(&outside).unwrap();
+        let policy = WorkspacePathPolicy::new(temp.as_path());
+        let parent = temp.as_path().join("output");
+        let (_handle, pinned) = super::publication_parent(&policy, &parent).unwrap();
+        std::fs::rename(&parent, temp.as_path().join("saved-output")).unwrap();
+        std::os::unix::fs::symlink(outside.as_path(), &parent).unwrap();
+        std::fs::write(pinned.join("candidate"), b"body").unwrap();
+        std::fs::hard_link(pinned.join("candidate"), pinned.join("published")).unwrap();
+        assert!(!outside.as_path().join("candidate").exists());
+        assert!(!outside.as_path().join("published").exists());
+        assert_eq!(
+            std::fs::read(temp.as_path().join("saved-output/published")).unwrap(),
+            b"body"
+        );
+        assert!(super::materialize_file(&policy, "output/new", b"body").is_err());
+        assert!(!outside.as_path().join("new").exists());
+        std::fs::remove_dir_all(&temp).unwrap();
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[test]
+    fn publication_preserves_exact_bytes_and_rejects_changed_sources() {
+        use sha2::{Digest, Sha256};
+        let root = temp_path("publication");
+        std::fs::create_dir_all(&root).unwrap();
+        let policy = WorkspacePathPolicy::new(&root);
+        let bytes = "<html>中文\r\n正文</html>\r\n".as_bytes();
+        let hash = format!("{:x}", Sha256::digest(bytes));
+        std::fs::write(root.join("source.html"), bytes).unwrap();
+        let snapshot = super::snapshot_file(&policy, "source.html", &hash).unwrap();
+        assert_eq!(snapshot, bytes);
+        super::materialize_file(&policy, "export.html", &snapshot).unwrap();
+        super::materialize_file(&policy, "export.html", &snapshot).unwrap();
+        assert_eq!(std::fs::read(root.join("export.html")).unwrap(), bytes);
+        assert!(super::materialize_file(&policy, "export.html", b"different").is_err());
+        std::fs::write(root.join("source.html"), b"new revision").unwrap();
+        assert!(super::snapshot_file(&policy, "source.html", &hash).is_err());
+        assert!(super::snapshot_file(&policy, "../outside", &hash).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn publication_concurrent_exports_never_replace_the_winner() {
+        let root = temp_path("publication-race");
+        std::fs::create_dir_all(&root).unwrap();
+        let policy = WorkspacePathPolicy::new(&root);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let joins: Vec<_> = [b"first".to_vec(), b"second".to_vec()]
+            .into_iter()
+            .map(|bytes| {
+                let policy = policy.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    super::materialize_file(&policy, "result", &bytes).map(|_| bytes)
+                })
+            })
+            .collect();
+        let results: Vec<_> = joins.into_iter().map(|join| join.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let winner = results.into_iter().find_map(Result::ok).unwrap();
+        assert_eq!(std::fs::read(root.join("result")).unwrap(), winner);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -963,6 +854,7 @@ mod tests {
                 offset: Some(0),
                 multiline: Some(false),
                 cursor: None,
+                search_options: Default::default(),
             },
         )
         .expect("grep should succeed");
@@ -1000,6 +892,7 @@ mod tests {
                 offset: None,
                 multiline: None,
                 cursor: None,
+                search_options: Default::default(),
             },
         )
         .expect("grep should succeed");
@@ -1082,6 +975,90 @@ mod tests {
     }
 
     #[test]
+    fn glob_pages_cover_braces_and_prefix_directories_without_duplicates() {
+        let directory = temp_path("glob-stable-pages");
+        std::fs::create_dir_all(&directory).unwrap();
+        let policy = WorkspacePathPolicy::new(&directory);
+        std::fs::create_dir(directory.join("a")).unwrap();
+        let mut expected = std::collections::BTreeSet::new();
+        for index in 0..251 {
+            let path = if index % 2 == 0 {
+                directory.join(format!("a/{index:04}.rs"))
+            } else {
+                directory.join(format!("a.{index:04}.toml"))
+            };
+            std::fs::write(&path, "data").unwrap();
+            expected.insert(path.to_string_lossy().into_owned());
+        }
+        let mut cursor = None;
+        let mut actual = std::collections::BTreeSet::new();
+        let mut page_count = 0;
+        loop {
+            let page = glob_search(&policy, "**/*.{rs,toml}", None, cursor.as_deref()).unwrap();
+            page_count += 1;
+            assert!(page_count <= 4, "cursor must make progress");
+            assert!(page.num_files <= super::MAX_SEARCH_RESULTS);
+            for path in page.filenames {
+                assert!(
+                    actual.insert(path),
+                    "each match must be delivered only once"
+                );
+            }
+            match page.continuation_cursor {
+                Some(next) => {
+                    assert!(!page.scan_complete);
+                    assert!(glob_search(&policy, "**/*.txt", None, Some(&next)).is_err());
+                    assert_ne!(cursor.as_ref(), Some(&next));
+                    cursor = Some(next);
+                }
+                None => {
+                    assert!(page.scan_complete);
+                    break;
+                }
+            }
+        }
+        assert_eq!(actual, expected);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn explicit_build_directory_is_searchable_and_exact_full_page_can_finish() {
+        let directory = temp_path("glob-explicit-build");
+        std::fs::create_dir_all(&directory).unwrap();
+        let build = directory.join("target");
+        std::fs::create_dir(&build).unwrap();
+        for index in 0..super::MAX_SEARCH_RESULTS {
+            std::fs::write(build.join(format!("{index:04}.txt")), "x").unwrap();
+        }
+        let policy = WorkspacePathPolicy::new(&directory);
+        let page = glob_search(&policy, "*.txt", Some("target"), None).unwrap();
+        assert_eq!(page.num_files, super::MAX_SEARCH_RESULTS);
+        let end = glob_search(
+            &policy,
+            "*.txt",
+            Some("target"),
+            page.continuation_cursor.as_deref(),
+        )
+        .unwrap();
+        assert!(end.scan_complete);
+        assert_eq!(end.num_files, 0);
+        assert!(end.continuation_cursor.is_none());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn default_directory_noise_filter_does_not_hide_same_named_files() {
+        let directory = temp_path("glob-directory-filter");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("target"), "ordinary project file").unwrap();
+        let policy = WorkspacePathPolicy::new(&directory);
+        let page = glob_search(&policy, "**/*", None, None).unwrap();
+        assert_eq!(page.num_files, 1);
+        assert!(page.scan_complete);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn broad_glob_reports_incomplete_when_depth_bound_hides_descendants() {
         let dir = temp_path("glob-depth-bound");
         std::fs::create_dir_all(&dir).expect("directory should be created");
@@ -1100,7 +1077,11 @@ mod tests {
             result.num_files, 0,
             "the file is intentionally beyond the bound"
         );
-        assert!(result.continuation_cursor.is_some());
+        assert!(
+            result.continuation_cursor.is_none(),
+            "depth omissions cannot be repaired by repeating a cursor"
+        );
+        assert!(result.omissions.contains(&"depth_limit".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

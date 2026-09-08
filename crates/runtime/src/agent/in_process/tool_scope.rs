@@ -163,6 +163,7 @@ impl ScopedRuntimeToolExecutor {
             policy_revision: self.policy_revision,
             authorized_scopes: Vec::new(),
             memory_context: Some(self.memory_context.clone()),
+            reality_context: self.reality_context.clone(),
             model_lease: Some(self.model_lease.clone()),
             parent_execution: Some(harness_contract::execution_graph::ExecutionParentBinding {
                 execution_id: self.execution_id.clone(),
@@ -232,6 +233,7 @@ impl ScopedRuntimeToolExecutor {
             policy_revision: self.policy_revision,
             authorized_scopes: self.authorized_scopes_for_tool(),
             memory_context: Some(self.memory_context.clone()),
+            reality_context: self.reality_context.clone(),
             model_lease: Some(self.model_lease.clone()),
             parent_execution: Some(harness_contract::execution_graph::ExecutionParentBinding {
                 execution_id: self.execution_id.clone(),
@@ -487,6 +489,7 @@ impl ScopedRuntimeToolExecutor {
             policy_revision: self.policy_revision,
             authorized_scopes: self.authorized_scopes_for_tool(),
             memory_context: Some(self.memory_context.clone()),
+            reality_context: self.reality_context.clone(),
             model_lease: Some(self.model_lease.clone()),
             parent_execution: Some(harness_contract::execution_graph::ExecutionParentBinding {
                 execution_id: self.execution_id.clone(),

@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use harness_contract::agent_action::{
     AgentAction, AgentActionEnvelope, AgentActionErrorObservation, AgentActionObservation,
-    AgentActionStatus,
+    AgentActionStatus, AgentActorKind,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -590,22 +590,13 @@ impl AgentActionService {
                 "topic_observer_not_in_program_roster:{agent_id}"
             ))
         })?;
-        let team_topics = projection
-            .active_team_ids_for(agent_id)
-            .into_iter()
-            .filter_map(|team_id| projection.teams.get(team_id))
-            .map(|team| team.topic_ref.as_str())
-            .collect::<std::collections::BTreeSet<_>>();
+        let team_topics = readable_topic_refs(&projection, agent_id);
         let cursor_stream = topic_cursor_stream(program_id, execution_id);
         let (from_revision, cursor_revision) = self.topic_cursor(&cursor_stream)?;
-        let program_topic = format!("topic:{program_id}");
         let mut candidates = projection
             .topics
             .iter()
-            .filter(|(topic_ref, _)| {
-                topic_ref.as_str() == program_topic.as_str()
-                    || team_topics.contains(topic_ref.as_str())
-            })
+            .filter(|(topic_ref, _)| team_topics.contains(topic_ref.as_str()))
             .flat_map(|(topic_ref, entries)| {
                 entries.iter().map(|entry| AgenticTopicObservation {
                     topic_ref: topic_ref.clone(),
@@ -615,12 +606,7 @@ impl AgentActionService {
             .filter(|observation| {
                 observation.entry.revision > from_revision
                     && observation.entry.actor_id != agent_id
-                    && (observation.entry.recipients.is_empty()
-                        || observation
-                            .entry
-                            .recipients
-                            .iter()
-                            .any(|recipient| recipient == agent_id))
+                    && topic_entry_visible(&observation.entry, agent_id)
             })
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| {
@@ -925,6 +911,8 @@ impl AgentActionService {
                     "agents": team.member_ids.iter().take(STATE_INSPECT_PAGE_SIZE).filter_map(|id| projection.agents.get(id)).collect::<Vec<_>>(),
                     "tasks": team.task_ids.iter().take(STATE_INSPECT_PAGE_SIZE).filter_map(|id| projection.tasks.get(id)).collect::<Vec<_>>(),
                     "topics": projection.topics.get(&team.topic_ref).map(|entries| entries.iter().rev().take(STATE_INSPECT_PAGE_SIZE).collect::<Vec<_>>()),
+                    "directory_request":{"query":team.team_id},
+                    "coverage":{"nested_lists":"bounded_previews","complete":false,"instruction":"use directory_request for all related entries"},
                 });
             }
             if let Some(agent) = projection.agents.get(scope_ref) {
@@ -939,6 +927,7 @@ impl AgentActionService {
                     "program_id": projection.program_id,
                     "revision": projection.revision,
                     "task": task,
+                    "issues": super::issues::issues(projection).into_iter().filter(|issue| issue.source_ref == task.task_id).collect::<Vec<_>>(),
                     "artifacts": task.artifact_refs.iter().filter_map(|id| projection.artifacts.get(id)).collect::<Vec<_>>(),
                 });
             }
@@ -947,6 +936,7 @@ impl AgentActionService {
                     "program_id": projection.program_id,
                     "revision": projection.revision,
                     "artifact": artifact,
+                    "read_request": { "evidence_ref": artifact.content_ref },
                 });
             }
             if let Some(entries) = projection.topics.get(scope_ref) {
@@ -955,6 +945,8 @@ impl AgentActionService {
                     "revision": projection.revision,
                     "topic_ref": scope_ref,
                     "entries": entries.iter().rev().take(STATE_INSPECT_PAGE_SIZE).collect::<Vec<_>>(),
+                    "directory_request":{"query":scope_ref},
+                    "coverage":{"loaded":entries.len().min(STATE_INSPECT_PAGE_SIZE),"total":entries.len(),"complete":entries.len()<=STATE_INSPECT_PAGE_SIZE},
                 });
             }
         }
@@ -970,6 +962,23 @@ fn apply_projection_events(
 ) -> Result<(), AgentActionServiceError> {
     for event in events {
         if event.sequence <= projection.revision {
+            continue;
+        }
+        if event.kind == PROGRAM_OPENED_EVENT_KIND {
+            if let Some(seed) = event.payload.get("continuation_seed") {
+                let inherited: AgenticProgramProjection = serde_json::from_value(seed.clone())?;
+                if inherited.program_id != projection.program_id
+                    || inherited.objective_id != projection.objective_id
+                    || inherited.continuation.is_none()
+                    || event.sequence != 1
+                {
+                    return Err(AgentActionServiceError::Corrupt(
+                        "invalid continuation seed".into(),
+                    ));
+                }
+                *projection = inherited;
+            }
+            projection.revision = event.sequence;
             continue;
         }
         if event.kind == OBJECTIVE_VERDICT_EVENT_KIND {
@@ -1126,6 +1135,18 @@ fn applied_observation(
     entity_ref: Option<String>,
     duplicate: bool,
 ) -> Result<AgentActionObservation, AgentActionServiceError> {
+    let artifact_access = entity_ref
+        .as_ref()
+        .and_then(|reference| projection.artifacts.get(reference))
+        .map(|artifact| {
+            json!({
+                "artifact_ref": artifact.artifact_ref,
+                "content_ref": artifact.content_ref,
+                "read_tool": "evidence_retrieve",
+                "read_request": { "evidence_ref": artifact.content_ref },
+                "submit_ref": artifact.artifact_ref,
+            })
+        });
     let changed_refs = entity_ref.into_iter().collect::<Vec<_>>();
     Ok(AgentActionObservation {
         receipt_id: format!(
@@ -1153,9 +1174,33 @@ fn applied_observation(
             },
             "final_artifact_ref": projection.final_artifact_ref,
             "unresolved": projection.unresolved,
+            "artifact_access": artifact_access,
         })),
         error: None,
     })
+}
+
+fn readable_topic_refs(
+    projection: &AgenticProgramProjection,
+    agent_id: &str,
+) -> std::collections::BTreeSet<String> {
+    std::iter::once(format!("topic:{}", projection.program_id))
+        .chain(
+            projection
+                .active_team_ids_for(agent_id)
+                .into_iter()
+                .filter_map(|team_id| projection.teams.get(team_id))
+                .map(|team| team.topic_ref.clone()),
+        )
+        .collect()
+}
+fn topic_entry_visible(entry: &AgenticTopicEntryProjection, agent_id: &str) -> bool {
+    entry.actor_id == agent_id
+        || entry.recipients.is_empty()
+        || entry
+            .recipients
+            .iter()
+            .any(|recipient| recipient == agent_id)
 }
 
 fn inspected_observation(
@@ -1166,9 +1211,40 @@ fn inspected_observation(
         AgentAction::StateInspect(input) => input,
         _ => unreachable!("only state_inspect reaches inspected_observation"),
     };
+    let reader = format!("{:?}:{}", envelope.actor.kind, envelope.actor.actor_id);
+    let scoped_projection = if envelope.actor.kind == AgentActorKind::Agent {
+        let Some(agent_id) = envelope
+            .actor
+            .agent_id
+            .as_deref()
+            .filter(|id| projection.agents.contains_key(*id))
+        else {
+            return rejected(
+                envelope,
+                projection.revision,
+                "reader_not_authorized",
+                "reader is not in the current Program roster",
+            );
+        };
+        let topics = readable_topic_refs(projection, agent_id);
+        let mut visible = projection.clone();
+        visible.topics.retain(|topic_ref, entries| {
+            if !topics.contains(topic_ref) {
+                return false;
+            }
+            entries.retain(|entry| topic_entry_visible(entry, agent_id));
+            true
+        });
+        Some(visible)
+    } else {
+        None
+    };
+    let projection = scoped_projection.as_ref().unwrap_or(projection);
     let value = if input.after_revision == Some(projection.revision)
         && input.entry_ref.is_none()
         && input.scope_ref.is_none()
+        && input.page_cursor.is_none()
+        && input.query.is_none()
     {
         json!({
             "program_id": projection.program_id,
@@ -1176,7 +1252,17 @@ fn inspected_observation(
             "unchanged": true,
         })
     } else {
-        inspect_projection_page(projection, input)
+        match inspect_projection_page(projection, input, &reader) {
+            Ok(value) => value,
+            Err(error) => {
+                return rejected(
+                    envelope,
+                    projection.revision,
+                    "invalid_state_cursor",
+                    &error,
+                )
+            }
+        }
     };
     AgentActionObservation {
         receipt_id: format!(
@@ -1196,6 +1282,17 @@ fn inspected_observation(
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StateInspectCursor {
+    reader: String,
+    version: u8,
+    program_id: String,
+    revision: u64,
+    query: Option<String>,
+    after_ref: String,
+}
+
 const STATE_INSPECT_PAGE_SIZE: usize = 32;
 
 /// Return a bounded navigation page or one exact entity.  The output never
@@ -1206,33 +1303,80 @@ const STATE_INSPECT_PAGE_SIZE: usize = 32;
 fn inspect_projection_page(
     projection: &AgenticProgramProjection,
     input: &harness_contract::agent_action::StateInspectInput,
-) -> serde_json::Value {
+    reader: &str,
+) -> Result<serde_json::Value, String> {
     let exact_ref = input.entry_ref.as_deref().or(input.scope_ref.as_deref());
     if let Some(reference) = exact_ref {
+        if let Some(membership) = projection.memberships.get(reference) {
+            return Ok(
+                json!({"program_id":projection.program_id,"revision":projection.revision,"membership":membership}),
+            );
+        }
+        if let Some((topic_ref, entry)) =
+            projection.topics.iter().find_map(|(topic_ref, entries)| {
+                entries
+                    .iter()
+                    .find(|entry| entry.entry_id == reference)
+                    .map(|entry| (topic_ref, entry))
+            })
+        {
+            return Ok(
+                json!({"program_id":projection.program_id,"revision":projection.revision,"topic_ref":topic_ref,"entry":entry,
+                "read_request":entry.content_ref.as_ref().map(|content| json!({"evidence_ref":content}))}),
+            );
+        }
+        if let Some(issue) = super::issues::issues(projection)
+            .into_iter()
+            .find(|issue| issue.issue_ref == reference)
+        {
+            return Ok(
+                json!({"program_id": projection.program_id, "revision": projection.revision, "issue": issue}),
+            );
+        }
         if projection.teams.contains_key(reference)
             || projection.agents.contains_key(reference)
             || projection.tasks.contains_key(reference)
             || projection.artifacts.contains_key(reference)
             || projection.topics.contains_key(reference)
         {
-            return AgentActionService::compact_projection(projection, Some(reference));
+            return Ok(AgentActionService::compact_projection(
+                projection,
+                Some(reference),
+            ));
         }
-        return json!({
+        return Ok(json!({
             "program_id": projection.program_id,
             "revision": projection.revision,
             "entry_ref": reference,
             "not_found": true,
-        });
+        }));
     }
-    let offset = input
+    let query = input
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+        .map(str::to_lowercase);
+    let cursor = input
         .page_cursor
         .as_deref()
-        .and_then(|cursor| {
-            cursor
-                .strip_prefix("state:")
-                .and_then(|value| value.parse::<usize>().ok())
+        .map(|cursor| {
+            serde_json::from_str::<StateInspectCursor>(cursor).map_err(|_| {
+                "invalid Program cursor; copy next_request from a fresh directory".to_string()
+            })
         })
-        .unwrap_or_default();
+        .transpose()?;
+    if cursor.as_ref().is_some_and(|cursor| {
+        cursor.version != 1
+            || cursor.reader != reader
+            || cursor.program_id != projection.program_id
+            || cursor.revision != projection.revision
+            || cursor.query != query
+    }) {
+        return Err(
+            "Program source, revision or query changed; restart directory discovery".into(),
+        );
+    }
     let mut entries = projection
         .teams
         .values()
@@ -1268,23 +1412,73 @@ fn inspect_projection_page(
                 "kind": "topic",
             })
         }))
+        .chain(projection.memberships.values().map(|membership| json!({
+            "entry_ref":membership.membership_id,"kind":"membership","agent_ref":membership.agent_id,"team_ref":membership.team_id,"lifecycle":membership.lifecycle
+        })))
+        .chain(projection.topics.iter().flat_map(|(topic_ref,entries)| entries.iter().map(move |entry| json!({
+            "entry_ref":entry.entry_id,"kind":"topic_entry","topic_ref":topic_ref,"author":entry.actor_id,
+            "label":entry.summary.as_deref().unwrap_or("").chars().take(480).collect::<String>(),"entry_revision":entry.revision
+        }))))
         .chain(projection.artifacts.values().map(|artifact| {
             json!({
                 "entry_ref": artifact.artifact_ref,
                 "kind": "artifact",
                 "label": artifact.title,
+                "read_request": { "evidence_ref": artifact.content_ref },
             })
         }))
+        .chain(super::issues::issues(projection).into_iter().map(|issue| json!({
+            "entry_ref": issue.issue_ref, "kind": "issue", "label": issue.description,
+            "source_ref": issue.source_ref, "disposition": issue.disposition,
+        })))
         .collect::<Vec<_>>();
     entries.sort_by(|left, right| left["entry_ref"].as_str().cmp(&right["entry_ref"].as_str()));
-    let start = offset.min(entries.len());
+    entries.retain(|entry| {
+        query
+            .as_ref()
+            .is_none_or(|query| entry.to_string().to_lowercase().contains(query))
+    });
+    if cursor.as_ref().is_some_and(|cursor| {
+        !entries
+            .iter()
+            .any(|entry| entry["entry_ref"].as_str() == Some(cursor.after_ref.as_str()))
+    }) {
+        return Err("Program cursor position is not present in this directory".into());
+    }
+    let start = cursor.as_ref().map_or(0, |cursor| {
+        entries.partition_point(|entry| {
+            entry["entry_ref"].as_str().unwrap_or("") <= cursor.after_ref.as_str()
+        })
+    });
     let end = start
         .saturating_add(STATE_INSPECT_PAGE_SIZE)
         .min(entries.len());
-    let next_cursor = (end < entries.len()).then(|| format!("state:{end}"));
-    json!({
+    let next_cursor = (end < entries.len())
+        .then(|| {
+            serde_json::to_string(&StateInspectCursor {
+                version: 1,
+                reader: reader.into(),
+                program_id: projection.program_id.clone(),
+                revision: projection.revision,
+                query: query.clone(),
+                after_ref: entries[end - 1]["entry_ref"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
+            })
+        })
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    for entry in &mut entries[start..end] {
+        entry["source_kind"] = json!("program");
+        entry["revision"] = json!(projection.revision);
+        entry["scope"] = json!(projection.program_id);
+        entry["inspect_request"] = json!({"entry_ref":entry["entry_ref"]});
+    }
+    Ok(json!({
         "program_id": projection.program_id,
         "objective_id": projection.objective_id,
+        "continuation": projection.continuation,
         "revision": projection.revision,
         "status": projection.status,
         "counts": {
@@ -1296,7 +1490,13 @@ fn inspect_projection_page(
         },
         "entries": entries[start..end].to_vec(),
         "next_page_cursor": next_cursor,
-    })
+        "next_request": next_cursor.as_ref().map(|cursor| {
+            let mut request = json!({"page_cursor":cursor});
+            if let Some(query) = &input.query { request["query"] = json!(query); }
+            request
+        }),
+        "coverage": {"kind":"program_metadata_directory", "complete":next_cursor.is_none(), "revision":projection.revision},
+    }))
 }
 
 fn rejected(

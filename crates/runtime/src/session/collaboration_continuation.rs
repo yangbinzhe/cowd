@@ -61,7 +61,7 @@ pub fn compile_continuation_binding(
     Ok(binding)
 }
 
-/// Loads the newest verified Agentic Program from the exact Session. The
+/// Loads the newest Agentic Program from the exact Session. The
 /// continuation authority is the durable Program reducer and its objective
 /// verdict, never a legacy strategy receipt or user/assistant prose. The
 /// current turn is excluded so a retry cannot bind a root to itself.
@@ -88,10 +88,7 @@ pub fn latest_same_session_candidate(
         else {
             continue;
         };
-        if program.session_id != session_id
-            || program.turn_id == current_turn_id
-            || program.status != crate::AgenticProgramStatus::Verified
-        {
+        if program.session_id != session_id || program.turn_id == current_turn_id {
             continue;
         }
         let Some(source_root_id) = program
@@ -146,7 +143,86 @@ pub fn latest_same_session_candidate(
         ));
     }
     candidates.sort_by_key(|(_, revision)| *revision);
-    Ok(candidates.pop())
+    let latest = candidates.pop();
+    if let Some((candidate, _)) = latest.as_ref() {
+        if let Some(source) = unfinished_source_program(store, candidate)? {
+            stopped_source_revisions(store, &source)?;
+        }
+    }
+    Ok(latest)
+}
+
+/// Resolve an unfinished source only through its typed Session/root binding.
+pub(crate) fn unfinished_source_program(
+    store: &Arc<RuntimeEventStore>,
+    candidate: &ContinuationCandidate,
+) -> Result<Option<crate::AgenticProgramProjection>, String> {
+    let Some(id) = candidate.team_set_ref.strip_prefix("agentic_program:") else {
+        return Ok(None);
+    };
+    let source = crate::AgentActionService::new(Arc::clone(store))
+        .project(id)
+        .map_err(|error| error.to_string())?;
+    if source.session_id != candidate.source_session_id
+        || source.turn_id != candidate.source_turn_id
+        || source.root_execution_id.as_deref() != Some(candidate.source_root_id.as_str())
+    {
+        return Err("continuation source identity mismatch".into());
+    }
+    Ok((source.status != crate::AgenticProgramStatus::Verified).then_some(source))
+}
+
+/// Read dependencies are fenced in the graph registration transaction. No new
+/// root can take unfinished work while the old root or a descendant is live.
+pub(crate) fn stopped_source_revisions(
+    store: &Arc<RuntimeEventStore>,
+    source: &crate::AgenticProgramProjection,
+) -> Result<std::collections::BTreeMap<String, u64>, String> {
+    let graphs = crate::ExecutionGraphStateStore::new(Arc::clone(store));
+    let mut pending = vec![source
+        .root_execution_id
+        .clone()
+        .ok_or("source root missing")?];
+    for task in source.tasks.values() {
+        pending.extend(task.active_attempts.keys().cloned());
+        pending.extend(task.claim_execution_id.iter().cloned());
+    }
+    let mut revisions = std::collections::BTreeMap::new();
+    while let Some(id) = pending.pop() {
+        if revisions.contains_key(&id) {
+            continue;
+        }
+        let graph = graphs
+            .load(&id)
+            .map_err(|error| format!("continuation source graph unavailable: {error}"))?;
+        if graph.node_statuses.is_empty()
+            || graph
+                .node_statuses
+                .values()
+                .any(|state| !state.is_terminal())
+        {
+            return Err(format!(
+                "continuation source execution is not drained: {id}"
+            ));
+        }
+        revisions.insert(id.clone(), graph.revision);
+        let lineage_stream = format!("execution-lineage:{id}");
+        // The lineage index revision also fences a concurrently registered child.
+        revisions.insert(
+            lineage_stream.clone(),
+            store
+                .stream_revision(&lineage_stream)
+                .map_err(|e| e.to_string())?,
+        );
+        pending.extend(
+            graphs
+                .child_links(&id)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|child| child.child_execution_id),
+        );
+    }
+    Ok(revisions)
 }
 
 fn continuation_digest(binding: &CollaborationContinuationBinding) -> Result<String, String> {

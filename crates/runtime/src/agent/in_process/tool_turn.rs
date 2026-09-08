@@ -7,6 +7,7 @@ pub(super) struct ScopedRuntimeToolExecutor {
     pub(super) sandbox_posture: harness_contract::policy::SandboxPosture,
     pub(super) policy_revision: u64,
     pub(super) memory_context: memory::MemoryTurnContext,
+    pub(super) reality_context: Option<harness_contract::agent::AgentDataLease>,
     pub(super) model_lease: String,
     pub(super) execution_id: String,
     pub(super) node_id: String,
@@ -598,7 +599,11 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
         // Gateway RuntimeExecutionHost. They are not pure ToolHost adapters;
         // letting them fall through would fail every required Team node with
         // "has no ToolHost implementation adapter".
-        if tool_name == "evidence_retrieve" || is_agent_action_tool(tool_name) {
+        if matches!(
+            tool_name,
+            "evidence_retrieve" | "artifact_publish" | "artifact_materialize"
+        ) || is_agent_action_tool(tool_name)
+        {
             if !self.allowed_tools.contains(tool_name) {
                 return Err(ToolError::new(
                     "agent tool authorization does not match the allowed tool request",
@@ -650,7 +655,10 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
     fn owns_durable_tool_effect(&self, tool_name: &str) -> bool {
         self.commit_service.is_some()
             && self.allowed_tools.contains(tool_name)
-            && !matches!(tool_name, "tool_search" | "evidence_retrieve")
+            && !matches!(
+                tool_name,
+                "tool_search" | "evidence_retrieve" | "artifact_publish" | "artifact_materialize"
+            )
             && !is_agent_action_tool(tool_name)
     }
 
@@ -672,7 +680,10 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
         input: &str,
     ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
         if tool_name == "checkpoint_create"
-            || tool_name == "evidence_retrieve"
+            || matches!(
+                tool_name,
+                "evidence_retrieve" | "artifact_publish" | "artifact_materialize"
+            )
             || is_agent_action_tool(tool_name)
         {
             return self

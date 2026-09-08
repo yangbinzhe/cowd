@@ -92,12 +92,18 @@ struct EvidenceRetrieveToolRequest {
     query: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum ContextRetrieveSource {
     Memory,
+    Program,
+    Artifact,
+    Fact,
+    Matrix,
     SessionCatalog,
     SessionHistory,
 }
@@ -117,12 +123,16 @@ struct ContextRetrieveRequest {
     #[serde(default)]
     query: Option<String>,
     memory_id: Option<String>,
+    content_cursor: Option<String>,
+    cursor: Option<String>,
+    entry_ref: Option<String>,
+    parent_ref: Option<String>,
     scope: Option<ContextRetrieveScope>,
     session_id: Option<String>,
     limit: Option<usize>,
-    offset: Option<usize>,
     before_sequence: Option<usize>,
     message_id: Option<String>,
+    message_digest: Option<String>,
     sequence: Option<usize>,
     block_cursor: Option<usize>,
     block_limit: Option<usize>,
@@ -134,6 +144,7 @@ struct RuntimeToolExecutionBinding<'a> {
     session_id: Option<&'a str>,
     authorized_scopes: &'a [String],
     memory_context: Option<&'a memory::MemoryTurnContext>,
+    reality_context: Option<&'a harness_contract::agent::AgentDataLease>,
     model_lease: Option<&'a str>,
     parent_execution: Option<&'a harness_contract::execution_graph::ExecutionParentBinding>,
     execution_decision: Option<&'a runtime::RuntimeExecutionDecision>,
@@ -153,6 +164,8 @@ fn is_gateway_runtime_control_tool(tool_name: &str) -> bool {
                 | "lark_cli_read"
                 | "lark_cli_write"
                 | "evidence_retrieve"
+                | "artifact_publish"
+                | "artifact_materialize"
                 | "get_context_remaining"
         )
 }
@@ -322,6 +335,8 @@ pub(crate) struct GatewayToolExecutor {
 }
 
 include!("gateway_tool_executor/runtime_tools.rs");
+include!("gateway_tool_executor/content_publication.rs");
+include!("gateway_tool_executor/reality_tools.rs");
 include!("gateway_tool_executor/runtime_introspection.rs");
 include!("gateway_tool_executor/authorized_execution.rs");
 include!("gateway_tool_executor/tool_executor_impl.rs");

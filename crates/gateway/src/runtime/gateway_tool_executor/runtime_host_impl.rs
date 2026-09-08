@@ -253,6 +253,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                     session_id: request.session_id.as_deref(),
                     authorized_scopes: &request.authorized_scopes,
                     memory_context: request.memory_context.as_ref(),
+                    reality_context: request.reality_context.as_ref(),
                     model_lease: request.model_lease.as_deref(),
                     parent_execution: request.parent_execution.as_ref(),
                     execution_decision: request.execution_decision.as_ref(),

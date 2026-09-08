@@ -209,12 +209,21 @@
 
     #[tokio::test(flavor = "multi_thread")]
     async fn governed_runtime_tool_batch_fans_out_many_independent_reads_and_keeps_order() {
+        struct LeaseCheckingHost { inner: ConcurrentRuntimeToolHost, lease: harness_contract::agent::AgentDataLease }
+        #[async_trait::async_trait]
+        impl crate::RuntimeExecutionHost for LeaseCheckingHost {
+            async fn execute_runtime_tool(&self, request: &crate::RuntimeToolExecutionRequest) -> crate::RuntimeToolExecutionOutcome {
+                assert_eq!(request.reality_context.as_ref(),Some(&self.lease));
+                self.inner.execute_runtime_tool(request).await
+            }
+        }
+        let reality_lease = harness_contract::agent::AgentDataLease {session_id:"session".into(),task_id:"task".into(),team_id:None,read_scopes:vec![harness_contract::agent::CognitiveReadScope::Session],write_mode:harness_contract::agent::CognitiveWriteMode::CandidateOnly,fact_boundaries:vec!["observed".into()],fact_refs:vec!["fact:exact".into()],matrix_snapshot_refs:vec!["matrix:source_snapshot:exact".into()]};
         let active = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
-        let host: Arc<dyn crate::RuntimeExecutionHost> = Arc::new(ConcurrentRuntimeToolHost {
+        let host: Arc<dyn crate::RuntimeExecutionHost> = Arc::new(LeaseCheckingHost { lease: reality_lease.clone(), inner: ConcurrentRuntimeToolHost {
             active: Arc::clone(&active),
             observed_peak: Arc::clone(&peak),
-        });
+        }});
         let ticket = NodeExecutionTicket {
             graph_id: "graph".to_string(),
             node_id: "tools".to_string(),
@@ -337,6 +346,7 @@
             harness_contract::policy::SandboxPosture::ReadOnlySandbox,
             0,
             None,
+            Some(&reality_lease),
             None,
             &ticket,
             1,

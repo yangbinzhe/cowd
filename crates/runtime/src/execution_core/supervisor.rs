@@ -738,6 +738,14 @@ impl RuntimeExecutionSupervisor {
         self.runner.register(graph).await
     }
 
+    pub(crate) async fn register_continuation_graph(
+        &self,
+        graph: ExecutionGraph,
+        actor: Option<harness_contract::agent_action::AgentActorBinding>,
+    ) -> Result<ExecutionGraph, ExecutionRunnerError> {
+        self.runner.register_continuation(graph, actor).await
+    }
+
     pub(crate) async fn drive_registered(
         &self,
         graph_id: &str,

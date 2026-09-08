@@ -1004,6 +1004,13 @@ where
     }
 
     #[must_use]
+    pub(crate) fn reality_data_lease(&self) -> Option<harness_contract::agent::AgentDataLease> {
+        self.reality_recall
+            .as_ref()
+            .and_then(|(_, binding)| binding.validate().ok().map(|()| binding.data_lease.clone()))
+    }
+
+    #[must_use]
     pub fn with_knowledge_activation(mut self, activation: KnowledgeActivationRuntime) -> Self {
         self.knowledge_activation = Some(activation);
         self

@@ -63,9 +63,12 @@ pub fn program_id_for_objective(objective_id: &str) -> String {
     format!("program:{digest:x}")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StateInspectInput {
+    /// Focused metadata search over the current Program directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
     /// Root only: yield to active workers after inspecting state. Leave false
     /// to keep planning, publishing dependent tasks or doing useful work.
     #[serde(default)]
@@ -268,6 +271,26 @@ pub struct TaskReviewInput {
     pub evidence_refs: Vec<String>,
 }
 
+/// Model-authored treatment of a source-bound issue. This classifies evidence;
+/// it does not turn Task acceptance into a factual truth assertion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueDispositionKind {
+    MustResolve,
+    Disclose,
+    Resolved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IssueDisposition {
+    pub issue_ref: String,
+    pub disposition: IssueDispositionKind,
+    pub reason_ref: String,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MessagePublishInput {
@@ -282,6 +305,9 @@ pub struct MessagePublishInput {
     pub recipients: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent: Option<TaskIntent>,
+    /// Root adjudication of source-bound issues returned by state_inspect.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issue_dispositions: Vec<IssueDisposition>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -379,9 +405,9 @@ pub struct TeamUpdateInput {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactCommitInput {
-    /// Use `preceding_content` while authoring in a model response. The Host
-    /// replaces it with an `artifact://...` selector before Runtime validates
-    /// and commits this action.
+    /// An immutable artifact:// selector from artifact_publish, or
+    /// current_message_block:<zero-based-index> selecting an explicit Text
+    /// block in this model response. The Host persists only that block.
     pub content_ref: String,
     pub kind: String,
     pub title: String,
@@ -509,15 +535,8 @@ impl AgentAction {
                 optional_nonempty("scope_ref", input.scope_ref.as_deref())?;
                 optional_nonempty("entry_ref", input.entry_ref.as_deref())?;
                 optional_nonempty("page_cursor", input.page_cursor.as_deref())?;
-                if let Some(cursor) = input.page_cursor.as_deref() {
-                    if cursor
-                        .strip_prefix("state:")
-                        .is_none_or(|offset| offset.is_empty() || offset.parse::<usize>().is_err())
-                    {
-                        return Err(AgentActionValidationError::Invalid("page_cursor"));
-                    }
-                }
-                if input.page_cursor.is_some()
+                optional_nonempty("query", input.query.as_deref())?;
+                if (input.page_cursor.is_some() || input.query.is_some())
                     && (input.scope_ref.is_some() || input.entry_ref.is_some())
                 {
                     return Err(AgentActionValidationError::Invalid(
@@ -614,6 +633,22 @@ impl AgentAction {
                 }
                 unique_nonempty("refs", &input.refs)?;
                 unique_nonempty("recipients", &input.recipients)?;
+                let issue_refs = input
+                    .issue_dispositions
+                    .iter()
+                    .map(|item| item.issue_ref.clone())
+                    .collect::<Vec<_>>();
+                unique_nonempty("issue_dispositions.issue_ref", &issue_refs)?;
+                for item in &input.issue_dispositions {
+                    required("issue_dispositions.issue_ref", &item.issue_ref)?;
+                    required("issue_dispositions.reason_ref", &item.reason_ref)?;
+                    unique_nonempty("issue_dispositions.evidence_refs", &item.evidence_refs)?;
+                    if item.evidence_refs.is_empty() {
+                        return Err(AgentActionValidationError::Missing(
+                            "issue_dispositions.evidence_refs",
+                        ));
+                    }
+                }
                 if let Some(intent) = &input.intent {
                     required("intent.task_ref", &intent.task_ref)?;
                     optional_nonempty("intent.reason_ref", intent.reason_ref.as_deref())?;
@@ -866,6 +901,7 @@ mod tests {
             },
             expected_revision: None,
             action: AgentAction::StateInspect(StateInspectInput {
+                query: None,
                 wait_for_workers: false,
                 scope_ref: None,
                 after_revision: None,

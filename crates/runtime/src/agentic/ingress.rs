@@ -61,6 +61,10 @@ impl RuntimeServices {
                 }
             }
             AgentAction::MessagePublish(input) => {
+                for disposition in &input.issue_dispositions {
+                    evidence_refs.push(&disposition.reason_ref);
+                    evidence_refs.extend(&disposition.evidence_refs);
+                }
                 if let Some(content_ref) = &input.content_ref {
                     evidence_refs.push(content_ref);
                 }

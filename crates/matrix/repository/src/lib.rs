@@ -16,6 +16,7 @@ mod repository;
 
 pub use data_plane::MatrixLocalDataPlane;
 pub use port::{
+    MatrixCatalogPage, MatrixCatalogQuery, MatrixCatalogRecord, MatrixCatalogSnapshot,
     MatrixHealth, MatrixMetricRecomputeResult, MatrixRecallQuery, MatrixRevisioned, MatrixStore,
     MatrixStoreError, MatrixStoreHandle, MatrixStoreResult,
 };

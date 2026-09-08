@@ -283,6 +283,12 @@ mod tests {
     }
 
     impl FactLedger for SlowFactLedger {
+        fn catalog_page(
+            &self,
+            query: &fact_kernel::FactCatalogQuery,
+        ) -> FactLedgerResult<fact_kernel::FactCatalogPage> {
+            self.inner.catalog_page(query)
+        }
         fn upsert_fact(&self, fact: FactRecord) -> FactLedgerResult<FactRecord> {
             self.inner.upsert_fact(fact)
         }

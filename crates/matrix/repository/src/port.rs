@@ -54,6 +54,60 @@ impl MatrixRecallQuery {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MatrixCatalogSnapshot {
+    pub fence: String,
+    pub revisions: std::collections::BTreeMap<String, i64>,
+}
+#[derive(Debug, Clone)]
+pub struct MatrixCatalogQuery {
+    pub authorization: MatrixRecallQuery,
+    pub exact_ref: Option<String>,
+    pub after_ref: Option<String>,
+    pub snapshot: Option<MatrixCatalogSnapshot>,
+}
+#[derive(Debug, Clone)]
+pub enum MatrixCatalogRecord {
+    Fact(MatrixFact),
+    SourceSnapshot(MatrixSourceSnapshot),
+}
+impl MatrixCatalogRecord {
+    #[must_use]
+    pub fn reference(&self) -> String {
+        match self {
+            Self::Fact(fact) => format!("matrix:fact:{}", fact.fact_id),
+            Self::SourceSnapshot(snapshot) => snapshot.reference(),
+        }
+    }
+    #[must_use]
+    pub fn snapshot_id(&self) -> &str {
+        match self {
+            Self::Fact(fact) => &fact.snapshot_id,
+            Self::SourceSnapshot(snapshot) => &snapshot.snapshot_id,
+        }
+    }
+    #[must_use]
+    pub fn source_time(&self) -> String {
+        match self {
+            Self::Fact(fact) => fact.event_time.to_rfc3339(),
+            Self::SourceSnapshot(snapshot) => snapshot.captured_at.to_rfc3339(),
+        }
+    }
+    pub fn value(&self) -> Result<Value, serde_json::Error> {
+        match self {
+            Self::Fact(fact) => serde_json::to_value(fact),
+            Self::SourceSnapshot(snapshot) => serde_json::to_value(snapshot),
+        }
+    }
+}
+#[derive(Debug, Clone)]
+pub struct MatrixCatalogPage {
+    pub records: Vec<MatrixCatalogRecord>,
+    pub snapshot: MatrixCatalogSnapshot,
+    pub next_ref: Option<String>,
+}
+
 fn normalized_values(values: Vec<String>) -> Vec<String> {
     values
         .into_iter()
@@ -201,6 +255,7 @@ macro_rules! matrix_store_operations {
             list_attention(limit: usize) -> Vec<MatrixAttentionItem>;
             list_facts(limit: usize) -> Vec<MatrixFact>;
             recall_facts(query: &MatrixRecallQuery) -> Vec<MatrixFact>;
+            catalog_page(query: &MatrixCatalogQuery) -> MatrixCatalogPage;
             recompute_metrics() -> MatrixMetricRecomputeResult;
             recompute_metrics_for_metric_ids(metric_ids: &[String]) -> MatrixMetricRecomputeResult;
             list_metric_definitions() -> Vec<MatrixMetricDefinition>;

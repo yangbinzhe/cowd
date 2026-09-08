@@ -1267,7 +1267,9 @@ fn build_pool(
     if let Some(minimum) = lane.min_idle_connections {
         builder = builder.min_idle(Some(minimum));
     }
-    let pool = builder.build(manager).map_err(|error| {
+    // Pool initialization may drop partially connected synchronous clients on
+    // failure. Keep that cleanup outside the caller's Tokio runtime too.
+    let pool = in_postgres_driver_context(move || builder.build(manager)).map_err(|error| {
         StorageError::Other(format!(
             "postgres {} pool for `{}` could not be created: {error}",
             workload.as_str(),

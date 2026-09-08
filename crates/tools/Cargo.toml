@@ -11,6 +11,7 @@ harness-contract = { path = "../harness-contract" }
 base64 = "0.22"
 flate2 = "1"
 glob = "0.3"
+ignore = "0.4"
 mcp = { path = "../mcp" }
 plugins = { path = "../plugins" }
 sandbox-launcher = { path = "../sandbox-launcher" }

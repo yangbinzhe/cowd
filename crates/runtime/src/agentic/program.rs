@@ -19,6 +19,20 @@ pub enum AgenticProgramStatus {
     Cancelled,
 }
 
+/// A new authorization of the same business objective. Source facts remain
+/// immutable; generation belongs to Program authorization, not Task scheduling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AgenticProgramContinuation {
+    pub source_program_id: String,
+    pub source_objective_id: String,
+    pub source_root_id: String,
+    pub source_revision: u64,
+    pub source_status: AgenticProgramStatus,
+    pub authorization_generation: u64,
+    pub authorization_revision: u64,
+    pub binding_digest: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AgenticProgramProjection {
     pub program_id: String,
@@ -31,6 +45,8 @@ pub struct AgenticProgramProjection {
     pub model_lease: String,
     pub permission_ceiling: harness_contract::policy::PermissionMode,
     pub resource_scopes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<AgenticProgramContinuation>,
     pub revision: u64,
     pub status: AgenticProgramStatus,
     pub teams: BTreeMap<String, AgenticTeamProjection>,
@@ -65,6 +81,7 @@ impl AgenticProgramProjection {
             model_lease: "default".to_string(),
             permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             resource_scopes: Vec::new(),
+            continuation: None,
             revision: 0,
             status: AgenticProgramStatus::Open,
             teams: BTreeMap::new(),
@@ -430,6 +447,8 @@ pub struct AgenticTopicEntryProjection {
     pub recipients: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent: Option<harness_contract::agent_action::TaskIntent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issue_dispositions: Vec<harness_contract::agent_action::IssueDisposition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

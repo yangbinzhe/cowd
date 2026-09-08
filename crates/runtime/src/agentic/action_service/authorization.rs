@@ -87,6 +87,11 @@ pub(super) fn validate_transition(
         }
         AgentAction::TaskReview(input) => validate_task_review(projection, envelope, input),
         AgentAction::MessagePublish(input) => {
+            if let Some(error) =
+                super::super::issues::validate_dispositions(projection, envelope, input)
+            {
+                return Some(error);
+            }
             let program_topic = format!("topic:{}", projection.program_id);
             let team_topic_exists = projection
                 .teams
@@ -98,10 +103,10 @@ pub(super) fn validate_transition(
             None
         }
         AgentAction::ArtifactCommit(input) => {
-            if input.content_ref == "preceding_content" {
+            if !input.content_ref.starts_with("artifact://") {
                 return Some((
                     "content_ref_unresolved",
-                    "Gateway must persist preceding content before Runtime action".to_string(),
+                    "Use artifact_publish or select an explicit current_message_block:<index> before committing".to_string(),
                 ));
             }
             None

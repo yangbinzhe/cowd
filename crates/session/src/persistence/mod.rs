@@ -1,3 +1,8 @@
+mod discovery;
+pub use discovery::{
+    SessionContextDiscoveryPage, SessionDiscoveryFilter, SessionDiscoveryKind,
+    SessionDiscoveryPage, SessionDiscoveryRequest, SessionDiscoveryScope, SessionDiscoverySnapshot,
+};
 mod backend;
 #[doc(hidden)]
 pub mod domain;

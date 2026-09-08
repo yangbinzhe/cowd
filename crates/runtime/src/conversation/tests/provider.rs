@@ -1706,11 +1706,7 @@ fn explicit_provider_telemetry_lease_accepts_large_operator_supplied_capacity() 
         .expect("large collaboration telemetry value is accepted");
     assert_eq!(guard.snapshot().unwrap().limit, 8_000_000);
     assert!(registry
-        .install(
-            "session-over-limit",
-            "eval-over-limit",
-            20_000_001,
-        )
+        .install("session-over-limit", "eval-over-limit", 20_000_001,)
         .is_ok());
 }
 
@@ -2226,6 +2222,29 @@ async fn runtime_owns_fallback_attempts_and_repacks_each_candidate() {
 
 #[tokio::test]
 async fn account_failure_skips_same_account_models_but_preserves_independent_fallback() {
+    use crate::execution_core::graph::{
+        ExecutionResourceKind, ExecutionResourceManager, ResourceQuota,
+    };
+    let manager = Arc::new(ExecutionResourceManager::new(
+        [
+            ExecutionResourceKind::Provider,
+            ExecutionResourceKind::ProviderAccount("deepseek".into()),
+            ExecutionResourceKind::ProviderAccount("qwen-tokenplan".into()),
+            ExecutionResourceKind::ProviderModel("primary".into()),
+            ExecutionResourceKind::ProviderModel("fallback".into()),
+            ExecutionResourceKind::ProviderTokenPool("deepseek".into()),
+            ExecutionResourceKind::ProviderTokenPool("qwen-tokenplan".into()),
+        ]
+        .into_iter()
+        .map(|kind| {
+            let quota = if matches!(kind, ExecutionResourceKind::ProviderTokenPool(_)) {
+                ResourceQuota::new(1, 256, 256).unwrap()
+            } else {
+                ResourceQuota::new(1, 8, 16).unwrap()
+            };
+            (kind, quota)
+        }),
+    ));
     let same_account_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut same_account = ConversationRuntime::new(
         Session::new(),
@@ -2238,7 +2257,8 @@ async fn account_failure_skips_same_account_models_but_preserves_independent_fal
         SystemPromptBuilder::new().build(),
     )
     .without_memory()
-    .with_model_context_window(128_000);
+    .with_model_context_window(128_000)
+    .with_provider_admission(Arc::clone(&manager));
     same_account.set_active_model("primary");
     *same_account.fallbacks.write().unwrap() = vec!["fallback".to_string()];
     same_account
@@ -2250,12 +2270,20 @@ async fn account_failure_skips_same_account_models_but_preserves_independent_fal
         .expect_err("same account must be exhausted after one provider request");
     assert_eq!(
         error.provider_failure_scope(),
-        model_protocol::provider_failure::ProviderFailureScope::Account
+        model_protocol::provider_failure::ProviderFailureScope::Account,
+        "{error}"
     );
     assert_eq!(
         same_account_requests.lock().unwrap().as_slice(),
         &["primary".to_string()]
     );
+    let capacity = manager.snapshot(&ExecutionResourceKind::Provider).unwrap();
+    assert_eq!(
+        capacity.sample_count, 0,
+        "balance is not congestion or a success sample"
+    );
+    assert_eq!(capacity.active_leases, 0);
+    assert_eq!(capacity.effective_limit, 8);
 
     let independent_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut independent = ConversationRuntime::new(
@@ -2269,7 +2297,8 @@ async fn account_failure_skips_same_account_models_but_preserves_independent_fal
         SystemPromptBuilder::new().build(),
     )
     .without_memory()
-    .with_model_context_window(128_000);
+    .with_model_context_window(128_000)
+    .with_provider_admission(Arc::clone(&manager));
     independent.set_active_model("primary");
     *independent.fallbacks.write().unwrap() = vec!["fallback".to_string()];
     independent
@@ -2287,6 +2316,86 @@ async fn account_failure_skips_same_account_models_but_preserves_independent_fal
         independent_requests.lock().unwrap().as_slice(),
         &["primary".to_string(), "fallback".to_string()]
     );
+    let capacity = manager.snapshot(&ExecutionResourceKind::Provider).unwrap();
+    assert_eq!(
+        capacity.sample_count, 1,
+        "only the successful independent request is a capacity sample"
+    );
+    assert_eq!(capacity.failure_rate_basis_points, Some(0));
+    assert_eq!(capacity.active_leases, 0);
+}
+
+#[tokio::test]
+async fn capacity_feedback_excludes_route_failures_but_retains_real_pressure() {
+    use crate::execution_core::graph::{
+        ExecutionResourceKind, ExecutionResourceManager, ResourceQuota, ResourceResultClass,
+    };
+    use model_protocol::provider_failure::ProviderFailureScope;
+    let manager = Arc::new(ExecutionResourceManager::new([(
+        ExecutionResourceKind::Provider,
+        ResourceQuota::new(1, 8, 16).unwrap(),
+    )]));
+    let runtime = ConversationRuntime::new(
+        Session::new(),
+        AccountScopedRouteApi {
+            requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+            separate_fallback_account: false,
+        },
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+        SystemPromptBuilder::new().build(),
+    )
+    .without_memory()
+    .with_provider_admission(Arc::clone(&manager));
+    let lease = manager
+        .acquire(ExecutionResourceKind::Provider, None)
+        .await
+        .unwrap();
+    for scope in [
+        ProviderFailureScope::Account,
+        ProviderFailureScope::Configuration,
+    ] {
+        runtime.record_provider_resource_outcome(
+            Some(&lease),
+            Duration::ZERO,
+            Duration::from_millis(10),
+            ResourceResultClass::Failed,
+            Some(scope),
+        );
+    }
+    assert_eq!(
+        manager
+            .snapshot(&ExecutionResourceKind::Provider)
+            .unwrap()
+            .sample_count,
+        0
+    );
+    for (scope, class) in [
+        (ProviderFailureScope::Request, ResourceResultClass::Failed),
+        (
+            ProviderFailureScope::Account,
+            ResourceResultClass::DownstreamOverload,
+        ),
+        (
+            ProviderFailureScope::Configuration,
+            ResourceResultClass::TimedOut,
+        ),
+    ] {
+        runtime.record_provider_resource_outcome(
+            Some(&lease),
+            Duration::ZERO,
+            Duration::from_millis(10),
+            class,
+            Some(scope),
+        );
+    }
+    drop(lease);
+    let capacity = manager.snapshot(&ExecutionResourceKind::Provider).unwrap();
+    assert_eq!(capacity.sample_count, 3);
+    assert!(capacity.failure_rate_basis_points.unwrap() > 0);
+    assert!(capacity.overload_rate_basis_points.unwrap() > 0);
+    assert!(capacity.timeout_rate_basis_points.unwrap() > 0);
+    assert_eq!(capacity.active_leases, 0);
 }
 
 #[tokio::test]
@@ -3225,9 +3334,7 @@ fn collaboration_strategy_admits_agent_inspection_with_bounded_workspace_work() 
         vec!["system".to_string()],
     )
     .without_memory()
-    .with_runtime_event_store(Arc::new(
-        RuntimeEventStore::for_test(),
-    ));
+    .with_runtime_event_store(Arc::new(RuntimeEventStore::for_test()));
     runtime
         .begin_turn_strategy("turn-collaboration-work", "启动两个团队完成实现与复核")
         .expect("admit collaboration strategy");
@@ -3317,9 +3424,7 @@ fn explicit_team_obligation_survives_a_non_collaboration_setup_batch() {
         vec!["system".to_string()],
     )
     .without_memory()
-    .with_runtime_event_store(Arc::new(
-        RuntimeEventStore::for_test(),
-    ));
+    .with_runtime_event_store(Arc::new(RuntimeEventStore::for_test()));
     runtime
         .begin_turn_strategy("turn-team-setup", "必须启动一个 Team 完成实现与复核")
         .expect("admit explicit Team strategy");
@@ -3526,9 +3631,7 @@ async fn evidence_index_miss_falls_through_to_the_durable_tool_host() {
         vec!["system".to_string()],
     )
     .without_memory()
-    .with_runtime_event_store(Arc::new(
-        RuntimeEventStore::for_test(),
-    ))
+    .with_runtime_event_store(Arc::new(RuntimeEventStore::for_test()))
     .with_session_journal_port(crate::session_runtime_port::TestSessionPortAdapter::new(
         session_store,
     ))

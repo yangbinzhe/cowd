@@ -1618,6 +1618,7 @@ mod tests {
                     refs: vec![research_artifact.clone()],
                     recipients: Vec::new(),
                     intent: None,
+                    issue_dispositions: Vec::new(),
                 }),
             ))
             .expect("publish topic");

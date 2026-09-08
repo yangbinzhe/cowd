@@ -181,6 +181,8 @@ pub mod authorization_negotiator;
 pub mod autonomy_profile;
 #[path = "conflict/conflict_arbiter.rs"]
 pub mod conflict_arbiter;
+#[path = "context/content_publication.rs"]
+pub mod content_publication;
 #[path = "context/context_fanout.rs"]
 pub mod context_fanout;
 #[path = "infrastructure/cowd_event.rs"]
@@ -491,6 +493,7 @@ pub use session_runtime_port::{
 };
 
 pub use artifact::{
+    ArtifactCatalogPage, ArtifactCatalogQuery, ArtifactCatalogSnapshot, ArtifactDirectoryPage,
     ArtifactError, ArtifactGcPort, ArtifactGcReport, ArtifactMetadataPort,
     ArtifactMetadataRepository, ArtifactObjectRecord, ArtifactObjectTier, ArtifactReadPort,
     ArtifactRecord, ArtifactStore, ArtifactStoreConfig, ArtifactStoreStats, ArtifactWriteSink,
@@ -642,8 +645,8 @@ pub use reality_decision::{
     RealityMemoryDecision, RealityRecallQualityReport, RealityRuntimeDecision,
 };
 pub use reality_recall_port::{
-    MatrixScenarioPort, MatrixScenarioStartRequest, RealityRecallPort, RealityRecallReport,
-    RealityRecallSourceStatus,
+    MatrixDirectoryPage, MatrixScenarioPort, MatrixScenarioStartRequest, RealityDirectoryPage,
+    RealityExactContent, RealityRecallPort, RealityRecallReport, RealityRecallSourceStatus,
 };
 pub use recovery::{
     RecoveryAppliedAction, RecoveryExecutionReport, RecoveryExecutor, RecoveryFailedAction,

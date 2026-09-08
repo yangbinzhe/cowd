@@ -629,8 +629,6 @@ fn explicit_surface_consumers(route: &GatewayRouteManifestEntry) -> Vec<String> 
         ("GET", "/api/approval/pending"),
         ("GET", "/api/mission/control"),
         ("POST", "/api/mission/control"),
-        ("GET", "/api/mission/control/teams/:team_id/execution"),
-        ("GET", "/api/mission/control/teams/:team_id/evidence"),
         ("GET", "/api/mission/schedules"),
         ("POST", "/api/mission/schedules"),
         ("PATCH", "/api/mission/schedules/:id"),

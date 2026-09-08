@@ -26,6 +26,8 @@ fn gateway_observed_evidence(
         "read_many" => batch_success_outputs(&output)
             .filter_map(|child| complete_read_evidence(resolver, "read_file", child, sequence))
             .collect(),
+        "artifact_materialize" => materialized_artifact_evidence(resolver, &output, sequence)
+            .into_iter().collect(),
         "write_file" => write_file_evidence(resolver, "write_file", &output, sequence)
             .into_iter()
             .collect(),
@@ -415,4 +417,21 @@ fn network_evidence(
         model_observation: None,
         workspace_prior_state: None,
     }
+}
+
+fn materialized_artifact_evidence(
+    resolver: &runtime::path_identity::WorkspacePathIdentityResolver,
+    output: &serde_json::Value,
+    sequence: u64,
+) -> Option<harness_contract::context::ObservedEvidence> {
+    use harness_contract::context::{WorkspaceAccessMode, WorkspacePriorState};
+    if output.get("status")?.as_str()? != "materialized" { return None; }
+    let path = output.get("path")?.as_str()?;
+    let sha256 = output.get("sha256")?.as_str()?.strip_prefix("sha256:")?;
+    if !is_sha256_hex(sha256) { return None; }
+    let created = output.get("created")?.as_bool()?;
+    let mode = if created { WorkspaceAccessMode::Write } else { WorkspaceAccessMode::Read };
+    let mut evidence = resolver.observe_trusted_tool_output_file("artifact_materialize", mode, path, sha256, sequence).ok()?;
+    if created { evidence.workspace_prior_state = Some(WorkspacePriorState::Absent); }
+    Some(evidence)
 }

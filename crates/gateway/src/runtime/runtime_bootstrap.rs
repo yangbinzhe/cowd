@@ -251,20 +251,27 @@ pub(crate) fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition
         RuntimeToolDefinition {
             name: "context_retrieve".to_string(),
             description: Some(
-                "Actively retrieve focused context when the automatically assembled packet is incomplete or appears unrelated. Search the current Runtime Binding's Memory, read one authorized Memory by an id returned from search, discover the current actor's own Session catalog with a focused query, page authorized history, or read one exact message by stable id/sequence and block cursor. Follow returned read_request/next_request objects. Evidence references are audit locators, not MCP resources. This tool cannot mutate Memory or cross durable workspace/actor boundaries.".to_string(),
+                "Actively retrieve focused context when the automatically assembled packet is incomplete or appears unrelated. Search the current Runtime Binding's Memory, read one authorized Memory by an id returned from search, discover the current actor's own Session catalog with a focused query, page authorized history, or read one exact message by stable id/sequence and a digest-bound block cursor. Session discovery uses a stable creation snapshot and supports cursor continuation, including searches across all authorized workspace Sessions. Artifact discovery searches authorized metadata (ID, hash, MIME), freezes the first-page record set and returns evidence_retrieve requests for raw bytes. Matrix discovery and exact reads expose only leased source snapshots and their facts. Fact discovery and exact Fact/evidence reads reuse the Runtime data lease; entry_ref/read_request identify exact content, parent_ref proves the cited evidence relation. Program discovery delegates to the same authorized state_inspect owner and supports query, entry_ref and cursor. Memory search returns a resumable lexical directory plus separate bounded hybrid recommendations on the first page. Follow returned read_request/next_request objects. Evidence references are audit locators, not MCP resources. This tool cannot mutate Memory or cross durable workspace/actor boundaries.".to_string(),
             ),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "source": {
                         "type": "string",
-                        "enum": ["memory", "session_catalog", "session_history"]
+                        "enum": ["memory", "program", "artifact", "fact", "matrix", "session_catalog", "session_history"]
                     },
                     "query": {
                         "type": "string",
                         "minLength": 1,
                         "description": "A focused semantic or full-text query. Required for memory search unless memory_id is supplied, session catalog discovery, and related_sessions search."
                     },
+                    "cursor": {"type":"string", "description":"Source directory/history continuation from next_request; binds query, authorization scope and source revision."},
+                    "content_cursor": {
+                        "type": "string",
+                        "description": "Exact-content continuation from next_request; valid with memory/memory_id or fact|matrix/entry_ref. Bound to the source content hash."
+                    },
+                    "parent_ref": {"type":"string", "description":"Authorized parent Fact reference returned in an evidence read_request; required for fact:evidence reads."},
+                    "entry_ref": {"type":"string", "description":"Exact entry returned by Program, Fact or Matrix discovery; checked against the current Runtime binding."},
                     "memory_id": {
                         "type": "string",
                         "description": "Exact Memory UUID returned by a prior memory search. Valid only with source=memory and always rechecked against the current Runtime Memory Binding."
@@ -284,16 +291,12 @@ pub(crate) fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition
                         "maximum": 16,
                         "default": 8
                     },
-                    "offset": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": "Session catalog page offset."
-                    },
                     "before_sequence": {
                         "type": "integer",
                         "minimum": 0,
                         "description": "Read an older bounded page ending before this message sequence when query is omitted."
                     },
+                    "message_digest": {"type":"string","description":"Exact message content digest from read_request/next_request; required for nonzero block_cursor and checked before every page."},
                     "message_id": {
                         "type": "string",
                         "description": "Read one exact authorized Session message by immutable stable id."
@@ -347,13 +350,14 @@ pub(crate) fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition
         RuntimeToolDefinition {
             name: "evidence_retrieve".to_string(),
             description: Some(
-                "Retrieve selected chunks from an immutable tool:// evidence receipt or artifact:// content reference. Use this before independent review; use a focused query when the content is large.".to_string(),
+                "Read immutable tool:// evidence or artifact:// content. Follow next_request for complete sequential reading. encoding=utf8 returns original text; encoding=base64 returns lossless binary chunks to concatenate and decode. A query filters text chunks and is not valid for binary content. Copy returned references exactly, do not reconstruct them from IDs.".to_string(),
             ),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "evidence_ref": { "type": "string", "description": "tool:// evidence reference or artifact:// content reference" },
-                    "query": { "type": "string", "description": "Optional FTS query; omit to read the first chunks" },
+                    "query": { "type": "string", "description": "Optional case-insensitive term filter; omit for full sequential reading" },
+                    "cursor": { "type": "string", "description": "Opaque continuation returned in next_request, bound to the source hash and query" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 16 }
                 },
                 "required": ["evidence_ref"],
@@ -363,6 +367,20 @@ pub(crate) fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition
             effect_resolver: runtime_effect_resolver("runtime.readonly"),
         },
     ];
+    definitions.push(RuntimeToolDefinition {
+        name: "artifact_publish".into(),
+        description: Some("Publish an explicit file snapshot (hash from read_file), stored Session text block (digest from context_retrieve), or authorized artifact. Returns immutable content_ref/sha256/bytes for artifact_commit. No body in JSON; never guess the latest text.".into()),
+        input_schema: serde_json::to_value(schemars::schema_for!(harness_contract::content_publication::ArtifactPublishInput)).expect("publication schema"),
+        required_permission: ToolPermissionMode::ReadOnly,
+        effect_resolver: runtime_effect_resolver("runtime.readonly"),
+    });
+    definitions.push(RuntimeToolDefinition {
+        name: "artifact_materialize".into(),
+        description: Some("Export authorized artifact bytes to a new workspace path without model rewriting. Supply content_ref and sha256 from publication. An existing identical file is accepted; different content is never overwritten.".into()),
+        input_schema: serde_json::to_value(schemars::schema_for!(harness_contract::content_publication::ArtifactMaterializeInput)).expect("materialization schema"),
+        required_permission: ToolPermissionMode::WorkspaceWrite,
+        effect_resolver: runtime_effect_resolver("runtime.state_write"),
+    });
     definitions.extend(agent_action_tool_definitions());
     definitions
 }
@@ -413,11 +431,11 @@ fn agent_action_tool_definitions() -> Vec<RuntimeToolDefinition> {
         ),
         agent_action_definition::<action::MessagePublishInput>(
             action::MESSAGE_PUBLISH_TOOL_ID,
-            "Publish a concise Team/Program update or a reference to committed long content. This is shared semantic communication, not private chain-of-thought.",
+            "Publish a concise Team/Program update or committed content reference. The root may adjudicate issue_refs returned by state_inspect via issue_dispositions: must_resolve, disclose, or resolved, each with durable reason_ref and evidence_refs. Disclose preserves a labelled limitation; it does not assert an estimate is a measurement. This is shared semantic communication, not private chain-of-thought.",
         ),
         agent_action_definition::<action::ArtifactCommitInput>(
             action::ARTIFACT_COMMIT_TOOL_ID,
-            "Commit a staged model content part or existing content reference as a versioned artifact. Use content_ref=preceding_content only when ordinary model content immediately precedes this tool call; never put the content body in JSON.",
+            "Commit an explicit artifact_publish content_ref, or content_ref=current_message_block:<zero-based-index> to select exactly one Text block in this response. A missing block never falls back to another paragraph or previous draft. Never put the content body in JSON.",
         ),
         agent_action_definition::<action::ObjectiveUpdateInput>(
             action::OBJECTIVE_UPDATE_TOOL_ID,
@@ -692,6 +710,10 @@ mod tests {
             ToolPermissionMode::ReadOnly
         );
         assert_eq!(evidence_tool.input_schema["required"][0], "evidence_ref");
+        assert_eq!(
+            evidence_tool.input_schema["properties"]["cursor"]["type"],
+            "string"
+        );
         assert_eq!(
             evidence_tool.input_schema["properties"]["query"]["type"],
             "string"

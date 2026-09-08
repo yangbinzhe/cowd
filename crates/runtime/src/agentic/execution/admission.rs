@@ -64,6 +64,10 @@ pub(super) fn resolve_agentic_execution_admission(
     let mut requested_tools = resolved.allowed_tools.clone();
     requested_tools.extend(AGENT_ACTION_TOOL_IDS.iter().map(|tool| (*tool).to_string()));
     requested_tools.extend(skill_tool_refs.iter().cloned());
+    requested_tools.insert("artifact_publish".into());
+    if required.iter().any(|capability| capability == "write") {
+        requested_tools.insert("artifact_materialize".into());
+    }
 
     let session_ceiling = services
         .session_execution_policy(&context.session_id)
@@ -330,7 +334,10 @@ pub(super) fn tool_effect_has_resource_lease(
     resource_scopes: &[String],
 ) -> bool {
     if AGENT_ACTION_TOOL_IDS.contains(&tool_name)
-        || matches!(tool_name, "context_retrieve" | "evidence_retrieve")
+        || matches!(
+            tool_name,
+            "context_retrieve" | "evidence_retrieve" | "artifact_publish"
+        )
     {
         return true;
     }

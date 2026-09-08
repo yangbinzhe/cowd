@@ -33,11 +33,9 @@ pub(crate) fn spawn_surface_ingress_dispatcher(
         crate::runtime_host::task_set::GatewayTaskKind::SurfaceIngress,
         None,
         move |cancellation| async move {
-            // This is only a process-local scan cache. The durable Surface
-            // ledger and idempotent Session event remain the two authorities;
-            // restart intentionally clears the cache and rechecks terminal
-            // rows to repair a crash between ledger settlement and projection.
-            let mut reconciled_terminal_inbox = BTreeSet::new();
+            // Retry timing is advisory. Restart rechecks the durable Surface
+            // ledger and idempotent Session events after a partial projection.
+            let mut projection_recovery = SurfaceProjectionRecovery::default();
             let mut retry_tick = tokio::time::interval(Duration::from_secs(5));
             retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut reconciliation_tick = tokio::time::interval(Duration::from_secs(30));
@@ -56,7 +54,7 @@ pub(crate) fn spawn_surface_ingress_dispatcher(
                         dispatch_pending_ingress(&state, &claim_owner, &concurrency, &task_owner).await;
                         reconcile_surface_terminal_deliveries(
                             &state,
-                            &mut reconciled_terminal_inbox,
+                            &mut projection_recovery,
                         ).await;
                     }
                     received = rx.recv() => {
@@ -169,9 +167,60 @@ async fn process_durable_ingress_frame(
 /// correlations from the durable inbox plus Session ingress identity, then
 /// sends through the unchanged Surface outbox with a stable idempotency key.
 /// It never treats transient TextDelta as a channel reply.
+// Advisory process-local retry state; durable inbox projections remain truth.
+// Successful repairs are deliberately rechecked on later scans so a corrected
+// or replayed durable row cannot be hidden behind a terminal-key cache.
+#[derive(Default)]
+struct SurfaceProjectionRecovery {
+    failures: BTreeMap<String, (u32, tokio::time::Instant)>,
+}
+
+impl SurfaceProjectionRecovery {
+    fn ready(&self, key: &str, now: tokio::time::Instant) -> bool {
+        self.failures.get(key).is_none_or(|(_, due)| now >= *due)
+    }
+
+    fn record(&mut self, key: &str, succeeded: bool, now: tokio::time::Instant) {
+        if succeeded {
+            self.failures.remove(key);
+            return;
+        }
+        let failures = self
+            .failures
+            .get(key)
+            .map_or(1, |(count, _)| count.saturating_add(1));
+        let delay = Duration::from_secs((30u64 << failures.min(7)).min(3600));
+        self.failures
+            .insert(key.to_string(), (failures, now + delay));
+    }
+}
+
+async fn repair_surface_inbox_projections(
+    state: &AppState,
+    inbox: &crate::surface_host::SurfaceInboxRecord,
+) -> Result<(), String> {
+    repair_surface_baseline_projection(state, inbox).await?;
+    if inbox.status != "received" {
+        repair_surface_resource_projection(state, inbox).await?;
+    }
+    if let Some(correlation) = inbox.correlation.as_ref() {
+        append_surface_accepted_projection(
+            state,
+            inbox,
+            &correlation.turn_id,
+            &correlation.execution_id,
+        )
+        .await?;
+    }
+    if inbox.status == "replied" {
+        repair_surface_replied_projection(state, inbox).await?;
+    }
+    Ok(())
+}
+
 async fn reconcile_surface_terminal_deliveries(
     state: &Arc<AppState>,
-    reconciled_terminal_inbox: &mut BTreeSet<String>,
+    recovery: &mut SurfaceProjectionRecovery,
 ) {
     let runtime_service = state.services.runtime.as_ref();
     let inboxes = match state.services.surface.all_inbox() {
@@ -181,70 +230,30 @@ async fn reconcile_surface_terminal_deliveries(
             return;
         }
     };
+    let keys: BTreeSet<_> = inboxes
+        .iter()
+        .map(|inbox| inbox.idempotency_key.as_str())
+        .collect();
+    recovery
+        .failures
+        .retain(|key, _| keys.contains(key.as_str()));
     for inbox in inboxes {
-        if matches!(inbox.status.as_str(), "replied" | "failed")
-            && reconciled_terminal_inbox.contains(&inbox.idempotency_key)
-        {
+        if !recovery.ready(&inbox.idempotency_key, tokio::time::Instant::now()) {
             continue;
         }
-        // The inbox row and durable ingress frame are the projection outbox.
-        // Every scan reconstructs the phases implied by that durable state;
-        // no process-local acknowledgement is required for correctness.
-        if let Err(error) = repair_surface_baseline_projection(state, &inbox).await {
+        let repair = repair_surface_inbox_projections(state, &inbox).await;
+        recovery.record(
+            &inbox.idempotency_key,
+            repair.is_ok(),
+            tokio::time::Instant::now(),
+        );
+        if let Err(error) = repair {
             tracing::warn!(
                 surface = %inbox.surface,
                 message_id = %inbox.message_id,
                 error = %error,
-                "surface timeline baseline repair failed"
+                "surface projection repair failed; this inbox will retry with backoff"
             );
-            continue;
-        }
-        if inbox.status != "received" {
-            if let Err(error) = repair_surface_resource_projection(state, &inbox).await {
-                tracing::warn!(
-                    surface = %inbox.surface,
-                    message_id = %inbox.message_id,
-                    error = %error,
-                    "surface resources projection repair failed"
-                );
-            }
-        }
-        if let Some(correlation) = inbox.correlation.as_ref() {
-            if let Err(error) = append_surface_accepted_projection(
-                state,
-                &inbox,
-                &correlation.turn_id,
-                &correlation.execution_id,
-            )
-            .await
-            {
-                tracing::warn!(
-                    surface = %inbox.surface,
-                    message_id = %inbox.message_id,
-                    error = %error,
-                    "surface accepted projection repair failed"
-                );
-            }
-        }
-        if inbox.status == "replied" {
-            let repair = repair_surface_replied_projection(state, &inbox).await;
-            match repair {
-                Ok(()) => {
-                    reconciled_terminal_inbox.insert(inbox.idempotency_key.clone());
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        surface = %inbox.surface,
-                        message_id = %inbox.message_id,
-                        error = %error,
-                        "surface replied projection repair failed"
-                    );
-                }
-            }
-            continue;
-        }
-        if inbox.status == "failed" {
-            reconciled_terminal_inbox.insert(inbox.idempotency_key.clone());
             continue;
         }
         if !matches!(
@@ -1111,10 +1120,15 @@ async fn flush_surface_projection(
     }
 }
 
-async fn repair_surface_baseline_projection(
-    state: &AppState,
+fn missing_surface_baseline_projections(
     inbox: &crate::surface_host::SurfaceInboxRecord,
-) -> Result<(), String> {
+) -> Result<Vec<surface::SurfaceSessionProjectionDraft>, String> {
+    if ["received", "activated"]
+        .iter()
+        .all(|phase| inbox.session_projections.iter().any(|p| p.phase == *phase))
+    {
+        return Ok(Vec::new());
+    }
     let session_id = inbox
         .correlation
         .as_ref()
@@ -1126,37 +1140,49 @@ async fn repair_surface_baseline_projection(
                 inbox.idempotency_key
             )
         })?;
-    if !inbox
-        .session_projections
-        .iter()
-        .any(|projection| projection.phase == "received")
-    {
-        let content_preview = payload_string(&inbox.payload_json, "text")
-            .or_else(|| payload_string(&inbox.payload_json, "content"))
-            .unwrap_or_else(|| inbox.payload_summary.clone())
-            .chars()
-            .take(160)
-            .collect();
-        let drafts = vec![
-            SurfaceSessionJournalEvent::SurfaceMessageReceived {
-                surface: inbox.surface.clone(),
-                message_id: inbox.message_id.clone(),
-                thread_id: inbox.thread_id.clone(),
-                user_id: inbox.sender_id.clone(),
-                content_preview,
-                inbox_ref: format!("surface-inbox:{}", inbox.idempotency_key),
-                payload_sha256: inbox.payload_hash.clone(),
-            }
-            .projection_draft(session_id.to_string())
-            .map_err(|error| error.to_string())?,
-            SurfaceSessionJournalEvent::SurfaceSessionRuntimeActivated {
-                surface: inbox.surface.clone(),
-                session_id: session_id.to_string(),
-                message_id: inbox.message_id.clone(),
-            }
-            .projection_draft(session_id.to_string())
-            .map_err(|error| error.to_string())?,
-        ];
+    let content_preview = payload_string(&inbox.payload_json, "text")
+        .or_else(|| payload_string(&inbox.payload_json, "content"))
+        .unwrap_or_else(|| inbox.payload_summary.clone())
+        .chars()
+        .take(160)
+        .collect();
+    let candidates = vec![
+        SurfaceSessionJournalEvent::SurfaceMessageReceived {
+            surface: inbox.surface.clone(),
+            message_id: inbox.message_id.clone(),
+            thread_id: inbox.thread_id.clone(),
+            user_id: inbox.sender_id.clone(),
+            content_preview,
+            inbox_ref: format!("surface-inbox:{}", inbox.idempotency_key),
+            payload_sha256: inbox.payload_hash.clone(),
+        }
+        .projection_draft(session_id.to_string())
+        .map_err(|error| error.to_string())?,
+        SurfaceSessionJournalEvent::SurfaceSessionRuntimeActivated {
+            surface: inbox.surface.clone(),
+            session_id: session_id.to_string(),
+            message_id: inbox.message_id.clone(),
+        }
+        .projection_draft(session_id.to_string())
+        .map_err(|error| error.to_string())?,
+    ];
+    Ok(candidates
+        .into_iter()
+        .filter(|draft| {
+            !inbox
+                .session_projections
+                .iter()
+                .any(|existing| existing.phase == draft.phase)
+        })
+        .collect())
+}
+
+async fn repair_surface_baseline_projection(
+    state: &AppState,
+    inbox: &crate::surface_host::SurfaceInboxRecord,
+) -> Result<(), String> {
+    let drafts = missing_surface_baseline_projections(inbox)?;
+    if !drafts.is_empty() {
         state
             .services
             .surface
@@ -1732,6 +1758,201 @@ fn final_text(summary: &runtime::TurnSummary) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn projection_recovery_inbox() -> surface::SurfaceInboxRecord {
+        surface::SurfaceInboxRecord {
+            id: "feishu:message-1".into(),
+            surface: "feishu".into(),
+            message_id: "message-1".into(),
+            idempotency_key: "feishu:message-1".into(),
+            thread_id: None,
+            sender_id: None,
+            payload_hash: "hash".into(),
+            payload_summary: "hello".into(),
+            payload_json: serde_json::json!({"text":"hello"}),
+            status: "received".into(),
+            received_at_ms: 100,
+            updated_at_ms: 100,
+            runtime_session_id: Some("session-1".into()),
+            runtime_turn_id: None,
+            correlation: None,
+            session_projections: Vec::new(),
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn baseline_recovery_repairs_each_partial_phase_without_rewriting_existing_events() {
+        for existing_phase in ["received", "activated"] {
+            let mut inbox = projection_recovery_inbox();
+            let initial = missing_surface_baseline_projections(&inbox).unwrap();
+            let existing = initial.iter().find(|p| p.phase == existing_phase).unwrap();
+            inbox
+                .stage_session_projections(std::slice::from_ref(existing))
+                .unwrap();
+            let event_id = inbox.session_projections[0].event_id.clone();
+            inbox
+                .mark_session_projection_applied(&event_id, 123)
+                .unwrap();
+            let preserved = inbox.session_projections[0].clone();
+            let missing = missing_surface_baseline_projections(&inbox).unwrap();
+            assert_eq!(missing.len(), 1);
+            assert_ne!(missing[0].phase, existing_phase);
+            inbox.stage_session_projections(&missing).unwrap();
+            inbox.stage_session_projections(&missing).unwrap();
+            assert_eq!(inbox.session_projections.len(), 2);
+            assert_eq!(
+                inbox
+                    .session_projections
+                    .iter()
+                    .find(|p| p.event_id == preserved.event_id),
+                Some(&preserved)
+            );
+            assert!(missing_surface_baseline_projections(&inbox)
+                .unwrap()
+                .is_empty());
+            // Restart round-trips the durable record, not an in-memory cache.
+            let restored = serde_json::from_value(serde_json::to_value(&inbox).unwrap()).unwrap();
+            assert!(missing_surface_baseline_projections(&restored)
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn projection_recovery_flushes_partial_inbox_to_postgres_and_isolates_bad_rows() {
+        let state = crate::api_routes::tests::test_state();
+        let session_id = format!("surface-recovery-{}", uuid::Uuid::new_v4());
+        state
+            .services
+            .session
+            .create_stored_session_for_tests(&crate::api_routes::new_api_session_record(
+                &session_id,
+                None,
+            ))
+            .await
+            .unwrap();
+        let mut source = projection_recovery_inbox();
+        source.runtime_session_id = Some(session_id.clone());
+        let received = missing_surface_baseline_projections(&source)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.phase == "received")
+            .unwrap();
+        let good = state
+            .services
+            .surface
+            .record_inbox_received(
+                "feishu",
+                "message-1",
+                &source.payload_json,
+                &session_id,
+                None,
+                None,
+                &[received],
+            )
+            .unwrap()
+            .record;
+        // A second row has a missing Session. It must not prevent the healthy
+        // row from completing or be silently marked repaired.
+        let bad = state
+            .services
+            .surface
+            .record_inbox_received(
+                "feishu",
+                "broken",
+                &source.payload_json,
+                "absent-session",
+                None,
+                None,
+                &[],
+            )
+            .unwrap()
+            .record;
+        let mut recovery = SurfaceProjectionRecovery::default();
+        reconcile_surface_terminal_deliveries(&state, &mut recovery).await;
+        let repaired = state
+            .services
+            .surface
+            .inbox_by_key(&good.idempotency_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(repaired.session_projections.len(), 2);
+        assert!(surface_projection_is_applied(&repaired, "received"));
+        assert!(surface_projection_is_applied(&repaired, "activated"));
+        assert!(recovery.failures.contains_key(&bad.idempotency_key));
+        assert!(!recovery.failures.contains_key(&good.idempotency_key));
+        // Clear advisory state to simulate restart. Event-id idempotency in
+        // the real PG-backed Session journal must prevent duplicate events.
+        reconcile_surface_terminal_deliveries(&state, &mut SurfaceProjectionRecovery::default())
+            .await;
+        let replayed = state
+            .services
+            .surface
+            .inbox_by_key(&good.idempotency_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(replayed.session_projections, repaired.session_projections);
+        let events = state
+            .services
+            .session
+            .stored_session_domain_events_page(&session_id, 0, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            events
+                .events
+                .iter()
+                .filter(|event| event.kind == "surface.message_received")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .events
+                .iter()
+                .filter(|event| event.kind == "surface.runtime_activated")
+                .count(),
+            1
+        );
+        assert!(state.services.surface.outbox("feishu").unwrap().is_empty());
+    }
+
+    #[test]
+    fn baseline_recovery_does_not_invent_a_missing_session_identity() {
+        let mut inbox = projection_recovery_inbox();
+        inbox.runtime_session_id = None;
+        assert!(missing_surface_baseline_projections(&inbox)
+            .unwrap_err()
+            .contains("Session identity"));
+        assert!(inbox.session_projections.is_empty());
+    }
+
+    #[test]
+    fn projection_recovery_backoff_is_per_record_bounded_and_cleared_after_success() {
+        let now = tokio::time::Instant::now();
+        let mut recovery = SurfaceProjectionRecovery::default();
+        recovery.record("broken", false, now);
+        assert!(!recovery.ready("broken", now + Duration::from_secs(30)));
+        assert!(recovery.ready("healthy", now));
+        assert!(recovery.ready("broken", now + Duration::from_secs(60)));
+        recovery.record("broken", false, now);
+        assert!(!recovery.ready("broken", now + Duration::from_secs(60)));
+        assert!(recovery.ready("broken", now + Duration::from_secs(120)));
+        for _ in 0..100 {
+            recovery.record("broken", false, now);
+        }
+        assert!(!recovery.ready("broken", now + Duration::from_secs(3599)));
+        assert!(recovery.ready("broken", now + Duration::from_secs(3600)));
+        recovery.record("broken", true, now);
+        assert!(recovery.ready("broken", now));
+        assert!(recovery.failures.is_empty());
+        // Success never permanently exempts a terminal key from reconciliation.
+        recovery.record("broken", false, now);
+        assert!(!recovery.ready("broken", now));
+        assert!(SurfaceProjectionRecovery::default().ready("broken", now));
+    }
 
     #[test]
     fn surface_session_id_prefers_explicit_session() {

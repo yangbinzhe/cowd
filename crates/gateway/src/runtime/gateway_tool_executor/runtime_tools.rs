@@ -227,6 +227,7 @@ impl GatewayToolExecutor {
                 session_id: self.runtime_session_id.as_deref(),
                 authorized_scopes: &[],
                 memory_context: self.runtime_memory_context.as_ref(),
+                reality_context: None,
                 model_lease: self.runtime_model_lease.as_deref(),
                 parent_execution: None,
                 execution_decision: None,
@@ -242,6 +243,9 @@ impl GatewayToolExecutor {
         mut value: serde_json::Value,
         binding: RuntimeToolExecutionBinding<'_>,
     ) -> Result<String, ToolError> {
+        if matches!(tool_name, "artifact_publish" | "artifact_materialize") {
+            return self.execute_content_publication(tool_name, value, binding).await;
+        }
         if is_agent_action_tool(tool_name) {
             let services = self.runtime_services.get().cloned().ok_or_else(|| {
                 ToolError::new("Agent action requires the workspace RuntimeServices")
@@ -570,6 +574,26 @@ impl GatewayToolExecutor {
             ToolError::new("context_retrieve requires the workspace RuntimeServices")
         })?;
         let limit = input.limit.unwrap_or(8).clamp(1, 16);
+        if input.cursor.is_some() && (input.memory_id.is_some() || input.entry_ref.is_some() || input.message_id.is_some() || input.sequence.is_some()) {
+            return Err(ToolError::new("directory cursor cannot be combined with an exact read"));
+        }
+        if (input.message_id.is_some() || input.sequence.is_some() || input.block_cursor.is_some() || input.block_limit.is_some() || input.before_sequence.is_some()) && input.source!=ContextRetrieveSource::SessionHistory {
+            return Err(ToolError::new("message selectors apply only to source=session_history"));
+        }
+        if (input.block_cursor.is_some() || input.block_limit.is_some()) && input.message_id.is_none() && input.sequence.is_none() {
+            return Err(ToolError::new("block controls require an exact message selector"));
+        }
+        if input.message_digest.is_some() && (input.source!=ContextRetrieveSource::SessionHistory || (input.message_id.is_none() && input.sequence.is_none())) {
+            return Err(ToolError::new("message_digest requires an exact Session message read"));
+        }
+        if input.entry_ref.is_some() && !matches!(input.source, ContextRetrieveSource::Program | ContextRetrieveSource::Fact | ContextRetrieveSource::Matrix) {
+            return Err(ToolError::new("entry_ref requires source=program, fact or matrix"));
+        }
+        if input.content_cursor.is_some()
+            && !((input.source == ContextRetrieveSource::Memory && input.memory_id.is_some()) || (matches!(input.source, ContextRetrieveSource::Fact | ContextRetrieveSource::Matrix) && input.entry_ref.is_some()))
+        {
+            return Err(ToolError::new("content_cursor requires an exact Memory, Fact or Matrix read"));
+        }
         if input.memory_id.is_some() && input.source != ContextRetrieveSource::Memory {
             return Err(ToolError::new("memory_id is valid only with source=memory"));
         }
@@ -582,7 +606,11 @@ impl GatewayToolExecutor {
             ));
         }
 
+        if input.parent_ref.is_some() && input.source != ContextRetrieveSource::Fact {
+            return Err(ToolError::new("parent_ref requires source=fact"));
+        }
         let value = match input.source {
+            ContextRetrieveSource::Fact | ContextRetrieveSource::Matrix => self.retrieve_reality_context(&input,binding,&services,limit).await?,
             ContextRetrieveSource::Memory => {
                 if input
                     .scope
@@ -593,7 +621,7 @@ impl GatewayToolExecutor {
                     ));
                 }
                 let Some(manager) = services.memory_manager() else {
-                    return serde_json::to_string_pretty(&serde_json::json!({
+                    return serialize_context_result(&serde_json::json!({
                         "kind": "runtime.context_retrieval",
                         "source": "memory",
                         "scope": "current_binding",
@@ -604,7 +632,7 @@ impl GatewayToolExecutor {
                     .map_err(|error| ToolError::new(error.to_string()));
                 };
                 let Some(context) = binding.memory_context.cloned() else {
-                    return serde_json::to_string_pretty(&serde_json::json!({
+                    return serialize_context_result(&serde_json::json!({
                         "kind": "runtime.context_retrieval",
                         "source": "memory",
                         "scope": "current_binding",
@@ -628,20 +656,52 @@ impl GatewayToolExecutor {
                         .await
                         .map_err(|error| ToolError::new(error.to_string()))?;
                     let selected = entry
-                        .map(|entry| {
-                            let (content, truncated) = bounded_context_text(&entry.content, 8_192);
-                            serde_json::json!({
+                        .map(|entry| -> Result<serde_json::Value, ToolError> {
+                            let mut revision = Sha256::new();
+                            revision.update(entry.id.as_bytes());
+                            revision.update(entry.updated_at.to_rfc3339().as_bytes());
+                            revision.update([0]);
+                            revision.update(entry.content.as_bytes());
+                            let digest = format!("sha256:{:x}", revision.finalize());
+                            let page = evidence_content_page(
+                                &entry.content,
+                                &digest,
+                                &EvidenceRetrieveToolRequest {
+                                    evidence_ref: format!("memory:{}", entry.id),
+                                    query: None,
+                                    limit: Some(limit),
+                                    cursor: input.content_cursor.clone(),
+                                },
+                            )?;
+                            let content = page["chunks"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|chunk| chunk["content"].as_str())
+                                .collect::<String>();
+                            let next_request = page["next_cursor"].as_str().map(|cursor| {
+                                serde_json::json!({
+                                    "source": "memory", "memory_id": entry.id,
+                                    "content_cursor": cursor, "limit": limit,
+                                })
+                            });
+                            Ok(serde_json::json!({
                                 "memory_id": entry.id,
+                                "source_kind":"memory", "ref":format!("memory:{}",entry.id), "source_time":entry.updated_at, "information_status":"visible_entry",
+                                "read_request":{"source":"memory","memory_id":entry.id},
                                 "layer": format!("{:?}", entry.layer),
                                 "category": format!("{:?}", entry.category),
                                 "title": entry.title,
                                 "content": content,
-                                "content_truncated": truncated,
+                                "content_truncated": page["truncated"],
+                                "revision_digest": digest,
+                                "next_request": next_request,
                                 "scope": entry.scope.to_string(),
                                 "updated_at": entry.updated_at,
                                 "evidence_ref": format!("memory:{}", entry.id),
-                            })
+                            }))
                         })
+                        .transpose()?
                         .into_iter()
                         .collect::<Vec<_>>();
                     serde_json::json!({
@@ -653,114 +713,128 @@ impl GatewayToolExecutor {
                         "selected_count": selected.len(),
                         "selected": selected,
                         "authorization": "exact Runtime Memory Binding",
-                        "reference_contract": context_reference_contract(),
                     })
                 } else {
                     let query = query.as_deref().ok_or_else(|| {
                         ToolError::new("memory retrieval requires query or memory_id")
                     })?;
-                    let packet = kernel
-                        .retrieve_packet_preview(&context, query, limit, 8_192)
-                        .await
+                    let (recommendations, recommendation_error) = if input.cursor.is_none() {
+                        match kernel.retrieve_packet_preview(&context, query, limit, 8_192).await {
+                            Ok(packet) => (packet.selected.iter().map(|item| serde_json::json!({
+                                "memory_id":item.atom.id, "title":item.atom.title, "preview":item.content_preview,
+                                "reason":item.reason, "read_request":{"source":"memory","scope":"current","memory_id":item.atom.id}
+                            })).collect::<Vec<_>>(), None),
+                            Err(error) => (Vec::new(), Some(error.to_string())),
+                        }
+                    } else { (Vec::new(), None) };
+                    let page = kernel.discover_page(&context, query, input.cursor.as_deref(), limit).await
                         .map_err(|error| ToolError::new(error.to_string()))?;
                     serde_json::json!({
-                        "kind": "runtime.context_retrieval",
-                        "source": "memory",
-                        "scope": "current_binding",
-                        "status": "completed",
-                        "query": query,
-                        "selected": packet.selected.iter().map(|item| serde_json::json!({
-                            "memory_id": item.atom.id,
-                            "layer": format!("{:?}", item.atom.layer),
-                            "role": format!("{:?}", item.role),
-                            "title": item.atom.title,
-                            "preview": item.content_preview,
-                            "reason": item.reason,
-                            "evidence_ref": item.atom.evidence_pointer,
-                            "read_request": {
-                                "source": "memory",
-                                "scope": "current",
-                                "memory_id": item.atom.id,
-                            },
+                        "kind": "runtime.context_retrieval", "source":"memory", "scope":"current_binding",
+                        "status":"completed", "query":query,
+                        "selected":page.selected.iter().map(|item| serde_json::json!({
+                            "source_kind":"memory", "ref":format!("memory:{}",item.atom.id), "memory_id":item.atom.id,
+                            "revision":item.revision, "scope":item.scope.scope_key(), "source_time":item.updated_at,
+                            "information_status":item.atom.state, "layer":format!("{:?}",item.atom.layer),
+                            "title":item.atom.title, "preview":item.preview, "evidence_ref":item.atom.evidence_pointer,
+                            "read_request":{"source":"memory","scope":"current","memory_id":item.atom.id}
                         })).collect::<Vec<_>>(),
-                        "selected_count": packet.selected.len(),
-                        "omitted_count": packet.omitted.len(),
-                        "truncated": packet.truncated,
-                        "token_estimate": packet.token_estimate,
-                        "reference_contract": context_reference_contract(),
+                        "selected_count":page.selected.len(), "truncated":page.next_cursor.is_some(),
+                        "next_cursor":page.next_cursor,
+                        "next_request":page.next_cursor.as_ref().map(|cursor| serde_json::json!({"source":"memory","scope":"current","query":query,"limit":limit,"cursor":cursor})),
+                        "coverage":{"kind":"authorized_lexical_catalog", "order":"stable_memory_id", "consistency":"scope_revision_snapshot",
+                            "complete":page.next_cursor.is_none(), "scope_revisions":page.scope_revisions},
+                        "ranked_recommendations":recommendations,
+                        "recommendation_coverage":{"kind":"bounded_hybrid_recall", "computed":input.cursor.is_none(), "complete":false, "degraded_reason":recommendation_error},
                     })
                 }
             }
-            ContextRetrieveSource::SessionCatalog => {
-                let query = query.as_deref().ok_or_else(|| {
-                    ToolError::new("session_catalog retrieval requires a focused query")
-                })?;
-                if input
-                    .scope
-                    .is_some_and(|scope| scope != ContextRetrieveScope::WorkspaceSessions)
-                {
-                    return Err(ToolError::new(
-                        "session_catalog supports only workspace_sessions scope",
-                    ));
+            ContextRetrieveSource::Artifact => {
+                if input.scope.is_some_and(|scope| scope != ContextRetrieveScope::Current) || input.session_id.is_some() {
+                    return Err(ToolError::new("Artifact discovery uses only the current Runtime scope grants"));
                 }
-                let Some(history) = services.session_history_reader() else {
-                    return serde_json::to_string_pretty(&serde_json::json!({
-                        "kind": "runtime.context_retrieval",
-                        "source": "session_catalog",
-                        "scope": "workspace_sessions",
-                        "status": "degraded",
-                        "reason": "session history reader is not configured",
-                        "selected": [],
-                    }))
-                    .map_err(|error| ToolError::new(error.to_string()));
-                };
-                let offset = input.offset.unwrap_or(0);
-                let page = history
-                    .discover_browsable_sessions(&session_id, Some(query), limit, offset)
-                    .await
+                let mut scopes = binding.authorized_scopes.to_vec(); scopes.push(format!("session:{session_id}"));
+                let page = services.artifact_store().discover_page(&scopes,query.as_deref().unwrap_or(""),input.cursor.as_deref(),limit).await
                     .map_err(|error| ToolError::new(error.to_string()))?;
-                serde_json::json!({
-                    "kind": "runtime.context_retrieval",
-                    "source": "session_catalog",
-                    "scope": "workspace_sessions",
-                    "status": "completed",
-                    "query": query,
-                    "selected": page.records.iter().map(|record| serde_json::json!({
-                        "session_id": record.session_id,
-                        "title": session_record_title(record),
-                        "platform": record.platform,
-                        "status": record.status,
-                        "last_activity": record.last_activity,
-                        "message_count": record.message_count,
-                        "evidence_ref": format!("session://{}", record.session_id),
-                        "read_request": {
-                            "source": "session_history",
-                            "scope": "explicit_session",
-                            "session_id": record.session_id,
-                            "limit": limit,
-                        },
-                    })).collect::<Vec<_>>(),
-                    "selected_count": page.records.len(),
-                    "total": page.total,
-                    "offset": offset,
-                    "next_offset": (offset + page.records.len() < page.total)
-                        .then_some(offset + page.records.len()),
-                    "next_request": (offset + page.records.len() < page.total)
-                        .then(|| serde_json::json!({
-                            "source": "session_catalog",
-                            "scope": "workspace_sessions",
-                            "query": query,
-                            "limit": limit,
-                            "offset": offset + page.records.len(),
-                        })),
-                    "truncated": offset + page.records.len() < page.total,
-                    "authorization": "same durable workspace and actor identity",
-                    "reference_contract": context_reference_contract(),
-                })
+                let next = page.next_cursor.as_ref().map(|cursor| {
+                    let mut request = serde_json::json!({"source":"artifact","limit":limit,"cursor":cursor});
+                    if let Some(query) = &query { request["query"] = serde_json::json!(query); }
+                    request
+                });
+                serde_json::json!({"kind":"runtime.context_retrieval","source":"artifact","scope":"current_binding","status":"completed",
+                    "selected_count":page.records.len(),"selected":page.records.iter().map(|record| serde_json::json!({
+                        "source_kind":"artifact", "ref":record.content_reference().selector, "sha256":record.sha256,
+                        "bytes":record.bytes,"media_type":record.media_type,"scope":record.visibility_scope,
+                        "source_time":i64::try_from(record.created_at_ms).ok().and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis).map(|time| time.to_rfc3339()),
+                        "preview":format!("{}; {} bytes",record.media_type,record.bytes),"information_status":"immutable_content",
+                        "read_tool":"evidence_retrieve", "read_request":{"evidence_ref":record.content_reference().selector}
+                    })).collect::<Vec<_>>(),"next_cursor":page.next_cursor,"next_request":next,
+                    "coverage":{"kind":"authorized_artifact_metadata", "query_scope":"id_sha256_media_type", "consistency":"first_page_creation_snapshot",
+                        "complete":page.next_cursor.is_none()},})
+            }
+            ContextRetrieveSource::Program => {
+                if input.scope.is_some_and(|scope| scope != ContextRetrieveScope::Current) || input.session_id.is_some() {
+                    return Err(ToolError::new("Program discovery uses only the current Runtime Program binding"));
+                }
+                let mut request = serde_json::json!({"wait_for_workers":false});
+                if let Some(query) = &query { request["query"] = serde_json::json!(query); }
+                if let Some(reference) = &input.entry_ref { request["entry_ref"] = serde_json::json!(reference); }
+                if let Some(cursor) = &input.cursor { request["page_cursor"] = serde_json::json!(cursor); }
+                // Delegation to the existing read-only action retains its exact
+                // actor/Program fence and never creates a second projection.
+                let output = Box::pin(self.execute_runtime_tool_with_binding("state_inspect", request, binding)).await?;
+                let observation: harness_contract::agent_action::AgentActionObservation = serde_json::from_str(&output)
+                    .map_err(|error| ToolError::new(error.to_string()))?;
+                if observation.status == harness_contract::agent_action::AgentActionStatus::Rejected {
+                    return Err(ToolError::new(observation.error.map_or_else(|| "Program discovery rejected".into(), |error| error.message)));
+                }
+                let projection = observation.projection.unwrap_or(serde_json::Value::Null);
+                let selected = projection["entries"].as_array().map(|entries| entries.iter().map(|entry| {
+                    let mut item = entry.clone();
+                    item["ref"] = entry["entry_ref"].clone();
+                    item["source_time"] = entry.get("created_at_ms").or_else(||entry.get("updated_at_ms")).cloned().unwrap_or(serde_json::Value::Null);
+                    item["information_status"] = entry.get("status").cloned().unwrap_or_else(||serde_json::json!("revisioned_projection"));
+                    item["preview"] = entry.get("title").cloned().unwrap_or_else(||serde_json::json!(entry["entry_ref"]));
+                    item["content_read_request"] = entry["read_request"].clone();
+                    item["read_request"] = serde_json::json!({"source":"program", "entry_ref":entry["entry_ref"]});
+                    item
+                }).collect::<Vec<_>>()).unwrap_or_default();
+                let next = projection["next_page_cursor"].as_str().map(|cursor| {
+                    let mut request = serde_json::json!({"source":"program", "cursor":cursor});
+                    if let Some(query) = &query { request["query"] = serde_json::json!(query); }
+                    request
+                });
+                serde_json::json!({"kind":"runtime.context_retrieval", "source":"program", "scope":"current_binding",
+                    "status":"completed", "program_id":observation.program_id, "revision":observation.revision,
+                    "selected_count":selected.len(), "selected":selected, "next_cursor":projection["next_page_cursor"],
+                    "next_request":next, "coverage":projection["coverage"],
+                    "exact":input.entry_ref.as_ref().map(|_| &projection),})
+            }
+            ContextRetrieveSource::SessionCatalog => {
+                let query=query.as_deref().ok_or_else(||ToolError::new("session_catalog requires a focused query"))?;
+                if input.scope.is_some_and(|scope|scope!=ContextRetrieveScope::WorkspaceSessions) {return Err(ToolError::new("session_catalog supports workspace_sessions scope only"));}
+                let Some(history)=services.session_history_reader() else {
+                    return serialize_context_result(&serde_json::json!({"kind":"runtime.context_retrieval","source":"session_catalog","status":"degraded","reason":"session history reader is not configured","selected":[]})).map_err(|e|ToolError::new(e.to_string()));
+                };
+                let page=history.discover_context(session::SessionDiscoveryFilter {
+                    kind:session::SessionDiscoveryKind::Sessions,scope:session::SessionDiscoveryScope::Workspace,
+                    current_session_id:session_id.clone(),authorized_session_ids:vec![session_id.clone()],query:Some(query.to_owned()),before_sequence:None,
+                },input.cursor.as_deref(),limit).await.map_err(|e|ToolError::new(e.to_string()))?;
+                let next=page.next_cursor.as_ref().map(|cursor|serde_json::json!({"source":"session_catalog","scope":"workspace_sessions","query":query,"cursor":cursor,"limit":limit}));
+                serde_json::json!({"kind":"runtime.context_retrieval","source":"session_catalog","scope":"workspace_sessions","status":"completed","query":query,
+                    "selected":page.sessions.iter().map(|record|serde_json::json!({
+                        "source_kind":"session","ref":format!("session://{}",record.session_id),"session_id":record.session_id,
+                        "title":session_record_title(record),"preview":session_record_title(record),"platform":record.platform,
+                        "information_status":record.status,"scope":"same_workspace_and_actor","source_time":record.last_activity,
+                        "revision":format!("{:x}",Sha256::digest(serde_json::to_vec(record).unwrap_or_default())),
+                        "message_count":record.message_count,"read_request":{"source":"session_history","scope":"explicit_session","session_id":record.session_id,"limit":limit}
+                    })).collect::<Vec<_>>(),"selected_count":page.sessions.len(),"next_cursor":page.next_cursor,"next_request":next,"truncated":next.is_some(),
+                    "coverage":{"order":"stable_session_id","consistency":"first_page_creation_snapshot","metadata":"latest_observed_activity","complete":next.is_none()},
+                    "authorization":"same durable workspace and actor identity"})
             }
             ContextRetrieveSource::SessionHistory => {
                 let Some(history) = services.session_history_reader() else {
-                    return serde_json::to_string_pretty(&serde_json::json!({
+                    return serialize_context_result(&serde_json::json!({
                         "kind": "runtime.context_retrieval",
                         "source": "session_history",
                         "scope": "current",
@@ -852,6 +926,9 @@ impl GatewayToolExecutor {
                     let Some(message) = message else {
                         return Err(ToolError::new("authorized Session message does not exist"));
                     };
+                    let digest=format!("{:x}",Sha256::digest(message.content_json.as_bytes()));
+                    if input.message_digest.as_ref().is_some_and(|expected|expected!=&digest) {return Err(ToolError::new("Session message source changed; restart exact reading"));}
+                    if input.block_cursor.unwrap_or(0)>0 && input.message_digest.is_none() {return Err(ToolError::new("block continuation requires message_digest from the prior page"));}
                     let block_cursor = input.block_cursor.unwrap_or(0);
                     let block_limit = input.block_limit.unwrap_or(16).clamp(1, 128);
                     let exact = exact_session_message_page(
@@ -860,146 +937,47 @@ impl GatewayToolExecutor {
                         block_limit,
                         retrieval_scope,
                     )?;
-                    return serde_json::to_string_pretty(&exact)
+                    return serialize_context_result(&exact)
                         .map_err(|error| ToolError::new(error.to_string()));
                 }
-                if retrieval_scope == ContextRetrieveScope::WorkspaceSessions {
-                    let query = query.as_deref().ok_or_else(|| {
-                        ToolError::new("workspace_sessions retrieval requires a focused query")
-                    })?;
-                    let mut offset = 0usize;
-                    loop {
-                        let page = history
-                            .discover_browsable_sessions(&session_id, None, 24, offset)
-                            .await
-                            .map_err(|error| ToolError::new(error.to_string()))?;
-                        let page_len = page.records.len();
-                        authorized_sessions
-                            .extend(page.records.into_iter().map(|record| record.session_id));
-                        offset = offset.saturating_add(page_len);
-                        if page_len == 0 || offset >= page.total || offset >= 512 {
-                            break;
-                        }
-                    }
-                    if query.trim().is_empty() {
-                        return Err(ToolError::new(
-                            "workspace_sessions retrieval requires a focused query",
-                        ));
-                    }
+                if matches!(retrieval_scope,ContextRetrieveScope::WorkspaceSessions|ContextRetrieveScope::RelatedSessions) && query.is_none() {
+                    return Err(ToolError::new("cross-session discovery requires a focused query"));
                 }
-                let authorized_sessions = authorized_sessions.into_iter().collect::<Vec<_>>();
-                let (messages, next_before_sequence) = match retrieval_scope {
-                    ContextRetrieveScope::Current | ContextRetrieveScope::ExplicitSession => {
-                        if let Some(query) = query.as_deref() {
-                            (
-                                history
-                                    .search_messages(query, &target_session_id, limit)
-                                    .await,
-                                None,
-                            )
-                        } else {
-                            let count = history
-                                .message_count(&target_session_id)
-                                .await
-                                .map_err(|error| ToolError::new(error.to_string()))?;
-                            let end = input.before_sequence.unwrap_or(count).min(count);
-                            let start = end.saturating_sub(limit);
-                            (
-                                history
-                                    .messages(
-                                        &target_session_id,
-                                        start,
-                                        end.saturating_sub(start).max(1),
-                                    )
-                                    .await,
-                                (start > 0).then_some(start),
-                            )
-                        }
-                    }
-                    ContextRetrieveScope::RelatedSessions => {
-                        let query = query.as_deref().ok_or_else(|| {
-                            ToolError::new("related_sessions retrieval requires a focused query")
-                        })?;
-                        (
-                            history
-                                .search_messages_in_sessions(query, &authorized_sessions, limit)
-                                .await,
-                            None,
-                        )
-                    }
-                    ContextRetrieveScope::WorkspaceSessions => {
-                        let query = query.as_deref().ok_or_else(|| {
-                            ToolError::new("workspace_sessions retrieval requires a focused query")
-                        })?;
-                        (
-                            history
-                                .search_messages_in_sessions(query, &authorized_sessions, limit)
-                                .await,
-                            None,
-                        )
-                    }
+                if input.before_sequence.is_some() && (query.is_some() || matches!(retrieval_scope,ContextRetrieveScope::WorkspaceSessions|ContextRetrieveScope::RelatedSessions)) {
+                    return Err(ToolError::new("before_sequence applies to current/explicit sequential history only"));
+                }
+                let (scope,scope_name)=match retrieval_scope {
+                    ContextRetrieveScope::Current=>(session::SessionDiscoveryScope::Current,"current"),
+                    ContextRetrieveScope::ExplicitSession=>(session::SessionDiscoveryScope::Explicit,"explicit_session"),
+                    ContextRetrieveScope::RelatedSessions=>(session::SessionDiscoveryScope::Related,"related_sessions"),
+                    ContextRetrieveScope::WorkspaceSessions=>(session::SessionDiscoveryScope::Workspace,"workspace_sessions"),
                 };
-                let messages = messages.map_err(|error| ToolError::new(error.to_string()))?;
-                let authorization_basis = if target_session_id == session_id {
-                    "current_session"
-                } else if explicitly_authorized {
-                    "durable_session_relation"
-                } else {
-                    "same_workspace_and_actor"
-                };
-                let truncated = if query.is_some() {
-                    messages.len() == limit
-                } else {
-                    next_before_sequence.is_some()
-                };
-                serde_json::json!({
-                    "kind": "runtime.context_retrieval",
-                    "source": "session_history",
-                    "scope": match retrieval_scope {
-                        ContextRetrieveScope::Current => "current",
-                        ContextRetrieveScope::RelatedSessions => "related_sessions",
-                        ContextRetrieveScope::ExplicitSession => "explicit_session",
-                        ContextRetrieveScope::WorkspaceSessions => "workspace_sessions",
-                    },
-                    "status": "completed",
-                    "query": query,
-                    "target_session_id": (retrieval_scope != ContextRetrieveScope::RelatedSessions)
-                        .then_some(target_session_id.clone()),
-                    "authorized_session_count": authorized_sessions.len(),
-                    "selected": messages.iter().map(|message| serde_json::json!({
-                        "message_id": message.stable_message_id,
-                        "session_id": message.session_id,
-                        "sequence": message.sequence,
-                        "role": message.role,
-                        "created_at_ms": message.created_at_ms,
-                        "preview": session_message_preview(&message.content_json, 800),
-                        "evidence_ref": format!(
-                            "session://{}/messages/{}",
-                            message.session_id, message.sequence
-                        ),
-                    })).collect::<Vec<_>>(),
-                    "selected_count": messages.len(),
-                    "next_before_sequence": next_before_sequence,
-                    "next_request": next_before_sequence.map(|before_sequence| serde_json::json!({
-                        "source": "session_history",
-                        "scope": match retrieval_scope {
-                            ContextRetrieveScope::Current => "current",
-                            ContextRetrieveScope::ExplicitSession => "explicit_session",
-                            ContextRetrieveScope::RelatedSessions => "related_sessions",
-                            ContextRetrieveScope::WorkspaceSessions => "workspace_sessions",
-                        },
-                        "session_id": (retrieval_scope == ContextRetrieveScope::ExplicitSession)
-                            .then_some(target_session_id.clone()),
-                        "limit": limit,
-                        "before_sequence": before_sequence,
-                    })),
-                    "truncated": truncated,
-                    "authorization_basis": authorization_basis,
-                    "reference_contract": context_reference_contract(),
+                let scoped_ids=if matches!(retrieval_scope,ContextRetrieveScope::Current|ContextRetrieveScope::ExplicitSession) {vec![target_session_id.clone()]} else {authorized_sessions.into_iter().collect()};
+                let explicitly_authorized_session_count=scoped_ids.len();
+                let page=history.discover_context(session::SessionDiscoveryFilter {kind:session::SessionDiscoveryKind::Messages,scope,
+                    current_session_id:session_id.clone(),authorized_session_ids:scoped_ids,query:query.clone(),before_sequence:input.before_sequence,
+                },input.cursor.as_deref(),limit).await.map_err(|e|ToolError::new(e.to_string()))?;
+                let next=page.next_cursor.as_ref().map(|cursor|compact_context_request(serde_json::json!({"source":"session_history","scope":scope_name,
+                    "session_id":(retrieval_scope==ContextRetrieveScope::ExplicitSession).then_some(&target_session_id),"query":query,
+                    "before_sequence":input.before_sequence,"limit":limit,"cursor":cursor})));
+                serde_json::json!({"kind":"runtime.context_retrieval","source":"session_history","scope":scope_name,"status":"completed","query":query,
+                    "explicitly_authorized_session_count":explicitly_authorized_session_count,
+                    "target_session_id":matches!(retrieval_scope,ContextRetrieveScope::Current|ContextRetrieveScope::ExplicitSession).then_some(&target_session_id),
+                    "selected":page.messages.iter().map(|message|serde_json::json!({
+                        "message_id":message.stable_message_id,"session_id":message.session_id,"sequence":message.sequence,"role":message.role,
+                        "created_at_ms":message.created_at_ms,"source_time":message.created_at_ms,"scope":format!("session:{}",message.session_id),
+                        "preview":session_message_preview(&message.content_json,1200),"source_kind":"session_message",
+                        "ref":format!("session://{}/messages/{}",message.session_id,message.stable_message_id),
+                        "evidence_ref":format!("session://{}/messages/{}",message.session_id,message.sequence),
+                        "revision":format!("{:x}",Sha256::digest(message.content_json.as_bytes())),"information_status":"persisted_message",
+                        "read_request":session_message_read_request(message,&session_id)
+                    })).collect::<Vec<_>>(),"selected_count":page.messages.len(),"next_cursor":page.next_cursor,"next_request":next,"truncated":next.is_some(),
+                    "coverage":{"order":"session_id_then_sequence_desc","consistency":"first_page_creation_snapshot","complete":next.is_none()},
+                    "authorization_basis":if target_session_id==session_id {"current_session"} else if explicitly_authorized {"durable_session_relation"} else {"same_workspace_and_actor"}
                 })
             }
         };
-        serde_json::to_string_pretty(&value).map_err(|error| ToolError::new(error.to_string()))
+        serialize_context_result(&value).map_err(|error| ToolError::new(error.to_string()))
     }
 
 }
