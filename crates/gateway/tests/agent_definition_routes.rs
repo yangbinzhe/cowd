@@ -7,7 +7,7 @@ use tower::ServiceExt;
 
 #[tokio::test]
 async fn runtime_backed_agent_catalog_and_directory_are_exposed_by_the_real_router() {
-    let harness = GatewayTestHarness::in_memory().expect("test harness");
+    let harness = GatewayTestHarness::postgres().expect("test harness");
 
     let catalog = harness
         .router()

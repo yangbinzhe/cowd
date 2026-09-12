@@ -142,6 +142,8 @@ pub mod runtime_control;
 pub mod sandbox;
 #[path = "session/session.rs"]
 mod session;
+#[path = "context/working_set.rs"]
+pub mod working_context;
 pub use session::workspace_sessions_dir;
 #[path = "session/session_turn_admission.rs"]
 mod session_turn_admission;
@@ -204,6 +206,8 @@ pub use agentic::{
     AgenticTaskStatus, AgenticTeamLifecycle, AgenticTeamProjection, AgenticTopicEntryProjection,
 };
 pub use definition_registry::AgentDefinitionDraftReceipt;
+#[path = "tooling/bound_tool_batch.rs"]
+pub(crate) mod bound_tool_batch;
 #[path = "infrastructure/eval_gate.rs"]
 pub mod eval_gate;
 #[path = "context/evidence_planner.rs"]

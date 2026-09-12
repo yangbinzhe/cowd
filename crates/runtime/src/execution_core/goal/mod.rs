@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
 pub mod policy;
+mod program_completion;
 pub mod supervisor;
+
+pub(crate) use program_completion::PreparedProgramConclusion;
 
 pub use supervisor::{ObjectiveReconcileDecision, ObjectiveSupervisor};
 
@@ -252,6 +255,7 @@ impl GoalStore {
         &self,
         envelope: &harness_contract::agent_action::AgentActionEnvelope,
         producer_refs: &[String],
+        verification: Option<&harness_contract::goal::ObjectiveReviewVerification>,
     ) -> Result<PreparedGoalMutation, String> {
         use harness_contract::agent_action::{
             AgentAction, ObjectiveReviewDecision, ObjectiveUpdateOperation,
@@ -302,6 +306,30 @@ impl GoalStore {
                     .any(|criterion| criterion.id == criterion_ref)
                 {
                     return Err("Objective update criterion does not exist".to_string());
+                }
+            }
+        }
+        if let AgentAction::ObjectiveReview(input) = &envelope.action {
+            if !current
+                .criteria
+                .iter()
+                .any(|criterion| criterion.id == input.criterion_ref)
+                && !current
+                    .obligations
+                    .iter()
+                    .any(|obligation| obligation.obligation_id == input.criterion_ref)
+            {
+                return Err(
+                    "Objective review criterion or obligation does not exist in the current specification".into(),
+                );
+            }
+            if input.decision == ObjectiveReviewDecision::Satisfied {
+                let proof = verification
+                    .ok_or("satisfied review requires Runtime physical-read verification")?;
+                if proof.goal_spec_revision != Some(current.spec_revision)
+                    || proof.goal_spec_digest.as_deref() != Some(current.spec_digest.as_str())
+                {
+                    return Err("review source Goal specification changed".into());
                 }
             }
         }
@@ -395,25 +423,10 @@ impl GoalStore {
                 next_sequence,
                 format!("agentic_objective_review:{}", envelope.action_id),
                 |goal| {
-                    let Some(criterion) = goal
-                        .criteria
-                        .iter_mut()
-                        .find(|item| item.id == input.criterion_ref)
-                    else {
-                        return vec!["missing_criterion".to_string()];
-                    };
                     let decision = match input.decision {
                         ObjectiveReviewDecision::Satisfied => "satisfied",
                         ObjectiveReviewDecision::Gap => "gap",
                         ObjectiveReviewDecision::Blocked => "blocked",
-                    };
-                    criterion.status = match input.decision {
-                        ObjectiveReviewDecision::Satisfied => {
-                            harness_contract::goal::AcceptanceStatus::Satisfied
-                        }
-                        ObjectiveReviewDecision::Gap | ObjectiveReviewDecision::Blocked => {
-                            harness_contract::goal::AcceptanceStatus::Open
-                        }
                     };
                     let review_id = format!(
                         "objective_review:{:x}",
@@ -422,6 +435,24 @@ impl GoalStore {
                                 .as_bytes()
                         )
                     );
+                    if let Some(criterion) = goal.criteria.iter_mut().find(|item| item.id == input.criterion_ref) {
+                        criterion.status = match input.decision {
+                            ObjectiveReviewDecision::Satisfied => AcceptanceStatus::Satisfied,
+                            ObjectiveReviewDecision::Gap | ObjectiveReviewDecision::Blocked => AcceptanceStatus::Open,
+                        };
+                    } else if let Some(obligation) = goal.obligations.iter_mut().find(|item| item.obligation_id == input.criterion_ref) {
+                        obligation.state = match input.decision {
+                            ObjectiveReviewDecision::Satisfied => ObjectiveObligationState::Satisfied,
+                            ObjectiveReviewDecision::Gap => ObjectiveObligationState::Open,
+                            ObjectiveReviewDecision::Blocked => ObjectiveObligationState::Blocked,
+                        };
+                        obligation.artifact_refs.clone_from(&input.result_refs);
+                        obligation.evidence_refs.clone_from(&input.evidence_refs);
+                        obligation.reread_receipts = verification.map(|proof| proof.reads.iter()
+                            .flat_map(|read| read.receipt_refs.iter().cloned()).collect()).unwrap_or_default();
+                        obligation.verifier_decision = (input.decision == ObjectiveReviewDecision::Satisfied).then(|| review_id.clone());
+                        obligation.diagnostic_code = (input.decision != ObjectiveReviewDecision::Satisfied).then(|| format!("objective_review_{decision}"));
+                    }
                     goal.review_refs.push(review_id.clone());
                     goal.review_refs.sort();
                     goal.review_refs.dedup();
@@ -437,8 +468,9 @@ impl GoalStore {
                         producer_refs: producer_refs.clone(),
                         decision: decision.to_string(),
                         reason_ref: input.reason_ref.clone(),
+                        verification: verification.cloned(),
                     });
-                    vec!["criteria".to_string(), "review_refs".to_string(), "reviews".to_string()]
+                    vec!["criteria".to_string(), "obligations".to_string(), "review_refs".to_string(), "reviews".to_string()]
                 },
             )?,
             _ => return Err("action is not an Objective mutation".to_string()),
@@ -459,22 +491,45 @@ impl GoalStore {
                 .rev()
                 .find(|review| review.criterion_ref == input.criterion_ref)
                 .ok_or_else(|| "Objective review was not durably recorded".to_string())?;
-            if review.producer_refs.is_empty() {
+            if input.decision == ObjectiveReviewDecision::Satisfied
+                && review.producer_refs.is_empty()
+            {
                 return Err(
                     "Objective review cannot establish independent review without a Runtime-resolved result producer"
                         .to_string(),
                 );
             }
-            if review
-                .producer_refs
-                .iter()
-                .any(|producer| producer == &review.reviewer_actor)
+            if input.decision == ObjectiveReviewDecision::Satisfied
+                && review
+                    .verification
+                    .as_ref()
+                    .is_none_or(|proof| proof.independence_required)
+                && review
+                    .producer_refs
+                    .iter()
+                    .any(|producer| producer == &review.reviewer_actor)
             {
                 return Err(
                     "Objective reviewer is also a producer of the reviewed result".to_string(),
                 );
             }
         }
+        let action_entity_ref = match &envelope.action {
+            AgentAction::ObjectiveUpdate(input) => match input.operation {
+                ObjectiveUpdateOperation::Add => updated
+                    .criteria
+                    .last()
+                    .map(|criterion| criterion.id.clone()),
+                _ => input.criterion_ref.clone(),
+            },
+            AgentAction::ObjectiveReview(_) => updated
+                .reviews
+                .last()
+                .map(|review| review.review_id.clone()),
+            _ => None,
+        };
+        let mut event = event;
+        event.event.payload["action_entity_ref"] = serde_json::json!(action_entity_ref);
         Ok(PreparedGoalMutation {
             stream_id: stream_id(&goal_id),
             expected_stream_revision: expected_goal_stream_revision,
@@ -483,12 +538,21 @@ impl GoalStore {
     }
 }
 
-fn goal_spec_digest(goal: &GoalContract) -> String {
+pub(crate) fn goal_spec_digest(goal: &GoalContract) -> String {
     let canonical = serde_json::json!({
         "source_intent_ref": goal.source_intent_ref,
-        "criteria": goal.criteria,
+        "criteria": goal.criteria.iter().map(|criterion| serde_json::json!({
+            "id":criterion.id,"statement":criterion.statement,"statement_ref":criterion.statement_ref,
+            "source_refs":criterion.source_refs,"required_evidence":criterion.required_evidence,
+            "waiver":criterion.waiver,
+        })).collect::<Vec<_>>(),
         "constraints": goal.constraints,
         "participation_requirement": goal.participation_requirement,
+        "obligations": goal.obligations.iter().map(|obligation| serde_json::json!({
+            "id":obligation.obligation_id,"required":obligation.required,
+            "success_predicate":obligation.success_predicate,"producer":obligation.producer,
+            "evidence_requirement":obligation.evidence_requirement,
+        })).collect::<Vec<_>>(),
     });
     format!(
         "{:x}",
@@ -572,7 +636,7 @@ impl GoalStore {
                     progress = Some(GoalProgressReducer::from_goal(&event_goal));
                 } else if matches!(
                     event.kind.as_str(),
-                    "goal.created" | "goal.revised" | "goal.completed"
+                    "goal.created" | "goal.revised" | "goal.completed" | "goal.completion_waiting"
                 ) {
                     let previous_goal = goal
                         .as_ref()
@@ -1155,6 +1219,33 @@ impl GoalStore {
     /// together with the graph transition and (when present) session terminal
     /// outbox record, so a graph can never be terminal while its goal remains
     /// open or vice versa.
+    /// A live Program owns its successful Goal conclusion through the atomic
+    /// Goal/Program transaction. Standalone goals retain the ordinary writer.
+    fn validate_terminal_owner(
+        &self,
+        goal: &GoalContract,
+        completion: GoalCompletion,
+    ) -> Result<(), String> {
+        if completion != GoalCompletion::Satisfied {
+            return Ok(());
+        }
+        if let Some(binding) = &goal.execution_binding {
+            let program = crate::AgentActionService::new(Arc::clone(&self.event_store))
+                .project_if_exists(&binding.agentic_program_id)
+                .map_err(|error| error.to_string())?;
+            if program.is_some() {
+                return Err(
+                    "program_terminal_authority: use the atomic Program conclusion for this Goal"
+                        .into(),
+                );
+            }
+        }
+        if goal.participation_requirement.is_some() {
+            return Err("original_participation_requires_program_conclusion: no bound Program contribution evidence".into());
+        }
+        Ok(())
+    }
+
     pub fn terminal_event(
         &self,
         goal_id: &str,
@@ -1170,6 +1261,7 @@ impl GoalStore {
         if goal.completion != GoalCompletion::Open {
             return Err(format!("goal {goal_id} is already terminal"));
         }
+        self.validate_terminal_owner(&goal, completion)?;
         let mut durable_evidence = projection.progress.evidence_refs.clone();
         durable_evidence.extend(evidence_refs.iter().cloned());
         durable_evidence.sort();
@@ -1345,6 +1437,10 @@ impl GoalStore {
                 "goal completion has stale revision {expected_revision}"
             ));
         }
+        if goal.completion != GoalCompletion::Open || goal.terminal.is_some() {
+            return Err(format!("goal {goal_id} is already terminal"));
+        }
+        self.validate_terminal_owner(&goal, completion)?;
         let durable_evidence = projection.progress.evidence_refs.clone();
         apply_completion_criterion_state(&mut goal, &projection.progress, &durable_evidence);
         validate_completion(&goal, &projection.progress, completion, &durable_evidence)?;
@@ -1448,18 +1544,27 @@ impl GoalStore {
             .projection(goal_id)?
             .ok_or_else(|| format!("goal {goal_id} not found"))?;
         let mut goal = projection.goal;
-        if goal.revision != expected_revision {
-            return Err(format!(
-                "objective terminal has stale revision {expected_revision}, actual {}",
-                goal.revision
-            ));
-        }
         if let Some(existing) = goal.terminal.as_ref() {
             if existing.terminal_fence == terminal.terminal_fence {
+                let mut retry = terminal.clone();
+                // Retry wall time is not part of the terminal's semantic identity.
+                retry.committed_at_ms = existing.committed_at_ms;
+                if existing != &retry {
+                    return Err("objective_terminal_fence_conflict: terminal fence names different outcome or evidence".into());
+                }
                 return Ok(goal);
             }
             return Err(format!(
                 "goal {goal_id} already has a different terminal fence"
+            ));
+        }
+        if goal.completion != GoalCompletion::Open {
+            return Err(format!("goal {goal_id} is already terminal"));
+        }
+        if goal.revision != expected_revision {
+            return Err(format!(
+                "objective terminal has stale revision {expected_revision}, actual {}",
+                goal.revision
             ));
         }
         let completion = match terminal.kind {
@@ -1469,6 +1574,7 @@ impl GoalStore {
             ObjectiveTerminalKind::Failed => GoalCompletion::Failed,
             ObjectiveTerminalKind::Cancelled => GoalCompletion::Cancelled,
         };
+        self.validate_terminal_owner(&goal, completion)?;
         let mut durable_evidence = projection.progress.evidence_refs.clone();
         durable_evidence.extend(goal.evidence_refs.iter().cloned());
         durable_evidence.extend(terminal.evidence_refs.iter().cloned());
@@ -1937,6 +2043,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn goal_spec_digest_tracks_requirements_without_progress_state() {
+        let mut original = goal();
+        original
+            .obligations
+            .push(harness_contract::goal::ObjectiveObligation {
+                obligation_id: "delivery".into(),
+                required: true,
+                success_predicate: "verified source".into(),
+                producer: Default::default(),
+                evidence_requirement: Default::default(),
+                state: ObjectiveObligationState::Open,
+                artifact_refs: vec![],
+                evidence_refs: vec![],
+                reread_receipts: vec![],
+                verifier_decision: None,
+                diagnostic_code: None,
+            });
+        let digest = goal_spec_digest(&original);
+        let mut progress = original.clone();
+        progress.criteria[0].status = AcceptanceStatus::Satisfied;
+        progress.obligations[0].state = ObjectiveObligationState::Satisfied;
+        progress.obligations[0]
+            .evidence_refs
+            .push("actual-evidence".into());
+        progress.obligations[0].verifier_decision = Some("review".into());
+        progress.revision += 1;
+        assert_eq!(goal_spec_digest(&progress), digest);
+        progress.obligations[0].success_predicate = "different user requirement".into();
+        assert_ne!(goal_spec_digest(&progress), digest);
+        let mut changed = original.clone();
+        changed.obligations[0].required = false;
+        assert_ne!(goal_spec_digest(&changed), digest);
+        changed = original.clone();
+        changed.obligations[0].evidence_requirement.reread_required = true;
+        assert_ne!(goal_spec_digest(&changed), digest);
+        changed = original;
+        changed.obligations[0].producer.capability_id = Some("write".into());
+        assert_ne!(goal_spec_digest(&changed), digest);
+    }
+
     fn observation(revision: u64) -> RuntimeObservation {
         RuntimeObservation {
             identity: RuntimeObservationIdentity {
@@ -1972,6 +2119,557 @@ mod tests {
             result_class: ObservationResultClass::Succeeded,
             failure_class: None,
         }
+    }
+
+    #[tokio::test]
+    async fn model_refinements_preserve_original_goal_and_failed_or_replayed_updates_do_not_write()
+    {
+        use harness_contract::agent_action::*;
+        let services = crate::RuntimeServices::in_memory().unwrap();
+        let material = services
+            .artifact_store()
+            .write_bytes(
+                harness_contract::context::ArtifactWriteDescriptor {
+                    media_type: "text/plain".into(),
+                    visibility_scope: "session:session-test".into(),
+                    expected_bytes: None,
+                    original_name: None,
+                },
+                b"Check the source-backed result against the user's original requirements",
+            )
+            .await
+            .unwrap();
+        let mut original = goal();
+        original.id = "goal:refinement-root".into();
+        original.scope = harness_contract::goal::GoalScope::UserObjective;
+        original.execution_binding = Some(harness_contract::goal::GoalExecutionBinding {
+            objective_id: "refinement-objective".into(),
+            session_id: original.session_id.clone(),
+            turn_id: "refinement-turn".into(),
+            root_execution_id: "refinement-root".into(),
+            agentic_program_id: "refinement-program".into(),
+        });
+        original
+            .obligations
+            .push(harness_contract::goal::ObjectiveObligation {
+                obligation_id: "original-user-obligation".into(),
+                required: true,
+                success_predicate: "retain and verify the original user deliverable".into(),
+                producer: Default::default(),
+                evidence_requirement: Default::default(),
+                state: ObjectiveObligationState::Open,
+                artifact_refs: vec![],
+                evidence_refs: vec![],
+                reread_receipts: vec![],
+                verifier_decision: None,
+                diagnostic_code: None,
+            });
+        services.goal_store().create(original.clone()).unwrap();
+        let actor = AgentActorBinding {
+            objective_id: "refinement-objective".into(),
+            program_id: "refinement-program".into(),
+            session_id: "session-test".into(),
+            turn_id: "refinement-turn".into(),
+            root_execution_id: Some("refinement-root".into()),
+            required_team_count: 0,
+            objective_summary: original.objective.clone(),
+            model_lease: "test".into(),
+            permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
+            resource_scopes: vec![],
+            actor_id: "refinement-root-actor".into(),
+            kind: AgentActorKind::Root,
+            execution_id: None,
+            team_id: None,
+            agent_id: None,
+        };
+        let action = |id: &str, operation, criterion_ref: Option<String>| AgentActionEnvelope {
+            action_id: id.into(),
+            actor: actor.clone(),
+            expected_revision: None,
+            action: AgentAction::ObjectiveUpdate(ObjectiveUpdateInput {
+                criterion_ref,
+                operation,
+                statement_ref: Some(material.selector.clone()),
+                source_refs: vec![material.selector.clone()],
+                reason_ref: Some(material.selector.clone()),
+                evidence_requirements: vec![],
+            }),
+        };
+        let add = action("add-derived", ObjectiveUpdateOperation::Add, None);
+        let added = services.submit_agent_action(&add).await.unwrap();
+        assert_eq!(added.status, AgentActionStatus::Applied);
+        let first = services.goal_store().get(&original.id).unwrap().unwrap();
+        assert_eq!(first.spec_revision, 2);
+        assert_eq!(first.criteria[0], original.criteria[0]);
+        let derived = added
+            .changed_refs
+            .first()
+            .expect("model receives its generated criterion reference")
+            .clone();
+        assert_eq!(derived, first.criteria[1].id);
+        let inspect = |id: &str, entry_ref: Option<String>, page_cursor: Option<String>| {
+            AgentActionEnvelope {
+                action_id: id.into(),
+                actor: actor.clone(),
+                expected_revision: None,
+                action: AgentAction::StateInspect(StateInspectInput {
+                    query: entry_ref.is_none().then(|| original.id.clone()),
+                    entry_ref,
+                    page_cursor,
+                    ..Default::default()
+                }),
+            }
+        };
+        let visible = services
+            .submit_agent_action(&inspect("inspect-derived", Some(derived.clone()), None))
+            .await
+            .unwrap();
+        assert_eq!(visible.status, AgentActionStatus::Observed);
+        assert_eq!(
+            visible.projection.unwrap()["goal_entry"]["criterion"]["id"],
+            derived
+        );
+        let review = |id: &str| AgentActionEnvelope {
+            action_id: id.into(),
+            actor: actor.clone(),
+            expected_revision: None,
+            action: AgentAction::ObjectiveReview(ObjectiveReviewInput {
+                criterion_ref: derived.clone(),
+                decision: ObjectiveReviewDecision::Gap,
+                result_refs: vec![],
+                evidence_refs: vec![material.selector.clone()],
+                reason_ref: material.selector.clone(),
+            }),
+        };
+        let team = services
+            .submit_agent_action(&AgentActionEnvelope {
+                action_id: "refinement-support-team".into(),
+                actor: actor.clone(),
+                expected_revision: None,
+                action: AgentAction::TeamCreate(TeamCreateInput {
+                    name: "Support".into(),
+                    mission: "Support existing conditions without replacing them".into(),
+                    objective: None,
+                }),
+            })
+            .await
+            .unwrap()
+            .changed_refs[0]
+            .clone();
+        let publish = |id: &str, references: Vec<String>, purpose| AgentActionEnvelope {
+            action_id: id.into(),
+            actor: actor.clone(),
+            expected_revision: None,
+            action: AgentAction::TaskPublish(TaskPublishInput {
+                team_ref: team.clone(),
+                title: id.into(),
+                objective: "Check source".into(),
+                acceptance: "source-backed evidence".into(),
+                required_capabilities: vec![],
+                depends_on: vec![],
+                obligation_refs: references,
+                purpose,
+                execution_requirements: vec![],
+                expertise_hints: vec![],
+            }),
+        };
+        let refs = vec![
+            derived.clone(),
+            "original-user-obligation".into(),
+            "checked".into(),
+        ];
+        let supporting = publish("support-many", refs.clone(), TaskPurpose::Delivery);
+        for request in [
+            supporting.clone(),
+            publish("support-same", refs.clone(), TaskPurpose::Delivery),
+            publish("optional-exploration", vec![], TaskPurpose::Exploration),
+        ] {
+            let result = services.submit_agent_action(&request).await.unwrap();
+            assert_eq!(result.status, AgentActionStatus::Applied);
+            let projection = services
+                .agent_action_service()
+                .project(&actor.program_id)
+                .unwrap();
+            let task = &projection.tasks[&result.changed_refs[0]];
+            let AgentAction::TaskPublish(input) = request.action else {
+                unreachable!()
+            };
+            assert_eq!(task.obligation_refs, input.obligation_refs);
+            assert_eq!(task.purpose, input.purpose);
+        }
+        assert_eq!(
+            services.goal_store().get(&original.id).unwrap().unwrap(),
+            first,
+            "publishing supporting or exploration work cannot change Goal obligations or success"
+        );
+        let before_invalid = services
+            .agent_action_service()
+            .project(&actor.program_id)
+            .unwrap()
+            .revision;
+        let invalid = services
+            .submit_agent_action(&publish(
+                "unknown-obligation",
+                vec!["foreign-condition".into()],
+                TaskPurpose::Delivery,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status, AgentActionStatus::Rejected);
+        assert_eq!(invalid.error.unwrap().code, "obligation_not_found");
+        assert_eq!(
+            services
+                .agent_action_service()
+                .project(&actor.program_id)
+                .unwrap()
+                .revision,
+            before_invalid
+        );
+        for operation in [
+            ObjectiveUpdateOperation::Replace,
+            ObjectiveUpdateOperation::Retire,
+        ] {
+            if operation == ObjectiveUpdateOperation::Retire {
+                let reviewed = services
+                    .submit_agent_action(&review("derived-gap"))
+                    .await
+                    .unwrap();
+                assert_eq!(reviewed.status, AgentActionStatus::Applied);
+                assert!(reviewed.changed_refs[0].starts_with("objective_review:"));
+            }
+            let before = services
+                .event_store()
+                .stream_revision("goal:goal:refinement-root")
+                .unwrap();
+            let before_program = services
+                .agent_action_service()
+                .project(&actor.program_id)
+                .unwrap()
+                .revision;
+            let rejected = action(
+                &format!("forbidden-{operation:?}"),
+                operation,
+                Some("checked".into()),
+            );
+            assert!(services
+                .submit_agent_action(&rejected)
+                .await
+                .unwrap_err()
+                .contains("original user_intent"));
+            assert_eq!(
+                services
+                    .event_store()
+                    .stream_revision("goal:goal:refinement-root")
+                    .unwrap(),
+                before
+            );
+            assert_eq!(
+                services
+                    .agent_action_service()
+                    .project(&actor.program_id)
+                    .unwrap()
+                    .revision,
+                before_program
+            );
+            let allowed = action(
+                &format!("derived-{operation:?}"),
+                operation,
+                Some(derived.clone()),
+            );
+            assert_eq!(
+                services.submit_agent_action(&allowed).await.unwrap().status,
+                AgentActionStatus::Applied
+            );
+        }
+        let before_retired = services
+            .agent_action_service()
+            .project(&actor.program_id)
+            .unwrap()
+            .revision;
+        let retired = services
+            .submit_agent_action(&publish(
+                "retired-support",
+                vec![derived.clone()],
+                TaskPurpose::Delivery,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(retired.status, AgentActionStatus::Rejected);
+        assert_eq!(retired.error.unwrap().code, "obligation_not_found");
+        let replayed = services.submit_agent_action(&supporting).await.unwrap();
+        assert!(replayed.duplicate);
+        assert_eq!(replayed.status, AgentActionStatus::Applied);
+        assert_eq!(
+            services
+                .agent_action_service()
+                .project(&actor.program_id)
+                .unwrap()
+                .revision,
+            before_retired
+        );
+        let current = services.goal_store().get(&original.id).unwrap().unwrap();
+        assert_eq!(current.criteria, original.criteria);
+        assert_eq!(current.obligations, original.obligations);
+        assert_eq!(current.source_intent_ref, original.source_intent_ref);
+        assert_eq!(current.spec_revision, 4);
+        assert!(services
+            .submit_agent_action(&review("cannot-review-retired-criterion"))
+            .await
+            .unwrap_err()
+            .contains("does not exist"));
+
+        let before = services
+            .event_store()
+            .stream_revision("goal:goal:refinement-root")
+            .unwrap();
+        assert_eq!(
+            services.submit_agent_action(&add).await.unwrap().status,
+            AgentActionStatus::Applied
+        );
+        assert_eq!(
+            services
+                .event_store()
+                .stream_revision("goal:goal:refinement-root")
+                .unwrap(),
+            before
+        );
+        let mut forged = serde_json::to_value(&add.action).unwrap();
+        forged["input"]["waiver"] = serde_json::json!({"permission_receipt":"model-says-approved"});
+        assert!(serde_json::from_value::<AgentAction>(forged).is_err());
+        let mut forged_receipt = action("forged-statement", ObjectiveUpdateOperation::Add, None);
+        if let AgentAction::ObjectiveUpdate(input) = &mut forged_receipt.action {
+            input.statement_ref = Some("tool://invented".into());
+        }
+        assert!(services.submit_agent_action(&forged_receipt).await.is_err());
+        assert_eq!(
+            services
+                .event_store()
+                .stream_revision("goal:goal:refinement-root")
+                .unwrap(),
+            before
+        );
+        // Independent Goal owner updates must also invalidate a directory
+        // cursor even when no Program action changes its revision.
+        let current = services.goal_store().get(&original.id).unwrap().unwrap();
+        services
+            .goal_store()
+            .revise(
+                &original.id,
+                current.revision,
+                current.user_sequence + 1,
+                "test owner adds a paged criterion set",
+                |goal| {
+                    for index in 0..40 {
+                        let mut criterion = original.criteria[0].clone();
+                        criterion.id = format!("criterion:paged:{index:03}");
+                        goal.criteria.push(criterion);
+                    }
+                    goal.spec_revision += 1;
+                    goal.spec_digest = goal_spec_digest(goal);
+                    vec![
+                        "criteria".into(),
+                        "spec_revision".into(),
+                        "spec_digest".into(),
+                    ]
+                },
+            )
+            .unwrap();
+        let page = services
+            .submit_agent_action(&inspect("goal-directory", None, None))
+            .await
+            .unwrap()
+            .projection
+            .unwrap();
+        assert_eq!(page["entries"].as_array().unwrap().len(), 32);
+        let cursor = page["next_page_cursor"].as_str().unwrap().to_string();
+        let program_revision = services
+            .agent_action_service()
+            .project(&actor.program_id)
+            .unwrap()
+            .revision;
+        let current = services.goal_store().get(&original.id).unwrap().unwrap();
+        services
+            .goal_store()
+            .revise(
+                &original.id,
+                current.revision,
+                current.user_sequence + 1,
+                "test independent Goal revision",
+                |goal| {
+                    goal.constraints.push("new current constraint".into());
+                    goal.spec_revision += 1;
+                    goal.spec_digest = goal_spec_digest(goal);
+                    vec![
+                        "constraints".into(),
+                        "spec_revision".into(),
+                        "spec_digest".into(),
+                    ]
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            services
+                .agent_action_service()
+                .project(&actor.program_id)
+                .unwrap()
+                .revision,
+            program_revision
+        );
+        let stale = services
+            .submit_agent_action(&inspect("stale-goal-directory", None, Some(cursor)))
+            .await
+            .unwrap();
+        assert_eq!(stale.status, AgentActionStatus::Rejected);
+        assert!(stale.error.unwrap().message.contains("revision"));
+    }
+
+    fn terminal_for_test() -> ObjectiveTerminal {
+        ObjectiveTerminal {
+            kind: ObjectiveTerminalKind::Satisfied,
+            terminal_fence: "terminal-test".into(),
+            authority_revision: 1,
+            reason: "verified result".into(),
+            evidence_refs: vec![],
+            diagnostics: vec![],
+            committed_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn all_public_terminal_writers_reject_open_obligations_uncertain_effects_and_empty_evidence() {
+        for writer in ["terminal_event", "complete", "complete_objective"] {
+            for defect in ["obligation", "effect", "empty", "participation"] {
+                let events = Arc::new(RuntimeEventStore::for_test());
+                let store = GoalStore::new(Arc::clone(&events));
+                let mut goal = goal();
+                goal.scope = harness_contract::goal::GoalScope::UserObjective;
+                goal.criteria[0].status = AcceptanceStatus::Satisfied;
+                goal.execution_binding = Some(harness_contract::goal::GoalExecutionBinding {
+                    objective_id: "user-objective".into(),
+                    session_id: goal.session_id.clone(),
+                    turn_id: "turn".into(),
+                    root_execution_id: "standalone-root".into(),
+                    agentic_program_id: "not-created-program".into(),
+                });
+                if defect == "participation" {
+                    goal.participation_requirement =
+                        Some(harness_contract::goal::ParticipationRequirement {
+                            minimum_team_count: 2,
+                            source_ref: "session_message:original".into(),
+                        });
+                }
+                if defect == "obligation" {
+                    goal.obligations
+                        .push(harness_contract::goal::ObjectiveObligation {
+                            obligation_id: "required-user-work".into(),
+                            required: true,
+                            success_predicate: "verify the result".into(),
+                            producer: Default::default(),
+                            evidence_requirement: Default::default(),
+                            state: ObjectiveObligationState::Open,
+                            artifact_refs: vec![],
+                            evidence_refs: vec![],
+                            reread_receipts: vec![],
+                            verifier_decision: None,
+                            diagnostic_code: None,
+                        });
+                }
+                store.create(goal).unwrap();
+                if defect != "empty" {
+                    let mut observed = observation(1);
+                    observed.evidence_delta.added = vec!["receipt:actual".into()];
+                    if defect == "effect" {
+                        observed
+                            .effect_deltas
+                            .push(harness_contract::goal::EffectDelta {
+                                effect_id: "external-effect".into(),
+                                terminal_class:
+                                    harness_contract::goal::EffectTerminalClass::Uncertain,
+                                idempotency_ref: "effect-request".into(),
+                            });
+                    }
+                    store.record_observation(observed).unwrap();
+                }
+                let before = events.stream_revision("goal:goal-test").unwrap();
+                let result = match writer {
+                    "terminal_event" => store
+                        .terminal_event(
+                            "goal-test",
+                            GoalCompletion::Satisfied,
+                            vec![],
+                            "done".into(),
+                            "terminal-test".into(),
+                        )
+                        .map(|_| ()),
+                    "complete" => store
+                        .complete("goal-test", 1, GoalCompletion::Satisfied, "done")
+                        .map(|_| ()),
+                    _ => store
+                        .complete_objective("goal-test", 1, terminal_for_test())
+                        .map(|_| ()),
+                };
+                let error = result.expect_err("writer must not bypass unmet acceptance");
+                assert!(error.contains(defect), "{writer}/{defect}: {error}");
+                assert_eq!(events.stream_revision("goal:goal-test").unwrap(), before);
+                assert_eq!(
+                    store.get("goal-test").unwrap().unwrap().completion,
+                    GoalCompletion::Open
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_complete_cannot_emit_a_second_terminal_or_be_replaced_by_an_objective_fence() {
+        let events = Arc::new(RuntimeEventStore::for_test());
+        let store = GoalStore::new(Arc::clone(&events));
+        let mut goal = goal();
+        goal.criteria[0].status = AcceptanceStatus::Satisfied;
+        store.create(goal).unwrap();
+        let completed = store
+            .complete("goal-test", 1, GoalCompletion::Satisfied, "done")
+            .unwrap();
+        let before = events.stream_revision("goal:goal-test").unwrap();
+        assert!(store
+            .complete(
+                "goal-test",
+                completed.revision,
+                GoalCompletion::Satisfied,
+                "again"
+            )
+            .is_err());
+        assert!(store
+            .complete_objective("goal-test", completed.revision, terminal_for_test())
+            .is_err());
+        assert_eq!(events.stream_revision("goal:goal-test").unwrap(), before);
+    }
+
+    #[test]
+    fn objective_terminal_fence_replays_same_result_before_revision_check_and_rejects_changed_evidence(
+    ) {
+        let events = Arc::new(RuntimeEventStore::for_test());
+        let store = GoalStore::new(Arc::clone(&events));
+        let mut goal = goal();
+        goal.criteria[0].status = AcceptanceStatus::Satisfied;
+        store.create(goal).unwrap();
+        let completed = store
+            .complete_objective("goal-test", 1, terminal_for_test())
+            .unwrap();
+        let before = events.stream_revision("goal:goal-test").unwrap();
+        let mut retry = terminal_for_test();
+        retry.committed_at_ms = 2;
+        assert_eq!(
+            store
+                .complete_objective("goal-test", 1, retry.clone())
+                .unwrap(),
+            completed
+        );
+        retry.evidence_refs.push("different-evidence".into());
+        assert!(store
+            .complete_objective("goal-test", 1, retry)
+            .unwrap_err()
+            .contains("fence_conflict"));
+        assert_eq!(events.stream_revision("goal:goal-test").unwrap(), before);
     }
 
     #[test]

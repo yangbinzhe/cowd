@@ -26,9 +26,15 @@ fn normal_runtime_dependency_cannot_construct_or_append_to_the_raw_event_store()
     )
     .expect("probe source");
 
+    let workspace = runtime_path.parent().unwrap().parent().unwrap();
+    fs::copy(workspace.join("Cargo.lock"), root.path().join("Cargo.lock"))
+        .expect("probe must use the candidate's resolved dependency versions");
+
     let output = Command::new(env!("CARGO"))
         .arg("check")
         .arg("--offline")
+        .env("CARGO_TARGET_DIR", workspace.join("target"))
+        .env("CARGO_PROFILE_DEV_DEBUG", "1")
         .current_dir(root.path())
         .output()
         .expect("run downstream compile probe");

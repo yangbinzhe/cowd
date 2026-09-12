@@ -709,12 +709,16 @@ async fn prepare_semantic_embeddings(
         .map(memory_embedding_text)
         .collect::<Vec<_>>();
     let text_refs = texts.iter().map(String::as_str).collect::<Vec<_>>();
-    let embeddings = client.embed(&text_refs).await?;
+    let partial = client.embed_partial(&text_refs).await?;
+    if let Some(error) = partial.error {
+        tracing::warn!(%error, "partial semantic preparation; successful inputs remain usable and pending segments durable");
+    }
     Ok(Some(
         entries
             .iter()
             .map(|entry| entry.id)
-            .zip(embeddings)
+            .zip(partial.vectors)
+            .filter_map(|(id, vector)| vector.map(|vector| (id, vector)))
             .collect(),
     ))
 }
@@ -723,7 +727,6 @@ async fn embed_memory_entries(
     capability: &EmbeddingCapability,
     vector_index: &RwLock<VectorIndex>,
     entries: &[(MemoryId, String)],
-    persist: bool,
 ) -> Result<usize> {
     let EmbeddingCapability::Remote { client } = capability else {
         return Ok(0);
@@ -735,19 +738,28 @@ async fn embed_memory_entries(
         .iter()
         .map(|(_, content)| content.as_str())
         .collect::<Vec<_>>();
-    let embeddings = client.embed(&texts).await?;
+    let partial = client.embed_partial(&texts).await?;
+    let mut acknowledged = Vec::new();
     let (indexed, snapshot) = {
         let mut index = vector_index.write();
         let mut indexed = 0;
-        for ((id, _), embedding) in entries.iter().zip(embeddings) {
-            index.upsert(*id, embedding)?;
-            indexed += 1;
+        for ((id, text), embedding) in entries.iter().zip(partial.vectors) {
+            if let Some(embedding) = embedding {
+                index.upsert(*id, embedding)?;
+                acknowledged.push(text.as_str());
+                indexed += 1;
+            }
         }
-        let snapshot = persist.then(|| index.persistence_snapshot());
+        // A later page/provider failure must not discard earlier successful pages.
+        let snapshot = (indexed > 0).then(|| index.persistence_snapshot());
         (indexed, snapshot)
     };
     if let Some(snapshot) = snapshot {
         snapshot.persist()?;
+        client.acknowledge_embeddings(&acknowledged).await?;
+    }
+    if let Some(error) = partial.error {
+        return Err(error);
     }
     Ok(indexed)
 }
@@ -814,8 +826,8 @@ async fn reconcile_vector_index(
                 .map(|entry| (entry.id, memory_embedding_text(entry)))
                 .collect::<Vec<_>>()
         };
-        indexed = indexed
-            .saturating_add(embed_memory_entries(capability, vector_index, &missing, false).await?);
+        indexed =
+            indexed.saturating_add(embed_memory_entries(capability, vector_index, &missing).await?);
         let Some(next) = page.next else {
             break;
         };
@@ -1235,7 +1247,17 @@ impl CognitiveContextManager {
         let monitor = ContextWindowMonitor::new(budget_mgr);
 
         // Determine embedding capability before moving config.
-        let embedding_capability = EmbeddingCapability::from_config(&config.store.vector);
+        let embedding_capability = match EmbeddingCapability::from_config(&config.store.vector) {
+            EmbeddingCapability::Remote { client } => EmbeddingCapability::Remote {
+                client: client.with_progress_store(Arc::clone(&selected_store)),
+            },
+            other => other,
+        };
+        if let EmbeddingCapability::Remote { client } = &embedding_capability {
+            vector_index
+                .write()
+                .bind_embedding_identity(client.configuration_identity());
+        }
 
         // Startup info logs for optional features.
         if !embedding_capability.supports_semantic() {
@@ -1497,6 +1519,15 @@ impl CognitiveContextManager {
                                     None
                                 }
                             };
+                            let acknowledged_embedding_texts = final_entries
+                                .iter()
+                                .filter(|entry| {
+                                    semantic_embeddings
+                                        .as_ref()
+                                        .is_some_and(|vectors| vectors.contains_key(&entry.id))
+                                })
+                                .map(memory_embedding_text)
+                                .collect::<Vec<_>>();
                             let persist_result = persist_semantic_extraction_batch(
                                 &bg_orchestrator,
                                 &request.turn,
@@ -1527,6 +1558,19 @@ impl CognitiveContextManager {
                                             snapshot_result.and_then(|snapshot| snapshot.persist());
                                         match index_result {
                                             Ok(()) => {
+                                                if let EmbeddingCapability::Remote { client } =
+                                                    &bg_embedding_capability
+                                                {
+                                                    let texts = acknowledged_embedding_texts
+                                                        .iter()
+                                                        .map(String::as_str)
+                                                        .collect::<Vec<_>>();
+                                                    if let Err(error) =
+                                                        client.acknowledge_embeddings(&texts).await
+                                                    {
+                                                        tracing::warn!(%error, "embedding acknowledgement deferred; durable checkpoints retained");
+                                                    }
+                                                }
                                                 bg_state.indexed_entries.fetch_add(
                                                     persisted.prepared_embeddings.len() as u64,
                                                     Ordering::Relaxed,
@@ -1544,6 +1588,23 @@ impl CognitiveContextManager {
                                                     session_id = %request.turn.session_id,
                                                     "background semantic memory indexing degraded"
                                                 );
+                                            }
+                                        }
+                                    }
+                                    if persisted.prepared_embeddings.is_empty() {
+                                        // All completed inputs were semantically deduplicated;
+                                        // the durable memory decision is their downstream receipt.
+                                        if let EmbeddingCapability::Remote { client } =
+                                            &bg_embedding_capability
+                                        {
+                                            let texts = acknowledged_embedding_texts
+                                                .iter()
+                                                .map(String::as_str)
+                                                .collect::<Vec<_>>();
+                                            if let Err(error) =
+                                                client.acknowledge_embeddings(&texts).await
+                                            {
+                                                tracing::warn!(%error, "deduplicated embedding acknowledgement deferred");
                                             }
                                         }
                                     }

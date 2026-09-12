@@ -106,6 +106,7 @@ pub struct EvolutionProjectorHealth {
 pub(crate) struct EvolutionSignalProjector {
     event_store: Arc<RuntimeEventStore>,
     discovery: Arc<EvolutionDiscoveryService>,
+    workspace_identity: Option<String>,
 }
 
 impl EvolutionSignalProjector {
@@ -117,7 +118,13 @@ impl EvolutionSignalProjector {
         Self {
             event_store,
             discovery,
+            workspace_identity: None,
         }
+    }
+
+    pub(crate) fn with_workspace_identity(mut self, identity: String) -> Self {
+        self.workspace_identity = (!identity.trim().is_empty()).then_some(identity);
+        self
     }
 
     pub(crate) fn projection_lane(self: &Arc<Self>) -> Result<RuntimeProjectionLane, String> {
@@ -352,6 +359,11 @@ impl EvolutionSignalProjector {
             outcome_signal(event)?
         } else if event.kind == "agent.run_evaluated" {
             self.repeated_agent_failure_signal(event)?
+        } else if matches!(
+            event.kind.as_str(),
+            "tool.invocation.completed" | "tool.invocation.failed"
+        ) {
+            self.tool_experience_signal(event)?
         } else {
             signal_from_source_event(event)
         };
@@ -361,6 +373,62 @@ impl EvolutionSignalProjector {
         self.discovery
             .materialize_projected_signal(signal)
             .map(|_| true)
+    }
+
+    fn tool_experience_signal(
+        &self,
+        event: &DurableRuntimeEvent,
+    ) -> Result<Option<EvolutionSignal>, String> {
+        let workspace = self
+            .workspace_identity
+            .as_ref()
+            .ok_or("tool experience requires a trusted workspace identity")?;
+        let invocation: crate::ToolInvocationRecord = serde_json::from_value(event.payload.clone())
+            .map_err(|error| format!("tool experience invocation invalid: {error}"))?;
+        let binding = event
+            .activity_binding()
+            .ok_or("tool experience requires immutable Runtime activity ownership")?;
+        if event.scope != RuntimeEventScope::Tool
+            || event.stream_id != format!("session:{}", invocation.session_id)
+            || binding.session_id != invocation.session_id
+            || binding.tool_call_id.as_deref() != Some(invocation.tool_call_id.as_str())
+            || binding.tool_contract_id.as_deref() != Some(invocation.tool_name.as_str())
+            || invocation.ended_at_ms.is_none()
+            || (event.kind == "tool.invocation.completed"
+                && invocation.status != crate::ToolInvocationStatus::Completed)
+            || (event.kind == "tool.invocation.failed"
+                && !matches!(
+                    invocation.status,
+                    crate::ToolInvocationStatus::Failed | crate::ToolInvocationStatus::TimedOut
+                ))
+        {
+            return Err("tool experience terminal event does not match its Runtime binding".into());
+        }
+        let Some(candidate) = crate::memory_candidate_from_tool_invocation(
+            &invocation,
+            &crate::ToolMemoryCandidatePolicy::default(),
+        ) else {
+            return Ok(None);
+        };
+        let failed = invocation.status != crate::ToolInvocationStatus::Completed;
+        let digest = format!("{:x}", Sha256::digest(event.event_id.as_bytes()));
+        Ok(Some(EvolutionSignal {
+            signal_id:format!("evo-tool-source-{}",&digest[..24]),
+            signal_type:if failed {EvolutionSignalType::RecoveryGap} else {EvolutionSignalType::SlowProgress},
+            severity:EvolutionSignalSeverity::Warning,
+            source:EvolutionSignalSource {owner:scope_owner(event.scope).into(),session_id:Some(binding.session_id),
+                agent_id:binding.agent_instance_id,team_id:binding.team_run_id,run_id:Some(binding.root_execution_id)},
+            evidence_refs:vec![EvidenceRef::observed("runtime_event",event.event_id.clone()).with_source(event.kind.clone())],
+            // Do not copy candidate.reason: it contains private tool previews.
+            summary:format!("{}: {} ({})",candidate.summary,invocation.tool_name,invocation.status.as_str()),
+            suggested_action:"Inspect the scoped original tool evidence; propose a retrieval/tool-use candidate and compare it with the pinned baseline before any release. An observation is not a verified method.".into(),
+            immediate_task_can_continue:true,
+            scope:EvolutionSignalScope {workspace_identity:workspace.clone(),affected_subject:format!("runtime.tool:{}",invocation.tool_name),
+                workload_fingerprint:format!("tool-contract:{}",invocation.effective_registration_id),
+                config_definition_revision:format!("tool-contract-v{}",invocation.contract_version),
+                provider:"not_applicable".into(),model:"not_applicable".into(),evaluation_environment:"production".into()},
+            created_at_ms:u128::from(event.created_at_ms),
+        }))
     }
 
     fn unresolved_dead_letters(&self, limit: usize) -> Result<Vec<DurableRuntimeEvent>, String> {
@@ -1163,6 +1231,8 @@ fn projection_interest() -> RuntimeProjectionInterest {
     .map(|scope| RuntimeProjectionEventInterest::new(scope, OUTCOME_EVENT_KIND))
     .to_vec();
     interests.extend([
+        RuntimeProjectionEventInterest::new(RuntimeEventScope::Tool, "tool.invocation.completed"),
+        RuntimeProjectionEventInterest::new(RuntimeEventScope::Tool, "tool.invocation.failed"),
         RuntimeProjectionEventInterest::new(RuntimeEventScope::Evolution, "agent.run_evaluated"),
         RuntimeProjectionEventInterest::new(RuntimeEventScope::Goal, "goal.intervention"),
         RuntimeProjectionEventInterest::new(RuntimeEventScope::Goal, "goal.observation"),
@@ -1215,6 +1285,91 @@ mod tests {
         reality::EvidenceCompleteness,
         strategy::ExecutionCandidateKind,
     };
+
+    #[test]
+    fn tool_experience_is_runtime_bound_private_preview_free_and_replay_safe() {
+        let store = Arc::new(RuntimeEventStore::for_test());
+        let discovery = Arc::new(EvolutionDiscoveryService::new(Arc::clone(&store)));
+        let projector = EvolutionSignalProjector::new(Arc::clone(&store), Arc::clone(&discovery))
+            .with_workspace_identity("workspace-tools".into());
+        let invocation = crate::ToolInvocationRecord::started(
+            "tool-session",
+            1,
+            "tool-call",
+            "read_file",
+            "PRIVATE_INPUT",
+            crate::ToolSafetyCategory::ReadOnly,
+            100,
+        )
+        .failed(
+            crate::ToolFailureKind::ExecutionError,
+            "PRIVATE_OUTPUT",
+            150,
+        );
+        let binding: harness_contract::projection::RuntimeActivityBinding=serde_json::from_value(serde_json::json!({
+            "root_execution_id":"root-tools","session_id":"tool-session","turn_id":"turn-tools",
+            "root_task_id":"task-tools","task_id":"task-tools","activity_id":"activity-tools",
+            "parent_activity_id":"activity-root-tools",
+            "agent_instance_id":"agent-tools","tool_contract_id":"read_file","tool_call_id":"tool-call",
+            "revision":1,"fence":1,"generation":1
+        })).unwrap();
+        let input = RuntimeEventInput {
+            stream_id: "session:tool-session".into(),
+            scope: RuntimeEventScope::Tool,
+            kind: "tool.invocation.failed".into(),
+            status: Some("failed".into()),
+            actor: Some("conversation_runtime".into()),
+            refs: vec![],
+            payload: serde_json::to_value(&invocation).unwrap(),
+        }
+        .with_activity_binding(binding.clone())
+        .unwrap();
+        let event = store.append(input).unwrap();
+        projector.run_once(128).unwrap();
+        let signals = discovery.list_signals().unwrap();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(
+            signals[0].source.session_id.as_deref(),
+            Some("tool-session")
+        );
+        assert_eq!(signals[0].scope.workspace_identity, "workspace-tools");
+        let encoded = serde_json::to_string(&signals).unwrap();
+        assert!(!encoded.contains("PRIVATE_INPUT") && !encoded.contains("PRIVATE_OUTPUT"));
+        assert_eq!(discovery.list_cases(10).unwrap().len(), 1);
+        let reopened = EvolutionSignalProjector::new(Arc::clone(&store), Arc::clone(&discovery))
+            .with_workspace_identity("workspace-tools".into());
+        reopened.project_source(&event).unwrap();
+        reopened.run_once(128).unwrap();
+        assert_eq!(discovery.list_signals().unwrap().len(), 1);
+        assert_eq!(discovery.list_cases(10).unwrap().len(), 1);
+        let mut wrong = event.clone();
+        wrong.payload["session_id"] = serde_json::json!("foreign-session");
+        assert!(reopened.tool_experience_signal(&wrong).is_err());
+        assert!(
+            EvolutionSignalProjector::new(Arc::clone(&store), Arc::clone(&discovery))
+                .tool_experience_signal(&event)
+                .is_err()
+        );
+        let fast = invocation.started_fact().completed("private success", 110);
+        let mut success = event.clone();
+        success.kind = "tool.invocation.completed".into();
+        success.payload = serde_json::to_value(fast).unwrap();
+        success.payload["_runtime_activity_binding"] = serde_json::to_value(binding).unwrap();
+        assert!(reopened.tool_experience_signal(&success).unwrap().is_none());
+        let slow = invocation
+            .started_fact()
+            .completed("PRIVATE_SLOW_OUTPUT", 31_000);
+        success.payload["duration_ms"] = serde_json::json!(slow.duration_ms);
+        success.payload["ended_at_ms"] = serde_json::json!(slow.ended_at_ms);
+        assert_eq!(
+            reopened
+                .tool_experience_signal(&success)
+                .unwrap()
+                .unwrap()
+                .signal_type,
+            EvolutionSignalType::SlowProgress
+        );
+    }
 
     fn failed_agent_evaluation(index: u64) -> crate::AgentRunEvaluation {
         crate::AgentRunEvaluation {

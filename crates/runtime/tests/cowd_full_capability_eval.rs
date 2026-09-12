@@ -27,7 +27,11 @@ use session::{SessionRecord, UnifiedSessionStore};
 use std::sync::Arc;
 use storage::{PostgresConnectionConfig, PostgresExecutor, StaticSecretRefResolver};
 
-fn postgres_session_store() -> UnifiedSessionStore {
+fn postgres_fixture() -> (
+    UnifiedSessionStore,
+    Arc<dyn memory::store::MemoryStore>,
+    PgFixture,
+) {
     let url = std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
     let resolver = StaticSecretRefResolver::new([("runtime.eval.pg".to_string(), url)]);
     let executor = PostgresExecutor::connect(
@@ -41,19 +45,42 @@ fn postgres_session_store() -> UnifiedSessionStore {
         .expect("PostgreSQL test connection")
         .batch_execute(&format!("CREATE SCHEMA \"{schema}\""))
         .expect("create isolated test schema");
-    let backend = session_postgres::PostgresSessionStore::new(
-        executor
-            .scoped_namespace(&schema)
-            .expect("scope test schema"),
+    let guard = PgFixture {
+        executor: executor.clone(),
+        schema,
+    };
+    let scoped = executor
+        .scoped_namespace(&guard.schema)
+        .expect("scope test schema");
+    let backend = session_postgres::PostgresSessionStore::new(scoped.clone())
+        .expect("Session PostgreSQL adapter");
+    let memory =
+        memory_postgres::PostgresMemoryStore::new(scoped).expect("Memory PostgreSQL adapter");
+    (
+        UnifiedSessionStore::from_backend(Arc::new(backend)),
+        Arc::new(memory),
+        guard,
     )
-    .expect("Session PostgreSQL adapter");
-    UnifiedSessionStore::from_backend(Arc::new(backend))
 }
 
-fn memory_config(sqlite_path: &std::path::Path) -> MemoryConfig {
+struct PgFixture {
+    executor: PostgresExecutor,
+    schema: String,
+}
+impl Drop for PgFixture {
+    fn drop(&mut self) {
+        self.executor
+            .checkout_critical()
+            .expect("cleanup connection")
+            .batch_execute(&format!("DROP SCHEMA \"{}\" CASCADE", self.schema))
+            .expect("cleanup only the fixture-owned schema");
+    }
+}
+
+fn memory_config(blob_dir: &std::path::Path) -> MemoryConfig {
     MemoryConfig {
         store: memory::config::StoreConfig {
-            blob_dir: sqlite_path.parent().unwrap().join("blobs"),
+            blob_dir: blob_dir.to_path_buf(),
             enable_vector_index: false,
             cache_capacity: 256,
             ..Default::default()
@@ -158,12 +185,17 @@ async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_an
 ) {
     let tmp = tempfile::TempDir::new().expect("temp dir creates");
     let session_id = "session-full-capability-eval";
+    let (sessions, memory_store, _pg_fixture) = postgres_fixture();
     let memory = Arc::new(
-        CognitiveContextManager::new(memory_config(&tmp.path().join("memory.db")))
-            .await
-            .expect("memory manager opens"),
+        CognitiveContextManager::new_with_selected_store(
+            memory_config(&tmp.path().join("blobs")),
+            None,
+            None,
+            memory_store,
+        )
+        .await
+        .expect("memory manager opens"),
     );
-    let sessions = postgres_session_store();
     sessions
         .create_session(&session_record(session_id))
         .await

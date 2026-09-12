@@ -553,9 +553,14 @@ fn json_error(error: serde_json::Error) -> FactLedgerError {
 }
 
 #[cfg(test)]
+#[path = "../../storage/test-support/postgres_scope.rs"]
+mod postgres_scope;
+
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
+    use crate::postgres_scope::PostgresTestScope;
     use fact_kernel::{
         Confidence, EvidencePacket, FactGrowthBatch, FactId, FactLedger, FactRecallQuery,
         FactRecord, FactSource, GrowthPromotionRecord, SourceKind,
@@ -564,17 +569,11 @@ mod tests {
         core::{ExecutionPattern, TaskComplexity, TaskRisk},
         growth::{GrowthEvent, GrowthEventInput, GrowthEvidenceRef, GrowthInput, LearningRecord},
     };
-    use storage::{PostgresConnectionConfig, StaticSecretRefResolver};
 
     use super::*;
 
-    fn ledger_from_url(url: String, application_name: &str) -> PostgresFactLedger {
-        let resolver = StaticSecretRefResolver::new([(String::from("test"), url)]);
-        PostgresFactLedger::connect(
-            PostgresConnectionConfig::new("fact-postgres-test", "test", application_name),
-            &resolver,
-        )
-        .unwrap()
+    fn ledger_from_scope(scope: &PostgresTestScope) -> PostgresFactLedger {
+        PostgresFactLedger::new(scope.reconnect()).unwrap()
     }
 
     fn clear(ledger: &PostgresFactLedger) {
@@ -630,9 +629,8 @@ mod tests {
     #[test]
     #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
     fn real_postgres_bounded_recall_matches_authorization_order_and_limit_contract() {
-        let url =
-            std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
-        let ledger = ledger_from_url(url, "fact-postgres-recall-contract");
+        let fixture = PostgresTestScope::new();
+        let ledger = ledger_from_scope(&fixture);
         clear(&ledger);
         for (id, scope, confidence) in [
             ("fact-pg-recall-low", "task:allowed", 8_000),
@@ -663,9 +661,8 @@ mod tests {
     #[test]
     #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
     fn real_postgres_reopens_and_serializes_competing_fact_upserts() {
-        let url =
-            std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
-        let ledger = Arc::new(ledger_from_url(url.clone(), "fact-postgres-contract"));
+        let fixture = PostgresTestScope::new();
+        let ledger = Arc::new(ledger_from_scope(&fixture));
         clear(&ledger);
         let mut fact = FactRecord::new("policy", "verify durable output");
         fact.id = FactId::from_string("fact-postgres-concurrent");
@@ -712,7 +709,7 @@ mod tests {
             .canonical_digest()
             .unwrap();
         drop(ledger);
-        let reopened = ledger_from_url(url, "fact-postgres-reopen-contract");
+        let reopened = ledger_from_scope(&fixture);
         assert_eq!(reopened.list_facts().unwrap().len(), 1);
         assert_eq!(reopened.list_growth_events().unwrap().len(), 1);
         assert_eq!(reopened.list_growth_promotions().unwrap().len(), 1);

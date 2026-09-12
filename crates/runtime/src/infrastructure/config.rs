@@ -923,6 +923,13 @@ pub(super) fn parse_trusted_agent_executor_commands(
                 )))
             }
         };
+        let transport_limits: AgentProcessTransportLimits = command
+            .get("transport_limits")
+            .map(|value| serde_json::from_str(&value.render()))
+            .transpose()
+            .map_err(|error| ConfigError::Parse(format!("{context}.transport_limits: {error}")))?
+            .unwrap_or_default();
+        transport_limits.validate().map_err(ConfigError::Parse)?;
         let unknown = command
             .keys()
             .filter(|key| {
@@ -933,6 +940,7 @@ pub(super) fn parse_trusted_agent_executor_commands(
                         | "working_directory"
                         | "environment_refs"
                         | "sandbox_profile"
+                        | "transport_limits"
                 )
             })
             .collect::<Vec<_>>();
@@ -953,6 +961,7 @@ pub(super) fn parse_trusted_agent_executor_commands(
             working_directory.as_deref(),
             &environment_refs,
             sandbox_profile,
+            &transport_limits,
         );
         parsed.push(AgentExecutorCommandConfig {
             command_ref: command_ref.clone(),
@@ -961,6 +970,7 @@ pub(super) fn parse_trusted_agent_executor_commands(
             working_directory,
             environment_refs,
             sandbox_profile,
+            transport_limits,
             manifest_digest,
         });
     }
@@ -984,13 +994,14 @@ fn valid_process_environment_reference(reference: &str) -> bool {
         .is_some_and(|name| !name.is_empty() && valid_process_environment_name(name))
 }
 
-fn process_executor_manifest_digest(
+pub(crate) fn process_executor_manifest_digest(
     command_ref: &str,
     executable: &str,
     args: &[String],
     working_directory: Option<&str>,
     environment_refs: &BTreeMap<String, String>,
     sandbox_profile: AgentExecutorSandboxProfile,
+    transport_limits: &AgentProcessTransportLimits,
 ) -> String {
     let canonical = serde_json::json!({
         "command_ref": command_ref,
@@ -999,6 +1010,7 @@ fn process_executor_manifest_digest(
         "working_directory": working_directory,
         "environment_refs": environment_refs,
         "sandbox_profile": sandbox_profile,
+        "transport_limits": transport_limits,
     });
     format!("{:x}", Sha256::digest(canonical.to_string().as_bytes()))
 }

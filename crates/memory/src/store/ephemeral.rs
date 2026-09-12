@@ -356,7 +356,14 @@ impl MemoryStore for EphemeralMemoryStore {
             self.read()?
                 .entries
                 .values()
-                .filter(|e| e.scope == query.scope && same_memory_key(e) == query.fingerprint)
+                .filter(|e| {
+                    e.scope == query.scope
+                        && same_memory_key(e) == query.fingerprint
+                        && e.visibility == query.visibility
+                        && (!matches!(query.visibility, crate::types::AgentVisibility::Private)
+                            || (query.source_agent.is_some()
+                                && e.source_agent == query.source_agent))
+                })
                 .cloned()
                 .collect(),
             query.limit.clamp(1, 256),
@@ -676,6 +683,19 @@ impl MemoryStore for EphemeralMemoryStore {
     }
     async fn kv_get(&self, k: &str) -> Result<Option<String>> {
         Ok(self.read()?.kv.get(k).cloned())
+    }
+    async fn kv_delete(&self, key: &str) -> Result<()> {
+        let mut state = self.write()?;
+        if state.kv.remove(key).is_some() {
+            if let Some(scope) = key
+                .strip_prefix("memory_lifecycle:")
+                .and_then(|id| state.entries.get(id))
+                .map(|entry| entry.scope.clone())
+            {
+                bump_discovery(&mut state, &scope);
+            }
+        }
+        Ok(())
     }
     async fn list_key_values(&self) -> Result<Vec<MemoryKeyValue>> {
         Ok(self

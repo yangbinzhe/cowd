@@ -39,11 +39,11 @@ pub(crate) struct SelectedStorageTopology {
     pub(crate) connector_factory: Arc<dyn connector::ResourceDirectoryFactory>,
     pub(crate) connector_handle: storage::StorageHandle,
     pub(crate) artifact_store: Arc<runtime::ArtifactStore>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     test_namespace: Option<Arc<TestPostgresNamespace>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 struct TestPostgresNamespace {
     executor: PostgresExecutor,
@@ -51,11 +51,11 @@ struct TestPostgresNamespace {
     _permit: TestPostgresFixturePermit,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 struct TestPostgresFixturePermit;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn acquire_test_postgres_fixture_permit() -> TestPostgresFixturePermit {
     let (active, available) = test_postgres_fixture_capacity();
     let mut active = active
@@ -70,7 +70,7 @@ fn acquire_test_postgres_fixture_permit() -> TestPostgresFixturePermit {
     TestPostgresFixturePermit
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for TestPostgresFixturePermit {
     fn drop(&mut self) {
         let (active, available) = test_postgres_fixture_capacity();
@@ -82,14 +82,14 @@ impl Drop for TestPostgresFixturePermit {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn test_postgres_fixture_capacity() -> &'static (std::sync::Mutex<usize>, std::sync::Condvar) {
     static CAPACITY: std::sync::OnceLock<(std::sync::Mutex<usize>, std::sync::Condvar)> =
         std::sync::OnceLock::new();
     CAPACITY.get_or_init(|| (std::sync::Mutex::new(0), std::sync::Condvar::new()))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for TestPostgresNamespace {
     fn drop(&mut self) {
         // `name` is generated below and validated by `scoped_namespace`; it is
@@ -130,7 +130,7 @@ impl SelectedStorageTopology {
     /// Database-dependent tests intentionally fail when the required URL is
     /// absent. This prevents `cargo test` from silently proving a different
     /// SQLite architecture than the one shipped by Gateway.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn compose_for_test(
         config_home: &Path,
         workspace_root: &Path,
@@ -327,7 +327,7 @@ impl SelectedStorageTopology {
             connector_factory,
             connector_handle: connector_endpoint.as_handle(),
             artifact_store,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             test_namespace: None,
         })
     }
@@ -354,7 +354,7 @@ impl SelectedStorageTopology {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn shared_test_postgres_executor(
     config: &runtime::PostgresTopologyConfig,
     config_home: &Path,

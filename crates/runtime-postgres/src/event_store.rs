@@ -557,6 +557,52 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         Ok(checkpoint)
     }
 
+    fn compare_and_repair_projection_checkpoint(
+        &self,
+        projection_id: &str,
+        source_cursor: u64,
+        expected_revision: u64,
+        payload: &Value,
+        updated_at_ms: u64,
+    ) -> RuntimeEventStoreResult<RuntimeProjectionCheckpoint> {
+        validate_projection_id(projection_id)?;
+        let mut connection = self.checkout_event_write()?;
+        let mut tx = pg(connection.transaction())?;
+        let lock_key = format!("cowd-runtime-projection:{projection_id}");
+        pg(tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&lock_key],
+        ))?;
+        let row = pg(tx.query_opt(
+            "UPDATE runtime_projection_checkpoints
+                SET source_cursor=$1, revision=revision+1, payload=$2, updated_at_ms=$3
+              WHERE projection_id=$4 AND revision=$5
+          RETURNING projection_id, source_cursor, revision, payload, updated_at_ms",
+            &[
+                &to_i64(source_cursor, "source_cursor")?,
+                payload,
+                &to_i64(updated_at_ms, "updated_at_ms")?,
+                &projection_id,
+                &to_i64(expected_revision, "expected_revision")?,
+            ],
+        ))?;
+        let Some(row) = row else {
+            let actual = pg(tx.query_opt(
+                "SELECT revision FROM runtime_projection_checkpoints WHERE projection_id=$1",
+                &[&projection_id],
+            ))?
+            .map_or(0, |row| row.get::<_, i64>(0) as u64);
+            return Err(RuntimeEventStoreError::StaleRevision {
+                stream_id: format!("projection:{projection_id}"),
+                expected: expected_revision,
+                actual,
+            });
+        };
+        let checkpoint = row_to_projection_checkpoint(&row)?;
+        pg(tx.commit())?;
+        Ok(checkpoint)
+    }
+
     fn delete_projection_checkpoint(&self, projection_id: &str) -> RuntimeEventStoreResult<bool> {
         validate_projection_id(projection_id)?;
         let mut connection = self.checkout_event_write()?;

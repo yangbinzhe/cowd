@@ -1,16 +1,5 @@
 use super::*;
 
-pub(super) fn observed_evidence_matches_requested_path(
-    observed: &harness_contract::context::ObservedEvidence,
-    requested_paths: &[String],
-) -> bool {
-    matches!(
-        &observed.target,
-        harness_contract::context::EvidenceTargetIdentity::Workspace { scope }
-            if requested_paths.contains(&scope.path.workspace_relative_path)
-    )
-}
-
 impl ScopedRuntimeToolExecutor {
     pub(super) fn provider_model_obligation_ids(
         &self,
@@ -204,19 +193,24 @@ impl ScopedRuntimeToolExecutor {
         let input = serde_json::from_str::<serde_json::Value>(input).map_err(|error| {
             ToolError::new(format!("invalid Runtime delegated tool input: {error}"))
         })?;
-        let operation = input
-            .get("operation")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        let category = if tool_name == "message_publish" || operation == "publish" {
-            crate::ToolSafetyCategory::WriteLocal
+        let descriptor = self
+            .host
+            .delegated_tool_effect_descriptor(tool_name, &input)
+            .ok_or_else(|| {
+                ToolError::new("Runtime delegated tool has no registered effect descriptor")
+            })?;
+        let category = crate::ToolSafetyCategory::from_effect(&descriptor);
+        let read_sequence = if tool_name == "evidence_retrieve" {
+            self.next_receipt_sequence
+                .fetch_add(1, Ordering::SeqCst)
+                .saturating_add(1)
         } else {
-            crate::ToolSafetyCategory::ReadOnly
+            0
         };
         let request = RuntimeToolExecutionRequest {
             governed_plan_id: self.execution_id.clone(),
             governed_plan_revision: 1,
-            observation_wave_sequence: 0,
+            observation_wave_sequence: read_sequence,
             idempotency_key: authorization
                 .idempotency_key
                 .clone()
@@ -245,7 +239,31 @@ impl ScopedRuntimeToolExecutor {
             managed_invocation: None,
             tool_progress: crate::ToolProgressSink::default(),
         };
-        let outcome = self.host.execute_runtime_tool(&request).await;
+        let outcome = if tool_name == "artifact_materialize" {
+            if let Some(dispatcher) = &self.tool_batch {
+                dispatcher.execute(request.clone()).await?
+            } else {
+                self.host.execute_runtime_tool(&request).await
+            }
+        } else {
+            self.host.execute_runtime_tool(&request).await
+        };
+        if tool_name == "evidence_retrieve" {
+            if let Some(commit) = &self.commit_service {
+                let mut receipt = outcome.clone();
+                receipt.output = receipt
+                    .output
+                    .as_deref()
+                    .map(crate::agentic::review_evidence::compact_read_receipt);
+                commit
+                    .commit_readonly_tool_receipts(&[(request.clone(), receipt)])
+                    .map_err(|error| {
+                        ToolError::new(format!(
+                            "evidence read completed but durable receipt commit failed: {error}"
+                        ))
+                    })?;
+            }
+        }
         match outcome.status {
             RuntimeToolExecutionStatus::Executed => Ok(outcome.output.unwrap_or_default()),
             RuntimeToolExecutionStatus::BlockedPermission => {
@@ -290,7 +308,11 @@ impl ScopedRuntimeToolExecutor {
         // and durable Session actor/workspace checks, not by a filesystem path.
         // Treating its read-only runtime scope as an unbounded path would make
         // Team Agents lose the context continuity that the primary Agent has.
-        if tool_name == "context_retrieve" || is_agent_action_tool(tool_name) {
+        if matches!(
+            tool_name,
+            "context_retrieve" | "working_context" | "private_note"
+        ) || is_agent_action_tool(tool_name)
+        {
             return Ok(());
         }
         let input = serde_json::from_str::<serde_json::Value>(input)
@@ -408,56 +430,6 @@ impl ScopedRuntimeToolExecutor {
             .next_receipt_sequence
             .fetch_add(1, Ordering::SeqCst)
             .saturating_add(1);
-        // AgentTask deliberately does not retain its broad resource locks while
-        // awaiting the delegated child.  The concrete leaf effect therefore
-        // acquires the same canonical locks used by graph ToolBatch nodes.  The
-        // lease spans pre-image capture, execution and receipt materialization,
-        // so neither the evidence snapshot nor the side effect can race another
-        // in-process or persistent scoped executor.
-        let lock_mode = if descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Write {
-            ScopeLockMode::Write
-        } else {
-            ScopeLockMode::Read
-        };
-        let lock_paths = if bounded_sandbox_process {
-            vec![".".to_string()]
-        } else {
-            requested.paths.clone()
-        };
-        let lock_requests = lock_paths
-            .iter()
-            .map(|path| {
-                let identity = if bounded_sandbox_process {
-                    self.path_identity_resolver.resolve_existing(path)
-                } else {
-                    self.path_identity_resolver.resolve_planned_file(path)
-                };
-                identity
-                    .map(|identity| ScopeLockRequest {
-                        scope: ScopedResource::workspace_object(identity),
-                        mode: lock_mode,
-                    })
-                    .map_err(|error| {
-                        ToolError::new(format!(
-                            "tool `{tool_name}` has an invalid scoped lock target `{path}`: {error}"
-                        ))
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let _scope_lock = if lock_requests.is_empty() {
-            None
-        } else {
-            Some(
-                self.scope_locks
-                    .acquire(lock_requests, None)
-                    .await
-                    .map_err(|error| {
-                        ToolError::new(format!(
-                            "tool `{tool_name}` could not acquire its scoped resource lease: {error}"
-                        ))
-                    })?,
-            )
-        };
         let idempotency_key = authorization
             .as_ref()
             .and_then(|value| value.idempotency_key.clone())
@@ -501,108 +473,19 @@ impl ScopedRuntimeToolExecutor {
             managed_invocation: self.managed_invocation.clone(),
             tool_progress: crate::ToolProgressSink::default(),
         };
-        let effect_state = self
-            .commit_service
-            .as_ref()
-            .map(|service| service.begin_tool_effect(&request, &descriptor))
-            .transpose()
-            .map_err(|error| {
-                ToolError::new(format!(
-                    "tool `{tool_name}` durable effect admission failed: {error}"
-                ))
-            })?
-            .unwrap_or(crate::execution_core::graph::ToolEffectState::Fresh);
-        let (mut outcome, fresh_execution) = match effect_state {
-            crate::execution_core::graph::ToolEffectState::Completed(mut outcome) => {
-                outcome.tool_use_id.clone_from(&request.tool_use_id);
-                outcome.tool_name.clone_from(&request.tool_name);
-                outcome.category = request.category;
-                for evidence in &mut outcome.observed_evidence {
-                    evidence.provenance =
-                        harness_contract::context::ObservedEvidenceProvenance::RetainedReplay;
-                }
-                (outcome, false)
-            }
-            crate::execution_core::graph::ToolEffectState::Uncertain => {
-                return Err(ToolError::new(
-                    "tool effect is uncertain; non-idempotent execution was not replayed",
-                ));
-            }
-            crate::execution_core::graph::ToolEffectState::Fresh
-            | crate::execution_core::graph::ToolEffectState::NotRequired => {
-                (self.host.execute_runtime_tool(&request).await, true)
-            }
+        let mut outcome = if let Some(dispatcher) = &self.tool_batch {
+            dispatcher.execute(request.clone()).await?
+        } else {
+            crate::bound_tool_batch::execute_bound_agent_tool(
+                self.host.as_ref(),
+                self.commit_service.as_ref(),
+                &self.path_identity_resolver,
+                &self.scope_locks,
+                &request,
+                &descriptor,
+            )
+            .await?
         };
-        // Delegated ToolHost adapters must return typed observations together
-        // with a successful receipt. Some compatibility adapters return only
-        // raw structured output. In that case Runtime may mint exact-content
-        // evidence solely when the output itself proves start=1, EOF coverage,
-        // no truncation and a valid full-file digest. Requested paths and a
-        // successful status alone are never evidence. Discovery tools must
-        // provide their own typed observations; writes and failures are never
-        // inferred here.
-        if outcome.status == RuntimeToolExecutionStatus::Executed
-            && outcome.observed_evidence.is_empty()
-            && descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Read
-        {
-            let parsed = outcome
-                .output
-                .as_deref()
-                .and_then(|output| serde_json::from_str::<serde_json::Value>(output).ok());
-            if tool_name == "read_file" {
-                if let Some(observed) = parsed.as_ref().and_then(|output| {
-                    self.path_identity_resolver
-                        .observe_complete_read_tool_output(tool_name, output, sequence)
-                        .ok()
-                        .filter(|observed| {
-                            observed_evidence_matches_requested_path(observed, &requested.paths)
-                        })
-                }) {
-                    outcome.observed_evidence.push(observed);
-                }
-            } else if tool_name == "read_many" {
-                outcome.observed_evidence.extend(
-                    parsed
-                        .as_ref()
-                        .and_then(|output| output.get("results"))
-                        .and_then(serde_json::Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .filter(|item| {
-                            item.get("status").and_then(serde_json::Value::as_str)
-                                == Some("success")
-                        })
-                        .filter_map(|item| item.get("output"))
-                        .filter_map(|output| {
-                            self.path_identity_resolver
-                                .observe_complete_read_tool_output("read_file", output, sequence)
-                                .ok()
-                                .filter(|observed| {
-                                    observed_evidence_matches_requested_path(
-                                        observed,
-                                        &requested.paths,
-                                    )
-                                })
-                        }),
-                );
-            }
-        }
-        if fresh_execution {
-            if let Some(commit_service) = &self.commit_service {
-                let committed =
-                    if descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Read {
-                        commit_service
-                            .commit_readonly_tool_receipts(&[(request.clone(), outcome.clone())])
-                    } else {
-                        commit_service.commit_tool_effect(&request, &descriptor, &outcome)
-                    };
-                if let Err(error) = committed {
-                    return Err(ToolError::new(format!(
-                        "tool `{tool_name}` completed but durable receipt commit failed: {error}"
-                    )));
-                }
-            }
-        }
         // The delegated read receipt is now committed (or was recovered from
         // that committed receipt). Bind any typed observation to that durable
         // Runtime event before the Agent terminal consumes it. Gateway may

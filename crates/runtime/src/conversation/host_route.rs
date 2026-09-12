@@ -199,6 +199,10 @@ where
         self.runtime_ref().set_context_profile(profile);
     }
 
+    pub(crate) fn bind_skill_task_objective(&mut self, objective: String) {
+        self.runtime_mut().bind_skill_task_objective(objective);
+    }
+
     pub fn set_execution_policy(
         &self,
         policy: harness_contract::policy::SessionExecutionPolicy,

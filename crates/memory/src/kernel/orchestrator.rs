@@ -12,23 +12,13 @@ use std::{
 };
 
 use chrono::Utc;
-use std::sync::OnceLock;
 use uuid::Uuid;
-
-/// Global FactChecker singleton — replacing the dual-instance pattern.
-static GLOBAL_FACT_CHECKER: OnceLock<parking_lot::Mutex<FactChecker>> = OnceLock::new();
-
-/// Get the global FactChecker instance.
-pub fn get_fact_checker() -> &'static parking_lot::Mutex<FactChecker> {
-    GLOBAL_FACT_CHECKER.get_or_init(|| parking_lot::Mutex::new(FactChecker::new()))
-}
 
 use crate::{
     closet::{Closet, ClosetManager},
     config::{BudgetCalculator, MemoryConfig},
     context_fence::FenceRegistry,
     error::MemoryError,
-    fact_checker::{FactCheckResult, FactChecker},
     kernel::{scoped_entry_scope, MemoryTurnContext},
     layers::{
         deep::DeepLayer, essential::EssentialLayer, identity::IdentityLayer, project::ProjectLayer,
@@ -38,7 +28,6 @@ use crate::{
     project_scope::MemoryScope,
     shared::SharedMemoryManager,
     store::MemoryStore,
-    temporal_graph::{EntityFacts, Triple},
     types::{
         MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemoryMeta, MemorySource,
         PreparedContext, Priority, TokenBudget,
@@ -569,11 +558,9 @@ impl MemoryOrchestrator {
 
     /// Store one already-resolved entry, routing it to the correct layer.
     ///
-    /// If a fact checker is configured, the entry content is scanned for
-    /// known entity facts. Extracted facts are registered for future checks,
-    /// and contradictory statements cause the entry's confidence to be
-    /// downgraded.
-    async fn remember_resolved(&self, mut entry: MemoryEntry) -> Result<MemoryId> {
+    /// Source and conflict governance belongs to MemoryKernel. Free-form
+    /// memory content is never registered as an unscoped, verified fact.
+    async fn remember_resolved(&self, entry: MemoryEntry) -> Result<MemoryId> {
         if entry.layer == MemoryLayer::L4 {
             return Err(MemoryError::WriteDenied {
                 layer: "L4".to_string(),
@@ -593,64 +580,6 @@ impl MemoryOrchestrator {
                     layer: format!("{:?}", entry.layer),
                     write_source: format!("{:?}", guard.source()),
                 });
-            }
-        }
-
-        // Apply fact checking if configured
-        let check_result: Option<FactCheckResult> = {
-            let guard = get_fact_checker().lock();
-            let checker = &*guard;
-            let source_agent = entry.source_agent.as_deref();
-            let triple = extract_triple_from_content(&entry.content, source_agent);
-            if let Some(ref t) = triple {
-                let result = checker.check_triple(t);
-                if !result.is_consistent {
-                    Some(result)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
-
-        if let Some(result) = check_result {
-            entry.confidence = (entry.confidence * result.confidence).min(0.5);
-            tracing::warn!(
-                contradiction = ?result.contradiction,
-                confidence = result.confidence,
-                entry_id = %entry.id,
-                "fact check: contradiction detected, confidence downgraded"
-            );
-        }
-
-        // Register new facts from content for future checks
-        // Also perform cross-agent conflict detection
-        {
-            let mut guard = get_fact_checker().lock();
-            let checker = &mut *guard;
-            let source_agent = entry.source_agent.as_deref();
-            register_facts_from_content(checker, &entry.content, source_agent);
-
-            // Cross-agent conflict detection
-            if let Some(triple) = extract_triple_from_content(&entry.content, source_agent) {
-                let conflict_info = checker.detect_conflict(&triple);
-                if let Some((conflicting, score)) = conflict_info {
-                    let loser_confidence = score.clamp(0.1, 0.9);
-                    entry.confidence = (entry.confidence * loser_confidence).min(0.5);
-                    tracing::warn!(
-                        subject = %conflicting.subject,
-                        predicate = %conflicting.predicate,
-                        existing_object = %conflicting.object,
-                        conflict_score = score,
-                        entry_id = %entry.id,
-                        "cross-agent conflict: confidence downgraded"
-                    );
-                    // Also register this triple with downgraded confidence
-                    let mut downgraded = triple;
-                    downgraded.confidence = entry.confidence;
-                    checker.register_triple(downgraded);
-                }
             }
         }
 
@@ -958,23 +887,6 @@ impl MemoryOrchestrator {
         self
     }
 
-    /// Configure a fact checker for contradiction detection.
-    ///
-    /// Uses the global FactChecker singleton (OnceLock). If already set,
-    /// this replaces the existing checker.
-    pub fn with_fact_checker(self, checker: FactChecker) -> Self {
-        let _ = GLOBAL_FACT_CHECKER.set(parking_lot::Mutex::new(checker));
-        self
-    }
-
-    /// Access the fact checker for configuration.
-    pub fn with_fact_checker_mut<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&mut FactChecker) -> R,
-    {
-        let mut guard = get_fact_checker().lock();
-        f(&mut guard)
-    }
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
@@ -990,108 +902,6 @@ impl MemoryOrchestrator {
 
 fn estimate_tokens(content: &str) -> u64 {
     (content.len() as u64).div_ceil(4)
-}
-
-/// Extract a Triple from entry content if it contains entity relationship statements.
-///
-/// Recognised patterns:
-/// - `"Alice's parent is Bob"` → triple(subject="Alice", predicate="parent_of", object="Bob")
-/// - `"Alice is child_of Charlie"` → same
-/// - `"Alice's full_name is Alice Smith"` → triple(subject="Alice", predicate="full_name", object="Alice Smith")
-fn extract_triple_from_content(content: &str, source_agent: Option<&str>) -> Option<Triple> {
-    static PARENT_RE: OnceLock<std::result::Result<regex::Regex, regex::Error>> = OnceLock::new();
-    static CHILD_RE: OnceLock<std::result::Result<regex::Regex, regex::Error>> = OnceLock::new();
-
-    let parent_re = PARENT_RE
-        .get_or_init(|| regex::Regex::new(r#"(\w+)'s\s+parent\s+is\s+(\w+)"#))
-        .as_ref()
-        .ok()?;
-    if let Some(caps) = parent_re.captures(content) {
-        let subject = caps.get(1)?.as_str().to_string();
-        let object = caps.get(2)?.as_str().to_string();
-        return Some(Triple {
-            id: uuid::Uuid::new_v4().to_string(),
-            subject,
-            predicate: "child_of".to_string(),
-            object,
-            valid_from: None,
-            valid_until: None,
-            confidence: 1.0,
-            source_memory_id: None,
-            source_file: None,
-            source_agent: source_agent.map(String::from),
-        });
-    }
-
-    // Pattern: "X is child_of Y"
-    let child_re = CHILD_RE
-        .get_or_init(|| regex::Regex::new(r#"(\w+)\s+is\s+child_of\s+(\w+)"#))
-        .as_ref()
-        .ok()?;
-    if let Some(caps) = child_re.captures(content) {
-        let subject = caps.get(1)?.as_str().to_string();
-        let object = caps.get(2)?.as_str().to_string();
-        return Some(Triple {
-            id: uuid::Uuid::new_v4().to_string(),
-            subject,
-            predicate: "child_of".to_string(),
-            object,
-            valid_from: None,
-            valid_until: None,
-            confidence: 1.0,
-            source_memory_id: None,
-            source_file: None,
-            source_agent: source_agent.map(String::from),
-        });
-    }
-
-    None
-}
-
-/// Register entity facts from entry content into the fact checker.
-///
-/// This enables the fact checker to detect contradictions across writes:
-/// first write registers the fact, second write with contradictory value
-/// triggers a warning and confidence downgrade.
-fn register_facts_from_content(
-    checker: &mut FactChecker,
-    content: &str,
-    source_agent: Option<&str>,
-) {
-    static REGISTER_PARENT_RE: OnceLock<std::result::Result<regex::Regex, regex::Error>> =
-        OnceLock::new();
-
-    let Ok(parent_re) = REGISTER_PARENT_RE
-        .get_or_init(|| regex::Regex::new(r#"(\w+)'s\s+parent\s+is\s+(\w+)"#))
-        .as_ref()
-    else {
-        return;
-    };
-    for caps in parent_re.captures_iter(content) {
-        if let (Some(subj), Some(obj)) = (caps.get(1), caps.get(2)) {
-            let subject = subj.as_str();
-            let parent_name = obj.as_str();
-            let mut facts = EntityFacts::default();
-            facts.entity_type = Some("person".to_string());
-            facts.parent = Some(parent_name.to_string());
-            checker.register_facts(subject, facts);
-
-            // Register triple for cross-agent conflict detection
-            let triple = Triple {
-                id: uuid::Uuid::new_v4().to_string(),
-                subject: subject.to_string(),
-                predicate: "child_of".to_string(),
-                object: parent_name.to_string(),
-                valid_from: Some(chrono::Utc::now()),
-                valid_until: None,
-                confidence: 1.0,
-                source_memory_id: None,
-                source_file: None,
-                source_agent: source_agent.map(String::from),
-            };
-            checker.register_triple(triple);
-        }
-    }
 }
 
 fn identity_entry(title: &str, content: &str) -> crate::types::MemoryEntry {

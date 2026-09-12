@@ -7,14 +7,10 @@ cd "$ROOT"
 tests=(
   user_defined_aliases_resolve_before_provider_dispatch
   yolo_flag_forces_danger_full_access_and_marks_tui_mode
-  yolo_mode_creates_and_reuses_durable_task
   yolo_system_prompt_adds_continuous_execution_instruction
   setup_report_and_json_are_redacted_and_actionable
-  managed_sessions_default_to_sqlite_and_detect_legacy_imports
   resolve_tui_model_ignores_provider_specific_model_environment
   resolve_tui_model_returns_default_when_env_unset_and_no_config
-  resume_diff_command_renders_report_for_saved_session
-  resume_session_switch_updates_outcome_session_and_path
 )
 
 if [[ "$#" -gt 0 ]]; then
@@ -28,6 +24,12 @@ mkdir -p "$REPORT_DIR/logs"
 
 status=0
 for test_name in "${tests[@]}"; do
+  if [[ ! "$test_name" =~ ^[a-zA-Z0-9_:]+$ ]]; then
+    echo "invalid global-env test name: $test_name" >&2
+    exit 2
+  fi
+  qualified_name="$test_name"
+  [[ "$qualified_name" == *::* ]] || qualified_name="tests::$qualified_name"
   echo "==> gateway global-env test: ${test_name}"
   log="$REPORT_DIR/logs/${test_name}.log"
   time_log="$REPORT_DIR/logs/${test_name}.time"
@@ -35,10 +37,14 @@ for test_name in "${tests[@]}"; do
   /usr/bin/time \
     -f 'TIME_REAL_SECONDS=%e\nTIME_USER_SECONDS=%U\nTIME_SYS_SECONDS=%S\nMAX_RSS_KB=%M' \
     -o "$time_log" \
-    cargo test -p gateway --lib "${test_name}" --no-default-features --quiet -- --ignored --test-threads=1 \
+    cargo test --locked -p gateway --lib "${qualified_name}" --no-default-features --quiet -- --exact --ignored --test-threads=1 \
     >"$log" 2>&1
   test_status=$?
   set -e
+  if [[ "$test_status" -eq 0 ]] && ! rg -q '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$log"; then
+    echo "global-env gate did not execute exactly one passing test: $qualified_name" >> "$log"
+    test_status=1
+  fi
   real_seconds="$(awk -F= '$1 == "TIME_REAL_SECONDS" {print $2}' "$time_log")"
   printf '%s\t%s\t%s\n' "$test_name" "$test_status" "$real_seconds" >> "$REPORT_DIR/commands.tsv"
   echo "    status=${test_status} real=${real_seconds}s"

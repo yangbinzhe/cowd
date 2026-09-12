@@ -1,7 +1,4 @@
 use harness_contract::agent_action::{AgentActionEnvelope, ObjectiveCompleteRequestInput};
-use harness_contract::goal::{
-    ObjectiveEvidenceRequirement, ObjectiveObligation, ObjectiveObligationState,
-};
 use std::collections::BTreeSet;
 
 use super::program::{
@@ -21,25 +18,12 @@ pub(crate) fn completion_gap(
             projection.teams.len()
         ));
     }
-    let incomplete_teams = projection
-        .teams
+    if projection
+        .tasks
         .values()
-        .filter(|team| {
-            team.member_ids.is_empty()
-                || !team.task_ids.iter().any(|task_id| {
-                    projection
-                        .tasks
-                        .get(task_id)
-                        .is_some_and(|task| task.status != AgenticTaskStatus::Superseded)
-                })
-        })
-        .map(|team| team.team_id.clone())
-        .collect::<Vec<_>>();
-    if !incomplete_teams.is_empty() {
-        return Some(format!(
-            "teams_without_members_or_work:{}",
-            incomplete_teams.join(",")
-        ));
+        .any(|task| !task.active_attempts.is_empty())
+    {
+        return Some("execution_cleanup_pending".into());
     }
     let primary_artifact = input
         .result_refs
@@ -56,31 +40,67 @@ pub(crate) fn completion_gap(
     let incomplete = projection
         .tasks
         .values()
-        .filter(|task| {
-            task.status != AgenticTaskStatus::Superseded
-                && task.status != AgenticTaskStatus::Accepted
-        })
+        .filter(|task| !task.status.is_retired() && task.status != AgenticTaskStatus::Accepted)
         .map(|task| task.task_id.clone())
         .collect::<Vec<_>>();
     if !incomplete.is_empty() {
         return Some(format!("tasks_not_accepted:{}", incomplete.join(",")));
     }
-    // A collaboration Program can only close through a registered Artifact
-    // that an independently reviewed Task actually submitted.  Accepting an
-    // arbitrary external result reference here would let a root model bypass
-    // the same dependency lineage that the Objective supervisor later relies
-    // on to prove multi-Team integration.
-    if !projection.tasks.is_empty() && primary_artifact.is_none() {
-        return Some("completion_result_artifact_not_registered".to_string());
+    let contributing_teams = projection
+        .tasks
+        .values()
+        .filter(|task| task.status == AgenticTaskStatus::Accepted)
+        .map(|task| &task.team_id)
+        .collect::<BTreeSet<_>>();
+    if contributing_teams.len() < usize::from(projection.required_team_count) {
+        return Some(format!(
+            "required_team_contributions_missing:expected={},actual={}",
+            projection.required_team_count,
+            contributing_teams.len()
+        ));
     }
-    if let Some(primary_artifact) = primary_artifact {
-        if !projection.tasks.values().any(|task| {
-            task.status == AgenticTaskStatus::Accepted
-                && task.artifact_refs.contains(primary_artifact)
-        }) {
-            return Some("result_artifact_not_accepted_by_task_review".to_string());
-        }
-        let uncovered_teams = uncovered_delivery_teams(projection, primary_artifact);
+    // A result may be a durable tool effect or structured content. The Goal
+    // owner separately requires its current original-objective review; no
+    // synthetic final report Artifact is required for these result kinds.
+    if input.result_refs.iter().any(|reference| {
+        !projection.artifacts.contains_key(reference)
+            && !reference.starts_with("tool://")
+            && !reference.starts_with("artifact://")
+            && crate::execution_core::graph::executors::parse_graph_approval_id(reference).is_none()
+    }) {
+        return Some("completion_result_reference_not_supported".into());
+    }
+    if primary_artifact.is_some() {
+        let integrated = input
+            .result_refs
+            .iter()
+            .flat_map(|reference| {
+                projection
+                    .artifacts
+                    .values()
+                    .filter(move |artifact| {
+                        artifact.artifact_ref == *reference || artifact.content_ref == *reference
+                    })
+                    .flat_map(|artifact| {
+                        integrated_accepted_tasks(projection, &artifact.artifact_ref)
+                    })
+            })
+            .collect::<BTreeSet<_>>();
+        let contributing = integrated
+            .iter()
+            .filter_map(|task| projection.tasks.get(task))
+            .map(|task| &task.team_id)
+            .collect::<BTreeSet<_>>();
+        let uncovered_teams = if contributing.len() >= usize::from(projection.required_team_count) {
+            vec![]
+        } else {
+            projection
+                .teams
+                .keys()
+                .filter(|team| !contributing.contains(team))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
         if !uncovered_teams.is_empty() {
             return Some(format!(
                 "result_artifact_does_not_integrate_required_teams:{}",
@@ -92,7 +112,7 @@ pub(crate) fn completion_gap(
         .tasks
         .values()
         .filter(|task| {
-            task.status != AgenticTaskStatus::Superseded
+            !task.status.is_retired()
                 && (task.claimant.is_none()
                     || task.reviewed_by.is_none()
                     || task.claimant.as_deref() == task.reviewed_by.as_deref())
@@ -124,9 +144,9 @@ pub(crate) fn completion_gap(
 /// Return final Artifact references that can truthfully close this Program.
 ///
 /// This is deliberately derived from Runtime projections rather than model
-/// labels: every non-superseded Task must be accepted, and a candidate
+/// labels: every non-retired Task must be accepted, and a candidate
 /// Artifact must belong to an accepted Task whose real dependency lineage
-/// reaches work from every active Team.  The root model still chooses the
+/// reaches the user-required number of contributing Teams.  The root model still chooses the
 /// synthesis Team, author, Task semantics, evidence and final presentation;
 /// the kernel merely exposes whether a requested terminal is mechanically
 /// admissible.
@@ -135,10 +155,10 @@ pub(crate) fn completion_ready_result_artifact_refs(
 ) -> Vec<String> {
     if projection.teams.len() < usize::from(projection.required_team_count)
         || projection.tasks.is_empty()
-        || projection.tasks.values().any(|task| {
-            task.status != AgenticTaskStatus::Superseded
-                && task.status != AgenticTaskStatus::Accepted
-        })
+        || projection
+            .tasks
+            .values()
+            .any(|task| !task.status.is_retired() && task.status != AgenticTaskStatus::Accepted)
     {
         return Vec::new();
     }
@@ -161,6 +181,14 @@ fn uncovered_delivery_teams(
     final_artifact_ref: &str,
 ) -> Vec<String> {
     let integrated_tasks = integrated_accepted_tasks(projection, final_artifact_ref);
+    let contributing = integrated_tasks
+        .iter()
+        .filter_map(|id| projection.tasks.get(id))
+        .map(|task| &task.team_id)
+        .collect::<BTreeSet<_>>();
+    if contributing.len() >= usize::from(projection.required_team_count) {
+        return Vec::new();
+    }
     projection
         .teams
         .values()
@@ -431,6 +459,27 @@ mod tests {
     }
 
     #[test]
+    fn safely_withdrawn_exploration_does_not_require_a_synthetic_report() {
+        let mut projection = AgenticProgramProjection::empty("program", "objective");
+        let mut exploration = accepted_task("optional", "research", vec![], vec![]);
+        exploration.status = AgenticTaskStatus::Withdrawn;
+        exploration.claimant = None;
+        exploration.reviewed_by = None;
+        projection.tasks.insert("optional".into(), exploration);
+        let request = ObjectiveCompleteRequestInput {
+            result_refs: vec!["tool://actual-effect".into()],
+            evidence_refs: vec!["tool://effect-verification".into()],
+            unresolved: vec![],
+        };
+        assert_eq!(completion_gap(&projection, &request), None);
+        projection.tasks.get_mut("optional").unwrap().status = AgenticTaskStatus::Submitted;
+        assert_eq!(
+            completion_gap(&projection, &request),
+            Some("tasks_not_accepted:optional".into())
+        );
+    }
+
+    #[test]
     fn completion_cannot_bypass_task_review_with_an_unregistered_result_ref() {
         let mut projection = AgenticProgramProjection::empty("program", "objective");
         projection.tasks.insert(
@@ -447,7 +496,7 @@ mod tests {
                     unresolved: Vec::new(),
                 },
             ),
-            Some("completion_result_artifact_not_registered".to_string())
+            Some("completion_result_reference_not_supported".to_string())
         );
     }
 
@@ -761,10 +810,6 @@ pub(crate) fn reconcile_completion_request(
     if projection.status != AgenticProgramStatus::CompletionRequested {
         return Ok(None);
     }
-    let request = projection
-        .completion_request
-        .as_ref()
-        .ok_or_else(|| "completion_requested Program has no durable request".to_string())?;
     let root_execution_id = projection
         .root_execution_id
         .as_deref()
@@ -779,67 +824,11 @@ pub(crate) fn reconcile_completion_request(
         }
     }
 
-    let obligations = projection
-        .tasks
-        .values()
-        .filter(|task| task.status != AgenticTaskStatus::Superseded)
-        .map(|task| ObjectiveObligation {
-            obligation_id: format!("agentic-task:{}", task.task_id),
-            required: true,
-            success_predicate: task.acceptance.clone(),
-            producer: Default::default(),
-            evidence_requirement: ObjectiveEvidenceRequirement {
-                required_artifact_kinds: Vec::new(),
-                independent_verifier_required: true,
-                reread_required: false,
-            },
-            state: if task.status == AgenticTaskStatus::Accepted {
-                ObjectiveObligationState::Satisfied
-            } else {
-                ObjectiveObligationState::Open
-            },
-            artifact_refs: task.artifact_refs.clone(),
-            evidence_refs: task.evidence_refs.clone(),
-            reread_receipts: Vec::new(),
-            verifier_decision: task
-                .reviewed_by
-                .as_ref()
-                .map(|reviewer| format!("accepted_by:{reviewer}")),
-            diagnostic_code: None,
-        })
-        .collect::<Vec<_>>();
-    let mut evidence_refs = request.evidence_refs.clone();
-    evidence_refs.push(format!("execution_graph:{root_execution_id}"));
-    for task in projection.tasks.values() {
-        evidence_refs.extend(task.evidence_refs.iter().cloned());
-        evidence_refs.extend(task.supersede_evidence_refs.iter().cloned());
-    }
-    evidence_refs.sort();
-    evidence_refs.dedup();
-    let terminal_fence = format!(
-        "agentic-objective:{program_id}:request:{}",
-        request.program_revision
-    );
-    match supervisor.reconcile(
-        &goal_id,
-        request.program_revision,
-        &terminal_fence,
-        obligations,
-        evidence_refs,
-        Vec::new(),
-        false,
-        format!(
-            "Agentic Program `{program_id}` completion request `{}` passed Objective supervision",
-            request.action_id
-        ),
-    )? {
-        crate::execution_core::goal::ObjectiveReconcileDecision::Terminal(goal) => actions
-            .bind_objective_verdict(program_id, &goal)
-            .map(Some)
-            .map_err(|error| error.to_string()),
-        crate::execution_core::goal::ObjectiveReconcileDecision::Waiting { .. }
-        | crate::execution_core::goal::ObjectiveReconcileDecision::ReplanRequired { .. } => {
-            Ok(Some(projection))
-        }
-    }
+    let prepared = supervisor
+        .goal_store()
+        .prepare_program_conclusion(&projection)?;
+    actions
+        .commit_program_conclusion(&projection, prepared)
+        .map(Some)
+        .map_err(|error| error.to_string())
 }

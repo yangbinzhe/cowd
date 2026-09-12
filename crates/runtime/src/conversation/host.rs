@@ -628,6 +628,11 @@ where
                 .map(|lineage| lineage.turn_id.clone())
         })
         .unwrap_or_else(|| TurnId::new().to_string());
+    let _delegated_input_turn = execution_role.is_delegated_leaf().then(|| {
+        runtime
+            .session_input_stream()
+            .begin_turn(TurnId::from_string(turn_ref.clone()))
+    });
     let runtime = Arc::new(tokio::sync::Mutex::new(runtime));
     let parent_merge_started_at = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
     if let Some(bus) = runtime.lock().await.cowd_bus().cloned() {
@@ -665,6 +670,8 @@ where
             failure: None,
             terminal_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
             pending_transcript: std::collections::BTreeMap::new(),
+            pending_agent_input_consumption: std::collections::BTreeMap::new(),
+            deferred_agent_input_consumption: Vec::new(),
             ingress: ingress.clone(),
             turn_transcript_start,
             session_id: session_id.clone(),
@@ -1028,7 +1035,15 @@ where
                 spec_digest: format!("{:x}", Sha256::digest(resolved_objective.as_bytes())),
                 review_refs: Vec::new(),
                 waiting: None,
-                participation_requirement: None,
+                participation_requirement: strategy.decision.collaboration_obligation.as_ref().map(|obligation| {
+                    harness_contract::goal::ParticipationRequirement {
+                        minimum_team_count: obligation.required_team_count(),
+                        source_ref: ingress.as_ref().map_or_else(
+                            || format!("session:{session_id}:turn:{turn_ref}:input"),
+                            |value| format!("session_message:{}", value.message_id),
+                        ),
+                    }
+                }),
                 obligations: Vec::new(),
                 recovery: None,
                 terminal: None,
@@ -1042,6 +1057,20 @@ where
             let original = services.goal_store().projection(&source_goal_id).map_err(RuntimeError::new)?
                 .ok_or_else(|| RuntimeError::new("unfinished continuation requires the original Goal contract"))?.goal;
             inherit_continuation_goal(&mut goal, &original, &graph.id);
+            // Older Goals omitted a user constraint that their frozen Program
+            // still enforced. Adopt it only in this newly authorized Goal,
+            // retaining its original source and explicitly versioning the spec.
+            if goal.participation_requirement.is_none() && source.required_team_count > 0 {
+                goal.participation_requirement = Some(harness_contract::goal::ParticipationRequirement {
+                    minimum_team_count: source.required_team_count,
+                    source_ref: original.source_intent_ref.clone().ok_or_else(||
+                        RuntimeError::new("legacy participation adoption requires the original user source"))?,
+                });
+                goal.spec_revision = goal.spec_revision.saturating_add(1);
+                goal.spec_digest = crate::execution_core::goal::goal_spec_digest(&goal);
+            }
+        } else {
+            goal.spec_digest = crate::execution_core::goal::goal_spec_digest(&goal);
         }
         services.goal_store().create(goal).map_err(RuntimeError::new)?;
         // Objective recovery now belongs to the Agentic Program supervisor.
@@ -2107,16 +2136,6 @@ pub(super) enum RootAgenticTerminalAction {
 }
 
 impl RootAgenticTerminalAction {
-    pub(super) fn tool_ids(&self) -> BTreeSet<String> {
-        let tool = match self {
-            Self::PublishIntegration { .. } => harness_contract::agent_action::TASK_PUBLISH_TOOL_ID,
-            Self::RequestObjectiveCompletion { .. } => {
-                harness_contract::agent_action::OBJECTIVE_COMPLETE_REQUEST_TOOL_ID
-            }
-        };
-        [tool.to_string()].into_iter().collect()
-    }
-
     fn checkpoint_next_actions(&self) -> Vec<&'static str> {
         match self {
             Self::PublishIntegration { .. } => vec!["publish_integration_task"],
@@ -2130,33 +2149,20 @@ impl RootAgenticTerminalAction {
                 prerequisite_task_refs,
             } => serde_json::json!({
                 "kind": "publish_integration_task",
-                "prerequisite_task_refs": prerequisite_task_refs,
+                "prerequisite_task_refs": prerequisite_task_refs.iter().take(32).collect::<Vec<_>>(),
+                "total_prerequisites":prerequisite_task_refs.len(),
+                "directory_request":{"name":"state_inspect","input":{}},
                 "requirement": "Publish one genuine synthesis Task with depends_on covering these accepted deliveries. Choose its Team, author, objective, acceptance criterion, and evidence semantics yourself; its accepted Artifact must be the final result.",
             }),
             Self::RequestObjectiveCompletion {
                 result_artifact_refs,
             } => serde_json::json!({
                 "kind": "objective_complete_request",
-                "eligible_result_artifact_refs": result_artifact_refs,
-                "requirement": "Request Objective completion using an eligible accepted integration Artifact and real evidence. Do not recommit a root-only Artifact or recreate delivery work.",
+                "eligible_result_artifact_refs": result_artifact_refs.iter().take(32).collect::<Vec<_>>(),
+                "total_eligible_results":result_artifact_refs.len(),
+                "directory_request":{"name":"state_inspect","input":{}},
+                "requirement": "When the original objective is supported, request Objective completion using an eligible accepted integration Artifact and real evidence. Continue inspecting sources and resolving or disclosing issues when needed. Accepted tasks alone do not certify the original objective.",
             }),
-        }
-    }
-
-    pub(super) fn continuation_instruction(&self) -> String {
-        match self {
-            Self::PublishIntegration {
-                prerequisite_task_refs,
-            } => format!(
-                "Runtime Agent-first closure boundary: all current delivery Tasks are independently accepted, but no accepted Task Artifact has a real dependency lineage across every required Team. Root-only Artifacts and Artifact.relates_to metadata cannot prove integration. Use task_publish exactly once to create a genuine synthesis Task with depends_on [{}]. You choose the Team, author, title, objective, acceptance criterion, evidence, and substantive synthesis semantics. Do not request Objective completion or recommit a root Artifact before that Task is independently accepted.",
-                prerequisite_task_refs.join(", ")
-            ),
-            Self::RequestObjectiveCompletion {
-                result_artifact_refs,
-            } => format!(
-                "Runtime Agent-first closure boundary: an accepted dependency-backed integration Artifact is ready for Objective admission. Use objective_complete_request once with one eligible result ref [{}] and real evidence. Do not requery, recommit Artifacts, or recreate Tasks; the Objective supervisor owns the resulting verdict.",
-                result_artifact_refs.join(", ")
-            ),
         }
     }
 }
@@ -2170,19 +2176,18 @@ pub(super) fn root_agentic_terminal_action(
     ) {
         return None;
     }
-    if crate::agentic::issues::completion_gap(program).is_some() {
+    if !program.unresolved.is_empty() || crate::agentic::issues::completion_gap(program).is_some() {
         return None;
     }
     let prerequisite_task_refs = program
         .tasks
         .values()
-        .filter(|task| task.status != crate::AgenticTaskStatus::Superseded)
+        .filter(|task| !task.status.is_retired())
         .map(|task| task.task_id.clone())
         .collect::<Vec<_>>();
     if prerequisite_task_refs.is_empty()
         || program.tasks.values().any(|task| {
-            task.status != crate::AgenticTaskStatus::Superseded
-                && task.status != crate::AgenticTaskStatus::Accepted
+            !task.status.is_retired() && task.status != crate::AgenticTaskStatus::Accepted
         })
     {
         return None;
@@ -2263,60 +2268,81 @@ fn compact_agentic_program_checkpoint(
     services: Option<&crate::RuntimeServices>,
     program: &crate::AgenticProgramProjection,
 ) -> String {
+    // Window size bounds materialization, never the authoritative directory.
+    const METADATA_WINDOW: usize = 32;
+    let terminal_action = root_agentic_terminal_action(program);
+    let preview_ref =
+        program
+            .final_artifact_ref
+            .as_deref()
+            .or_else(|| match terminal_action.as_ref() {
+                Some(RootAgenticTerminalAction::RequestObjectiveCompletion {
+                    result_artifact_refs,
+                }) => result_artifact_refs.first().map(String::as_str),
+                _ => program
+                    .tasks
+                    .values()
+                    .filter(|task| task.status == crate::AgenticTaskStatus::Submitted)
+                    .find_map(|task| task.artifact_refs.first().map(String::as_str)),
+            });
+    let mut visible_tasks = program.tasks.values().collect::<Vec<_>>();
+    visible_tasks.sort_by_key(|task| {
+        (
+            matches!(
+                task.status,
+                crate::AgenticTaskStatus::Accepted | crate::AgenticTaskStatus::Superseded
+            ),
+            task.unresolved.is_empty(),
+            &task.task_id,
+        )
+    });
+    let mut visible_artifacts = program.artifacts.values().collect::<Vec<_>>();
+    visible_artifacts.sort_by_key(|artifact| {
+        (
+            Some(artifact.artifact_ref.as_str()) != preview_ref,
+            &artifact.artifact_ref,
+        )
+    });
+    let issues = crate::agentic::issues::issues(program);
     let teams = program
         .teams
         .values()
+        .take(METADATA_WINDOW)
         .map(|team| {
             serde_json::json!({
                 "team_ref": team.team_id,
                 "name": team.name,
-                "mission": team.mission,
-                "member_refs": team.member_ids,
-                "task_refs": team.task_ids,
+                "member_count": team.member_ids.len(),
+                "task_count": team.task_ids.len(),
+                "read_request":{"name":"state_inspect","input":{"entry_ref":team.team_id}},
             })
         })
         .collect::<Vec<_>>();
     let agents = program
         .agents
         .values()
+        .take(METADATA_WINDOW)
         .map(|agent| {
             serde_json::json!({
                 "agent_ref": agent.agent_id,
                 "team_refs": program.active_team_ids_for(&agent.agent_id),
                 "role": agent.role,
-                "mission": agent.mission,
+                "read_request":{"name":"state_inspect","input":{"entry_ref":agent.agent_id}},
             })
         })
         .collect::<Vec<_>>();
-    let tasks = program
-        .tasks
-        .values()
-        .map(|task| {
-            serde_json::json!({
-                "task_ref": task.task_id,
-                "team_ref": task.team_id,
-                "title": task.title,
-                "status": task.status,
-                "claimant": task.claimant,
-                "artifact_refs": task.artifact_refs,
-                "evidence_refs": task.evidence_refs,
-                "unresolved": task.unresolved,
-                "review_reason": task.review_reason,
-                "failed_attempts": task.failed_attempts,
-                "failed_review_attempts": task.failed_review_attempts,
-                "last_failure": task.last_failure,
-                "replacement_task_refs": task.replacement_task_refs,
-                "supersede_evidence_refs": task.supersede_evidence_refs,
-                "superseded_reason": task.superseded_reason,
-                "superseded_by": task.superseded_by,
-            })
+    let tasks = visible_tasks.into_iter().take(METADATA_WINDOW).map(|task| {
+        serde_json::json!({
+            "task_ref":task.task_id,"team_ref":task.team_id,"title":task.title,
+            "status":task.status,"claimant":task.claimant,
+            "artifact_count":task.artifact_refs.len(),"evidence_count":task.evidence_refs.len(),
+            "unresolved_count":task.unresolved.len(),"review_required":task.review_reason.is_some(),
+            "read_request":{"name":"state_inspect","input":{"entry_ref":task.task_id}}
         })
-        .collect::<Vec<_>>();
-    let artifacts = program
-        .artifacts
-        .values()
+    }).collect::<Vec<_>>();
+    let artifacts = visible_artifacts.into_iter().take(METADATA_WINDOW)
         .map(|artifact| {
-            let content = services.and_then(|services| {
+            let content = services.filter(|_| Some(artifact.artifact_ref.as_str()) == preview_ref).and_then(|services| {
                 agentic_checkpoint_artifact_content(
                     services,
                     &artifact.content_ref,
@@ -2328,14 +2354,15 @@ fn compact_agentic_program_checkpoint(
                 "content_ref": artifact.content_ref,
                 "title": artifact.title,
                 "kind": artifact.kind,
-                "relates_to": artifact.relates_to,
+                "relation_count": artifact.relates_to.len(),
                 "committed_by": artifact.committed_by,
+                "read_request":{"name":"state_inspect","input":{"entry_ref":artifact.artifact_ref}},
+                "content_request":{"name":"evidence_retrieve","input":{"evidence_ref":artifact.content_ref}},
                 "content": content.as_ref().map(|content| content.text.as_str()),
                 "content_complete": content.as_ref().map(|content| content.complete),
             })
         })
         .collect::<Vec<_>>();
-    let terminal_action = root_agentic_terminal_action(program);
     let next_actions = if let Some(action) = terminal_action.as_ref() {
         action.checkpoint_next_actions()
     } else if program.status == crate::AgenticProgramStatus::Verified {
@@ -2360,13 +2387,25 @@ fn compact_agentic_program_checkpoint(
         "revision": program.revision,
         "status": program.status,
         "required_team_count": program.required_team_count,
+        "objective":program.objective_summary,
+        "directory_request":{"name":"state_inspect","input":{}},
+        "coverage":{
+            "kind":"current_work_window","authoritative_directory_complete":false,
+            "metadata_window_per_kind":METADATA_WINDOW,"body_preview_limit":1,
+            "total":{"teams":program.teams.len(),"agents":program.agents.len(),"tasks":program.tasks.len(),"artifacts":program.artifacts.len(),"issues":issues.len()},
+            "loaded":{"teams":teams.len(),"agents":agents.len(),"tasks":tasks.len(),"artifacts":artifacts.len(),"issues":issues.len().min(METADATA_WINDOW)}
+        },
         "teams": teams,
         "agents": agents,
         "tasks": tasks,
         "artifacts": artifacts,
         "continuation": program.continuation,
-        "issues": crate::agentic::issues::issues(program),
-        "unresolved": program.unresolved,
+        "issues":issues.iter().take(METADATA_WINDOW).map(|issue| serde_json::json!({
+            "issue_ref":issue.issue_ref,"source_ref":issue.source_ref,
+            "disposition":issue.disposition.as_ref().map(|value| value.disposition),
+            "read_request":{"name":"state_inspect","input":{"entry_ref":issue.issue_ref}}
+        })).collect::<Vec<_>>(),
+        "unresolved_count": program.unresolved.len(),
         "next_actions": next_actions,
         "terminal_action": terminal_action.as_ref().map(RootAgenticTerminalAction::checkpoint_detail),
         "instruction": "Use this Runtime projection as current truth. You may continue planning, publish dependent or independent Tasks, and coordinate while members execute. When ready to wait for active workers, call state_inspect with wait_for_workers=true; Runtime waits without provider polling. Do not recreate committed entities. Before completion, classify retained issue_refs through message_publish.issue_dispositions with durable reasons/evidence: must_resolve, disclose, or resolved. Keep estimates and assumptions labelled; only the Goal verifier can certify the original objective.",
@@ -2973,6 +3012,11 @@ struct TurnGraphState {
     /// closing the summary-check/await race without polling.
     terminal_notify: std::sync::Arc<tokio::sync::Notify>,
     pending_transcript: std::collections::BTreeMap<String, Vec<ConversationMessage>>,
+    pending_agent_input_consumption: std::collections::BTreeMap<
+        String,
+        Vec<crate::runtime_event_store::RuntimeTransactionEventInput>,
+    >,
+    deferred_agent_input_consumption: Vec<crate::runtime_event_store::RuntimeTransactionEventInput>,
     ingress: Option<TurnIngressRef>,
     /// First transcript offset owned by this graph turn. Gateway ingress
     /// already persists the initial user row; the terminal outbox persists
@@ -3779,6 +3823,7 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                 plan_revision: plan.revision,
                 observation_wave_sequence,
                 execution_plane: services.tool_execution_plane(),
+                physical_owner: services.model_step_executor(),
                 commit_service: services.commit_service(),
                 precompleted: None,
                 idempotency_keys: Some(&idempotency_keys),
@@ -4018,6 +4063,7 @@ struct HostGovernedToolContext<'a> {
     plan_revision: u64,
     observation_wave_sequence: u64,
     execution_plane: &'a Arc<crate::ToolExecutionPlane>,
+    physical_owner: &'a Arc<crate::execution_core::graph::executors::ScopedNodeExecutor>,
     commit_service: &'a crate::execution_core::graph::ExecutionCommitService,
     precompleted: Option<&'a BTreeMap<String, crate::conversation::EarlyToolExecutionReceipt>>,
     idempotency_keys: Option<&'a std::collections::HashMap<String, String>>,
@@ -4174,7 +4220,12 @@ async fn execute_fenced_runtime_tool(
             | crate::execution_core::graph::ToolEffectState::NotRequired,
         ) => {
             let outcome = host.execute_runtime_tool(request).await;
-            if let Err(error) = commit_service.commit_tool_effect(request, effect, &outcome) {
+            let committed = if effect.effect_kind == harness_contract::tool::ToolEffectKind::Read {
+                commit_service.commit_readonly_tool_receipts(&[(request.clone(), outcome.clone())])
+            } else {
+                commit_service.commit_tool_effect(request, effect, &outcome)
+            };
+            if let Err(error) = committed {
                 return crate::RuntimeToolExecutionOutcome {
                     tool_use_id: request.tool_use_id.clone(),
                     tool_name: request.tool_name.clone(),

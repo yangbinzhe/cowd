@@ -825,13 +825,13 @@ async fn clear_mission_focus_handler(
     Ok(Json(receipt))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(super) struct BranchSessionRequest {
     pub(super) idempotency_key: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 pub(super) struct BranchSessionReceipt {
     pub(super) id: String,
     pub(super) status: String,

@@ -559,3 +559,350 @@ fn agentic_child_registration_and_parent_cancel_have_one_atomic_order() {
         assert!(commits.register_graph(late).is_err());
     }
 }
+
+#[test]
+fn delegated_effect_intent_is_atomic_with_index_and_current_graph_authority() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = ExecutionCommitService::new(store.clone());
+    let mut graph = agent_task_graph();
+    // An ordinary graph ToolBatch has the same fresh-effect admission owner;
+    // the real Agent claim and Process path is covered by execution tests.
+    graph.nodes[0].kind = ExecutionNodeKind::ToolBatch;
+    graph.nodes[0].executor_kind = "tool".into();
+    let graph = service.register_graph(graph).unwrap().graph;
+    let mut request = request("indexed-write");
+    request.session_id = Some(graph.lineage.as_ref().unwrap().session_id.clone());
+    request.parent_execution = Some(harness_contract::execution_graph::ExecutionParentBinding {
+        execution_id: graph.id.clone(),
+        node_id: graph.nodes[0].id.clone(),
+    });
+    request.parent_execution_attempt = Some(1);
+    let effect = mutation_effect(ToolIdempotency::Idempotent);
+    let index = delegated_agent_receipt_stream_id(&request).unwrap();
+    assert!(service.begin_tool_effect(&request, &effect).is_err());
+    assert_eq!(store.stream_revision(&index).unwrap(), 0);
+    let graph = service
+        .transition_node(
+            &graph,
+            &graph.nodes[0].id,
+            ExecutionNodeStatus::Ready,
+            None,
+            vec![],
+        )
+        .unwrap()
+        .graph;
+    let graph = service
+        .transition_node(
+            &graph,
+            &graph.nodes[0].id,
+            ExecutionNodeStatus::Running,
+            None,
+            vec![],
+        )
+        .unwrap()
+        .graph;
+    assert_eq!(
+        service.begin_tool_effect(&request, &effect).unwrap(),
+        ToolEffectState::Fresh
+    );
+    let intent = store.list_stream(&index).unwrap();
+    assert_eq!(intent.len(), 1);
+    assert_eq!(intent[0].kind, "execution.agent_tool.intent");
+    let program = crate::AgenticProgramProjection::empty("program", "objective");
+    let snapshot = || {
+        crate::agentic::review_evidence::effect_review_snapshot(
+            &store,
+            &program,
+            None,
+            &[index.clone()],
+        )
+    };
+    assert!(snapshot().err().unwrap().contains("effect_review_pending"));
+    assert!(service
+        .load_delegated_agent_tool_receipts(&graph.id, &graph.nodes[0].id, 1)
+        .unwrap()
+        .is_empty());
+    service
+        .commit_tool_effect(&request, &effect, &outcome("indexed-write", "written"))
+        .unwrap();
+    let before = snapshot().unwrap();
+    assert_eq!(
+        service
+            .load_delegated_agent_tool_receipts(&graph.id, &graph.nodes[0].id, 1)
+            .unwrap()
+            .len(),
+        1
+    );
+    let mut pending = request.clone();
+    pending.idempotency_key = "pending-after-review".into();
+    pending.tool_use_id = "pending-after-review".into();
+    pending.observation_wave_sequence = 2;
+    assert_eq!(
+        service.begin_tool_effect(&pending, &effect).unwrap(),
+        ToolEffectState::Fresh
+    );
+    assert!(snapshot().err().unwrap().contains("effect_review_pending"));
+    // A conclusion prepared before the second write cannot commit even its
+    // unrelated terminal stream if the original receipt source changed.
+    assert!(store
+        .append_transaction(AppendTransactionRequest {
+            transaction_id: "negative-stale-effect-conclusion".into(),
+            expected_streams: before.additional_sources,
+            events: vec![RuntimeTransactionEventInput {
+                event: RuntimeEventInput {
+                    stream_id: "negative-terminal".into(),
+                    scope: RuntimeEventScope::ExecutionNode,
+                    kind: "test.negative_terminal".into(),
+                    status: None,
+                    actor: None,
+                    refs: vec![],
+                    payload: json!({}),
+                },
+                idempotency_key: Some("negative-terminal".into()),
+                schema_version: 1,
+            }],
+        })
+        .is_err());
+    assert_eq!(store.stream_revision("negative-terminal").unwrap(), 0);
+    service
+        .apply_command(
+            &graph,
+            &ExecutionGraphCommand::CancelNode {
+                expected_revision: graph.revision,
+                node_id: graph.nodes[0].id.clone(),
+                reason: "cancel current producer".into(),
+            },
+        )
+        .unwrap();
+    let revision = store.stream_revision(&index).unwrap();
+    assert!(
+        service.begin_tool_effect(&pending, &effect).is_err(),
+        "idempotent retries still require current authority"
+    );
+    let mut fresh = pending.clone();
+    fresh.idempotency_key = "new-after-cancel".into();
+    assert!(service.begin_tool_effect(&fresh, &effect).is_err());
+    assert_eq!(store.stream_revision(&index).unwrap(), revision);
+    assert!(
+        matches!(
+            service.begin_tool_effect(&request, &effect).unwrap(),
+            ToolEffectState::Completed(_)
+        ),
+        "committed replay needs no fresh effect authority"
+    );
+    // Cancellation does not erase an already admitted external effect. Its
+    // original receipt may still settle and make the retained source readable.
+    service
+        .commit_tool_effect(
+            &pending,
+            &effect,
+            &outcome("pending-after-review", "settled"),
+        )
+        .unwrap();
+    assert_ne!(snapshot().unwrap().digest, before.digest);
+}
+
+#[test]
+fn root_effect_fences_lineage_cancellation_and_replay_without_losing_admitted_receipts() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = ExecutionCommitService::new(store.clone());
+    let mut graph = agent_task_graph();
+    graph.nodes[0].kind = ExecutionNodeKind::ToolBatch;
+    graph.nodes[0].executor_kind = "tool".into();
+    let mut graph = service.register_graph(graph).unwrap().graph;
+    let node = graph.nodes[0].id.clone();
+    let lineage = graph.lineage.as_ref().unwrap();
+    let context = crate::CowdExecutionContext {
+        execution_id: graph.id.clone(),
+        session_id: lineage.session_id.clone(),
+        turn_id: lineage.turn_id.clone(),
+    };
+    let mut write = request("root-write");
+    write.session_id = Some(context.session_id.clone());
+    let effect = mutation_effect(ToolIdempotency::Idempotent);
+    assert!(service
+        .begin_root_tool_effect(&write, &effect, &context)
+        .is_err());
+    for status in [ExecutionNodeStatus::Ready, ExecutionNodeStatus::Running] {
+        graph = service
+            .transition_node(&graph, &node, status, None, vec![])
+            .unwrap()
+            .graph;
+    }
+    let mut stale = context.clone();
+    stale.turn_id = "old-turn".into();
+    assert!(service
+        .begin_root_tool_effect(&write, &effect, &stale)
+        .is_err());
+    assert_eq!(
+        store
+            .stream_revision("execution-effect:idem-root-write")
+            .unwrap(),
+        0
+    );
+    let sources = service.root_effect_authority(&context).unwrap();
+    assert_eq!(sources.len(), 3);
+    assert_eq!(
+        sources
+            .iter()
+            .filter(|source| source.expected_revision == 0)
+            .count(),
+        2,
+        "absence of Goal and Program is included in the source CAS"
+    );
+    assert_eq!(
+        service
+            .begin_root_tool_effect(&write, &effect, &context)
+            .unwrap(),
+        ToolEffectState::Fresh
+    );
+    service
+        .commit_tool_effect(&write, &effect, &outcome("root-write", "written"))
+        .unwrap();
+    let mut pending = request("root-pending");
+    pending.session_id = write.session_id.clone();
+    assert_eq!(
+        service
+            .begin_root_tool_effect(&pending, &effect, &context)
+            .unwrap(),
+        ToolEffectState::Fresh
+    );
+    service
+        .apply_command(
+            &graph,
+            &ExecutionGraphCommand::Cancel {
+                expected_revision: graph.revision,
+                reason: "cancel Root".into(),
+            },
+        )
+        .unwrap();
+    assert!(service
+        .begin_root_tool_effect(&pending, &effect, &context)
+        .is_err());
+    let mut late = request("root-late");
+    late.session_id = write.session_id.clone();
+    assert!(service
+        .begin_root_tool_effect(&late, &effect, &context)
+        .is_err());
+    assert_eq!(
+        store
+            .stream_revision("execution-effect:idem-root-late")
+            .unwrap(),
+        0
+    );
+    assert!(matches!(
+        service
+            .begin_root_tool_effect(&write, &effect, &context)
+            .unwrap(),
+        ToolEffectState::Completed(_)
+    ));
+    service
+        .commit_tool_effect(
+            &pending,
+            &effect,
+            &outcome("root-pending", "settled after cancel"),
+        )
+        .unwrap();
+    assert!(matches!(
+        service
+            .begin_root_tool_effect(&pending, &effect, &context)
+            .unwrap(),
+        ToolEffectState::Completed(_)
+    ));
+}
+
+#[test]
+fn root_effect_goal_states_and_absent_source_revisions_are_enforced() {
+    use harness_contract::goal::GoalCompletion;
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = ExecutionCommitService::new(store.clone());
+    let mut graph = agent_task_graph();
+    graph.nodes[0].kind = ExecutionNodeKind::ToolBatch;
+    graph.nodes[0].executor_kind = "tool".into();
+    let mut graph = service.register_graph(graph).unwrap().graph;
+    let node = graph.nodes[0].id.clone();
+    for status in [ExecutionNodeStatus::Ready, ExecutionNodeStatus::Running] {
+        graph = service
+            .transition_node(&graph, &node, status, None, vec![])
+            .unwrap()
+            .graph;
+    }
+    let lineage = graph.lineage.as_ref().unwrap();
+    let context = crate::CowdExecutionContext {
+        execution_id: graph.id.clone(),
+        session_id: lineage.session_id.clone(),
+        turn_id: lineage.turn_id.clone(),
+    };
+    let absent = service.root_effect_authority(&context).unwrap();
+    let goals = crate::execution_core::GoalStore::new(store.clone());
+    let goal_id = format!("goal:{}", graph.id);
+    let mut goal = goals.create(serde_json::from_value(json!({
+        "id": goal_id, "session_id": context.session_id, "objective":"check Root admission",
+        "criteria": [{"id":"intent", "statement":"check Root admission", "status":"open"}],
+        "source_intent_ref":"session_message:root-admission", "user_intent_criterion_id":"intent",
+        "spec_revision":1, "spec_digest":"root-admission-fixture",
+        "phase":"execution", "completion":"open", "revision":1, "user_sequence":1,
+        "execution_binding": {
+            "objective_id":"root-admission", "session_id":context.session_id, "turn_id":context.turn_id,
+            "root_execution_id":context.execution_id, "agentic_program_id":"root-admission-program"
+        }
+    })).unwrap()).unwrap();
+    assert!(store
+        .append_transaction(AppendTransactionRequest {
+            transaction_id: "stale-absent-goal".into(),
+            expected_streams: absent,
+            events: vec![RuntimeTransactionEventInput {
+                event: RuntimeEventInput {
+                    stream_id: "stale-root-effect".into(),
+                    scope: RuntimeEventScope::ExecutionNode,
+                    kind: "test.stale_effect".into(),
+                    status: None,
+                    actor: None,
+                    refs: vec![],
+                    payload: json!({}),
+                },
+                idempotency_key: Some("stale-root-effect".into()),
+                schema_version: 1,
+            }],
+        })
+        .is_err());
+    assert_eq!(store.stream_revision("stale-root-effect").unwrap(), 0);
+    let mut write = request("goal-state-write");
+    write.session_id = Some(context.session_id.clone());
+    let effect = mutation_effect(ToolIdempotency::Idempotent);
+    assert!(service.root_effect_authority(&context).is_ok());
+    for state in [
+        GoalCompletion::WaitingExternalDecision,
+        GoalCompletion::Blocked,
+        GoalCompletion::Partial,
+        GoalCompletion::Failed,
+        GoalCompletion::Cancelled,
+        GoalCompletion::Satisfied,
+    ] {
+        goal = goals
+            .revise(
+                &goal_id,
+                goal.revision,
+                goal.user_sequence + 1,
+                "negative admission fixture",
+                |goal| {
+                    goal.completion = state;
+                    vec![]
+                },
+            )
+            .unwrap()
+            .0;
+        assert!(
+            service
+                .begin_root_tool_effect(&write, &effect, &context)
+                .is_err(),
+            "{state:?}"
+        );
+        assert_eq!(
+            store
+                .stream_revision("execution-effect:idem-goal-state-write")
+                .unwrap(),
+            0
+        );
+    }
+}

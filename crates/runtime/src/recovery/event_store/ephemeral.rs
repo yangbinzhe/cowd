@@ -360,6 +360,18 @@ impl RuntimeEventStoreBackend for EphemeralRuntimeEventStore {
                 actual,
             });
         }
+        if let Some(current) = s.checkpoints.get(id) {
+            if cursor < current.source_cursor {
+                return Err(RuntimeEventStoreError::StaleRevision {
+                    stream_id: format!("projection-source:{id}"),
+                    expected: cursor,
+                    actual: current.source_cursor,
+                });
+            }
+            if cursor == current.source_cursor && current.payload == *payload {
+                return Ok(current.clone());
+            }
+        }
         let value = RuntimeProjectionCheckpoint {
             projection_id: id.into(),
             source_cursor: cursor,
@@ -370,6 +382,34 @@ impl RuntimeEventStoreBackend for EphemeralRuntimeEventStore {
         s.checkpoints.insert(id.into(), value.clone());
         Ok(value)
     }
+    fn compare_and_repair_projection_checkpoint(
+        &self,
+        id: &str,
+        cursor: u64,
+        expected: u64,
+        payload: &serde_json::Value,
+        at: u64,
+    ) -> RuntimeEventStoreResult<RuntimeProjectionCheckpoint> {
+        let mut s = self.state.lock().unwrap();
+        let actual = s.checkpoints.get(id).map_or(0, |v| v.revision);
+        if actual == 0 || actual != expected {
+            return Err(RuntimeEventStoreError::StaleRevision {
+                stream_id: id.into(),
+                expected,
+                actual,
+            });
+        }
+        let value = RuntimeProjectionCheckpoint {
+            projection_id: id.into(),
+            source_cursor: cursor,
+            revision: actual + 1,
+            payload: payload.clone(),
+            updated_at_ms: at,
+        };
+        s.checkpoints.insert(id.into(), value.clone());
+        Ok(value)
+    }
+
     fn delete_projection_checkpoint(&self, id: &str) -> RuntimeEventStoreResult<bool> {
         Ok(self.state.lock().unwrap().checkpoints.remove(id).is_some())
     }

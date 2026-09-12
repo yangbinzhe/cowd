@@ -88,6 +88,8 @@ pub fn resolve_agent_capability(request: AgentCapabilityRequest) -> ResolvedAgen
     // entry point. The tool itself enforces the exact Agent/Session/Project/
     // Team Binding, so this does not grant broad Memory or Session access.
     allowed_tools.insert("context_retrieve".to_string());
+    allowed_tools.insert("working_context".to_string());
+    allowed_tools.insert("private_note".to_string());
     // Agent-first actions are injected only by the dynamic Program dispatcher
     // after it binds an immutable roster identity. Generic/legacy Agent
     // capability resolution must not advertise those actions without an
@@ -223,7 +225,11 @@ pub(crate) fn capability_mapping_authorizes_tool(
         && (AGENT_ACTION_TOOL_IDS.contains(&tool.as_str())
             || matches!(
                 tool.as_str(),
-                "context_retrieve" | "evidence_retrieve" | "artifact_publish"
+                "context_retrieve"
+                    | "working_context"
+                    | "private_note"
+                    | "evidence_retrieve"
+                    | "artifact_publish"
             ))
     {
         return true;
@@ -246,7 +252,11 @@ pub(crate) fn runtime_capability_map_contains_tool(tool_ref: &str) -> bool {
     if AGENT_ACTION_TOOL_IDS.contains(&tool.as_str())
         || matches!(
             tool.as_str(),
-            "context_retrieve" | "evidence_retrieve" | "artifact_publish"
+            "context_retrieve"
+                | "working_context"
+                | "private_note"
+                | "evidence_retrieve"
+                | "artifact_publish"
         )
     {
         return true;

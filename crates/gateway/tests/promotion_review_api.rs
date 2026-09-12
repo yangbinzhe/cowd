@@ -7,7 +7,7 @@ use tower::ServiceExt;
 
 #[tokio::test]
 async fn evaluation_policy_promotion_stays_pending_until_the_typed_human_decision() {
-    let harness = GatewayTestHarness::in_memory().expect("test harness");
+    let harness = GatewayTestHarness::postgres().expect("test harness");
     let request = serde_json::json!({
         "request_id": "gateway-policy-review-1",
         "next_policy": {

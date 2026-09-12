@@ -6,8 +6,8 @@ TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT/target}"
 BIN="${COWD_BIN:-$TARGET_ROOT/debug/cowd}"
 PORT="${COWD_RUNTIME_SURFACE_PORT:-18684}"
 BASE_URL="http://127.0.0.1:$PORT"
-GATEWAY_SESSION="cowd-runtime-surface-gateway-$$"
-TMP_DIR="$(mktemp -d /tmp/cowd-runtime-surface.XXXXXX)"
+GATEWAY_PID=""
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cowd-runtime-surface.XXXXXX")"
 FAILED=0
 WORKDIR="$TMP_DIR/workspace"
 CONFIG_HOME="$TMP_DIR/config"
@@ -25,12 +25,13 @@ curl() {
 }
 
 cleanup() {
-  if [[ "$FAILED" == "1" && "${COWD_RUNTIME_SURFACE_KEEP_TMP:-}" == "1" ]]; then
+  if [[ "${COWD_RUNTIME_SURFACE_KEEP_TMP:-}" == "1" ]]; then
     echo "preserving runtime surface scenario temp dir: $TMP_DIR" >&2
     return
   fi
-  if command -v tmux >/dev/null 2>&1; then
-    tmux kill-session -t "$GATEWAY_SESSION" >/dev/null 2>&1 || true
+  if [[ -n "$GATEWAY_PID" ]]; then
+    kill "$GATEWAY_PID" >/dev/null 2>&1 || true
+    wait "$GATEWAY_PID" >/dev/null 2>&1 || true
   fi
   rm -rf "$TMP_DIR"
 }
@@ -38,8 +39,6 @@ cleanup() {
 print_logs() {
   echo "----- scenario temp dir -----" >&2
   echo "$TMP_DIR" >&2
-  echo "----- tmux sessions -----" >&2
-  tmux ls 2>/dev/null | sed -n '1,80p' >&2 || true
   echo "----- gateway log -----" >&2
   sed -n '1,260p' "$GATEWAY_LOG" >&2 || true
   echo "----- captured json -----" >&2
@@ -62,7 +61,7 @@ on_error() {
 trap cleanup EXIT
 trap on_error ERR
 
-for cmd in tmux curl python3 rg ss; do
+for cmd in curl python3 rg ss; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     echo "$cmd is required for runtime surface unified scenario" >&2
     exit 1
@@ -99,6 +98,11 @@ permissions:
   default_mode: "danger-full-access"
 memory:
   enabled: true
+storage:
+  backend: postgres
+  postgres:
+    logicalIdentity: "cowd-runtime-surface"
+    secretRef: "env:COWD_TEST_POSTGRES_URL"
 gateway:
   enabled: true
   sessionReset: "none"
@@ -114,11 +118,32 @@ EOF
 cp "$CONFIG_HOME/config.yaml" "$HOME_DIR/.cowd/config.yaml"
 cp "$CONFIG_HOME/config.yaml" "$WORKDIR/.cowd/config.yaml"
 
-tmux new-session -d -s "$GATEWAY_SESSION" \
-  "bash -lc \"cd '$WORKDIR' && \
-    export COWD_CONFIG_HOME='$CONFIG_HOME' && \
-    export HOME='$HOME_DIR' && \
-    '$BIN' gateway run >'$GATEWAY_LOG' 2>&1\""
+(
+  cd "$WORKDIR"
+  env COWD_CONFIG_HOME="$CONFIG_HOME" HOME="$HOME_DIR" \
+    COWD_TEST_POSTGRES_URL="$COWD_TEST_POSTGRES_URL" \
+    "$BIN" storage upgrade
+)
+
+start_gateway() {
+  (
+    cd "$WORKDIR"
+    env COWD_CONFIG_HOME="$CONFIG_HOME" HOME="$HOME_DIR" \
+      COWD_TEST_POSTGRES_URL="$COWD_TEST_POSTGRES_URL" \
+      "$BIN" gateway run >"$GATEWAY_LOG" 2>&1
+  ) &
+  GATEWAY_PID=$!
+}
+
+stop_gateway() {
+  if [[ -n "$GATEWAY_PID" ]]; then
+    kill "$GATEWAY_PID" >/dev/null 2>&1 || true
+    wait "$GATEWAY_PID" >/dev/null 2>&1 || true
+    GATEWAY_PID=""
+  fi
+}
+
+start_gateway
 
 for _ in {1..120}; do
   if curl -fsS "$BASE_URL/health" >/dev/null 2>&1; then
@@ -184,12 +209,8 @@ rg -q "tasks" "$TMP_DIR/tasks.json"
 rg -q "runtime_control_plane" "$TMP_DIR/control-plane.json"
 rg -q "connector_summary" "$TMP_DIR/connectors.json"
 
-tmux kill-session -t "$GATEWAY_SESSION" >/dev/null 2>&1 || true
-tmux new-session -d -s "$GATEWAY_SESSION" \
-  "bash -lc \"cd '$WORKDIR' && \
-    export COWD_CONFIG_HOME='$CONFIG_HOME' && \
-    export HOME='$HOME_DIR' && \
-    '$BIN' gateway run >'$GATEWAY_LOG' 2>&1\""
+stop_gateway
+start_gateway
 for _ in {1..120}; do
   if curl -fsS "$BASE_URL/health" >/dev/null 2>&1; then
     break
@@ -209,5 +230,5 @@ if [[ "${COWD_RUNTIME_SURFACE_REAL_CONNECTOR_PROVIDER:-}" == "feishu.readonly" ]
   rg -q "service.feishu.docx.read" "$TMP_DIR/feishu-tools.json"
 fi
 
-tmux kill-session -t "$GATEWAY_SESSION" >/dev/null 2>&1 || true
+stop_gateway
 echo "runtime surface scenario passed"

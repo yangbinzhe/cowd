@@ -68,6 +68,24 @@ pub struct AgenticProgramProjection {
 }
 
 impl AgenticProgramProjection {
+    /// Business references survive a new authorization, while physical Task
+    /// aggregates retain immutable ingress lineage. Both admission and actor
+    /// authentication must use this same identity mapping.
+    pub(crate) fn execution_task_id(&self, task_ref: &str) -> Result<String, String> {
+        use sha2::Digest;
+        if self.continuation.is_some() {
+            Ok(format!(
+                "agentic-authorization-task:{:x}",
+                sha2::Sha256::digest(
+                    serde_json::to_vec(&(&self.program_id, task_ref))
+                        .map_err(|error| error.to_string())?
+                )
+            ))
+        } else {
+            Ok(task_ref.to_string())
+        }
+    }
+
     #[must_use]
     pub fn empty(program_id: impl Into<String>, objective_id: impl Into<String>) -> Self {
         Self {
@@ -440,6 +458,15 @@ pub struct AgenticTopicEntryProjection {
     pub entry_id: String,
     pub revision: u64,
     pub actor_id: String,
+    /// Runtime-authenticated publisher; never taken from the model's message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_execution_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_generation: Option<u64>,
+    /// Durable consumption history for this canonical help request. Active
+    /// occupancy remains in Task.active_attempts; both are journal-derived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordination: Option<AgenticCoordinationConsumption>,
     pub summary: Option<String>,
     pub content_ref: Option<String>,
     pub refs: Vec<String>,
@@ -449,6 +476,55 @@ pub struct AgenticTopicEntryProjection {
     pub intent: Option<harness_contract::agent_action::TaskIntent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub issue_dispositions: Vec<harness_contract::agent_action::IssueDisposition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AgenticCoordinationConsumption {
+    pub execution_id: String,
+    pub agent_id: String,
+    pub membership_id: String,
+    pub settled: bool,
+    pub reason: Option<String>,
+}
+
+impl AgenticProgramProjection {
+    pub(crate) fn offered_task_opportunity(
+        &self,
+        task_ref: &str,
+        agent_id: &str,
+        generation: u64,
+    ) -> bool {
+        self.topics.values().flatten().any(|entry| {
+            entry.actor_id == agent_id
+                && entry.source_execution_id.is_some()
+                && entry.intent_generation == Some(generation)
+                && entry.intent.as_ref().is_some_and(|intent| {
+                    intent.task_ref == task_ref
+                        && intent.kind == harness_contract::agent_action::TaskIntentKind::Offer
+                })
+        })
+    }
+
+    pub(crate) fn declined_task_opportunity(
+        &self,
+        task_ref: &str,
+        agent_id: &str,
+        generation: Option<u64>,
+        execution_id: Option<&str>,
+    ) -> bool {
+        self.topics.values().flatten().any(|entry| {
+            entry.actor_id == agent_id
+                && entry.source_execution_id.is_some()
+                && entry.intent_generation.is_some()
+                && generation.is_none_or(|value| entry.intent_generation == Some(value))
+                && execution_id
+                    .is_none_or(|value| entry.source_execution_id.as_deref() == Some(value))
+                && entry.intent.as_ref().is_some_and(|intent| {
+                    intent.task_ref == task_ref
+                        && intent.kind == harness_contract::agent_action::TaskIntentKind::Decline
+                })
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

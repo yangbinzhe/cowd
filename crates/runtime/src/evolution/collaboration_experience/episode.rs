@@ -63,7 +63,7 @@ pub(super) fn from_verdict(
     for task in program
         .tasks
         .values()
-        .filter(|task| task.status != AgenticTaskStatus::Superseded)
+        .filter(|task| !task.status.is_retired())
     {
         if let Some(graph_id) = task.claim_execution_id.as_ref() {
             let graph = graphs.load(graph_id).map_err(|error| error.to_string())?;
@@ -156,7 +156,7 @@ fn build(
     let active = program
         .tasks
         .values()
-        .filter(|task| task.status != AgenticTaskStatus::Superseded)
+        .filter(|task| !task.status.is_retired())
         .collect::<Vec<_>>();
     let satisfied = active
         .iter()

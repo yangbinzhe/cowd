@@ -10,6 +10,249 @@ use harness_contract::agent_action::{
 use harness_contract::turn::TurnId;
 use sha2::{Digest, Sha256};
 
+#[tokio::test]
+async fn native_coordination_model_loop_consumes_wake_once() {
+    native_coordination_wire(false, false).await;
+}
+
+#[tokio::test]
+async fn native_durable_supplement_crosses_real_model_checkpoint_and_graph_commit() {
+    native_coordination_wire(true, false).await;
+}
+
+#[tokio::test]
+async fn native_durable_input_survives_failed_provider_step_before_consumption_commit() {
+    native_coordination_wire(true, true).await;
+}
+
+async fn native_coordination_wire(supplement: bool, fail_input_request: bool) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let provider = Arc::new(
+        crate::ProviderRegistry::new(model_protocol::provider_config::ProvidersConfig {
+            providers: std::collections::HashMap::from([(
+                "test".into(),
+                model_protocol::provider_config::ProviderConfig {
+                    name: "test".into(),
+                    base_url: format!("http://{address}/v1"),
+                    api_key: "local-test-only".into(),
+                    models: vec!["test".into()],
+                    protocol: Some("responses".into()),
+                    parallel_tool_calls: Default::default(),
+                    early_tool_start: Default::default(),
+                },
+            )]),
+        })
+        .unwrap(),
+    );
+    let fixture = crate::agentic::coordination::tests::fixture_with_provider(provider).await;
+    let requests = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let captured = requests.clone();
+    let input_services = fixture.services.clone();
+    let input_agent_id = fixture.packet.agent_id().to_string();
+    let wake = fixture.wake_ref.clone();
+    let topic = format!(
+        "topic:{}",
+        fixture.packet.agentic_binding.as_ref().unwrap().team_id
+    );
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let header_end = loop {
+                let mut chunk = [0; 4096];
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert!(read > 0);
+                bytes.extend_from_slice(&chunk[..read]);
+                if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            let length: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+                .unwrap();
+            while bytes.len() < header_end + length {
+                let mut chunk = [0; 4096];
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert!(read > 0);
+                bytes.extend_from_slice(&chunk[..read]);
+            }
+            let request =
+                String::from_utf8(bytes[header_end..header_end + length].to_vec()).unwrap();
+            let first = {
+                let mut all = captured.lock().unwrap();
+                all.push(request.clone());
+                all.len() == 1
+            };
+            assert!(
+                request.contains(&wake),
+                "actual model wire must consume its source wake"
+            );
+            assert!(request.contains("source A"));
+            if supplement && captured.lock().unwrap().len() == 2 {
+                assert!(
+                    request.contains("DURABLE_NATIVE_SUPPLEMENT"),
+                    "actual next request must consume the accepted supplement"
+                );
+            }
+            let ordinal = captured.lock().unwrap().len();
+            if fail_input_request && ordinal == 2 {
+                assert_eq!(
+                    input_services
+                        .agent_runtime()
+                        .pending_agent_inputs(
+                            &input_agent_id,
+                            &input_services
+                                .agent_runtime()
+                                .get(&input_agent_id)
+                                .unwrap()
+                                .run_id
+                        )
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                let body = r#"{"error":{"message":"intentional pre-consumption model failure","type":"invalid_request_error"}}"#;
+                socket.write_all(format!("HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                continue;
+            }
+            if fail_input_request && ordinal == 3 {
+                assert!(
+                    request.contains("DURABLE_NATIVE_SUPPLEMENT"),
+                    "failed Provider step must not lose input: {request}"
+                );
+            }
+            let logical_round = ordinal - usize::from(fail_input_request && ordinal > 2);
+            // Original Turn input handling has two fences: abandon the
+            // pre-input response, then commit its input-disposition replan.
+            // Only the following model step may publish a fresh tool plan.
+            let events = if first || (supplement && logical_round <= 3) {
+                if supplement && first {
+                    let snapshot = input_services.agent_runtime().get(&input_agent_id).unwrap();
+                    let receipt = input_services
+                        .agent_runtime()
+                        .command(AgentCommandRequest {
+                            command_id: "native-durable-supplement".into(),
+                            agent_id: input_agent_id.clone(),
+                            expected_revision: snapshot.revision,
+                            command: AgentCommand::SendInput,
+                            input: Some(AgentInput::UserSupplement(
+                                "DURABLE_NATIVE_SUPPLEMENT: retain the empty-input boundary".into(),
+                            )),
+                        })
+                        .await;
+                    assert!(receipt.accepted, "{receipt:?}");
+                }
+                let arguments = serde_json::json!({"topic_ref":topic,"summary":"Source A needs an explicit empty-input boundary check", "refs":[wake]}).to_string();
+                let call_id = format!("coord-answer-{}", captured.lock().unwrap().len());
+                vec![
+                    serde_json::json!({"type":"response.created","response":{"id":"coord-tool","model":"test"}}),
+                    serde_json::json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":call_id,"name":"message_publish"}}),
+                    serde_json::json!({"type":"response.function_call_arguments.delta","output_index":0,"delta":arguments}),
+                    serde_json::json!({"type":"response.completed","response":{"id":"coord-tool","model":"test","output":[{"type":"function_call","call_id":call_id,"name":"message_publish","arguments":arguments}],"usage":{"input_tokens":16,"output_tokens":12}}}),
+                ]
+            } else {
+                assert_eq!(
+                    captured.lock().unwrap().len(),
+                    2 + 2 * usize::from(supplement) + usize::from(fail_input_request),
+                    "no unprompted model loop after the durable reply"
+                );
+                vec![
+                    serde_json::json!({"type":"response.created","response":{"id":"coord-final","model":"test"}}),
+                    serde_json::json!({"type":"response.output_text.delta","delta":"The requested boundary check has been published to the original Topic."}),
+                    serde_json::json!({"type":"response.completed","response":{"id":"coord-final","model":"test","output":[],"usage":{"input_tokens":16,"output_tokens":12}}}),
+                ]
+            };
+            let mut body = events
+                .into_iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect::<String>();
+            body.push_str("data: [DONE]\n\n");
+            socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        }
+    });
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        fixture
+            .services
+            .agent_runtime()
+            .execute_task(fixture.packet.clone()),
+    )
+    .await;
+    let outcome = result.expect("local native model loop timeout").unwrap();
+    server.abort();
+    assert!(outcome.failure.is_none(), "{outcome:?}");
+    assert!(
+        fixture
+            .services
+            .agent_runtime()
+            .pending_agent_inputs(fixture.packet.agent_id(), fixture.packet.run_id())
+            .unwrap()
+            .is_empty(),
+        "real ModelStep graph commit must acknowledge consumption"
+    );
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        2 + 2 * usize::from(supplement) + usize::from(fail_input_request)
+    );
+    let projection = fixture
+        .services
+        .agent_action_service()
+        .project("coord-program")
+        .unwrap();
+    let consumed = projection.coordination_requests()[0]
+        .1
+        .coordination
+        .as_ref()
+        .unwrap();
+    assert!(consumed.settled && consumed.reason.is_none());
+    assert_eq!(
+        projection.tasks[&fixture.task_ref]
+            .claim_execution_id
+            .as_deref(),
+        Some("primary-execution")
+    );
+    assert_eq!(projection.tasks[&fixture.task_ref].failed_attempts, 0);
+    for index in 0..128 {
+        let mut duplicate = fixture.request.clone();
+        duplicate.action_id = format!("native-wire-duplicate-{index}");
+        assert_eq!(
+            fixture
+                .services
+                .submit_agent_action(&duplicate)
+                .await
+                .unwrap()
+                .status,
+            harness_contract::agent_action::AgentActionStatus::Applied
+        );
+    }
+    assert!(fixture
+        .services
+        .dispatch_ready_agentic_work("coord-program")
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(fixture
+        .services
+        .agent_runtime()
+        .execute_task(fixture.packet.clone())
+        .await
+        .unwrap()
+        .failure
+        .is_none());
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        2 + 2 * usize::from(supplement) + usize::from(fail_input_request)
+    );
+}
+
 fn test_authorization_lease(
     descriptor: &harness_contract::tool::ToolEffectDescriptor,
     ceiling: PermissionMode,
@@ -509,6 +752,13 @@ impl crate::RuntimeExecutionHost for EchoRuntimeExecutionHost {
         &self,
         request: &crate::RuntimeToolExecutionRequest,
     ) -> crate::RuntimeToolExecutionOutcome {
+        if request.tool_name == "artifact_materialize" {
+            assert_eq!(
+                request.category,
+                crate::ToolSafetyCategory::WriteLocal,
+                "materializing an Artifact must not masquerade as a read at the isolation boundary"
+            );
+        }
         if request.authorization.is_none() {
             return crate::RuntimeToolExecutionOutcome {
                 tool_use_id: request.tool_use_id.clone(),
@@ -598,6 +848,7 @@ fn concurrency_test_executor(
     scope_locks: Arc<ScopeLockManager>,
 ) -> ScopedRuntimeToolExecutor {
     ScopedRuntimeToolExecutor {
+        tool_batch: None,
         host,
         allowed_tools: BTreeSet::from(["write_file".to_string()]),
         session_id: "session".to_string(),
@@ -804,7 +1055,7 @@ fn test_tool_descriptor_for_input(
             ToolPermissionMode::ReadOnly,
             PermissionResource::Tool,
         ),
-        "checkpoint_create" | "write_file" => (
+        "checkpoint_create" | "write_file" | "artifact_materialize" => (
             ToolEffectKind::Write,
             PermissionOperation::Write,
             ToolPermissionMode::WorkspaceWrite,
@@ -845,6 +1096,65 @@ fn read_only_ceiling_never_escalates_for_a_write_tool() {
         policy.required_mode_for("write_file"),
         PermissionMode::WorkspaceWrite
     );
+}
+
+#[tokio::test]
+async fn runtime_artifact_materialization_uses_registered_write_classification() {
+    let root = tempfile::tempdir().unwrap();
+    let mut executor = concurrency_test_executor(
+        root.path(),
+        Arc::new(ConcurrencyTrackingRuntimeExecutionHost::new()),
+        Arc::new(ScopeLockManager::new()),
+    );
+    executor.host = Arc::new(EchoRuntimeExecutionHost);
+    executor.allowed_tools.insert("artifact_materialize".into());
+    let input = r#"{"path":"output.html","operation":"read"}"#;
+    let descriptor = test_tool_descriptor_for_input(
+        "artifact_materialize",
+        &serde_json::from_str(input).unwrap(),
+    )
+    .unwrap();
+    let effective =
+        crate::AuthorizationNegotiator::compile_effective_descriptor(&descriptor, input);
+    let authorization = crate::ToolPolicy
+        .authorize(
+            &effective,
+            &test_capability_assessment(&descriptor, PermissionMode::WorkspaceWrite),
+            "materialize",
+            test_authorization_lease(&descriptor, PermissionMode::WorkspaceWrite, "materialize"),
+            30,
+        )
+        .unwrap()
+        .authorization;
+    assert_eq!(
+        executor
+            .execute_delegated_runtime_tool("artifact_materialize", input, authorization.clone())
+            .await
+            .unwrap(),
+        "authorized:artifact_materialize"
+    );
+    assert!(executor
+        .execute_delegated_runtime_tool("unregistered", input, authorization.clone())
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("no registered effect descriptor"));
+    let services = RuntimeServices::in_memory().unwrap();
+    executor.tool_batch = Some(
+        crate::execution_core::graph::executors::agent_tool::AgentToolBatchDispatcher::new(
+            &services,
+            &test_agent_packet(vec![]),
+        ),
+    );
+    assert!(executor.owns_durable_tool_effect("artifact_materialize"));
+    assert!(executor.owns_tool_resource_admission("artifact_materialize"));
+    assert!(!executor.owns_tool_resource_admission("checkpoint_create"));
+    // With a production dispatcher, an absent parent fails admission. The
+    // compatibility Echo host must no longer return a successful direct call.
+    assert!(executor
+        .execute_delegated_runtime_tool("artifact_materialize", input, authorization)
+        .await
+        .is_err());
 }
 
 #[test]
@@ -898,6 +1208,7 @@ fn exact_model_delivery_policy_is_scoped_to_the_matching_invocation() {
     crate::path_identity::require_provider_model_observation(&mut required);
     let obligation_id = required.evidence_obligations[0].obligation_id.clone();
     let executor = ScopedRuntimeToolExecutor {
+        tool_batch: None,
         host: Arc::new(InputSensitiveRuntimeExecutionHost),
         allowed_tools: BTreeSet::from(["read_file".to_string()]),
         session_id: "session".to_string(),
@@ -1202,6 +1513,33 @@ fn virtual_team_delivery_directory_scope_authorizes_new_descendants() {
 }
 
 #[test]
+fn evaluation_virtual_directory_allows_first_write_but_not_sibling_or_traversal() {
+    let root = tempfile::tempdir().unwrap();
+    let resolver =
+        crate::path_identity::WorkspacePathIdentityResolver::discover(root.path()).unwrap();
+    let scope = format!(".cowd/evaluation/{}", "a".repeat(64));
+    let allowed = vec![format!("write:{scope}")];
+    assert!(resource_path_is_authorized(
+        &resolver,
+        &format!("{scope}/proof.txt"),
+        &allowed,
+        true
+    ));
+    for path in [
+        format!(".cowd/evaluation/{}/proof.txt", "b".repeat(64)),
+        format!("{scope}/../foreign.txt"),
+        "/tmp/foreign.txt".into(),
+    ] {
+        assert!(
+            !resource_path_is_authorized(&resolver, &path, &allowed, true),
+            "{path}"
+        );
+    }
+    assert!(!is_virtual_directory_scope(".cowd/evaluation"));
+    assert!(!is_virtual_directory_scope(".cowd/evaluation/invalid"));
+}
+
+#[test]
 fn absolute_escape_and_parent_traversal_remain_unauthorized() {
     let root = tempfile::tempdir().expect("workspace");
     let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
@@ -1251,6 +1589,7 @@ fn permission_policy_uses_the_explicit_packet_ceiling() {
 fn sandboxed_process_requires_and_accepts_only_a_whole_workspace_read_lease() {
     let root = tempfile::tempdir().expect("scoped workspace");
     let build = |scopes: Vec<String>| ScopedRuntimeToolExecutor {
+        tool_batch: None,
         host: Arc::new(EchoRuntimeExecutionHost),
         allowed_tools: BTreeSet::from(["execute_code".to_string()]),
         session_id: "session".to_string(),
@@ -1296,6 +1635,7 @@ async fn team_tool_boundary_enforces_the_exact_focus_scope() {
     std::fs::write(root.path().join("crates/runtime/src/lib.rs"), "checked").expect("runtime file");
     std::fs::create_dir_all(root.path().join("crates/gateway")).expect("gateway scope");
     let executor = ScopedRuntimeToolExecutor {
+        tool_batch: None,
         host: Arc::new(EchoRuntimeExecutionHost),
         allowed_tools: BTreeSet::from([
             "read_file".to_string(),
@@ -1431,6 +1771,7 @@ async fn absolute_path_authorization_and_execution_share_the_normalized_descript
     std::fs::create_dir_all(target.parent().expect("target parent")).expect("scope directory");
     std::fs::write(&target, "checked").expect("scope file");
     let executor = ScopedRuntimeToolExecutor {
+        tool_batch: None,
         host: Arc::new(InputSensitiveRuntimeExecutionHost),
         allowed_tools: BTreeSet::from(["read_file".to_string()]),
         session_id: "session".to_string(),
@@ -1499,6 +1840,7 @@ fn team_tool_boundary_rejects_symlink_escape_for_existing_and_new_targets() {
     std::fs::write(outside.path().join("secret.txt"), "secret").expect("outside fixture");
     symlink(outside.path(), root.path().join("crates/runtime/escape")).expect("workspace symlink");
     let executor = ScopedRuntimeToolExecutor {
+        tool_batch: None,
         host: Arc::new(EchoRuntimeExecutionHost),
         allowed_tools: BTreeSet::from(["read_file".to_string(), "write_file".to_string()]),
         session_id: "session".to_string(),
@@ -1544,6 +1886,7 @@ fn team_tool_boundary_rejects_symlink_escape_for_existing_and_new_targets() {
 #[tokio::test]
 async fn scoped_executor_advertises_only_packet_authorized_tools() {
     let executor = ScopedRuntimeToolExecutor {
+        tool_batch: None,
         host: Arc::new(NoopRuntimeExecutionHost),
         allowed_tools: BTreeSet::from(["read_file".to_string(), "grep_search".to_string()]),
         session_id: "session".to_string(),
@@ -1608,6 +1951,7 @@ async fn scoped_executor_advertises_only_packet_authorized_tools() {
 #[tokio::test]
 async fn scoped_executor_routes_hidden_checkpoint_for_runtime_guard_only() {
     let executor = ScopedRuntimeToolExecutor {
+        tool_batch: None,
         host: Arc::new(EchoRuntimeExecutionHost),
         allowed_tools: BTreeSet::from(["read_file".to_string()]),
         session_id: "session".to_string(),
@@ -1685,6 +2029,7 @@ async fn scoped_executor_routes_hidden_checkpoint_for_runtime_guard_only() {
 #[test]
 fn root_write_scope_compiles_to_the_checkpoint_whole_workspace_form() {
     let executor = ScopedRuntimeToolExecutor {
+        tool_batch: None,
         host: Arc::new(NoopRuntimeExecutionHost),
         allowed_tools: BTreeSet::new(),
         session_id: "session".to_string(),
@@ -2018,6 +2363,7 @@ async fn scoped_executor_propagates_runtime_authorization_for_normal_agent_tools
         matrix_snapshot_refs: vec!["matrix:source_snapshot:exact".into()],
     };
     let executor = ScopedRuntimeToolExecutor {
+        tool_batch: None,
         host: Arc::new(LeaseCheckingHost(reality_lease.clone())),
         allowed_tools: BTreeSet::from(["read_file".to_string()]),
         session_id: "session".to_string(),
@@ -2525,6 +2871,9 @@ fn scoped_tool_effect_key_is_stable_across_worker_recovery() {
 #[test]
 fn recovered_receipt_context_is_bounded_and_explicitly_fences_tools() {
     let receipt = crate::execution_core::graph::DurableAgentToolReceipt {
+        committed_cursor: 1,
+        effect_scope: None,
+        effect_scopes: Vec::new(),
         sequence: 7,
         effect_kind: harness_contract::tool::ToolEffectKind::Write,
         authorized_scopes: vec!["write:src/lib.rs".to_string()],
@@ -2540,6 +2889,12 @@ fn recovered_receipt_context_is_bounded_and_explicitly_fences_tools() {
         },
     };
 
+    let mut read = receipt.clone();
+    read.outcome.tool_name = "evidence_retrieve".into();
+    read.effect_kind = harness_contract::tool::ToolEffectKind::Read;
+    let retained = recoverable_effect_receipts(&[read.clone(), receipt.clone()]);
+    assert_eq!(retained, vec![receipt.clone()]);
+    assert!(recoverable_effect_receipts(&[read]).is_empty());
     let prompt = recovered_agent_tool_receipt_prompt(&[receipt], false).expect("recovery prompt");
     assert!(prompt.contains("committed output"));
     assert!(prompt.contains("Do not call tools"));
@@ -2585,6 +2940,275 @@ fn generic_team_packet_has_no_retired_graph_work_market_checkpoint() {
             .is_none(),
         "generic ExecutionGraph/Team packets must not revive a second task ownership plane"
     );
+}
+
+#[tokio::test]
+async fn native_checkpoint_closes_only_after_its_typed_decline() {
+    use harness_contract::agent_action::{
+        AgentActionStatus, AgentAttemptMode, TaskAttemptDispatchInput,
+    };
+    let services = Arc::new(RuntimeServices::in_memory().unwrap());
+    let actions = services.agent_action_service();
+    let mut actor = AgentActorBinding {
+        objective_id: "decline-objective".into(),
+        program_id: "decline-program".into(),
+        session_id: "decline-session".into(),
+        turn_id: "decline-turn".into(),
+        root_execution_id: None,
+        required_team_count: 1,
+        objective_summary: "choose useful work".into(),
+        model_lease: "test".into(),
+        permission_ceiling: Some(PermissionMode::ReadOnly),
+        resource_scopes: vec![],
+        actor_id: "root".into(),
+        kind: AgentActorKind::Root,
+        execution_id: None,
+        team_id: None,
+        agent_id: None,
+    };
+    let apply = |id: &str, actor: &AgentActorBinding, action| {
+        actions
+            .apply(&AgentActionEnvelope {
+                action_id: id.into(),
+                actor: actor.clone(),
+                expected_revision: None,
+                action,
+            })
+            .unwrap()
+    };
+    let team = apply(
+        "team",
+        &actor,
+        AgentAction::TeamCreate(TeamCreateInput {
+            name: "Readers".into(),
+            mission: "read evidence".into(),
+            objective: None,
+        }),
+    )
+    .changed_refs[0]
+        .clone();
+    let member = apply("member", &actor, AgentAction::AgentInvite(serde_json::from_value(serde_json::json!({
+        "team_ref":team,"role":"Reader","mission":"inspect evidence","required_capabilities":["read"]
+    })).unwrap())).changed_refs[0].clone();
+    let task = apply("task", &actor, AgentAction::TaskPublish(serde_json::from_value(serde_json::json!({
+        "team_ref":team,"title":"Evidence","objective":"read evidence","acceptance":"cited source"
+    })).unwrap())).changed_refs[0].clone();
+    let mut packet = test_agent_packet(vec![]);
+    packet.assignment = crate::test_support::agent_assignment(
+        None,
+        &member,
+        "decline-run",
+        &task,
+        "decline-session",
+        "decline-run",
+        Some(&team),
+        "decline-graph",
+        "decline-node",
+    );
+    packet.allowed_tools = vec!["message_publish".into(), "task_claim".into()];
+    packet.agentic_binding = Some(AgenticExecutionBinding {
+        program_id: "decline-program".into(),
+        agent_id: member.clone(),
+        membership_id: format!("membership:{member}:{team}"),
+        team_id: team.clone(),
+        task_team_id: team.clone(),
+        source_spec_revision: 1,
+        focus: AgenticExecutionFocus::TaskExecute {
+            task_ref: task.clone(),
+        },
+    });
+    actor.kind = AgentActorKind::Supervisor;
+    actor.actor_id = "runtime.program-supervisor".into();
+    actor.execution_id = Some(packet.graph_id().into());
+    assert_eq!(
+        apply(
+            "dispatch",
+            &actor,
+            AgentAction::TaskAttemptDispatch(TaskAttemptDispatchInput {
+                task_ref: task.clone(),
+                execution_id: packet.graph_id().into(),
+                agent_ref: member.clone(),
+                membership_id: format!("membership:{member}:{team}"),
+                mode: AgentAttemptMode::Execute,
+                generation: 0,
+            })
+        )
+        .status,
+        AgentActionStatus::Applied
+    );
+    let before = agent_autonomy_checkpoint(&services, &packet)
+        .unwrap()
+        .unwrap();
+    let checkpoint: serde_json::Value =
+        serde_json::from_str(before.prompt.rsplit_once("\n\n").unwrap().1).unwrap();
+    assert_eq!(
+        checkpoint["required_actions"][0]["options"][1]["input"]["intent"]["kind"],
+        "decline"
+    );
+    actor.kind = AgentActorKind::Agent;
+    actor.actor_id = member.clone();
+    actor.agent_id = Some(member);
+    actor.team_id = Some(team);
+    assert_eq!(apply("prose", &actor, AgentAction::MessagePublish(serde_json::from_value(serde_json::json!({
+        "topic_ref":"topic:decline-program", "summary":"DECLINE: narrative only", "refs":[task]
+    })).unwrap())).status, AgentActionStatus::Applied);
+    assert!(agent_autonomy_checkpoint(&services, &packet)
+        .unwrap()
+        .is_some());
+    assert_eq!(apply("typed", &actor, AgentAction::MessagePublish(serde_json::from_value(serde_json::json!({
+        "topic_ref":"topic:decline-program", "summary":"I lack the required expertise", "intent":{"kind":"decline","task_ref":task}
+    })).unwrap())).status, AgentActionStatus::Applied);
+    assert!(agent_autonomy_checkpoint(&services, &packet)
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn native_coordination_checkpoint_requires_own_durable_reply() {
+    use crate::agentic::coordination::tests::{actor, fixture};
+    let fixture = fixture(false).await;
+    let checkpoint = agent_autonomy_checkpoint(&fixture.services, &fixture.packet)
+        .unwrap()
+        .unwrap();
+    assert!(checkpoint.prompt.contains(&fixture.wake_ref));
+    assert!(agentic_task_protocol_pending(&fixture.services, &fixture.packet).unwrap());
+    let actions = fixture.services.agent_action_service();
+    let mut unrelated = fixture.request.clone();
+    unrelated.action_id = "requestor-not-coordinator-reply".into();
+    if let AgentAction::MessagePublish(input) = &mut unrelated.action {
+        input.intent = None;
+        input.refs = vec![fixture.wake_ref.clone()];
+        input.summary = Some("requestor self reply".into());
+    }
+    actions.apply(&unrelated).unwrap();
+    assert!(
+        agent_autonomy_checkpoint(&fixture.services, &fixture.packet)
+            .unwrap()
+            .is_some()
+    );
+    let bound = actor(&fixture).await;
+    let reply=AgentActionEnvelope {action_id:"native-coordination-reply".into(),actor:bound,expected_revision:None,
+        action:AgentAction::MessagePublish(serde_json::from_value(serde_json::json!({
+            "topic_ref":format!("topic:{}",fixture.packet.agentic_binding.as_ref().unwrap().team_id),
+            "summary":"Inspect the empty-input boundary before accepting source A", "refs":[fixture.wake_ref]
+        })).unwrap())};
+    assert_eq!(
+        fixture
+            .services
+            .submit_agent_action(&reply)
+            .await
+            .unwrap()
+            .status,
+        harness_contract::agent_action::AgentActionStatus::Applied
+    );
+    assert!(
+        agent_autonomy_checkpoint(&fixture.services, &fixture.packet)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!agentic_task_protocol_pending(&fixture.services, &fixture.packet).unwrap());
+}
+
+#[tokio::test]
+async fn generalized_coalesced_coordination_wake() {
+    let fixture = crate::agentic::coordination::tests::fixture(false).await;
+    let actions = fixture.services.agent_action_service();
+    for index in 0..128 {
+        let mut duplicate = fixture.request.clone();
+        duplicate.action_id = format!("model-duplicate-{index}");
+        assert_eq!(
+            actions.apply(&duplicate).unwrap().status,
+            harness_contract::agent_action::AgentActionStatus::Applied
+        );
+    }
+    assert_eq!(
+        actions
+            .project("coord-program")
+            .unwrap()
+            .coordination_requests()
+            .len(),
+        1
+    );
+    let checkpoint = agent_autonomy_checkpoint(&fixture.services, &fixture.packet)
+        .unwrap()
+        .unwrap();
+    let packet = fixture.packet.clone();
+    let services = fixture.services.clone();
+    // Deterministic decision stub consumes the actual Native checkpoint and
+    // immutable packet, then calls the shared authorized runtime tool path.
+    // No fixture writes its response into the Program on its behalf.
+    let worker = tokio::spawn(async move {
+        assert!(checkpoint
+            .prompt
+            .contains("Check the boundary condition in source A"));
+        let binding = packet.agentic_binding.as_ref().unwrap();
+        let AgenticExecutionFocus::Coordination { wake_ref } = &binding.focus else {
+            panic!("expected coordination")
+        };
+        let bridge = ProcessJsonlToolSession::prepare(
+            &services,
+            &packet,
+            &AgentModelSelection {
+                model: "test".into(),
+                provider: "deterministic-stub".into(),
+                registry_revision: 0,
+            },
+        )
+        .unwrap();
+        let reply=bridge.execute_tool("native-stub-response","message_publish",&serde_json::json!({
+            "topic_ref":format!("topic:{}",binding.team_id),"summary":"Source A needs an empty-input boundary check before acceptance","refs":[wake_ref]
+        }).to_string()).await.unwrap();
+        let observation: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(observation["status"], "applied");
+        assert!(agent_autonomy_checkpoint(&services, &packet)
+            .unwrap()
+            .is_none());
+        services
+            .settle_abandoned_agentic_attempt(&packet, "deterministic worker exit")
+            .await
+            .unwrap();
+    });
+    worker.await.unwrap();
+    let settled = actions.project("coord-program").unwrap();
+    assert_eq!(
+        settled.tasks[&fixture.task_ref]
+            .claim_execution_id
+            .as_deref(),
+        Some("primary-execution")
+    );
+    assert_eq!(
+        settled
+            .topics
+            .values()
+            .flatten()
+            .filter(|entry| entry.source_execution_id.as_deref() == Some(fixture.packet.graph_id()))
+            .count(),
+        1
+    );
+    for _ in 0..3 {
+        assert!(fixture
+            .services
+            .dispatch_ready_agentic_work("coord-program")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+    let mut novel = fixture.request.clone();
+    novel.action_id = "model-new-source".into();
+    if let AgentAction::MessagePublish(input) = &mut novel.action {
+        input.summary = Some("New source B contradicts the boundary result".into());
+    }
+    assert_eq!(
+        actions.apply(&novel).unwrap().status,
+        harness_contract::agent_action::AgentActionStatus::Applied
+    );
+    let next = fixture
+        .services
+        .dispatch_ready_agentic_work("coord-program")
+        .await
+        .unwrap();
+    assert_eq!(next.len(), 1);
+    assert_ne!(next[0].graph_id, fixture.packet.graph_id());
 }
 
 #[tokio::test]

@@ -132,6 +132,17 @@ impl DefinitionEvolutionScenarioCatalog for FileDefinitionEvolutionScenarioCatal
                     "complete the declared definition objective and return auditable evidence"
                         .to_string(),
                 acceptance: vec!["evidence".to_string()],
+                acceptance_checks: vec![
+                    harness_contract::evaluation::EvaluationAcceptanceRequirement {
+                        criterion: "evidence".into(),
+                        check: harness_contract::evaluation::EvaluationAcceptanceCheck::Output {
+                            check:
+                                harness_contract::agent::OutputAcceptanceCheck::StructuredArtifact {
+                                    name: "evidence".into(),
+                                },
+                        },
+                    },
+                ],
                 allowed_tools: Vec::new(),
                 allowed_skills: Vec::new(),
                 resource_scopes: Vec::new(),
@@ -1199,6 +1210,16 @@ mod tests {
             scenario_ref: "custom/scenario".to_string(),
             objective: "first objective".to_string(),
             acceptance: vec!["evidence".to_string()],
+            acceptance_checks: vec![
+                harness_contract::evaluation::EvaluationAcceptanceRequirement {
+                    criterion: "evidence".into(),
+                    check: harness_contract::evaluation::EvaluationAcceptanceCheck::Output {
+                        check: harness_contract::agent::OutputAcceptanceCheck::StructuredArtifact {
+                            name: "evidence".into(),
+                        },
+                    },
+                },
+            ],
             allowed_tools: Vec::new(),
             allowed_skills: Vec::new(),
             resource_scopes: Vec::new(),

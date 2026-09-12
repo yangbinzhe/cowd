@@ -91,7 +91,9 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
-        let bounded_resource_lease = packet.team_id().is_some() || packet.agentic_binding.is_some();
+        let bounded_resource_lease = packet.team_id().is_some()
+            || packet.agentic_binding.is_some()
+            || binding.evaluation.is_some();
         let requested_tool_names = packet_allowed_tools.iter().cloned().collect::<Vec<_>>();
         let tool_definitions = host.delegated_tool_definitions(&requested_tool_names);
         let allowed_tools = tool_definitions
@@ -151,10 +153,11 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                     packet.attempt
                 )
             })?;
-        let recovered_tool_receipt_count = durable_agent_receipts.len();
+        let recoverable_receipts = recoverable_effect_receipts(&durable_agent_receipts);
+        let recovered_tool_receipt_count = recoverable_receipts.len();
         let recovered_agentic_protocol_pending = agentic_task_protocol_pending(&services, &packet)?;
         let recovered_tool_receipt_prompt = recovered_agent_tool_receipt_prompt(
-            &durable_agent_receipts,
+            &recoverable_receipts,
             recovered_agentic_protocol_pending,
         );
         let durable_receipts = durable_agent_receipts
@@ -177,6 +180,11 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             .cloned()
             .collect();
         let tool_executor = Arc::new(ScopedRuntimeToolExecutor {
+            tool_batch: Some(
+                crate::execution_core::graph::executors::agent_tool::AgentToolBatchDispatcher::new(
+                    &services, &packet,
+                ),
+            ),
             host,
             allowed_tools: allowed_tools.clone(),
             session_id: packet.session_id().to_string(),
@@ -243,55 +251,8 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         // refs below remain the capability ceiling; this worker never scans
         // package directories or falls back to an empty production profile.
         let skill_catalog = services.skill_catalog();
-        // Agent-first topic observations are the sole collaboration inbox.
-        // They are fenced by the immutable Program member/execution binding;
-        // a retired collaboration board is never consulted by a model.
-        let initial_agentic_binding = packet.agentic_binding.as_ref();
-        let mut initial_agentic_topic_ack = None;
-        let external_context_items = match initial_agentic_binding {
-            Some(binding) => services
-                .agent_action_service()
-                .topic_observations(
-                    &binding.program_id,
-                    &binding.agent_id,
-                    packet.graph_id(),
-                    32,
-                    64 * 1024,
-                )
-                .map_err(|error| format!("load initial Agent-first topic observations: {error}"))?
-                .filter(|page| !page.entries.is_empty())
-                .map(|page| {
-                    let to_revision = page.to_revision;
-                    initial_agentic_topic_ack = Some(crate::agentic::AgenticTopicObservationAck {
-                        program_id: binding.program_id.clone(),
-                        execution_id: packet.graph_id().to_string(),
-                        through_revision: to_revision,
-                        expected_cursor_revision: page.cursor_revision,
-                    });
-                    let summary = serde_json::to_string(&serde_json::json!({
-                        "from_revision": page.from_revision,
-                        "to_revision": to_revision,
-                        "entries": page.entries,
-                        "instruction": "Use committed public summaries and durable references only; publish new collaboration facts through Agent Actions."
-                    }))
-                    .unwrap_or_else(|_| "{}".to_string());
-                    let mut item = crate::ContextItem::new(
-                        format!("agentic-topic:{}", binding.program_id),
-                        crate::ContextSourceKind::AgentPeer,
-                        crate::ContextRole::Evidence,
-                        summary,
-                    );
-                    item.authority = crate::ContextAuthority::Tool;
-                    item.evidence = vec![format!(
-                        "agentic-topic:{}:{to_revision}",
-                        binding.program_id
-                    )];
-                    item
-                })
-                .into_iter()
-                .collect(),
-            None => Vec::new(),
-        };
+        // Topic deltas are consumed by the conversation host at each actual
+        // model step, with acknowledgement after selected successful delivery.
         let program_dossier_fragment = crate::TaskRuntimePort::new(services.as_ref())
             .get(&packet.assignment.root_task_id)
             .ok()
@@ -354,7 +315,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             tool_callback: None,
             model_context_window: None,
             hook_progress_reporter: None,
-            external_context_items,
+            external_context_items: Vec::new(),
             immutable_user_prefix: (!role_user_brief.trim().is_empty())
                 .then(|| {
                     format!(
@@ -426,6 +387,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         // parent session authority but must not inherit MainTurn's broad,
         // open-ended exploration profile.
         runtime.set_context_profile(ContextProfile::SubAgent);
+        runtime.bind_skill_task_objective(packet.objective.clone());
         runtime.set_execution_service_class(if binding.evaluation.is_some() {
             harness_contract::execution_graph::ExecutionServiceClass::Maintenance
         } else if packet.managed_invocation.is_some() {
@@ -449,14 +411,16 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                 packet.run_id().to_string(),
                 ActiveInProcessRun {
                     cancellation: cancellation.clone(),
-                    session_id: child_session_id,
-                    input_stream,
+                    session_id: child_session_id.clone(),
+                    input_stream: input_stream.clone(),
                 },
             );
         let active_run_cleanup = ActiveRunCleanup {
             worker: self,
             run_id: packet.run_id().to_string(),
         };
+        // Durable replay happens at the original ModelStep checkpoint, after
+        // its child Turn identity exists (not as a new parent Session turn).
         if self
             .pending_cancellations
             .lock()
@@ -547,11 +511,6 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             "agent.execution.started",
             "provider-backed child execution admitted",
         );
-        // The real worker future, rather than dispatch or a detached Runtime
-        // task, owns claim renewal. It waits for this Agent's first explicit
-        // task_claim and is aborted automatically on every worker exit path.
-        let _claim_heartbeat: Option<crate::agentic::AgenticClaimHeartbeatGuard> =
-            crate::agentic::start_agentic_claim_heartbeat(Arc::downgrade(&services), &packet)?;
         let result = runtime
             .submit_turn(
                 "Begin the bounded role using the Runtime-attested shared Team context and private role brief above. Return verified findings, evidence, and genuine gaps.",
@@ -559,26 +518,9 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             )
             .await;
         let mut summary = match result {
-            Ok(summary) => {
-                if let Some(request) = initial_agentic_topic_ack.take() {
-                    if let Err(error) = services
-                        .agent_action_service()
-                        .acknowledge_topic_observations(request)
-                    {
-                        let _ = services.agent_runtime().record_progress(
-                            packet.agent_id(),
-                            "agent.agentic_topic_ack_deferred",
-                            &format!(
-                                "Program topic page will be redelivered after ack failure: {error}"
-                            ),
-                        );
-                    }
-                }
-                summary
-            }
+            Ok(summary) => summary,
             Err(error) => {
                 let error = format!("in-process agent turn failed: {error}");
-                settle_failed_agentic_attempt(&services, &packet, &error).await;
                 services.fail_agent_live_execution(packet.run_id(), error.clone());
                 drop(runtime);
                 drop(child_execution_scope);
@@ -656,20 +598,6 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                 Ok(updated) => {
                     let may_continue =
                         autonomy_continuation_may_advance(updated.terminal_completion);
-                    if let Some(request) = checkpoint.agentic_topic_ack {
-                        if let Err(error) = services
-                            .agent_action_service()
-                            .acknowledge_topic_observations(request)
-                        {
-                            let _ = services.agent_runtime().record_progress(
-                                packet.agent_id(),
-                                "agent.agentic_topic_ack_deferred",
-                                &format!(
-                                    "Program topic page will be redelivered after ack failure: {error}"
-                                ),
-                            );
-                        }
-                    }
                     summary = updated;
                     if !may_continue && !checkpoint.requires_tool_action {
                         let _ = services.agent_runtime().record_progress(
@@ -815,12 +743,6 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         );
         let (status, failure) =
             agent_terminal_outcome(summary.terminal_completion, &summary.final_answer);
-        settle_failed_agentic_attempt(
-            &services,
-            &packet,
-            "Agent execution ended without a durable task submission",
-        )
-        .await;
         let terminal_ref = format!("agent-terminal:{}", packet.run_id());
         match status {
             AgentTerminalStatus::Completed => services.complete_agent_live_execution(
@@ -958,17 +880,32 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                     .ok_or(
                         harness_contract::agent::AgentCommandRejectReason::UnsupportedByBackend,
                     )?;
+                if active.input_stream.active_turn_id().is_none() {
+                    // The durable intent remains queued for the first actual
+                    // ModelStep; do not misclassify it as a new Session turn.
+                    return Err(
+                        harness_contract::agent::AgentCommandRejectReason::UnsupportedByBackend,
+                    );
+                }
                 let envelope = SessionInputEnvelope::text(
                     active.session_id,
                     InputSourceKind::Agent,
                     agent_input_text(input),
                 )
-                .with_source_ref(format!("agent:{}", handle.agent_id))
+                .with_source_ref(format!("agent-input:{}", handle.run_id))
                 .with_source_message_id(request.command_id.clone());
-                active
+                let receipt = active
                     .input_stream
                     .admit(envelope, active.input_stream.runtime_state());
-                Ok(())
+                if matches!(
+                    receipt.status,
+                    harness_contract::turn::SessionInputStatus::RejectedPolicy
+                        | harness_contract::turn::SessionInputStatus::Failed
+                ) {
+                    Err(harness_contract::agent::AgentCommandRejectReason::InvalidInput)
+                } else {
+                    Ok(())
+                }
             }
             harness_contract::agent::AgentCommand::Pause
             | harness_contract::agent::AgentCommand::Resume => {

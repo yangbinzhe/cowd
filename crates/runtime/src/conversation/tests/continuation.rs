@@ -228,7 +228,12 @@ async fn bare_continue_actual_host_inherits_goal_and_program_before_current_prov
         .unwrap()
         .unwrap();
     assert_eq!(new_goal.objective, original.objective);
-    assert_eq!(new_goal.spec_digest, original.spec_digest);
+    assert_eq!(new_goal.spec_revision, original.spec_revision + 1,
+        "legacy Program participation is explicitly adopted into the new Goal specification");
+    assert_eq!(new_goal.spec_digest, crate::execution_core::goal::goal_spec_digest(&new_goal));
+    let participation = new_goal.participation_requirement.as_ref().unwrap();
+    assert_eq!(participation.minimum_team_count, source.required_team_count);
+    assert_eq!(Some(&participation.source_ref), original.source_intent_ref.as_ref());
     assert_eq!(
         new_goal
             .execution_binding
@@ -242,4 +247,50 @@ async fn bare_continue_actual_host_inherits_goal_and_program_before_current_prov
         services.goal_store().get(&original.id).unwrap().unwrap(),
         original
     );
+}
+
+// This test exercises pre-execution Goal genesis. Inventory availability is
+// controlled; the rejecting Provider never asks to execute a Team tool.
+struct GoalGenesisInventory;
+#[async_trait::async_trait]
+impl ToolExecutor for GoalGenesisInventory {
+    async fn execute_output(&self, name: &str, _input: &str)
+        -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+        Err(ToolError::new(format!("genesis probe must not execute {name}")))
+    }
+    fn available_tool_names(&self) -> Vec<String> {
+        vec![harness_contract::agent_action::TEAM_CREATE_TOOL_ID.into()]
+    }
+    fn collaboration_runtime_available(&self) -> bool { true }
+}
+
+#[tokio::test]
+async fn actual_host_goal_records_only_user_sourced_participation_constraints() {
+    for (index, (prompt, expected)) in [
+        ("启动两个 Team 并行完成审计", Some(2)),
+        ("分析三个输入文件并汇总结果后写入目标文件", None),
+        ("不要创建团队，只解释什么是缓存", None),
+    ].into_iter().enumerate() {
+        let services = crate::RuntimeServices::in_memory().unwrap();
+        let mut session = Session::new();
+        session.session_id = format!("participation-genesis-{index}");
+        session.model = Some("qwen3.8-max".into());
+        let captured = Arc::new(Mutex::new(vec![]));
+        let mut runtime = crate::ConversationRuntime::new(session, ContinuationEntryProbe(captured),
+            GoalGenesisInventory, PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
+            canonical_host_system_prompt(vec![])).without_memory();
+        runtime.set_active_model("qwen3.8-max");
+        let (_, result) = submit_test_owned_conversation_turn(runtime, Arc::clone(&services), prompt,
+            &SharedPrompter::none(), test_execution_lineage()).await;
+        let streams = services.event_store().stream_ids_for_scope(crate::RuntimeEventScope::Goal).unwrap();
+        let goals = streams.iter().filter_map(|stream| stream.strip_prefix("goal:"))
+            .filter_map(|id| services.goal_store().get(id).unwrap()).collect::<Vec<_>>();
+        assert_eq!(goals.len(), 1, "one actual host Goal for {prompt}: {result:?}");
+        let goal = &goals[0];
+        assert_eq!(goal.participation_requirement.as_ref().map(|requirement| requirement.minimum_team_count), expected);
+        if let Some(requirement) = &goal.participation_requirement {
+            assert_eq!(Some(&requirement.source_ref), goal.source_intent_ref.as_ref());
+        }
+        assert_eq!(goal.spec_digest, crate::execution_core::goal::goal_spec_digest(goal));
+    }
 }

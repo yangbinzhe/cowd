@@ -881,7 +881,7 @@ impl PostgresSessionStore {
                     claim_expires_at_ms=NULL,last_error=$1,terminal_at_ms=$2,
                     updated_at_ms=$2,revision=revision+1
               WHERE input_id=$3 AND session_generation=$4 AND revision=$5
-                AND status NOT IN ('completed','supplemented','failed','cancelled','expired')",
+                AND status NOT IN ('rejected_duplicate','rejected_policy','completed','supplemented','failed','cancelled','expired')",
                 &[
                     &reason,
                     &to_u64_i64(now_ms, "runtime clock")?,
@@ -1448,7 +1448,7 @@ impl PostgresSessionStore {
                     runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
                     claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
                     updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch,application_receipt_json FROM session_runtime_outbox
-              WHERE status NOT IN ('completed','supplemented','failed','cancelled','expired')
+              WHERE status NOT IN ('rejected_duplicate','rejected_policy','completed','supplemented','failed','cancelled','expired')
               ORDER BY updated_at_ms DESC,sequence DESC,request_id DESC LIMIT $1",
             &[&to_i64(bounded_limit(limit, 1, 500), "runtime outbox limit")?],
         )

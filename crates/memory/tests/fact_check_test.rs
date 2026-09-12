@@ -7,8 +7,8 @@
 
 //! Fact-check write path integration tests.
 //!
-//! These tests verify that `remember()` uses `FactChecker` to detect
-//! contradictions while preserving consistent facts.
+//! Explicit FactChecker validation remains available. Memory writes preserve
+//! source claims; a process-global regex inference is not evidence authority.
 
 use memory::config::{BudgetConfig, StoreConfig};
 use memory::{
@@ -17,10 +17,10 @@ use memory::{
 };
 
 /// 创建一个基础的测试配置
-fn test_config(sqlite_path: &std::path::Path) -> MemoryConfig {
+fn test_config(blob_dir: &std::path::Path) -> MemoryConfig {
     MemoryConfig {
         store: StoreConfig {
-            blob_dir: sqlite_path.parent().unwrap().join("blobs"),
+            blob_dir: blob_dir.to_path_buf(),
             enable_vector_index: false,
             cache_capacity: 128,
             ..Default::default()
@@ -87,23 +87,23 @@ fn test_fact_checker_detects_contradiction() {
 }
 
 // =========================================================================
-// Test 2: 通过 CognitiveContextManager 写入时触发事实校验
+// Test 2: 私有来源主张写入不触发全局正则改写
 //
-// 写入一个包含矛盾三元组的记忆条目，验证：
-// 1. 写入成功（FactChecker 只降级置信度，不阻止写入）
-// 2. 置信度被降级
-// 3. 持久化后的条目保留降级结果
+// 写入两个不同来源的主张，验证：
+// 1. 两个来源都保留自己的原文
+// 2. 来源置信度不被全局推断自动改写
+// 3. 私有可见性与来源身份保留
 // =========================================================================
 #[tokio::test]
-async fn test_remember_contradictory_triple_confidence_downgraded() {
+async fn test_remember_preserves_private_source_claims_without_global_fact_rewrite() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let config = test_config(&tmp.path().join("test.db"));
+    let config = test_config(&tmp.path().join("blobs"));
 
     let mgr = CognitiveContextManager::new_ephemeral(config)
         .await
         .expect("Should create CognitiveContextManager");
 
-    // First, register the baseline fact: Alice's parent is Bob
+    // A private claim does not register process-global verified identity.
     let identity_entry = MemoryEntry {
         id: uuid::Uuid::new_v4(),
         layer: MemoryLayer::L1,
@@ -123,14 +123,14 @@ async fn test_remember_contradictory_triple_confidence_downgraded() {
         last_accessed_at: None,
         scope: MemoryScope::default(),
         session_id: None,
-        source_agent: None,
-        visibility: memory::AgentVisibility::default(),
+        source_agent: Some("source-a".to_string()),
+        visibility: memory::AgentVisibility::Private,
     };
     mgr.remember(identity_entry)
         .await
         .expect("Should remember identity entry");
 
-    // Now write the contradictory entry: FactChecker should detect the conflict
+    // A different source may disagree; retain provenance for explicit review.
     let contradictory_id = uuid::Uuid::new_v4();
     let contradictory_entry = MemoryEntry {
         id: contradictory_id,
@@ -151,37 +151,24 @@ async fn test_remember_contradictory_triple_confidence_downgraded() {
         last_accessed_at: None,
         scope: MemoryScope::default(),
         session_id: None,
-        source_agent: None,
-        visibility: memory::AgentVisibility::default(),
+        source_agent: Some("source-b".to_string()),
+        visibility: memory::AgentVisibility::Private,
     };
 
     let original_confidence = contradictory_entry.confidence;
     mgr.remember(contradictory_entry)
         .await
-        .expect("Should remember contradictory entry (FactChecker only downgrades, never rejects)");
+        .expect("Should retain the independently attributed claim");
 
-    let id_str = contradictory_id.to_string();
-    match mgr.get_entry(&id_str).await {
-        Ok(Some(retrieved)) => {
-            eprintln!(
-                "Retrieved entry: title={}, confidence={:.3}, original={:.3}",
-                retrieved.title, retrieved.confidence, original_confidence
-            );
-
-            assert!(
-                retrieved.confidence < original_confidence,
-                "Contradictory entry confidence should be below {:.3}; got {:.3}",
-                original_confidence,
-                retrieved.confidence
-            );
-        }
-        Ok(None) => {
-            panic!("Entry with id {} should exist after remember()", id_str);
-        }
-        Err(e) => {
-            panic!("Failed to retrieve entry: {}", e);
-        }
-    }
+    let retrieved = mgr
+        .get_entry(&contradictory_id.to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retrieved.confidence, original_confidence);
+    assert_eq!(retrieved.content, "Alice's parent is Charlie");
+    assert_eq!(retrieved.source_agent.as_deref(), Some("source-b"));
+    assert_eq!(retrieved.visibility, memory::AgentVisibility::Private);
 }
 
 // =========================================================================
@@ -193,7 +180,7 @@ async fn test_remember_contradictory_triple_confidence_downgraded() {
 #[tokio::test]
 async fn test_remember_accepts_consistent_entry() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let config = test_config(&tmp.path().join("test.db"));
+    let config = test_config(&tmp.path().join("blobs"));
 
     let mgr = CognitiveContextManager::new_ephemeral(config)
         .await

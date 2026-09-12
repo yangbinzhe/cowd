@@ -61,6 +61,35 @@ pub(crate) fn attach_execution_graph_lineage(graph: &mut ExecutionGraph) {
     graph.lineage = Some(execution_graph_lineage(&graph.id));
 }
 
+pub(crate) fn register_running_root(
+    store: Arc<crate::RuntimeEventStore>,
+    context: &crate::CowdExecutionContext,
+) {
+    use harness_contract::execution_graph::{
+        ExecutionNodeKind, ExecutionNodeSpec, ExecutionNodeStatus,
+    };
+    let commits = crate::ExecutionCommitService::new(store);
+    let mut graph = ExecutionGraph::new("test Root execution");
+    graph.id = context.execution_id.clone();
+    graph.lineage = Some(ExecutionGraphLineage {
+        session_id: context.session_id.clone(),
+        turn_id: context.turn_id.clone(),
+        root_task_id: format!("task:{}", graph.id),
+        task_id: format!("task:{}", graph.id),
+        generation: 1,
+    });
+    let node = ExecutionNodeSpec::new(ExecutionNodeKind::InlineModel, "inline_model", "test Root");
+    let node_id = node.id.clone();
+    graph.nodes.push(node);
+    graph = commits.register_graph(graph).unwrap().graph;
+    for status in [ExecutionNodeStatus::Ready, ExecutionNodeStatus::Running] {
+        graph = commits
+            .transition_node(&graph, &node_id, status, None, vec![])
+            .unwrap()
+            .graph;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn agent_assignment(
     definition_ref: Option<AgentDefinitionRevisionRef>,

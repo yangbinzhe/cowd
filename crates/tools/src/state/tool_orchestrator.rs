@@ -210,7 +210,7 @@ fn resolve_effect_properties(
             mutates_packages: false,
             mutates_system: false,
         },
-        "runtime.agent_action" => {
+        "runtime.agent_action" | "runtime.private_note" => {
             if tool_id == harness_contract::agent_action::STATE_INSPECT_TOOL_ID {
                 EffectProperties {
                     effect_kind: ToolEffectKind::Read,
@@ -675,6 +675,25 @@ fn contains_sequence(command: &str, sequences: &[&str]) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn private_note_is_an_idempotent_runtime_write_without_workspace_authority() {
+        let resolver = ToolEffectResolverSpec {
+            resolver_id: "runtime.private_note".into(),
+            resolver_version: 1,
+        };
+        let effect = resolve_registered_tool_effect(
+            &resolver,
+            "private_note",
+            &json!({"kind":"hypothesis","title":"note","content":"maybe"}),
+            ToolPermissionMode::ReadOnly,
+        );
+        assert_eq!(effect.effect_kind, ToolEffectKind::Write);
+        assert_eq!(effect.idempotency, ToolIdempotency::IdempotentWithKey);
+        assert_eq!(effect.required_permission, ToolPermissionMode::ReadOnly);
+        assert_eq!(effect.approval_class, ToolApprovalClass::None);
+        assert!(!effect.uses_network && !effect.spawns_process && !effect.mutates_system);
+    }
 
     #[test]
     fn bash_effect_escalates_with_effective_command() {

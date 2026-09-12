@@ -69,6 +69,11 @@ pub(super) async fn agentic_claim_heartbeat_state(
     let Some(task) = projection.tasks.get(task_ref) else {
         return AgenticClaimDriverState::Stop;
     };
+    if actor.agent_id.as_deref().is_some_and(|agent| {
+        projection.declined_task_opportunity(task_ref, agent, None, Some(execution_id))
+    }) {
+        return AgenticClaimDriverState::Stop;
+    }
     if matches!(
         task.status,
         AgenticTaskStatus::Published | AgenticTaskStatus::Rework

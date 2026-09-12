@@ -910,7 +910,7 @@ pub mod test_support {
     /// Owns the Tokio runtime that drives the production Session workers used
     /// by the synchronous black-box harness API.
     ///
-    /// Integration tests call `GatewayTestHarness::in_memory()` from inside a
+    /// Integration tests call `GatewayTestHarness::postgres()` from inside a
     /// Tokio test, so attempting to synchronously block that test runtime would
     /// panic. A dedicated thread preserves the existing synchronous fixture
     /// API while still exercising the production supervisor and shutdown path.
@@ -924,6 +924,7 @@ pub mod test_support {
             runtime: Arc<RuntimeService>,
             session: Arc<SessionService>,
             event_bus: Arc<SessionProjectionHub>,
+            selected_storage: Arc<crate::selected_storage::SelectedStorageTopology>,
         ) -> Result<
             (
                 Self,
@@ -936,6 +937,10 @@ pub mod test_support {
             let thread = std::thread::Builder::new()
                 .name("cowd-gateway-test-session-workers".to_string())
                 .spawn(move || {
+                    // Keep the fixture namespace alive through every startup
+                    // error and the real supervisor shutdown, even if the
+                    // router's AppState is dropped first.
+                    let _storage = selected_storage;
                     let tokio_runtime = match tokio::runtime::Builder::new_multi_thread()
                         .worker_threads(2)
                         .enable_all()
@@ -1033,23 +1038,23 @@ pub mod test_support {
     }
 
     impl GatewayTestHarness {
-        pub fn in_memory() -> Result<Self, String> {
-            Self::in_memory_with_optional_auth_token(None)
+        pub fn postgres() -> Result<Self, String> {
+            Self::postgres_with_optional_auth_token(None)
         }
 
-        /// Construct the same in-memory production router with bearer
+        /// Construct the same isolated PostgreSQL production router with bearer
         /// authentication enabled. This is intentionally test-support only so
         /// black-box tests can prove missing and invalid credentials are
         /// rejected without exposing a production authentication bypass.
-        pub fn in_memory_with_auth_token(token: impl Into<String>) -> Result<Self, String> {
+        pub fn postgres_with_auth_token(token: impl Into<String>) -> Result<Self, String> {
             let token = token.into();
             if token.trim().is_empty() {
                 return Err("test auth token must not be empty".to_string());
             }
-            Self::in_memory_with_optional_auth_token(Some(token))
+            Self::postgres_with_optional_auth_token(Some(token))
         }
 
-        fn in_memory_with_optional_auth_token(auth_token: Option<String>) -> Result<Self, String> {
+        fn postgres_with_optional_auth_token(auth_token: Option<String>) -> Result<Self, String> {
             let root = unique_test_root("gateway-api-harness");
             let config_home = root.join("config");
             let workspace_root = root.join("workspace");
@@ -1057,8 +1062,7 @@ pub mod test_support {
             std::fs::create_dir_all(&workspace_root).map_err(|error| error.to_string())?;
 
             let selected_storage = Arc::new(
-                crate::selected_storage::SelectedStorageTopology::compose_for_runtime(
-                    &runtime::StorageTopologyConfig::default(),
+                crate::selected_storage::SelectedStorageTopology::compose_for_test(
                     &config_home,
                     &workspace_root,
                 )?,
@@ -1150,6 +1154,7 @@ pub mod test_support {
                 Arc::clone(&runtime),
                 Arc::clone(&session_service),
                 Arc::clone(&event_bus),
+                Arc::clone(&selected_storage),
             )?;
             let growth_projection_services = crate::services::GrowthProjectionServices::selected(
                 None,

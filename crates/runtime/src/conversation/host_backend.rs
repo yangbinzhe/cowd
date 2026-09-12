@@ -116,6 +116,7 @@ where
         &self,
         ticket: &NodeExecutionTicket,
     ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+        let result = async {
         if self.state.lock().await.terminal_override.is_some() {
             return Ok(precommitted_terminal_outcome(ticket));
         }
@@ -129,7 +130,6 @@ where
             if let Some(program) =
                 root_agentic_program_projection(self.services.as_ref(), &session_id, &turn_id)
             {
-                let terminal_action = root_agentic_terminal_action(&program);
                 let checkpoint = if self.state.lock().await.agentic_program_context_revision
                     != Some(program.revision)
                 {
@@ -156,40 +156,6 @@ where
                         checkpoint,
                     );
                     state.agentic_program_context_revision = Some(program.revision);
-                }
-                // Only a mechanically unique Program closure is narrowed.
-                // The model retains the semantic decision surface for every
-                // ordinary planning/execution state, including the Team,
-                // author and contents of a required integration Task.
-                // Running-turn input disposition retains priority and may
-                // replace the topology before another closure is attempted.
-                if state.pending_disposition_inputs.is_empty() {
-                    if let Some(action) = terminal_action {
-                        state.force_text_only_next_model = false;
-                        state.clean_terminal_synthesis_next = false;
-                        state.force_tool_allowlist_next_model = Some(action.tool_ids());
-                        let evidence = match &action {
-                            RootAgenticTerminalAction::PublishIntegration {
-                                prerequisite_task_refs,
-                            } => prerequisite_task_refs.clone(),
-                            RootAgenticTerminalAction::RequestObjectiveCompletion {
-                                result_artifact_refs,
-                            } => result_artifact_refs.clone(),
-                        };
-                        let mut item = ContextItem::new(
-                            format!(
-                                "agentic-root-terminal-action:{}:{}",
-                                program.program_id, program.revision
-                            ),
-                            ContextSourceKind::Task,
-                            ContextRole::Instruction,
-                            action.continuation_instruction(),
-                        );
-                        item.authority = ContextAuthority::System;
-                        item.visibility = ContextVisibility::Private;
-                        item.evidence = evidence;
-                        state.pending_next_model_context.push(item);
-                    }
                 }
             }
         }
@@ -448,7 +414,73 @@ where
                 u64::try_from(state.iterations.saturating_add(1)).unwrap_or(u64::MAX),
             )
         };
+        let topic_delivery = if !clean_terminal_synthesis && delegated_protocol_at_step.is_some() {
+            if let Some(packet) = delegated_agent_task_packet(self.services.as_ref(), ticket) {
+                let services = Arc::clone(&self.services);
+                tokio::task::spawn_blocking(move || {
+                    crate::agentic::topic_delivery::prepare(
+                        &services.agent_action_service(),
+                        &packet,
+                    )
+                })
+                .await
+                .map_err(|error| NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason: format!("prepare Topic delta: {error}"),
+                })?
+                .map_err(|error| NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason: format!("read Topic delta: {error}"),
+                })?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let working_item = if clean_terminal_synthesis {
+            None
+        } else {
+            let context = self.runtime.lock().await.memory_turn_context();
+            self.services
+                .working_context_item(&context)
+                .await
+                .map_err(|reason| NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason: format!("prepare working context: {reason}"),
+                })?
+        };
         let mut runtime = self.runtime.lock().await;
+        let mut replayed_agent_inputs = Vec::new();
+        if let Some(packet) = delegated_input_task_packet(self.services.as_ref(), ticket) {
+            let stream = runtime.session_input_stream();
+            for input in self.services.agent_runtime().pending_agent_inputs(packet.agent_id(), packet.run_id())
+                .map_err(|reason| NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason })? {
+                let content = crate::AgentRuntime::input_text(input.input.as_ref().ok_or_else(|| NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason: "durable Agent input has no content".into() })?);
+                let envelope = harness_contract::turn::SessionInputEnvelope::text(packet.session_id(), harness_contract::turn::InputSourceKind::Agent, content)
+                    .with_source_ref(format!("agent-input:{}", packet.run_id()))
+                    .with_source_message_id(input.command_id);
+                let receipt = stream.admit(envelope, stream.runtime_state());
+                if let Some(record) = stream.record_snapshot(&receipt.input_id).filter(|record| record.consumed_at.is_some()) {
+                    // Checkpoint extraction is not durable consumption. A
+                    // failed Provider request (or graph commit) may have
+                    // drained the transient prompt, while its journal intent
+                    // remains pending. Re-project it until an actual successful
+                    // ModelStep commits; do not repeat Turn disposition.
+                    for item in crate::turn_inbox::checkpoint_context_items(TurnInputCheckpoint::BeforeProviderRequest, std::slice::from_ref(&record)) {
+                        runtime.push_next_model_context_item(item);
+                    }
+                    replayed_agent_inputs.push(record);
+                }
+            }
+        }
+        if let Some(item) = working_item {
+            runtime.push_next_model_context_item(item);
+        }
+        if let Some(delivery) = topic_delivery.as_ref() {
+            runtime.push_next_model_context_item(delivery.item.clone());
+        }
+
         let required_control_plane = {
             let state = self.state.lock().await;
             if state.execution_role.is_delegated_leaf()
@@ -616,11 +648,45 @@ where
             .await
             .truncate_messages(transcript_len);
         let consumed_inputs = runtime.take_consumed_session_inputs();
+        if let Some(packet) = result.as_ref().ok().and_then(|_| delegated_input_task_packet(self.services.as_ref(), ticket)) {
+            let (before, after): (Vec<_>, Vec<_>) = consumed_inputs.iter().cloned().partition(|record|
+                matches!(record.checkpoint, Some(TurnInputCheckpoint::BeforeProviderRequest | TurnInputCheckpoint::TurnStart | TurnInputCheckpoint::IngressDispatched)));
+            let mut before = before;
+            before.extend(replayed_agent_inputs);
+            let events = self.services.agent_runtime().agent_input_consumption_events(&packet, &before)
+                .map_err(|reason| NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason })?;
+            let deferred = self.services.agent_runtime().agent_input_consumption_events(&packet, &after)
+                .map_err(|reason| NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason })?;
+            let mut state = self.state.lock().await;
+            let previous = state.deferred_agent_input_consumption.clone();
+            let pending = state.pending_agent_input_consumption.entry(ticket.node_id.clone()).or_default();
+            pending.extend(previous);
+            pending.extend(events);
+            state.deferred_agent_input_consumption.extend(deferred);
+        }
+        let topic_selected = topic_delivery
+            .as_ref()
+            .is_some_and(|delivery| delivery.selected_in(runtime.last_context_envelope().as_ref()));
         let cache_dimensions_known = runtime.turn_cache_dimensions_known();
         let cowd_bus = runtime.cowd_bus().cloned();
         drop(runtime);
         match result {
             Ok(step) => {
+                if topic_selected {
+                    if let Some(delivery) = topic_delivery {
+                        let services = Arc::clone(&self.services);
+                        let ack = tokio::task::spawn_blocking(move || {
+                            services
+                                .agent_action_service()
+                                .acknowledge_topic_observations(delivery.ack)
+                        })
+                        .await;
+                        if !matches!(ack, Ok(Ok(()))) {
+                            tracing::warn!(?ack, "selected Topic delta acknowledgement deferred; unread entries remain replayable");
+                        }
+                    }
+                }
+
                 let committed_graph = self
                     .services
                     .graph_state_store()
@@ -2461,12 +2527,44 @@ where
                 Ok(outcome)
             }
         }
+        }.await;
+        let mut outcome = result?;
+        if outcome.result.status == ExecutionNodeStatus::Completed {
+            if let Some(events) = self
+                .state
+                .lock()
+                .await
+                .pending_agent_input_consumption
+                .get(&ticket.node_id)
+            {
+                let mut seen = BTreeSet::new();
+                outcome.domain_events.extend(
+                    events
+                        .iter()
+                        .filter(|event| seen.insert(event.idempotency_key.clone()))
+                        .cloned(),
+                );
+            }
+        }
+        Ok(outcome)
     }
 
     async fn after_commit(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
         tracing::debug!(node_id = %ticket.node_id, "publishing committed model transcript");
         let (messages, required_control_plane_team_count, session_id, turn_id) = {
             let mut state = self.state.lock().await;
+            if let Some(consumed) = state
+                .pending_agent_input_consumption
+                .remove(&ticket.node_id)
+            {
+                let keys = consumed
+                    .iter()
+                    .map(|event| event.idempotency_key.clone())
+                    .collect::<BTreeSet<_>>();
+                state
+                    .deferred_agent_input_consumption
+                    .retain(|event| !keys.contains(&event.idempotency_key));
+            }
             (
                 state
                     .pending_transcript
@@ -2816,6 +2914,26 @@ fn agentic_content_draft_scope(
 /// graph. Dynamic model-step graphs point at the Agent node in their parent
 /// graph, so inspecting only the current graph loses both Session visibility
 /// and the stable Agent attempt identity.
+fn delegated_input_task_packet(
+    services: &crate::RuntimeServices,
+    ticket: &NodeExecutionTicket,
+) -> Option<harness_contract::agent::AgentTaskPacket> {
+    let graph = services.graph_state_store().load(&ticket.graph_id).ok()?;
+    let parent = graph.parent_execution.as_ref()?;
+    let parent_graph = services
+        .graph_state_store()
+        .load(&parent.execution_id)
+        .ok()?;
+    let node = parent_graph
+        .nodes
+        .iter()
+        .find(|node| node.id == parent.node_id && node.kind == ExecutionNodeKind::AgentTask)?;
+    let packet: harness_contract::agent::AgentTaskPacket =
+        serde_json::from_str(&node.payload_ref).ok()?;
+    (packet.graph_id() == parent.execution_id && packet.node_id() == parent.node_id)
+        .then_some(packet)
+}
+
 fn delegated_agent_task_packet(
     services: &crate::RuntimeServices,
     ticket: &NodeExecutionTicket,
@@ -3384,6 +3502,7 @@ where
                 governed_compilation,
                 &execution_decision,
                 self.services.tool_execution_plane(),
+                self.services.tool_batch_executor(),
                 self.services.commit_service(),
                 &precompleted,
             )

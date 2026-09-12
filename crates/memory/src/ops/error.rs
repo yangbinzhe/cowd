@@ -5,6 +5,11 @@ use thiserror::Error;
 /// The master error type for all memory-system operations.
 #[derive(Debug, Error)]
 pub enum MemoryError {
+    #[error(
+        "embedding credentials rejected; waiting for an updated route credential configuration"
+    )]
+    EmbeddingCredentialsRequired,
+
     #[error("storage error: {0}")]
     Store(String),
 

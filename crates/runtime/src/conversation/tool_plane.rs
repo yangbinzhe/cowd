@@ -7,6 +7,17 @@ where
     C: ApiClient,
     T: ToolExecutor,
 {
+    fn root_effect_context(&self) -> Option<crate::CowdExecutionContext> {
+        let bus = self.cowd_bus.as_ref()?;
+        if bus
+            .current_activity_binding()
+            .is_some_and(|binding| binding.agent_run_id.is_some())
+        {
+            return None;
+        }
+        bus.current_execution_context()
+    }
+
     /// Execute one graph-owned tool wave. All tool side effects in a normal
     /// conversation turn enter through this method.
     pub(crate) async fn execute_tool_batch_step(
@@ -646,6 +657,8 @@ where
                 let plane = Arc::clone(&self.tool_execution_plane);
                 let executor_owns_durable_effect =
                     self.tool_executor.owns_durable_tool_effect(tool_name);
+                let executor_owns_admission =
+                    self.tool_executor.owns_tool_resource_admission(tool_name);
                 let effect_request = crate::RuntimeToolExecutionRequest {
                     governed_plan_id: plan_id.to_string(),
                     governed_plan_revision: plan_revision,
@@ -692,15 +705,18 @@ where
                     })
                     .flatten();
                 let effect_state = match (executor_owns_durable_effect, effect_commit.as_ref()) {
-                    (true, _) => crate::execution_core::graph::ToolEffectState::NotRequired,
-                    (false, Some(commit)) => commit
-                        .begin_tool_effect(&effect_request, &task.effect)
-                        .map_err(|error| RuntimeError::new(error.to_string()))?,
+                    (true, _) => Ok(crate::execution_core::graph::ToolEffectState::NotRequired),
+                    (false, Some(commit)) => match self.root_effect_context() {
+                        Some(root) => {
+                            commit.begin_root_tool_effect(&effect_request, &task.effect, &root)
+                        }
+                        None => commit.begin_tool_effect(&effect_request, &task.effect),
+                    },
                     (false, None)
                         if task.effect.effect_kind
                             == harness_contract::tool::ToolEffectKind::Read =>
                     {
-                        crate::execution_core::graph::ToolEffectState::NotRequired
+                        Ok(crate::execution_core::graph::ToolEffectState::NotRequired)
                     }
                     (false, None) => {
                         return Err(RuntimeError::new(
@@ -709,12 +725,13 @@ where
                     }
                 };
                 let execute_fresh = matches!(
-                    effect_state,
-                    crate::execution_core::graph::ToolEffectState::Fresh
-                        | crate::execution_core::graph::ToolEffectState::NotRequired
+                    &effect_state,
+                    Ok(crate::execution_core::graph::ToolEffectState::Fresh
+                        | crate::execution_core::graph::ToolEffectState::NotRequired)
                 );
                 let execution = match effect_state {
-                    crate::execution_core::graph::ToolEffectState::Completed(outcome) => {
+                    Err(error) => Ok(Err(ToolError::new(error.to_string()))),
+                    Ok(crate::execution_core::graph::ToolEffectState::Completed(outcome)) => {
                         if outcome.status == crate::RuntimeToolExecutionStatus::Executed {
                             Ok(Ok(
                                 harness_contract::context::ToolOutputDraft::bounded_inline(
@@ -730,60 +747,68 @@ where
                             )))
                         }
                     }
-                    crate::execution_core::graph::ToolEffectState::Uncertain => {
+                    Ok(crate::execution_core::graph::ToolEffectState::Uncertain) => {
                         return Err(RuntimeError::new(format!(
                             "tool effect `{}` is uncertain; non-idempotent execution was not replayed",
                             effect_request.idempotency_key
                         )));
                     }
-                    crate::execution_core::graph::ToolEffectState::Fresh
-                    | crate::execution_core::graph::ToolEffectState::NotRequired => {
-                        let (execution, admission) = plane
-                            .execute_async_classified_retained(
-                                &demand,
-                                Some(tool_timeout),
-                                self.execution_service_class,
-                                Some(self.execution_service_class),
-                                Some(self.session_id()),
-                                async move {
-                                    if is_evidence_retrieve {
-                                        if let Ok(output) = retrieve_tool_evidence_from_sandbox(
-                                            evidence_sandbox.as_ref(),
-                                            &tinput,
-                                        ) {
-                                            return Ok(harness_contract::context::ToolOutputDraft::bounded_inline(output));
-                                        }
-                                        // Small outputs are intentionally not duplicated in the
-                                        // in-memory search index, while every completed invocation
-                                        // still exposes its durable `tool://` ArtifactStore ref.
-                                        // Let the authorized Runtime ToolHost resolve that source of
-                                        // truth instead of turning an index miss into a false tool
-                                        // failure. Scope and Session checks remain in that host.
-                                    }
-                                    if matches!(
-                                        tname.as_str(),
-                                        "tool_search" | "runtime_capabilities"
-                                    ) {
-                                        tool_exec
-                                            .execute_invocation_output(
-                                                &provider_invocation_id,
-                                                &tname,
-                                                &tinput,
-                                            )
-                                            .await
-                                    } else {
-                                        tool_exec
-                                            .execute_authorized_invocation_output(
-                                                &provider_invocation_id,
-                                                &authorization.authorization,
-                                                &tname,
-                                                &tinput,
-                                            )
-                                            .await
-                                    }
-                                },
-                            )
-                            .await;
+                    Ok(
+                        crate::execution_core::graph::ToolEffectState::Fresh
+                        | crate::execution_core::graph::ToolEffectState::NotRequired,
+                    ) => {
+                        let operation = async move {
+                            if is_evidence_retrieve {
+                                if let Ok(output) = retrieve_tool_evidence_from_sandbox(
+                                    evidence_sandbox.as_ref(),
+                                    &tinput,
+                                ) {
+                                    return Ok(
+                                        harness_contract::context::ToolOutputDraft::bounded_inline(
+                                            output,
+                                        ),
+                                    );
+                                }
+                                // Small outputs are intentionally not duplicated in the
+                                // in-memory search index, while every completed invocation
+                                // still exposes its durable `tool://` ArtifactStore ref.
+                                // Let the authorized Runtime ToolHost resolve that source of
+                                // truth instead of turning an index miss into a false tool
+                                // failure. Scope and Session checks remain in that host.
+                            }
+                            if matches!(tname.as_str(), "tool_search" | "runtime_capabilities") {
+                                tool_exec
+                                    .execute_invocation_output(
+                                        &provider_invocation_id,
+                                        &tname,
+                                        &tinput,
+                                    )
+                                    .await
+                            } else {
+                                tool_exec
+                                    .execute_authorized_invocation_output(
+                                        &provider_invocation_id,
+                                        &authorization.authorization,
+                                        &tname,
+                                        &tinput,
+                                    )
+                                    .await
+                            }
+                        };
+                        let (execution, admission) = if executor_owns_admission {
+                            (Ok(operation.await), None)
+                        } else {
+                            plane
+                                .execute_async_classified_retained(
+                                    &demand,
+                                    Some(tool_timeout),
+                                    self.execution_service_class,
+                                    Some(self.execution_service_class),
+                                    Some(self.session_id()),
+                                    operation,
+                                )
+                                .await
+                        };
                         *retained_admission = admission;
                         execution
                     }

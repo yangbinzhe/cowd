@@ -5,6 +5,9 @@ use runtime::RuntimeServices;
 use storage::StaticSecretRefResolver;
 
 use super::*;
+#[path = "../../storage/test-support/postgres_scope.rs"]
+mod postgres_scope;
+use postgres_scope::PostgresTestScope;
 
 #[test]
 fn runtime_event_initial_migration_remains_immutable() {
@@ -34,20 +37,12 @@ fn input(stream_id: &str, scope: RuntimeEventScope, kind: &str) -> RuntimeEventI
     }
 }
 
-fn open_real_store() -> (RuntimeEventStore, String) {
-    let url = std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
-    let resolver = StaticSecretRefResolver::new([("test.pg".to_string(), url.clone())]);
-    let store = PostgresRuntimeEventStore::connect(
-        PostgresConnectionConfig::new(
-            "runtime-event-test",
-            "test.pg",
-            "cowd-runtime-event-postgres-contract",
-        ),
-        &resolver,
-    )
-    .expect("postgres runtime event store opens")
-    .into_runtime_event_store();
-    (store, url)
+fn open_real_store() -> (RuntimeEventStore, PostgresTestScope) {
+    let scope = PostgresTestScope::new();
+    let store = PostgresRuntimeEventStore::new(scope.reconnect())
+        .expect("owned Runtime event namespace")
+        .into_runtime_event_store();
+    (store, scope)
 }
 
 fn policy_bound_task_spec(session_id: &str, objective: &str) -> TaskSpec {
@@ -85,7 +80,8 @@ fn projection_work_class_maps_background_without_downgrading_recovery() {
         &resolver,
     )
     .expect("isolated pool set");
-    let executor = pool_set.executor();
+    let fixture = PostgresTestScope::new();
+    let executor = fixture.bind(&pool_set.executor());
     let store = PostgresRuntimeEventStore::new(executor.clone())
         .expect("runtime store")
         .into_runtime_event_store();
@@ -192,8 +188,100 @@ fn projection_work_class_maps_background_without_downgrading_recovery() {
 
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn postgres_sequence_pages_freeze_the_head_during_independent_concurrent_appends() {
+    let (store, fixture) = open_real_store();
+    let stream = "program:sequence-page";
+    for index in 0..64 {
+        let mut event = input(stream, RuntimeEventScope::Program, "page.seed");
+        event.payload = serde_json::json!({"seed":index});
+        store.append(event).unwrap();
+    }
+    let frozen_head = store.stream_revision(stream).unwrap();
+    assert_eq!(frozen_head, 64);
+    let barrier = Arc::new(Barrier::new(3));
+    let writers = (0..2)
+        .map(|writer| {
+            let adapter = PostgresRuntimeEventStore::new(fixture.reconnect())
+                .unwrap()
+                .into_runtime_event_store();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                (0..32)
+                    .map(|index| {
+                        let mut event =
+                            input(stream, RuntimeEventScope::Program, "page.concurrent");
+                        event.payload = serde_json::json!({"writer":writer,"index":index});
+                        adapter.append(event).unwrap()
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect::<Vec<_>>();
+    let read_range = |store: &RuntimeEventStore, from: u64, through: u64| {
+        let mut cursor = from;
+        let mut events = vec![];
+        while cursor < through {
+            let page = store
+                .list_stream_after(stream, cursor, through, 7, 8 * 1024)
+                .unwrap();
+            assert!(!page.is_empty(), "a stable committed interval has no gaps");
+            assert!(page.len() <= 7);
+            for event in page {
+                assert_eq!(event.sequence, cursor + 1);
+                assert!(event.sequence <= through);
+                cursor = event.sequence;
+                events.push(event);
+            }
+        }
+        events
+    };
+    barrier.wait();
+    let first = read_range(&store, 0, frozen_head);
+    let written = writers
+        .into_iter()
+        .flat_map(|writer| writer.join().unwrap())
+        .collect::<Vec<_>>();
+    let new_head = store.stream_revision(stream).unwrap();
+    assert_eq!(new_head, 128);
+    assert!(first.iter().all(|event| event.kind == "page.seed"));
+    let tail = read_range(&store, frozen_head, new_head);
+    let written_ids = written
+        .iter()
+        .map(|event| event.event_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let read_ids = tail
+        .iter()
+        .map(|event| event.event_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(read_ids, written_ids);
+    assert_eq!(read_ids.len(), 64);
+    let reopened = PostgresRuntimeEventStore::new(fixture.reconnect())
+        .unwrap()
+        .into_runtime_event_store();
+    let replay = read_range(&reopened, 0, new_head);
+    let expected = first
+        .iter()
+        .chain(tail.iter())
+        .map(|event| (&event.event_id, &event.payload))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        replay
+            .iter()
+            .map(|event| (&event.event_id, &event.payload))
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert!(reopened
+        .list_stream_after(stream, new_head, new_head, 7, 8 * 1024)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 fn postgres_runtime_event_store_preserves_fences_outbox_restart_and_runtime_composition() {
-    let (store, url) = open_real_store();
+    let (store, fixture) = open_real_store();
     store
         .append_transaction(AppendTransactionRequest {
             transaction_id: "postgres-source-transaction".to_string(),
@@ -388,18 +476,10 @@ fn postgres_runtime_event_store_preserves_fences_outbox_restart_and_runtime_comp
     assert_eq!(claim.attempts, 1);
     assert_eq!(claim.claim_expires_at_ms, Some(1_100));
     drop(store);
-    let crash_resolver = StaticSecretRefResolver::new([("test.pg".to_string(), url.clone())]);
     let store = Arc::new(
-        PostgresRuntimeEventStore::connect(
-            PostgresConnectionConfig::new(
-                "runtime-event-crash-recovery-test",
-                "test.pg",
-                "cowd-runtime-event-postgres-crash-recovery-contract",
-            ),
-            &crash_resolver,
-        )
-        .expect("postgres event store reopens after delivery crash")
-        .into_runtime_event_store(),
+        PostgresRuntimeEventStore::new(fixture.reconnect())
+            .expect("postgres event store reopens after delivery crash")
+            .into_runtime_event_store(),
     );
     assert!(matches!(
         store.adopt_session_terminal_fence(&RuntimeSessionTerminalFenceAdoption {
@@ -515,18 +595,10 @@ fn postgres_runtime_event_store_preserves_fences_outbox_restart_and_runtime_comp
     );
 
     drop(store);
-    let resolver = StaticSecretRefResolver::new([("test.pg".to_string(), url)]);
     let reopened = Arc::new(
-        PostgresRuntimeEventStore::connect(
-            PostgresConnectionConfig::new(
-                "runtime-event-reopen-test",
-                "test.pg",
-                "cowd-runtime-event-postgres-reopen-contract",
-            ),
-            &resolver,
-        )
-        .expect("postgres event store reopens")
-        .into_runtime_event_store(),
+        PostgresRuntimeEventStore::new(fixture.reconnect())
+            .expect("postgres event store reopens")
+            .into_runtime_event_store(),
     );
     assert_eq!(reopened.stream_revision("graph:concurrent").unwrap(), 2);
     let terminal = reopened
@@ -542,6 +614,22 @@ fn postgres_runtime_event_store_preserves_fences_outbox_restart_and_runtime_comp
     std::fs::create_dir_all(&workspace).expect("workspace exists");
     let services = RuntimeServices::builder(temp.path().join("home"), &workspace)
         .runtime_event_store(reopened)
+        .artifact_store(Arc::new(
+            runtime::ArtifactStore::new(
+                temp.path().join("artifact-blobs"),
+                Arc::new(
+                    PostgresArtifactRepository::new(fixture.reconnect())
+                        .expect("PG artifact backend"),
+                ),
+                runtime::ArtifactStoreConfig::default(),
+            )
+            .expect("PG artifact store"),
+        ))
+        .task_aggregate_service(Arc::new(
+            PostgresTaskStore::new(fixture.reconnect())
+                .expect("PG task backend")
+                .into_task_service(),
+        ))
         .build()
         .expect("RuntimeServices composes PostgreSQL event backend");
     services.publish_session_execution_policy(
@@ -596,17 +684,8 @@ fn postgres_runtime_event_store_preserves_fences_outbox_restart_and_runtime_comp
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 fn postgres_task_store_preserves_restart_and_per_task_concurrency() {
-    let url = std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
-    let resolver = StaticSecretRefResolver::new([("task.pg".to_string(), url.clone())]);
-    let pg_store = PostgresTaskStore::connect(
-        PostgresConnectionConfig::new(
-            "runtime-task-test",
-            "task.pg",
-            "cowd-runtime-task-postgres-contract",
-        ),
-        &resolver,
-    )
-    .expect("postgres task store opens");
+    let fixture = PostgresTestScope::new();
+    let pg_store = PostgresTaskStore::new(fixture.reconnect()).expect("postgres task store opens");
     let executor = pg_store.executor().clone();
     let target = Arc::new(pg_store.into_task_service());
     let source_task = target
@@ -768,17 +847,9 @@ fn postgres_task_store_preserves_restart_and_per_task_concurrency() {
         .save_organization_decision(&foreign_root, None)
         .is_err());
 
-    let reopened_resolver = StaticSecretRefResolver::new([("task.pg".to_string(), url)]);
-    let reopened = PostgresTaskStore::connect(
-        PostgresConnectionConfig::new(
-            "runtime-task-reopen-test",
-            "task.pg",
-            "cowd-runtime-task-postgres-reopen-contract",
-        ),
-        &reopened_resolver,
-    )
-    .expect("postgres task store reopens")
-    .into_task_service();
+    let reopened = PostgresTaskStore::new(fixture.reconnect())
+        .expect("postgres task store reopens")
+        .into_task_service();
     let restored = reopened
         .list()
         .expect("reopened task list")
@@ -795,18 +866,9 @@ fn postgres_task_store_preserves_restart_and_per_task_concurrency() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 async fn postgres_artifact_repository_preserves_selector_and_scope_contract() {
-    let url = std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
+    let fixture = PostgresTestScope::new();
     let suffix = uuid::Uuid::new_v4().simple().to_string();
-    let resolver = StaticSecretRefResolver::new([("artifact.pg".to_string(), url)]);
-    let executor = PostgresExecutor::connect(
-        PostgresConnectionConfig::new(
-            format!("runtime-artifact-{suffix}"),
-            "artifact.pg",
-            format!("cowd-artifact-test-{suffix}"),
-        ),
-        &resolver,
-    )
-    .expect("PostgreSQL artifact executor opens");
+    let executor = fixture.reconnect();
     let repository = Arc::new(
         PostgresArtifactRepository::new(executor).expect("PostgreSQL artifact migrations apply"),
     );
@@ -906,23 +968,8 @@ async fn postgres_artifact_repository_preserves_selector_and_scope_contract() {
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 async fn postgres_artifact_catalog_excludes_inflight_and_later_receipts() {
     use sha2::Digest;
-    let url = std::env::var("COWD_TEST_POSTGRES_URL").unwrap();
-    let resolver = StaticSecretRefResolver::new([("catalog.pg".to_string(), url)]);
-    let base = PostgresExecutor::connect(
-        PostgresConnectionConfig::new(
-            "artifact-catalog-test",
-            "catalog.pg",
-            "artifact-catalog-test",
-        ),
-        &resolver,
-    )
-    .unwrap();
-    let schema = format!("artifact_catalog_{}", uuid::Uuid::new_v4().simple());
-    base.checkout_critical()
-        .unwrap()
-        .batch_execute(&format!("CREATE SCHEMA \"{schema}\""))
-        .unwrap();
-    let scoped = base.scoped_namespace(&schema).unwrap();
+    let fixture = PostgresTestScope::new();
+    let scoped = fixture.reconnect();
     let repository = Arc::new(PostgresArtifactRepository::new(scoped.clone()).unwrap());
     let root = tempfile::tempdir().unwrap();
     let store = runtime::ArtifactStore::new(
@@ -1011,8 +1058,4 @@ async fn postgres_artifact_catalog_excludes_inflight_and_later_receipts() {
     drop(store);
     drop(repository);
     drop(scoped);
-    base.checkout_critical()
-        .unwrap()
-        .batch_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
-        .unwrap();
 }

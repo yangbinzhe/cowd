@@ -664,9 +664,18 @@ impl PostgresSessionStore {
         } else {
             "DESC"
         };
-        let query = options.query.filter(|value| !value.trim().is_empty());
-        let status = options.status.filter(|value| !value.trim().is_empty());
-        let model = options.model.filter(|value| !value.trim().is_empty());
+        let query = options
+            .query
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let status = options
+            .status
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let model = options
+            .model
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
         let owner_principal_id = options
             .owner_principal_id
             .filter(|value| !value.trim().is_empty());
@@ -678,18 +687,24 @@ impl PostgresSessionStore {
         let offset = i64::try_from(options.offset).map_err(|_| {
             session::SessionError::Store("session page offset overflow".to_string())
         })?;
-        let where_clause = "WHERE ($1::text IS NULL OR to_tsvector('simple',
-                coalesce(platform, '') || ' ' || coalesce(chat_id, '') || ' ' ||
-                coalesce(user_id, '') || ' ' || coalesce(metadata_json, ''))
-                @@ websearch_to_tsquery('simple', $1)
-                OR platform ILIKE '%' || $1 || '%' OR chat_id ILIKE '%' || $1 || '%')
-             AND ($2::text IS NULL OR status = $2)
-             AND ($3::text IS NULL OR model = $3)
+        // Listing is a literal substring filter, not the separately exposed
+        // full-text search language. strpos preserves %, _ and backslashes
+        // without SQL wildcard or tsquery reinterpretation.
+        let where_clause = "WHERE ($1::text IS NULL
+                OR strpos(lower(session_id), lower($1)) > 0
+                OR strpos(lower(platform), lower($1)) > 0
+                OR strpos(lower(chat_id), lower($1)) > 0
+                OR strpos(lower(coalesce(user_id, '')), lower($1)) > 0
+                OR strpos(lower(coalesce(model, '')), lower($1)) > 0
+                OR strpos(lower(status), lower($1)) > 0
+                OR strpos(lower(coalesce(metadata_json, '')), lower($1)) > 0)
+             AND ($2::text IS NULL OR lower(status) = lower($2))
+             AND ($3::text IS NULL OR lower(model) = lower($3))
              AND ($6::boolean
                   OR metadata_json::jsonb ->> 'owner_principal_id' = $4
                   OR session_id = ANY($5::text[]))
              AND ($2::text IS NOT NULL OR $7::boolean
-                  OR status NOT IN ('deleted', 'deleting'))";
+                  OR lower(status) NOT IN ('deleted', 'deleting'))";
         let mut connection = self
             .executor
             .checkout_online_read()

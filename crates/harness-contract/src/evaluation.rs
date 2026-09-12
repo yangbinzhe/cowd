@@ -214,6 +214,9 @@ pub struct EvaluationScenarioSpec {
     pub scenario_ref: String,
     pub objective: String,
     pub acceptance: Vec<String>,
+    /// Executable checks, not an interpretation of model-authored criteria.
+    #[serde(default)]
+    pub acceptance_checks: Vec<EvaluationAcceptanceRequirement>,
     #[serde(default)]
     pub allowed_tools: Vec<String>,
     #[serde(default)]
@@ -230,6 +233,24 @@ pub struct EvaluationScenarioSpec {
     /// again and measured by the normal evaluator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_manifest: Option<FrozenEvaluationReplayManifest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvaluationAcceptanceRequirement {
+    pub criterion: String,
+    pub check: EvaluationAcceptanceCheck,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EvaluationAcceptanceCheck {
+    Output {
+        check: crate::agent::OutputAcceptanceCheck,
+    },
+    IsolatedWorkspaceChange {
+        field: crate::agent::StructuredOutputField,
+    },
+    IsolatedWorkspaceRead,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -269,6 +290,10 @@ pub struct EvaluationScenarioObservation {
 }
 
 impl EvaluationScenarioSpec {
+    pub fn rubric_digest(&self) -> String {
+        stable_digest(&(&self.acceptance, &self.acceptance_checks))
+    }
+
     pub fn validate(&self) -> Result<(), ValidationError> {
         validate_reference("evaluation.scenario.scenario_ref", &self.scenario_ref)?;
         validate_reference("evaluation.scenario.objective", &self.objective)?;
@@ -287,6 +312,26 @@ impl EvaluationScenarioSpec {
                     value: acceptance.clone(),
                 });
             }
+        }
+        let checks = self
+            .acceptance_checks
+            .iter()
+            .map(|check| &check.criterion)
+            .collect::<BTreeSet<_>>();
+        if checks != values || checks.len() != self.acceptance_checks.len() {
+            return Err(ValidationError::InvalidContract { message: "evaluation criteria require exactly one explicit executable acceptance check each".into() });
+        }
+        if self.permission_ceiling == PermissionMode::ReadOnly
+            && self.acceptance_checks.iter().any(|requirement| {
+                matches!(
+                    requirement.check,
+                    EvaluationAcceptanceCheck::IsolatedWorkspaceChange { .. }
+                )
+            })
+        {
+            return Err(ValidationError::InvalidContract {
+                message: "isolated write acceptance requires a writable permission ceiling".into(),
+            });
         }
         for (field, values) in [
             ("evaluation.scenario.allowed_tools", &self.allowed_tools),
@@ -320,7 +365,7 @@ impl EvaluationScenarioSpec {
                 validate_prefixed_digest(&format!("evaluation.scenario.replay.{field}"), digest)?;
             }
             let expected_input = stable_digest(&self.objective);
-            let expected_rubric = stable_digest(&self.acceptance);
+            let expected_rubric = self.rubric_digest();
             if replay.input_digest != expected_input || replay.rubric_digest != expected_rubric {
                 return Err(ValidationError::InvalidContract {
                     message: "frozen evaluation replay does not bind the scenario input and rubric"
@@ -350,6 +395,7 @@ impl EvaluationScenarioSpec {
             &self.scenario_ref,
             &self.objective,
             &self.acceptance,
+            &self.acceptance_checks,
             &self.allowed_tools,
             &self.allowed_skills,
             &self.resource_scopes,
@@ -733,10 +779,19 @@ mod tests {
     fn replay_scenario() -> EvaluationScenarioSpec {
         let objective = "inspect the frozen fixture".to_string();
         let acceptance = vec!["report observed result".to_string()];
+        let acceptance_checks = vec![EvaluationAcceptanceRequirement {
+            criterion: acceptance[0].clone(),
+            check: EvaluationAcceptanceCheck::Output {
+                check: crate::agent::OutputAcceptanceCheck::ScopedEvidence {
+                    scopes: vec!["read:fixtures/input".into()],
+                },
+            },
+        }];
         EvaluationScenarioSpec {
             scenario_ref: "scenario:episode-replay".to_string(),
             objective: objective.clone(),
             acceptance: acceptance.clone(),
+            acceptance_checks: acceptance_checks.clone(),
             allowed_tools: vec!["read_file".to_string()],
             allowed_skills: vec!["skill:analysis".to_string()],
             resource_scopes: vec!["read:fixtures/input".to_string()],
@@ -748,7 +803,7 @@ mod tests {
                 input_digest: stable_digest(&objective),
                 attachment_refs: vec!["artifact:fixture".to_string()],
                 environment_fingerprint: stable_digest(&"environment"),
-                rubric_digest: stable_digest(&acceptance),
+                rubric_digest: stable_digest(&(&acceptance, &acceptance_checks)),
             }),
         }
     }
@@ -763,8 +818,46 @@ mod tests {
         changed.allowed_skills.push("skill:review".to_string());
         assert_ne!(changed.executable_replay_digest(), original);
 
+        let mut changed_check = scenario.clone();
+        changed_check.acceptance_checks[0].check = EvaluationAcceptanceCheck::IsolatedWorkspaceRead;
+        assert_ne!(changed_check.executable_replay_digest(), original);
+        assert!(
+            changed_check.validate().is_err(),
+            "frozen rubric binds executable checks"
+        );
+        changed_check.replay_manifest = None;
+        changed_check.validate().unwrap();
+        let digest = changed_check.executable_replay_digest();
+        changed_check.acceptance_checks.clear();
+        assert_ne!(changed_check.executable_replay_digest(), digest);
+        assert!(
+            changed_check.validate().is_err(),
+            "text alone is not executable acceptance"
+        );
+
         let mut forged = scenario;
         forged.objective.push_str(" with changed input");
         assert!(forged.validate().is_err());
+    }
+
+    #[test]
+    fn acceptance_checks_reject_duplicate_unbound_and_readonly_writes() {
+        let mut scenario = replay_scenario();
+        scenario.replay_manifest = None;
+        scenario
+            .acceptance_checks
+            .push(scenario.acceptance_checks[0].clone());
+        assert!(scenario.validate().is_err());
+        scenario.acceptance_checks.pop();
+        scenario.acceptance_checks[0].criterion = "unbound".into();
+        assert!(scenario.validate().is_err());
+        scenario.acceptance_checks[0].criterion = scenario.acceptance[0].clone();
+        scenario.acceptance_checks[0].check = EvaluationAcceptanceCheck::IsolatedWorkspaceChange {
+            field: crate::agent::StructuredOutputField::Implementation,
+        };
+        scenario.permission_ceiling = PermissionMode::ReadOnly;
+        assert!(scenario.validate().is_err());
+        scenario.permission_ceiling = PermissionMode::WorkspaceWrite;
+        scenario.validate().unwrap();
     }
 }

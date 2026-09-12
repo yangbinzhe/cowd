@@ -11,7 +11,9 @@ use memory::{
     types::AgentVisibility,
     MemoryCategory, MemoryEntry, MemoryLayer, MemorySource, Priority,
 };
-use storage::{PostgresConnectionConfig, StaticSecretRefResolver};
+#[path = "../../storage/test-support/postgres_scope.rs"]
+mod postgres_scope;
+use postgres_scope::PostgresTestScope;
 
 use super::*;
 
@@ -43,18 +45,96 @@ fn memory_entry(id: uuid::Uuid, marker: &str) -> MemoryEntry {
 
 #[tokio::test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
-async fn real_postgres_memory_roundtrip() {
-    let url = std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
-    let marker = uuid::Uuid::new_v4().simple().to_string();
-    let mut config = PostgresConnectionConfig::new(
-        format!("memory-test-{marker}"),
-        "memory-test-url",
-        format!("cowd-memory-test-{marker}"),
+async fn real_postgres_embedding_partial_progress_survives_store_and_client_reopen() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let fixture = PostgresTestScope::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let config = memory::config::VectorConfig {
+        enabled: true,
+        api_url: format!("http://{}/embeddings", listener.local_addr().unwrap()),
+        model: "pg-partial-fixture".into(),
+        dimension: 2,
+        batch_size: 1,
+        ..Default::default()
+    };
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let (offset, length) = loop {
+                let mut buf = [0; 4096];
+                let count = socket.read(&mut buf).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&buf[..count]);
+                if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..end]);
+                    let size = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    break (end + 4, size);
+                }
+            };
+            while bytes.len() < offset + length {
+                let mut buf = [0; 4096];
+                let count = socket.read(&mut buf).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&buf[..count]);
+            }
+            let request: serde_json::Value =
+                serde_json::from_slice(&bytes[offset..offset + length]).unwrap();
+            let call = observed.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(
+                request["input"][0],
+                if call == 0 { "first" } else { "second" },
+                "successful first batch must not be resent after reopening PG"
+            );
+            let (status, body) = if call == 1 {
+                (
+                    "400 Bad Request",
+                    r#"{"error":"invalid input fixture failure"}"#,
+                )
+            } else {
+                ("200 OK", r#"{"data":[{"index":0,"embedding":[1.0,2.0]}]}"#)
+            };
+            socket.write_all(format!("HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+        }
+    });
+    let store: Arc<dyn MemoryStore> =
+        Arc::new(PostgresMemoryStore::new(fixture.reconnect()).unwrap());
+    let first =
+        memory::embedding::EmbeddingClient::new(config.clone()).with_progress_store(store.clone());
+    assert!(first.embed(&["first", "second"]).await.is_err());
+    assert_eq!(store.list_key_values().await.unwrap().len(), 1);
+    drop(first);
+    drop(store);
+    let reopened: Arc<dyn MemoryStore> =
+        Arc::new(PostgresMemoryStore::new(fixture.reconnect()).unwrap());
+    let resumed =
+        memory::embedding::EmbeddingClient::new(config).with_progress_store(reopened.clone());
+    assert_eq!(
+        resumed.embed(&["first", "second"]).await.unwrap(),
+        vec![vec![1.0, 2.0], vec![1.0, 2.0]]
     );
-    config.max_connections = 4;
-    let resolver = StaticSecretRefResolver::new([("memory-test-url".to_string(), url)]);
-    let store =
-        PostgresMemoryStore::connect(config.clone(), &resolver).expect("connect PostgreSQL");
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert!(reopened.list_key_values().await.unwrap().is_empty());
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+async fn real_postgres_memory_roundtrip() {
+    let fixture = PostgresTestScope::new();
+    let marker = uuid::Uuid::new_v4().simple().to_string();
+    let store = PostgresMemoryStore::new(fixture.reconnect()).expect("owned memory namespace");
     let id = uuid::Uuid::new_v4();
     let entry = memory_entry(id, &marker);
     store.insert(&entry).await.unwrap();
@@ -79,8 +159,7 @@ async fn real_postgres_memory_roundtrip() {
         .await
         .unwrap();
 
-    let reopened =
-        PostgresMemoryStore::connect(config, &resolver).expect("reopen PostgreSQL owner");
+    let reopened = PostgresMemoryStore::new(fixture.reconnect()).expect("reopen PostgreSQL owner");
     let loaded = reopened.get(&id).await.unwrap().expect("persisted entry");
     assert_eq!(loaded.id, id);
     let queue =
@@ -144,6 +223,19 @@ async fn real_postgres_memory_roundtrip() {
             .as_deref(),
         Some("present")
     );
+    reopened
+        .kv_delete(&format!("durability:{marker}"))
+        .await
+        .unwrap();
+    reopened
+        .kv_delete(&format!("durability:{marker}"))
+        .await
+        .unwrap();
+    assert!(reopened
+        .kv_get(&format!("durability:{marker}"))
+        .await
+        .unwrap()
+        .is_none());
 
     let knowledge_target = Arc::new(
         PostgresKnowledgeStore::new(reopened.executor().clone())
@@ -194,4 +286,61 @@ async fn real_postgres_memory_roundtrip() {
         reopened.delete(&concurrent_id).await.unwrap();
     }
     assert!(reopened.executor().health().metrics.checkout_count > 8);
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+async fn real_postgres_authority_filters_private_and_team_domains_before_limit() {
+    let fixture = PostgresTestScope::new();
+    let marker = uuid::Uuid::new_v4().simple().to_string();
+    let store = PostgresMemoryStore::new(fixture.reconnect()).unwrap();
+    let mut own = memory_entry(uuid::Uuid::new_v4(), &marker);
+    own.scope = MemoryScope::Project(format!("authority-{marker}"));
+    own.source_agent = Some("owner".into());
+    own.updated_at -= chrono::Duration::hours(1);
+    store.insert(&own).await.unwrap();
+    for i in 0..70 {
+        let mut hidden = own.clone();
+        hidden.id = uuid::Uuid::new_v4();
+        hidden.source_agent = Some(format!("hidden-{i}"));
+        hidden.updated_at = chrono::Utc::now();
+        store.insert(&hidden).await.unwrap();
+    }
+    let mut query = memory::store::AuthorityLookup {
+        fingerprint: memory::same_memory_key(&own),
+        scope: own.scope.clone(),
+        visibility: AgentVisibility::Private,
+        source_agent: own.source_agent.clone(),
+        limit: 1,
+    };
+    let found = store
+        .lookup_authority_candidates(query.clone())
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].id, own.id);
+    query.source_agent = None;
+    assert!(store
+        .lookup_authority_candidates(query.clone())
+        .await
+        .unwrap()
+        .is_empty());
+    for visibility in [
+        AgentVisibility::Shared,
+        AgentVisibility::TeamScoped("team-a".into()),
+        AgentVisibility::TeamScoped("team-b".into()),
+    ] {
+        let mut scoped = own.clone();
+        scoped.id = uuid::Uuid::new_v4();
+        scoped.visibility = visibility.clone();
+        scoped.source_agent = Some("contributor".into());
+        store.insert(&scoped).await.unwrap();
+        query.visibility = visibility;
+        let rows = store
+            .lookup_authority_candidates(query.clone())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, scoped.id);
+    }
 }

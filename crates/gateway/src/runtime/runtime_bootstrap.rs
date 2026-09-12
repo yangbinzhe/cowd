@@ -350,12 +350,12 @@ pub(crate) fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition
         RuntimeToolDefinition {
             name: "evidence_retrieve".to_string(),
             description: Some(
-                "Read immutable tool:// evidence or artifact:// content. Follow next_request for complete sequential reading. encoding=utf8 returns original text; encoding=base64 returns lossless binary chunks to concatenate and decode. A query filters text chunks and is not valid for binary content. Copy returned references exactly, do not reconstruct them from IDs.".to_string(),
+                "Read tool:// evidence, artifact:// content, or a current approval:v1: external decision. A decision records approval scope, not Objective completion. Follow next_request for complete sequential reading. encoding=utf8 returns original text; encoding=base64 returns lossless binary chunks to concatenate and decode. A query filters text chunks and is not valid for binary content. Copy returned references exactly, do not reconstruct them from IDs.".to_string(),
             ),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "evidence_ref": { "type": "string", "description": "tool:// evidence reference or artifact:// content reference" },
+                    "evidence_ref": { "type": "string", "description": "tool:// evidence, artifact:// content, or approval:v1: external decision reference" },
                     "query": { "type": "string", "description": "Optional case-insensitive term filter; omit for full sequential reading" },
                     "cursor": { "type": "string", "description": "Opaque continuation returned in next_request, bound to the source hash and query" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 16 }
@@ -370,16 +370,30 @@ pub(crate) fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition
     definitions.push(RuntimeToolDefinition {
         name: "artifact_publish".into(),
         description: Some("Publish an explicit file snapshot (hash from read_file), stored Session text block (digest from context_retrieve), or authorized artifact. Returns immutable content_ref/sha256/bytes for artifact_commit. No body in JSON; never guess the latest text.".into()),
-        input_schema: serde_json::to_value(schemars::schema_for!(harness_contract::content_publication::ArtifactPublishInput)).expect("publication schema"),
+        input_schema: model_object_input_schema::<harness_contract::content_publication::ArtifactPublishInput>(),
         required_permission: ToolPermissionMode::ReadOnly,
         effect_resolver: runtime_effect_resolver("runtime.readonly"),
     });
     definitions.push(RuntimeToolDefinition {
         name: "artifact_materialize".into(),
         description: Some("Export authorized artifact bytes to a new workspace path without model rewriting. Supply content_ref and sha256 from publication. An existing identical file is accepted; different content is never overwritten.".into()),
-        input_schema: serde_json::to_value(schemars::schema_for!(harness_contract::content_publication::ArtifactMaterializeInput)).expect("materialization schema"),
+        input_schema: model_object_input_schema::<harness_contract::content_publication::ArtifactMaterializeInput>(),
         required_permission: ToolPermissionMode::WorkspaceWrite,
         effect_resolver: runtime_effect_resolver("runtime.state_write"),
+    });
+    definitions.push(RuntimeToolDefinition {
+        name: "working_context".into(),
+        description: Some("Manage your private working selection: pin an authorized Memory or Artifact source, expand its exact source-hash-bound byte window, list, or unpin. Runtime rechecks current binding and source version before every model delivery. Follow read_request for original content; this does not edit sources, grant permissions or prove a claim. Working capacity is bounded and omissions are explicit.".into()),
+        input_schema: model_object_input_schema::<runtime::working_context::WorkingContextInput>(),
+        required_permission: ToolPermissionMode::ReadOnly,
+        effect_resolver: runtime_effect_resolver("runtime.readonly"),
+    });
+    definitions.push(RuntimeToolDefinition {
+        name: "private_note".into(),
+        description: Some("Save your own private observation, hypothesis, question or decision. Runtime binds the author and scope; notes are Agent reports, never independently verified facts or current permissions. Returns exact read_request and pin_request. This does not publish shared knowledge or change long-term policy.".into()),
+        input_schema: model_object_input_schema::<runtime::working_context::PrivateNoteInput>(),
+        required_permission: ToolPermissionMode::ReadOnly,
+        effect_resolver: runtime_effect_resolver("runtime.private_note"),
     });
     definitions.extend(agent_action_tool_definitions());
     definitions
@@ -443,7 +457,7 @@ fn agent_action_tool_definitions() -> Vec<RuntimeToolDefinition> {
         ),
         agent_action_definition::<action::ObjectiveReviewInput>(
             action::OBJECTIVE_REVIEW_TOOL_ID,
-            "Record an evidence-backed review of one Objective criterion as satisfied, gapped, or blocked. Use durable result and evidence references plus a reason; Runtime binds the verdict to the current Objective generation and prevents stale review from finalizing a newer plan.",
+            "Record an evidence-backed review of one Goal criterion or obligation as satisfied, gapped, or blocked. Copy its exact reference from state_inspect into criterion_ref. Use durable result and evidence references plus a reason; Runtime binds the verdict to the current Objective generation and prevents stale review from finalizing a newer plan.",
         ),
         agent_action_definition::<action::MembershipUpdateInput>(
             action::MEMBERSHIP_UPDATE_TOOL_ID,
@@ -464,8 +478,7 @@ fn agent_action_definition<T: schemars::JsonSchema>(
     name: &str,
     description: &str,
 ) -> RuntimeToolDefinition {
-    let input_schema = serde_json::to_value(schemars::schema_for!(T))
-        .unwrap_or_else(|_| json!({"type": "object", "additionalProperties": false}));
+    let input_schema = model_object_input_schema::<T>();
     // Program revisions are a global journal cursor, not a resource-local
     // concurrency token. Exposing that volatile counter to autonomous Agents
     // makes independent Team/Task mutations contend and turns harmless
@@ -484,6 +497,17 @@ fn agent_action_definition<T: schemars::JsonSchema>(
         required_permission: ToolPermissionMode::ReadOnly,
         effect_resolver: runtime_effect_resolver("runtime.agent_action"),
     }
+}
+
+fn model_object_input_schema<T: schemars::JsonSchema>() -> serde_json::Value {
+    let mut input_schema = serde_json::to_value(schemars::schema_for!(T))
+        .unwrap_or_else(|_| json!({"type": "object", "additionalProperties": false}));
+    if let Some(schema) = input_schema.as_object_mut() {
+        schema
+            .entry("type".to_string())
+            .or_insert_with(|| json!("object"));
+    }
+    input_schema
 }
 
 pub(crate) fn mcp_runtime_tool_definition(tool: &runtime::ManagedMcpTool) -> RuntimeToolDefinition {
@@ -725,6 +749,19 @@ mod tests {
         assert!(evidence_tool.input_schema["properties"]
             .get("selector")
             .is_none());
+
+        for tool_name in [
+            "artifact_publish",
+            "artifact_materialize",
+            "working_context",
+            "private_note",
+        ] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name == tool_name)
+                .unwrap_or_else(|| panic!("missing runtime tool {tool_name}"));
+            assert_eq!(tool.input_schema["type"], "object");
+        }
     }
 
     #[test]

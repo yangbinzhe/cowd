@@ -341,6 +341,10 @@ impl ExecutionGraphRunner {
         &self.state_store
     }
 
+    pub(crate) async fn drain_physical_execution(&self) {
+        self.registry.drain_physical_execution().await;
+    }
+
     pub(crate) async fn recover_graph(
         &self,
         graph_id: &str,
@@ -1552,6 +1556,9 @@ impl ExecutionGraphRunner {
                 biased;
                 outcome = executor.poll_or_await(&ticket) => outcome,
                 () = tokio::time::sleep(remaining) => {
+                    if executor.cancellation_requires_quiescence(&ticket) {
+                        executor.cancel(&ticket).await?;
+                    } else {
                     match tokio::time::timeout(Duration::from_secs(5), executor.cancel(&ticket)).await {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => tracing::warn!(
@@ -1565,6 +1572,7 @@ impl ExecutionGraphRunner {
                             node_id = ticket.node_id,
                             "deadline terminalization timed out while propagating executor cancellation"
                         ),
+                    }
                     }
                     Ok(deadline_exceeded_outcome(&ticket.node_id, deadline_at_ms))
                 }

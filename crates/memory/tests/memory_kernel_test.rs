@@ -663,7 +663,7 @@ async fn memory_context_packet_prefers_explainable_orientation() {
     orientation.content = "PACKET_ORIENTATION_ALPHA is the active project direction.".to_string();
     orientation.scope = MemoryScope::Session(ctx.session_id.clone());
     orientation.session_id = Some(ctx.session_id.clone());
-    manager.remember(orientation).await.unwrap();
+    manager.remember_for_turn(&ctx, orientation).await.unwrap();
 
     let packet = kernel
         .context_packet(&ctx, "PACKET_ORIENTATION_ALPHA", &[], 8, 1_000)
@@ -700,7 +700,7 @@ async fn memory_context_packet_includes_scoped_semantic_checkpoint() {
     checkpoint.tags = vec!["semantic-checkpoint".to_string()];
     checkpoint.scope = MemoryScope::Session(ctx.session_id.clone());
     checkpoint.session_id = Some(ctx.session_id.clone());
-    manager.remember(checkpoint).await.unwrap();
+    manager.remember_for_turn(&ctx, checkpoint).await.unwrap();
 
     let packet = kernel
         .context_packet(&ctx, "previous session decisions", &[], 8, 1_000)
@@ -736,7 +736,7 @@ async fn memory_context_packet_omits_unrelated_semantic_checkpoint() {
     checkpoint.tags = vec!["semantic-checkpoint".to_string()];
     checkpoint.scope = MemoryScope::Session(ctx.session_id.clone());
     checkpoint.session_id = Some(ctx.session_id.clone());
-    manager.remember(checkpoint).await.unwrap();
+    manager.remember_for_turn(&ctx, checkpoint).await.unwrap();
 
     let packet = kernel
         .context_packet(&ctx, "frontend color palette", &[], 8, 1_000)
@@ -772,7 +772,7 @@ async fn task_scoped_checkpoint_isolated_between_tasks() {
     checkpoint.tags = vec!["semantic-checkpoint".to_string()];
     checkpoint.scope = MemoryScope::Task("task-a".to_string());
     checkpoint.session_id = Some(ctx_a.session_id.clone());
-    manager.remember(checkpoint).await.unwrap();
+    manager.remember_for_turn(&ctx_a, checkpoint).await.unwrap();
 
     let packet_a = kernel
         .context_packet(&ctx_a, "backend migration decisions", &[], 8, 1_000)
@@ -1120,7 +1120,7 @@ async fn context_usage_feedback_updates_hot_summary_without_validating_memory() 
     hot.scope = MemoryScope::Session(ctx.session_id.clone());
     hot.session_id = Some(ctx.session_id.clone());
     let hot_id = hot.id;
-    manager.remember(hot).await.unwrap();
+    manager.remember_for_turn(&ctx, hot).await.unwrap();
 
     for _ in 0..3 {
         kernel
@@ -1158,7 +1158,7 @@ async fn context_packet_preview_does_not_record_usage_or_validate_atoms() {
     entry.scope = MemoryScope::Session(ctx.session_id.clone());
     entry.session_id = Some(ctx.session_id.clone());
     let memory_id = entry.id;
-    manager.remember(entry).await.unwrap();
+    manager.remember_for_turn(&ctx, entry).await.unwrap();
 
     let preview = kernel
         .context_packet_preview(&ctx, "PREVIEW_MEMORY_ALPHA", &[], 4, 1_000)
@@ -1350,6 +1350,7 @@ async fn memory_discovery_pages_all_matches_without_leaking_hidden_cursor_ids() 
         let mut visible = entry(MemoryLayer::L3, MemorySource::Import, "catalog needle");
         visible.id = uuid::Uuid::from_u128(index * 2 + 2);
         visible.scope = MemoryScope::Project("catalog-project".into());
+        visible.source_agent = Some(ctx.agent_id.clone());
         visible.content = format!("needle {}", "中文".repeat(500));
         expected.insert(visible.id);
         store.insert(&visible).await.unwrap();
@@ -1440,4 +1441,107 @@ async fn memory_discovery_pages_all_matches_without_leaking_hidden_cursor_ids() 
         .discover_page(&ctx, "needle", Some(&cursor), 7)
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn private_writes_never_deduplicate_or_conflict_across_agents_in_one_project() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new_ephemeral(test_config(&tmp.path().join("private-domain")))
+            .await
+            .unwrap(),
+    );
+    let kernel = MemoryKernel::new(Arc::clone(&manager));
+    let a = MemoryTurnContext::new("private-domain-session", "private-agent-a")
+        .with_project_id(Some("private-domain-project".into()));
+    let b = MemoryTurnContext::new("private-domain-session", "private-agent-b")
+        .with_project_id(Some("private-domain-project".into()));
+    let mut first = entry(
+        MemoryLayer::L3,
+        MemorySource::AutoExtracted,
+        "private same key",
+    );
+    first.scope = MemoryScope::Project("private-domain-project".into());
+    first.content = "ScopeSubject's parent is SecretA".into();
+    first.confidence = 0.73;
+    let first_id = first.id;
+    kernel.remember(&a, first.clone()).await.unwrap();
+    let mut second = first.clone();
+    second.id = uuid::Uuid::new_v4();
+    let second_id = second.id;
+    kernel.remember(&b, second).await.unwrap();
+    assert!(
+        kernel
+            .retrieve_visible_entry(&b, second_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "another Agent's private duplicate cannot suppress this write"
+    );
+    let mut third = first;
+    third.id = uuid::Uuid::new_v4();
+    third.content = "ScopeSubject's parent is SecretB".into();
+    let third_id = third.id;
+    kernel.remember(&b, third).await.unwrap();
+    assert_eq!(
+        kernel
+            .lifecycle_events(first_id)
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .to,
+        MemoryState::Active
+    );
+    assert_eq!(
+        kernel
+            .lifecycle_events(second_id)
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .to,
+        MemoryState::Conflicted
+    );
+    assert_eq!(
+        kernel
+            .lifecycle_events(third_id)
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .to,
+        MemoryState::Conflicted
+    );
+    let own = kernel
+        .retrieve_visible_entry(&a, first_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(own.confidence, 0.73);
+    assert!(kernel
+        .retrieve_visible_entry(&b, first_id)
+        .await
+        .unwrap()
+        .is_none());
+    // A separate title still cannot populate an unscoped regex fact registry
+    // or change the confidence on the basis of another private statement.
+    let mut unrelated = entry(
+        MemoryLayer::L3,
+        MemorySource::AutoExtracted,
+        "private unrelated key",
+    );
+    unrelated.content = "ScopeSubject's parent is OtherSecret".into();
+    unrelated.confidence = 0.73;
+    let unrelated_id = unrelated.id;
+    kernel.remember(&b, unrelated).await.unwrap();
+    assert_eq!(
+        kernel
+            .retrieve_visible_entry(&b, unrelated_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .confidence,
+        0.73
+    );
 }

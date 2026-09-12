@@ -516,6 +516,9 @@ mod tests {
     async fn continuation_dispatch_preserves_business_task_and_creates_current_execution_identity()
     {
         let services = crate::RuntimeServices::in_memory().unwrap();
+        services.agent_task_executor().install_resolver(Arc::new(
+            crate::agentic::coordination::tests::ControlledAgenticWorker,
+        ));
         let store = Arc::clone(services.event_store());
         let commits = services.commit_service().clone();
         let (old, task_ref) = source(&store, &commits);
@@ -640,10 +643,39 @@ mod tests {
             .unwrap();
         assert_eq!(execution_task.origin_turn_id, "new-turn");
         assert_eq!(execution_task.root_task_id, "task-new-turn");
-        let binding = packet.agentic_binding.unwrap();
+        let binding = packet.agentic_binding.as_ref().unwrap();
         assert_eq!(binding.program_id, current.program_id);
         assert!(
             matches!(binding.focus, harness_contract::agent::AgenticExecutionFocus::TaskExecute {task_ref: ref business, ..} if business == &task_ref)
+        );
+        let resolved = services
+            .resolve_agent_action_actor(
+                &harness_contract::execution_graph::ExecutionParentBinding {
+                    execution_id: child.id.clone(),
+                    node_id: child.nodes[0].id.clone(),
+                },
+                None,
+            )
+            .await
+            .expect("continued physical worker authenticates against its business Task");
+        assert_eq!(resolved.program_id, current.program_id);
+        let claimed = actions
+            .apply(&AgentActionEnvelope {
+                action_id: "continued-worker-real-claim".into(),
+                actor: resolved,
+                expected_revision: None,
+                action: AgentAction::TaskClaim(harness_contract::agent_action::TaskClaimInput {
+                    task_ref: task_ref.clone(),
+                    reason: Some("resume the authorized remaining gap".into()),
+                }),
+            })
+            .unwrap();
+        assert_eq!(claimed.status, AgentActionStatus::Applied, "{claimed:?}");
+        assert_eq!(
+            actions.project(&current.program_id).unwrap().tasks[&task_ref]
+                .claim_execution_id
+                .as_deref(),
+            Some(child.id.as_str())
         );
         assert_eq!(
             services
@@ -660,6 +692,72 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "recovery never starts the same gap twice"
+        );
+
+        // A valid packet/lease/lineage cannot be rebound to another real
+        // business Task, even when both Tasks have the same Team authority.
+        let other = actions
+            .apply(&AgentActionEnvelope {
+                action_id: "other-continued-task".into(),
+                actor: current.clone(),
+                expected_revision: None,
+                action: AgentAction::TaskPublish(TaskPublishInput {
+                    team_ref: binding.task_team_id.clone(),
+                    title: "Other contribution".into(),
+                    objective: "separate business identity".into(),
+                    acceptance: "separate result".into(),
+                    required_capabilities: vec!["read".into()],
+                    depends_on: vec![task_ref.clone()],
+                    obligation_refs: vec![],
+                    purpose: Default::default(),
+                    execution_requirements: vec![],
+                    expertise_hints: vec![],
+                }),
+            })
+            .unwrap();
+        assert_eq!(other.status, AgentActionStatus::Applied, "{other:?}");
+        let mut corrupt = child.clone();
+        corrupt.id = "continued-worker-wrong-business-focus".into();
+        let mut wrong_packet = packet.clone();
+        wrong_packet.assignment.graph_id = corrupt.id.clone();
+        let identity = harness_contract::execution::ExecutionIdentity::for_task_graph(
+            "test.principal",
+            "test-workspace",
+            &packet.assignment.mission_id,
+            packet.task_id(),
+            packet.session_id(),
+            "new-turn",
+            &corrupt.id,
+        )
+        .unwrap();
+        wrong_packet.assignment.execution_identity =
+            harness_contract::execution::ExecutionIdentity::for_agent_node(
+                &identity,
+                &packet.assignment.run_id,
+                packet.node_id(),
+            )
+            .unwrap();
+        wrong_packet.agentic_binding.as_mut().unwrap().focus =
+            harness_contract::agent::AgenticExecutionFocus::TaskExecute {
+                task_ref: other.changed_refs[0].clone(),
+            };
+        corrupt.nodes[0].payload_ref = serde_json::to_string(&wrong_packet).unwrap();
+        services
+            .commit_service()
+            .register_graph(corrupt.clone())
+            .unwrap();
+        assert_eq!(
+            services
+                .resolve_agent_action_actor(
+                    &harness_contract::execution_graph::ExecutionParentBinding {
+                        execution_id: corrupt.id,
+                        node_id: corrupt.nodes[0].id.clone(),
+                    },
+                    None,
+                )
+                .await
+                .unwrap_err(),
+            "agent_actor_agentic_task_mismatch"
         );
     }
 }

@@ -169,7 +169,6 @@ impl CognitiveContextManager {
                 &self.embedding_capability,
                 &self.vector_index,
                 &pending_embeddings,
-                false,
             )
             .await
             {

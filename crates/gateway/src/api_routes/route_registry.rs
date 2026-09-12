@@ -355,6 +355,15 @@ fn mission_control_delta_spec() -> TypedRouteSpec<(), (), MissionProjectionDelta
 
 pub(crate) fn typed_route_metadata() -> Vec<StableRouteMetadata> {
     vec![
+        TypedRouteSpec::<
+            super::session_routes::BranchSessionRequest,
+            (),
+            super::session_routes::BranchSessionReceipt,
+        >::new(
+            surface::gateway_api::routes::POST_API_SESSIONS_BY_ID_BRANCH,
+            "session_branch",
+        )
+        .metadata(Some("BranchSessionRequest"), "BranchSessionReceipt", false),
         agentic_program_root_spec().metadata(None, "AgenticProgramProjection", false),
         execution_projection_snapshot_spec().metadata(None, "ExecutionProjection", false),
         execution_activity_detail_spec().metadata(None, "ExecutionActivityDetailProjection", false),

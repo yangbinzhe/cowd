@@ -25,6 +25,27 @@ fn stop_child(child: &mut Child) {
     let _ = child.wait();
 }
 
+struct OwnedTestChild(Child);
+
+impl std::ops::Deref for OwnedTestChild {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for OwnedTestChild {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for OwnedTestChild {
+    fn drop(&mut self) {
+        stop_child(&mut self.0);
+    }
+}
+
 fn wait_for_broker(client: &auth_broker::BrokerClient, child: &mut Child) {
     for _ in 0..80 {
         if client.trust_metadata().is_ok() {
@@ -317,6 +338,12 @@ fn release_installer_replaces_a_running_cowd_atomically_and_cleans_legacy_helper
     let install_dir = fixture.path().join("install");
     let authority_root = fixture.path().join("authority");
     let socket = fixture.path().join("broker.sock");
+    // This gate verifies installation/copy semantics, not launcher execution.
+    // Never depend on an unrelated stale binary in the developer's target dir.
+    let launcher = fixture.path().join("launcher-copy-fixture");
+    let launcher_bytes = b"#!/bin/sh\nexit 125\n";
+    fs::write(&launcher, launcher_bytes).expect("seed explicit launcher copy fixture");
+    fs::set_permissions(&launcher, fs::Permissions::from_mode(0o500)).unwrap();
     fs::create_dir_all(&authority_root).expect("create authority root");
     let catalog_path = auth_broker::catalog_file(&authority_root);
     auth_broker::write_catalog(
@@ -334,23 +361,25 @@ fn release_installer_replaces_a_running_cowd_atomically_and_cleans_legacy_helper
         .expect("seed legacy backup");
     let original_inode = fs::metadata(&installed).expect("old metadata").ino();
 
-    let mut child = Command::new(&installed)
-        .args([
-            INTERNAL_DISPATCH,
-            "auth-broker",
-            "--root",
-            authority_root.to_str().expect("utf-8 authority root"),
-            "--socket",
-            socket.to_str().expect("utf-8 socket"),
-            "--catalog",
-            catalog_path.to_str().expect("utf-8 catalogue"),
-            "--credential-stdin",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("start installed Cowd process");
+    let mut child = OwnedTestChild(
+        Command::new(&installed)
+            .args([
+                INTERNAL_DISPATCH,
+                "auth-broker",
+                "--root",
+                authority_root.to_str().expect("utf-8 authority root"),
+                "--socket",
+                socket.to_str().expect("utf-8 socket"),
+                "--catalog",
+                catalog_path.to_str().expect("utf-8 catalogue"),
+                "--credential-stdin",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start installed Cowd process"),
+    );
     child
         .stdin
         .take()
@@ -377,6 +406,8 @@ fn release_installer_replaces_a_running_cowd_atomically_and_cleans_legacy_helper
         .arg(installer)
         .arg("--print-path-only")
         .env("COWD_BIN", cowd_binary())
+        .env("COWD_LAUNCHER_BIN", &launcher)
+        .env("COWD_CONFIG_HOME", fixture.path().join("config"))
         .env("COWD_INSTALL_DIR", &install_dir)
         .env("COWD_AI_ROOT", fixture.path().join("ai"))
         .output()
@@ -401,6 +432,22 @@ fn release_installer_replaces_a_running_cowd_atomically_and_cleans_legacy_helper
         "the process using the old inode must remain alive until an explicit restart"
     );
     assert!(!install_dir.join("cowd-auth-broker").exists());
+    let installed_launcher = install_dir.join("managed-worker-launcher");
+    assert_eq!(fs::read(&installed_launcher).unwrap(), launcher_bytes);
+    assert_eq!(
+        fs::metadata(&installed_launcher)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o500
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(install_dir.join("install.json")).unwrap()).unwrap();
+    assert_eq!(
+        manifest["managed_worker_launcher"],
+        installed_launcher.to_str().unwrap()
+    );
     assert!(!install_dir.join(".cowd-sandbox-launcher.prev-1").exists());
     assert!(fs::read_dir(&install_dir)
         .expect("read install directory")

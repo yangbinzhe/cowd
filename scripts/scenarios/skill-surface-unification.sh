@@ -6,7 +6,7 @@ TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT/target}"
 BIN="${COWD_BIN:-$TARGET_ROOT/debug/cowd}"
 PORT="${COWD_SKILL_SURFACE_PORT:-18756}"
 BASE_URL="http://127.0.0.1:$PORT"
-SESSION="cowd-skill-surface-$$"
+GATEWAY_PID=""
 TMP_ROOT="${TMPDIR:-/tmp}"
 TMP_DIR="$(mktemp -d "$TMP_ROOT/cowd-skill-surface.XXXXXX")"
 WORKDIR="$TMP_DIR/workspace"
@@ -16,7 +16,10 @@ LOG="$TMP_DIR/gateway.log"
 API_TOKEN="skill-surface-$$_credential"
 
 cleanup() {
-  tmux kill-session -t "$SESSION" >/dev/null 2>&1 || true
+  if [[ -n "$GATEWAY_PID" ]]; then
+    kill "$GATEWAY_PID" >/dev/null 2>&1 || true
+    wait "$GATEWAY_PID" >/dev/null 2>&1 || true
+  fi
   rm -rf "$TMP_DIR" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -29,7 +32,6 @@ on_error() {
 }
 trap on_error ERR
 
-command -v tmux >/dev/null 2>&1 || { echo "tmux is required" >&2; exit 1; }
 [[ -x "$BIN" ]] || { echo "cowd binary not found at $BIN" >&2; exit 1; }
 if ss -ltnp | rg -q ":$PORT\\b"; then
   echo "port $PORT is already in use" >&2
@@ -59,6 +61,11 @@ permissions:
   default_mode: "danger-full-access"
 memory:
   enabled: false
+storage:
+  backend: postgres
+  postgres:
+    logicalIdentity: "cowd-skill-surface"
+    secretRef: "env:COWD_TEST_POSTGRES_URL"
 gateway:
   enabled: true
   session_reset: "none"
@@ -74,8 +81,20 @@ EOF
 cp "$CONFIG_HOME/config.yaml" "$HOME_DIR/.cowd/config.yaml"
 cp "$CONFIG_HOME/config.yaml" "$WORKDIR/.cowd/config.yaml"
 
-tmux new-session -d -s "$SESSION" \
-  "bash -lc \"cd '$WORKDIR' && COWD_CONFIG_HOME='$CONFIG_HOME' HOME='$HOME_DIR' '$BIN' gateway run >'$LOG' 2>&1\""
+(
+  cd "$WORKDIR"
+  env COWD_CONFIG_HOME="$CONFIG_HOME" HOME="$HOME_DIR" \
+    COWD_TEST_POSTGRES_URL="$COWD_TEST_POSTGRES_URL" \
+    "$BIN" storage upgrade
+)
+
+(
+  cd "$WORKDIR"
+  env COWD_CONFIG_HOME="$CONFIG_HOME" HOME="$HOME_DIR" \
+    COWD_TEST_POSTGRES_URL="$COWD_TEST_POSTGRES_URL" \
+    "$BIN" gateway run >"$LOG" 2>&1
+) &
+GATEWAY_PID=$!
 for _ in {1..100}; do
   curl -fsS -H "Authorization: Bearer $API_TOKEN" "$BASE_URL/health" >/dev/null 2>&1 && break
   sleep 0.25

@@ -467,6 +467,17 @@
 
     #[tokio::test]
     async fn first_model_step_activates_skill_persists_bridge_and_injects_asset() {
+        verify_first_model_skill_activation(None).await;
+    }
+
+    #[tokio::test]
+    async fn missing_or_wrong_version_second_skill_never_leaks_partial_prompt_or_tool_exposure() {
+        for failure in ["missing", "version"] {
+            verify_first_model_skill_activation(Some(failure)).await;
+        }
+    }
+
+    async fn verify_first_model_skill_activation(failure: Option<&str>) {
         let store = Arc::new(crate::test_support::session_store());
         let session = Session::new();
         let session_id = session.session_id.clone();
@@ -536,12 +547,67 @@
             tool_refs: vec!["lark_cli_read".to_string()],
         }]);
         runtime.model = Some("test-model".to_string());
+        let query = if failure.is_some() {
+            "prepare release evidence and release-verification"
+        } else {
+            "prepare release evidence"
+        };
+        if let Some(failure) = failure {
+            let mut second = runtime.skill_profiles[0].clone();
+            second.skill_id = "release-verification".into();
+            second.name = "Release Verification".into();
+            second.version = Some("2.0.0".into());
+            runtime.skill_profiles.push(second);
+            if failure == "version" {
+                let mut asset = runtime.skill_prompt_assets[0].clone();
+                asset.skill_id = "release-verification".into();
+                runtime.skill_prompt_assets.push(asset);
+            }
+        }
         runtime
-            .begin_turn_strategy("test-skill-turn", "prepare release evidence")
+            .begin_turn_strategy("test-skill-turn", query)
             .expect("test turn strategy admission");
 
+        if let Some(failure) = failure {
+            let error = runtime.execute_model_step(query, true).await.unwrap_err();
+            assert!(
+                error.to_string().contains(if failure == "missing" {
+                    "has no instruction asset"
+                } else {
+                    "identity/version mismatch"
+                }),
+                "{error}"
+            );
+            assert!(
+                requests.lock().unwrap().is_empty(),
+                "failed Skill must stop before Provider"
+            );
+            assert!(runtime.take_next_model_context_items().is_empty());
+            assert!(runtime.active_skill_tool_refs.lock().unwrap().is_empty());
+            let events = store
+                .session_domain_events_page(&session_id, 0, 20)
+                .await
+                .unwrap();
+            assert!(!events
+                .events
+                .iter()
+                .any(|event| event.kind == "skill_candidates"));
+            runtime
+                .skill_prompt_assets
+                .retain(|asset| asset.skill_id != "release-verification");
+            runtime
+                .skill_prompt_assets
+                .push(super::RuntimeSkillPromptAsset {
+                    skill_id: "release-verification".into(),
+                    version: Some("2.0.0".into()),
+                    content: "SECOND_SKILL_VERIFIED_VERSION".into(),
+                    source_ref: "skill://release-verification/SKILL.md".into(),
+                    tool_refs: vec![],
+                });
+        }
+
         runtime
-            .execute_model_step("prepare release evidence", true)
+            .execute_model_step(query, true)
             .await
             .expect("first skill-aware model step");
 
@@ -561,6 +627,15 @@
         }));
         let requests = requests.lock().expect("request recorder");
         assert_eq!(requests.len(), 1);
+        if failure.is_some() {
+            assert!(rendered_prompt(&requests[0].prompt).contains("SECOND_SKILL_VERIFIED_VERSION"));
+            assert_eq!(
+                rendered_prompt(&requests[0].prompt)
+                    .matches("# Activated skill: release-evidence")
+                    .count(),
+                1
+            );
+        }
         assert!(rendered_prompt(&requests[0].prompt)
             .contains("Require release evidence before accepting completion."));
         let projections = projections.lock().expect("projection recorder");

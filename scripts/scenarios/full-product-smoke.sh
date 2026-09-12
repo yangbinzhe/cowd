@@ -17,7 +17,7 @@ PORT="${COWD_RELEASE_SMOKE_PORT:-18695}"
 PROVIDER_PORT="${COWD_RELEASE_SMOKE_PROVIDER_PORT:-18696}"
 BASE_URL="http://127.0.0.1:$PORT"
 SESSION="cowd-release-smoke-$$"
-TMP_DIR="$(mktemp -d /tmp/cowd-release-smoke.XXXXXX)"
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cowd-release-smoke.XXXXXX")"
 WORKDIR="$TMP_DIR/workspace"
 CONFIG_HOME="$TMP_DIR/config"
 HOME_DIR="$TMP_DIR/home"
@@ -180,7 +180,15 @@ EOF
 cp "$CONFIG_HOME/config.yaml" "$HOME_DIR/.cowd/config.yaml"
 cp "$CONFIG_HOME/config.yaml" "$WORKDIR/.cowd/config.yaml"
 
+(
+  cd "$WORKDIR"
+  env COWD_CONFIG_HOME="$CONFIG_HOME" HOME="$HOME_DIR" \
+    COWD_TEST_POSTGRES_URL="$COWD_TEST_POSTGRES_URL" \
+    "$BIN" storage upgrade
+)
+
 tmux new-session -d -s "$SESSION" \
+  -e "COWD_TEST_POSTGRES_URL=$COWD_TEST_POSTGRES_URL" \
   "bash -lc \"cd '$WORKDIR' && \
     export COWD_CONFIG_HOME='$CONFIG_HOME' && \
     export COWD_FRONTEND_REPO='$FRONTEND_REPO' && \
@@ -232,7 +240,7 @@ curl -fsS -X POST "$BASE_URL/api/sessions/$SMOKE_ID/messages" \
   -H "x-cowd-observer-id: $SMOKE_OBSERVER_ID" \
   -H 'x-cowd-surface-id: release-smoke' \
   -H 'content-type: application/json' \
-  -d '{"content":"Run the release smoke evidence check using the available release skill.","idempotency_key":"release-smoke-skill-activation"}' \
+  -d "{\"content\":\"Run the release smoke evidence check using the available release skill.\",\"idempotency_key\":\"release-smoke-skill-activation-$SMOKE_ID\"}" \
   | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("status") == "accepted", data'
 skill_activation_observed=0
 for _ in {1..120}; do
@@ -257,8 +265,19 @@ curl -fsS "$BASE_URL/api/matrix/evidence/build" \
   -H 'content-type: application/json' \
   -d "{\"request_id\":\"release-smoke-evidence\",\"session_id\":\"$SMOKE_ID\",\"attention_id\":\"$attention_id\",\"problem_statement\":\"Release smoke validates structured evidence and outcome timeline\"}" \
   | match '"kind":"matrix.evidence.packet"'
+outcome_observed=0
+for _ in {1..120}; do
+  timeline_json="$(curl -sS "$BASE_URL/api/runtime/timeline?session_id=$SMOKE_ID&limit=200" || true)"
+  if [[ -n "$timeline_json" ]] && printf '%s' "$timeline_json" \
+    | python3 -c 'import json,sys; events=json.load(sys.stdin).get("events", []); raise SystemExit(0 if any(e.get("kind")=="runtime.outcome.recorded.v1" and e.get("status")=="succeeded" and e.get("payload",{}).get("terminal",{}).get("class")=="succeeded" for e in events) else 1)' 2>/dev/null; then
+    outcome_observed=1
+    break
+  fi
+  sleep 0.25
+done
+[[ "$outcome_observed" == "1" ]]
 curl -fsS "$BASE_URL/api/runtime/timeline?session_id=$SMOKE_ID&limit=200" \
-  | python3 -c 'import json,sys; events=json.load(sys.stdin).get("events", []); assert any(e.get("kind")=="runtime.outcome.recorded.v1" and e.get("status")=="succeeded" for e in events), events; assert any(e.get("kind")=="application.execution_summary" for e in events), events'
+  | python3 -c 'import json,sys; events=json.load(sys.stdin).get("events", []); assert any(e.get("kind")=="runtime.outcome.recorded.v1" and e.get("status")=="succeeded" and e.get("payload",{}).get("terminal",{}).get("class")=="succeeded" for e in events), events; assert any(e.get("kind")=="application.execution_summary" for e in events), events'
 
 release_gate_json="$(curl -fsS "$BASE_URL/api/cowd/release-gate")"
 printf '%s' "$release_gate_json" | python3 -c 'import json,sys; data=json.load(sys.stdin); checks={item.get("check_id"): item.get("status") for item in data.get("checks", [])}; assert data.get("status")=="pass", data; required=["structured_data.indexes.ready","structured_data.watermark.persistent","execution_outcome.timeline.available"]; missing=[item for item in required if checks.get(item)!="pass"]; assert not missing, f"release gate checks not passing: {missing}"'

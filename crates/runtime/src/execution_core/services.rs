@@ -963,6 +963,19 @@ impl RuntimeServices {
     }
 
     pub fn in_memory() -> Result<Arc<Self>, RuntimeServicesError> {
+        Self::in_memory_composed(None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_memory_with_tool_host(
+        host: Arc<dyn crate::RuntimeExecutionHost>,
+    ) -> Result<Arc<Self>, RuntimeServicesError> {
+        Self::in_memory_composed(Some(host))
+    }
+
+    fn in_memory_composed(
+        tool_host: Option<Arc<dyn crate::RuntimeExecutionHost>>,
+    ) -> Result<Arc<Self>, RuntimeServicesError> {
         let workspace_key = format!("in-memory-{}", uuid::Uuid::new_v4());
         let ephemeral_root = tempfile::Builder::new()
             .prefix("cowd-runtime-services-")
@@ -997,7 +1010,7 @@ impl RuntimeServices {
             Vec::new(),
             Arc::new(crate::ProviderTransportPool::default()),
             Arc::new(crate::ProviderClientTemplateCache::default()),
-            None,
+            tool_host,
             Arc::new(crate::ArtifactStore::for_test_default(
                 storage_registry
                     .endpoint(&storage::StorageDomainId::Blobs)?
@@ -1022,6 +1035,9 @@ impl RuntimeServices {
             false,
         )?);
         services.install_graph_settled_observer()?;
+        crate::execution_core::graph::executors::agent_tool::AgentToolBatchResolver::install(
+            &services,
+        );
         services.agent_runtime.bind_services(Arc::clone(&services));
         services
             .agent_runtime
@@ -1090,7 +1106,10 @@ impl RuntimeServices {
             Arc::clone(&event_store),
             Arc::clone(&hot_state),
         );
-        let agentic_read_model = Arc::new(crate::agentic::AgenticReadModel::default());
+        let agentic_read_model = Arc::new(
+            crate::agentic::AgenticReadModel::default()
+                .with_residency(Arc::clone(hot_state.residency())),
+        );
         let model_step_executor = Arc::new(ScopedNodeExecutor::new("inline_model"));
         let tool_batch_executor = Arc::new(ScopedNodeExecutor::new("tool_batch"));
         let cross_plane_connector_executor =
@@ -1148,10 +1167,13 @@ impl RuntimeServices {
             Arc::clone(&event_store),
             Arc::clone(&evolution_discovery),
         ));
-        let evolution_signal_projector = Arc::new(crate::evolution::EvolutionSignalProjector::new(
-            Arc::clone(&event_store),
-            Arc::clone(&evolution_discovery),
-        ));
+        let evolution_signal_projector = Arc::new(
+            crate::evolution::EvolutionSignalProjector::new(
+                Arc::clone(&event_store),
+                Arc::clone(&evolution_discovery),
+            )
+            .with_workspace_identity(workspace_key.clone()),
+        );
         let skill_maintenance_projector = Arc::new(crate::SkillMaintenanceProjector::new(
             Arc::clone(&event_store),
         ));
@@ -1493,14 +1515,19 @@ impl RuntimeServices {
     ) -> Result<(), RuntimeServicesError> {
         let managed_projection_store = self.graph_state_store.clone();
         let managed_projection_dispatcher = Arc::clone(&self.managed_agents);
-        let settled_lineage_supervisor = Arc::clone(&self.execution_supervisor);
+        // The observer is retained by this supervisor. Capturing its strong Arc
+        // here would keep the runner, event store and PostgreSQL pool alive even
+        // after shutdown and after RuntimeServices itself has been dropped.
+        let settled_lineage_supervisor = Arc::downgrade(&self.execution_supervisor);
         let settled_agentic_actions = self.agent_action_service();
         self.execution_supervisor
             .install_graph_settled_observer(move |graph_id| {
                 let graph_id = graph_id.to_string();
                 let graph_store = managed_projection_store.clone();
                 let dispatcher = Arc::clone(&managed_projection_dispatcher);
-                let lineage_supervisor = Arc::clone(&settled_lineage_supervisor);
+                let Some(lineage_supervisor) = settled_lineage_supervisor.upgrade() else {
+                    return;
+                };
                 let agentic_actions = settled_agentic_actions.clone();
                 tokio::spawn(async move {
                     if let Err(error) = crate::execution_core::graph::executors::reconcile_agentic_program_wait_for_settled_graph(
@@ -1530,13 +1557,21 @@ impl RuntimeServices {
     /// scheduler behind one gate prevents either subsystem from advancing
     /// durable business state during crash recovery.
     pub(super) fn start_background_reactors(self: &Arc<Self>) -> Result<(), RuntimeServicesError> {
-        let deadline_supervisor = Arc::clone(&self.execution_supervisor);
-        let deadline_approval_coordinator = Arc::clone(&self.approval_coordinator);
+        // ApprovalQueue retains this wake callback and is itself retained by
+        // the supervisor's approval executor/coordinator. Neither back-edge
+        // may keep its owner alive after maintenance shutdown.
+        let deadline_supervisor = Arc::downgrade(&self.execution_supervisor);
+        let deadline_approval_coordinator = Arc::downgrade(&self.approval_coordinator);
         self.approval_queue
             .install_deadline_scheduler(Arc::new(move |approval_id| {
-                let supervisor = Arc::clone(&deadline_supervisor);
-                let approval_coordinator = Arc::clone(&deadline_approval_coordinator);
+                let supervisor = deadline_supervisor.clone();
+                let approval_coordinator = deadline_approval_coordinator.clone();
                 Box::pin(async move {
+                    let (Some(supervisor), Some(approval_coordinator)) =
+                        (supervisor.upgrade(), approval_coordinator.upgrade())
+                    else {
+                        return;
+                    };
                     approval_coordinator.notify_decision(&approval_id);
                     if let Some((graph_id, _)) =
                         crate::execution_core::graph::executors::parse_graph_approval_id(
@@ -2141,6 +2176,7 @@ impl RuntimeServices {
     #[must_use]
     pub fn agent_action_service(&self) -> crate::AgentActionService {
         crate::AgentActionService::new(Arc::clone(&self.event_store))
+            .with_graph_store(self.graph_state_store.clone())
             .with_read_model(Arc::clone(&self.agentic_read_model))
             .with_artifact_store(Arc::clone(&self.artifact_store))
     }
@@ -2292,12 +2328,51 @@ impl RuntimeServices {
         agentic
             .validate()
             .map_err(|error| format!("agent_actor_packet_agentic_binding_invalid:{error}"))?;
+        let projection = self
+            .agent_action_service()
+            .project(&agentic.program_id)
+            .map_err(|error| format!("agent_actor_program_load_failed:{error}"))?;
+        if projection.execution_is_coordinator(Some(packet.graph_id()))
+            && !matches!(
+                agentic.focus,
+                harness_contract::agent::AgenticExecutionFocus::Coordination { .. }
+            )
+        {
+            return Err("agent_actor_coordination_focus_mismatch".into());
+        }
         let (task_id, mode) = match &agentic.focus {
             harness_contract::agent::AgenticExecutionFocus::TaskExecute { task_ref } => {
                 (task_ref.as_str(), "execute")
             }
             harness_contract::agent::AgenticExecutionFocus::TaskReview { task_ref } => {
                 (task_ref.as_str(), "review")
+            }
+            harness_contract::agent::AgenticExecutionFocus::Coordination { wake_ref } => {
+                let (_, wake) = projection
+                    .coordination_wake_ref(wake_ref)
+                    .ok_or("agent_actor_coordination_wake_missing")?;
+                let consumption = wake
+                    .coordination
+                    .as_ref()
+                    .ok_or("agent_actor_coordination_not_registered")?;
+                if consumption.settled
+                    || consumption.execution_id != packet.graph_id()
+                    || consumption.agent_id != agentic.agent_id
+                    || consumption.membership_id != agentic.membership_id
+                    || projection.coordination_attempt(packet.graph_id()).is_none()
+                    || projection.coordination_team_id_for(&agentic.agent_id, wake.revision)
+                        != Some(agentic.team_id.as_str())
+                {
+                    return Err("agent_actor_coordination_binding_mismatch".into());
+                }
+                (
+                    wake.intent
+                        .as_ref()
+                        .ok_or("agent_actor_coordination_intent_missing")?
+                        .task_ref
+                        .as_str(),
+                    "coordination",
+                )
             }
             _ => return Err("agent_actor_packet_focus_cannot_mutate_task".to_string()),
         };
@@ -2306,10 +2381,6 @@ impl RuntimeServices {
         let task_team_id = agentic.task_team_id.as_str();
         let agent_id = agentic.agent_id.as_str();
 
-        let projection = self
-            .agent_action_service()
-            .project(program_id)
-            .map_err(|error| format!("agent_actor_program_load_failed:{error}"))?;
         let parent_execution_id = graph
             .parent_execution
             .as_ref()
@@ -2338,7 +2409,7 @@ impl RuntimeServices {
             .get(task_id)
             .ok_or_else(|| "agent_actor_task_is_not_in_program".to_string())?;
         if task.team_id != task_team_id
-            || packet.task_id() != task_id
+            || packet.task_id() != projection.execution_task_id(task_id)?
             || (mode == "execute" && !projection.agent_is_active_in(agent_id, &task.team_id))
         {
             return Err("agent_actor_agentic_task_mismatch".to_string());
@@ -3455,6 +3526,69 @@ impl RuntimeServices {
     pub fn approval_queue(&self) -> &Arc<ApprovalQueue> {
         &self.approval_queue
     }
+
+    /// Materialize the current decision for the ordinary evidence reader.
+    /// The approval journal remains the authority; the blob is derived data.
+    pub async fn approval_result_content(
+        &self,
+        session_id: &str,
+        reference: &str,
+    ) -> Result<
+        (
+            harness_contract::context::ArtifactRef,
+            harness_contract::policy::ApprovalRequest,
+            crate::ExpectedStreamRevision,
+        ),
+        String,
+    > {
+        let (graph_id, node_id) =
+            crate::execution_core::graph::executors::parse_graph_approval_id(reference)
+                .ok_or("external result requires a canonical graph approval reference")?;
+        let (request, source) = self
+            .approval_queue
+            .decision_result_snapshot(session_id, reference)?;
+        let graph = self
+            .graph_state_store()
+            .load(&graph_id)
+            .map_err(|error| error.to_string())?;
+        if !graph
+            .lineage
+            .as_ref()
+            .is_some_and(|lineage| lineage.session_id == session_id)
+            || !graph.nodes.iter().any(|node| {
+                node.id == node_id
+                    && node.kind == harness_contract::execution_graph::ExecutionNodeKind::Approval
+            })
+        {
+            return Err("external decision has no matching Session graph approval source".into());
+        }
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "kind":"external_decision", "approval":request, "source_revision":source.expected_revision,
+            "scope":"approval_decision_only"
+        })).map_err(|error| error.to_string())?;
+        let content = self
+            .artifact_store()
+            .write_bytes(
+                harness_contract::context::ArtifactWriteDescriptor {
+                    media_type: "application/json".into(),
+                    visibility_scope: format!("session:{session_id}"),
+                    expected_bytes: Some(bytes.len() as u64),
+                    original_name: None,
+                },
+                &bytes,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if self
+            .event_store()
+            .stream_revision(&source.stream_id)
+            .map_err(|error| error.to_string())?
+            != source.expected_revision
+        {
+            return Err("external decision changed while materializing its content; retry".into());
+        }
+        Ok((content, request, source))
+    }
     pub fn approval_coordinator(&self) -> &Arc<ApprovalCoordinator> {
         &self.approval_coordinator
     }
@@ -4166,6 +4300,32 @@ fn validate_evolution_scenario_isolation(
             "paired evolution evaluation has tools without an enforceable effect descriptor: {}",
             unknown_tools.join(", ")
         )));
+    }
+    for requirement in &scenario.acceptance_checks {
+        use harness_contract::{evaluation::EvaluationAcceptanceCheck, tool::ToolEffectKind};
+        let effect = match requirement.check {
+            EvaluationAcceptanceCheck::IsolatedWorkspaceChange { .. } => ToolEffectKind::Write,
+            EvaluationAcceptanceCheck::IsolatedWorkspaceRead => ToolEffectKind::Read,
+            EvaluationAcceptanceCheck::Output { .. } => continue,
+        };
+        let available = scenario.allowed_tools.iter().any(|tool| {
+            tool_host
+                .and_then(|host| {
+                    host.delegated_tool_effect_descriptor(tool, &serde_json::json!({}))
+                })
+                .is_some_and(|descriptor| {
+                    descriptor.effect_kind == effect
+                        && descriptor.scopes.iter().any(|scope| {
+                            scope.resource == harness_contract::policy::PermissionResource::File
+                        })
+                })
+        });
+        if !available {
+            return Err(RuntimeServicesError::Invariant(format!(
+                "paired evaluation acceptance `{}` has no authorized file {effect:?} tool",
+                requirement.criterion
+            )));
+        }
     }
     Ok(())
 }

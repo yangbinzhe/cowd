@@ -2452,6 +2452,12 @@ pub trait ToolExecutor: Send + Sync + 'static {
         false
     }
 
+    /// A durable delegated leaf acquires its own Tool quota and scope. Its
+    /// orchestration caller must not acquire the same resource while waiting.
+    fn owns_tool_resource_admission(&self, _tool_name: &str) -> bool {
+        false
+    }
+
     /// Validate provider-supplied input before Runtime publishes the ToolUse
     /// block, negotiates permission, or reserves execution capacity.
     /// Production executors bind this check to their pinned catalog; the
@@ -3783,6 +3789,9 @@ pub struct ConversationRuntime<C, T> {
     skill_profiles: Vec<SkillCapabilityProfile>,
     /// Agent-scoped Skill visibility and adapter policy.
     agent_skill_profile: AgentSkillProfile,
+    /// Original delegated objective, not the generic child-turn start hint.
+    /// Selection-only context: the Provider already receives its scoped brief.
+    skill_task_objective: Option<String>,
     /// Gateway-inspected PromptOnly assets keyed by Skill identity. Runtime
     /// chooses among these assets but never discovers or reads packages.
     skill_prompt_assets: Vec<RuntimeSkillPromptAsset>,
@@ -4469,25 +4478,6 @@ fn compacted_source_messages(
     &messages[start..end_exclusive]
 }
 
-fn source_message_evidence_refs(
-    session_id: &str,
-    messages: &[ConversationMessage],
-    start: usize,
-    end_exclusive: usize,
-) -> Vec<EvidenceRef> {
-    let start = start.min(messages.len());
-    let end_exclusive = end_exclusive.min(messages.len()).max(start);
-    messages[start..end_exclusive]
-        .iter()
-        .enumerate()
-        .map(|(offset, message)| {
-            let index = start + offset;
-            EvidenceRef::observed("session-message", format!("{session_id}:{index}"))
-                .with_source(message_index_label(message))
-        })
-        .collect()
-}
-
 fn deterministic_checkpoint_id(
     session_id: &str,
     message_start: usize,
@@ -4759,18 +4749,6 @@ fn revalidate_context_binding(
         }
     }
     (selected, omitted)
-}
-
-fn message_index_label(message: &ConversationMessage) -> String {
-    let mut checksum = 0_u64;
-    for byte in message
-        .blocks
-        .iter()
-        .flat_map(|block| format!("{block:?}").into_bytes())
-    {
-        checksum = checksum.wrapping_mul(31).wrapping_add(u64::from(byte));
-    }
-    format!("{}:{checksum:x}", message.role.role_str())
 }
 
 fn memory_project_id_for_session(session: &Session) -> Option<String> {

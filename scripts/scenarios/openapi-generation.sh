@@ -77,6 +77,11 @@ permissions:
   default_mode: "danger-full-access"
 memory:
   enabled: false
+storage:
+  backend: postgres
+  postgres:
+    logicalIdentity: "cowd-openapi-generation"
+    secretRef: "env:COWD_TEST_POSTGRES_URL"
 gateway:
   enabled: true
   session_reset: "none"
@@ -91,6 +96,12 @@ gateway:
 EOF
 cp "${CONFIG_HOME}/config.yaml" "${TEST_HOME}/.cowd/config.yaml"
 cp "${CONFIG_HOME}/config.yaml" "${WORKSPACE}/.cowd/config.yaml"
+
+(
+  cd "${WORKSPACE}"
+  env COWD_CONFIG_HOME="${CONFIG_HOME}" HOME="${TEST_HOME}" \
+    "${BIN}" storage upgrade
+)
 
 (
   cd "${WORKSPACE}"

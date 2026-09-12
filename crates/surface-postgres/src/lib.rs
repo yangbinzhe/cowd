@@ -1343,25 +1343,18 @@ fn outbox_event(r: &SurfaceOutboxRecord, kind: &str, detail: Value) -> SurfaceDe
 }
 
 #[cfg(test)]
+#[path = "../../storage/test-support/postgres_scope.rs"]
+mod postgres_scope;
+
+#[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
+    use crate::postgres_scope::PostgresTestScope;
     use harness_contract::managed_agent::ManagedAgentTriggerEvent;
-    use storage::StaticSecretRefResolver;
 
     use super::*;
-
-    fn ledger_from_url(url: String, identity: &str) -> Arc<PostgresSurfaceMessageLedger> {
-        let resolver = StaticSecretRefResolver::new([("surface-postgres-test".to_string(), url)]);
-        Arc::new(
-            PostgresSurfaceMessageLedger::connect(
-                PostgresConnectionConfig::new(identity, "surface-postgres-test", identity),
-                &resolver,
-            )
-            .expect("connect isolated PostgreSQL test database"),
-        )
-    }
 
     fn clear(ledger: &PostgresSurfaceMessageLedger) {
         let mut connection = ledger
@@ -1437,10 +1430,8 @@ mod tests {
     #[test]
     #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
     fn real_postgres_preserves_contract_and_serializes_competing_delivery_claims() {
-        let ledger = ledger_from_url(
-            std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required"),
-            "surface-postgres-contract",
-        );
+        let fixture = PostgresTestScope::new();
+        let ledger = Arc::new(PostgresSurfaceMessageLedger::new(fixture.reconnect()).unwrap());
         clear(&ledger);
         let checksum_original = PostgresMigrationSpec {
             id: "surface_message.test_checksum",

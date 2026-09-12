@@ -216,6 +216,7 @@ where
             approval_coordinator: None,
             skill_profiles: Vec::new(),
             agent_skill_profile: AgentSkillProfile::default(),
+            skill_task_objective: None,
             skill_prompt_assets: Vec::new(),
             skill_instruction_source: None,
             memory_agent_id: "primary".to_string(),

@@ -23,6 +23,7 @@ async fn runtime_agent_routes_preserve_rejection_for_unrecoverable_process_handl
     services
         .agent_runtime()
         .restore_verified_run(runtime::AgentRunSnapshot {
+            agentic_binding: None,
             execution_identity: harness_contract::execution::ExecutionIdentity::for_agent_node(
                 &graph_identity,
                 format!("run-{agent_id}"),

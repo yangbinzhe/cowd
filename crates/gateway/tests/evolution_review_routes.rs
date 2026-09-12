@@ -7,7 +7,7 @@ use tower::ServiceExt;
 
 #[tokio::test]
 async fn runtime_owned_evolution_reviews_and_policy_are_projected_by_gateway() {
-    let harness = GatewayTestHarness::in_memory().expect("test harness");
+    let harness = GatewayTestHarness::postgres().expect("test harness");
 
     let reviews = harness
         .router()

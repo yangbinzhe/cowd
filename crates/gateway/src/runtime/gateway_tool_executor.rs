@@ -167,6 +167,8 @@ fn is_gateway_runtime_control_tool(tool_name: &str) -> bool {
                 | "artifact_publish"
                 | "artifact_materialize"
                 | "get_context_remaining"
+                | "working_context"
+                | "private_note"
         )
 }
 

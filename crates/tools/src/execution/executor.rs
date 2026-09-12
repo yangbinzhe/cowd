@@ -384,9 +384,7 @@ fn run_read_file(lease: &ToolHostLease, input: ReadFileInput) -> Result<String, 
         .path_policy()
         .resolve(&input.path)
         .map_err(io_to_string)?;
-    let fingerprint = file_fingerprint(&resolved);
-    let scope = file_cache_scope(&resolved);
-    cached_json_tool(lease, "read_file", &input, &fingerprint, &scope, || {
+    let operation = || {
         read_file(
             lease.path_policy(),
             &input.path,
@@ -395,7 +393,50 @@ fn run_read_file(lease: &ToolHostLease, input: ReadFileInput) -> Result<String, 
             input.complete,
         )
         .map_err(io_to_string)
-    })
+    };
+    let Some(authority) = lease.read_cache_authority_digest() else {
+        return to_pretty_json(operation()?);
+    };
+    let fingerprint = file_fingerprint(&resolved);
+    let scope = file_cache_scope(&resolved);
+    let cache_input = serde_json::to_string(
+        &json!({"input":input,"fingerprint":fingerprint,"authority":authority}),
+    )
+    .map_err(|e| e.to_string())?;
+    lease.cache().with_read_flight(
+        lease.workspace_id(),
+        &scope,
+        "read_file",
+        &cache_input,
+        lease.schema_revision(),
+        || {
+            if let Some(cached) = lease.cache().get(
+                lease.workspace_id(),
+                &scope,
+                "read_file",
+                &cache_input,
+                lease.schema_revision(),
+            ) {
+                return Ok(cached);
+            }
+            let token = lease.cache().epoch_token(&scope);
+            let output = to_pretty_json(operation()?)?;
+            if file_fingerprint(&resolved) == fingerprint {
+                if let Some(token) = token {
+                    lease.cache().put_if_current(
+                        lease.workspace_id(),
+                        &scope,
+                        "read_file",
+                        &cache_input,
+                        lease.schema_revision(),
+                        &output,
+                        token,
+                    );
+                }
+            }
+            Ok(output)
+        },
+    )
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -574,46 +615,6 @@ fn run_grep_many(lease: &ToolHostLease, input: GrepManyInput) -> Result<String, 
 #[path = "workspace_snapshot.rs"]
 mod workspace_snapshot;
 use workspace_snapshot::{run_workspace_snapshot, WorkspaceSnapshotInput};
-
-fn cached_json_tool<T, F, O>(
-    lease: &ToolHostLease,
-    tool_name: &str,
-    input: &T,
-    fingerprint: &str,
-    scope: &str,
-    operation: F,
-) -> Result<String, String>
-where
-    T: Serialize,
-    F: FnOnce() -> Result<O, String>,
-    O: Serialize,
-{
-    const UNCACHEABLE_FINGERPRINT: &str = "uncacheable";
-    let input_json = serde_json::to_string(input).map_err(|error| error.to_string())?;
-    if fingerprint == UNCACHEABLE_FINGERPRINT {
-        return to_pretty_json(operation()?);
-    }
-    let cache_input = format!("{input_json}::fingerprint::{fingerprint}");
-    if let Some(cached) = lease.cache().get(
-        lease.workspace_id(),
-        scope,
-        tool_name,
-        &cache_input,
-        lease.schema_revision(),
-    ) {
-        return Ok(cached);
-    }
-    let output = to_pretty_json(operation()?)?;
-    lease.cache().put(
-        lease.workspace_id(),
-        scope,
-        tool_name,
-        &cache_input,
-        lease.schema_revision(),
-        &output,
-    );
-    Ok(output)
-}
 
 fn file_cache_scope(path: &Path) -> String {
     format!("file:{}", path.to_string_lossy())

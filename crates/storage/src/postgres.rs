@@ -1648,19 +1648,20 @@ mod tests {
     fn real_pool_set_resets_search_path_between_scoped_and_public_checkouts() {
         let pool_set = real_pool_set();
         let executor = pool_set.executor();
-        let schema = format!("storage_test_{}", std::process::id());
-        executor
+        let fixture = crate::postgres_scope::PostgresTestScope::new();
+        let scoped = fixture.bind(&executor);
+        let schema: String = fixture
+            .reconnect()
             .checkout_critical()
-            .expect("admin checkout")
-            .batch_execute(&format!(
-                "DROP SCHEMA IF EXISTS \"{schema}\" CASCADE; CREATE SCHEMA \"{schema}\""
-            ))
-            .expect("create test schema");
-        let scoped = executor.scoped_namespace(&schema).expect("scoped executor");
+            .unwrap()
+            .query_one("SELECT current_schema()", &[])
+            .unwrap()
+            .get(0);
+        let probe = format!("probe_{}", schema.strip_prefix("cowdtest_").unwrap());
         scoped
             .checkout_critical()
             .expect("scoped checkout")
-            .batch_execute("CREATE TABLE namespace_probe(value INTEGER NOT NULL)")
+            .batch_execute(&format!("CREATE TABLE {probe}(value INTEGER NOT NULL)"))
             .expect("create scoped table");
 
         let scoped_path: String = scoped
@@ -1682,15 +1683,9 @@ mod tests {
         assert!(executor
             .checkout_online_read()
             .expect("public table probe")
-            .query_opt("SELECT to_regclass('namespace_probe')::text", &[])
+            .query_opt("SELECT to_regclass($1)::text", &[&probe])
             .expect("public table probe query")
             .and_then(|row| row.get::<_, Option<String>>(0))
             .is_none());
-
-        executor
-            .checkout_critical()
-            .expect("cleanup checkout")
-            .batch_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
-            .expect("drop test schema");
     }
 }

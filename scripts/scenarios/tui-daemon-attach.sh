@@ -6,9 +6,9 @@ TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT/target}"
 BIN="${COWD_BIN:-$TARGET_ROOT/debug/cowd}"
 PORT="${COWD_TUI_DAEMON_ATTACH_PORT:-18672}"
 BASE_URL="http://127.0.0.1:$PORT"
-GATEWAY_SESSION="cowd-tui-gateway-attach-gateway-$$"
+GATEWAY_PID=""
 TUI_SESSION="cowd-tui-gateway-attach-tui-$$"
-TMP_DIR="$(mktemp -d /tmp/cowd-tui-gateway-attach.XXXXXX)"
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cowd-tui-gateway-attach.XXXXXX")"
 WORKDIR="$TMP_DIR/workspace"
 CONFIG_HOME="$TMP_DIR/config"
 HOME_DIR="$TMP_DIR/home"
@@ -28,9 +28,12 @@ cleanup() {
     echo "preserving TUI Gateway attach temp dir: $TMP_DIR" >&2
     return
   fi
+  if [[ -n "$GATEWAY_PID" ]]; then
+    kill "$GATEWAY_PID" >/dev/null 2>&1 || true
+    wait "$GATEWAY_PID" >/dev/null 2>&1 || true
+  fi
   if command -v tmux >/dev/null 2>&1; then
     tmux kill-session -t "$TUI_SESSION" >/dev/null 2>&1 || true
-    tmux kill-session -t "$GATEWAY_SESSION" >/dev/null 2>&1 || true
   fi
   for _ in {1..5}; do
     rm -rf "$TMP_DIR" 2>/dev/null && return 0
@@ -93,6 +96,11 @@ permissions:
   default_mode: "danger-full-access"
 memory:
   enabled: false
+storage:
+  backend: postgres
+  postgres:
+    logicalIdentity: "cowd-tui-daemon-attach"
+    secretRef: "env:COWD_TEST_POSTGRES_URL"
 gateway:
   enabled: true
   sessionReset: "none"
@@ -108,11 +116,20 @@ EOF
 cp "$CONFIG_HOME/config.yaml" "$HOME_DIR/.cowd/config.yaml"
 cp "$CONFIG_HOME/config.yaml" "$WORKDIR/.cowd/config.yaml"
 
-tmux new-session -d -s "$GATEWAY_SESSION" \
-  "bash -lc \"cd '$WORKDIR' && \
-    export COWD_CONFIG_HOME='$CONFIG_HOME' && \
-    export HOME='$HOME_DIR' && \
-    '$BIN' gateway run >'$GATEWAY_LOG' 2>&1\""
+(
+  cd "$WORKDIR"
+  env COWD_CONFIG_HOME="$CONFIG_HOME" HOME="$HOME_DIR" \
+    COWD_TEST_POSTGRES_URL="$COWD_TEST_POSTGRES_URL" \
+    "$BIN" storage upgrade
+)
+
+(
+  cd "$WORKDIR"
+  env COWD_CONFIG_HOME="$CONFIG_HOME" HOME="$HOME_DIR" \
+    COWD_TEST_POSTGRES_URL="$COWD_TEST_POSTGRES_URL" \
+    "$BIN" gateway run >"$GATEWAY_LOG" 2>&1
+) &
+GATEWAY_PID=$!
 
 for _ in {1..100}; do
   if curl -fsS "$BASE_URL/health" >/dev/null 2>&1; then
@@ -172,5 +189,7 @@ curl -fsS "$BASE_URL/api/connectors/resources" \
   | python3 -c 'import json,sys; data=json.load(sys.stdin); text=json.dumps(data); assert "tui-daemon-tui-doc" in text or "tui-daemon TUI Attach Doc" in text, data'
 
 tmux kill-session -t "$TUI_SESSION" >/dev/null 2>&1 || true
-tmux kill-session -t "$GATEWAY_SESSION" >/dev/null 2>&1 || true
+kill "$GATEWAY_PID" >/dev/null 2>&1 || true
+wait "$GATEWAY_PID" >/dev/null 2>&1 || true
+GATEWAY_PID=""
 echo "TUI Gateway attach scenario passed"

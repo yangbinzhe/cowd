@@ -204,7 +204,7 @@ impl ToolExecutionPlane {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        let mut admission = match self
+        let admission = match self
             .admit(
                 demand,
                 timeout,
@@ -220,9 +220,12 @@ impl ToolExecutionPlane {
         self.counters.active.fetch_add(1, Ordering::AcqRel);
         let counters = Arc::clone(&self.counters);
         let mut worker = tokio::task::spawn_blocking(move || {
+            // The physical operation owns its admission. Aborting the async
+            // waiter cannot release a path lock while this thread still writes.
+            let mut admission = admission;
             let result = std::panic::catch_unwind(AssertUnwindSafe(operation));
             counters.active.fetch_sub(1, Ordering::AcqRel);
-            match result {
+            let execution = match result {
                 Ok(value) => {
                     counters.completed.fetch_add(1, Ordering::Relaxed);
                     Ok(value)
@@ -232,15 +235,19 @@ impl ToolExecutionPlane {
                     counters.panicked.fetch_add(1, Ordering::Relaxed);
                     Err(ToolExecutionPlaneError::Panicked)
                 }
-            }
+            };
+            admission.set_result_class(if execution.is_ok() {
+                ResourceResultClass::Completed
+            } else {
+                ResourceResultClass::Failed
+            });
+            (execution, admission)
         });
 
         let mut soft_timed_out = false;
-        let execution = if let Some(timeout) = timeout {
+        let joined = if let Some(timeout) = timeout {
             match tokio::time::timeout(timeout, &mut worker).await {
-                Ok(joined) => joined.unwrap_or_else(|error| {
-                    Err(ToolExecutionPlaneError::Worker(error.to_string()))
-                }),
+                Ok(joined) => joined,
                 Err(_) => {
                     soft_timed_out = true;
                     self.counters
@@ -250,15 +257,20 @@ impl ToolExecutionPlane {
                         ?timeout,
                         "synchronous tool crossed its soft timeout; waiting for truthful completion"
                     );
-                    worker.await.unwrap_or_else(|error| {
-                        Err(ToolExecutionPlaneError::Worker(error.to_string()))
-                    })
+                    worker.await
                 }
             }
         } else {
-            worker
-                .await
-                .unwrap_or_else(|error| Err(ToolExecutionPlaneError::Worker(error.to_string())))
+            worker.await
+        };
+        let (execution, mut admission) = match joined {
+            Ok(completed) => completed,
+            Err(error) => {
+                return (
+                    Err(ToolExecutionPlaneError::Worker(error.to_string())),
+                    None,
+                )
+            }
         };
         let result_class = if soft_timed_out {
             ResourceResultClass::TimedOut
@@ -665,6 +677,75 @@ mod tests {
 
         drop(admission);
         assert_eq!(waiting.await.unwrap().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn abandoned_blocking_waiter_retains_physical_write_scope_and_quota() {
+        let plane = plane(2);
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("physical.txt");
+        let demand = ResourceDemand {
+            scopes: vec![ResourceScopeDemand {
+                key: "file:abandoned-physical-write".into(),
+                access: ResourceAccess::Write,
+            }],
+            ..ResourceDemand::default()
+        };
+        let (started, began) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        // Dropping this sender also unblocks the physical thread after a panic.
+        let first = {
+            let plane = plane.clone();
+            let demand = demand.clone();
+            let path = path.clone();
+            tokio::spawn(async move {
+                plane
+                    .execute(&demand, None, move || {
+                        std::fs::write(&path, "first-started").unwrap();
+                        let _ = started.send(());
+                        let _ = released.recv();
+                        std::fs::write(&path, "first-finished").unwrap();
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), began)
+            .await
+            .unwrap()
+            .unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert_eq!(plane.stats().active, 1);
+        let second_started = Arc::new(AtomicUsize::new(0));
+        let second = {
+            let plane = plane.clone();
+            let path = path.clone();
+            let marker = second_started.clone();
+            tokio::spawn(async move {
+                plane
+                    .execute(&demand, None, move || {
+                        marker.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first-finished");
+                        std::fs::write(path, "second-finished").unwrap();
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let crossed_unfinished_write = second_started.load(Ordering::SeqCst) != 0;
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            !crossed_unfinished_write,
+            "a different request cannot acquire the abandoned writer's scope"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second-finished");
+        assert_eq!(plane.stats().active, 0);
+        assert_eq!(plane.stats().completed, 2);
     }
 
     #[tokio::test]

@@ -203,6 +203,7 @@ pub struct TaskWithdrawInput {
 pub enum AgentAttemptMode {
     Execute,
     Review,
+    Coordination,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -364,6 +365,7 @@ pub enum ObjectiveReviewDecision {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectiveReviewInput {
+    /// Exact Goal criterion or obligation reference returned by state_inspect.
     pub criterion_ref: String,
     pub decision: ObjectiveReviewDecision,
     #[serde(default)]

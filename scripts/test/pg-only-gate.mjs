@@ -48,7 +48,7 @@ for (const file of files) {
 
 let dependencyViolation = false;
 try {
-  const tree = execFileSync("cargo", ["tree", "--workspace", "--all-features"], {
+  const tree = execFileSync("cargo", ["tree", "--workspace", "--all-features", "--edges", "all", "--locked"], {
     cwd: root,
     encoding: "utf8",
   });

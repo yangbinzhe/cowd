@@ -89,18 +89,43 @@ pub(crate) fn apply_task_attempt_dispatch(
             generation: input.generation,
         },
     );
+    if input.mode == AgentAttemptMode::Coordination {
+        if let Some(entry) = projection
+            .topics
+            .values_mut()
+            .flatten()
+            .find(|entry| entry.revision == input.generation)
+        {
+            entry.coordination = Some(super::program::AgenticCoordinationConsumption {
+                execution_id: input.execution_id.clone(),
+                agent_id: input.agent_ref.clone(),
+                membership_id: input.membership_id.clone(),
+                settled: false,
+                reason: None,
+            });
+        }
+    }
 }
 
 pub(crate) fn apply_task_attempt_fail(
     projection: &mut AgenticProgramProjection,
     input: &TaskAttemptFailInput,
 ) {
+    if input.mode == AgentAttemptMode::Coordination {
+        projection.settle_coordination(&input.execution_id, Some(input.reason.clone()));
+    }
     if let Some(task) = projection.tasks.get_mut(&input.task_ref) {
-        task.active_attempts.remove(&input.execution_id);
+        let attempt = task.active_attempts.remove(&input.execution_id);
         if task.status == AgenticTaskStatus::CancelRequested {
-            if task.active_attempts.is_empty() {
+            if task.claim_execution_id.as_deref() == Some(input.execution_id.as_str()) {
+                task.claim_execution_id = None;
+            }
+            if task.active_attempts.is_empty() && task.claim_execution_id.is_none() {
                 finalize_pending_retirement(task);
             }
+            return;
+        }
+        if input.mode == AgentAttemptMode::Coordination {
             return;
         }
         // Retries are controlled by evidence of progress, not an arbitrary
@@ -116,7 +141,20 @@ pub(crate) fn apply_task_attempt_fail(
                 .is_some_and(|previous| previous == input.reason);
         task.last_failure = Some(input.reason.clone());
         match input.mode {
+            AgentAttemptMode::Coordination => {
+                unreachable!("coordination settles without business failure")
+            }
             AgentAttemptMode::Execute => {
+                // A failure before the first claim still consumes a physical
+                // opportunity. Give recovery a fresh graph identity without
+                // forging the Agent's claim or reusing its old graph.
+                if task.claim_execution_id.is_none()
+                    && attempt
+                        .as_ref()
+                        .is_some_and(|attempt| attempt.generation == task.claim_generation)
+                {
+                    task.claim_generation = task.claim_generation.saturating_add(1);
+                }
                 task.failed_attempts = task.failed_attempts.saturating_add(1);
                 task.claimant = None;
                 task.claim_execution_id = None;
@@ -189,14 +227,26 @@ pub(crate) fn apply_task_release(
     envelope: &AgentActionEnvelope,
     input: &TaskReleaseInput,
 ) {
+    let coordination = projection
+        .coordination_attempt(envelope.actor.execution_id.as_deref().unwrap_or(""))
+        .is_some();
+    if coordination {
+        projection.settle_coordination(envelope.actor.execution_id.as_deref().unwrap_or(""), None);
+    }
     if let Some(task) = projection.tasks.get_mut(&input.task_ref) {
         if let Some(execution_id) = envelope.actor.execution_id.as_deref() {
             task.active_attempts.remove(execution_id);
         }
         if task.status == AgenticTaskStatus::CancelRequested {
-            if task.active_attempts.is_empty() {
+            if task.claim_execution_id == envelope.actor.execution_id {
+                task.claim_execution_id = None;
+            }
+            if task.active_attempts.is_empty() && task.claim_execution_id.is_none() {
                 finalize_pending_retirement(task);
             }
+            return;
+        }
+        if coordination {
             return;
         }
         task.status = AgenticTaskStatus::Published;

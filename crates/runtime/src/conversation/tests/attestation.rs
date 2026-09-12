@@ -1,4 +1,65 @@
     #[tokio::test]
+    async fn delegated_leaf_does_not_double_acquire_the_single_tool_slot() {
+        use crate::execution_core::graph::{ExecutionResourceKind, ExecutionResourceManager, ResourceQuota, ScopeLockManager};
+        struct DelegatedTool {
+            plane: Arc<crate::ToolExecutionPlane>,
+            inner: RecordingToolExecutor,
+        }
+        #[async_trait::async_trait]
+        impl ToolExecutor for DelegatedTool {
+            async fn execute_output(&self, name: &str, input: &str) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+                let (output, admission) = self.plane.execute_async_classified_retained(
+                    &harness_contract::tool::ResourceDemand::default(), None,
+                    Default::default(), None, Some("single-slot"), self.inner.execute_output(name, input),
+                ).await;
+                drop(admission);
+                output.map_err(|error| ToolError::new(error.to_string()))?
+            }
+            fn available_tool_names(&self) -> Vec<String> { self.inner.available_tool_names() }
+            fn registered_tool_effect(&self, name: &str, input: &serde_json::Value) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+                self.inner.registered_tool_effect(name, input)
+            }
+            fn owns_tool_resource_admission(&self, _: &str) -> bool { true }
+            async fn execute_authorized_output(&self, _: &harness_contract::tool::ToolExecutionAuthorization, name: &str, input: &str) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+                self.execute_output(name, input).await
+            }
+        }
+        let plane = Arc::new(crate::ToolExecutionPlane::new(
+            Arc::new(ExecutionResourceManager::new([
+                (ExecutionResourceKind::Tool, ResourceQuota::new(1, 1, 1).unwrap()),
+                (ExecutionResourceKind::Custom("tool.cpu".into()), ResourceQuota::new(1, 1, 1).unwrap()),
+            ])),
+            Arc::new(ScopeLockManager::new()),
+        ));
+        let executed = Arc::new(AtomicUsize::new(0));
+        let services = crate::RuntimeServices::in_memory().unwrap();
+        let session = Session::new();
+        let store = Arc::new(crate::test_support::session_store());
+        store.create_session(&session::SessionRecord {
+            session_id: session.session_id.clone(), platform: "test".into(), chat_id: "single-slot".into(),
+            user_id: None, model: None, created_at: "2026-09-09T00:00:00Z".into(),
+            last_activity: "2026-09-09T00:00:00Z".into(), message_count: 0,
+            reset_policy: "manual".into(), metadata_json: None, input_tokens: 0, output_tokens: 0, status: "active".into(),
+        }).await.unwrap();
+        let runtime = crate::ConversationRuntime::new(
+            session, FinalAnswerClient,
+            DelegatedTool { plane: plane.clone(), inner: RecordingToolExecutor { executed: executed.clone(), order: Arc::new(Mutex::new(vec![])) } },
+            PermissionPolicy::new(crate::PermissionMode::DangerFullAccess), vec!["bounded read".into()],
+        ).without_memory().with_runtime_event_store(services.event_store().clone()).with_tool_execution_plane(plane.clone())
+            .with_session_journal_port(crate::session_runtime_port::TestSessionPortAdapter::new(store))
+            .with_artifact_store(services.artifact_store().clone());
+        runtime.begin_turn_strategy("single-slot", "read current file").unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), runtime.execute_tool_batch_step(
+            &[ModelToolCall { id: "read".into(), name: "read_file".into(), input: "{\"path\":\"README.md\"}".into(), depends_on: vec![] }],
+            &crate::SharedPrompter::none(), 1,
+        )).await.expect("outer conversation cannot hold the slot needed by its delegated leaf").unwrap();
+        assert_eq!(result.failed, 0, "{:?}", result.messages);
+        assert_eq!(executed.load(Ordering::SeqCst), 1);
+        assert_eq!(plane.stats().active, 0);
+        assert_eq!(plane.stats().submitted, 1, "one invocation must acquire one Tool admission");
+    }
+
+    #[tokio::test]
     async fn write_team_downgrade_retargets_registered_parent_to_execute_topology() {
         let services = crate::RuntimeServices::in_memory().expect("runtime services");
         let mut current = ExecutionGraphCompiler
@@ -88,6 +149,9 @@
             .await
             .unwrap();
         let cowd_bus = crate::CowdEventBus::new();
+        crate::test_support::register_running_root(Arc::clone(services.event_store()), &crate::CowdExecutionContext {
+            execution_id: "test-root-execution".into(), session_id: session.session_id.clone(), turn_id: "test-turn".into(),
+        });
         let _execution_scope = cowd_bus.enter_execution_with_activity(
             crate::CowdExecutionContext {
                 execution_id: "test-root-execution".to_string(),
@@ -356,6 +420,7 @@
             compilation,
             &decision,
             services.tool_execution_plane(),
+            services.tool_batch_executor(),
             services.commit_service(),
             &BTreeMap::new(),
         )

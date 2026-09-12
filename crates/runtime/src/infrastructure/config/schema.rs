@@ -613,7 +613,52 @@ pub struct AgentExecutorCommandConfig {
     pub environment_refs: BTreeMap<String, String>,
     #[serde(default)]
     pub sandbox_profile: AgentExecutorSandboxProfile,
+    #[serde(default)]
+    pub transport_limits: AgentProcessTransportLimits,
     pub manifest_digest: String,
+}
+
+/// Operator-owned per-run transport bounds, never a total business-content budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentProcessTransportLimits {
+    pub frame_bytes: usize,
+    pub content_chunk_bytes: usize,
+    pub pending_uploads: usize,
+    pub pending_commands: usize,
+    pub cached_tool_responses: usize,
+    pub stderr_tail_bytes: usize,
+    pub handshake_timeout_ms: u64,
+}
+
+impl Default for AgentProcessTransportLimits {
+    fn default() -> Self {
+        Self {
+            frame_bytes: 256 * 1024,
+            content_chunk_bytes: 64 * 1024,
+            pending_uploads: 32,
+            pending_commands: 32,
+            cached_tool_responses: 32,
+            stderr_tail_bytes: 256 * 1024,
+            handshake_timeout_ms: 30_000,
+        }
+    }
+}
+
+impl AgentProcessTransportLimits {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if !(1..=16 * 1024 * 1024).contains(&self.frame_bytes)
+            || !(1..=self.frame_bytes).contains(&self.content_chunk_bytes)
+            || !(1..=1024).contains(&self.pending_uploads)
+            || !(1..=1024).contains(&self.pending_commands)
+            || !(1..=1024).contains(&self.cached_tool_responses)
+            || !(1..=16 * 1024 * 1024).contains(&self.stderr_tail_bytes)
+            || !(1..=600_000).contains(&self.handshake_timeout_ms)
+        {
+            return Err("invalid ProcessJsonl transport_limits: positive buffers <=16MiB, chunk<=frame, queue/upload/cache slots<=1024, handshake<=600000ms required".into());
+        }
+        Ok(())
+    }
 }
 
 /// Small, explicit sandbox profiles for an external Agent executable. This

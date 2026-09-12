@@ -12,7 +12,7 @@ use tower::ServiceExt;
 /// have the route treat it as an authenticated identity.
 #[tokio::test]
 async fn protected_mutation_rejects_a_forged_actor_payload() {
-    let harness = GatewayTestHarness::in_memory().expect("gateway test harness");
+    let harness = GatewayTestHarness::postgres().expect("gateway test harness");
     let response = harness
         .router()
         .oneshot(
@@ -38,7 +38,7 @@ async fn protected_mutation_rejects_a_forged_actor_payload() {
 
 #[tokio::test]
 async fn protected_routes_require_the_configured_bearer_credential() {
-    let harness = GatewayTestHarness::in_memory_with_auth_token("gateway-test-token")
+    let harness = GatewayTestHarness::postgres_with_auth_token("gateway-test-token")
         .expect("authenticated gateway test harness");
 
     for authorization in [None, Some("Bearer wrong-token")] {
@@ -76,7 +76,7 @@ async fn protected_routes_require_the_configured_bearer_credential() {
 
 #[tokio::test]
 async fn lifecycle_keeps_each_authenticated_surface_attachment_distinct() {
-    let harness = GatewayTestHarness::in_memory_with_auth_token("gateway-test-token")
+    let harness = GatewayTestHarness::postgres_with_auth_token("gateway-test-token")
         .expect("authenticated gateway test harness");
     let app = harness.router();
 
@@ -192,7 +192,7 @@ async fn lifecycle_keeps_each_authenticated_surface_attachment_distinct() {
 
 #[tokio::test]
 async fn every_session_mutation_route_fails_closed_without_a_writer_observer() {
-    let harness = GatewayTestHarness::in_memory().expect("gateway test harness");
+    let harness = GatewayTestHarness::postgres().expect("gateway test harness");
     let app = harness.router();
     let session_id = "writer-route-contract";
     let ensured = app
@@ -275,7 +275,7 @@ async fn every_session_mutation_route_fails_closed_without_a_writer_observer() {
 
 #[tokio::test]
 async fn task_slash_dispatch_executes_the_gateway_owned_task_service() {
-    let harness = GatewayTestHarness::in_memory().expect("gateway test harness");
+    let harness = GatewayTestHarness::postgres().expect("gateway test harness");
     let app = harness.router();
     let session_id = "task-slash-auth-session";
     let observer_id = "tui:task-slash-auth";
@@ -351,7 +351,7 @@ async fn task_slash_dispatch_executes_the_gateway_owned_task_service() {
 
 #[tokio::test]
 async fn webui_login_uses_a_one_day_http_only_cookie_not_a_browser_token() {
-    let harness = GatewayTestHarness::in_memory_with_auth_token("gateway-test-token")
+    let harness = GatewayTestHarness::postgres_with_auth_token("gateway-test-token")
         .expect("authenticated gateway test harness");
     let login = harness
         .router()
@@ -402,7 +402,7 @@ async fn webui_login_uses_a_one_day_http_only_cookie_not_a_browser_token() {
 #[tokio::test]
 async fn cross_plane_and_connector_routes_reject_payload_principals_and_inject_the_verified_actor()
 {
-    let harness = GatewayTestHarness::in_memory().expect("gateway test harness");
+    let harness = GatewayTestHarness::postgres().expect("gateway test harness");
 
     let forged_connector = harness
         .router()

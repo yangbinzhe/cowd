@@ -31,6 +31,32 @@ pub(crate) fn apply_team_create(
             lifecycle: AgenticTeamLifecycle::Active,
         },
     );
+    // The creation action already proved the immutable run's organizing
+    // grant. Keep its scoped delegation in the existing membership journal.
+    if matches!(
+        envelope.actor.kind,
+        harness_contract::agent_action::AgentActorKind::Agent
+            | harness_contract::agent_action::AgentActorKind::TeamLead
+    ) {
+        if let (Some(agent_id), Some(execution)) =
+            (&envelope.actor.agent_id, &envelope.actor.execution_id)
+        {
+            apply_membership_update(
+                projection,
+                envelope,
+                &MembershipUpdateInput {
+                    agent_ref: agent_id.clone(),
+                    team_ref: team_id.into(),
+                    operation: MembershipOperation::Join,
+                    reason_ref: None,
+                },
+            );
+            let membership_id = AgenticProgramProjection::membership_id(agent_id, team_id);
+            if let Some(membership) = projection.memberships.get_mut(&membership_id) {
+                membership.delegation_ref = Some(execution.clone());
+            }
+        }
+    }
 }
 
 pub(crate) fn apply_membership_update(

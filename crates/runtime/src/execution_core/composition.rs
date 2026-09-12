@@ -346,6 +346,9 @@ impl RuntimeServicesBuilder {
             "Runtime service graph assembly completed"
         );
         services.install_graph_settled_observer()?;
+        crate::execution_core::graph::executors::agent_tool::AgentToolBatchResolver::install(
+            &services,
+        );
         let task_recovery_started_at = Instant::now();
         services
             .task_runtime_port()

@@ -1749,7 +1749,43 @@ mod tests {
                 completion: GoalCompletion::Open,
                 revision: 1,
                 user_sequence: 1,
-                reviews: Vec::new(),
+                reviews: vec![harness_contract::goal::ObjectiveReviewRecord {
+                    review_id: "projection-semantic-review".into(),
+                    criterion_ref: "terminal_synthesis".into(),
+                    spec_revision: 1,
+                    input_manifest_digest: "projection-test".into(),
+                    result_refs: vec![final_artifact.clone()],
+                    evidence_refs: vec!["tool://decision-review".into()],
+                    reviewer_actor: "root-projection-reviewer".into(),
+                    reviewer_execution_id: Some(execution_id.into()),
+                    producer_refs: vec![reviewer_id.clone()],
+                    decision: "satisfied".into(),
+                    reason_ref: "tool://decision-review".into(),
+                    // Pure projection fixture: physical receipt ingress has separate tests.
+                    verification: Some(harness_contract::goal::ObjectiveReviewVerification {
+                        result_source_revisions: Default::default(),
+                        independence_required: true,
+                        review_policy_digest: None,
+                        effect_manifest_digest: None,
+                        effect_source_refs: Vec::new(),
+                        goal_spec_revision: Some(1),
+                        goal_spec_digest: Some("projection-test".into()),
+                        work_manifest_digest: crate::agentic::review_evidence::work_manifest_digest(
+                            &actions.project("program-agentic-projection").unwrap(),
+                        ),
+                        reviewer_execution_id: execution_id.into(),
+                        producer_execution_ids: vec!["projection-producer-run".into()],
+                        reads: vec![harness_contract::goal::ObjectiveResultReadProof {
+                            result_kind: harness_contract::goal::GoalResultKind::Artifact,
+                            effect_observation_refs: vec![],
+                            result_ref: final_artifact.clone(),
+                            content_ref: "artifact://projection-fixture".into(),
+                            sha256: "projection-fixture-hash".into(),
+                            bytes: 1,
+                            receipt_refs: vec!["fixture:read".into()],
+                        }],
+                    }),
+                }],
             })
             .expect("create objective goal");
         let before_completion = snapshot(&services, execution_id, &context(&services))

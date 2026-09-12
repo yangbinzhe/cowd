@@ -128,6 +128,13 @@ pub trait NodeExecutor: Send + Sync {
     async fn cancel(&self, _ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
         Ok(())
     }
+    /// Physical effects cannot be abandoned by a cancellation propagation timeout.
+    fn cancellation_requires_quiescence(&self, _ticket: &NodeExecutionTicket) -> bool {
+        false
+    }
+    /// Called after process-local drivers stop. Finish retained physical work
+    /// without inventing a business cancellation or terminal graph result.
+    async fn drain_physical_execution(&self) {}
     /// Release process-local cancellation intent after the graph command has
     /// either committed or definitively failed. Implementations must not
     /// mutate durable graph state from this callback.
@@ -181,6 +188,22 @@ impl NodeExecutorRegistry {
             .keys()
             .cloned()
             .collect()
+    }
+
+    pub(crate) async fn drain_physical_execution(&self) {
+        let executors = self
+            .executors
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        futures::future::join_all(
+            executors
+                .iter()
+                .map(|executor| executor.drain_physical_execution()),
+        )
+        .await;
     }
 
     pub fn validate_graph(&self, graph: &ExecutionGraph) -> Result<(), NodeExecutorError> {

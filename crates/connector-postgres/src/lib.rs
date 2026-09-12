@@ -352,11 +352,16 @@ impl ResourceDirectoryFactory for PostgresResourceDirectoryFactory {
 }
 
 #[cfg(test)]
+#[path = "../../storage/test-support/postgres_scope.rs"]
+mod postgres_scope;
+
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
+    use crate::postgres_scope::PostgresTestScope;
     use connector::ResourceDirectoryRepository;
-    use storage::{PostgresConnectionConfig, PostgresMigrationSpec, StaticSecretRefResolver};
+    use storage::PostgresMigrationSpec;
 
     use super::*;
 
@@ -367,18 +372,9 @@ mod tests {
     #[test]
     #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
     fn postgres_resource_directory_migrates_restarts_and_handles_concurrency() {
-        let url =
-            std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
-        let resolver = StaticSecretRefResolver::new([("test.pg".to_string(), url)]);
-        let directory = PostgresResourceDirectory::connect(
-            PostgresConnectionConfig::new(
-                "connector-directory-test",
-                "test.pg",
-                "cowd-connector-postgres-contract",
-            ),
-            &resolver,
-        )
-        .expect("postgres directory opens");
+        let fixture = PostgresTestScope::new();
+        let directory =
+            PostgresResourceDirectory::new(fixture.reconnect()).expect("postgres directory opens");
         let checksum_original = PostgresMigrationSpec {
             id: "connector_directory.test_checksum",
             domain: "connector_directory_test_checksum",
@@ -438,15 +434,8 @@ mod tests {
                 .indexed_state,
             "indexed"
         );
-        let restarted = PostgresResourceDirectory::connect(
-            PostgresConnectionConfig::new(
-                "connector-directory-test",
-                "test.pg",
-                "cowd-connector-postgres-restart-contract",
-            ),
-            &resolver,
-        )
-        .expect("postgres directory restarts");
+        let restarted = PostgresResourceDirectory::new(fixture.reconnect())
+            .expect("postgres directory restarts");
         assert_eq!(
             restarted
                 .get(&first.reference)

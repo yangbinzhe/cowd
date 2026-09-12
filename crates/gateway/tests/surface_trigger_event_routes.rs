@@ -7,7 +7,7 @@ use tower::ServiceExt;
 
 #[tokio::test]
 async fn trigger_event_retry_is_surface_scoped_and_only_revives_dead_letters() {
-    let harness = GatewayTestHarness::in_memory().expect("test harness");
+    let harness = GatewayTestHarness::postgres().expect("test harness");
     let key = harness
         .seed_dead_letter_trigger_event("feishu", "surface-dead-letter-1")
         .expect("dead-letter fixture");

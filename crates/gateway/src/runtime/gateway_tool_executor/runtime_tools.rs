@@ -244,7 +244,9 @@ impl GatewayToolExecutor {
         binding: RuntimeToolExecutionBinding<'_>,
     ) -> Result<String, ToolError> {
         if matches!(tool_name, "artifact_publish" | "artifact_materialize") {
-            return self.execute_content_publication(tool_name, value, binding).await;
+            return self
+                .execute_content_publication(tool_name, value, binding)
+                .await;
         }
         if is_agent_action_tool(tool_name) {
             let services = self.runtime_services.get().cloned().ok_or_else(|| {
@@ -412,6 +414,48 @@ impl GatewayToolExecutor {
                 .execute_get_context_remaining(input, binding.session_id)
                 .await;
         }
+        if tool_name == "private_note" {
+            let input: runtime::working_context::PrivateNoteInput =
+                serde_json::from_value(value)
+                    .map_err(|error| self.input_contract_error(tool_name, error))?;
+            let context = binding.memory_context.ok_or_else(|| {
+                ToolError::new("private_note requires the exact Runtime Memory binding")
+            })?;
+            if binding.session_id != Some(context.session_id.as_str()) {
+                return Err(ToolError::new("private note Session binding mismatch"));
+            }
+            let services = self
+                .runtime_services
+                .get()
+                .ok_or_else(|| ToolError::new("private note Runtime unavailable"))?;
+            let output = services
+                .private_note_command(context, binding.action_id.unwrap_or(""), input)
+                .await
+                .map_err(ToolError::new)?;
+            return serde_json::to_string(&output)
+                .map_err(|error| ToolError::new(error.to_string()));
+        }
+        if tool_name == "working_context" {
+            let input: runtime::working_context::WorkingContextInput =
+                serde_json::from_value(value)
+                    .map_err(|error| self.input_contract_error(tool_name, error))?;
+            let context = binding.memory_context.ok_or_else(|| {
+                ToolError::new("working_context requires the exact Runtime Memory binding")
+            })?;
+            if binding.session_id != Some(context.session_id.as_str()) {
+                return Err(ToolError::new("working context Session binding mismatch"));
+            }
+            let services = self
+                .runtime_services
+                .get()
+                .ok_or_else(|| ToolError::new("working context Runtime unavailable"))?;
+            let output = services
+                .working_context_command(context, binding.action_id.unwrap_or(""), input)
+                .await
+                .map_err(ToolError::new)?;
+            return serde_json::to_string(&output)
+                .map_err(|error| ToolError::new(error.to_string()));
+        }
         if tool_name == "context_retrieve" {
             let input: ContextRetrieveRequest = serde_json::from_value(value)
                 .map_err(|error| self.input_contract_error(tool_name, error))?;
@@ -574,25 +618,65 @@ impl GatewayToolExecutor {
             ToolError::new("context_retrieve requires the workspace RuntimeServices")
         })?;
         let limit = input.limit.unwrap_or(8).clamp(1, 16);
-        if input.cursor.is_some() && (input.memory_id.is_some() || input.entry_ref.is_some() || input.message_id.is_some() || input.sequence.is_some()) {
-            return Err(ToolError::new("directory cursor cannot be combined with an exact read"));
+        if input.cursor.is_some()
+            && (input.memory_id.is_some()
+                || input.entry_ref.is_some()
+                || input.message_id.is_some()
+                || input.sequence.is_some())
+        {
+            return Err(ToolError::new(
+                "directory cursor cannot be combined with an exact read",
+            ));
         }
-        if (input.message_id.is_some() || input.sequence.is_some() || input.block_cursor.is_some() || input.block_limit.is_some() || input.before_sequence.is_some()) && input.source!=ContextRetrieveSource::SessionHistory {
-            return Err(ToolError::new("message selectors apply only to source=session_history"));
+        if (input.message_id.is_some()
+            || input.sequence.is_some()
+            || input.block_cursor.is_some()
+            || input.block_limit.is_some()
+            || input.before_sequence.is_some())
+            && input.source != ContextRetrieveSource::SessionHistory
+        {
+            return Err(ToolError::new(
+                "message selectors apply only to source=session_history",
+            ));
         }
-        if (input.block_cursor.is_some() || input.block_limit.is_some()) && input.message_id.is_none() && input.sequence.is_none() {
-            return Err(ToolError::new("block controls require an exact message selector"));
+        if (input.block_cursor.is_some() || input.block_limit.is_some())
+            && input.message_id.is_none()
+            && input.sequence.is_none()
+        {
+            return Err(ToolError::new(
+                "block controls require an exact message selector",
+            ));
         }
-        if input.message_digest.is_some() && (input.source!=ContextRetrieveSource::SessionHistory || (input.message_id.is_none() && input.sequence.is_none())) {
-            return Err(ToolError::new("message_digest requires an exact Session message read"));
+        if input.message_digest.is_some()
+            && (input.source != ContextRetrieveSource::SessionHistory
+                || (input.message_id.is_none() && input.sequence.is_none()))
+        {
+            return Err(ToolError::new(
+                "message_digest requires an exact Session message read",
+            ));
         }
-        if input.entry_ref.is_some() && !matches!(input.source, ContextRetrieveSource::Program | ContextRetrieveSource::Fact | ContextRetrieveSource::Matrix) {
-            return Err(ToolError::new("entry_ref requires source=program, fact or matrix"));
+        if input.entry_ref.is_some()
+            && !matches!(
+                input.source,
+                ContextRetrieveSource::Program
+                    | ContextRetrieveSource::Fact
+                    | ContextRetrieveSource::Matrix
+            )
+        {
+            return Err(ToolError::new(
+                "entry_ref requires source=program, fact or matrix",
+            ));
         }
         if input.content_cursor.is_some()
-            && !((input.source == ContextRetrieveSource::Memory && input.memory_id.is_some()) || (matches!(input.source, ContextRetrieveSource::Fact | ContextRetrieveSource::Matrix) && input.entry_ref.is_some()))
+            && !((input.source == ContextRetrieveSource::Memory && input.memory_id.is_some())
+                || (matches!(
+                    input.source,
+                    ContextRetrieveSource::Fact | ContextRetrieveSource::Matrix
+                ) && input.entry_ref.is_some()))
         {
-            return Err(ToolError::new("content_cursor requires an exact Memory, Fact or Matrix read"));
+            return Err(ToolError::new(
+                "content_cursor requires an exact Memory, Fact or Matrix read",
+            ));
         }
         if input.memory_id.is_some() && input.source != ContextRetrieveSource::Memory {
             return Err(ToolError::new("memory_id is valid only with source=memory"));
@@ -610,7 +694,10 @@ impl GatewayToolExecutor {
             return Err(ToolError::new("parent_ref requires source=fact"));
         }
         let value = match input.source {
-            ContextRetrieveSource::Fact | ContextRetrieveSource::Matrix => self.retrieve_reality_context(&input,binding,&services,limit).await?,
+            ContextRetrieveSource::Fact | ContextRetrieveSource::Matrix => {
+                self.retrieve_reality_context(&input, binding, &services, limit)
+                    .await?
+            }
             ContextRetrieveSource::Memory => {
                 if input
                     .scope
@@ -726,8 +813,12 @@ impl GatewayToolExecutor {
                             })).collect::<Vec<_>>(), None),
                             Err(error) => (Vec::new(), Some(error.to_string())),
                         }
-                    } else { (Vec::new(), None) };
-                    let page = kernel.discover_page(&context, query, input.cursor.as_deref(), limit).await
+                    } else {
+                        (Vec::new(), None)
+                    };
+                    let page = kernel
+                        .discover_page(&context, query, input.cursor.as_deref(), limit)
+                        .await
                         .map_err(|error| ToolError::new(error.to_string()))?;
                     serde_json::json!({
                         "kind": "runtime.context_retrieval", "source":"memory", "scope":"current_binding",
@@ -750,15 +841,33 @@ impl GatewayToolExecutor {
                 }
             }
             ContextRetrieveSource::Artifact => {
-                if input.scope.is_some_and(|scope| scope != ContextRetrieveScope::Current) || input.session_id.is_some() {
-                    return Err(ToolError::new("Artifact discovery uses only the current Runtime scope grants"));
+                if input
+                    .scope
+                    .is_some_and(|scope| scope != ContextRetrieveScope::Current)
+                    || input.session_id.is_some()
+                {
+                    return Err(ToolError::new(
+                        "Artifact discovery uses only the current Runtime scope grants",
+                    ));
                 }
-                let mut scopes = binding.authorized_scopes.to_vec(); scopes.push(format!("session:{session_id}"));
-                let page = services.artifact_store().discover_page(&scopes,query.as_deref().unwrap_or(""),input.cursor.as_deref(),limit).await
+                let mut scopes = binding.authorized_scopes.to_vec();
+                scopes.push(format!("session:{session_id}"));
+                let page = services
+                    .artifact_store()
+                    .discover_page(
+                        &scopes,
+                        query.as_deref().unwrap_or(""),
+                        input.cursor.as_deref(),
+                        limit,
+                    )
+                    .await
                     .map_err(|error| ToolError::new(error.to_string()))?;
                 let next = page.next_cursor.as_ref().map(|cursor| {
-                    let mut request = serde_json::json!({"source":"artifact","limit":limit,"cursor":cursor});
-                    if let Some(query) = &query { request["query"] = serde_json::json!(query); }
+                    let mut request =
+                        serde_json::json!({"source":"artifact","limit":limit,"cursor":cursor});
+                    if let Some(query) = &query {
+                        request["query"] = serde_json::json!(query);
+                    }
                     request
                 });
                 serde_json::json!({"kind":"runtime.context_retrieval","source":"artifact","scope":"current_binding","status":"completed",
@@ -773,20 +882,42 @@ impl GatewayToolExecutor {
                         "complete":page.next_cursor.is_none()},})
             }
             ContextRetrieveSource::Program => {
-                if input.scope.is_some_and(|scope| scope != ContextRetrieveScope::Current) || input.session_id.is_some() {
-                    return Err(ToolError::new("Program discovery uses only the current Runtime Program binding"));
+                if input
+                    .scope
+                    .is_some_and(|scope| scope != ContextRetrieveScope::Current)
+                    || input.session_id.is_some()
+                {
+                    return Err(ToolError::new(
+                        "Program discovery uses only the current Runtime Program binding",
+                    ));
                 }
                 let mut request = serde_json::json!({"wait_for_workers":false});
-                if let Some(query) = &query { request["query"] = serde_json::json!(query); }
-                if let Some(reference) = &input.entry_ref { request["entry_ref"] = serde_json::json!(reference); }
-                if let Some(cursor) = &input.cursor { request["page_cursor"] = serde_json::json!(cursor); }
+                if let Some(query) = &query {
+                    request["query"] = serde_json::json!(query);
+                }
+                if let Some(reference) = &input.entry_ref {
+                    request["entry_ref"] = serde_json::json!(reference);
+                }
+                if let Some(cursor) = &input.cursor {
+                    request["page_cursor"] = serde_json::json!(cursor);
+                }
                 // Delegation to the existing read-only action retains its exact
                 // actor/Program fence and never creates a second projection.
-                let output = Box::pin(self.execute_runtime_tool_with_binding("state_inspect", request, binding)).await?;
-                let observation: harness_contract::agent_action::AgentActionObservation = serde_json::from_str(&output)
-                    .map_err(|error| ToolError::new(error.to_string()))?;
-                if observation.status == harness_contract::agent_action::AgentActionStatus::Rejected {
-                    return Err(ToolError::new(observation.error.map_or_else(|| "Program discovery rejected".into(), |error| error.message)));
+                let output = Box::pin(self.execute_runtime_tool_with_binding(
+                    "state_inspect",
+                    request,
+                    binding,
+                ))
+                .await?;
+                let observation: harness_contract::agent_action::AgentActionObservation =
+                    serde_json::from_str(&output)
+                        .map_err(|error| ToolError::new(error.to_string()))?;
+                if observation.status == harness_contract::agent_action::AgentActionStatus::Rejected
+                {
+                    return Err(ToolError::new(observation.error.map_or_else(
+                        || "Program discovery rejected".into(),
+                        |error| error.message,
+                    )));
                 }
                 let projection = observation.projection.unwrap_or(serde_json::Value::Null);
                 let selected = projection["entries"].as_array().map(|entries| entries.iter().map(|entry| {
@@ -801,7 +932,9 @@ impl GatewayToolExecutor {
                 }).collect::<Vec<_>>()).unwrap_or_default();
                 let next = projection["next_page_cursor"].as_str().map(|cursor| {
                     let mut request = serde_json::json!({"source":"program", "cursor":cursor});
-                    if let Some(query) = &query { request["query"] = serde_json::json!(query); }
+                    if let Some(query) = &query {
+                        request["query"] = serde_json::json!(query);
+                    }
                     request
                 });
                 serde_json::json!({"kind":"runtime.context_retrieval", "source":"program", "scope":"current_binding",
@@ -811,15 +944,35 @@ impl GatewayToolExecutor {
                     "exact":input.entry_ref.as_ref().map(|_| &projection),})
             }
             ContextRetrieveSource::SessionCatalog => {
-                let query=query.as_deref().ok_or_else(||ToolError::new("session_catalog requires a focused query"))?;
-                if input.scope.is_some_and(|scope|scope!=ContextRetrieveScope::WorkspaceSessions) {return Err(ToolError::new("session_catalog supports workspace_sessions scope only"));}
-                let Some(history)=services.session_history_reader() else {
+                let query = query
+                    .as_deref()
+                    .ok_or_else(|| ToolError::new("session_catalog requires a focused query"))?;
+                if input
+                    .scope
+                    .is_some_and(|scope| scope != ContextRetrieveScope::WorkspaceSessions)
+                {
+                    return Err(ToolError::new(
+                        "session_catalog supports workspace_sessions scope only",
+                    ));
+                }
+                let Some(history) = services.session_history_reader() else {
                     return serialize_context_result(&serde_json::json!({"kind":"runtime.context_retrieval","source":"session_catalog","status":"degraded","reason":"session history reader is not configured","selected":[]})).map_err(|e|ToolError::new(e.to_string()));
                 };
-                let page=history.discover_context(session::SessionDiscoveryFilter {
-                    kind:session::SessionDiscoveryKind::Sessions,scope:session::SessionDiscoveryScope::Workspace,
-                    current_session_id:session_id.clone(),authorized_session_ids:vec![session_id.clone()],query:Some(query.to_owned()),before_sequence:None,
-                },input.cursor.as_deref(),limit).await.map_err(|e|ToolError::new(e.to_string()))?;
+                let page = history
+                    .discover_context(
+                        session::SessionDiscoveryFilter {
+                            kind: session::SessionDiscoveryKind::Sessions,
+                            scope: session::SessionDiscoveryScope::Workspace,
+                            current_session_id: session_id.clone(),
+                            authorized_session_ids: vec![session_id.clone()],
+                            query: Some(query.to_owned()),
+                            before_sequence: None,
+                        },
+                        input.cursor.as_deref(),
+                        limit,
+                    )
+                    .await
+                    .map_err(|e| ToolError::new(e.to_string()))?;
                 let next=page.next_cursor.as_ref().map(|cursor|serde_json::json!({"source":"session_catalog","scope":"workspace_sessions","query":query,"cursor":cursor,"limit":limit}));
                 serde_json::json!({"kind":"runtime.context_retrieval","source":"session_catalog","scope":"workspace_sessions","status":"completed","query":query,
                     "selected":page.sessions.iter().map(|record|serde_json::json!({
@@ -926,9 +1079,21 @@ impl GatewayToolExecutor {
                     let Some(message) = message else {
                         return Err(ToolError::new("authorized Session message does not exist"));
                     };
-                    let digest=format!("{:x}",Sha256::digest(message.content_json.as_bytes()));
-                    if input.message_digest.as_ref().is_some_and(|expected|expected!=&digest) {return Err(ToolError::new("Session message source changed; restart exact reading"));}
-                    if input.block_cursor.unwrap_or(0)>0 && input.message_digest.is_none() {return Err(ToolError::new("block continuation requires message_digest from the prior page"));}
+                    let digest = format!("{:x}", Sha256::digest(message.content_json.as_bytes()));
+                    if input
+                        .message_digest
+                        .as_ref()
+                        .is_some_and(|expected| expected != &digest)
+                    {
+                        return Err(ToolError::new(
+                            "Session message source changed; restart exact reading",
+                        ));
+                    }
+                    if input.block_cursor.unwrap_or(0) > 0 && input.message_digest.is_none() {
+                        return Err(ToolError::new(
+                            "block continuation requires message_digest from the prior page",
+                        ));
+                    }
                     let block_cursor = input.block_cursor.unwrap_or(0);
                     let block_limit = input.block_limit.unwrap_or(16).clamp(1, 128);
                     let exact = exact_session_message_page(
@@ -940,23 +1105,66 @@ impl GatewayToolExecutor {
                     return serialize_context_result(&exact)
                         .map_err(|error| ToolError::new(error.to_string()));
                 }
-                if matches!(retrieval_scope,ContextRetrieveScope::WorkspaceSessions|ContextRetrieveScope::RelatedSessions) && query.is_none() {
-                    return Err(ToolError::new("cross-session discovery requires a focused query"));
+                if matches!(
+                    retrieval_scope,
+                    ContextRetrieveScope::WorkspaceSessions | ContextRetrieveScope::RelatedSessions
+                ) && query.is_none()
+                {
+                    return Err(ToolError::new(
+                        "cross-session discovery requires a focused query",
+                    ));
                 }
-                if input.before_sequence.is_some() && (query.is_some() || matches!(retrieval_scope,ContextRetrieveScope::WorkspaceSessions|ContextRetrieveScope::RelatedSessions)) {
-                    return Err(ToolError::new("before_sequence applies to current/explicit sequential history only"));
+                if input.before_sequence.is_some()
+                    && (query.is_some()
+                        || matches!(
+                            retrieval_scope,
+                            ContextRetrieveScope::WorkspaceSessions
+                                | ContextRetrieveScope::RelatedSessions
+                        ))
+                {
+                    return Err(ToolError::new(
+                        "before_sequence applies to current/explicit sequential history only",
+                    ));
                 }
-                let (scope,scope_name)=match retrieval_scope {
-                    ContextRetrieveScope::Current=>(session::SessionDiscoveryScope::Current,"current"),
-                    ContextRetrieveScope::ExplicitSession=>(session::SessionDiscoveryScope::Explicit,"explicit_session"),
-                    ContextRetrieveScope::RelatedSessions=>(session::SessionDiscoveryScope::Related,"related_sessions"),
-                    ContextRetrieveScope::WorkspaceSessions=>(session::SessionDiscoveryScope::Workspace,"workspace_sessions"),
+                let (scope, scope_name) = match retrieval_scope {
+                    ContextRetrieveScope::Current => {
+                        (session::SessionDiscoveryScope::Current, "current")
+                    }
+                    ContextRetrieveScope::ExplicitSession => {
+                        (session::SessionDiscoveryScope::Explicit, "explicit_session")
+                    }
+                    ContextRetrieveScope::RelatedSessions => {
+                        (session::SessionDiscoveryScope::Related, "related_sessions")
+                    }
+                    ContextRetrieveScope::WorkspaceSessions => (
+                        session::SessionDiscoveryScope::Workspace,
+                        "workspace_sessions",
+                    ),
                 };
-                let scoped_ids=if matches!(retrieval_scope,ContextRetrieveScope::Current|ContextRetrieveScope::ExplicitSession) {vec![target_session_id.clone()]} else {authorized_sessions.into_iter().collect()};
-                let explicitly_authorized_session_count=scoped_ids.len();
-                let page=history.discover_context(session::SessionDiscoveryFilter {kind:session::SessionDiscoveryKind::Messages,scope,
-                    current_session_id:session_id.clone(),authorized_session_ids:scoped_ids,query:query.clone(),before_sequence:input.before_sequence,
-                },input.cursor.as_deref(),limit).await.map_err(|e|ToolError::new(e.to_string()))?;
+                let scoped_ids = if matches!(
+                    retrieval_scope,
+                    ContextRetrieveScope::Current | ContextRetrieveScope::ExplicitSession
+                ) {
+                    vec![target_session_id.clone()]
+                } else {
+                    authorized_sessions.into_iter().collect()
+                };
+                let explicitly_authorized_session_count = scoped_ids.len();
+                let page = history
+                    .discover_context(
+                        session::SessionDiscoveryFilter {
+                            kind: session::SessionDiscoveryKind::Messages,
+                            scope,
+                            current_session_id: session_id.clone(),
+                            authorized_session_ids: scoped_ids,
+                            query: query.clone(),
+                            before_sequence: input.before_sequence,
+                        },
+                        input.cursor.as_deref(),
+                        limit,
+                    )
+                    .await
+                    .map_err(|e| ToolError::new(e.to_string()))?;
                 let next=page.next_cursor.as_ref().map(|cursor|compact_context_request(serde_json::json!({"source":"session_history","scope":scope_name,
                     "session_id":(retrieval_scope==ContextRetrieveScope::ExplicitSession).then_some(&target_session_id),"query":query,
                     "before_sequence":input.before_sequence,"limit":limit,"cursor":cursor})));
@@ -979,5 +1187,4 @@ impl GatewayToolExecutor {
         };
         serialize_context_result(&value).map_err(|error| ToolError::new(error.to_string()))
     }
-
 }

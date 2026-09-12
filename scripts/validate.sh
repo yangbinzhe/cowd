@@ -221,10 +221,28 @@ run_scenario() {
   run_step cargo_build_cli cargo build -p cli --features full
   export COWD_BIN="$CARGO_TARGET_DIR/debug/cowd"
   run_step ai_harness bash scripts/ci/ai-harness.sh
+  # PostgreSQL closes the harness' short-lived test connections
+  # asynchronously. Give a shared local fixture a bounded settle window before
+  # starting the next pool-owning Gateway scenario.
+  if [[ -n "${COWD_TEST_POSTGRES_URL:-}" ]]; then
+    run_step postgres_fixture_settle sleep "${COWD_POSTGRES_FIXTURE_SETTLE_SECS:-8}"
+  fi
   run_step session_runtime bash scripts/scenarios/runtime-surface.sh
+  settle_postgres_fixture session_runtime
   run_step memory_context bash scripts/scenarios/memory-runtime.sh
+  settle_postgres_fixture memory_context
   run_step tool_permission bash scripts/scenarios/channel-permission.sh
+  settle_postgres_fixture tool_permission
   run_step skill_surface bash scripts/scenarios/skill-surface-unification.sh
+  settle_postgres_fixture skill_surface
+}
+
+settle_postgres_fixture() {
+  local prior_step="$1"
+  if [[ -n "${COWD_TEST_POSTGRES_URL:-}" ]]; then
+    run_step "postgres_fixture_settle_${prior_step}" \
+      sleep "${COWD_POSTGRES_FIXTURE_BETWEEN_SCENARIOS_SECS:-3}"
+  fi
 }
 
 run_surface() {
@@ -236,7 +254,9 @@ run_surface() {
   run_step cargo_build_surface_full cargo build -p cli --features full
   export COWD_BIN="$CARGO_TARGET_DIR/debug/cowd"
   run_step tui_projection_smoke bash scripts/scenarios/tui-interaction-quality.sh
+  settle_postgres_fixture tui_projection_smoke
   run_step webui_gateway_contract bash scripts/scenarios/gateway-webui-contract.sh
+  settle_postgres_fixture webui_gateway_contract
   run_step reference_bundle bash scripts/test/reference-app.sh
 }
 

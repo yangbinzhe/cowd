@@ -7,19 +7,22 @@
 
 mod action_service;
 pub(crate) mod continuation;
+pub(crate) mod coordination;
 mod execution;
 mod ingress;
 pub(crate) mod issues;
 mod program;
 mod read_model;
+pub(crate) mod review_evidence;
 mod roster;
 pub(crate) mod supervision;
 mod topic;
+pub(crate) mod topic_delivery;
 mod work_market;
 
-pub(crate) use action_service::AgenticTopicObservationAck;
 pub use action_service::{AgentActionService, AgentActionServiceError};
-pub(crate) use execution::{start_agentic_claim_heartbeat, AgenticClaimHeartbeatGuard};
+pub(crate) use action_service::{AgenticTopicObservationAck, TopicObservationKind};
+pub(crate) use execution::start_agentic_claim_heartbeat;
 pub use execution::{AgenticDispatchContext, AgenticDispatchReceipt};
 pub use program::{
     AgentMemberProjection, AgenticArtifactProjection, AgenticCompletionRequestProjection,

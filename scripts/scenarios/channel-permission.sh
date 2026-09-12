@@ -6,8 +6,8 @@ TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT/target}"
 BIN="${COWD_BIN:-$TARGET_ROOT/debug/cowd}"
 PORT="${COWD_CHANNEL_PERMISSION_PORT:-18694}"
 BASE_URL="http://127.0.0.1:$PORT"
-SESSION="cowd-channel-permission-$$"
-TMP_DIR="$(mktemp -d /tmp/cowd-channel-permission.XXXXXX)"
+GATEWAY_PID=""
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cowd-channel-permission.XXXXXX")"
 WORKDIR="$TMP_DIR/workspace"
 CONFIG_HOME="$TMP_DIR/config"
 HOME_DIR="$TMP_DIR/home"
@@ -26,8 +26,9 @@ curl() {
 
 cleanup() {
   status=$?
-  if command -v tmux >/dev/null 2>&1; then
-    tmux kill-session -t "$SESSION" >/dev/null 2>&1 || true
+  if [[ -n "$GATEWAY_PID" ]]; then
+    kill "$GATEWAY_PID" >/dev/null 2>&1 || true
+    wait "$GATEWAY_PID" >/dev/null 2>&1 || true
   fi
   if [[ "$status" -ne 0 && -s "$LOG" ]]; then
     echo "channel permission gateway log:" >&2
@@ -37,12 +38,6 @@ cleanup() {
   return "$status"
 }
 trap cleanup EXIT
-
-if ! command -v tmux >/dev/null 2>&1; then
-  echo "tmux is required for channel permission scenario" >&2
-  exit 1
-fi
-
 
 if ss -ltnp | rg -q ":$PORT\\b"; then
   echo "port $PORT is already in use" >&2
@@ -63,6 +58,11 @@ permissions:
   default_mode: "danger-full-access"
 memory:
   enabled: false
+storage:
+  backend: postgres
+  postgres:
+    logicalIdentity: "cowd-channel-permission"
+    secretRef: "env:COWD_TEST_POSTGRES_URL"
 gateway:
   enabled: true
   sessionReset: "none"
@@ -78,11 +78,20 @@ EOF
 cp "$CONFIG_HOME/config.yaml" "$HOME_DIR/.cowd/config.yaml"
 cp "$CONFIG_HOME/config.yaml" "$WORKDIR/.cowd/config.yaml"
 
-tmux new-session -d -s "$SESSION" \
-  "bash -lc \"cd '$WORKDIR' && \
-    export COWD_CONFIG_HOME='$CONFIG_HOME' && \
-    export HOME='$HOME_DIR' && \
-    '$BIN' gateway run >'$LOG' 2>&1\""
+(
+  cd "$WORKDIR"
+  env COWD_CONFIG_HOME="$CONFIG_HOME" HOME="$HOME_DIR" \
+    COWD_TEST_POSTGRES_URL="$COWD_TEST_POSTGRES_URL" \
+    "$BIN" storage upgrade
+)
+
+(
+  cd "$WORKDIR"
+  env COWD_CONFIG_HOME="$CONFIG_HOME" HOME="$HOME_DIR" \
+    COWD_TEST_POSTGRES_URL="$COWD_TEST_POSTGRES_URL" \
+    "$BIN" gateway run >"$LOG" 2>&1
+) &
+GATEWAY_PID=$!
 
 gateway_ready=0
 for _ in {1..100}; do

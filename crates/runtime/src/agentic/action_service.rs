@@ -5,6 +5,7 @@ use harness_contract::agent_action::{
     AgentAction, AgentActionEnvelope, AgentActionErrorObservation, AgentActionObservation,
     AgentActionStatus, AgentActorKind,
 };
+use harness_contract::goal::ObjectiveReviewVerification;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -17,12 +18,14 @@ use crate::{
 use super::program::{AgenticProgramProjection, AgenticTaskStatus, AgenticTopicEntryProjection};
 
 mod authorization;
+mod delegation;
 
 use authorization::validate_transition;
 
 const ACTION_EVENT_KIND: &str = "agentic.action_applied";
 const PROGRAM_OPENED_EVENT_KIND: &str = "agentic.program_opened";
 const OBJECTIVE_VERDICT_EVENT_KIND: &str = "agentic.objective_verdict_bound";
+const COMPLETION_REOPENED_EVENT_KIND: &str = "agentic.completion_reopened";
 const TOPIC_CURSOR_EVENT_KIND: &str = "agentic.topic_observation_acknowledged";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,12 +43,20 @@ pub(crate) struct AgenticTopicObservation {
     pub entry: AgenticTopicEntryProjection,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TopicObservationKind {
+    ProviderModel,
+    WorkerTransport,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AgenticTopicObservationAck {
     pub program_id: String,
     pub execution_id: String,
     pub through_revision: u64,
     pub expected_cursor_revision: u64,
+    pub observation_kind: TopicObservationKind,
 }
 
 #[derive(Debug, Error)]
@@ -64,6 +75,7 @@ pub enum AgentActionServiceError {
 pub struct AgentActionService {
     store: Arc<RuntimeEventStore>,
     artifacts: Option<Arc<crate::ArtifactStore>>,
+    graphs: Option<crate::ExecutionGraphStateStore>,
     read_model: Arc<super::AgenticReadModel>,
 }
 
@@ -73,8 +85,15 @@ impl AgentActionService {
         Self {
             store,
             artifacts: None,
+            graphs: None,
             read_model: Arc::new(super::AgenticReadModel::default()),
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_graph_store(mut self, graphs: crate::ExecutionGraphStateStore) -> Self {
+        self.graphs = Some(graphs);
+        self
     }
 
     #[must_use]
@@ -99,8 +118,16 @@ impl AgentActionService {
             return Ok(rejected(envelope, 0, "invalid_action", &error.to_string()));
         }
         let stream_id = program_stream(&envelope.actor.program_id);
-        self.store
-            .with_stream_lock(&stream_id, || self.apply_locked(envelope, &stream_id, None))
+        let mut streams = vec![stream_id.clone()];
+        if matches!(&envelope.action, AgentAction::TaskPublish(input) if !input.obligation_refs.is_empty())
+        {
+            if let Some(root) = &envelope.actor.root_execution_id {
+                streams.push(format!("goal:goal:{root}"));
+            }
+        }
+        self.store.with_stream_locks(&streams, || {
+            self.apply_locked(envelope, &stream_id, None, None)
+        })
     }
 
     /// Commit one Program action and its prepared Goal revision atomically.
@@ -113,19 +140,85 @@ impl AgentActionService {
         goal_stream_id: String,
         expected_goal_stream_revision: u64,
         goal_event: RuntimeTransactionEventInput,
+        verification: Option<&ObjectiveReviewVerification>,
     ) -> Result<AgentActionObservation, AgentActionServiceError> {
         if let Err(error) = envelope.validate() {
             return Ok(rejected(envelope, 0, "invalid_action", &error.to_string()));
         }
         let program_stream_id = program_stream(&envelope.actor.program_id);
-        self.store
-            .with_stream_locks(&[program_stream_id.clone(), goal_stream_id.clone()], || {
-                self.apply_locked(
-                    envelope,
-                    &program_stream_id,
-                    Some((goal_stream_id, expected_goal_stream_revision, goal_event)),
-                )
-            })
+        let mut streams = vec![program_stream_id.clone(), goal_stream_id.clone()];
+        streams.extend(
+            verification
+                .into_iter()
+                .flat_map(|proof| proof.result_source_revisions.keys().cloned()),
+        );
+        if verification.is_some_and(|proof| {
+            !proof.independence_required || proof.effect_manifest_digest.is_some()
+        }) {
+            streams.push(format!("session:{}", envelope.actor.session_id));
+            streams.extend(
+                verification
+                    .into_iter()
+                    .flat_map(|proof| proof.effect_source_refs.iter().cloned()),
+            );
+        }
+        self.store.with_stream_locks(&streams, || {
+            self.apply_locked(
+                envelope,
+                &program_stream_id,
+                Some((goal_stream_id, expected_goal_stream_revision, goal_event)),
+                verification,
+            )
+        })
+    }
+
+    pub(crate) fn replay_if_applied(
+        &self,
+        envelope: &AgentActionEnvelope,
+    ) -> Result<Option<AgentActionObservation>, AgentActionServiceError> {
+        let stream_id = program_stream(&envelope.actor.program_id);
+        if let Some(existing) = self
+            .store
+            .event_by_idempotency_key(&stream_id, &action_key(&envelope.action_id))?
+        {
+            let projection = self.project_snapshot(&envelope.actor.program_id)?;
+            let original: AgentActionEnvelope = serde_json::from_value(
+                existing.payload.get("envelope").cloned().ok_or_else(|| {
+                    AgentActionServiceError::Corrupt(
+                        "applied action has no durable envelope".into(),
+                    )
+                })?,
+            )?;
+            if original.actor != envelope.actor || original.action != envelope.action {
+                return Ok(Some(rejected(envelope, projection.revision, "action_id_conflict",
+                    "action_id already identifies a different actor or payload; use the original request to retry")));
+            }
+            let entity_ref = existing
+                .payload
+                .get("entity_ref")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            return applied_observation(envelope, &projection, entity_ref, true).map(Some);
+        }
+
+        Ok(None)
+    }
+
+    pub(crate) fn apply_verified_review(
+        &self,
+        envelope: &AgentActionEnvelope,
+        verification: &ObjectiveReviewVerification,
+    ) -> Result<AgentActionObservation, AgentActionServiceError> {
+        let stream_id = program_stream(&envelope.actor.program_id);
+        let mut streams = vec![stream_id.clone()];
+        streams.extend(verification.result_source_revisions.keys().cloned());
+        if verification.effect_manifest_digest.is_some() {
+            streams.push(format!("session:{}", envelope.actor.session_id));
+            streams.extend(verification.effect_source_refs.iter().cloned());
+        }
+        self.store.with_stream_locks(&streams, || {
+            self.apply_locked(envelope, &stream_id, None, Some(verification))
+        })
     }
 
     fn apply_locked(
@@ -133,21 +226,13 @@ impl AgentActionService {
         envelope: &AgentActionEnvelope,
         stream_id: &str,
         goal_event: Option<(String, u64, RuntimeTransactionEventInput)>,
+        verification: Option<&ObjectiveReviewVerification>,
     ) -> Result<AgentActionObservation, AgentActionServiceError> {
-        if let Some(existing) = self
-            .store
-            .event_by_idempotency_key(stream_id, &action_key(&envelope.action_id))?
-        {
-            let projection = self.project(&envelope.actor.program_id)?;
-            let entity_ref = existing
-                .payload
-                .get("entity_ref")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string);
-            return applied_observation(envelope, &projection, entity_ref, true);
+        if let Some(replay) = self.replay_if_applied(envelope)? {
+            return Ok(replay);
         }
 
-        let mut projection = match self.project(&envelope.actor.program_id) {
+        let mut projection = match self.project_snapshot(&envelope.actor.program_id) {
             Ok(projection) => projection,
             Err(AgentActionServiceError::Corrupt(message)) if message == "program_not_found" => {
                 let mut projection = AgenticProgramProjection::empty(
@@ -175,7 +260,7 @@ impl AgentActionService {
                 projection
                     .root_execution_id
                     .clone_from(&envelope.actor.root_execution_id);
-                projection
+                Arc::new(projection)
             }
             Err(error) => return Err(error),
         };
@@ -205,6 +290,16 @@ impl AgentActionService {
         }
 
         if matches!(envelope.action, AgentAction::StateInspect(_)) {
+            let goal = projection
+                .root_execution_id
+                .as_ref()
+                .map(|root| {
+                    crate::execution_core::goal::GoalStore::new(Arc::clone(&self.store))
+                        .get(&format!("goal:{root}"))
+                })
+                .transpose()
+                .map_err(AgentActionServiceError::Corrupt)?
+                .flatten();
             if matches!(&envelope.action, AgentAction::StateInspect(input)
                 if input.scope_ref.as_deref() == Some("collaboration_patterns"))
             {
@@ -221,7 +316,7 @@ impl AgentActionService {
                             ))
                         }
                     };
-                let mut observation = inspected_observation(envelope, &projection);
+                let mut observation = inspected_observation(envelope, &projection, goal.as_ref());
                 observation.projection = Some(json!({
                     "advisory_only": true,
                     "instruction": "These are structural observations from independent completed Turns, not prescribed plans, quality guarantees, executable definitions, or capability grants. Adopt, adapt, or ignore them. Inspect Runtime capabilities before using any suggested tool or skill.",
@@ -234,7 +329,83 @@ impl AgentActionService {
                 }));
                 return Ok(observation);
             }
-            return Ok(inspected_observation(envelope, &projection));
+            return Ok(inspected_observation(envelope, &projection, goal.as_ref()));
+        }
+        if verification.is_some_and(|proof| {
+            proof.work_manifest_digest != super::review_evidence::work_manifest_digest(&projection)
+        }) {
+            return Ok(rejected(
+                envelope,
+                projection.revision,
+                "stale_review_evidence",
+                "source work changed while review evidence was being verified",
+            ));
+        }
+        let mut policy_sources = Vec::new();
+        if let Some(proof) = verification.filter(|proof| !proof.independence_required) {
+            if envelope.actor.kind != AgentActorKind::Root
+                || !matches!(envelope.action, AgentAction::ObjectiveReview(_))
+                || goal_event.is_none()
+            {
+                return Ok(rejected(
+                    envelope,
+                    projection.revision,
+                    "invalid_review_policy",
+                    "self review is confined to the bound Root Objective",
+                ));
+            }
+            let root = envelope
+                .actor
+                .root_execution_id
+                .as_deref()
+                .ok_or_else(|| AgentActionServiceError::Corrupt("review has no root".into()))?;
+            let goal = crate::execution_core::GoalStore::new(Arc::clone(&self.store))
+                .get(&format!("goal:{root}"))
+                .map_err(AgentActionServiceError::EventStore)?
+                .ok_or_else(|| AgentActionServiceError::Corrupt("review has no Goal".into()))?;
+            let policy =
+                super::review_evidence::root_self_review_policy(&self.store, &projection, &goal)
+                    .map_err(AgentActionServiceError::EventStore)?;
+            let Some(policy) = policy.filter(|policy| {
+                proof.review_policy_digest.as_deref() == Some(policy.digest.as_str())
+            }) else {
+                return Ok(rejected(
+                    envelope,
+                    projection.revision,
+                    "stale_review_policy",
+                    "Runtime risk or tool effects no longer permit this review",
+                ));
+            };
+            policy_sources.push(policy.source);
+        }
+        if let Some(digest) = verification.and_then(|proof| proof.effect_manifest_digest.as_deref())
+        {
+            let root = envelope.actor.root_execution_id.as_deref().ok_or_else(|| {
+                AgentActionServiceError::Corrupt("effect review has no root".into())
+            })?;
+            let goal = crate::execution_core::GoalStore::new(Arc::clone(&self.store))
+                .get(&format!("goal:{root}"))
+                .map_err(AgentActionServiceError::EventStore)?;
+            let snapshot = super::review_evidence::effect_review_snapshot(
+                &self.store,
+                &projection,
+                goal.as_ref(),
+                &verification
+                    .expect("effect digest requires proof")
+                    .effect_source_refs,
+            )
+            .map_err(AgentActionServiceError::EventStore)?;
+            if snapshot.digest != digest {
+                return Ok(rejected(
+                    envelope,
+                    projection.revision,
+                    "stale_effect_review",
+                    "admitted effects changed after verification; inspect the current target again",
+                ));
+            }
+            policy_sources.retain(|source| source.stream_id != snapshot.source.stream_id);
+            policy_sources.push(snapshot.source);
+            policy_sources.extend(snapshot.additional_sources);
         }
         if let Some(expected) = envelope.expected_revision {
             if expected != projection.revision {
@@ -249,8 +420,75 @@ impl AgentActionService {
                 ));
             }
         }
-        if let Some((code, message)) = validate_transition(&projection, envelope, now_ms()) {
+        if let Some((code, message)) =
+            validate_transition(&projection, envelope, now_ms(), self.graphs.as_ref())
+        {
             return Ok(rejected(envelope, projection.revision, code, &message));
+        }
+        // A Task may support several original Goal conditions, but it cannot
+        // manufacture them. Keep the read revision in this same transaction so
+        // a concurrent Goal change cannot admit a dangling reference.
+        let mut obligation_source = None;
+        if let AgentAction::TaskPublish(input) = &envelope.action {
+            if !input.obligation_refs.is_empty() {
+                let goal = projection
+                    .root_execution_id
+                    .as_ref()
+                    .map(|root| {
+                        crate::execution_core::goal::GoalStore::new(Arc::clone(&self.store))
+                            .projection(&format!("goal:{root}"))
+                    })
+                    .transpose()
+                    .map_err(AgentActionServiceError::Corrupt)?
+                    .flatten();
+                let Some(goal) = goal else {
+                    return Ok(rejected(
+                        envelope,
+                        projection.revision,
+                        "obligation_goal_not_found",
+                        "Task obligation references require the bound durable Goal",
+                    ));
+                };
+                if !goal.goal.execution_binding.as_ref().is_some_and(|binding| {
+                    binding.agentic_program_id == projection.program_id
+                        && binding.objective_id == projection.objective_id
+                        && binding.session_id == projection.session_id
+                        && binding.turn_id == projection.turn_id
+                        && Some(&binding.root_execution_id) == projection.root_execution_id.as_ref()
+                }) {
+                    return Ok(rejected(
+                        envelope,
+                        projection.revision,
+                        "obligation_goal_binding_mismatch",
+                        "Task references must belong to this Program's immutable Goal binding",
+                    ));
+                }
+                if let Some(missing) = input.obligation_refs.iter().find(|reference| {
+                    !goal
+                        .goal
+                        .criteria
+                        .iter()
+                        .any(|criterion| &criterion.id == *reference)
+                        && !goal
+                            .goal
+                            .obligations
+                            .iter()
+                            .any(|obligation| &obligation.obligation_id == *reference)
+                }) {
+                    return Ok(rejected(
+                        envelope,
+                        projection.revision,
+                        "obligation_not_found",
+                        &format!(
+                            "Goal condition {missing} does not exist; inspect the current Goal"
+                        ),
+                    ));
+                }
+                obligation_source = Some(ExpectedStreamRevision {
+                    stream_id: format!("goal:{}", goal.goal.id),
+                    expected_revision: goal.stream_revision,
+                });
+            }
         }
         if let AgentAction::ArtifactCommit(input) = &envelope.action {
             if let Some(artifacts) = &self.artifacts {
@@ -292,7 +530,16 @@ impl AgentActionService {
             }
         }
 
-        let entity_ref = entity_ref(envelope);
+        let entity_ref = entity_ref(envelope).or_else(|| {
+            goal_event.as_ref().and_then(|(_, _, event)| {
+                event
+                    .event
+                    .payload
+                    .get("action_entity_ref")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+        });
         let mut events = Vec::with_capacity(if projection.revision == 0 { 2 } else { 1 });
         if projection.revision == 0 {
             events.push(RuntimeTransactionEventInput {
@@ -356,6 +603,7 @@ impl AgentActionService {
                 payload: json!({
                     "envelope": envelope,
                     "entity_ref": entity_ref,
+                    "review_verification": verification,
                 }),
             },
             idempotency_key: Some(action_key(&envelope.action_id)),
@@ -365,6 +613,19 @@ impl AgentActionService {
             stream_id: stream_id.to_string(),
             expected_revision: projection.revision,
         }];
+        expected_streams.extend(policy_sources);
+        expected_streams.extend(
+            verification
+                .into_iter()
+                .flat_map(|proof| &proof.result_source_revisions)
+                .map(|(stream_id, revision)| ExpectedStreamRevision {
+                    stream_id: stream_id.clone(),
+                    expected_revision: *revision,
+                }),
+        );
+        if let Some(source) = obligation_source {
+            expected_streams.push(source);
+        }
         if let Some((goal_stream_id, expected_goal_stream_revision, goal_event)) = goal_event {
             expected_streams.push(ExpectedStreamRevision {
                 stream_id: goal_stream_id,
@@ -381,7 +642,7 @@ impl AgentActionService {
                 expected_streams,
                 events,
             })?;
-        projection = self.project(&envelope.actor.program_id)?;
+        projection = self.project_snapshot(&envelope.actor.program_id)?;
         applied_observation(envelope, &projection, entity_ref, false)
     }
 
@@ -389,6 +650,18 @@ impl AgentActionService {
         &self,
         program_id: &str,
     ) -> Result<AgenticProgramProjection, AgentActionServiceError> {
+        // Callers that need an independently mutable projection explicitly own a copy.
+        // Bounded read consumers use the shared immutable snapshot below.
+        self.project_snapshot(program_id)
+            .map(|snapshot| (*snapshot).clone())
+    }
+
+    /// Immutable causal view for read consumers. Unlike `project`, this does
+    /// not copy the complete Program on an unchanged durable-head cache hit.
+    pub fn project_snapshot(
+        &self,
+        program_id: &str,
+    ) -> Result<Arc<AgenticProgramProjection>, AgentActionServiceError> {
         let stream_id = program_stream(program_id);
         let durable_revision = self.store.stream_revision(&stream_id)?;
         if let Some(mut cached) = self.read_model.get(program_id) {
@@ -407,7 +680,7 @@ impl AgentActionService {
                     )
                     .map_err(AgentActionServiceError::EventStore)?;
                 if delta.last().map(|event| event.sequence) == Some(durable_revision) {
-                    apply_projection_events(&mut cached, delta)?;
+                    apply_projection_events(Arc::make_mut(&mut cached), delta)?;
                     self.remember_projection(&cached);
                     return Ok(cached);
                 }
@@ -427,11 +700,13 @@ impl AgentActionService {
                     .map_err(AgentActionServiceError::EventStore)?;
                 if delta.last().map(|event| event.sequence) == Some(durable_revision) {
                     apply_projection_events(&mut persisted, delta)?;
+                    let persisted = Arc::new(persisted);
                     self.remember_projection(&persisted);
                     return Ok(persisted);
                 }
             } else {
-                self.read_model.put(persisted.clone());
+                let persisted = Arc::new(persisted);
+                self.read_model.put(Arc::clone(&persisted));
                 return Ok(persisted);
             }
         }
@@ -499,6 +774,7 @@ impl AgentActionService {
             .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or_default();
         apply_projection_events(&mut projection, events)?;
+        let projection = Arc::new(projection);
         self.remember_projection(&projection);
         Ok(projection)
     }
@@ -523,40 +799,58 @@ impl AgentActionService {
             );
             return Ok(None);
         }
-        let Ok(projection) = serde_json::from_value::<AgenticProgramProjection>(checkpoint.payload)
-        else {
-            tracing::warn!(program_id, "discarding corrupt Agentic read snapshot");
-            return Ok(None);
-        };
-        if projection.program_id != program_id || projection.revision != checkpoint.source_cursor {
-            tracing::warn!(program_id, "discarding misbound Agentic read snapshot");
-            return Ok(None);
-        }
-        Ok(Some(projection))
+        Ok(decode_read_snapshot(&checkpoint, program_id))
     }
 
-    fn remember_projection(&self, projection: &AgenticProgramProjection) {
-        self.read_model.put(projection.clone());
+    fn remember_projection(&self, projection: &Arc<AgenticProgramProjection>) {
+        self.read_model.put(Arc::clone(projection));
         let projection_id = read_model_projection_id(&projection.program_id);
-        let already_current = self
+        let checkpoint = self
             .store
             .projection_checkpoint(&projection_id)
             .ok()
-            .flatten()
-            .is_some_and(|checkpoint| checkpoint.source_cursor == projection.revision);
-        if already_current {
+            .flatten();
+        if checkpoint.as_ref().is_some_and(|checkpoint| {
+            checkpoint.source_cursor >= projection.revision
+                && self
+                    .store
+                    .stream_revision(&program_stream(&projection.program_id))
+                    .is_ok_and(|head| checkpoint.source_cursor <= head)
+                && decode_read_snapshot(checkpoint, &projection.program_id).is_some()
+        }) {
             return;
         }
-        let payload = match serde_json::to_value(projection) {
+        let payload = match serde_json::to_value(projection.as_ref()) {
             Ok(payload) => payload,
             Err(error) => {
                 tracing::warn!(program_id = %projection.program_id, %error, "Agentic read snapshot serialization failed");
                 return;
             }
         };
-        if let Err(error) = self.store.put_projection_checkpoint(
+        let digest = format!(
+            "sha256:{:x}",
+            Sha256::digest(payload.to_string().as_bytes())
+        );
+        let payload = json!({"schema_version":1,"projection":payload,"sha256":digest});
+        let repair_ahead = checkpoint.as_ref().is_some_and(|checkpoint| {
+            checkpoint.source_cursor > projection.revision
+                && self
+                    .store
+                    .stream_revision(&program_stream(&projection.program_id))
+                    .is_ok_and(|head| checkpoint.source_cursor > head)
+        });
+        let write = if repair_ahead {
+            RuntimeEventStore::compare_and_repair_projection_checkpoint
+        } else {
+            RuntimeEventStore::compare_and_put_projection_checkpoint
+        };
+        if let Err(error) = write(
+            &self.store,
             &projection_id,
             projection.revision,
+            checkpoint
+                .as_ref()
+                .map_or(0, |checkpoint| checkpoint.revision),
             &payload,
             now_ms(),
         ) {
@@ -572,6 +866,7 @@ impl AgentActionService {
         &self,
         program_id: &str,
         agent_id: &str,
+        team_id: &str,
         execution_id: &str,
         max_entries: usize,
         max_bytes: usize,
@@ -584,13 +879,13 @@ impl AgentActionService {
         {
             return Ok(None);
         }
-        let projection = self.project(program_id)?;
+        let projection = self.project_snapshot(program_id)?;
         let _member = projection.agents.get(agent_id).ok_or_else(|| {
             AgentActionServiceError::Corrupt(format!(
                 "topic_observer_not_in_program_roster:{agent_id}"
             ))
         })?;
-        let team_topics = readable_topic_refs(&projection, agent_id);
+        let team_topics = readable_topic_refs(&projection, agent_id, team_id);
         let cursor_stream = topic_cursor_stream(program_id, execution_id);
         let (from_revision, cursor_revision) = self.topic_cursor(&cursor_stream)?;
         let mut candidates = projection
@@ -598,27 +893,33 @@ impl AgentActionService {
             .iter()
             .filter(|(topic_ref, _)| team_topics.contains(topic_ref.as_str()))
             .flat_map(|(topic_ref, entries)| {
-                entries.iter().map(|entry| AgenticTopicObservation {
-                    topic_ref: topic_ref.clone(),
-                    entry: entry.clone(),
-                })
-            })
-            .filter(|observation| {
-                observation.entry.revision > from_revision
-                    && observation.entry.actor_id != agent_id
-                    && topic_entry_visible(&observation.entry, agent_id)
+                let start = entries.partition_point(|entry| entry.revision <= from_revision);
+                entries[start..]
+                    .iter()
+                    .filter(|entry| {
+                        entry.actor_id != agent_id && topic_entry_visible(entry, agent_id)
+                    })
+                    .take(max_entries)
+                    .map(move |entry| (topic_ref, entry))
             })
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| {
-            left.entry
+            left.1
                 .revision
-                .cmp(&right.entry.revision)
-                .then_with(|| left.entry.entry_id.cmp(&right.entry.entry_id))
+                .cmp(&right.1.revision)
+                .then_with(|| left.1.entry_id.cmp(&right.1.entry_id))
         });
 
         let mut entries = Vec::new();
         let mut observed_bytes = 0usize;
-        for mut entry in candidates {
+        for (topic_ref, source) in candidates {
+            if entries.len() >= max_entries {
+                break;
+            }
+            let mut entry = AgenticTopicObservation {
+                topic_ref: topic_ref.clone(),
+                entry: source.clone(),
+            };
             let mut entry_bytes = serde_json::to_vec(&entry)?.len();
             if !entries.is_empty()
                 && (entries.len() >= max_entries
@@ -703,6 +1004,7 @@ impl AgentActionService {
                                 "program_id": request.program_id,
                                 "execution_id": request.execution_id,
                                 "through_revision": request.through_revision,
+                                "observation_kind": request.observation_kind,
                             }),
                         },
                         idempotency_key: Some(format!(
@@ -730,6 +1032,86 @@ impl AgentActionService {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or_default();
         Ok((through_revision, cursor_revision))
+    }
+
+    /// Commit the Goal decision and the exact Program request disposition in
+    /// one transaction. Neither domain can become terminal on its own here.
+    pub(crate) fn commit_program_conclusion(
+        &self,
+        projection: &AgenticProgramProjection,
+        prepared: crate::execution_core::goal::PreparedProgramConclusion,
+    ) -> Result<AgenticProgramProjection, AgentActionServiceError> {
+        let request = projection
+            .completion_request
+            .as_ref()
+            .ok_or_else(|| AgentActionServiceError::Corrupt("missing completion request".into()))?;
+        let program_stream_id = program_stream(&projection.program_id);
+        let goal_stream_id = prepared.event.event.stream_id.clone();
+        let (kind, status, payload) = if let Some(terminal) = prepared.goal.terminal.as_ref() {
+            let verdict = super::program::AgenticObjectiveVerdictProjection {
+                goal_id: prepared.goal.id.clone(),
+                goal_revision: prepared.goal.revision,
+                terminal_fence: terminal.terminal_fence.clone(),
+                authority_revision: terminal.authority_revision,
+                kind: terminal.kind,
+            };
+            (
+                OBJECTIVE_VERDICT_EVENT_KIND,
+                "verified",
+                json!({"program_id": projection.program_id, "verdict": verdict}),
+            )
+        } else {
+            (
+                COMPLETION_REOPENED_EVENT_KIND,
+                "open",
+                json!({
+                    "program_id": projection.program_id,
+                    "request_revision": request.program_revision,
+                    "gaps": prepared.gaps,
+                }),
+            )
+        };
+        let mut expected_streams = prepared.policy_sources;
+        expected_streams.extend([
+            ExpectedStreamRevision {
+                stream_id: program_stream_id.clone(),
+                expected_revision: projection.revision,
+            },
+            ExpectedStreamRevision {
+                stream_id: goal_stream_id,
+                expected_revision: prepared.expected_stream_revision,
+            },
+        ]);
+        self.store.append_transaction(AppendTransactionRequest {
+            transaction_id: format!(
+                "program-conclusion:{}:{}",
+                projection.program_id, request.program_revision
+            ),
+            expected_streams,
+            events: vec![
+                prepared.event,
+                RuntimeTransactionEventInput {
+                    event: RuntimeEventInput {
+                        stream_id: program_stream_id,
+                        scope: RuntimeEventScope::Program,
+                        kind: kind.into(),
+                        status: Some(status.into()),
+                        actor: Some("runtime.objective_supervisor".into()),
+                        refs: vec![RuntimeEventRef {
+                            kind: "goal".into(),
+                            id: prepared.goal.id,
+                        }],
+                        payload,
+                    },
+                    idempotency_key: Some(format!(
+                        "program-conclusion:{}",
+                        request.program_revision
+                    )),
+                    schema_version: 1,
+                },
+            ],
+        })?;
+        self.project(&projection.program_id)
     }
 
     /// Bind the only authoritative Objective verdict back into Program truth.
@@ -993,6 +1375,34 @@ fn apply_projection_events(
             projection.apply_objective_verdict(verdict, event.sequence);
             continue;
         }
+        if event.kind == COMPLETION_REOPENED_EVENT_KIND {
+            let request_revision = event
+                .payload
+                .get("request_revision")
+                .and_then(serde_json::Value::as_u64);
+            if projection
+                .completion_request
+                .as_ref()
+                .map(|request| request.program_revision)
+                != request_revision
+            {
+                return Err(AgentActionServiceError::Corrupt(
+                    "completion reopen request fence mismatch".into(),
+                ));
+            }
+            projection.status = super::program::AgenticProgramStatus::Open;
+            projection.completion_request = None;
+            projection.final_artifact_ref = None;
+            projection.unresolved = serde_json::from_value(
+                event
+                    .payload
+                    .get("gaps")
+                    .cloned()
+                    .unwrap_or_else(|| json!([])),
+            )?;
+            projection.revision = event.sequence;
+            continue;
+        }
         if event.kind != ACTION_EVENT_KIND {
             projection.revision = event.sequence;
             continue;
@@ -1180,21 +1590,22 @@ fn applied_observation(
     })
 }
 
-fn readable_topic_refs(
+pub(super) fn readable_topic_refs(
     projection: &AgenticProgramProjection,
     agent_id: &str,
+    team_id: &str,
 ) -> std::collections::BTreeSet<String> {
     std::iter::once(format!("topic:{}", projection.program_id))
         .chain(
             projection
-                .active_team_ids_for(agent_id)
-                .into_iter()
-                .filter_map(|team_id| projection.teams.get(team_id))
+                .teams
+                .get(team_id)
+                .filter(|_| projection.agent_is_active_in(agent_id, team_id))
                 .map(|team| team.topic_ref.clone()),
         )
         .collect()
 }
-fn topic_entry_visible(entry: &AgenticTopicEntryProjection, agent_id: &str) -> bool {
+pub(super) fn topic_entry_visible(entry: &AgenticTopicEntryProjection, agent_id: &str) -> bool {
     entry.actor_id == agent_id
         || entry.recipients.is_empty()
         || entry
@@ -1206,13 +1617,23 @@ fn topic_entry_visible(entry: &AgenticTopicEntryProjection, agent_id: &str) -> b
 fn inspected_observation(
     envelope: &AgentActionEnvelope,
     projection: &AgenticProgramProjection,
+    goal: Option<&harness_contract::goal::GoalContract>,
 ) -> AgentActionObservation {
     let input = match &envelope.action {
         AgentAction::StateInspect(input) => input,
         _ => unreachable!("only state_inspect reaches inspected_observation"),
     };
-    let reader = format!("{:?}:{}", envelope.actor.kind, envelope.actor.actor_id);
-    let scoped_projection = if envelope.actor.kind == AgentActorKind::Agent {
+    let reader = format!(
+        "{:?}:{}:{:?}:{:?}",
+        envelope.actor.kind,
+        envelope.actor.actor_id,
+        envelope.actor.execution_id,
+        envelope.actor.team_id
+    );
+    let topic_scope = if matches!(
+        envelope.actor.kind,
+        AgentActorKind::Agent | AgentActorKind::TeamLead
+    ) {
         let Some(agent_id) = envelope
             .actor
             .agent_id
@@ -1226,21 +1647,20 @@ fn inspected_observation(
                 "reader is not in the current Program roster",
             );
         };
-        let topics = readable_topic_refs(projection, agent_id);
-        let mut visible = projection.clone();
-        visible.topics.retain(|topic_ref, entries| {
-            if !topics.contains(topic_ref) {
-                return false;
-            }
-            entries.retain(|entry| topic_entry_visible(entry, agent_id));
-            true
-        });
-        Some(visible)
+        let Some(team_id) = envelope.actor.team_id.as_deref() else {
+            return rejected(
+                envelope,
+                projection.revision,
+                "reader_not_authorized",
+                "reader has no bound Team",
+            );
+        };
+        Some((agent_id, readable_topic_refs(projection, agent_id, team_id)))
     } else {
         None
     };
-    let projection = scoped_projection.as_ref().unwrap_or(projection);
-    let value = if input.after_revision == Some(projection.revision)
+    let value = if goal.is_none()
+        && input.after_revision == Some(projection.revision)
         && input.entry_ref.is_none()
         && input.scope_ref.is_none()
         && input.page_cursor.is_none()
@@ -1252,7 +1672,7 @@ fn inspected_observation(
             "unchanged": true,
         })
     } else {
-        match inspect_projection_page(projection, input, &reader) {
+        match inspect_projection_page(projection, input, &reader, goal, topic_scope.as_ref()) {
             Ok(value) => value,
             Err(error) => {
                 return rejected(
@@ -1289,11 +1709,36 @@ struct StateInspectCursor {
     version: u8,
     program_id: String,
     revision: u64,
+    #[serde(default)]
+    goal_revision: Option<u64>,
     query: Option<String>,
     after_ref: String,
 }
 
 const STATE_INSPECT_PAGE_SIZE: usize = 32;
+
+fn goal_summary(goal: &harness_contract::goal::GoalContract) -> serde_json::Value {
+    json!({"goal_id":goal.id,"revision":goal.revision,"spec_revision":goal.spec_revision,
+        "spec_digest":goal.spec_digest,"source_intent_ref":goal.source_intent_ref,"completion":goal.completion,
+        "participation_requirement":goal.participation_requirement,
+        "criteria_count":goal.criteria.len(),"obligation_count":goal.obligations.len(),"review_count":goal.reviews.len(),
+        "inspect_request":{"query":goal.id}})
+}
+
+fn goal_directory_entries(goal: &harness_contract::goal::GoalContract) -> Vec<serde_json::Value> {
+    std::iter::once(json!({"entry_ref":goal.id,"goal_id":goal.id,"kind":"goal",
+        "label":goal.objective.chars().take(480).collect::<String>()}))
+        .chain(goal.criteria.iter().map(|criterion| json!({"entry_ref":criterion.id,"goal_id":goal.id,
+            "kind":"criterion","label":criterion.statement.chars().take(480).collect::<String>(),
+            "status":criterion.status,"statement_ref":criterion.statement_ref})))
+        .chain(goal.obligations.iter().map(|obligation| json!({"entry_ref":obligation.obligation_id,"goal_id":goal.id,
+            "kind":"obligation","label":obligation.success_predicate.chars().take(480).collect::<String>(),
+            "state":obligation.state,"required":obligation.required,
+            "review_request":{"criterion_ref":obligation.obligation_id}})))
+        .chain(goal.reviews.iter().map(|review| json!({"entry_ref":review.review_id,"goal_id":goal.id,
+            "kind":"objective_review","criterion_ref":review.criterion_ref,"decision":review.decision,
+            "spec_revision":review.spec_revision}))).collect()
+}
 
 /// Return a bounded navigation page or one exact entity.  The output never
 /// contains an unbounded Program dump: models use the returned stable refs to
@@ -1304,19 +1749,53 @@ fn inspect_projection_page(
     projection: &AgenticProgramProjection,
     input: &harness_contract::agent_action::StateInspectInput,
     reader: &str,
+    goal: Option<&harness_contract::goal::GoalContract>,
+    topic_scope: Option<&(&str, std::collections::BTreeSet<String>)>,
 ) -> Result<serde_json::Value, String> {
+    let readable_topic = |topic: &str| topic_scope.is_none_or(|(_, topics)| topics.contains(topic));
+    let readable_entry = |entry: &AgenticTopicEntryProjection| {
+        topic_scope.is_none_or(|(agent, _)| topic_entry_visible(entry, agent))
+    };
     let exact_ref = input.entry_ref.as_deref().or(input.scope_ref.as_deref());
     if let Some(reference) = exact_ref {
+        if let Some(goal) = goal {
+            let value = if reference == goal.id {
+                Some(goal_summary(goal))
+            } else if let Some(criterion) = goal.criteria.iter().find(|item| item.id == reference) {
+                Some(json!({"criterion":criterion}))
+            } else if let Some(obligation) = goal
+                .obligations
+                .iter()
+                .find(|item| item.obligation_id == reference)
+            {
+                Some(json!({"obligation":obligation}))
+            } else {
+                goal.reviews
+                    .iter()
+                    .find(|item| item.review_id == reference)
+                    .map(|review| json!({"review":review}))
+            };
+            if let Some(value) = value {
+                return Ok(
+                    json!({"program_id":projection.program_id,"revision":projection.revision,
+                    "goal_id":goal.id,"goal_revision":goal.revision,"spec_revision":goal.spec_revision,
+                    "spec_digest":goal.spec_digest,"goal_entry":value}),
+                );
+            }
+        }
         if let Some(membership) = projection.memberships.get(reference) {
             return Ok(
                 json!({"program_id":projection.program_id,"revision":projection.revision,"membership":membership}),
             );
         }
-        if let Some((topic_ref, entry)) =
-            projection.topics.iter().find_map(|(topic_ref, entries)| {
+        if let Some((topic_ref, entry)) = projection
+            .topics
+            .iter()
+            .filter(|(topic, _)| readable_topic(topic))
+            .find_map(|(topic_ref, entries)| {
                 entries
                     .iter()
-                    .find(|entry| entry.entry_id == reference)
+                    .find(|entry| entry.entry_id == reference && readable_entry(entry))
                     .map(|entry| (topic_ref, entry))
             })
         {
@@ -1333,11 +1812,28 @@ fn inspect_projection_page(
                 json!({"program_id": projection.program_id, "revision": projection.revision, "issue": issue}),
             );
         }
+        if let Some(entries) = projection
+            .topics
+            .get(reference)
+            .filter(|_| readable_topic(reference))
+        {
+            let total = entries.iter().filter(|entry| readable_entry(entry)).count();
+            let page = entries
+                .iter()
+                .rev()
+                .filter(|entry| readable_entry(entry))
+                .take(STATE_INSPECT_PAGE_SIZE)
+                .collect::<Vec<_>>();
+            return Ok(
+                json!({"program_id":projection.program_id,"revision":projection.revision,
+                "topic_ref":reference,"entries":page,"directory_request":{"query":reference},
+                "coverage":{"loaded":page.len(),"total":total,"complete":total<=STATE_INSPECT_PAGE_SIZE}}),
+            );
+        }
         if projection.teams.contains_key(reference)
             || projection.agents.contains_key(reference)
             || projection.tasks.contains_key(reference)
             || projection.artifacts.contains_key(reference)
-            || projection.topics.contains_key(reference)
         {
             return Ok(AgentActionService::compact_projection(
                 projection,
@@ -1371,13 +1867,14 @@ fn inspect_projection_page(
             || cursor.reader != reader
             || cursor.program_id != projection.program_id
             || cursor.revision != projection.revision
+            || cursor.goal_revision != goal.map(|goal| goal.revision)
             || cursor.query != query
     }) {
         return Err(
             "Program source, revision or query changed; restart directory discovery".into(),
         );
     }
-    let mut entries = projection
+    let directory = projection
         .teams
         .values()
         .map(|team| {
@@ -1406,7 +1903,7 @@ fn inspect_projection_page(
                 "active_attempt_count": task.active_attempts.len(),
             })
         }))
-        .chain(projection.topics.keys().map(|topic_ref| {
+        .chain(projection.topics.keys().filter(|topic| readable_topic(topic)).map(|topic_ref| {
             json!({
                 "entry_ref": topic_ref,
                 "kind": "topic",
@@ -1415,7 +1912,7 @@ fn inspect_projection_page(
         .chain(projection.memberships.values().map(|membership| json!({
             "entry_ref":membership.membership_id,"kind":"membership","agent_ref":membership.agent_id,"team_ref":membership.team_id,"lifecycle":membership.lifecycle
         })))
-        .chain(projection.topics.iter().flat_map(|(topic_ref,entries)| entries.iter().map(move |entry| json!({
+        .chain(projection.topics.iter().filter(|(topic, _)| readable_topic(topic)).flat_map(|(topic_ref,entries)| entries.iter().filter(|entry| readable_entry(entry)).map(move |entry| json!({
             "entry_ref":entry.entry_id,"kind":"topic_entry","topic_ref":topic_ref,"author":entry.actor_id,
             "label":entry.summary.as_deref().unwrap_or("").chars().take(480).collect::<String>(),"entry_revision":entry.revision
         }))))
@@ -1431,25 +1928,39 @@ fn inspect_projection_page(
             "entry_ref": issue.issue_ref, "kind": "issue", "label": issue.description,
             "source_ref": issue.source_ref, "disposition": issue.disposition,
         })))
-        .collect::<Vec<_>>();
-    entries.sort_by(|left, right| left["entry_ref"].as_str().cmp(&right["entry_ref"].as_str()));
-    entries.retain(|entry| {
-        query
+        .chain(goal.into_iter().flat_map(goal_directory_entries));
+    // Keep only the next page plus one look-ahead entry. Discovery can scan
+    // metadata, but must not materialize the complete Program directory.
+    let mut entries: Vec<serde_json::Value> = Vec::with_capacity(STATE_INSPECT_PAGE_SIZE + 1);
+    let mut cursor_found = cursor.is_none();
+    for entry in directory {
+        if query
             .as_ref()
-            .is_none_or(|query| entry.to_string().to_lowercase().contains(query))
-    });
-    if cursor.as_ref().is_some_and(|cursor| {
-        !entries
-            .iter()
-            .any(|entry| entry["entry_ref"].as_str() == Some(cursor.after_ref.as_str()))
-    }) {
+            .is_some_and(|query| !entry.to_string().to_lowercase().contains(query))
+        {
+            continue;
+        }
+        let reference = entry["entry_ref"].as_str().unwrap_or("");
+        if let Some(cursor) = &cursor {
+            cursor_found |= reference == cursor.after_ref;
+            if reference <= cursor.after_ref.as_str() {
+                continue;
+            }
+        }
+        let position = entries.partition_point(|candidate| {
+            candidate["entry_ref"].as_str().unwrap_or("") <= reference
+        });
+        if position <= STATE_INSPECT_PAGE_SIZE {
+            entries.insert(position, entry);
+            if entries.len() > STATE_INSPECT_PAGE_SIZE + 1 {
+                entries.pop();
+            }
+        }
+    }
+    if !cursor_found {
         return Err("Program cursor position is not present in this directory".into());
     }
-    let start = cursor.as_ref().map_or(0, |cursor| {
-        entries.partition_point(|entry| {
-            entry["entry_ref"].as_str().unwrap_or("") <= cursor.after_ref.as_str()
-        })
-    });
+    let start: usize = 0;
     let end = start
         .saturating_add(STATE_INSPECT_PAGE_SIZE)
         .min(entries.len());
@@ -1460,6 +1971,7 @@ fn inspect_projection_page(
                 reader: reader.into(),
                 program_id: projection.program_id.clone(),
                 revision: projection.revision,
+                goal_revision: goal.map(|goal| goal.revision),
                 query: query.clone(),
                 after_ref: entries[end - 1]["entry_ref"]
                     .as_str()
@@ -1488,6 +2000,7 @@ fn inspect_projection_page(
             "tasks": projection.tasks.len(),
             "artifacts": projection.artifacts.len(),
         },
+        "goal": goal.map(goal_summary),
         "entries": entries[start..end].to_vec(),
         "next_page_cursor": next_cursor,
         "next_request": next_cursor.as_ref().map(|cursor| {
@@ -1554,6 +2067,16 @@ fn actionable(projection: &AgenticProgramProjection, duplicate: bool) -> Vec<Str
             return actions;
         }
         super::program::AgenticProgramStatus::Open => {}
+    }
+    if !projection.unresolved.is_empty() {
+        actions.push(format!("The previous completion request was reopened. Resolve the recorded gaps before requesting completion again: {}", projection.unresolved.join("; ")));
+        if projection
+            .unresolved
+            .iter()
+            .any(|gap| gap.starts_with("original_intent_review_required:"))
+        {
+            actions.push("Use objective_review for the original criterion with the current delivered result and durable evidence; the reviewer must be distinct from its Runtime-resolved producer. Preserve accepted work.".into());
+        }
     }
     if projection.teams.is_empty() {
         actions.push("create a Team or complete directly with a committed artifact".to_string());
@@ -1622,6 +2145,33 @@ fn read_model_projection_id(program_id: &str) -> String {
         "runtime:agentic-read-model:v1:{:x}",
         Sha256::digest(program_id.as_bytes())
     )
+}
+
+fn decode_read_snapshot(
+    checkpoint: &crate::RuntimeProjectionCheckpoint,
+    program_id: &str,
+) -> Option<AgenticProgramProjection> {
+    let payload = &checkpoint.payload;
+    let body = &payload["projection"];
+    let expected_digest = format!("sha256:{:x}", Sha256::digest(body.to_string().as_bytes()));
+    if payload["schema_version"].as_u64() != Some(1)
+        || payload["sha256"].as_str() != Some(expected_digest.as_str())
+    {
+        tracing::warn!(
+            program_id,
+            "discarding unversioned or corrupt Agentic read snapshot"
+        );
+        return None;
+    }
+    let Ok(projection) = serde_json::from_value::<AgenticProgramProjection>(body.clone()) else {
+        tracing::warn!(program_id, "discarding malformed Agentic read snapshot");
+        return None;
+    };
+    if projection.program_id != program_id || projection.revision != checkpoint.source_cursor {
+        tracing::warn!(program_id, "discarding misbound Agentic read snapshot");
+        return None;
+    }
+    Some(projection)
 }
 
 fn now_ms() -> u64 {

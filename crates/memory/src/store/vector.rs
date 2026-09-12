@@ -42,6 +42,8 @@ const VECTOR_INDEX_SCHEMA_VERSION: u32 = 2;
 /// snapshot can be streamed without cloning every embedding buffer.
 #[derive(Deserialize)]
 struct IndexSnapshotV2 {
+    #[serde(default)]
+    embedding_identity: Option<String>,
     schema_version: u32,
     generation: u64,
     dimension: u32,
@@ -71,6 +73,7 @@ enum CompatibleIndexSnapshot {
 
 #[derive(Serialize)]
 struct IndexSnapshotRef<'a> {
+    embedding_identity: &'a Option<String>,
     schema_version: u32,
     generation: u64,
     dimension: u32,
@@ -95,6 +98,7 @@ struct PersistenceCoordinator {
 /// Immutable, cheap persistence view. Capturing it clones only `Arc` handles;
 /// serialisation and file I/O happen after the `VectorIndex` lock is released.
 pub struct VectorPersistenceSnapshot {
+    embedding_identity: Option<String>,
     generation: u64,
     dimension: u32,
     vectors: Vec<(MemoryId, Arc<Vec<f32>>)>,
@@ -117,6 +121,7 @@ pub struct VectorRuntimeStats {
 
 /// Lightweight in-process vector index with cosine-similarity search.
 pub struct VectorIndex {
+    embedding_identity: Option<String>,
     /// All vectors keyed by memory ID.
     vectors: HashMap<MemoryId, Arc<Vec<f32>>>,
     /// Path used for [`persist`] / [`load`].
@@ -141,6 +146,7 @@ impl VectorIndex {
     /// first call to [`persist`].
     pub fn new(persist_path: PathBuf, dimension: u32) -> Result<Self, MemoryError> {
         Ok(Self {
+            embedding_identity: None,
             vectors: HashMap::new(),
             persist_path,
             dimension,
@@ -157,6 +163,7 @@ impl VectorIndex {
     pub fn load(persist_path: PathBuf, dimension: u32) -> Result<Self, MemoryError> {
         let auto_dimension = dimension == 0;
         let mut idx = Self {
+            embedding_identity: None,
             vectors: HashMap::new(),
             persist_path,
             dimension,
@@ -172,6 +179,9 @@ impl VectorIndex {
             Ok(json) => {
                 let snap: CompatibleIndexSnapshot = serde_json::from_str(&json)
                     .map_err(|e| MemoryError::Store(format!("deserialise vector index: {e}")))?;
+                if let CompatibleIndexSnapshot::V2(snapshot) = &snap {
+                    idx.embedding_identity = snapshot.embedding_identity.clone();
+                }
                 let (snapshot_dimension, generation, vectors): (
                     u32,
                     u64,
@@ -246,6 +256,7 @@ impl VectorIndex {
             .map(|(id, embedding)| (*id, Arc::clone(embedding)))
             .collect::<Vec<_>>();
         VectorPersistenceSnapshot {
+            embedding_identity: self.embedding_identity.clone(),
             generation: self.generation,
             dimension: self.dimension,
             vectors,
@@ -460,6 +471,17 @@ impl VectorIndex {
         }
     }
 
+    /// A same-dimensional vector from another configured model is still stale.
+    /// Bind identity in the same atomic artifact as the vectors, not a sidecar.
+    pub(crate) fn bind_embedding_identity(&mut self, identity: String) {
+        if self.embedding_identity.as_ref() != Some(&identity) {
+            self.vectors.clear();
+            self.insert_order.clear();
+            self.embedding_identity = Some(identity);
+            self.advance_generation();
+        }
+    }
+
     // ─── Internal helpers ─────────────────────────────────────────────────────
 
     fn check_dimension(&self, v: &[f32]) -> Result<(), MemoryError> {
@@ -588,6 +610,7 @@ impl VectorPersistenceSnapshot {
             serde_json::to_writer(
                 &mut writer,
                 &IndexSnapshotRef {
+                    embedding_identity: &self.embedding_identity,
                     schema_version: VECTOR_INDEX_SCHEMA_VERSION,
                     generation: self.generation,
                     dimension: self.dimension,
@@ -681,6 +704,23 @@ fn cosine_similarity(a: &[f32], b: &[f32], norm_a: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn model_identity_is_atomic_with_vectors_and_same_dimension_change_invalidates_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("identity.json");
+        let id = crate::types::MemoryId::new_v4();
+        let mut index = super::VectorIndex::new(path.clone(), 2).unwrap();
+        index.bind_embedding_identity("model-a".into());
+        index.upsert(id, vec![1.0, 2.0]).unwrap();
+        index.persist().unwrap();
+        let mut restored = super::VectorIndex::load(path.clone(), 2).unwrap();
+        restored.bind_embedding_identity("model-a".into());
+        assert!(restored.contains(&id));
+        restored.bind_embedding_identity("model-b".into());
+        assert!(!restored.contains(&id));
+        restored.persist().unwrap();
+        assert_eq!(super::VectorIndex::load(path, 2).unwrap().count(), 0);
+    }
     use super::*;
     use parking_lot::RwLock;
     use std::{sync::Arc, thread, time::Instant};

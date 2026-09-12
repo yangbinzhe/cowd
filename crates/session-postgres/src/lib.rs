@@ -1316,6 +1316,15 @@ const SESSION_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
         CREATE TRIGGER session_discovery_record_invalidation AFTER UPDATE OR DELETE ON session_records FOR EACH ROW EXECUTE FUNCTION session_discovery_record_invalidate();
         CREATE TRIGGER session_discovery_message_invalidation AFTER UPDATE OR DELETE ON session_messages FOR EACH ROW EXECUTE FUNCTION session_discovery_message_invalidate();
     "#],
+}, PostgresMigrationSpec {
+    id: "session.0023.casefolded-list-filter",
+    domain: SESSION_DOMAIN,
+    version: 23,
+    description: "index the canonical case-insensitive Session status/model listing",
+    statements: &[
+        "CREATE INDEX IF NOT EXISTS idx_session_records_casefold_status_model
+             ON session_records(lower(status), lower(model), last_activity DESC, session_id ASC)",
+    ],
 }];
 
 #[derive(Clone, Debug)]

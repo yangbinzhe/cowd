@@ -117,7 +117,7 @@ impl CognitiveContextManager {
         result
     }
 
-    /// Remaining post-turn maintenance: fact-checker, tick,
+    /// Remaining post-turn maintenance: tick,
     /// KG persistence, context rotation, closet/seeds save, etc.
     ///
     /// Call this *after* `extract_and_remember` and `run_drift_and_seeds`
@@ -128,20 +128,6 @@ impl CognitiveContextManager {
         messages: &mut Vec<Message>,
     ) -> Result<()> {
         let _post_turn_start = Instant::now();
-        // ── 0c. Auto-correct contradictions via fact checker ──────────────
-        {
-            let mut fc = crate::orchestrator::get_fact_checker().lock();
-            let report = fc.auto_correct();
-            if report.corrected > 0 || report.pruned > 0 {
-                tracing::info!(
-                    corrected = report.corrected,
-                    pruned = report.pruned,
-                    flagged = report.flagged,
-                    "auto-correction applied"
-                );
-            }
-        }
-
         // Runtime retains ownership of the conversation transcript and its
         // sole semantic checkpoint. This memory-maintenance pass must not
         // apply a second threshold-driven summarizer to a copied transcript:

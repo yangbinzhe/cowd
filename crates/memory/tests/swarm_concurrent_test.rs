@@ -179,11 +179,11 @@ async fn test_swarm_source_agent_tracking() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 3: Cross-agent conflict detection
+// Test 3: Cross-agent claims retain provenance for explicit review
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_swarm_cross_agent_conflict_detection() {
+async fn test_swarm_preserves_conflicting_source_claims_for_explicit_review() {
     let store: Arc<dyn MemoryStore> = Arc::new(EphemeralMemoryStore::new());
 
     let orch = MemoryOrchestrator::from_store(test_config(), Arc::clone(&store), None).unwrap();
@@ -246,17 +246,17 @@ async fn test_swarm_cross_agent_conflict_detection() {
     };
     orch.remember(entry_b).await.unwrap();
 
-    // Verify Agent B's entry was downgraded in confidence
+    // Global text inference must not rewrite another source's claim.
     let got_b = orch.recall(&fact_b_id).await.unwrap().unwrap();
     eprintln!(
         "Conflict test: Agent B confidence = {:.3} (was 0.9)",
         got_b.confidence
     );
-    assert!(
-        got_b.confidence < 0.9,
-        "Contradictory entry from Agent B should have confidence < 0.9, got {:.3}",
-        got_b.confidence
-    );
+    assert_eq!(got_b.confidence, 0.9);
+    assert_eq!(got_b.content, "Bob's parent is Charlie");
+    let retained_a = orch.recall(&fact_a_id).await.unwrap().unwrap();
+    assert_eq!(retained_a.confidence, 1.0);
+    assert_eq!(retained_a.content, "Bob's parent is Alice");
     assert_eq!(
         got_b.source_agent.as_deref(),
         Some("agent-executor"),

@@ -167,45 +167,78 @@ impl RuntimeServices {
         envelope: &AgentActionEnvelope,
     ) -> Result<AgentActionObservation, String> {
         envelope.validate().map_err(|error| error.to_string())?;
+        let actions = self.agent_action_service();
+        if let Some(replay) = actions
+            .replay_if_applied(envelope)
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(replay);
+        }
         self.validate_agent_action_evidence(&envelope.actor, &envelope.action)
             .await?;
+        let positive_review = matches!(&envelope.action,
+            AgentAction::ObjectiveReview(input) if input.decision == harness_contract::agent_action::ObjectiveReviewDecision::Satisfied)
+            || matches!(&envelope.action, AgentAction::TaskReview(input)
+                if input.decision == harness_contract::agent_action::TaskReviewDecision::Accept);
+        let review = if positive_review {
+            // Resolve both the result set and its manifest from one projection.
+            let program = actions
+                .project(&envelope.actor.program_id)
+                .map_err(|error| error.to_string())?;
+            let results = match &envelope.action {
+                AgentAction::ObjectiveReview(input) => &input.result_refs,
+                AgentAction::TaskReview(input) => {
+                    &program
+                        .tasks
+                        .get(&input.task_ref)
+                        .ok_or("review Task not found")?
+                        .artifact_refs
+                }
+                _ => unreachable!("positive review classification"),
+            };
+            Some(
+                self.independent_result_review(
+                    &envelope.actor,
+                    &program,
+                    results,
+                    match &envelope.action {
+                        AgentAction::ObjectiveReview(input) => Some(input.criterion_ref.as_str()),
+                        _ => None,
+                    },
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let verification = review.as_ref().map(|review| &review.verification);
         if matches!(
             envelope.action,
             AgentAction::ObjectiveUpdate(_) | AgentAction::ObjectiveReview(_)
         ) {
-            let producer_refs = match &envelope.action {
-                AgentAction::ObjectiveReview(input) => {
-                    let projection = self
-                        .agent_action_service()
-                        .project(&envelope.actor.program_id)
-                        .map_err(|error| error.to_string())?;
-                    let mut producers = input
-                        .result_refs
-                        .iter()
-                        .filter_map(|result_ref| projection.artifacts.get(result_ref))
-                        .map(|artifact| artifact.committed_by.clone())
-                        .collect::<Vec<_>>();
-                    producers.sort();
-                    producers.dedup();
-                    producers
-                }
-                _ => Vec::new(),
-            };
-            let prepared = self
-                .goal_store()
-                .prepare_agentic_objective_action(envelope, &producer_refs)?;
-            self.agent_action_service()
+            let producers = review
+                .as_ref()
+                .map_or(&[][..], |review| review.producers.as_slice());
+            let prepared = self.goal_store().prepare_agentic_objective_action(
+                envelope,
+                producers,
+                verification,
+            )?;
+            actions
                 .apply_with_goal_event(
                     envelope,
                     prepared.stream_id,
                     prepared.expected_stream_revision,
                     prepared.event,
+                    verification,
                 )
                 .map_err(|error| error.to_string())
-        } else {
-            self.agent_action_service()
-                .apply(envelope)
+        } else if let Some(verification) = verification {
+            actions
+                .apply_verified_review(envelope, verification)
                 .map_err(|error| error.to_string())
+        } else {
+            actions.apply(envelope).map_err(|error| error.to_string())
         }
     }
 }

@@ -1203,8 +1203,9 @@ mod tests {
                 },
             );
             let selected = decision
-                .selected_invocation
-                .as_ref()
+                .activations
+                .first()
+                .and_then(|activation| activation.selected_invocation.as_ref())
                 .expect("Lark skill should be selected");
             assert_eq!(selected.skill_id, expected);
             let prompt = assets

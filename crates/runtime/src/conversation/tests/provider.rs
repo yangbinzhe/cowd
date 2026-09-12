@@ -43,6 +43,7 @@ use harness_contract::skill::{
 };
 use harness_contract::strategy::{understand, StrategyInput};
 use model_protocol::usage::TokenUsage;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
 use std::pin::Pin;
@@ -2772,6 +2773,17 @@ async fn manual_compaction_uses_one_semantic_checkpoint_and_preserves_recent_tur
         })
         .await
         .expect("session record");
+    let original_bytes = crate::JsonValue::Array(
+        session
+            .messages()
+            .map(|m| m.to_persisted_json().unwrap())
+            .collect(),
+    )
+    .render();
+    let artifacts = Arc::new(crate::ArtifactStore::for_test_default(
+        tmp.path().join("artifacts"),
+    ));
+    let session_id = session.session_id.clone();
     let mut runtime = ConversationRuntime::new(
         session,
         MockApi,
@@ -2780,9 +2792,10 @@ async fn manual_compaction_uses_one_semantic_checkpoint_and_preserves_recent_tur
         vec!["system".to_string()],
     )
     .without_memory()
-    .with_memory_manager(manager)
+    .with_memory_manager(Arc::clone(&manager))
+    .with_artifact_store(Arc::clone(&artifacts))
     .with_session_journal_port(crate::session_runtime_port::TestSessionPortAdapter::new(
-        store,
+        Arc::clone(&store),
     ));
     runtime.session_compaction_config.preserve_recent = 2;
 
@@ -2812,6 +2825,116 @@ async fn manual_compaction_uses_one_semantic_checkpoint_and_preserves_recent_tur
             )
         })
     }));
+
+    // Reconstruct the Runtime from its persisted-window representation between
+    // each compression. No original raw message is carried in this new runtime.
+    let mut last_summary = compacted.compaction.as_ref().unwrap().summary.clone();
+    for round in 1..3 {
+        let mut recovered = runtime.session_snapshot().await;
+        recovered
+            .push_message(ConversationMessage::user_text(format!(
+                "next request {round} {}",
+                "detail ".repeat(200)
+            )))
+            .unwrap();
+        recovered
+            .push_message(ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: format!("next response {round} {}", "analysis ".repeat(200)),
+            }]))
+            .unwrap();
+        runtime = ConversationRuntime::new(
+            recovered,
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".into()],
+        )
+        .without_memory()
+        .with_memory_manager(Arc::clone(&manager))
+        .with_artifact_store(Arc::clone(&artifacts))
+        .with_session_journal_port(
+            crate::session_runtime_port::TestSessionPortAdapter::new(Arc::clone(&store)),
+        );
+        runtime.session_compaction_config.preserve_recent = 2;
+        runtime.compact_active_session().await.unwrap().unwrap();
+        last_summary = runtime.session_snapshot().await.compaction.unwrap().summary;
+    }
+    let port = crate::session_runtime_port::TestSessionPortAdapter::new(Arc::clone(&store));
+    let mut raw_windows = Vec::new();
+    // Follow the exposed read locators through the actual durable receipt
+    // resolver and ArtifactStore, validating every byte hash across generations.
+    for _ in 0..3 {
+        let recovery = last_summary
+            .lines()
+            .rev()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|value| value["name"] == "evidence_retrieve")
+            .expect("formatted summary retains an exact recovery request");
+        let logical = recovery["input"]["evidence_ref"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("tool://")
+            .unwrap();
+        let access =
+            crate::SessionRuntimeQueryPort::evidence_access(port.as_ref(), &session_id, logical)
+                .await
+                .unwrap()
+                .unwrap();
+        let artifact = artifacts.resolve(&access.retrieval_selector).unwrap();
+        let bytes = artifacts
+            .read(&artifact, &format!("session:{session_id}"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            format!("sha256:{:x}", Sha256::digest(&bytes)),
+            access.sha256
+        );
+        assert_eq!(recovery["sha256"], access.sha256);
+        assert!(artifacts
+            .read(&artifact, "session:foreign", None)
+            .await
+            .is_err());
+        let raw = String::from_utf8(bytes).unwrap();
+        let records: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        raw_windows.push(raw);
+        let prior = records
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|record| record["blocks"].as_array().unwrap())
+            .filter_map(|block| block["text"].as_str())
+            .find(|text| text.contains("Raw working-window recovery (read-only;"));
+        if let Some(prior) = prior {
+            last_summary = prior.to_string();
+        }
+    }
+    assert_eq!(raw_windows.len(), 3);
+    assert_eq!(
+        raw_windows.last().unwrap(),
+        &original_bytes,
+        "initial raw window remains byte-exact after three compressions"
+    );
+    // A missing raw owner must not fall back to positional references.
+    runtime.artifact_store = None;
+    runtime
+        .session
+        .write()
+        .await
+        .push_message(ConversationMessage::user_text(
+            "one more request".repeat(200),
+        ))
+        .unwrap();
+    let before = runtime.session_snapshot().await;
+    assert!(runtime
+        .compact_active_session()
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("Artifact store"));
+    assert_eq!(
+        runtime.session_snapshot().await.materialize_messages(),
+        before.materialize_messages()
+    );
 }
 
 #[tokio::test]
@@ -3496,6 +3619,11 @@ async fn parallel_network_tool_batch_is_admitted_by_the_retargeted_strategy_leas
     let executions = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&executions);
     let event_store = Arc::new(RuntimeEventStore::for_test());
+    let mut session = Session::new();
+    session.session_id = "parallel-network-session".into();
+    crate::test_support::register_running_root(Arc::clone(&event_store), &crate::CowdExecutionContext {
+        execution_id: "parallel-network-execution".into(), session_id: session.session_id.clone(), turn_id: "parallel-network-turn".into(),
+    });
     let bus = CowdEventBus::new();
     let _scope = bus.enter_execution(crate::CowdExecutionContext {
         execution_id: "parallel-network-execution".to_string(),
@@ -3504,7 +3632,7 @@ async fn parallel_network_tool_batch_is_admitted_by_the_retargeted_strategy_leas
     });
     let mut receiver = bus.subscribe();
     let runtime = ConversationRuntime::new(
-        Session::new(),
+        session,
         MockApi,
         StaticToolExecutor::new().register("web_search", move |_| {
             observed.fetch_add(1, Ordering::SeqCst);
@@ -3875,4 +4003,66 @@ fn low_novelty_publishes_bounded_early_stop() {
         .as_str()
         .expect("visible early-stop reason")
         .contains("low novelty"));
+}
+
+#[tokio::test]
+async fn compaction_raw_journal_failure_retains_original_window() {
+    struct RejectRawJournal;
+    #[async_trait::async_trait]
+    impl crate::SessionRuntimeJournalPort for RejectRawJournal {
+        async fn append_event(
+            &self,
+            _event: &crate::RuntimeSessionEvent,
+        ) -> Result<crate::RuntimeSessionEventReceipt, session::SessionError> {
+            Err(session::SessionError::Store(
+                "injected raw receipt failure".into(),
+            ))
+        }
+        async fn append_context_envelope_if_absent(
+            &self,
+            _record: &crate::RuntimeContextEnvelopeRecord,
+        ) -> Result<Option<crate::RuntimeSessionEventReceipt>, session::SessionError> {
+            Ok(None)
+        }
+        async fn append_compaction_bundle_if_absent(
+            &self,
+            _events: &[crate::RuntimeSessionEvent],
+            _checkpoint_id: &str,
+        ) -> Result<bool, session::SessionError> {
+            panic!("checkpoint must not commit before raw durability")
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut source = Session::new();
+    for i in 0..6 {
+        source
+            .push_message(ConversationMessage::user_text(format!(
+                "original {i} {}",
+                "原文".repeat(1000)
+            )))
+            .unwrap();
+    }
+    let before = source.materialize_messages();
+    let mut runtime = ConversationRuntime::new(
+        source,
+        MockApi,
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::ReadOnly),
+        vec![],
+    )
+    .without_memory()
+    .with_artifact_store(Arc::new(crate::ArtifactStore::for_test_default(
+        tmp.path().join("raw"),
+    )))
+    .with_session_journal_port(Arc::new(RejectRawJournal));
+    runtime.session_compaction_config.preserve_recent = 2;
+    let error = runtime.compact_active_session().await.unwrap_err();
+    assert!(
+        error.to_string().contains("injected raw receipt failure"),
+        "{error}"
+    );
+    assert_eq!(
+        runtime.session_snapshot().await.materialize_messages(),
+        before
+    );
 }

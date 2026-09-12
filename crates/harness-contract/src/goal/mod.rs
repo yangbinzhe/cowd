@@ -126,6 +126,57 @@ pub struct ObjectiveReviewRecord {
     pub producer_refs: Vec<String>,
     pub decision: String,
     pub reason_ref: String,
+    /// Runtime-attested physical reads. Legacy reviews remain replayable but
+    /// cannot establish current independent acceptance without this proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<ObjectiveReviewVerification>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectiveReviewVerification {
+    /// Current external result sources resolved by Runtime, never model input.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub result_source_revisions: BTreeMap<String, u64>,
+    pub goal_spec_revision: Option<u64>,
+    pub goal_spec_digest: Option<String>,
+    pub work_manifest_digest: String,
+    /// Runtime policy only. Historical proofs remain strict.
+    #[serde(default = "required_by_default")]
+    pub independence_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_policy_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_manifest_digest: Option<String>,
+    /// Runtime-resolved producer receipt streams, never supplied by the model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effect_source_refs: Vec<String>,
+    pub reviewer_execution_id: String,
+    pub producer_execution_ids: Vec<String>,
+    pub reads: Vec<ObjectiveResultReadProof>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalResultKind {
+    #[default]
+    Artifact,
+    Content,
+    StructuredData,
+    ToolEffect,
+    ExternalDecision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectiveResultReadProof {
+    pub result_ref: String,
+    #[serde(default)]
+    pub result_kind: GoalResultKind,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effect_observation_refs: Vec<String>,
+    pub content_ref: String,
+    pub sha256: String,
+    pub bytes: u64,
+    pub receipt_refs: Vec<String>,
 }
 
 /// Durable state of one business obligation.  It is intentionally distinct

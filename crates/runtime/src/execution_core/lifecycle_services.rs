@@ -1,6 +1,7 @@
 //! Governed evolution, recovery, scheduling, and managed-agent lifecycle services.
 
 use super::*;
+use harness_contract::agent::AgentReturnPacket;
 
 impl RuntimeServices {
     /// Reconcile durable Agentic Program root barriers after Program claims
@@ -1083,20 +1084,24 @@ impl RuntimeServices {
         // Both sides execute the same immutable inputs and ceilings. Distinct
         // run/session identities and side-specific output leases prevent the
         // first run from contaminating the second.
-        let started = Instant::now();
-        let baseline_return = self
-            .agent_runtime
-            .execute_task(baseline_packet.clone())
-            .await
-            .map_err(RuntimeServicesError::AgentRuntime)?;
-        let baseline_elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-        let started = Instant::now();
-        let candidate_return = self
-            .agent_runtime
-            .execute_task(candidate_packet.clone())
-            .await
-            .map_err(RuntimeServicesError::AgentRuntime)?;
-        let candidate_elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        let baseline_return = self.execute_evolution_packet(&baseline_packet).await?;
+        let candidate_return = self.execute_evolution_packet(&candidate_packet).await?;
+        let elapsed = |packet: &AgentTaskPacket| -> Result<u64, RuntimeServicesError> {
+            let snapshot = self
+                .agent_runtime
+                .get(packet.agent_id())
+                .filter(|snapshot| snapshot.run_id == packet.run_id())
+                .ok_or_else(|| {
+                    RuntimeServicesError::Invariant(
+                        "evaluation has no original durable timing snapshot".into(),
+                    )
+                })?;
+            Ok(snapshot
+                .updated_at_ms
+                .saturating_sub(snapshot.started_at_ms))
+        };
+        let baseline_elapsed_ms = elapsed(&baseline_packet)?;
+        let candidate_elapsed_ms = elapsed(&candidate_packet)?;
         let baseline_observation = scenario_observation(
             &baseline_packet,
             &baseline_return,
@@ -1125,6 +1130,83 @@ impl RuntimeServices {
             }
         }
         Ok((baseline_observation, candidate_observation))
+    }
+
+    async fn execute_evolution_packet(
+        &self,
+        packet: &AgentTaskPacket,
+    ) -> Result<AgentReturnPacket, RuntimeServicesError> {
+        let mut graph = ExecutionGraph::new(packet.objective.clone()).with_lineage(
+            harness_contract::execution_graph::ExecutionGraphLineage {
+                session_id: packet.session_id().to_string(),
+                turn_id: packet
+                    .assignment
+                    .execution_identity
+                    .turn_id()
+                    .ok_or_else(|| {
+                        RuntimeServicesError::Invariant(
+                            "evaluation packet has no turn identity".into(),
+                        )
+                    })?
+                    .to_string(),
+                root_task_id: packet.assignment.root_task_id.clone(),
+                task_id: packet.task_id().to_string(),
+                generation: 1,
+            },
+        );
+        graph.id = packet.graph_id().to_string();
+        graph.service_class = harness_contract::execution_graph::ExecutionServiceClass::Maintenance;
+        let mut node = harness_contract::execution_graph::ExecutionNodeSpec::new(
+            ExecutionNodeKind::AgentTask,
+            AgentTaskExecutor::KIND,
+            serde_json::to_string(packet)
+                .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?,
+        );
+        node.id = packet.node_id().to_string();
+        node.idempotency_key = packet.idempotency_key.clone();
+        node.acceptance.criteria = packet.acceptance.clone();
+        graph.nodes.push(node);
+        if let Err(error) = self
+            .execution_supervisor
+            .register_graph(graph.clone())
+            .await
+        {
+            if !matches!(
+                &error,
+                ExecutionRunnerError::Commit(
+                    crate::execution_core::graph::ExecutionCommitError::EventStore(_)
+                        | crate::execution_core::graph::ExecutionCommitError::StaleRevision { .. }
+                )
+            ) {
+                return Err(RuntimeServicesError::GraphRunner(error));
+            }
+            let existing = self.graph_state_store.load(&graph.id)?;
+            if existing.nodes != graph.nodes
+                || existing.lineage != graph.lineage
+                || existing.service_class != graph.service_class
+            {
+                return Err(RuntimeServicesError::Invariant(
+                    "evaluation graph identity conflict".into(),
+                ));
+            }
+        }
+        self.execution_supervisor
+            .drive_registered(&graph.id)
+            .await
+            .map_err(RuntimeServicesError::GraphRunner)?;
+        self.execution_supervisor
+            .wait_for_terminal(&graph.id)
+            .await
+            .map_err(RuntimeServicesError::GraphRunner)?;
+        self.agent_runtime
+            .terminal_return(packet.agent_id())
+            .filter(|returned| returned.run_id == packet.run_id())
+            .ok_or_else(|| {
+                RuntimeServicesError::Invariant(format!(
+                    "evaluation graph {} has no matching durable Agent result",
+                    graph.id
+                ))
+            })
     }
 
     fn compile_evolution_scenario_packet(
@@ -1173,8 +1255,32 @@ impl RuntimeServices {
             None => compiler.compile_resolved(request, resolved, None),
         }
         .map_err(|error| RuntimeServicesError::AgentRuntime(error.to_string()))?;
-        let deadline_at_ms = now_ms()
-            .saturating_add(harness_contract::agent::DEFAULT_DELEGATED_EXECUTION_TIMEOUT_MS);
+        let graph_id = format!(
+            "evolution-eval-graph:{:x}",
+            Sha256::digest(run_id.as_bytes())
+        );
+        // A retry reattaches to the original immutable reservation; it must
+        // neither refresh its deadline nor replay completed physical effects.
+        // All other packet fields are reconstructed and compared at registration.
+        let deadline_at_ms = match self.graph_state_store.load(&graph_id) {
+            Ok(graph) => {
+                let node = graph
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == format!("{}:{}", scenario.scenario_ref, side))
+                    .ok_or_else(|| {
+                        RuntimeServicesError::Invariant(
+                            "evaluation graph has no original Agent node".into(),
+                        )
+                    })?;
+                let original: AgentTaskPacket = serde_json::from_str(&node.payload_ref)
+                    .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+                original.deadline_at_ms
+            }
+            Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound(_)) => now_ms()
+                .saturating_add(harness_contract::agent::DEFAULT_DELEGATED_EXECUTION_TIMEOUT_MS),
+            Err(error) => return Err(error.into()),
+        };
         let isolation_digest = format!(
             "{:x}",
             Sha256::digest(format!(
@@ -1205,7 +1311,7 @@ impl RuntimeServices {
             session_id,
             mission_id: self.mission_runtime.default_mission_id().to_string(),
             team_id: None,
-            graph_id: format!("evolution-eval-graph:{}", candidate.candidate_id),
+            graph_id,
             node_id: format!("{}:{}", scenario.scenario_ref, side),
             attempt: 1,
             expected_graph_revision: 0,
@@ -1214,7 +1320,31 @@ impl RuntimeServices {
                 criteria: scenario.acceptance.clone(),
                 evidence_obligations: Vec::new(),
             },
-            output_acceptance: Vec::new(),
+            output_acceptance: scenario
+                .acceptance_checks
+                .iter()
+                .map(|requirement| {
+                    use harness_contract::evaluation::EvaluationAcceptanceCheck;
+                    let check = match &requirement.check {
+                        EvaluationAcceptanceCheck::Output { check } => check.clone(),
+                        EvaluationAcceptanceCheck::IsolatedWorkspaceChange { field } => {
+                            harness_contract::agent::OutputAcceptanceCheck::WorkspaceChange {
+                                field: *field,
+                                scopes: vec![output_scope.clone()],
+                            }
+                        }
+                        EvaluationAcceptanceCheck::IsolatedWorkspaceRead => {
+                            harness_contract::agent::OutputAcceptanceCheck::ScopedEvidence {
+                                scopes: vec![format!("read:{output_scope}")],
+                            }
+                        }
+                    };
+                    harness_contract::agent::OutputAcceptanceRequirement {
+                        criterion: requirement.criterion.clone(),
+                        check,
+                    }
+                })
+                .collect(),
             acceptance: scenario.acceptance.clone(),
             constraints: vec![
                 "evolution_evaluation:isolation_required".to_string(),

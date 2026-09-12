@@ -9,6 +9,12 @@
     )
 )]
 
+#[cfg(all(test, feature = "storage-postgres"))]
+extern crate self as storage;
+#[cfg(all(test, feature = "storage-postgres"))]
+#[path = "../test-support/postgres_scope.rs"]
+mod postgres_scope;
+
 #[cfg(feature = "storage-postgres")]
 mod postgres;
 

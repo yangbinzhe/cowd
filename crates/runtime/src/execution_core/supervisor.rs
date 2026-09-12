@@ -108,6 +108,7 @@ struct DriverSlotState {
 #[derive(Debug)]
 struct DriverSlot {
     state: StdMutex<DriverSlotState>,
+    admission: StdMutex<Option<Arc<tokio::sync::OwnedSemaphorePermit>>>,
     changed: tokio::sync::Notify,
 }
 
@@ -128,6 +129,7 @@ impl DriverSlot {
                 outcome: None,
             }),
             changed: tokio::sync::Notify::new(),
+            admission: StdMutex::new(None),
         }
     }
 
@@ -312,6 +314,13 @@ enum OwnedCompletionStatus {
     Aborted,
 }
 
+#[derive(Default)]
+struct ShutdownDrainState {
+    dispatcher: Option<JoinHandle<()>>,
+    preserved_graphs: Option<usize>,
+    errors: Vec<String>,
+}
+
 /// The single Runtime owner of durable graph execution.
 ///
 /// Callers may admit work, issue typed commands, wait for a projection, or
@@ -323,6 +332,7 @@ pub struct RuntimeExecutionSupervisor {
     reaper_sender: mpsc::Sender<SupervisorMessage>,
     reaper_receiver: StdMutex<Option<mpsc::Receiver<SupervisorMessage>>>,
     dispatcher: StdMutex<Option<JoinHandle<()>>>,
+    shutdown_state: tokio::sync::Mutex<ShutdownDrainState>,
     slots: Arc<StdMutex<HashMap<String, Arc<DriverSlot>>>>,
     parallelism: Arc<Semaphore>,
     owned_parallelism: Arc<Semaphore>,
@@ -437,6 +447,7 @@ impl RuntimeExecutionSupervisor {
             reaper_sender,
             reaper_receiver: StdMutex::new(Some(reaper_receiver)),
             dispatcher: StdMutex::new(None),
+            shutdown_state: tokio::sync::Mutex::new(ShutdownDrainState::default()),
             slots: Arc::new(StdMutex::new(HashMap::new())),
             parallelism: Arc::new(Semaphore::new(max_parallel_graphs.max(1))),
             owned_parallelism: Arc::new(Semaphore::new(max_parallel_owned_tasks.max(1))),
@@ -997,6 +1008,9 @@ impl RuntimeExecutionSupervisor {
     }
 
     pub async fn shutdown(&self) -> RuntimeExecutionShutdownReport {
+        // This is a shutdown-owner lock, not a graph/data lock. Keeping the
+        // join handle here lets another waiter resume an abandoned shutdown.
+        let mut shutdown = self.shutdown_state.lock().await;
         let prior = self
             .metrics
             .lifecycle
@@ -1008,7 +1022,11 @@ impl RuntimeExecutionSupervisor {
             )
             .unwrap_or_else(|current| current);
         if prior == LIFECYCLE_CLOSED {
-            return self.shutdown_report(0, 0, Vec::new());
+            return self.shutdown_report(
+                shutdown.preserved_graphs.unwrap_or(0),
+                0,
+                shutdown.errors.clone(),
+            );
         }
 
         let graph_ids = self
@@ -1038,33 +1056,42 @@ impl RuntimeExecutionSupervisor {
                     })
             })
             .count();
-        let mut errors = Vec::new();
+        let preserved_graphs = *shutdown.preserved_graphs.get_or_insert(preserved_graphs);
         self.cancellation.cancel();
-        let dispatcher = self
-            .dispatcher
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(mut dispatcher) = dispatcher {
-            if tokio::time::timeout(self.shutdown_timeout, &mut dispatcher)
+        if shutdown.dispatcher.is_none() {
+            shutdown.dispatcher = self
+                .dispatcher
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+        }
+        if let Some(dispatcher) = shutdown.dispatcher.as_mut() {
+            if tokio::time::timeout(self.shutdown_timeout, &mut *dispatcher)
                 .await
                 .is_err()
             {
                 dispatcher.abort();
-                let _ = dispatcher.await;
+                let _ = (&mut *dispatcher).await;
                 let forced = self.metrics.force_abort_active_owners().max(1);
                 self.metrics
                     .forced_aborts
                     .fetch_add(forced, Ordering::Relaxed);
                 self.metrics.active_drivers.store(0, Ordering::Relaxed);
                 self.metrics.active_owned_tasks.store(0, Ordering::Relaxed);
-                errors.push("execution dispatcher exceeded shutdown timeout".to_string());
+                shutdown
+                    .errors
+                    .push("execution dispatcher exceeded shutdown timeout".to_string());
             }
         }
+        shutdown.dispatcher.take();
+        // No producer/driver remains. Retained effects must finish before the
+        // Runtime is reported closed; a shutdown timeout cannot unlock a write.
+        // Their graph attempts remain recoverable, not business-cancelled.
+        self.runner.drain_physical_execution().await;
         self.metrics
             .lifecycle
             .store(LIFECYCLE_CLOSED, Ordering::Release);
-        self.shutdown_report(preserved_graphs, 0, errors)
+        self.shutdown_report(preserved_graphs, 0, shutdown.errors.clone())
     }
 
     fn shutdown_report(
@@ -1257,6 +1284,7 @@ async fn dispatch_loop(
                             active.insert(graph_id.clone(), generation);
                             spawn_graph_pump(
                                 &mut workers,
+                                Arc::clone(&slots),
                                 graph_id,
                                 generation,
                                 slot,
@@ -1331,6 +1359,7 @@ async fn dispatch_loop(
                                 active.insert(graph_id.clone(), next_generation);
                                 spawn_graph_pump(
                                     &mut workers,
+                                    Arc::clone(&slots),
                                     graph_id,
                                     next_generation,
                                     slot,
@@ -1395,6 +1424,7 @@ fn prepare_worker(
 
 fn spawn_graph_pump(
     workers: &mut JoinSet<SupervisorCompletion>,
+    slots: Arc<StdMutex<HashMap<String, Arc<DriverSlot>>>>,
     graph_id: String,
     generation: u64,
     slot: Arc<DriverSlot>,
@@ -1407,7 +1437,22 @@ fn spawn_graph_pump(
     metrics.owner_submitted("graph");
     workers.spawn(async move {
         let execution = async {
-            let permit = tokio::select! {
+            let inherited = match runner.state_store().load_async(&graph_id).await {
+                Ok(graph) if super::graph::executors::agent_tool::is_bound_agent_tool_graph(&graph) => {
+                    let parent = graph.parent_execution.as_ref().expect("typed parent checked");
+                    match runner.state_store().load_async(&parent.execution_id).await {
+                        Ok(parent_graph) if parent_graph.node_statuses.get(&parent.node_id) == Some(&harness_contract::execution_graph::ExecutionNodeStatus::Running)
+                            && graph.lineage == parent_graph.lineage && graph.service_class == parent_graph.service_class
+                            && parent_graph.nodes.iter().any(|node| node.id == parent.node_id && node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask) => {
+                            let parent_slot = slots.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&parent.execution_id).cloned();
+                            parent_slot.and_then(|slot| slot.admission.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone())
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            let permit = if let Some(permit) = inherited { permit } else { Arc::new(tokio::select! {
                 _ = cancellation.cancelled() => {
                     return DriverOutcome::Aborted(
                         "execution cancelled before driver start".to_string()
@@ -1421,7 +1466,13 @@ fn spawn_graph_pump(
                         }
                     }
                 }
-            };
+            }) };
+            *slot.admission.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(permit.clone());
+            struct AdmissionOwner(Arc<DriverSlot>);
+            impl Drop for AdmissionOwner {
+                fn drop(&mut self) { self.0.admission.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take(); }
+            }
+            let _admission_owner = AdmissionOwner(slot.clone());
             metrics.active_drivers.fetch_add(1, Ordering::Relaxed);
             let result = run_completion_pump(
                 Arc::clone(&runner),
@@ -1777,6 +1828,8 @@ mod completion_pump_tests {
     use crate::runtime_event_store::RuntimeEventStore;
 
     struct PumpTestExecutor {
+        kind: &'static str,
+        release: Option<Arc<Notify>>,
         delays: BTreeMap<String, Duration>,
         panic_nodes: BTreeSet<String>,
         running: AtomicUsize,
@@ -1790,6 +1843,8 @@ mod completion_pump_tests {
     impl PumpTestExecutor {
         fn new(delays: impl IntoIterator<Item = (String, Duration)>) -> Self {
             Self {
+                kind: "completion_pump_test",
+                release: None,
                 delays: delays.into_iter().collect(),
                 panic_nodes: BTreeSet::new(),
                 running: AtomicUsize::new(0),
@@ -1810,7 +1865,7 @@ mod completion_pump_tests {
     #[async_trait]
     impl NodeExecutor for PumpTestExecutor {
         fn kind(&self) -> &str {
-            "completion_pump_test"
+            self.kind
         }
 
         fn validate(&self, _node: &ExecutionNodeSpec) -> Result<(), NodeExecutorError> {
@@ -1860,6 +1915,9 @@ mod completion_pump_tests {
                 .push(std::time::Instant::now());
             let running = self.running.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_running.fetch_max(running, Ordering::SeqCst);
+            if let Some(release) = &self.release {
+                release.notified().await;
+            }
             tokio::time::sleep(
                 self.delays
                     .get(&ticket.node_id)
@@ -1911,9 +1969,25 @@ mod completion_pump_tests {
         resource_capacity: usize,
         active_nodes_per_graph: usize,
     ) -> RuntimeExecutionSupervisor {
+        test_supervisor_with_executors(
+            vec![executor],
+            resource_capacity,
+            active_nodes_per_graph,
+            16,
+        )
+    }
+
+    fn test_supervisor_with_executors(
+        executors: Vec<Arc<dyn NodeExecutor>>,
+        resource_capacity: usize,
+        active_nodes_per_graph: usize,
+        graph_capacity: usize,
+    ) -> RuntimeExecutionSupervisor {
         let event_store = Arc::new(RuntimeEventStore::for_test());
         let registry = Arc::new(NodeExecutorRegistry::new());
-        registry.register(executor).expect("register executor");
+        for executor in executors {
+            registry.register(executor).expect("register executor");
+        }
         let workspace_id = format!("completion-pump-{}", uuid::Uuid::new_v4());
         let leases = WorktreeLeaseManager::open(
             std::env::temp_dir()
@@ -1950,10 +2024,217 @@ mod completion_pump_tests {
         );
         RuntimeExecutionSupervisor::with_limits(
             Arc::new(runner),
-            16,
+            graph_capacity,
             active_nodes_per_graph,
             Duration::from_secs(2),
         )
+    }
+
+    #[tokio::test]
+    async fn abandoned_shutdown_retains_dispatcher_join_for_concurrent_waiters() {
+        let supervisor = Arc::new(test_supervisor(Arc::new(PumpTestExecutor::new([]))));
+        let release = Arc::new(Notify::new());
+        let exited = Arc::new(AtomicBool::new(false));
+        *supervisor.dispatcher.lock().unwrap() = Some({
+            let release = release.clone();
+            let exited = exited.clone();
+            tokio::spawn(async move {
+                release.notified().await;
+                exited.store(true, Ordering::SeqCst);
+            })
+        });
+        let first = {
+            let supervisor = supervisor.clone();
+            tokio::spawn(async move { supervisor.shutdown().await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while supervisor.dispatcher.lock().unwrap().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert!(!exited.load(Ordering::SeqCst));
+        let mut second = {
+            let supervisor = supervisor.clone();
+            tokio::spawn(async move { supervisor.shutdown().await })
+        };
+        let mut third = {
+            let supervisor = supervisor.clone();
+            tokio::spawn(async move { supervisor.shutdown().await })
+        };
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut second)
+            .await
+            .is_err());
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut third)
+            .await
+            .is_err());
+        assert_eq!(supervisor.health().lifecycle, "closing");
+        release.notify_one();
+        let second = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .unwrap()
+            .unwrap();
+        let third = tokio::time::timeout(Duration::from_secs(1), third)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(exited.load(Ordering::SeqCst));
+        assert_eq!(supervisor.health().lifecycle, "closed");
+        assert_eq!(second, third);
+        assert_eq!(second.forced_aborts, 0);
+    }
+
+    #[tokio::test]
+    async fn bound_agent_child_shares_one_parent_slot_but_unrelated_root_cannot() {
+        use sha2::{Digest, Sha256};
+        let release = Arc::new(Notify::new());
+        let mut parent_executor = PumpTestExecutor::new([]);
+        parent_executor.release = Some(release.clone());
+        let parent_executor = Arc::new(parent_executor);
+        let mut leaf_executor = PumpTestExecutor::new([]);
+        leaf_executor.kind = "tool_batch";
+        let leaf_executor = Arc::new(leaf_executor);
+        let supervisor = test_supervisor_with_executors(
+            vec![parent_executor.clone(), leaf_executor.clone()],
+            1,
+            1,
+            1,
+        );
+        let mut parent = ExecutionGraph::new("one-slot Agent parent");
+        crate::test_support::attach_execution_graph_lineage(&mut parent);
+        let mut parent_node = test_node("parent-agent");
+        parent_node.kind = ExecutionNodeKind::AgentTask;
+        parent_node.payload_ref =
+            serde_json::to_string(&harness_contract::agent::AgentTaskIntent {
+                selected_agent_id: None,
+                definition_ref: None,
+                granted_capabilities: vec![],
+                principal_id: "test".into(),
+                source_turn_id: "turn".into(),
+                run_id: "run".into(),
+                task_id: "task".into(),
+                root_task_id: "task".into(),
+                parent_task_id: None,
+                session_id: "session".into(),
+                mission_id: "mission".into(),
+                team_id: None,
+                graph_id: parent.id.clone(),
+                node_id: parent_node.id.clone(),
+                attempt: 1,
+                expected_graph_revision: 0,
+                objective: "wait for own tool child".into(),
+                required_acceptance: Default::default(),
+                output_acceptance: vec![],
+                acceptance: vec![],
+                constraints: vec![],
+                context_refs: vec![],
+                evidence_refs: vec![],
+                resource_scopes: vec![],
+                allowed_tools: vec![],
+                allowed_skills: vec![],
+                permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+                model_lease: "test".into(),
+                budget_lease: harness_contract::context::ChildExecutionBudgetReservation::single(
+                    "parent-budget",
+                    "agent-budget",
+                    "agent",
+                    1_000,
+                    u64::MAX,
+                    1,
+                ),
+                deadline_at_ms: u64::MAX,
+                managed_invocation: None,
+                idempotency_key: "parent-invocation".into(),
+                agentic_binding: None,
+            })
+            .unwrap();
+        parent.nodes.push(parent_node);
+        supervisor
+            .submit(
+                parent.clone(),
+                ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while parent_executor.running.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(supervisor.parallelism.available_permits(), 0);
+        let mut request = crate::RuntimeToolExecutionRequest::from_tool_request(
+            &crate::tool_dispatch::ToolRequest {
+                tool_use_id: "child-tool".into(),
+                tool_name: "read_file".into(),
+                input: "{}".into(),
+                depends_on: vec![],
+            },
+        );
+        request.parent_execution =
+            Some(harness_contract::execution_graph::ExecutionParentBinding {
+                execution_id: parent.id.clone(),
+                node_id: "parent-agent".into(),
+            });
+        let payload = serde_json::json!({"kind":"agent_tool_batch.v1", "agent_id":"agent", "run_id":"run", "request":request}).to_string();
+        let digest = format!("{:x}", Sha256::digest(payload.as_bytes()));
+        let mut child = ExecutionGraph::new("bound tool child");
+        child.id = format!("agent-tool-batch:{digest}");
+        child.parent_execution = request.parent_execution;
+        child.lineage = parent.lineage.clone();
+        let mut node = ExecutionNodeSpec::new(ExecutionNodeKind::ToolBatch, "tool_batch", payload);
+        node.id = format!("agent-tool:{digest}");
+        node.idempotency_key = node.id.clone();
+        child.nodes.push(node);
+        let mut unrelated = ExecutionGraph::new("independent root cannot borrow capacity");
+        crate::test_support::attach_execution_graph_lineage(&mut unrelated);
+        unrelated.nodes.push(ExecutionNodeSpec::new(
+            ExecutionNodeKind::ToolBatch,
+            "tool_batch",
+            "unrelated",
+        ));
+        let unrelated_id = unrelated.id.clone();
+        supervisor
+            .submit(
+                unrelated,
+                ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let (_, report) = tokio::time::timeout(
+            Duration::from_secs(2),
+            supervisor.submit_and_wait_terminal(
+                child,
+                ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            ),
+        )
+        .await
+        .expect("child must finish while its sole-capacity parent still waits")
+        .unwrap();
+        assert_eq!(report.completed, 1);
+        assert_eq!(leaf_executor.calls.lock().unwrap().len(), 1);
+        assert_eq!(supervisor.parallelism.available_permits(), 0);
+        release.notify_one();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            supervisor.wait_for_terminal(&unrelated_id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(leaf_executor.calls.lock().unwrap().len(), 2);
+        supervisor.shutdown().await;
+        assert_eq!(supervisor.parallelism.available_permits(), 1);
     }
 
     #[tokio::test]

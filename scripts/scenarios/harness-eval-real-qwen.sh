@@ -45,6 +45,7 @@ STAGED_CREDENTIAL_ENV=""
 # run it: an optional provider-token value is advisory accounting only, never
 # a scenario-specific quality floor or a task-execution stop condition.
 SCENARIO_ID="${COWD_EVAL_LIVE_SCENARIOS:-}"
+MAX_PROVIDER_TOKENS="${COWD_EVAL_MAX_PROVIDER_TOKENS:-unbounded-explicit-opt-in}"
 [[ -n "$SCENARIO_ID" && "$SCENARIO_ID" != *,* ]] || {
   echo 'set COWD_EVAL_LIVE_SCENARIOS to exactly one paid scenario id' >&2
   exit 2
@@ -272,6 +273,7 @@ if ss -ltn | rg -q ":${PORT}\\b"; then
   echo "isolated Gateway port $PORT is already in use" >&2
   exit 2
 fi
+cd "$ROOT"
 # The Gateway and harness evaluator are both part of the system under test.
 # Building only harness-eval after the Gateway starts leaves an old
 # `target/debug/cowd` serving the scenario; conversely, rebuilding only Cowd
@@ -326,6 +328,8 @@ gateway:
         enabled: true
         token: "$TOKEN"
 EOF
+
+env COWD_CONFIG_HOME="$CONFIG_HOME" "$BIN" storage upgrade
 
 gateway_env=(
   COWD_CONFIG_HOME="$CONFIG_HOME"

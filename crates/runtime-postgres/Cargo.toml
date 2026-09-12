@@ -15,6 +15,7 @@ storage = { path = "../storage", features = ["storage-postgres"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+async-trait = "0.1"
 harness-contract = { path = "../harness-contract" }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

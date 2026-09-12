@@ -19,7 +19,9 @@ fn surface_catalog_gateway_bindings_and_openapi_are_identical() {
         .map(|(method, path)| (method.clone(), path.replace('*', ":")))
         .collect::<BTreeSet<_>>();
 
-    assert_eq!(surface.len(), 482, "real public route surface regressed");
+    // The reviewed catalog retired eight legacy team/template routes and
+    // added the canonical Program root route (482 - 8 + 1).
+    assert_eq!(surface.len(), 475, "real public route surface regressed");
     assert_eq!(bindings, surface, "Gateway handler binding drift");
     assert_eq!(openapi, openapi_expected, "OpenAPI projection drift");
 }

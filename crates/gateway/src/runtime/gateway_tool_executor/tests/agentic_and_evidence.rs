@@ -21,6 +21,62 @@
     }
 
     #[tokio::test]
+    async fn external_decision_evidence_uses_runtime_source_and_authenticated_pagination() {
+        use harness_contract::execution_graph::*;
+        use harness_contract::policy::*;
+        let services = runtime::RuntimeServices::in_memory().unwrap();
+        let mut graph = ExecutionGraph::new("external decision Gateway");
+        graph.lineage = Some(ExecutionGraphLineage {
+            session_id:"decision-session".into(), turn_id:"decision-turn".into(),
+            root_task_id:"decision-task".into(), task_id:"decision-task".into(), generation:1,
+        });
+        let node = ExecutionNodeSpec::new(ExecutionNodeKind::Approval, "approval", "decision source");
+        let reference = runtime::execution_core::graph::executors::graph_approval_id(&graph.id, &node.id);
+        graph.nodes.push(node);
+        services.commit_service().register_graph(graph).unwrap();
+        let source = ApprovalSource {kind:ApprovalSourceKind::Session, session_id:Some("decision-session".into()),
+            agent_id:None, team_id:None, mission_id:None, resource_ref:None, review_ref:None, application:None};
+        services.approval_queue().submit_scoped(&reference, SubmitApprovalRequest {
+            context:ApprovalContext::owned(&source, "decide work", "test-workspace"), source,
+            action:"decide work".into(), summary:"Review requested work".into(),
+            risk:harness_contract::core::TaskRisk::Medium, domain:ApprovalDomain::Execution,
+            blocks_execution:true, evidence_refs:vec![], timeout_policy:ApprovalTimeoutPolicy::AutoDeny,
+        }).unwrap();
+        let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
+        executor.bind_runtime_services(Arc::clone(&services)).unwrap();
+        let request = || serde_json::from_value::<EvidenceRetrieveToolRequest>(serde_json::json!({"evidence_ref":reference, "limit":1})).unwrap();
+        assert!(executor.execute_evidence_retrieve(request(), Some("decision-session"), &[]).await.is_err());
+        let reason = "Operator checked the proposed work and declined. ".repeat(1200);
+        services.approval_queue().decide_surface_human("operator:gateway", ApprovalDecisionCommand {
+            approval_id:reference.clone(), approved:false, skip:false, reason:reason.clone(), scope:ApprovalGrantScope::Once,
+            actor:ApprovalDecisionActor {kind:ApprovalDecisionActorKind::Human, actor_id:"surface-replaces-this".into()}, evidence_refs:vec![],
+        }).unwrap();
+        assert!(executor.execute_evidence_retrieve(request(), None, &[]).await.is_err());
+        assert!(executor.execute_evidence_retrieve(request(), Some("other-session"), &["session:decision-session".into()]).await.is_err());
+        let mut next = request();
+        let mut text = String::new();
+        let mut pages = 0;
+        let mut expected_hash = None;
+        loop {
+            let value:serde_json::Value = serde_json::from_str(&executor.execute_evidence_retrieve(next, Some("decision-session"), &[]).await.unwrap()).unwrap();
+            assert_eq!(value["available"], true);
+            if let Some(hash) = &expected_hash { assert_eq!(&value["sha256"], hash); }
+            expected_hash = Some(value["sha256"].clone());
+            for chunk in value["chunks"].as_array().unwrap() { text.push_str(chunk["content"].as_str().unwrap()); }
+            pages += 1;
+            assert!(pages < 200, "pagination must terminate");
+            if value["next_request"].is_null() { break; }
+            next = serde_json::from_value(value["next_request"].clone()).unwrap();
+        }
+        assert!(pages > 1);
+        let content:serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(content["approval"]["decision"]["reason"], reason);
+        assert_eq!(content["approval"]["decision"]["approved"], false);
+        assert_eq!(content["approval"]["decision"]["actor"]["actor_id"], "operator:gateway");
+        assert_eq!(content["scope"], "approval_decision_only");
+    }
+
+    #[tokio::test]
     async fn logical_tool_evidence_resolves_through_session_receipt_to_opaque_artifact() {
         let temporary = tempfile::tempdir().expect("temporary Runtime root");
         let workspace = temporary.path().join("workspace");
@@ -369,6 +425,10 @@
             session_id: Some("session-foreign"),
             ..binding
         };
+        let before_foreign = services
+            .agent_action_service()
+            .project(&program.program_id)
+            .expect("Program before rejected foreign root write");
         assert!(executor
             .execute_runtime_tool_with_binding(
                 harness_contract::agent_action::TEAM_CREATE_TOOL_ID,
@@ -377,6 +437,14 @@
             )
             .await
             .is_err());
+        assert_eq!(
+            services
+                .agent_action_service()
+                .project(&program.program_id)
+                .expect("Program after rejected foreign root write"),
+            before_foreign,
+            "a cross-Session root write must not change the durable Program"
+        );
     }
 
     #[tokio::test]
@@ -454,6 +522,11 @@
             "receipt must echo the Runtime-parsed physical content_ref"
         );
 
+        let actor = root_agent_action_actor(binding);
+        let before_rejected_external_write = services
+            .agent_action_service()
+            .project(&actor.program_id)
+            .expect("Program before rejected external write");
         let rejected = executor
             .execute_runtime_tool_with_binding(
                 harness_contract::agent_action::ARTIFACT_COMMIT_TOOL_ID,
@@ -479,8 +552,15 @@
             rejected.error.expect("error").code,
             "artifact_content_not_durable"
         );
+        assert_eq!(
+            services
+                .agent_action_service()
+                .project(&actor.program_id)
+                .expect("Program after rejected external write"),
+            before_rejected_external_write,
+            "Gateway must reject invented content before writing business state"
+        );
 
-        let actor = root_agent_action_actor(binding);
         let direct_artifact = harness_contract::agent_action::AgentAction::TaskSubmit(
             harness_contract::agent_action::TaskSubmitInput {
                 task_ref: "task:any".to_string(),
@@ -538,6 +618,14 @@
                 .to_string()
                 .contains("has no canonical durable receipt"),
             "{error}"
+        );
+        assert_eq!(
+            services
+                .agent_action_service()
+                .project(&actor.program_id)
+                .expect("Program after rejected forged external evidence"),
+            before_rejected_external_write,
+            "unreadable or forged external evidence must not write business state"
         );
     }
 

@@ -407,6 +407,14 @@ fn gateway_openapi_document_from_contract(
 }
 
 fn insert_runtime_contract_schemas(schemas: &mut Map<String, Value>) {
+    insert_canonical_schema::<super::session_routes::BranchSessionRequest>(
+        schemas,
+        "BranchSessionRequest",
+    );
+    insert_canonical_schema::<super::session_routes::BranchSessionReceipt>(
+        schemas,
+        "BranchSessionReceipt",
+    );
     insert_canonical_schema::<harness_contract::projection::ExecutionProjection>(
         schemas,
         "ExecutionProjection",
@@ -2652,6 +2660,35 @@ mod tests {
                 && capability.http.method == "POST"
                 && capability.consumed_by == ["webui", "tui"]
         }));
+    }
+
+    #[test]
+    fn branch_receipt_schema_matches_the_real_route_and_can_export_candidate_contract() {
+        let document = gateway_openapi_document_for_apps();
+        assert_eq!(
+            document["paths"]["/api/sessions/{id}/branch"]["post"]["responses"]["200"]["content"]
+                ["application/json"]["schema"]["$ref"],
+            "#/components/schemas/BranchSessionReceipt"
+        );
+        let required = document["components"]["schemas"]["BranchSessionReceipt"]["required"]
+            .as_array()
+            .unwrap();
+        for field in [
+            "id",
+            "operation_id",
+            "source_session_id",
+            "source_message_count",
+            "copied_message_count",
+            "replayed",
+        ] {
+            assert!(
+                required.contains(&json!(field)),
+                "missing real receipt field {field}"
+            );
+        }
+        if let Some(path) = std::env::var_os("COWD_TEST_OPENAPI_EXPORT") {
+            std::fs::write(path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+        }
     }
 
     #[test]

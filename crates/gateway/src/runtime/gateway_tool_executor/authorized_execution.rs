@@ -88,18 +88,22 @@ impl GatewayToolExecutor {
             ToolError::new("evidence_retrieve requires the workspace RuntimeServices")
         })?;
         let selector = input.evidence_ref.clone();
-        if !selector.starts_with("tool://") && !selector.starts_with("artifact://") {
+        if !selector.starts_with("tool://") && !selector.starts_with("artifact://") && !selector.starts_with("approval:v1:") {
             return serde_json::to_string_pretty(&serde_json::json!({
                 "kind": "evidence_retrieve",
                 "evidence_ref": input.evidence_ref,
                 "available": false,
                 "reason": "unsupported_ref",
-                "hint": "Only durable tool:// raw-output or artifact:// content references are resolvable here; memory:/session:// refs must be read through context_retrieve",
+                "hint": "Use durable tool://, artifact:// or approval:v1: references; memory:/session:// refs must be read through context_retrieve",
             }))
             .map_err(|error| ToolError::new(error.to_string()));
         }
         let store = services.artifact_store();
-        let artifact = if let Some(evidence_id) = selector.strip_prefix("tool://") {
+        let artifact = if selector.starts_with("approval:v1:") {
+            let session_id = session_id.ok_or_else(|| ToolError::new("external decisions require an authenticated Session"))?;
+            services.approval_result_content(session_id, &selector).await
+                .map_err(ToolError::new)?.0
+        } else if let Some(evidence_id) = selector.strip_prefix("tool://") {
             let Some(session_id) = session_id else {
                 return serde_json::to_string_pretty(&serde_json::json!({
                     "kind": "evidence_retrieve",

@@ -336,7 +336,11 @@ pub(super) fn tool_effect_has_resource_lease(
     if AGENT_ACTION_TOOL_IDS.contains(&tool_name)
         || matches!(
             tool_name,
-            "context_retrieve" | "evidence_retrieve" | "artifact_publish"
+            "context_retrieve"
+                | "working_context"
+                | "private_note"
+                | "evidence_retrieve"
+                | "artifact_publish"
         )
     {
         return true;

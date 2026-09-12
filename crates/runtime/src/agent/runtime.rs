@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use async_trait::async_trait;
 use harness_contract::agent::{
     AgentBindingSnapshot, AgentCommand, AgentCommandReceipt, AgentCommandRejectReason,
-    AgentCommandRequest, AgentInput, AgentLifecycleEvent, AgentReturnPacket, AgentStatus,
-    AgentTaskPacket, AgentTerminalStatus, RevisionSelector,
+    AgentCommandRequest, AgentLifecycleEvent, AgentReturnPacket, AgentStatus, AgentTaskPacket,
+    AgentTerminalStatus, RevisionSelector,
 };
 use harness_contract::execution::ExecutionIdentity;
 use harness_contract::execution_graph::{
@@ -30,8 +30,13 @@ use crate::agent_model_selector::{AgentModelSelection, AgentModelSelector};
 use crate::agent_result_validator::validate_agent_return;
 use crate::agent_run_handle::{AgentBackendCapabilities, AgentBackendKind, AgentRunHandle};
 
+#[path = "input_journal.rs"]
+mod input_journal;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentRunSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agentic_binding: Option<harness_contract::agent::AgenticExecutionBinding>,
     pub execution_identity: ExecutionIdentity,
     pub run_id: String,
     pub agent_id: String,
@@ -121,7 +126,6 @@ struct PersistedAgentEvent {
 struct AgentRunRecord {
     snapshot: Option<AgentRunSnapshot>,
     receipts: BTreeMap<String, AgentCommandReceipt>,
-    inputs: Vec<AgentInput>,
     returned: Option<AgentReturnPacket>,
 }
 
@@ -326,6 +330,21 @@ impl AgentRuntime {
         runs
     }
 
+    /// Original run truth retains the immutable typed Program/member scope.
+    /// No display metadata, role names or cross-Program graph scans participate.
+    pub(crate) fn running_agentic_members(&self, program_id: &str) -> BTreeSet<String> {
+        self.records
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .filter_map(|record| record.snapshot.as_ref())
+            .filter(|run| !run.status.is_terminal())
+            .filter_map(|run| run.agentic_binding.as_ref())
+            .filter(|binding| binding.program_id == program_id)
+            .map(|binding| binding.agent_id.clone())
+            .collect()
+    }
+
     #[must_use]
     pub fn list_for_graphs(&self, graph_ids: &BTreeSet<String>) -> Vec<AgentRunSnapshot> {
         let agent_ids = {
@@ -407,7 +426,6 @@ impl AgentRuntime {
             snapshot: Some(payload.snapshot),
             returned: payload.returned,
             receipts,
-            inputs: Vec::new(),
         })
     }
 
@@ -658,6 +676,40 @@ impl AgentRuntime {
                 ));
             }
         }
+        let result = self.execute_task_locked(packet.clone()).await;
+        // The next opportunity may choose this same Agent. Never await its
+        // dispatch while retaining the previous run's exclusive lock.
+        drop(_run_guard);
+        if let Some(services) = self.services() {
+            let reason = match &result {
+                Ok(returned) => returned
+                    .failure
+                    .as_deref()
+                    .unwrap_or("Agent execution ended without a durable task submission or review"),
+                Err(error) => error.as_str(),
+            };
+            if let Err(error) = services
+                .settle_abandoned_agentic_attempt(&packet, reason)
+                .await
+            {
+                tracing::warn!(run_id = packet.run_id(), %error, "Agent attempt settlement awaits durable recovery");
+            }
+            if let Some(binding) = packet.agentic_binding.as_ref() {
+                if let Err(error) = services
+                    .dispatch_ready_agentic_work(&binding.program_id)
+                    .await
+                {
+                    tracing::warn!(run_id = packet.run_id(), %error, "ready Agent work awaits recovery after worker exit");
+                }
+            }
+        }
+        result
+    }
+
+    async fn execute_task_locked(
+        &self,
+        packet: AgentTaskPacket,
+    ) -> Result<AgentReturnPacket, String> {
         let packet = self.attach_predecessor_context(packet).await?;
         let packet = self.ensure_runtime_binding(packet)?;
         let backend_kind = backend_from_packet(&packet)?;
@@ -684,6 +736,7 @@ impl AgentRuntime {
             );
             self.persist_snapshot(
                 AgentRunSnapshot {
+                    agentic_binding: packet.agentic_binding.clone(),
                     execution_identity: packet.assignment.execution_identity.clone(),
                     run_id: packet.run_id().to_string(),
                     agent_id: packet.agent_id().to_string(),
@@ -734,6 +787,7 @@ impl AgentRuntime {
                         let returned = blocked_return(&packet, failure.clone());
                         self.persist_snapshot(
                             AgentRunSnapshot {
+                                agentic_binding: packet.agentic_binding.clone(),
                                 execution_identity: packet.assignment.execution_identity.clone(),
                                 run_id: packet.run_id().to_string(),
                                 agent_id: packet.agent_id().to_string(),
@@ -780,6 +834,7 @@ impl AgentRuntime {
             let returned = blocked_return(&packet, failure.clone());
             self.persist_snapshot(
                 AgentRunSnapshot {
+                    agentic_binding: packet.agentic_binding.clone(),
                     execution_identity: packet.assignment.execution_identity.clone(),
                     run_id: packet.run_id().to_string(),
                     agent_id: packet.agent_id().to_string(),
@@ -808,6 +863,7 @@ impl AgentRuntime {
             return Ok(returned);
         }
         let snapshot = AgentRunSnapshot {
+            agentic_binding: packet.agentic_binding.clone(),
             execution_identity: packet.assignment.execution_identity.clone(),
             run_id: packet.run_id().to_string(),
             agent_id: packet.agent_id().to_string(),
@@ -892,6 +948,16 @@ impl AgentRuntime {
         let observation_authority = backend
             .as_ref()
             .is_some_and(|registered| registered.observation_authority);
+        // Both Native and ProcessJsonl share this physical worker lifetime.
+        // The keeper waits for the Agent's own first claim; dropping the
+        // execute future (including cancellation) aborts renewal.
+        let claim_heartbeat = self
+            .services()
+            .map(|services| {
+                crate::agentic::start_agentic_claim_heartbeat(Arc::downgrade(&services), &packet)
+            })
+            .transpose()?
+            .flatten();
         let mut returned = match backend {
             Some(registered) => match registered.backend.execute(packet.clone(), selection).await {
                 Ok(returned) => returned,
@@ -902,6 +968,7 @@ impl AgentRuntime {
                 format!("agent backend {backend_kind:?} is not installed for this RuntimeServices instance"),
             ),
         };
+        drop(claim_heartbeat);
         if !observation_authority {
             // Extension/process backends may return business output, but they
             // cannot mint Runtime observation truth. Only the crate-private
@@ -964,6 +1031,15 @@ impl AgentRuntime {
             returned.status = AgentTerminalStatus::Cancelled;
             returned.outcome.clear();
             returned.failure = Some("agent cancelled by command".into());
+        }
+        if returned.status == AgentTerminalStatus::Completed
+            && backend_from_packet(&packet)? == AgentBackendKind::InProcess
+            && !self
+                .pending_agent_inputs(packet.agent_id(), packet.run_id())?
+                .is_empty()
+        {
+            returned.status = AgentTerminalStatus::Failed;
+            returned.failure = Some("accepted Agent inputs remain without a committed model-consumption receipt; reconcile the original run".into());
         }
         if let Err(error) = validate_agent_return(&packet, &returned) {
             let missing_acceptance = packet
@@ -1410,6 +1486,12 @@ impl AgentRuntime {
     }
 
     pub async fn command(&self, request: AgentCommandRequest) -> AgentCommandReceipt {
+        if request.command == AgentCommand::SendInput {
+            return self.command_durable_input(request).await;
+        }
+        if let Some(receipt) = self.reject_reserved_input_command_id(&request) {
+            return receipt;
+        }
         if let Some(receipt) = self
             .records
             .read()
@@ -1474,15 +1556,6 @@ impl AgentRuntime {
             );
         }
         let mut updated = snapshot;
-        if let Some(input) = request.input.clone() {
-            self.records
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .entry(updated.agent_id.clone())
-                .or_default()
-                .inputs
-                .push(input);
-        }
         updated.status = match request.command {
             AgentCommand::Pause => AgentStatus::Paused,
             AgentCommand::Resume => AgentStatus::Running,
@@ -1555,18 +1628,44 @@ impl AgentRuntime {
 
     fn persist_snapshot_with_evaluation(
         &self,
-        mut snapshot: AgentRunSnapshot,
+        snapshot: AgentRunSnapshot,
         kind: &str,
         message: &str,
         receipt: Option<AgentCommandReceipt>,
         returned: Option<AgentReturnPacket>,
         evaluation: Option<AgentRunEvaluation>,
     ) -> Result<AgentCommandReceipt, String> {
+        self.persist_snapshot_with_input(
+            snapshot, kind, message, receipt, returned, evaluation, None,
+        )
+    }
+
+    fn persist_snapshot_with_input(
+        &self,
+        mut snapshot: AgentRunSnapshot,
+        kind: &str,
+        message: &str,
+        receipt: Option<AgentCommandReceipt>,
+        returned: Option<AgentReturnPacket>,
+        evaluation: Option<AgentRunEvaluation>,
+        input_event: Option<(
+            crate::runtime_event_store::RuntimeTransactionEventInput,
+            u64,
+        )>,
+    ) -> Result<AgentCommandReceipt, String> {
         validate_snapshot_identity(&snapshot)?;
         let lifecycle_lock = self.lifecycle_lock(&snapshot.agent_id);
         let _lifecycle_guard = lifecycle_lock
             .lock()
             .map_err(|_| "AgentRuntime lifecycle lock poisoned".to_string())?;
+        if snapshot.status == AgentStatus::Completed
+            && snapshot.backend == AgentBackendKind::InProcess
+            && !self
+                .pending_agent_inputs(&snapshot.agent_id, &snapshot.run_id)?
+                .is_empty()
+        {
+            return Err("Agent success commit is fenced by an accepted, unconsumed input; original run reconciliation required".into());
+        }
         let current = self
             .records
             .read()
@@ -1684,7 +1783,27 @@ impl AgentRuntime {
             generation: activity_generation,
         })
         .map_err(|error| error.to_string())?;
-        if let Some(evaluation) = evaluation {
+        if let Some((input_event, expected_revision)) = input_event {
+            self.event_store
+                .append_transaction(AppendTransactionRequest {
+                    transaction_id: format!(
+                        "agent-input:{}:{}:{}",
+                        snapshot.run_id, snapshot.revision, input_event.event.kind
+                    ),
+                    expected_streams: vec![
+                        ExpectedStreamRevision {
+                            stream_id: stream_id.clone(),
+                            expected_revision: snapshot.revision.saturating_sub(1),
+                        },
+                        ExpectedStreamRevision {
+                            stream_id: input_event.event.stream_id.clone(),
+                            expected_revision,
+                        },
+                    ],
+                    events: vec![agent_event.into(), input_event],
+                })
+                .map_err(|error| error.to_string())?;
+        } else if let Some(evaluation) = evaluation {
             let evaluation_stream = agent_evaluation_stream(&evaluation.run_id);
             let evaluation_revision = self
                 .event_store
@@ -2449,6 +2568,330 @@ mod tests {
 
     struct CompletedBackend(AgentBackendKind);
 
+    struct ClaimLifetimeBackend {
+        kind: AgentBackendKind,
+        services: Arc<RuntimeServices>,
+        claim: harness_contract::agent_action::AgentActionEnvelope,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        claim_first: bool,
+    }
+
+    #[async_trait]
+    impl AgentRuntimeBackend for ClaimLifetimeBackend {
+        fn kind(&self) -> AgentBackendKind {
+            self.kind
+        }
+        fn capabilities(&self) -> AgentBackendCapabilities {
+            CompletedBackend(self.kind).capabilities()
+        }
+        async fn execute(
+            &self,
+            packet: AgentTaskPacket,
+            selection: AgentModelSelection,
+        ) -> Result<AgentReturnPacket, String> {
+            if self.claim_first {
+                assert_eq!(
+                    self.services
+                        .submit_agent_action(&self.claim)
+                        .await
+                        .unwrap()
+                        .status,
+                    harness_contract::agent_action::AgentActionStatus::Applied
+                );
+            }
+            self.entered.notify_one();
+            self.release.notified().await;
+            if self.claim_first {
+                CompletedBackend(self.kind).execute(packet, selection).await
+            } else {
+                Err("backend failed before choosing work".into())
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn common_agent_lifetime_renews_and_settles_native_and_process_opportunities() {
+        use harness_contract::agent::{AgenticExecutionBinding, AgenticExecutionFocus};
+        use harness_contract::agent_action::*;
+        use harness_contract::execution_graph::{
+            ExecutionGraph, ExecutionGraphLineage, ExecutionNodeSpec,
+        };
+        for kind in [AgentBackendKind::InProcess, AgentBackendKind::ProcessJsonl] {
+            for claim_first in [false, true] {
+                let services = RuntimeServices::in_memory().unwrap();
+                let actions = services.agent_action_service();
+                let mut actor = AgentActorBinding {
+                    objective_id: "lifetime-objective".into(),
+                    program_id: "lifetime-program".into(),
+                    session_id: "session-1".into(),
+                    turn_id: "lifetime-turn".into(),
+                    root_execution_id: None,
+                    required_team_count: 1,
+                    objective_summary: "preserve worker truth".into(),
+                    model_lease: "fast".into(),
+                    permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
+                    resource_scopes: vec![],
+                    actor_id: "root".into(),
+                    kind: AgentActorKind::Root,
+                    execution_id: None,
+                    team_id: None,
+                    agent_id: None,
+                };
+                let apply = |id: &str, actor: &AgentActorBinding, action| {
+                    actions
+                        .apply(&AgentActionEnvelope {
+                            action_id: id.into(),
+                            actor: actor.clone(),
+                            expected_revision: None,
+                            action,
+                        })
+                        .unwrap()
+                };
+                let team = apply(
+                    "team",
+                    &actor,
+                    AgentAction::TeamCreate(TeamCreateInput {
+                        name: "Readers".into(),
+                        mission: "read evidence".into(),
+                        objective: None,
+                    }),
+                )
+                .changed_refs[0]
+                    .clone();
+                let member = apply("member", &actor, AgentAction::AgentInvite(serde_json::from_value(serde_json::json!({
+                    "team_ref":team,"role":"Reader","mission":"inspect evidence","required_capabilities":["read"]
+                })).unwrap())).changed_refs[0].clone();
+                let work = apply("task", &actor, AgentAction::TaskPublish(serde_json::from_value(serde_json::json!({
+                    "team_ref":team,"title":"Evidence","objective":"inspect","acceptance":"cited source"
+                })).unwrap())).changed_refs[0].clone();
+                let mut packet = task("lifetime");
+                packet.agentic_binding = Some(AgenticExecutionBinding {
+                    program_id: "lifetime-program".into(),
+                    agent_id: member.clone(),
+                    membership_id: format!("membership:{member}:{team}"),
+                    team_id: team.clone(),
+                    task_team_id: team.clone(),
+                    source_spec_revision: 1,
+                    focus: AgenticExecutionFocus::TaskExecute {
+                        task_ref: work.clone(),
+                    },
+                });
+                // Bind an actually approved Definition: attaching services
+                // enables the production content/digest validator, so the
+                // standalone test packet's invented binding is not authority.
+                let registry = services.definition_registry();
+                let base = registry
+                    .resolve_agent(
+                        &AgentDefinitionId::new(DefinitionScope::Builtin, "cowd/execute").unwrap(),
+                        RevisionSelector::LatestApprovedStable,
+                    )
+                    .unwrap();
+                let mut manifest = base.revision.manifest.clone();
+                manifest.definition_id =
+                    AgentDefinitionId::new(DefinitionScope::Workspace, "tests/lifetime").unwrap();
+                manifest.model_policy.profile = "test".into();
+                manifest.model_policy.allowed_models = vec!["fast".into()];
+                manifest.model_policy.fallback_allowed = false;
+                if kind == AgentBackendKind::ProcessJsonl {
+                    manifest.executor =
+                        harness_contract::agent::AgentExecutorPolicy::ProcessJsonl {
+                            command_ref: "test/lifetime".into(),
+                            command_digest: "a".repeat(64),
+                        };
+                }
+                let stored = registry
+                    .agents()
+                    .store_revision(manifest, &base.agent_markdown)
+                    .unwrap();
+                registry
+                    .agents()
+                    .record_release_assignment(&harness_contract::agent::ReleaseAssignment {
+                        scope: DefinitionScope::Workspace,
+                        revision_ref: stored.revision.revision_ref.clone(),
+                        channel: harness_contract::agent::ReleaseChannel::Stable,
+                        status: harness_contract::agent::ReleaseAssignmentStatus::Active,
+                        authorization:
+                            harness_contract::agent::ReleaseAuthorization::HumanApproval {
+                                approval_ref: "test-fixture:lifetime".into(),
+                            },
+                        content_digest: stored.revision.content_digest,
+                    })
+                    .unwrap();
+                let mut request = crate::AgentBindingRequest::new(
+                    stored.revision.revision_ref.definition_id,
+                    RevisionSelector::LatestApprovedStable,
+                    packet.agent_id(),
+                    packet.session_id(),
+                    packet.task_id(),
+                );
+                request.team_id = Some(team.clone());
+                request.granted_capabilities = vec![AgentCapability::Read];
+                let binding = crate::AgentBindingCompiler::new(Arc::clone(registry))
+                    .compile(request)
+                    .unwrap()
+                    .snapshot;
+                packet.assignment = crate::test_support::agent_assignment(
+                    Some(binding.definition_ref.clone()),
+                    packet.agent_id(),
+                    packet.run_id(),
+                    packet.task_id(),
+                    packet.session_id(),
+                    packet.mission_id(),
+                    Some(&team),
+                    packet.graph_id(),
+                    packet.node_id(),
+                );
+                packet.binding = Some(binding);
+                let mut graph = ExecutionGraph::new("lifetime");
+                graph.id = packet.graph_id().into();
+                graph.lineage = Some(ExecutionGraphLineage {
+                    session_id: packet.session_id().into(),
+                    turn_id: "lifetime-turn".into(),
+                    root_task_id: packet.task_id().into(),
+                    task_id: packet.task_id().into(),
+                    generation: 1,
+                });
+                let mut node = ExecutionNodeSpec::new(
+                    ExecutionNodeKind::AgentTask,
+                    "agent_task",
+                    serde_json::to_string(&packet).unwrap(),
+                );
+                node.id = packet.node_id().into();
+                graph
+                    .node_statuses
+                    .insert(node.id.clone(), ExecutionNodeStatus::Planned);
+                graph.nodes.push(node);
+                services.commit_service().register_graph(graph).unwrap();
+                actor.kind = AgentActorKind::Supervisor;
+                actor.actor_id = "runtime.program-supervisor".into();
+                actor.execution_id = Some(packet.graph_id().into());
+                assert_eq!(
+                    apply(
+                        "dispatch",
+                        &actor,
+                        AgentAction::TaskAttemptDispatch(TaskAttemptDispatchInput {
+                            task_ref: work.clone(),
+                            execution_id: packet.graph_id().into(),
+                            agent_ref: member.clone(),
+                            membership_id: format!("membership:{member}:{team}"),
+                            mode: AgentAttemptMode::Execute,
+                            generation: 0,
+                        })
+                    )
+                    .status,
+                    AgentActionStatus::Applied
+                );
+                actor.kind = AgentActorKind::Agent;
+                actor.actor_id = member.clone();
+                actor.agent_id = Some(member);
+                actor.team_id = Some(team);
+                let entered = Arc::new(tokio::sync::Notify::new());
+                let release = Arc::new(tokio::sync::Notify::new());
+                let runtime = Arc::new(AgentRuntime::new(
+                    services.event_store().clone(),
+                    configured_registry(),
+                ));
+                runtime.bind_services(services.clone());
+                runtime.register_backend(Arc::new(ClaimLifetimeBackend {
+                    kind,
+                    services: services.clone(),
+                    entered: entered.clone(),
+                    release: release.clone(),
+                    claim_first,
+                    claim: AgentActionEnvelope {
+                        action_id: "agent-claim".into(),
+                        actor,
+                        expected_revision: None,
+                        action: AgentAction::TaskClaim(TaskClaimInput {
+                            task_ref: work.clone(),
+                            reason: None,
+                        }),
+                    },
+                }));
+                let executing = runtime.clone();
+                let run_packet = packet.clone();
+                let mut worker =
+                    tokio::spawn(async move { executing.execute_task(run_packet).await });
+                tokio::select! {
+                    _ = entered.notified() => {},
+                    early = &mut worker => panic!("{kind:?} did not enter backend: {early:?}"),
+                }
+                let before = actions.project("lifetime-program").unwrap();
+                let logical_member = &packet.agentic_binding.as_ref().unwrap().agent_id;
+                assert!(runtime
+                    .running_agentic_members("lifetime-program")
+                    .contains(logical_member));
+                assert!(runtime
+                    .running_agentic_members("foreign-program")
+                    .is_empty());
+                let recovered =
+                    AgentRuntime::new(services.event_store().clone(), configured_registry());
+                assert!(recovered.running_agentic_members("lifetime-program").contains(logical_member),
+                    "typed busy identity survives cold journal reconstruction without display metadata");
+                let mut commits = services.event_store().subscribe_commits();
+                // The heartbeat reads the graph on a blocking worker. A
+                // fixed number of yields is not evidence that it finished,
+                // particularly while other tests occupy those workers.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+                    // Allow the actual blocking read and the newly scheduled
+                    // interval to initialize, then observe its durable event.
+                    tokio::time::resume();
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_millis(50),
+                        commits.changed(),
+                    )
+                    .await;
+                    tokio::time::pause();
+                    if !claim_first
+                        || actions.project("lifetime-program").unwrap().revision > before.revision
+                    {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{kind:?} real heartbeat journal commit timed out"
+                    );
+                }
+                let during = actions.project("lifetime-program").unwrap();
+                if claim_first {
+                    assert!(
+                        during.revision > before.revision,
+                        "{kind:?} must renew its real claim"
+                    );
+                    assert_eq!(during.tasks[&work].claim_generation, 1);
+                } else {
+                    assert_eq!(
+                        during.revision, before.revision,
+                        "Runtime must not claim for the Agent"
+                    );
+                }
+                release.notify_one();
+                worker.await.unwrap().unwrap();
+                assert!(runtime
+                    .running_agentic_members("lifetime-program")
+                    .is_empty());
+                let after = actions.project("lifetime-program").unwrap();
+                assert!(!after.tasks[&work]
+                    .active_attempts
+                    .contains_key(packet.graph_id()));
+                assert_eq!(after.tasks[&work].failed_attempts, 1);
+                assert_eq!(after.tasks[&work].claim_generation, 1);
+                tokio::time::advance(std::time::Duration::from_secs(60)).await;
+                for _ in 0..16 {
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(
+                    actions.project("lifetime-program").unwrap().revision,
+                    after.revision,
+                    "backend return must stop the common lease keeper"
+                );
+            }
+        }
+    }
+
     #[async_trait]
     impl AgentRuntimeBackend for CompletedBackend {
         fn kind(&self) -> AgentBackendKind {
@@ -2661,6 +3104,29 @@ mod tests {
         assert!(ensure_team_backend_trusted(&packet, backend).is_ok());
     }
 
+    #[test]
+    fn mcp_and_manual_review_definitions_are_not_agent_task_backends() {
+        let mut packet = task("unsupported-backend");
+        for (executor, expected) in [
+            (
+                harness_contract::agent::AgentExecutorPolicy::McpBacked {
+                    server_ref: "mcp:research".to_string(),
+                    tool_prefixes: vec!["research_".to_string()],
+                },
+                "McpBacked Agent definitions have no Runtime AgentTask backend",
+            ),
+            (
+                harness_contract::agent::AgentExecutorPolicy::ManualReview,
+                "ManualReview Agent definitions require the approval workflow",
+            ),
+        ] {
+            packet.binding.as_mut().expect("binding").executor = executor;
+            assert!(backend_from_packet(&packet)
+                .expect_err("unsupported definition must not start an AgentTask backend")
+                .contains(expected));
+        }
+    }
+
     #[tokio::test]
     async fn process_agent_does_not_require_a_local_provider_model() {
         let store = Arc::new(RuntimeEventStore::for_test());
@@ -2830,6 +3296,7 @@ mod tests {
 
     fn legacy_snapshot(packet: &AgentTaskPacket, status: AgentStatus) -> AgentRunSnapshot {
         AgentRunSnapshot {
+            agentic_binding: packet.agentic_binding.clone(),
             execution_identity: packet.assignment.execution_identity.clone(),
             run_id: packet.run_id().to_string(),
             agent_id: packet.agent_id().to_string(),
@@ -3110,6 +3577,7 @@ mod tests {
         let packet = task("agent-command");
         runtime
             .restore_verified_run(AgentRunSnapshot {
+                agentic_binding: packet.agentic_binding.clone(),
                 execution_identity: packet.assignment.execution_identity.clone(),
                 run_id: packet.run_id().to_string(),
                 agent_id: packet.agent_id().to_string(),
@@ -3144,6 +3612,217 @@ mod tests {
         assert!(first.accepted);
         assert_eq!(first, duplicate);
         assert_eq!(runtime.events(packet.agent_id()).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn durable_input_replays_exact_payload_and_consumption_is_transactional() {
+        use harness_contract::turn::{
+            InputSourceKind, SessionInputEnvelope, TurnId, TurnInputCheckpoint,
+        };
+        let store = Arc::new(RuntimeEventStore::for_test());
+        let runtime = AgentRuntime::new(store.clone(), configured_registry());
+        runtime.register_observation_authority_backend(Arc::new(CompletedBackend(
+            AgentBackendKind::InProcess,
+        )));
+        let packet = task("durable-input");
+        runtime
+            .restore_verified_run(legacy_snapshot(&packet, AgentStatus::Running))
+            .unwrap();
+        let request = AgentCommandRequest {
+            command_id: "supplement".into(),
+            agent_id: packet.agent_id().into(),
+            expected_revision: runtime.get(packet.agent_id()).unwrap().revision,
+            command: AgentCommand::SendInput,
+            input: Some(harness_contract::agent::AgentInput::UserSupplement(
+                "durable requirement".into(),
+            )),
+        };
+        let receipt = runtime.command(request.clone()).await;
+        assert!(receipt.accepted, "{receipt:?}");
+        assert_eq!(runtime.command(request.clone()).await, receipt);
+        let mut different_command = request.clone();
+        different_command.command = AgentCommand::Cancel;
+        assert!(!runtime.command(different_command).await.accepted);
+        let mut premature_terminal = runtime.get(packet.agent_id()).unwrap();
+        premature_terminal.status = AgentStatus::Completed;
+        assert!(runtime
+            .persist_snapshot(
+                premature_terminal,
+                "agent.terminal",
+                "must not lose input",
+                None,
+                None
+            )
+            .is_err());
+        let mut conflicting = request.clone();
+        conflicting.input = Some(harness_contract::agent::AgentInput::UserSupplement(
+            "other payload".into(),
+        ));
+        assert!(!runtime.command(conflicting).await.accepted);
+        drop(runtime);
+        let restored = AgentRuntime::new(store.clone(), configured_registry());
+        assert_eq!(
+            restored
+                .pending_agent_inputs(packet.agent_id(), packet.run_id())
+                .unwrap(),
+            vec![request.clone()]
+        );
+        assert!(restored
+            .pending_agent_inputs(packet.agent_id(), "different-run")
+            .unwrap()
+            .is_empty());
+        let inbox = crate::SessionInputStream::new(packet.session_id());
+        let turn = TurnId::from_string("input-checkpoint");
+        inbox.set_active_turn(Some(turn.clone()));
+        inbox.admit(
+            SessionInputEnvelope::text(
+                packet.session_id(),
+                InputSourceKind::Agent,
+                "durable requirement",
+            )
+            .with_source_ref(format!("agent-input:{}", packet.run_id()))
+            .with_source_message_id("supplement"),
+            inbox.runtime_state(),
+        );
+        let records =
+            inbox.consume_for_checkpoint(&turn, TurnInputCheckpoint::BeforeProviderRequest, 32);
+        assert_eq!(records.len(), 1);
+        let mut forged = records.clone();
+        forged[0].envelope.content = "forged".into();
+        assert!(restored
+            .agent_input_consumption_events(&packet, &forged)
+            .is_err());
+        let events = restored
+            .agent_input_consumption_events(&packet, &records)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(store
+            .append_transaction(AppendTransactionRequest {
+                transaction_id: "input-consumption-fault".into(),
+                expected_streams: vec![
+                    ExpectedStreamRevision {
+                        stream_id: "test-model-node".into(),
+                        expected_revision: 1
+                    },
+                    ExpectedStreamRevision {
+                        stream_id: events[0].event.stream_id.clone(),
+                        expected_revision: 1
+                    }
+                ],
+                events: events.clone(),
+            })
+            .is_err());
+        assert_eq!(
+            restored
+                .pending_agent_inputs(packet.agent_id(), packet.run_id())
+                .unwrap()
+                .len(),
+            1
+        );
+        store
+            .append_transaction(AppendTransactionRequest {
+                transaction_id: "input-consumption-commit".into(),
+                expected_streams: vec![ExpectedStreamRevision {
+                    stream_id: events[0].event.stream_id.clone(),
+                    expected_revision: 1,
+                }],
+                events,
+            })
+            .unwrap();
+        drop(restored);
+        let recovered = AgentRuntime::new(store, configured_registry());
+        assert!(recovered
+            .pending_agent_inputs(packet.agent_id(), packet.run_id())
+            .unwrap()
+            .is_empty());
+        assert_eq!(recovered.command(request).await, receipt);
+    }
+
+    struct PendingInputBackend {
+        kind: AgentBackendKind,
+        entered: Arc<tokio::sync::Notify>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl AgentRuntimeBackend for PendingInputBackend {
+        fn kind(&self) -> AgentBackendKind {
+            self.kind
+        }
+        fn capabilities(&self) -> AgentBackendCapabilities {
+            CompletedBackend(self.kind).capabilities()
+        }
+        async fn execute(
+            &self,
+            _packet: AgentTaskPacket,
+            _selection: AgentModelSelection,
+        ) -> Result<AgentReturnPacket, String> {
+            unreachable!("command-only fault fixture")
+        }
+        async fn command(
+            &self,
+            _handle: &AgentRunHandle,
+            _request: &AgentCommandRequest,
+        ) -> Result<(), AgentCommandRejectReason> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.entered.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn abandoned_input_delivery_retains_native_intent_and_never_resends_uncertain_process() {
+        for kind in [AgentBackendKind::InProcess, AgentBackendKind::ProcessJsonl] {
+            let store = Arc::new(RuntimeEventStore::for_test());
+            let runtime = Arc::new(AgentRuntime::new(store.clone(), configured_registry()));
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            runtime.register_observation_authority_backend(Arc::new(PendingInputBackend {
+                kind,
+                entered: entered.clone(),
+                calls: calls.clone(),
+            }));
+            let packet = task("abandoned-input");
+            let mut snapshot = legacy_snapshot(&packet, AgentStatus::Running);
+            snapshot.backend = kind;
+            runtime.restore_verified_run(snapshot).unwrap();
+            let request = AgentCommandRequest {
+                command_id: "original-input".into(),
+                agent_id: packet.agent_id().into(),
+                expected_revision: runtime.get(packet.agent_id()).unwrap().revision,
+                command: AgentCommand::SendInput,
+                input: Some(harness_contract::agent::AgentInput::UserSupplement(
+                    "keep this".into(),
+                )),
+            };
+            let waiter = {
+                let runtime = runtime.clone();
+                let request = request.clone();
+                tokio::spawn(async move { runtime.command(request).await })
+            };
+            entered.notified().await;
+            waiter.abort();
+            let _ = waiter.await;
+            drop(runtime);
+            let recovered = AgentRuntime::new(store, configured_registry());
+            recovered.register_observation_authority_backend(Arc::new(PendingInputBackend {
+                kind,
+                entered,
+                calls: calls.clone(),
+            }));
+            let receipt = recovered.command(request.clone()).await;
+            assert_eq!(receipt.accepted, kind == AgentBackendKind::InProcess);
+            if kind == AgentBackendKind::ProcessJsonl {
+                assert!(receipt.message.contains("reconcile"));
+            }
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(
+                recovered
+                    .pending_agent_inputs(packet.agent_id(), packet.run_id())
+                    .unwrap(),
+                vec![request]
+            );
+        }
     }
 
     #[test]
@@ -3242,6 +3921,7 @@ mod tests {
         let packet = task("agent-recovery");
         runtime
             .restore_verified_run(AgentRunSnapshot {
+                agentic_binding: packet.agentic_binding.clone(),
                 execution_identity: packet.assignment.execution_identity.clone(),
                 run_id: packet.run_id().to_string(),
                 agent_id: packet.agent_id().to_string(),
@@ -3286,6 +3966,7 @@ mod tests {
         let packet = task("agent-prepared-recovery");
         runtime
             .restore_verified_run(AgentRunSnapshot {
+                agentic_binding: packet.agentic_binding.clone(),
                 execution_identity: packet.assignment.execution_identity.clone(),
                 run_id: packet.run_id().to_string(),
                 agent_id: packet.agent_id().to_string(),
@@ -3327,6 +4008,7 @@ mod tests {
         let packet = task("agent-native-recovery");
         runtime
             .restore_verified_run(AgentRunSnapshot {
+                agentic_binding: packet.agentic_binding.clone(),
                 execution_identity: packet.assignment.execution_identity.clone(),
                 run_id: packet.run_id().to_string(),
                 agent_id: packet.agent_id().to_string(),

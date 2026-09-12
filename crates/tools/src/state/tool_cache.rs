@@ -1,7 +1,7 @@
 //! Workspace-scoped cache owned by [`crate::ToolHost`].
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -80,6 +80,7 @@ const DEFAULT_TTL: Duration = Duration::from_secs(300);
 #[derive(Default)]
 pub struct ToolCache {
     state: Mutex<ToolCacheState>,
+    read_flights: Mutex<HashMap<CacheKey, Weak<Mutex<()>>>>,
 }
 
 impl std::fmt::Debug for ToolCache {
@@ -89,6 +90,12 @@ impl std::fmt::Debug for ToolCache {
             .field("stats", &self.stats())
             .finish()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CacheEpoch {
+    global: u64,
+    scope: u64,
 }
 
 impl ToolCache {
@@ -144,6 +151,73 @@ impl ToolCache {
         value
     }
 
+    /// Only coalesces identical, already-authorized read keys. No work runs
+    /// while holding the map lock; cold keys retain only bounded weak metadata.
+    pub(crate) fn with_read_flight<F>(
+        &self,
+        workspace: &str,
+        scope: &str,
+        tool: &str,
+        input: &str,
+        revision: u64,
+        operation: F,
+    ) -> Result<String, String>
+    where
+        F: FnOnce() -> Result<String, String>,
+    {
+        let key = cache_key(workspace, scope, tool, input, revision);
+        let flight = {
+            let mut flights = self
+                .read_flights
+                .lock()
+                .map_err(|_| "read flight map unavailable")?;
+            flights.retain(|_, flight| flight.strong_count() > 0);
+            if let Some(flight) = flights.get(&key).and_then(Weak::upgrade) {
+                Some(flight)
+            } else if flights.len() < 4096 && cache_key_bytes(&key) <= 16 * 1024 {
+                let flight = Arc::new(Mutex::new(()));
+                flights.insert(key, Arc::downgrade(&flight));
+                Some(flight)
+            } else {
+                None
+            }
+        };
+        let _guard = flight
+            .as_ref()
+            .map(|flight| flight.lock().map_err(|_| "read flight failed".to_string()))
+            .transpose()?;
+        operation()
+    }
+
+    pub(crate) fn epoch_token(&self, scope: &str) -> Option<CacheEpoch> {
+        let state = self.state.lock().ok()?;
+        Some(CacheEpoch {
+            global: state.epoch,
+            scope: state.scope_epoch(scope),
+        })
+    }
+
+    pub(crate) fn put_if_current(
+        &self,
+        workspace_id: &str,
+        scope: &str,
+        tool_name: &str,
+        input: &str,
+        schema_revision: u64,
+        value: &str,
+        token: CacheEpoch,
+    ) {
+        self.put_inner(
+            workspace_id,
+            scope,
+            tool_name,
+            input,
+            schema_revision,
+            value,
+            Some(token),
+        );
+    }
+
     pub fn put(
         &self,
         workspace_id: &str,
@@ -153,8 +227,34 @@ impl ToolCache {
         schema_revision: u64,
         value: &str,
     ) {
+        self.put_inner(
+            workspace_id,
+            scope,
+            tool_name,
+            input,
+            schema_revision,
+            value,
+            None,
+        );
+    }
+
+    fn put_inner(
+        &self,
+        workspace_id: &str,
+        scope: &str,
+        tool_name: &str,
+        input: &str,
+        schema_revision: u64,
+        value: &str,
+        token: Option<CacheEpoch>,
+    ) {
         let key = cache_key(workspace_id, scope, tool_name, input, schema_revision);
         if let Ok(mut state) = self.state.lock() {
+            if token.is_some_and(|token| {
+                token.global != state.epoch || token.scope != state.scope_epoch(scope)
+            }) {
+                return;
+            }
             let resident_bytes = cache_key_bytes(&key).saturating_add(value.len());
             if resident_bytes > DEFAULT_MAX_ENTRY_BYTES {
                 state.oversized_rejections = state.oversized_rejections.saturating_add(1);
@@ -199,6 +299,13 @@ impl ToolCache {
 
     pub fn invalidate_scope(&self, scope: &str) {
         if let Ok(mut state) = self.state.lock() {
+            if state.scope_epochs.len() >= 4096 && !state.scope_epochs.contains_key(scope) {
+                // Bounded metadata fallback invalidates all in-flight tokens.
+                state.epoch = state.epoch.saturating_add(1);
+                state.entries.clear();
+                state.scope_epochs.clear();
+                state.resident_bytes = 0;
+            }
             let next_epoch = state.scope_epoch(scope).saturating_add(1);
             state.scope_epochs.insert(scope.to_string(), next_epoch);
             let removed = state
@@ -294,6 +401,92 @@ fn canonical_json(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_read_flights_compute_once_and_failures_can_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cache = Arc::new(ToolCache::new());
+        let computed = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let threads = (0..16)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                let computed = Arc::clone(&computed);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    cache
+                        .with_read_flight(
+                            "workspace",
+                            "file:a",
+                            "read_file",
+                            "source-v1/auth-v1",
+                            1,
+                            || {
+                                if let Some(hit) = cache.get(
+                                    "workspace",
+                                    "file:a",
+                                    "read_file",
+                                    "source-v1/auth-v1",
+                                    1,
+                                ) {
+                                    return Ok(hit);
+                                }
+                                let token = cache.epoch_token("file:a").unwrap();
+                                computed.fetch_add(1, Ordering::SeqCst);
+                                std::thread::sleep(Duration::from_millis(10));
+                                cache.put_if_current(
+                                    "workspace",
+                                    "file:a",
+                                    "read_file",
+                                    "source-v1/auth-v1",
+                                    1,
+                                    "body",
+                                    token,
+                                );
+                                Ok("body".into())
+                            },
+                        )
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            assert_eq!(thread.join().unwrap(), "body");
+        }
+        assert_eq!(computed.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.stats().hits, 15);
+        assert!(cache
+            .with_read_flight("workspace", "file:b", "read_file", "v1", 1, || Err(
+                "read failed".into()
+            ))
+            .is_err());
+        assert_eq!(
+            cache
+                .with_read_flight("workspace", "file:b", "read_file", "v1", 1, || Ok(
+                    "retry".into()
+                ))
+                .unwrap(),
+            "retry"
+        );
+    }
+
+    #[test]
+    fn invalidation_fences_inflight_put_and_cold_scope_metadata_is_bounded() {
+        let cache = ToolCache::new();
+        let token = cache.epoch_token("file:a").unwrap();
+        cache.invalidate_scope("file:a");
+        cache.put_if_current("w", "file:a", "read_file", "v1", 1, "stale", token);
+        assert!(cache.get("w", "file:a", "read_file", "v1", 1).is_none());
+        let token = cache.epoch_token("file:a").unwrap();
+        cache.invalidate_all();
+        cache.put_if_current("w", "file:a", "read_file", "v1", 1, "stale", token);
+        assert!(cache.get("w", "file:a", "read_file", "v1", 1).is_none());
+        for i in 0..4200 {
+            cache.invalidate_scope(&format!("cold-{i}"));
+        }
+        assert!(cache.stats().scope_epochs <= 4096);
+    }
 
     #[test]
     fn instances_and_workspaces_are_isolated() {

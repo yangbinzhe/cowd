@@ -270,10 +270,15 @@ pub(super) fn is_virtual_directory_scope(scope: &str) -> bool {
     let Some(parts) = normalized_relative_parts(scope) else {
         return false;
     };
-    !parts.is_empty()
+    (!parts.is_empty()
         && parts
             .first()
-            .is_some_and(|part| part == "team.dependencies")
+            .is_some_and(|part| part == "team.dependencies"))
+        || (parts.len() == 3
+            && parts[0] == ".cowd"
+            && parts[1] == "evaluation"
+            && parts[2].len() == 64
+            && parts[2].bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 pub(super) fn workspace_root_request(path: &str, workspace_root: &std::path::Path) -> bool {
@@ -532,104 +537,4 @@ pub(super) fn normalized_relative_parts(value: &str) -> Option<Vec<String>> {
         }
     }
     Some(parts)
-}
-
-pub(super) async fn settle_failed_agentic_attempt(
-    services: &Arc<RuntimeServices>,
-    packet: &AgentTaskPacket,
-    reason: &str,
-) {
-    let Some(agentic) = packet.agentic_binding.as_ref() else {
-        return;
-    };
-    let (task_ref, attempt_mode) = match &agentic.focus {
-        harness_contract::agent::AgenticExecutionFocus::TaskExecute { task_ref } => (
-            task_ref.as_str(),
-            harness_contract::agent_action::AgentAttemptMode::Execute,
-        ),
-        harness_contract::agent::AgenticExecutionFocus::TaskReview { task_ref } => (
-            task_ref.as_str(),
-            harness_contract::agent_action::AgentAttemptMode::Review,
-        ),
-        _ => return,
-    };
-    let program_id = agentic.program_id.as_str();
-    let agent_id = agentic.agent_id.as_str();
-    let service = services.agent_action_service();
-    let Ok(projection) = service.project(program_id) else {
-        return;
-    };
-    let Some(task) = projection.tasks.get(task_ref) else {
-        return;
-    };
-    let attempt_is_current = match attempt_mode {
-        harness_contract::agent_action::AgentAttemptMode::Execute => {
-            task.status == crate::AgenticTaskStatus::Claimed
-                && task.claimant.as_deref() == Some(agent_id)
-                && task.claim_execution_id.as_deref() == Some(packet.graph_id())
-        }
-        harness_contract::agent_action::AgentAttemptMode::Review => {
-            task.status == crate::AgenticTaskStatus::Submitted
-        }
-    };
-    if !attempt_is_current {
-        return;
-    }
-    if !projection.agents.contains_key(agent_id) {
-        return;
-    }
-    let team_id = task.team_id.clone();
-    let context = crate::AgenticDispatchContext {
-        session_id: projection.session_id.clone(),
-        turn_id: projection.turn_id.clone(),
-        model_lease: projection.model_lease.clone(),
-        permission_ceiling: projection.permission_ceiling,
-        resource_scopes: projection.resource_scopes.clone(),
-    };
-    let envelope = harness_contract::agent_action::AgentActionEnvelope {
-        action_id: format!("runtime-release:{}", packet.run_id()),
-        actor: harness_contract::agent_action::AgentActorBinding {
-            objective_id: projection.objective_id.clone(),
-            program_id: projection.program_id.clone(),
-            session_id: projection.session_id.clone(),
-            turn_id: projection.turn_id.clone(),
-            root_execution_id: projection.root_execution_id.clone(),
-            required_team_count: projection.required_team_count,
-            objective_summary: projection.objective_summary.clone(),
-            model_lease: projection.model_lease.clone(),
-            permission_ceiling: Some(projection.permission_ceiling),
-            resource_scopes: projection.resource_scopes.clone(),
-            actor_id: "runtime.program-supervisor".to_string(),
-            kind: harness_contract::agent_action::AgentActorKind::Supervisor,
-            execution_id: Some(packet.graph_id().to_string()),
-            team_id: Some(team_id),
-            agent_id: None,
-        },
-        expected_revision: None,
-        action: harness_contract::agent_action::AgentAction::TaskAttemptFail(
-            harness_contract::agent_action::TaskAttemptFailInput {
-                task_ref: task_ref.to_string(),
-                execution_id: packet.graph_id().to_string(),
-                mode: attempt_mode,
-                reason: reason.to_string(),
-                retryable: true,
-            },
-        ),
-    };
-    match services.submit_agent_action(&envelope).await {
-        Ok(observation)
-            if observation.status == harness_contract::agent_action::AgentActionStatus::Applied =>
-        {
-            if let Err(error) = services
-                .dispatch_agentic_followups(&envelope, context)
-                .await
-            {
-                tracing::warn!(%error, task_ref, agent_id, "failed to reconcile retryable Agent-first attempt");
-            }
-        }
-        Ok(_) => {}
-        Err(error) => {
-            tracing::warn!(%error, task_ref, agent_id, "failed to settle abandoned Agent-first claim");
-        }
-    }
 }

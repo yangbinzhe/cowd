@@ -6,8 +6,52 @@ use gateway::test_support::GatewayTestHarness;
 use tower::ServiceExt;
 
 #[tokio::test]
+async fn postgres_harness_isolates_sessions_and_survives_peer_shutdown() {
+    let left = GatewayTestHarness::postgres().expect("left isolated PG harness");
+    let right = GatewayTestHarness::postgres().expect("right isolated PG harness");
+    for (harness, id) in [(&left, "pg-harness-left"), (&right, "pg-harness-right")] {
+        let response = harness
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/sessions/{id}/ensure"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"test-model"}"#))
+                    .expect("ensure request"),
+            )
+            .await
+            .expect("ensure response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let absent = right
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/sessions/pg-harness-left")
+                .body(Body::empty())
+                .expect("cross-fixture request"),
+        )
+        .await
+        .expect("cross-fixture response");
+    assert_eq!(absent.status(), StatusCode::NOT_FOUND);
+    drop(left);
+    let retained = right
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/sessions/pg-harness-right")
+                .body(Body::empty())
+                .expect("surviving fixture request"),
+        )
+        .await
+        .expect("surviving fixture response");
+    assert_eq!(retained.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn agent_discovery_uses_runtime_catalog_and_rejects_empty_intent() {
-    let harness = GatewayTestHarness::in_memory().expect("test harness");
+    let harness = GatewayTestHarness::postgres().expect("test harness");
 
     let discovery = harness
         .router()

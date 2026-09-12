@@ -1,15 +1,74 @@
-use std::sync::{Arc, Barrier, Mutex, MutexGuard, OnceLock};
-
-use storage::StaticSecretRefResolver;
+use std::sync::{Arc, Barrier};
+#[path = "../../storage/test-support/postgres_scope.rs"]
+mod postgres_scope;
+use postgres_scope::PostgresTestScope;
 
 use super::*;
 
-fn postgres_test_guard() -> MutexGuard<'static, ()> {
-    static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-    GUARD
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn postgres_v23_preserves_existing_records_and_indexes_casefolded_listing() {
+    let fixture = PostgresTestScope::new();
+    let executor = fixture.reconnect();
+    prepare_legacy_session_usage_for_migration(&executor).unwrap();
+    executor
+        .apply_migrations(SESSION_DOMAIN, &SESSION_MIGRATIONS[..22])
+        .unwrap();
+    let old = PostgresSessionStore { executor };
+    let mut record = session("preserved-v22");
+    record.status = "Active".into();
+    record.model = Some("FAST".into());
+    old.create_session(&record).unwrap();
+    drop(old);
+    let upgraded = PostgresSessionStore::new(fixture.reconnect()).unwrap();
+    assert_eq!(upgraded.get_session("preserved-v22").unwrap(), Some(record));
+    let mut connection = upgraded.executor.checkout_critical().unwrap();
+    connection.batch_execute("INSERT INTO session_records(
+        session_id,platform,chat_id,model,created_at,last_activity,reset_policy,status,message_count)
+        SELECT 'casefold-'||n,'test','test',CASE WHEN n%2=0 THEN 'Fast' ELSE 'Slow' END,
+          '2026-01-01T00:00:00Z',to_char(timestamp '2026-01-01' + n*interval '1 second', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
+          'None',CASE WHEN n%3=0 THEN 'Active' ELSE 'Closed' END,n
+        FROM generate_series(0,9999) n;
+        ANALYZE session_records;").unwrap();
+    let plan: serde_json::Value = connection
+        .query_one(
+            "EXPLAIN (FORMAT JSON) SELECT session_id FROM session_records
+         WHERE lower(status)=lower($1) AND lower(model)=lower($2)
+         ORDER BY last_activity DESC,session_id ASC LIMIT 7",
+            &[&"active", &"fast"],
+        )
+        .unwrap()
+        .get(0);
+    assert!(
+        plan.to_string()
+            .contains("idx_session_records_casefold_status_model"),
+        "{plan}"
+    );
+    drop(connection);
+    let page = upgraded
+        .list_sessions_page(&SessionListOptions {
+            status: Some(" ACTIVE "),
+            model: Some(" fast "),
+            unrestricted: true,
+            sort: "last_activity",
+            order: "desc",
+            limit: 7,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(page.total, 1668);
+    assert_eq!(page.records.len(), 7);
+    assert!(page
+        .records
+        .windows(2)
+        .all(|rows| rows[0].last_activity >= rows[1].last_activity));
+    assert!(page
+        .records
+        .iter()
+        .all(|record| record.status.eq_ignore_ascii_case("active")
+            && record.model.as_ref().unwrap().eq_ignore_ascii_case("fast")));
+    let reopened = PostgresSessionStore::new(fixture.reconnect()).unwrap();
+    assert!(reopened.get_session("preserved-v22").unwrap().is_some());
 }
 
 fn session(id: &str) -> SessionRecord {
@@ -32,18 +91,8 @@ fn session(id: &str) -> SessionRecord {
     }
 }
 
-fn real_store() -> PostgresSessionStore {
-    let url = std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
-    let resolver = StaticSecretRefResolver::new([("test.pg".to_string(), url)]);
-    PostgresSessionStore::connect(
-        PostgresConnectionConfig::new(
-            "session-postgres-test",
-            "test.pg",
-            "cowd-session-postgres-contract",
-        ),
-        &resolver,
-    )
-    .expect("isolated PostgreSQL session store opens")
+fn real_store(scope: &PostgresTestScope) -> PostgresSessionStore {
+    PostgresSessionStore::new(scope.reconnect()).expect("owned PostgreSQL Session store")
 }
 
 fn clear_isolated_store(store: &PostgresSessionStore) {
@@ -125,8 +174,8 @@ fn append_runtime_input(
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 fn postgres_usage_summary_decodes_bigint_aggregates() {
-    let _guard = postgres_test_guard();
-    let store = real_store();
+    let fixture = PostgresTestScope::new();
+    let store = real_store(&fixture);
     clear_isolated_store(&store);
     let session_id = unique_id("usage-summary");
     let mut record = session(&session_id);
@@ -153,8 +202,8 @@ fn postgres_usage_summary_decodes_bigint_aggregates() {
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 fn postgres_reads_selected_context_ranges_with_one_query() {
-    let _guard = postgres_test_guard();
-    let store = real_store();
+    let fixture = PostgresTestScope::new();
+    let store = real_store(&fixture);
     clear_isolated_store(&store);
     let session_id = unique_id("context-ranges");
     store
@@ -196,8 +245,8 @@ fn postgres_reads_selected_context_ranges_with_one_query() {
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 fn postgres_message_batch_eliminates_round_trips_and_beats_legacy_by_fifteen_percent() {
-    let _guard = postgres_test_guard();
-    let store = real_store();
+    let fixture = PostgresTestScope::new();
+    let store = real_store(&fixture);
     clear_isolated_store(&store);
     let mut legacy_samples = Vec::new();
     let mut batch_samples = Vec::new();
@@ -286,8 +335,8 @@ fn postgres_message_batch_eliminates_round_trips_and_beats_legacy_by_fifteen_per
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 fn postgres_activation_index_and_manifest_repair_preserve_session_contract() {
-    let _guard = postgres_test_guard();
-    let store = real_store();
+    let fixture = PostgresTestScope::new();
+    let store = real_store(&fixture);
     clear_isolated_store(&store);
     let session_id = unique_id("activation-index");
     store
@@ -392,8 +441,8 @@ fn postgres_activation_index_and_manifest_repair_preserve_session_contract() {
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 fn existing_postgres_outbox_schema_migrates_claim_fence_epoch_in_place() {
-    let _guard = postgres_test_guard();
-    let store = real_store();
+    let fixture = PostgresTestScope::new();
+    let store = real_store(&fixture);
     clear_isolated_store(&store);
     store
         .create_session(&session("claim-fence-migration"))
@@ -439,7 +488,7 @@ fn existing_postgres_outbox_schema_migrates_claim_fence_epoch_in_place() {
     drop(connection);
     drop(store);
 
-    let migrated = real_store()
+    let migrated = real_store(&fixture)
         .get_session_runtime_outbox(&request.request_id)
         .expect("read migrated input")
         .expect("migrated input remains");
@@ -450,8 +499,8 @@ fn existing_postgres_outbox_schema_migrates_claim_fence_epoch_in_place() {
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 fn postgres_fenced_terminal_commit_preserves_atomic_identity_contract() {
-    let _guard = postgres_test_guard();
-    let store = real_store();
+    let fixture = PostgresTestScope::new();
+    let store = real_store(&fixture);
     let session_id = unique_id("terminal-fence");
     let id = unique_id("terminal-input");
     store
@@ -675,8 +724,8 @@ fn postgres_fenced_terminal_commit_preserves_atomic_identity_contract() {
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 fn postgres_terminal_commit_and_generation_advance_share_one_lock_order() {
-    let _guard = postgres_test_guard();
-    let store = real_store();
+    let fixture = PostgresTestScope::new();
+    let store = real_store(&fixture);
     let session_id = unique_id("terminal-lock-order");
     let id = unique_id("terminal-lock-input");
     store
@@ -782,8 +831,8 @@ fn postgres_terminal_commit_and_generation_advance_share_one_lock_order() {
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 fn postgres_branch_command_commits_every_artifact_or_nothing() {
-    let _guard = postgres_test_guard();
-    let store = real_store();
+    let fixture = PostgresTestScope::new();
+    let store = real_store(&fixture);
     let source = unique_id("branch-command-source");
     let target = unique_id("branch-command-target");
     let rollback_target = unique_id("branch-command-rollback");
@@ -966,9 +1015,9 @@ fn postgres_branch_command_commits_every_artifact_or_nothing() {
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 fn postgres_presence_projection_is_mutable_and_does_not_append_history() {
-    let _guard = postgres_test_guard();
+    let fixture = PostgresTestScope::new();
     let session_id = unique_id("presence-projection");
-    let store = real_store();
+    let store = real_store(&fixture);
     store
         .create_session(&session(&session_id))
         .expect("create presence Session");
@@ -1032,10 +1081,10 @@ fn postgres_presence_projection_is_mutable_and_does_not_append_history() {
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 fn postgres_lifecycle_intent_recovers_each_phase_and_commits_one_tombstone() {
-    let _guard = postgres_test_guard();
+    let fixture = PostgresTestScope::new();
     let session_id = unique_id("lifecycle-recovery");
     let operation_id = format!("session-lifecycle:archive:{session_id}");
-    let store = real_store();
+    let store = real_store(&fixture);
     store
         .create_session(&session(&session_id))
         .expect("create lifecycle session");
@@ -1059,7 +1108,7 @@ fn postgres_lifecycle_intent_recovers_each_phase_and_commits_one_tombstone() {
     assert_eq!(planned.phase, SessionLifecyclePhase::Planned);
     drop(store);
 
-    let store = real_store();
+    let store = real_store(&fixture);
     let fenced = store
         .fence_session_lifecycle(&SessionLifecycleFenceRequest {
             transition: SessionLifecycleTransition {
@@ -1100,7 +1149,7 @@ fn postgres_lifecycle_intent_recovers_each_phase_and_commits_one_tombstone() {
         .expect("persist lifecycle failure");
     drop(store);
 
-    let store = real_store();
+    let store = real_store(&fixture);
     assert!(store
         .list_recoverable_session_lifecycle_intents(10)
         .unwrap()
@@ -1128,7 +1177,7 @@ fn postgres_lifecycle_intent_recovers_each_phase_and_commits_one_tombstone() {
         .expect("mark Runtime drained");
     drop(store);
 
-    let store = real_store();
+    let store = real_store(&fixture);
     let mut record = store
         .get_session(&session_id)
         .unwrap()
@@ -1160,7 +1209,7 @@ fn postgres_lifecycle_intent_recovers_each_phase_and_commits_one_tombstone() {
     assert_eq!(committed.phase, SessionLifecyclePhase::TombstoneCommitted);
     drop(store);
 
-    let store = real_store();
+    let store = real_store(&fixture);
     assert_eq!(
         store
             .get_events_limited(&session_id, 0, 100)
@@ -1201,10 +1250,10 @@ fn postgres_lifecycle_intent_recovers_each_phase_and_commits_one_tombstone() {
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 fn postgres_delete_lifecycle_recovers_stable_phases_and_commits_one_tombstone() {
-    let _guard = postgres_test_guard();
+    let fixture = PostgresTestScope::new();
     let session_id = unique_id("delete-lifecycle-recovery");
     let operation_id = format!("session-lifecycle:delete:{session_id}");
-    let store = real_store();
+    let store = real_store(&fixture);
     store
         .create_session(&session(&session_id))
         .expect("create delete lifecycle Session");
@@ -1219,7 +1268,7 @@ fn postgres_delete_lifecycle_recovers_stable_phases_and_commits_one_tombstone() 
         .expect("plan delete lifecycle");
     drop(store);
 
-    let store = real_store();
+    let store = real_store(&fixture);
     let fenced = store
         .fence_session_lifecycle(&SessionLifecycleFenceRequest {
             transition: SessionLifecycleTransition {
@@ -1244,7 +1293,7 @@ fn postgres_delete_lifecycle_recovers_stable_phases_and_commits_one_tombstone() 
         .expect("fence delete lifecycle");
     drop(store);
 
-    let store = real_store();
+    let store = real_store(&fixture);
     let drained = store
         .transition_session_lifecycle(&SessionLifecycleTransition {
             operation_id: operation_id.clone(),
@@ -1257,7 +1306,7 @@ fn postgres_delete_lifecycle_recovers_stable_phases_and_commits_one_tombstone() 
         .expect("mark delete Runtime drained");
     drop(store);
 
-    let store = real_store();
+    let store = real_store(&fixture);
     let mut record = store
         .get_session(&session_id)
         .unwrap()
@@ -1288,7 +1337,7 @@ fn postgres_delete_lifecycle_recovers_stable_phases_and_commits_one_tombstone() 
         .expect("commit delete lifecycle tombstone");
     drop(store);
 
-    let store = real_store();
+    let store = real_store(&fixture);
     assert_eq!(
         store
             .get_events_limited(&session_id, 0, 100)
@@ -1327,8 +1376,8 @@ fn postgres_delete_lifecycle_recovers_stable_phases_and_commits_one_tombstone() 
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 fn postgres_durable_input_contract_is_fenced_ordered_and_auditable() {
-    let _guard = postgres_test_guard();
-    let store = real_store();
+    let fixture = PostgresTestScope::new();
+    let store = real_store(&fixture);
     let source = unique_id("durable-source");
     let peer = unique_id("durable-peer");
     let branch = unique_id("durable-branch");
@@ -1650,8 +1699,8 @@ fn postgres_durable_input_contract_is_fenced_ordered_and_auditable() {
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 fn postgres_batched_execution_history_limits_turn_roots_after_filtering_related_inputs() {
-    let _guard = postgres_test_guard();
-    let store = real_store();
+    let fixture = PostgresTestScope::new();
+    let store = real_store(&fixture);
     let session_id = unique_id("execution-root-recovery");
     store
         .create_session(&session(&session_id))
@@ -1707,8 +1756,8 @@ fn postgres_batched_execution_history_limits_turn_roots_after_filtering_related_
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 fn postgres_runtime_failure_retry_and_terminal_statuses_are_real() {
-    let _guard = postgres_test_guard();
-    let store = real_store();
+    let fixture = PostgresTestScope::new();
+    let store = real_store(&fixture);
     let session_id = unique_id("durable-failure");
     store
         .create_session(&session(&session_id))
@@ -1861,16 +1910,11 @@ fn published_v8_migration_remains_immutable() {
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 fn postgres_v8_migrates_legacy_runtime_rows_in_place() {
-    let _guard = postgres_test_guard();
-    let url = std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
-    let mut client =
-        postgres::Client::connect(&url, postgres::NoTls).expect("connect isolated PostgreSQL");
-    let schema = unique_id("legacy_v8").replace('-', "_");
-    client
-        .batch_execute(&format!(
-            "CREATE SCHEMA {schema}; SET search_path TO {schema};"
-        ))
-        .expect("create isolated migration schema");
+    let fixture = PostgresTestScope::new();
+    let executor = fixture.reconnect();
+    let mut client = executor
+        .checkout_critical()
+        .expect("legacy migration fixture");
     client
         .batch_execute(
             "CREATE TABLE session_records(
@@ -1944,43 +1988,30 @@ fn postgres_v8_migrates_legacy_runtime_rows_in_place() {
         assert_eq!(row.get::<_, i64>(3), 1);
         assert_eq!(row.get::<_, String>(4), "start_new_turn");
     }
-    client
-        .batch_execute(&format!(
-            "SET search_path TO public; DROP SCHEMA {schema} CASCADE;"
-        ))
-        .expect("drop isolated migration schema");
 }
 
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 fn postgres_concurrent_store_startup_serializes_preflight_and_migrations() {
-    let _guard = postgres_test_guard();
-    let url = std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
+    let fixture = PostgresTestScope::new();
+    let fixture = Arc::new(fixture);
     let worker_count = 8;
     let gate = Arc::new(Barrier::new(worker_count));
     let workers = (0..worker_count)
-        .map(|worker| {
+        .map(|_| {
             let gate = Arc::clone(&gate);
-            let url = url.clone();
+            let fixture = Arc::clone(&fixture);
             std::thread::spawn(move || {
-                let resolver = StaticSecretRefResolver::new([("test.pg".to_string(), url)]);
+                let executor = fixture.reconnect();
                 gate.wait();
-                PostgresSessionStore::connect(
-                    PostgresConnectionConfig::new(
-                        format!("session-postgres-concurrent-{worker}"),
-                        "test.pg",
-                        "cowd-concurrent-session-test",
-                    ),
-                    &resolver,
-                )
-                .expect("concurrent PostgreSQL session store opens")
+                PostgresSessionStore::new(executor).expect("concurrent scoped store startup")
             })
         })
         .collect::<Vec<_>>();
     for worker in workers {
         worker.join().expect("startup worker does not panic");
     }
-    let store = real_store();
+    let store = real_store(&fixture);
     let mut connection = store
         .executor
         .checkout_background()
@@ -1989,7 +2020,7 @@ fn postgres_concurrent_store_startup_serializes_preflight_and_migrations() {
         .query_one(
             "SELECT COUNT(*)
                    FROM information_schema.tables
-                  WHERE table_schema='public'
+                  WHERE table_schema=current_schema()
                     AND table_name IN (
                         'session_mission_outbox',
                         'session_mission_outbox_history'
@@ -2003,7 +2034,7 @@ fn postgres_concurrent_store_startup_serializes_preflight_and_migrations() {
         .query_one(
             "SELECT COUNT(*)
                    FROM information_schema.columns
-                  WHERE table_schema='public'
+                  WHERE table_schema=current_schema()
                     AND table_name='session_runtime_outbox'
                     AND column_name='task_route_hint_json'",
             &[],
@@ -2011,4 +2042,68 @@ fn postgres_concurrent_store_startup_serializes_preflight_and_migrations() {
         .expect("query durable Task route hint column")
         .get(0);
     assert_eq!(route_hint_columns, 1);
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn postgres_fixture_namespaces_are_disjoint_and_drop_only_their_own_data() {
+    let first = PostgresTestScope::new();
+    let second = PostgresTestScope::new();
+    let first_executor = first.reconnect();
+    let second_executor = second.reconnect();
+    let first_schema: String = first_executor
+        .checkout_critical()
+        .unwrap()
+        .query_one("SELECT current_schema()", &[])
+        .unwrap()
+        .get(0);
+    let second_schema: String = second_executor
+        .checkout_critical()
+        .unwrap()
+        .query_one("SELECT current_schema()", &[])
+        .unwrap()
+        .get(0);
+    assert_ne!(first_schema, second_schema);
+    assert_ne!(first_schema, "public");
+    assert_ne!(second_schema, "public");
+    first_executor
+        .checkout_critical()
+        .unwrap()
+        .batch_execute(
+            "CREATE TABLE isolation_probe(value INTEGER); INSERT INTO isolation_probe VALUES (1)",
+        )
+        .unwrap();
+    second_executor
+        .checkout_critical()
+        .unwrap()
+        .batch_execute(
+            "CREATE TABLE isolation_probe(value INTEGER); INSERT INTO isolation_probe VALUES (2)",
+        )
+        .unwrap();
+    let reopened = first.reconnect();
+    let value: i32 = reopened
+        .checkout_critical()
+        .unwrap()
+        .query_one("SELECT value FROM isolation_probe", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(value, 1);
+    drop(first);
+    let mut reader = second_executor.checkout_critical().unwrap();
+    let exists: bool = reader
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname=$1)",
+            &[&first_schema],
+        )
+        .unwrap()
+        .get(0);
+    assert!(!exists);
+    let value: i32 = reader
+        .query_one("SELECT value FROM isolation_probe", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        value, 2,
+        "dropping another fixture must preserve this fixture's data"
+    );
 }

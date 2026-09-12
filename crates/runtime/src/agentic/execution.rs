@@ -32,7 +32,9 @@ mod helpers;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use heartbeat::{start_agentic_claim_heartbeat, AgenticClaimHeartbeatGuard};
+pub(crate) use heartbeat::start_agentic_claim_heartbeat;
+#[cfg(test)]
+use heartbeat::AgenticClaimHeartbeatGuard;
 
 #[cfg(test)]
 use admission::{effective_skill_grants, intersect_agentic_tools, AgenticToolHostSnapshot};

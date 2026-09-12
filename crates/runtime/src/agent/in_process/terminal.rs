@@ -33,21 +33,7 @@ pub(super) fn agent_terminal_outcome(
 }
 
 pub(super) fn agent_input_text(input: &AgentInput) -> String {
-    match input {
-        AgentInput::UserSupplement(text) => text.clone(),
-        AgentInput::PeerMessage {
-            from_agent_id,
-            message,
-        } => format!("Peer message from {from_agent_id}: {message}"),
-        AgentInput::ControlContext(value) => format!("Control context: {value}"),
-        AgentInput::ApprovalResult {
-            approval_id,
-            approved,
-        } => format!(
-            "Approval {approval_id}: {}",
-            if *approved { "approved" } else { "denied" }
-        ),
-    }
+    crate::AgentRuntime::input_text(input)
 }
 
 pub(super) fn normalize_verified_narrative_terminal(

@@ -38,8 +38,13 @@ pub struct SkillActivationInput {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillActivationDecision {
-    pub activation: SkillActivationRecord,
     pub selection: SkillSelectionResult,
+    pub activations: Vec<SkillActivation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillActivation {
+    pub activation: SkillActivationRecord,
     pub selected_invocation: Option<SkillInvocation>,
     pub invocation_evidence: Option<SkillInvocationEvidence>,
     pub structured_dependencies: Vec<CowdSkillStructuredDependency>,
@@ -210,49 +215,64 @@ impl SkillActivationEngine {
             candidates = fallback_capability_candidates(&input.capability_refs);
         }
 
-        let selected_invocation = selection
-            .selected
-            .as_ref()
-            .and_then(|selected| profile_by_id.get(&selected.skill_id))
-            .and_then(|profile| {
-                SkillInvocation::from_profile(profile, &input.agent_profile.adapter_ceiling)
-            });
-        let structured_dependencies = selection
-            .selected
-            .as_ref()
-            .and_then(|selected| profile_by_id.get(&selected.skill_id))
-            .map(|profile| {
-                profile
-                    .structured_dependencies
-                    .iter()
-                    .map(|dependency| {
-                        CowdSkillStructuredDependency::from_contract(&profile.skill_id, dependency)
+        // A discovery-only decision still emits one truthful unselected record.
+        // Executable decisions emit one record per selected immutable Skill.
+        let selected = if selection.selected.is_empty() {
+            vec![None]
+        } else {
+            selection.selected.iter().map(Some).collect()
+        };
+        let activations = selected
+            .into_iter()
+            .map(|selected| {
+                let selected_invocation = selected
+                    .and_then(|selected| profile_by_id.get(&selected.skill_id))
+                    .and_then(|profile| {
+                        SkillInvocation::from_profile(profile, &input.agent_profile.adapter_ceiling)
+                    });
+                let structured_dependencies = selected
+                    .and_then(|selected| profile_by_id.get(&selected.skill_id))
+                    .map(|profile| {
+                        profile
+                            .structured_dependencies
+                            .iter()
+                            .map(|dependency| {
+                                CowdSkillStructuredDependency::from_contract(
+                                    &profile.skill_id,
+                                    dependency,
+                                )
+                            })
+                            .collect::<Vec<_>>()
                     })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let invocation_evidence = selected_invocation
-            .as_ref()
-            .map(|invocation| invocation.to_evidence("selected_for_runtime"));
-        let mut activation =
-            SkillActivationRecord::new(input.session_id, input.turn_index, input.query, candidates)
+                    .unwrap_or_default();
+                let invocation_evidence = selected_invocation
+                    .as_ref()
+                    .map(|invocation| invocation.to_evidence("selected_for_runtime"));
+                let mut activation = SkillActivationRecord::new(
+                    input.session_id.clone(),
+                    input.turn_index,
+                    input.query.clone(),
+                    candidates.clone(),
+                )
                 .with_invocation_evidence(invocation_evidence.clone())
                 .with_structured_dependencies(structured_dependencies.clone());
-        // Candidate discovery and executable selection are different facts.
-        // SkillActivationRecord historically picked the highest profile
-        // candidate again, which could project a false `selected` Skill even
-        // when the selector deliberately rejected generic token overlap.
-        activation.selected = selection
-            .selected
-            .as_ref()
-            .map(|selected| selected.skill_id.clone());
+                // Candidate discovery and executable selection are different facts.
+                // SkillActivationRecord historically picked the highest profile
+                // candidate again, which could project a false `selected` Skill even
+                // when the selector deliberately rejected generic token overlap.
+                activation.selected = selected.map(|selected| selected.skill_id.clone());
 
+                SkillActivation {
+                    activation,
+                    selected_invocation,
+                    invocation_evidence,
+                    structured_dependencies,
+                }
+            })
+            .collect();
         SkillActivationDecision {
-            activation,
             selection,
-            selected_invocation,
-            invocation_evidence,
-            structured_dependencies,
+            activations,
         }
     }
 }
@@ -289,7 +309,7 @@ pub struct SkillSelectionCandidate {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillSelectionResult {
-    pub selected: Option<SkillSelectionCandidate>,
+    pub selected: Vec<SkillSelectionCandidate>,
     pub candidates: Vec<SkillSelectionCandidate>,
 }
 
@@ -373,15 +393,31 @@ impl SkillSelector {
         // discovery evidence, not authorization to inject an entire Skill
         // prompt. Selection requires an explicit visible grant or the full
         // skill id/name phrase in the query.
-        let selected = candidates
-            .first()
+        let eligible = candidates
+            .iter()
             .filter(|candidate| candidate.score >= MIN_SKILL_SELECTION_SCORE)
             .filter(|candidate| {
                 candidate.reasons.iter().any(|reason| {
                     reason == "agent_profile.visible" || reason.starts_with("identity:")
                 })
             })
-            .cloned();
+            .cloned()
+            .collect::<Vec<_>>();
+        let explicit = eligible
+            .iter()
+            .filter(|candidate| {
+                candidate
+                    .reasons
+                    .iter()
+                    .any(|reason| reason.starts_with("identity:"))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let selected = if explicit.is_empty() {
+            eligible.into_iter().take(1).collect()
+        } else {
+            explicit
+        };
         SkillSelectionResult {
             selected,
             candidates,
@@ -531,7 +567,7 @@ mod tests {
 
         let result = SkillSelector::select(input);
         assert_eq!(result.candidates.len(), 1);
-        assert_eq!(result.selected.unwrap().skill_id, "release-plan");
+        assert_eq!(result.selected[0].skill_id, "release-plan");
     }
 
     #[test]
@@ -555,7 +591,43 @@ mod tests {
         };
 
         let result = SkillSelector::select(input);
-        assert!(result.selected.is_none());
+        assert!(result.selected.is_empty());
+    }
+
+    #[test]
+    fn explicit_multiple_skills_are_selected_without_loading_every_visible_grant() {
+        let profiles = ["producer", "verifier", "unrelated"]
+            .map(|id| profile(id, id, vec![SkillAdapterKind::PromptOnly]))
+            .to_vec();
+        let mut input = SkillSelectionInput {
+            query: "use producer then verifier on the produced file".into(),
+            available_skills: profiles,
+            agent_profile: AgentSkillProfile {
+                explicit_grants: vec!["producer".into(), "verifier".into(), "unrelated".into()],
+                ..Default::default()
+            },
+        };
+        let selected = SkillSelector::select(input.clone()).selected;
+        assert_eq!(
+            selected
+                .iter()
+                .map(|s| s.skill_id.as_str())
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from(["producer", "verifier"])
+        );
+        input
+            .agent_profile
+            .hidden_skill_refs
+            .push("verifier".into());
+        let selected = SkillSelector::select(input.clone()).selected;
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].skill_id, "producer");
+        input.query = "summarize the result".into();
+        assert_eq!(
+            SkillSelector::select(input).selected.len(),
+            1,
+            "implicit selection must not load the whole capability grant set"
+        );
     }
 
     #[test]
@@ -591,17 +663,19 @@ mod tests {
         });
 
         assert_eq!(
-            decision.activation.selected.as_deref(),
+            decision.activations[0].activation.selected.as_deref(),
             Some("release-plan")
         );
         assert_eq!(
-            decision
+            decision.activations[0]
                 .invocation_evidence
                 .as_ref()
                 .map(|evidence| evidence.skill_id.as_str()),
             Some("release-plan")
         );
-        let event = decision.activation.to_runtime_session_event(9);
+        let event = decision.activations[0]
+            .activation
+            .to_runtime_session_event(9);
         assert_eq!(
             event.payload["invocation_evidence"]["outcome"],
             "selected_for_runtime"
@@ -641,8 +715,10 @@ mod tests {
             },
         });
 
-        assert_eq!(decision.structured_dependencies.len(), 1);
-        let event = decision.activation.to_runtime_session_event(10);
+        assert_eq!(decision.activations[0].structured_dependencies.len(), 1);
+        let event = decision.activations[0]
+            .activation
+            .to_runtime_session_event(10);
         assert_eq!(
             event.payload["structured_dependencies"][0]["domain"],
             "supply_chain"
@@ -664,17 +740,19 @@ mod tests {
             agent_profile: AgentSkillProfile::default(),
         });
 
-        assert_eq!(decision.activation.selected.as_deref(), None);
-        assert!(decision.invocation_evidence.is_none());
+        assert_eq!(decision.activations[0].activation.selected.as_deref(), None);
+        assert!(decision.activations[0].invocation_evidence.is_none());
         assert_eq!(
-            decision.activation.candidates[0].reasons,
+            decision.activations[0].activation.candidates[0].reasons,
             vec!["capability_ref_fallback".to_string()]
         );
         assert_eq!(
-            decision.activation.candidates[0].source,
+            decision.activations[0].activation.candidates[0].source,
             RuntimeSkillCandidateSource::CapabilityRefFallback
         );
-        let event = decision.activation.to_runtime_session_event(2);
+        let event = decision.activations[0]
+            .activation
+            .to_runtime_session_event(2);
         assert!(event.payload.get("invocation_evidence").is_some());
         assert!(!event
             .refs
@@ -711,11 +789,11 @@ mod tests {
             },
         });
 
-        assert_eq!(decision.activation.selected.as_deref(), None);
-        assert!(decision.invocation_evidence.is_none());
-        assert!(decision.structured_dependencies.is_empty());
+        assert_eq!(decision.activations[0].activation.selected.as_deref(), None);
+        assert!(decision.activations[0].invocation_evidence.is_none());
+        assert!(decision.activations[0].structured_dependencies.is_empty());
         assert_eq!(
-            decision.activation.candidates[0].reasons,
+            decision.activations[0].activation.candidates[0].reasons,
             vec!["capability_ref_fallback".to_string()]
         );
     }
@@ -735,7 +813,7 @@ mod tests {
             available_skills: vec![candidate],
         });
 
-        assert!(result.selected.is_none());
+        assert!(result.selected.is_empty());
         assert_eq!(result.candidates[0].score, 2);
     }
 
@@ -754,7 +832,7 @@ mod tests {
             available_skills: vec![candidate],
         });
 
-        assert!(result.selected.is_none());
+        assert!(result.selected.is_empty());
         assert!(result.candidates[0]
             .reasons
             .iter()
@@ -782,12 +860,16 @@ mod tests {
             agent_profile: AgentSkillProfile::default(),
         });
 
-        assert!(decision.selection.selected.is_none());
-        assert!(decision.selected_invocation.is_none());
-        assert!(decision.activation.selected.is_none());
-        assert!(decision.activation.candidates.iter().any(|candidate| {
-            candidate.name == "agent-reach"
-                && candidate.source == RuntimeSkillCandidateSource::Profile
-        }));
+        assert!(decision.selection.selected.is_empty());
+        assert!(decision.activations[0].selected_invocation.is_none());
+        assert!(decision.activations[0].activation.selected.is_none());
+        assert!(decision.activations[0]
+            .activation
+            .candidates
+            .iter()
+            .any(|candidate| {
+                candidate.name == "agent-reach"
+                    && candidate.source == RuntimeSkillCandidateSource::Profile
+            }));
     }
 }

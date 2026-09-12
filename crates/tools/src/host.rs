@@ -153,6 +153,7 @@ impl ToolHost {
             snapshot,
             cache: Arc::clone(&self.cache),
             authorization_lease_verifier: self.authorization_lease_verifier.clone(),
+            read_cache_authority_digest: None,
         }
     }
 
@@ -191,6 +192,7 @@ pub struct ToolHostLease {
     revision: u64,
     snapshot: Arc<ToolHostSnapshot>,
     cache: Arc<ToolCache>,
+    read_cache_authority_digest: Option<String>,
     authorization_lease_verifier:
         Option<Arc<dyn Fn(&AuthorizationLease) -> bool + Send + Sync + 'static>>,
 }
@@ -208,6 +210,37 @@ impl std::fmt::Debug for ToolHostLease {
 }
 
 impl ToolHostLease {
+    pub(crate) fn read_cache_authority_digest(&self) -> Option<&str> {
+        self.read_cache_authority_digest.as_deref()
+    }
+
+    fn for_authorized_read_cache(
+        &self,
+        authorization: &ToolExecutionAuthorization,
+    ) -> Result<Self, ToolHostError> {
+        use sha2::{Digest, Sha256};
+        let signed = &authorization.authorization_lease;
+        let mut scopes = signed
+            .scopes
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ToolHostError::Execution(e.to_string()))?;
+        scopes.sort();
+        scopes.dedup();
+        let identity = serde_json::to_vec(&(
+            authorization.policy_revision,
+            &authorization.scope,
+            &scopes,
+            signed.ceiling,
+            &signed.capability,
+            &authorization.descriptor_hash,
+        ))
+        .map_err(|e| ToolHostError::Execution(e.to_string()))?;
+        let mut lease = self.clone();
+        lease.read_cache_authority_digest = Some(format!("{:x}", Sha256::digest(identity)));
+        Ok(lease)
+    }
     #[must_use]
     pub fn workspace_id(&self) -> &str {
         &self.workspace_id
@@ -379,7 +412,8 @@ impl ToolHostLease {
     ) -> Result<String, ToolHostError> {
         let (canonical_id, value) =
             self.authorize_and_canonicalize(authorization, tool_id, input)?;
-        self.dispatch_sync(&canonical_id, value)
+        self.for_authorized_read_cache(authorization)?
+            .dispatch_sync(&canonical_id, value)
     }
 
     /// Unified asynchronous entry (T4): bash runs on the tokio runtime with
@@ -419,7 +453,7 @@ impl ToolHostLease {
             return serde_json::to_string_pretty(&output)
                 .map_err(|error| ToolHostError::Execution(error.to_string()));
         }
-        let lease = self.clone();
+        let lease = self.for_authorized_read_cache(authorization)?;
         let value = value.clone();
         tokio::task::spawn_blocking(move || lease.dispatch_sync(&canonical_id, &value))
             .await
@@ -1090,6 +1124,108 @@ mod tests {
             .expect("authorized read should execute");
         assert!(output.contains("pinned-host"));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn read_tool_cache_hits_and_invalidates_after_write() {
+        let _guard = crate::test_process_environment_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = std::env::temp_dir().join(format!(
+            "cowd-read-cache-{}-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test"),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&temp).unwrap();
+        std::fs::write(temp.as_path().join("source.txt"), "alpha").unwrap();
+        let host = test_host("authorized-cache", temp.as_path());
+        let lease = host.pin_snapshot();
+        let input = json!({"path":"source.txt"});
+        let auth = authorization(&lease.describe_effect("read_file", &input), None);
+        lease.execute(&auth, "read_file", &input).unwrap();
+        lease.execute(&auth, "read_file", &input).unwrap();
+        assert_eq!(host.cache_stats().hits, 1);
+        let mut revised = auth.clone();
+        revised.policy_revision = 2;
+        revised.authorization_lease.policy_revision = 2;
+        lease.execute(&revised, "read_file", &input).unwrap();
+        assert_eq!(
+            host.cache_stats().hits,
+            1,
+            "new policy revision cannot hit old scope cache"
+        );
+        let mut revoked = auth.clone();
+        revoked.authorization_lease.remaining_uses = 0;
+        assert!(lease.execute(&revoked, "read_file", &input).is_err());
+        assert_eq!(
+            host.cache_stats().hits,
+            1,
+            "authorization is checked before cache lookup"
+        );
+        let write = json!({"path":"source.txt","content":"omega"});
+        let write_auth = authorization(
+            &lease.describe_effect("write_file", &write),
+            Some("write-cache-test"),
+        );
+        lease.execute(&write_auth, "write_file", &write).unwrap();
+        assert_eq!(host.cache_stats().invalidations, 1);
+        assert!(lease
+            .execute(&auth, "read_file", &input)
+            .unwrap()
+            .contains("omega"));
+        lease.execute(&write_auth, "write_file", &write).unwrap();
+        assert_eq!(
+            host.cache_stats().invalidations,
+            2,
+            "same write input still performs its effect; never read-cache reuse"
+        );
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn read_tool_cache_misses_after_external_file_change() {
+        let _guard = crate::test_process_environment_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = std::env::temp_dir().join(format!(
+            "cowd-read-cache-{}-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test"),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&temp).unwrap();
+        let file = temp.as_path().join("source.txt");
+        std::fs::write(&file, "alpha").unwrap();
+        let old_time = std::fs::metadata(&file).unwrap().modified().unwrap();
+        let host = test_host("external-cache", temp.as_path());
+        let lease = host.pin_snapshot();
+        let input = json!({"path":"source.txt"});
+        let auth = authorization(&lease.describe_effect("read_file", &input), None);
+        assert!(lease
+            .execute(&auth, "read_file", &input)
+            .unwrap()
+            .contains("alpha"));
+        std::fs::write(&file, "omega").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+        assert!(lease
+            .execute(&auth, "read_file", &input)
+            .unwrap()
+            .contains("omega"));
+        assert_eq!(host.cache_stats().hits, 0);
+        assert_eq!(host.cache_stats().misses, 2);
+        std::fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]

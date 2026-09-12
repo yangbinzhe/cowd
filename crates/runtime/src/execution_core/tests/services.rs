@@ -19,6 +19,9 @@ use harness_contract::skill::{
 };
 use session::SessionRecord;
 
+#[path = "paired_skill.rs"]
+mod paired_skill;
+
 struct ReadinessOnlyEvolutionEvalRunner;
 
 struct TestRuntimeBackends {
@@ -410,15 +413,32 @@ fn episode_baseline_requires_three_distinct_durable_turns() {
 
 #[tokio::test]
 async fn generalized_episode_set_executable_baseline() {
+    episode_set_pair(false).await;
+}
+
+#[tokio::test]
+async fn paired_skill_executes_native_writes_and_reads_in_distinct_runtime_leases() {
+    episode_set_pair(true).await;
+}
+
+async fn episode_set_pair(real_skill: bool) {
     let temp = tempfile::tempdir().expect("temporary root");
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
+    let local = if real_skill {
+        Some(paired_skill::Fixture::new(workspace.clone()).await)
+    } else {
+        None
+    };
     let providers = crate::config::ProvidersConfig {
         providers: std::collections::HashMap::from([(
             "test".into(),
             crate::config::ProviderConfig {
                 name: "test".into(),
-                base_url: "https://example.test/v1".into(),
+                base_url: local.as_ref().map_or_else(
+                    || "https://example.test/v1".into(),
+                    |fixture| fixture.url.clone(),
+                ),
                 api_key: "test".into(),
                 models: vec!["fast".into()],
                 protocol: Some("responses".into()),
@@ -427,19 +447,27 @@ async fn generalized_episode_set_executable_baseline() {
             },
         )]),
     };
-    let services = RuntimeServices::test_builder(temp.path().join("home"), &workspace)
+    let mut builder = RuntimeServices::test_builder(temp.path().join("home"), &workspace)
         .provider_registry(Arc::new(
             crate::ProviderRegistry::new(providers).expect("providers"),
         ))
-        .evolution_eval_runner(Arc::new(ReadinessOnlyEvolutionEvalRunner))
-        .build()
-        .expect("runtime services");
+        .evolution_eval_runner(Arc::new(ReadinessOnlyEvolutionEvalRunner));
+    if let Some(local) = &local {
+        builder = builder.tool_execution_host(local.host.clone());
+    }
+    let services = builder.build().expect("runtime services");
     let captured_packets = Arc::new(Mutex::new(Vec::new()));
-    services
-        .agent_runtime()
-        .register_observation_authority_backend(Arc::new(CapturingAgentBackend {
-            packets: Arc::clone(&captured_packets),
-        }));
+    if let Some(local) = &local {
+        services.replace_skill_catalog(local.catalog());
+        local.install_sessions(&services).await;
+    }
+    if !real_skill {
+        services
+            .agent_runtime()
+            .register_observation_authority_backend(Arc::new(CapturingAgentBackend {
+                packets: Arc::clone(&captured_packets),
+            }));
+    }
 
     let definition_id = AgentDefinitionId::new(
         DefinitionScope::Workspace,
@@ -467,8 +495,16 @@ async fn generalized_episode_set_executable_baseline() {
             write_mode: CognitiveWriteMode::CandidateOnly,
         },
         capability_contract: AgentCapabilityContract {
-            capability_ceiling: vec![AgentCapability::Read],
-            skill_refs: Vec::new(),
+            capability_ceiling: if real_skill {
+                vec![AgentCapability::Read, AgentCapability::Write]
+            } else {
+                vec![AgentCapability::Read]
+            },
+            skill_refs: if real_skill {
+                vec!["paired-evidence".into(), "paired-verification".into()]
+            } else {
+                Vec::new()
+            },
             approval_required_for: Vec::new(),
         },
         output_contract: AgentOutputContract::reviewable(),
@@ -509,14 +545,62 @@ async fn generalized_episode_set_executable_baseline() {
         &episode_ids,
     );
 
-    let acceptance = vec!["completed".to_string()];
-    let objective = "execute the frozen paired evaluation workload".to_string();
+    let acceptance = if real_skill {
+        vec!["isolated write".to_string(), "isolated reread".to_string()]
+    } else {
+        vec!["completed".to_string()]
+    };
+    use harness_contract::evaluation::{
+        EvaluationAcceptanceCheck, EvaluationAcceptanceRequirement,
+    };
+    let acceptance_checks = if real_skill {
+        vec![
+            EvaluationAcceptanceRequirement {
+                criterion: acceptance[0].clone(),
+                check: EvaluationAcceptanceCheck::IsolatedWorkspaceChange {
+                    field: harness_contract::agent::StructuredOutputField::Implementation,
+                },
+            },
+            EvaluationAcceptanceRequirement {
+                criterion: acceptance[1].clone(),
+                check: EvaluationAcceptanceCheck::IsolatedWorkspaceRead,
+            },
+        ]
+    } else {
+        vec![EvaluationAcceptanceRequirement {
+            criterion: acceptance[0].clone(),
+            check: EvaluationAcceptanceCheck::Output {
+                check: harness_contract::agent::OutputAcceptanceCheck::StructuredArtifact {
+                    name: "summary".into(),
+                },
+            },
+        }]
+    };
+    let objective = if real_skill { "Activate paired-evidence to write proof.txt inside your Runtime-issued evaluation_output_scope, then use paired-verification to read that exact produced file and verify the actual content. Return reviewable evidence." } else { "execute the frozen paired evaluation workload" }.to_string();
+    let permission = if real_skill {
+        harness_contract::policy::PermissionMode::WorkspaceWrite
+    } else {
+        harness_contract::policy::PermissionMode::ReadOnly
+    };
+    let allowed_tools = if real_skill {
+        vec!["write_file".to_string(), "read_file".to_string()]
+    } else {
+        vec![]
+    };
+    let allowed_skills = if real_skill {
+        vec![
+            "paired-evidence".to_string(),
+            "paired-verification".to_string(),
+        ]
+    } else {
+        vec![]
+    };
     let environment_fingerprint = evaluation_digest(&serde_json::json!({
         "provider": "test",
         "model": "fast",
-        "permission_ceiling": harness_contract::policy::PermissionMode::ReadOnly,
-        "allowed_tools": Vec::<String>::new(),
-        "allowed_skills": Vec::<String>::new(),
+        "permission_ceiling": permission,
+        "allowed_tools": allowed_tools,
+        "allowed_skills": allowed_skills,
         "resource_scopes": Vec::<String>::new(),
     }));
     let replay = harness_contract::evaluation::FrozenEvaluationReplayManifest {
@@ -525,16 +609,17 @@ async fn generalized_episode_set_executable_baseline() {
         input_digest: evaluation_digest(&objective),
         attachment_refs: Vec::new(),
         environment_fingerprint,
-        rubric_digest: evaluation_digest(&acceptance),
+        rubric_digest: evaluation_digest(&(&acceptance, &acceptance_checks)),
     };
     let scenario = harness_contract::evaluation::EvaluationScenarioSpec {
         scenario_ref: scenario_ref.to_string(),
         objective,
         acceptance,
-        allowed_tools: Vec::new(),
-        allowed_skills: Vec::new(),
+        acceptance_checks,
+        allowed_tools,
+        allowed_skills,
         resource_scopes: Vec::new(),
-        permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+        permission_ceiling: permission,
         model_lease: "fast".to_string(),
         replay_manifest: Some(replay.clone()),
     };
@@ -570,18 +655,52 @@ async fn generalized_episode_set_executable_baseline() {
             &format!("evolution-eval:{}:{side}:0", candidate.candidate_id),
         );
     }
-    let (baseline_observation, candidate_observation) = services
-        .execute_evolution_agent_scenario(&candidate.candidate_id, &scenario, 0)
-        .await
-        .expect("both revisions execute from the frozen EpisodeSet replay");
+    let (baseline_observation, candidate_observation) = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        services.execute_evolution_agent_scenario(&candidate.candidate_id, &scenario, 0),
+    )
+    .await
+    .expect("paired original Runner deadline")
+    .expect("both revisions execute from the frozen EpisodeSet replay");
     assert_eq!(baseline_observation.definition_revision, 1);
     assert_eq!(candidate_observation.definition_revision, 2);
-    assert!(baseline_observation.succeeded && candidate_observation.succeeded);
+    if !(baseline_observation.succeeded && candidate_observation.succeeded) {
+        if let Some(local) = &local {
+            eprintln!("{}", local.diagnostics());
+        }
+    }
+    assert!(
+        baseline_observation.succeeded && candidate_observation.succeeded,
+        "baseline={baseline_observation:?}; candidate={candidate_observation:?}; returns={:?}",
+        ["baseline", "candidate"].map(|side| services.agent_runtime().terminal_return(&format!(
+            "instance:evolution-eval:{}:{}:{side}:{}:0",
+            candidate.candidate_id,
+            scenario.scenario_ref,
+            if side == "baseline" { 1 } else { 2 }
+        )))
+    );
     assert_ne!(baseline_observation.run_ref, candidate_observation.run_ref);
     assert_eq!(
         baseline_observation.environment_fingerprint,
         candidate_observation.environment_fingerprint
     );
+    if let Some(local) = local {
+        let repeated = services
+            .execute_evolution_agent_scenario(&candidate.candidate_id, &scenario, 0)
+            .await
+            .expect("same sample reattaches without renewing its budget");
+        assert_eq!(repeated.0, baseline_observation);
+        assert_eq!(repeated.1, candidate_observation);
+        assert!(repeated.0.succeeded && repeated.1.succeeded);
+        local.verify(&services).await;
+        assert!(services
+            .execution_supervisor()
+            .shutdown()
+            .await
+            .errors
+            .is_empty());
+        return;
+    }
     let packets = captured_packets
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -605,6 +724,16 @@ fn generalized_paired_write_skill_isolation() {
             scenario_ref: "episode/isolation".to_string(),
             objective: "exercise a paired workload".to_string(),
             acceptance: vec!["reviewable evidence".to_string()],
+            acceptance_checks: vec![
+                harness_contract::evaluation::EvaluationAcceptanceRequirement {
+                    criterion: "reviewable evidence".into(),
+                    check: harness_contract::evaluation::EvaluationAcceptanceCheck::Output {
+                        check: harness_contract::agent::OutputAcceptanceCheck::StructuredArtifact {
+                            name: "evidence".into(),
+                        },
+                    },
+                },
+            ],
             allowed_tools: Vec::new(),
             allowed_skills,
             resource_scopes,
@@ -640,6 +769,21 @@ fn generalized_paired_write_skill_isolation() {
 
     validate_evolution_scenario_isolation(&scenario(Vec::new(), Vec::new()), None, &catalog)
         .expect("read-only inputs with Runtime-issued output scopes are isolated");
+    for check in [
+        harness_contract::evaluation::EvaluationAcceptanceCheck::IsolatedWorkspaceRead,
+        harness_contract::evaluation::EvaluationAcceptanceCheck::IsolatedWorkspaceChange {
+            field: harness_contract::agent::StructuredOutputField::Implementation,
+        },
+    ] {
+        let mut missing_tool = scenario(Vec::new(), Vec::new());
+        missing_tool.acceptance_checks[0].check = check;
+        assert!(
+            validate_evolution_scenario_isolation(&missing_tool, None, &catalog)
+                .unwrap_err()
+                .to_string()
+                .contains("has no authorized file")
+        );
+    }
 }
 
 #[test]

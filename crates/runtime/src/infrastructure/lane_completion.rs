@@ -135,6 +135,7 @@ mod tests {
         )
         .expect("graph identity");
         AgentOutput {
+            agentic_binding: None,
             execution_identity: harness_contract::execution::ExecutionIdentity::for_agent_node(
                 &graph_identity,
                 "run-test",

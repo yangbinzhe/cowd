@@ -25,6 +25,8 @@ use super::events::{ExecutionGraphDelta, ExecutionGraphEvent, ExecutionNodeBindi
 
 #[path = "commit_pipeline.rs"]
 mod commit_pipeline;
+#[path = "effect_authority.rs"]
+mod effect_authority;
 pub(crate) use commit_pipeline::execution_lineage_stream_id;
 use commit_pipeline::*;
 
@@ -141,6 +143,9 @@ pub enum ToolEffectState {
 /// receipt set that an acceptance verdict was based on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DurableAgentToolReceipt {
+    pub committed_cursor: u64,
+    pub effect_scope: Option<harness_contract::policy::PermissionScope>,
+    pub effect_scopes: Vec<harness_contract::policy::PermissionScope>,
     pub sequence: u64,
     pub effect_kind: ToolEffectKind,
     pub authorized_scopes: Vec<String>,
@@ -149,6 +154,8 @@ pub struct DurableAgentToolReceipt {
 
 #[derive(Clone)]
 pub struct ExecutionCommitService {
+    effect_authority_actions: crate::agentic::AgentActionService,
+    effect_authority_graphs: crate::ExecutionGraphStateStore,
     event_store: Arc<RuntimeEventStore>,
     hot_state: Arc<RuntimeHotStatePlane>,
     hot_graphs: Arc<HotExecutionGraphRegistry>,
@@ -183,6 +190,15 @@ impl ExecutionCommitService {
                     serde_json::from_value(event.payload["authorized_scopes"].clone())?;
                 let outcome = serde_json::from_value(event.payload["outcome"].clone())?;
                 Ok(DurableAgentToolReceipt {
+                    committed_cursor: event.commit_cursor,
+                    effect_scope: serde_json::from_value(event.payload["effect_scope"].clone())?,
+                    effect_scopes: event
+                        .payload
+                        .get("effect_scopes")
+                        .cloned()
+                        .map(serde_json::from_value)
+                        .transpose()?
+                        .unwrap_or_default(),
                     sequence,
                     effect_kind,
                     authorized_scopes,
@@ -288,6 +304,24 @@ impl ExecutionCommitService {
         request: &crate::RuntimeToolExecutionRequest,
         effect: &ToolEffectDescriptor,
     ) -> Result<ToolEffectState, ExecutionCommitError> {
+        self.begin_tool_effect_scoped(request, effect, None)
+    }
+
+    pub(crate) fn begin_root_tool_effect(
+        &self,
+        request: &crate::RuntimeToolExecutionRequest,
+        effect: &ToolEffectDescriptor,
+        root: &crate::CowdExecutionContext,
+    ) -> Result<ToolEffectState, ExecutionCommitError> {
+        self.begin_tool_effect_scoped(request, effect, Some(root))
+    }
+
+    fn begin_tool_effect_scoped(
+        &self,
+        request: &crate::RuntimeToolExecutionRequest,
+        effect: &ToolEffectDescriptor,
+        root: Option<&crate::CowdExecutionContext>,
+    ) -> Result<ToolEffectState, ExecutionCommitError> {
         if effect.effect_kind == ToolEffectKind::Read {
             let stream_id = format!("execution-effect:{}", request.idempotency_key);
             let receipt_key = format!("{}:read-receipt", request.idempotency_key);
@@ -320,46 +354,110 @@ impl ExecutionCommitService {
                 .map(ToolEffectState::Completed)
                 .map_err(ExecutionCommitError::Serialization);
         }
+        // A completed receipt above is replay, not a new effect admission.
+        // Non-idempotent uncertainty likewise never reaches ToolHost again.
         if let Some(intent) = self
             .event_store
             .event_by_idempotency_key(&stream_id, &format!("{}:intent", request.idempotency_key))?
         {
             validate_mutation_tool_fingerprint(request, effect, &intent.payload, "intent")?;
-            return Ok(match effect.idempotency {
-                ToolIdempotency::Idempotent | ToolIdempotency::IdempotentWithKey => {
-                    ToolEffectState::Fresh
-                }
-                ToolIdempotency::NonIdempotent | ToolIdempotency::Unknown => {
-                    ToolEffectState::Uncertain
-                }
-            });
+            if matches!(
+                effect.idempotency,
+                ToolIdempotency::NonIdempotent | ToolIdempotency::Unknown
+            ) {
+                return Ok(ToolEffectState::Uncertain);
+            }
         }
-        let revision = self.event_store.stream_revision(&stream_id)?;
-        self.event_store.append_batch_if_revision(
-            stream_id.clone(),
-            revision,
-            format!("{}:intent", request.idempotency_key),
-            vec![RuntimeTransactionEventInput {
+        let authority = || {
+            if let Some(root) = root {
+                if request.session_id.as_deref() != Some(root.session_id.as_str())
+                    || request.parent_execution.is_some()
+                {
+                    return Err(ExecutionCommitError::InvalidCommand(
+                        "root_effect_authority: invocation scope mismatch".into(),
+                    ));
+                }
+                self.root_effect_authority(root)
+            } else {
+                self.tool_effect_authority(request)
+            }
+        };
+        let sources = authority()?;
+        let mut streams = sources
+            .iter()
+            .map(|source| source.stream_id.clone())
+            .collect::<Vec<_>>();
+        streams.push(stream_id.clone());
+        if let Some(index) = delegated_agent_receipt_stream_id(request) {
+            streams.push(index);
+        }
+        self.event_store.with_stream_locks(&streams, || {
+            if let Some(receipt) = self.event_store.event_by_idempotency_key(
+                &stream_id, &format!("{}:receipt", request.idempotency_key))? {
+                validate_mutation_tool_fingerprint(request, effect, &receipt.payload, "receipt")?;
+                return Ok(ToolEffectState::Completed(serde_json::from_value(receipt.payload["outcome"].clone())?));
+            }
+            let mut expected_streams = authority()?;
+            if expected_streams.iter().any(|source| !streams.contains(&source.stream_id)) {
+                return Err(ExecutionCommitError::InvalidCommand("tool effect authority scope changed during admission".into()));
+            }
+            let revision = self.event_store.stream_revision(&stream_id)?;
+            let intent = self.event_store.event_by_idempotency_key(
+                &stream_id, &format!("{}:intent", request.idempotency_key))?;
+            if let Some(intent) = &intent {
+                validate_mutation_tool_fingerprint(request, effect, &intent.payload, "intent")?;
+                if matches!(effect.idempotency, ToolIdempotency::NonIdempotent | ToolIdempotency::Unknown) {
+                    return Ok(ToolEffectState::Uncertain);
+                }
+            }
+            let retry = intent.is_some();
+            let key = if retry { format!("{}:retry:{revision}", request.idempotency_key) }
+                else { format!("{}:intent", request.idempotency_key) };
+            expected_streams.push(ExpectedStreamRevision { stream_id: stream_id.clone(), expected_revision: revision });
+            let mut events = vec![RuntimeTransactionEventInput {
                 event: RuntimeEventInput {
-                    stream_id,
+                    stream_id: stream_id.clone(),
                     scope: RuntimeEventScope::ExecutionNode,
-                    kind: "execution.effect.intent".to_string(),
-                    status: Some("inflight".to_string()),
-                    actor: Some("governed_tool".to_string()),
+                    kind: if retry { "execution.effect.retry_admitted" } else { "execution.effect.intent" }.into(),
+                    status: Some("inflight".into()), actor: Some("governed_tool".into()),
                     refs: tool_effect_refs(request),
                     payload: json!({
                         "idempotency_key": request.idempotency_key,
-                        "tool_use_id": request.tool_use_id,
-                        "tool_name": request.tool_name,
+                        "tool_use_id": request.tool_use_id, "tool_name": request.tool_name,
                         "input_sha256": format!("sha256:{:x}", Sha256::digest(request.input.as_bytes())),
                         "effect": effect,
                     }),
                 },
-                idempotency_key: Some(format!("{}:intent", request.idempotency_key)),
-                schema_version: 1,
-            }],
-        )?;
-        Ok(ToolEffectState::Fresh)
+                idempotency_key: Some(key.clone()), schema_version: 1,
+            }];
+            if let Some(index) = delegated_agent_receipt_stream_id(request) {
+                let index_key = format!("agent-tool-intent:{}", request.idempotency_key);
+                if self.event_store.event_by_idempotency_key(&index, &index_key)?.is_none() {
+                    expected_streams.push(ExpectedStreamRevision {
+                        stream_id: index.clone(), expected_revision: self.event_store.stream_revision(&index)?,
+                    });
+                    events.push(RuntimeTransactionEventInput {
+                        event: RuntimeEventInput {
+                            stream_id: index, scope: RuntimeEventScope::ExecutionNode,
+                            kind: "execution.agent_tool.intent".into(), status: Some("inflight".into()),
+                            actor: Some("governed_tool".into()), refs: tool_effect_refs(request),
+                            payload: json!({
+                                "idempotency_key": request.idempotency_key,
+                                "tool_name": request.tool_name,
+                                "sequence": request.observation_wave_sequence,
+                                "effect_kind": effect.effect_kind,
+                                "effect_scopes": effect.scopes,
+                                "effect_scope": request.authorization.as_ref().map(|authorization| &authorization.scope),
+                            }),
+                        }, idempotency_key: Some(index_key), schema_version: 1,
+                    });
+                }
+            }
+            self.event_store.append_transaction_locked(AppendTransactionRequest {
+                transaction_id: key, expected_streams, events,
+            })?;
+            Ok(ToolEffectState::Fresh)
+        })
     }
 
     pub fn commit_tool_effect(
@@ -409,9 +507,10 @@ impl ExecutionCommitService {
             idempotency_key: Some(format!("{}:receipt", request.idempotency_key)),
             schema_version: 1,
         }];
-        if let Some(agent_receipt) =
+        if let Some(mut agent_receipt) =
             delegated_agent_receipt_event(request, effect.effect_kind, outcome)
         {
+            agent_receipt.event.payload["effect_scopes"] = serde_json::to_value(&effect.scopes)?;
             let agent_stream = agent_receipt.event.stream_id.clone();
             expected_streams
                 .entry(agent_stream.clone())
@@ -502,6 +601,10 @@ impl ExecutionCommitService {
         hot_state: Arc<RuntimeHotStatePlane>,
     ) -> Self {
         Self {
+            effect_authority_actions: crate::agentic::AgentActionService::new(Arc::clone(
+                &event_store,
+            )),
+            effect_authority_graphs: crate::ExecutionGraphStateStore::new(Arc::clone(&event_store)),
             event_store,
             hot_graphs: Arc::clone(hot_state.graphs()),
             hot_state,

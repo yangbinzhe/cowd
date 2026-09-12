@@ -384,6 +384,24 @@ impl RuntimeEventStore {
         )
     }
 
+    /// Fenced repair of an existing, damaged derived checkpoint from journal truth.
+    pub fn compare_and_repair_projection_checkpoint(
+        &self,
+        projection_id: &str,
+        source_cursor: u64,
+        expected_revision: u64,
+        payload: &serde_json::Value,
+        updated_at_ms: u64,
+    ) -> RuntimeEventStoreResult<RuntimeProjectionCheckpoint> {
+        self.backend.compare_and_repair_projection_checkpoint(
+            projection_id,
+            source_cursor,
+            expected_revision,
+            payload,
+            updated_at_ms,
+        )
+    }
+
     pub fn delete_projection_checkpoint(
         &self,
         projection_id: &str,

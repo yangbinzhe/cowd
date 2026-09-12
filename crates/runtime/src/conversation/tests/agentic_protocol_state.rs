@@ -1,13 +1,13 @@
+use super::agentic_program_owns_root_terminal;
 use super::host_backend::{
     delegated_agentic_protocol_state, pending_delegated_action_is_ready,
     DelegatedAgenticProtocolState,
 };
-use super::agentic_program_owns_root_terminal;
-use harness_contract::agent::{AgenticExecutionBinding, AgenticExecutionFocus, AgentTaskPacket};
+use harness_contract::agent::{AgentTaskPacket, AgenticExecutionBinding, AgenticExecutionFocus};
 use harness_contract::agent_action::{
     AgentAction, AgentActionEnvelope, AgentActionStatus, AgentActorBinding, AgentActorKind,
-    AgentInviteInput, ArtifactCommitInput, TaskClaimInput, TaskPublishInput,
-    TaskReviewDecision, TaskReviewInput, TaskSubmitInput, TeamCreateInput,
+    AgentInviteInput, ArtifactCommitInput, TaskClaimInput, TaskPublishInput, TaskReviewDecision,
+    TaskReviewInput, TaskSubmitInput, TeamCreateInput,
 };
 use harness_contract::context::{ArtifactWriteDescriptor, ChildExecutionBudgetReservation};
 use harness_contract::execution_graph::{
@@ -61,14 +61,32 @@ fn bound_agentic_program_exclusively_owns_the_root_goal_terminal() {
         root_execution_id,
     )
     .expect("terminal owner"));
-    assert!(super::host_presentation::root_terminal_owned_elsewhere(
-        services.as_ref(), true, session_id, turn_id, root_execution_id,
-        "goal:root-terminal-owner", harness_contract::goal::GoalCompletion::Satisfied,
-    ).is_err(), "presentation cannot turn an Open Program into visible success");
-    assert!(super::host_presentation::root_terminal_owned_elsewhere(
-        services.as_ref(), true, session_id, turn_id, root_execution_id,
-        "goal:root-terminal-owner", harness_contract::goal::GoalCompletion::Partial,
-    ).unwrap(), "failure presentation preserves Program terminal ownership");
+    assert!(
+        super::host_presentation::root_terminal_owned_elsewhere(
+            services.as_ref(),
+            true,
+            session_id,
+            turn_id,
+            root_execution_id,
+            "goal:root-terminal-owner",
+            harness_contract::goal::GoalCompletion::Satisfied,
+        )
+        .is_err(),
+        "presentation cannot turn an Open Program into visible success"
+    );
+    assert!(
+        super::host_presentation::root_terminal_owned_elsewhere(
+            services.as_ref(),
+            true,
+            session_id,
+            turn_id,
+            root_execution_id,
+            "goal:root-terminal-owner",
+            harness_contract::goal::GoalCompletion::Partial,
+        )
+        .unwrap(),
+        "failure presentation preserves Program terminal ownership"
+    );
     assert!(!agentic_program_owns_root_terminal(
         services.as_ref(),
         "session-direct",
@@ -126,7 +144,6 @@ fn applied_ref(services: &crate::RuntimeServices, envelope: &AgentActionEnvelope
 }
 
 fn protocol_fixture() -> AgenticProtocolFixture {
-    let services = crate::RuntimeServices::in_memory().expect("Runtime services");
     let root = AgentActorBinding {
         objective_id: "objective-protocol-state".to_string(),
         program_id: "program-protocol-state".to_string(),
@@ -144,6 +161,11 @@ fn protocol_fixture() -> AgenticProtocolFixture {
         team_id: None,
         agent_id: None,
     };
+    protocol_fixture_for_root(root)
+}
+
+fn protocol_fixture_for_root(root: AgentActorBinding) -> AgenticProtocolFixture {
+    let services = crate::RuntimeServices::in_memory().expect("Runtime services");
     let envelope = |action_id: &str, action: AgentAction| AgentActionEnvelope {
         action_id: action_id.to_string(),
         actor: root.clone(),
@@ -175,7 +197,7 @@ fn protocol_fixture() -> AgenticProtocolFixture {
                 model_profile_ref: None,
                 expertise_hints: Vec::new(),
                 execution_requirements: Vec::new(),
-}),
+            }),
         ),
     );
     let reviewer_ref = applied_ref(
@@ -192,7 +214,7 @@ fn protocol_fixture() -> AgenticProtocolFixture {
                 model_profile_ref: None,
                 expertise_hints: Vec::new(),
                 execution_requirements: Vec::new(),
-}),
+            }),
         ),
     );
     let task_ref = applied_ref(
@@ -207,11 +229,11 @@ fn protocol_fixture() -> AgenticProtocolFixture {
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
 
-            obligation_refs: Vec::new(),
-            purpose: Default::default(),
-            execution_requirements: Vec::new(),
-            expertise_hints: Vec::new(),
-}),
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
+            }),
         ),
     );
     AgenticProtocolFixture {
@@ -885,4 +907,516 @@ async fn delegated_review_is_pending_only_until_its_durable_verdict() {
     assert_eq!(terminal.status, crate::AgenticTaskStatus::Accepted);
     assert!(!terminal.owns_active_attempt);
     assert!(terminal.is_terminal());
+}
+
+#[test]
+fn topic_transport_preserves_unacknowledged_pages_and_rechecks_private_scope() {
+    let fixture = protocol_fixture();
+    let ticket = register_protocol_graph(
+        &fixture,
+        "execute",
+        &fixture.author_ref,
+        "topic-port-parent",
+        "topic-port-conversation",
+        1,
+    );
+    let parent = fixture
+        .services
+        .graph_state_store()
+        .load("topic-port-parent")
+        .unwrap();
+    let packet: AgentTaskPacket = serde_json::from_str(&parent.nodes[0].payload_ref).unwrap();
+    let actions = fixture.services.agent_action_service();
+    let publish = |id: &str, recipients: Vec<String>| {
+        applied_ref(
+            fixture.services.as_ref(),
+            &fixture.envelope(
+                id,
+                AgentAction::MessagePublish(harness_contract::agent_action::MessagePublishInput {
+                    topic_ref: format!("topic:{}", fixture.root.program_id),
+                    summary: Some(id.into()),
+                    content_ref: None,
+                    refs: vec![fixture.task_ref.clone()],
+                    recipients,
+                    intent: None,
+                    issue_dispositions: vec![],
+                }),
+            ),
+        )
+    };
+    let mut transport = crate::agentic::topic_delivery::TopicTransport::default();
+    assert!(transport.issue(&actions, &packet).unwrap().is_none());
+    let first_ref = publish("first-peer-evidence", vec![fixture.author_ref.clone()]);
+    let first = transport.issue(&actions, &packet).unwrap().unwrap();
+    let id = first["delivery_id"].as_str().unwrap();
+    assert_eq!(
+        first["context"]["entries"][0]["read_request"]["input"]["entry_ref"],
+        first_ref
+    );
+    publish("second-peer-evidence", vec![fixture.author_ref.clone()]);
+    assert_eq!(
+        transport.issue(&actions, &packet).unwrap().unwrap(),
+        first,
+        "a new event cannot replace the unacknowledged page"
+    );
+    assert!(transport
+        .acknowledge(&actions, "topic-delivery:forged")
+        .is_err());
+    assert!(actions
+        .topic_observations(
+            &fixture.root.program_id,
+            &fixture.author_ref,
+            &packet.agentic_binding.as_ref().unwrap().team_id,
+            packet.graph_id(),
+            16,
+            48 * 1024
+        )
+        .unwrap()
+        .is_some());
+    transport.acknowledge(&actions, id).unwrap();
+    transport.acknowledge(&actions, id).unwrap();
+    let cursor_events = fixture
+        .services
+        .event_store()
+        .list_stream(&format!(
+            "agentic-topic-cursor:{}:{}",
+            fixture.root.program_id,
+            packet.graph_id()
+        ))
+        .unwrap();
+    assert_eq!(cursor_events.len(), 1);
+    assert_eq!(
+        cursor_events[0].payload["observation_kind"],
+        "worker_transport"
+    );
+
+    let second = transport.issue(&actions, &packet).unwrap().unwrap();
+    assert_eq!(second["context"]["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        second["context"]["entries"][0]["entry"]["summary"],
+        "second-peer-evidence"
+    );
+    transport
+        .acknowledge(&actions, second["delivery_id"].as_str().unwrap())
+        .unwrap();
+    publish("reviewer-private", vec![fixture.reviewer_ref.clone()]);
+    assert!(transport.issue(&actions, &packet).unwrap().is_none());
+    assert!(crate::agentic::topic_delivery::prepare(&actions, &packet)
+        .unwrap()
+        .is_none());
+    assert_eq!(ticket.graph_id, "topic-port-conversation");
+}
+
+#[derive(Clone)]
+struct TopicSafePointClient {
+    requests: Arc<Mutex<Vec<ApiRequest>>>,
+    services: Arc<crate::RuntimeServices>,
+    publication: AgentActionEnvelope,
+    fail_first: bool,
+}
+impl ApiClient for TopicSafePointClient {
+    fn stream(
+        &mut self,
+        request: ApiRequest,
+    ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+        let step = {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(request);
+            requests.len()
+        };
+        if self.fail_first || step >= 3 {
+            return Box::pin(stream::iter(vec![Err(RuntimeError::new(
+                "HTTP 402 Payment Required: safe-point test",
+            ))]));
+        }
+        if step == 1 {
+            assert_eq!(
+                self.services
+                    .agent_action_service()
+                    .apply(&self.publication)
+                    .unwrap()
+                    .status,
+                harness_contract::agent_action::AgentActionStatus::Applied
+            );
+        }
+        Box::pin(stream::iter(vec![
+            Ok(AssistantEvent::ToolUse {
+                id: format!("topic-read-{step}"),
+                name: "read_file".into(),
+                input: format!("{{\"path\":\"part-{step}.txt\"}}"),
+            }),
+            Ok(AssistantEvent::MessageStop),
+        ]))
+    }
+}
+struct TopicSafePointReader;
+#[async_trait::async_trait]
+impl ToolExecutor for TopicSafePointReader {
+    async fn execute_output(
+        &self,
+        name: &str,
+        _input: &str,
+    ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+        if name != "read_file" {
+            return Err(ToolError::new("unexpected tool"));
+        }
+        Ok(harness_contract::context::ToolOutputDraft::bounded_inline(
+            "fixture source evidence".to_string(),
+        ))
+    }
+    fn available_tool_names(&self) -> Vec<String> {
+        vec!["read_file".into()]
+    }
+}
+
+#[tokio::test]
+async fn actual_delegated_model_safe_point_receives_delta_and_only_success_acknowledges() {
+    for fail_first in [false, true] {
+        let fixture = protocol_fixture();
+        let parent_id = "topic-model-parent";
+        register_protocol_graph(
+            &fixture,
+            "execute",
+            &fixture.author_ref,
+            parent_id,
+            "topic-model-unused-conversation",
+            1,
+        );
+        let services = Arc::clone(&fixture.services);
+        let claim = fixture.agent_envelope(
+            "safe-point-claim",
+            &fixture.author_ref,
+            parent_id,
+            AgentAction::TaskClaim(harness_contract::agent_action::TaskClaimInput {
+                task_ref: fixture.task_ref.clone(),
+                reason: Some("inspect before work".into()),
+            }),
+        );
+        assert_eq!(
+            services
+                .agent_action_service()
+                .apply(&claim)
+                .unwrap()
+                .status,
+            harness_contract::agent_action::AgentActionStatus::Applied
+        );
+        services.publish_session_execution_policy(
+            &fixture.root.session_id,
+            crate::permissions::SessionExecutionPolicyControl::from_policy(
+                harness_contract::policy::SessionExecutionPolicy::from_profile(
+                    harness_contract::policy::AutonomyProfileId::Supervised,
+                    1,
+                    harness_contract::policy::SessionExecutionPolicyOrigin::SessionExplicit,
+                ),
+            ),
+        );
+        let spec = services
+            .task_runtime_port()
+            .bind_task_spec(
+                &fixture.root.session_id,
+                Some(harness_contract::policy::PermissionMode::ReadOnly),
+                harness_contract::task::TaskSpec::new(
+                    "Read the bounded source and preserve peer evidence",
+                ),
+            )
+            .unwrap();
+        services
+            .task_runtime_port()
+            .create(harness_contract::task::TaskCreateCommand {
+                task_id: fixture.task_ref.clone(),
+                mission_id: services.mission_runtime().default_mission_id().into(),
+                kind: harness_contract::task::TaskKind::Root,
+                origin: harness_contract::task::TaskOrigin::User,
+                origin_session_id: fixture.root.session_id.clone(),
+                origin_turn_id: fixture.root.turn_id.clone(),
+                root_task_id: fixture.task_ref.clone(),
+                parent_task_id: None,
+                predecessor_task_id: None,
+                mission_assignment: harness_contract::task::TaskMissionAssignment::Default,
+                mission_assigned_by: "topic-test".into(),
+                spec,
+                evidence_refs: vec![],
+            })
+            .unwrap();
+        let publication = fixture.envelope(
+            "live-peer-change",
+            AgentAction::MessagePublish(harness_contract::agent_action::MessagePublishInput {
+                topic_ref: format!("topic:{}", fixture.root.program_id),
+                summary: Some("peer-counterexample-arrived-at-tool-boundary".into()),
+                content_ref: None,
+                refs: vec![fixture.task_ref.clone()],
+                recipients: vec![fixture.author_ref.clone()],
+                intent: None,
+                issue_dispositions: vec![],
+            }),
+        );
+        if fail_first {
+            assert_eq!(
+                services
+                    .agent_action_service()
+                    .apply(&publication)
+                    .unwrap()
+                    .status,
+                harness_contract::agent_action::AgentActionStatus::Applied
+            );
+        }
+        let captured = Arc::new(Mutex::new(vec![]));
+        let mut session = Session::new();
+        session.session_id = fixture.root.session_id.clone();
+        let mut runtime = crate::ConversationRuntime::new(
+            session,
+            TopicSafePointClient {
+                requests: Arc::clone(&captured),
+                services: Arc::clone(&services),
+                publication,
+                fail_first,
+            },
+            TopicSafePointReader,
+            PermissionPolicy::new(crate::PermissionMode::ReadOnly),
+            canonical_host_system_prompt(vec![]),
+        )
+        .without_memory();
+        runtime.set_active_model("test-model");
+        runtime.set_context_profile(ContextProfile::SubAgent);
+        let parent = services.graph_state_store().load(parent_id).unwrap();
+        let lineage = parent.lineage.clone().unwrap();
+        let (_runtime, result) = submit_owned_conversation_turn_with_ingress(
+            runtime,
+            Arc::clone(&services),
+            "Read the bounded source and preserve peer evidence",
+            &SharedPrompter::none(),
+            None,
+            Some(ExecutionParentBinding {
+                execution_id: parent_id.into(),
+                node_id: parent.nodes[0].id.clone(),
+            }),
+            Some(lineage),
+            TurnExecutionRole::DelegatedLeaf,
+            0,
+            false,
+        )
+        .await;
+        if let Ok(summary) = &result {
+            assert_ne!(
+                summary.terminal_completion,
+                harness_contract::goal::GoalCompletion::Satisfied
+            );
+        }
+        let requests = captured.lock().unwrap();
+        let wanted = if fail_first { 0 } else { 1 };
+        assert!(
+            requests.len() > wanted,
+            "provider requests missing: {result:?}"
+        );
+        assert!(
+            format!("{:?}", requests[wanted].prompt.contextual_packets)
+                .contains("peer-counterexample-arrived-at-tool-boundary"),
+            "actual next request must contain peer delta"
+        );
+        let unread = services
+            .agent_action_service()
+            .topic_observations(
+                &fixture.root.program_id,
+                &fixture.author_ref,
+                &fixture.team_ref,
+                parent_id,
+                16,
+                48 * 1024,
+            )
+            .unwrap();
+        assert_eq!(
+            unread.is_some(),
+            fail_first,
+            "failed provider delivery must remain unread; selected success acknowledges"
+        );
+        let cursor_events = services
+            .event_store()
+            .list_stream(&format!(
+                "agentic-topic-cursor:{}:{parent_id}",
+                fixture.root.program_id
+            ))
+            .unwrap();
+        if fail_first {
+            assert!(cursor_events.is_empty());
+        } else {
+            assert_eq!(cursor_events.len(), 1);
+            assert_eq!(
+                cursor_events[0].payload["observation_kind"],
+                "provider_model"
+            );
+            assert!(requests.len() >= 3);
+            assert!(
+                !format!("{:?}", requests[2].prompt.contextual_packets)
+                    .contains("peer-counterexample-arrived-at-tool-boundary"),
+                "acknowledged peer page must not be reinjected at the next model safe point"
+            );
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RootClosureResearchClient {
+    requests: Arc<Mutex<Vec<ApiRequest>>>,
+    choices: Arc<Mutex<Vec<(bool, Option<String>)>>>,
+}
+impl ApiClient for RootClosureResearchClient {
+    fn configure_tool_choice(&mut self, required: bool, name: Option<String>) {
+        self.choices.lock().unwrap().push((required, name));
+    }
+    fn stream(
+        &mut self,
+        request: ApiRequest,
+    ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+        self.requests.lock().unwrap().push(request);
+        Box::pin(stream::iter(vec![Err(RuntimeError::new(
+            "HTTP 402 Payment Required: fixture unavailable after recording actual request",
+        ))]))
+    }
+}
+
+#[tokio::test]
+async fn accepted_root_work_does_not_force_a_terminal_tool_or_promote_its_checkpoint_to_system() {
+    let mut root = protocol_fixture().root;
+    root.session_id = "root-research-session".into();
+    root.turn_id = "turn-test".into();
+    root.objective_id =
+        harness_contract::agent_action::root_objective_id(&root.session_id, &root.turn_id);
+    root.program_id = harness_contract::agent_action::program_id_for_objective(&root.objective_id);
+    root.resource_scopes = vec![format!("session:{}", root.session_id)];
+    let fixture = protocol_fixture_for_root(root);
+    let actions = fixture.services.agent_action_service();
+    assert_eq!(
+        actions
+            .apply(&fixture.agent_envelope(
+                "root-check-claim",
+                &fixture.author_ref,
+                "root-check-author",
+                AgentAction::TaskClaim(TaskClaimInput {
+                    task_ref: fixture.task_ref.clone(),
+                    reason: None
+                })
+            ))
+            .unwrap()
+            .status,
+        AgentActionStatus::Applied
+    );
+    let (artifact, content) = commit_protocol_artifact(
+        &fixture,
+        "root-check-artifact",
+        &fixture.author_ref,
+        "root-check-author",
+        vec![fixture.task_ref.clone()],
+        "Evidence for the accepted task; new counterexamples still require research",
+    )
+    .await;
+    assert_eq!(
+        actions
+            .apply(&fixture.agent_envelope(
+                "root-check-submit",
+                &fixture.author_ref,
+                "root-check-author",
+                AgentAction::TaskSubmit(TaskSubmitInput {
+                    task_ref: fixture.task_ref.clone(),
+                    artifact_refs: vec![artifact],
+                    evidence_refs: vec![content.clone()],
+                    unresolved: vec![]
+                })
+            ))
+            .unwrap()
+            .status,
+        AgentActionStatus::Applied
+    );
+    assert_eq!(
+        actions
+            .apply(&fixture.agent_envelope(
+                "root-check-review",
+                &fixture.reviewer_ref,
+                "root-check-reviewer",
+                AgentAction::TaskReview(TaskReviewInput {
+                    task_ref: fixture.task_ref.clone(),
+                    decision: TaskReviewDecision::Accept,
+                    reason: "source supports this task".into(),
+                    evidence_refs: vec![content]
+                })
+            ))
+            .unwrap()
+            .status,
+        AgentActionStatus::Applied
+    );
+    let projection = actions.project(&fixture.root.program_id).unwrap();
+    assert!(matches!(
+        super::root_agentic_terminal_action(&projection),
+        Some(super::RootAgenticTerminalAction::RequestObjectiveCompletion { .. })
+    ));
+    let requests = Arc::new(Mutex::new(vec![]));
+    let choices = Arc::new(Mutex::new(vec![]));
+    let mut session = Session::new();
+    session.session_id = fixture.root.session_id.clone();
+    let mut runtime = crate::ConversationRuntime::new(
+        session,
+        RootClosureResearchClient {
+            requests: Arc::clone(&requests),
+            choices: Arc::clone(&choices),
+        },
+        TopicSafePointReader,
+        PermissionPolicy::new(PermissionMode::ReadOnly),
+        canonical_host_system_prompt(vec![]),
+    )
+    .without_memory();
+    runtime.set_active_model("test-model");
+    fixture
+        .services
+        .working_context_command(
+            &runtime.memory_turn_context(),
+            "root-working-pin",
+            crate::working_context::WorkingContextInput::Pin {
+                source: crate::working_context::WorkingSource::Artifact {
+                    content_ref: projection
+                        .artifacts
+                        .values()
+                        .next()
+                        .unwrap()
+                        .content_ref
+                        .clone(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let (_, result) = submit_test_owned_conversation_turn(
+        runtime,
+        Arc::clone(&fixture.services),
+        "Inspect new counterevidence before deciding whether the original objective is complete",
+        &SharedPrompter::none(),
+        test_execution_lineage(),
+    )
+    .await;
+    let captured = requests.lock().unwrap();
+    assert!(
+        !captured.is_empty(),
+        "missing real root request: {result:?}"
+    );
+    assert!(captured[0]
+        .prompt
+        .contextual_packets
+        .iter()
+        .any(|p| p.content.contains("agentic_program_checkpoint")));
+    assert!(!captured[0]
+        .prompt
+        .trusted_system
+        .iter()
+        .any(|p| p.contains("agentic_program_checkpoint")));
+    assert!(captured[0].prompt.contextual_packets.iter().any(|p| p
+        .content
+        .contains("runtime.working_context")
+        && p.content
+            .contains("new counterexamples still require research")));
+    let choices = choices.lock().unwrap();
+    assert!(!choices.is_empty());
+    assert!(
+        choices
+            .iter()
+            .all(|(required, name)| !required && name.is_none()),
+        "root must retain research and disposition choices: {choices:?}"
+    );
 }

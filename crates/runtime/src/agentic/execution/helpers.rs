@@ -50,6 +50,7 @@ pub(super) fn attach_agentic_display(
 pub(super) enum DispatchMode {
     Execute,
     Review,
+    Coordination(u64),
 }
 
 impl DispatchMode {
@@ -57,6 +58,28 @@ impl DispatchMode {
         match self {
             Self::Execute => "execute",
             Self::Review => "review",
+            Self::Coordination(_) => "coordination",
+        }
+    }
+
+    pub(super) const fn attempt_mode(self) -> harness_contract::agent_action::AgentAttemptMode {
+        use harness_contract::agent_action::AgentAttemptMode;
+        match self {
+            Self::Execute => AgentAttemptMode::Execute,
+            Self::Review => AgentAttemptMode::Review,
+            Self::Coordination(_) => AgentAttemptMode::Coordination,
+        }
+    }
+
+    pub(super) fn team_id<'a>(
+        self,
+        projection: &'a AgenticProgramProjection,
+        agent_id: &str,
+        task: &AgenticTaskProjection,
+    ) -> Option<&'a str> {
+        match self {
+            Self::Coordination(revision) => projection.coordination_team_id_for(agent_id, revision),
+            _ => projection.dispatch_team_id_for(agent_id, task, self == Self::Review),
         }
     }
 }
@@ -65,6 +88,30 @@ pub(super) fn task_is_ready(projection: &AgenticProgramProjection, task_ref: &st
     projection.tasks.get(task_ref).is_some_and(|task| {
         task_ready_for_execution(task, now_ms()) && dependencies_accepted(projection, task)
     })
+}
+
+pub(super) fn coordination_requests(
+    projection: &AgenticProgramProjection,
+) -> Vec<(String, DispatchMode)> {
+    projection
+        .coordination_requests()
+        .into_iter()
+        .filter(|(_, entry)| {
+            projection.coordination_request_current(entry)
+                && entry
+                    .coordination
+                    .as_ref()
+                    .is_none_or(|consumption| !consumption.settled)
+        })
+        .filter_map(|(_, entry)| {
+            entry.intent.as_ref().map(|intent| {
+                (
+                    intent.task_ref.clone(),
+                    DispatchMode::Coordination(entry.revision),
+                )
+            })
+        })
+        .collect()
 }
 
 pub(super) fn task_ready_for_execution(task: &AgenticTaskProjection, observed_at_ms: u64) -> bool {
@@ -95,12 +142,23 @@ pub(super) fn eligible_members<'a>(
         .agents
         .values()
         .filter(|member| match mode {
+            DispatchMode::Coordination(revision) => projection
+                .coordination_team_id_for(&member.agent_id, revision)
+                .is_some(),
             // Team membership is the semantic eligibility boundary. Model
             // capability labels express expertise and ranking hints, not a
             // trusted physical grant or an exact-string scheduling fence.
             // Concrete effect capabilities and ToolHost availability are
             // resolved later by Runtime admission for the selected member.
-            DispatchMode::Execute => projection.agent_is_active_in(&member.agent_id, &task.team_id),
+            DispatchMode::Execute => {
+                projection.agent_is_active_in(&member.agent_id, &task.team_id)
+                    && !projection.declined_task_opportunity(
+                        &task.task_id,
+                        &member.agent_id,
+                        Some(task.claim_generation),
+                        None,
+                    )
+            }
             DispatchMode::Review => {
                 task.claimant.as_deref() != Some(member.agent_id.as_str())
                     && projection
@@ -116,7 +174,7 @@ pub(super) fn member_dispatch_rank(
     member: &AgentMemberProjection,
     task: &AgenticTaskProjection,
     mode: DispatchMode,
-) -> (u8, usize, Reverse<usize>, String) {
+) -> (u8, u8, usize, Reverse<usize>, String) {
     // Independence is a semantic topology fact; role labels are presentation
     // authored by the model and must never act as a hidden scheduler policy.
     let preferred_reviewer = mode == DispatchMode::Review
@@ -127,8 +185,12 @@ pub(super) fn member_dispatch_rank(
         .tasks
         .values()
         .filter(|candidate| {
-            candidate.status == AgenticTaskStatus::Claimed
-                && candidate.claimant.as_deref() == Some(member.agent_id.as_str())
+            candidate
+                .active_attempts
+                .values()
+                .any(|attempt| attempt.agent_id == member.agent_id)
+                || (candidate.status == AgenticTaskStatus::Claimed
+                    && candidate.claimant.as_deref() == Some(member.agent_id.as_str()))
         })
         .count();
     let member_terms = semantic_terms(&format!(
@@ -150,6 +212,12 @@ pub(super) fn member_dispatch_rank(
     );
     (
         (!preferred_reviewer) as u8,
+        (!(mode == DispatchMode::Execute
+            && projection.offered_task_opportunity(
+                &task.task_id,
+                &member.agent_id,
+                task.claim_generation,
+            ))) as u8,
         active_execution_load,
         Reverse(semantic_relevance),
         format!("{digest:x}"),
@@ -179,11 +247,18 @@ pub(super) fn task_objective(
     member: &AgentMemberProjection,
     mode: DispatchMode,
 ) -> String {
+    if let DispatchMode::Coordination(revision) = mode {
+        let Some((topic, entry)) = projection.coordination_wake(revision) else {
+            return String::new();
+        };
+        return format!("You are coordination Agent `{}`. A member requested help on Task `{}`. Inspect the authorized request below and its referenced evidence, then contribute a useful answer, challenge, or actionable proposal through message_publish on `{}`. Include `{}` in refs so the requester can trace your response. Respect the original execution owner: do not task_claim or task_review from this coordination run. You may propose work, publish an Offer for another task, or invite collaborators within your authorized scope; actual execution requires a new bound run. Do not invent replies or evidence. Your durable response, not final prose, closes this opportunity. No fixed debate rounds are required.\n\nRequest: {}", member.agent_id, task.task_id, topic, entry.entry_id, serde_json::json!(entry));
+    }
     let topic_ref = projection.teams.get(&task.team_id).map_or_else(
         || format!("topic:{}", task.team_id),
         |team| team.topic_ref.clone(),
     );
-    match mode {
+    let mut objective = match mode {
+        DispatchMode::Coordination(_) => unreachable!("coordination objective handled above"),
         DispatchMode::Execute => format!(
             "You are Agent `{}` in Team `{}`. Role: {}. Mission: {}.\n\nWork item `{}`: {}\nObjective: {}\nAcceptance: {}\n\nFirst call state_inspect and inspect the current Program truth. If this work fits your role and capabilities, actively call task_claim for this exact task before doing substantive work; Runtime binds that claim to your immutable Agent identity and physical execution. If it is unsuitable or already owned, do not claim or submit it: explain the mismatch concisely and let the Team reassign or replan. After a successful claim, use workspace_snapshot to identify actual repository roots and document entries before searching files; follow returned continuation requests and never infer absence from a partial scan. Then act autonomously: choose and use the most effective available tools, and publish useful findings to topic:{} when collaboration benefits. Produce long-form work in a workspace file, use read_file to obtain its exact sha256 and artifact_publish to publish it, then call artifact_commit with the returned content_ref. For ordinary response text, explicitly select the intended zero-based Text block using content_ref=current_message_block:<index>; Runtime automatically binds the artifact to this claimed Task, while relates_to is only for additional semantic relations. Finally call task_submit: pass the collaboration `artifact:...` value returned in artifact_commit.changed_refs as artifact_refs, and pass real durable source/test/tool receipts as evidence_refs. Runtime automatically binds the artifact's content; do not copy its internal artifact:// content_ref into evidence_refs. Retain material uncertainty in task_submit.unresolved; distinguish measured facts from assumptions and estimates, and use Topic references for challenges and responses. Never submit before claiming, and never claim completion only in prose.",
             member.agent_id,
@@ -200,7 +275,19 @@ pub(super) fn task_objective(
             "You are independent reviewer `{}`. Review submitted work item `{}` against: {}. First call state_inspect for the Task, retrieve and inspect its submitted artifact content, and check the supporting evidence. Do not redo the author’s work and do not self-review. Use task_review with accept only when the evidence supports the acceptance criterion; otherwise challenge or request rework with a concrete reason. Cite the real durable inspection/source/test receipts in evidence_refs; Runtime already binds the Task's artifact set, so do not echo internal artifact storage selectors merely to satisfy a join. Your durable review action, not prose, is the verdict. Program: {}.",
             member.agent_id, task.task_id, task.acceptance, projection.program_id,
         ),
-    }
+    };
+    objective.push_str(&format!(
+        "\n\nCurrent work directory: {}. This directory describes existing work, not evidence of its correctness. Inspect the exact Task and follow its artifact/evidence read requests before repeating prior work. Add only the contribution required by this Task objective and acceptance; reuse cited common background instead of restating or regenerating it. There is one result owner for each Task. Other members may contribute evidence, challenges and responses through authorized Topics without taking a second claim. You may propose narrower tasks or invite collaborators within your active memberships; preserve existing accepted results and source references when replanning.",
+        serde_json::json!({
+            "task_ref":task.task_id,
+            "artifact_count":task.artifact_refs.len(),
+            "evidence_count":task.evidence_refs.len(),
+            "unresolved_count":task.unresolved.len(),
+            "dependency_count":task.depends_on.len(),
+            "read_request":{"name":"state_inspect","input":{"scope_ref":task.task_id}}
+        })
+    ));
+    objective
 }
 
 pub(super) fn entity_ref_for_action(envelope: &AgentActionEnvelope) -> Option<String> {

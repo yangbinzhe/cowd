@@ -21,7 +21,7 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
     fn execute<'a>(
         &'a self,
         task: &'a crate::GovernedToolPlanTask,
-        admission: &'a mut Self::Admission,
+        _admission: &'a mut Self::Admission,
     ) -> crate::GovernedToolFuture<'a, Result<Self::Output, String>> {
         Box::pin(async move {
             let call = self.calls.get(task.original_call_index).ok_or_else(|| {
@@ -62,29 +62,52 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
                 self.idempotency_keys
                     .and_then(|keys| keys.get(task.tool_call_id.as_str())),
             );
-            let (execution, retained_admission) = self
-                .execution_plane
-                .execute_async_classified_retained(
-                    &task.resource_demand,
-                    Some(std::time::Duration::from_secs(
-                        task.safety_category.default_timeout_secs(),
-                    )),
-                    self.ticket.service_class,
-                    Some(self.ticket.service_class),
-                    Some(self.session_id),
-                    async move {
-                        execute_fenced_runtime_tool(
-                            host.as_ref(),
-                            &commit_service,
-                            &request,
-                            effect.as_ref(),
-                        )
-                        .await
-                    },
+            let plane = Arc::clone(self.execution_plane);
+            let demand = task.resource_demand.clone();
+            let service_class = self.ticket.service_class;
+            let timeout_secs = task.safety_category.default_timeout_secs();
+            let session_id = self.session_id.to_string();
+            let node_id = self.ticket.node_id.clone();
+            use sha2::Digest;
+            let invocation_id = format!(
+                "leaf:{:x}",
+                sha2::Sha256::digest(
+                    serde_json::to_vec(&request).map_err(|error| error.to_string())?
                 )
-                .await;
-            *admission = retained_admission;
-            execution.map_err(|error| error.to_string())
+            );
+            self.physical_owner
+                .execute_physical_tool(
+                    self.ticket,
+                    &invocation_id,
+                    Box::pin(async move {
+                        let (execution, admission) = plane
+                            .execute_async_classified_retained(
+                                &demand,
+                                Some(std::time::Duration::from_secs(timeout_secs)),
+                                service_class,
+                                Some(service_class),
+                                Some(&session_id),
+                                async move {
+                                    execute_fenced_runtime_tool(
+                                        host.as_ref(),
+                                        &commit_service,
+                                        &request,
+                                        effect.as_ref(),
+                                    )
+                                    .await
+                                },
+                            )
+                            .await;
+                        // Both reads and writes have durable leaf receipts now.
+                        drop(admission);
+                        execution.map_err(|error| NodeExecutorError::Poll {
+                            node_id,
+                            reason: error.to_string(),
+                        })
+                    }),
+                )
+                .await
+                .map_err(|error| error.to_string())
         })
     }
 
@@ -184,35 +207,8 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
                     host_tool_terminal_reason(terminal),
                 ),
             };
-            if self
-                .prepared_invocations
-                .get(&call.id)
-                .is_some_and(|invocation| {
-                    invocation.effect.effect_kind == harness_contract::tool::ToolEffectKind::Read
-                })
-            {
-                let request = bound_runtime_tool_request(
-                    call,
-                    task,
-                    self.plan_id,
-                    self.plan_revision,
-                    self.observation_wave_sequence,
-                    self.session_id,
-                    self.sandbox_posture,
-                    self.policy_revision,
-                    self.memory_context,
-                    self.reality_context,
-                    self.model_lease,
-                    self.ticket,
-                    self.execution_decision,
-                    self.tool_authorizations.get(&call.id).cloned(),
-                    self.idempotency_keys
-                        .and_then(|keys| keys.get(call.id.as_str())),
-                );
-                self.commit_service
-                    .commit_readonly_tool_receipts(&[(request, outcome.clone())])
-                    .map_err(|error| error.to_string())?;
-            }
+            // Executed leaf receipts were committed while their physical
+            // owner still held admission, including the early-model path.
             Ok(outcome)
         })
     }
@@ -342,6 +338,7 @@ pub(super) async fn execute_governed_runtime_tool_batch(
     compilation: Result<crate::GovernedToolCompilation, crate::GovernedToolCompileError>,
     decision: &crate::execution_core::RuntimeExecutionDecision,
     execution_plane: &Arc<crate::ToolExecutionPlane>,
+    physical_owner: &Arc<crate::execution_core::graph::executors::ScopedNodeExecutor>,
     commit_service: &crate::execution_core::graph::ExecutionCommitService,
     precompleted: &BTreeMap<String, crate::conversation::EarlyToolExecutionReceipt>,
 ) -> GovernedToolBatchResult {
@@ -466,6 +463,7 @@ pub(super) async fn execute_governed_runtime_tool_batch(
         plan_revision: plan.revision,
         observation_wave_sequence,
         execution_plane,
+        physical_owner,
         commit_service,
         precompleted: Some(precompleted),
         idempotency_keys: None,

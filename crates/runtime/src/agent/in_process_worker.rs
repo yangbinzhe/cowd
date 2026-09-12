@@ -18,9 +18,7 @@ use crate::{
 use crate::agent_model_selector::AgentModelSelection;
 use crate::agent_run_handle::{AgentBackendCapabilities, AgentBackendKind, AgentRunHandle};
 use crate::agent_runtime::AgentRuntimeBackend;
-use crate::execution_core::graph::{
-    ScopeLockManager, ScopeLockMode, ScopeLockRequest, ScopedResource,
-};
+use crate::execution_core::graph::ScopeLockManager;
 
 #[path = "in_process/stages.rs"]
 mod stages;
@@ -57,9 +55,16 @@ pub(crate) use evidence_collector::{
 /// receives a raw ToolHost capability and therefore cannot mint evidence or
 /// change receipts in its terminal JSON.
 pub(crate) struct ProcessJsonlToolSession {
+    services: Arc<RuntimeServices>,
     executor: Arc<ScopedRuntimeToolExecutor>,
     artifact_store: Arc<crate::ArtifactStore>,
     external_model_profile: String,
+    topic_actions: crate::AgentActionService,
+    topic_packet: AgentTaskPacket,
+    topic_transport: Mutex<crate::agentic::topic_delivery::TopicTransport>,
+    permission_policy: PermissionPolicy,
+    authorization_negotiator: crate::AuthorizationNegotiator,
+    event_store: Arc<crate::RuntimeEventStore>,
 }
 
 impl ProcessJsonlToolSession {
@@ -111,7 +116,9 @@ impl ProcessJsonlToolSession {
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
-        let bounded_resource_lease = packet.team_id().is_some() || packet.agentic_binding.is_some();
+        let bounded_resource_lease = packet.team_id().is_some()
+            || packet.agentic_binding.is_some()
+            || binding.evaluation.is_some();
         let requested_tool_names = packet_allowed_tools.iter().cloned().collect::<Vec<_>>();
         let allowed_tools = host
             .delegated_tool_definitions(&requested_tool_names)
@@ -147,8 +154,8 @@ impl ProcessJsonlToolSession {
         .with_task_id(Some(binding.data_lease.task_id.clone()))
         .with_team_id(binding.data_lease.team_id.clone())
         .with_cognitive_read_scopes(binding.data_lease.read_scopes.clone());
-        let session_policy = services
-            .session_execution_policy_control(packet.session_id())
+        let live_control = services.session_execution_policy_control(packet.session_id());
+        let session_policy = live_control
             .as_ref()
             .map(crate::permissions::SessionExecutionPolicyControl::snapshot)
             .ok_or_else(|| {
@@ -194,8 +201,15 @@ impl ProcessJsonlToolSession {
             })
             .cloned()
             .collect();
+        let process_permission_policy = permission_policy(
+            live_control.clone(),
+            packet.permission_ceiling,
+            &allowed_tools,
+        );
         Ok(Self {
+            services: Arc::clone(services),
             executor: Arc::new(ScopedRuntimeToolExecutor {
+                tool_batch: Some(crate::execution_core::graph::executors::agent_tool::AgentToolBatchDispatcher::new(services, packet)),
                 host,
                 allowed_tools,
                 session_id: packet.session_id().to_string(),
@@ -219,18 +233,254 @@ impl ProcessJsonlToolSession {
             }),
             artifact_store: Arc::clone(services.artifact_store()),
             external_model_profile: selection.model.clone(),
+            topic_actions: services.agent_action_service(),
+            topic_packet: packet.clone(),
+            topic_transport: Mutex::new(Default::default()),
+            permission_policy: process_permission_policy,
+            authorization_negotiator: crate::AuthorizationNegotiator::new(),
+            event_store: Arc::clone(services.event_store()),
         })
+    }
+
+    pub(crate) fn working_context_delta(
+        &self,
+        handle: &tokio::runtime::Handle,
+    ) -> Result<Option<serde_json::Value>, String> {
+        self.validate_current_policy()?;
+        let window = handle.block_on(
+            self.services
+                .working_context_window(&self.executor.memory_context),
+        )?;
+        Ok((window["coverage"]["active_references"].as_u64() != Some(0)).then_some(window))
+    }
+
+    pub(crate) fn topic_delta(&self) -> Result<Option<serde_json::Value>, String> {
+        self.topic_transport
+            .lock()
+            .map_err(|_| "Topic transport lock poisoned".to_string())?
+            .issue(&self.topic_actions, &self.topic_packet)
+    }
+
+    pub(crate) fn acknowledge_topic_delta(&self, delivery_id: &str) -> Result<(), String> {
+        self.topic_transport
+            .lock()
+            .map_err(|_| "Topic transport lock poisoned".to_string())?
+            .acknowledge(&self.topic_actions, delivery_id)
+    }
+
+    pub(crate) fn validate_current_policy(&self) -> Result<(), String> {
+        let snapshot = self.permission_policy.execution_policy_control().snapshot();
+        if snapshot.revision != self.executor.policy_revision {
+            return Err(
+                "ProcessJsonl packet policy revision is stale; reauthorize before continuing"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 
     pub(crate) async fn execute_tool(
         &self,
+        request_id: &str,
         tool_name: &str,
         input: &str,
     ) -> Result<String, String> {
+        self.validate_current_policy()?;
+        if tool_name == "checkpoint_create" {
+            return Err("checkpoint_create is Runtime-internal".into());
+        }
+        if tool_name == "tool_search" {
+            return self
+                .executor
+                .execute_output(tool_name, input)
+                .await
+                .map(|output| output.model_text().to_string())
+                .map_err(|e| e.to_string());
+        }
+        let value = serde_json::from_str(input)
+            .map_err(|e| format!("invalid ProcessJsonl tool input: {e}"))?;
+        let effect = self
+            .executor
+            .registered_tool_effect(tool_name, &value)
+            .ok_or_else(|| {
+                format!("tool `{tool_name}` is outside the admitted Agent tool contracts")
+            })?;
+        let snapshot = self.permission_policy.execution_policy_control().snapshot();
+        let policy = self.permission_policy.bound_to_snapshot(&snapshot);
+        let authorization_id = format!(
+            "process-tool:{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&(
+                    &self.executor.execution_id,
+                    self.executor.attempt,
+                    request_id
+                ))
+                .map_err(|e| e.to_string())?
+            )
+        );
+        let evaluated = self.authorization_negotiator.assess_effective(
+            &policy,
+            &crate::AuthorizationRequest {
+                principal_id: format!("agent:{}", self.topic_packet.agent_id()),
+                capability: tool_name.into(),
+                input: input.into(),
+                idempotency_key: authorization_id.clone(),
+                effect,
+                parent_ceiling: self.topic_packet.permission_ceiling,
+                parent_lease_id: None,
+                policy_revision: snapshot.revision,
+                recovery_scope: format!("execution:{}", self.executor.execution_id),
+                context: crate::PermissionContext::default(),
+                safe_alternatives: vec![],
+            },
+        );
+        let _ = self
+            .authorization_negotiator
+            .take_transitions_for_persistence();
+        for transition in self
+            .authorization_negotiator
+            .transitions_awaiting_persistence()
+        {
+            crate::authorization_negotiator::persist_authorization_transition(
+                &self.event_store,
+                &format!("authorization-lease:{}", transition.lease.lease_id),
+                "runtime.process_jsonl",
+                &transition,
+            )?;
+            self.authorization_negotiator
+                .acknowledge_persisted_transitions(std::slice::from_ref(&transition.transition_id));
+        }
+        let lease = evaluated.assessment.lease.clone().ok_or_else(|| {
+            evaluated.assessment.gap.as_ref().map_or_else(
+                || "ProcessJsonl tool authorization unavailable".to_string(),
+                |gap| format!("ProcessJsonl tool authorization denied: {}", gap.reason),
+            )
+        })?;
+        let decision = crate::ToolPolicy
+            .authorize(
+                &evaluated.effective,
+                &evaluated.assessment,
+                authorization_id.clone(),
+                lease,
+                60,
+            )
+            .map_err(|e| e.to_string())?;
         self.executor
-            .execute_scoped(tool_name, input, None, None)
+            .execute_authorized_invocation_output(
+                &authorization_id,
+                &decision.authorization,
+                tool_name,
+                input,
+            )
             .await
+            .map(|output| output.model_text().to_string())
             .map_err(|error| error.to_string())
+    }
+
+    fn transport_request_identity(&self, request_id: &str) -> (String, String) {
+        let packet = &self.topic_packet;
+        let scope = serde_json::json!([
+            packet.session_id(),
+            packet.graph_id(),
+            packet.node_id(),
+            packet.run_id(),
+            packet.agent_id(),
+            self.executor.attempt,
+            packet
+                .binding
+                .as_ref()
+                .map(|binding| binding.binding_digest.as_str())
+        ]);
+        (
+            format!(
+                "agent-process-transport:{:x}",
+                Sha256::digest(scope.to_string().as_bytes())
+            ),
+            format!("{:x}", Sha256::digest(request_id.as_bytes())),
+        )
+    }
+
+    /// Protocol replay metadata only. Physical effect and acceptance authority
+    /// remains with the original ToolHost invocation and Session receipts.
+    pub(crate) fn replay_or_begin_transport_request(
+        &self,
+        request_id: &str,
+        fingerprint: &str,
+    ) -> Result<Option<serde_json::Value>, String> {
+        self.validate_current_policy()?;
+        if request_id.trim().is_empty() {
+            return Err("ProcessJsonl request_id must not be empty".into());
+        }
+        let (stream, key) = self.transport_request_identity(request_id);
+        for stage in ["completed", "started"] {
+            if let Some(record) = self
+                .event_store
+                .event_by_idempotency_key(&stream, &format!("{stage}:{key}"))
+                .map_err(|error| error.to_string())?
+            {
+                if record.payload["fingerprint"].as_str() != Some(fingerprint)
+                    || record.payload["request_id"].as_str() != Some(request_id)
+                {
+                    return Err(
+                        "ProcessJsonl request_id was reused for a different tool invocation".into(),
+                    );
+                }
+                if stage == "completed" {
+                    let response = record
+                        .payload
+                        .get("response")
+                        .filter(|response| response.is_object())
+                        .cloned()
+                        .ok_or("ProcessJsonl durable transport response is corrupt")?;
+                    return Ok(Some(response));
+                }
+                return Err("ProcessJsonl prior request has unresolved transport completion; reconcile its recorded effects before retrying, do not blindly repeat the tool".into());
+            }
+        }
+        if self.record_transport_request("started", request_id, fingerprint, None)? {
+            return Err("ProcessJsonl prior request has unresolved transport completion; another reader already owns this request, reconcile its recorded effects before retrying".into());
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn complete_transport_request(
+        &self,
+        request_id: &str,
+        fingerprint: &str,
+        response: &serde_json::Value,
+    ) -> Result<(), String> {
+        self.record_transport_request("completed", request_id, fingerprint, Some(response))
+            .map(|_| ())
+    }
+
+    fn record_transport_request(
+        &self,
+        stage: &str,
+        request_id: &str,
+        fingerprint: &str,
+        response: Option<&serde_json::Value>,
+    ) -> Result<bool, String> {
+        let (stream, key) = self.transport_request_identity(request_id);
+        let head = self
+            .event_store
+            .stream_revision(&stream)
+            .map_err(|error| error.to_string())?;
+        self.event_store.append_transaction(crate::AppendTransactionRequest {
+            transaction_id: format!("{stream}:{stage}:{key}"),
+            expected_streams: vec![crate::ExpectedStreamRevision {stream_id: stream.clone(), expected_revision: head}],
+            events: vec![crate::RuntimeTransactionEventInput {
+                event: crate::RuntimeEventInput {
+                    stream_id: stream, scope: crate::RuntimeEventScope::Agent,
+                    kind: format!("agent.process_request_{stage}"), status: Some(stage.into()),
+                    actor: Some(self.topic_packet.agent_id().into()),
+                    refs: vec![crate::RuntimeEventRef {kind:"agent_run".into(), id:self.topic_packet.run_id().into()},
+                        crate::RuntimeEventRef {kind:"session".into(), id:self.topic_packet.session_id().into()},
+                        crate::RuntimeEventRef {kind:"execution_graph".into(), id:self.topic_packet.graph_id().into()}],
+                    payload: serde_json::json!({"request_id":request_id,"fingerprint":fingerprint,
+                        "response":response,"authority":"transport_replay_only"}),
+                }, idempotency_key: Some(format!("{stage}:{key}")), schema_version: 1,
+            }],
+        }).map(|receipt| receipt.duplicate).map_err(|error| error.to_string())
     }
 
     pub(crate) fn artifact_store(&self) -> &Arc<crate::ArtifactStore> {

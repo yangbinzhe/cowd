@@ -5,8 +5,7 @@ use harness_contract::agent_action::{
     TaskSubmitInput, TaskSupersedeInput, TeamCreateInput,
 };
 use harness_contract::goal::{
-    AcceptanceCriterion, AcceptanceStatus, GoalCompletion, GoalContract,
-    ObjectiveEvidenceRequirement, ObjectiveObligation, ObjectiveObligationState, ObjectiveTerminal,
+    AcceptanceCriterion, AcceptanceStatus, GoalCompletion, GoalContract, ObjectiveTerminal,
     ObjectiveTerminalKind,
 };
 
@@ -76,6 +75,571 @@ fn supervisor(action_id: &str, execution_id: &str, action: AgentAction) -> Agent
 }
 
 #[test]
+fn typed_decline_settles_only_its_opportunity_and_survives_cold_replay() {
+    use harness_contract::agent_action::{AgentAttemptMode, TaskAttemptDispatchInput};
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = AgentActionService::new(store.clone());
+    let team = service
+        .apply(&root(
+            "decline-team",
+            AgentAction::TeamCreate(TeamCreateInput {
+                name: "Readers".into(),
+                mission: "inspect evidence".into(),
+                objective: None,
+            }),
+        ))
+        .unwrap()
+        .changed_refs[0]
+        .clone();
+    let mut agents = Vec::new();
+    for index in 0..2 {
+        agents.push(service.apply(&root(&format!("decline-agent-{index}"), AgentAction::AgentInvite(
+            serde_json::from_value(json!({"team_ref":team,"role":"Reader","mission":"read evidence","required_capabilities":["read"]})).unwrap()
+        ))).unwrap().changed_refs[0].clone());
+    }
+    let task = service.apply(&root("decline-task", AgentAction::TaskPublish(
+        serde_json::from_value(json!({"team_ref":team,"title":"Evidence","objective":"read evidence","acceptance":"cited evidence","required_capabilities":["read"]})).unwrap()
+    ))).unwrap().changed_refs[0].clone();
+    let dispatch = |agent: &str, execution: &str, generation| {
+        supervisor(
+            &format!("dispatch:{execution}"),
+            execution,
+            AgentAction::TaskAttemptDispatch(TaskAttemptDispatchInput {
+                task_ref: task.clone(),
+                execution_id: execution.into(),
+                agent_ref: agent.into(),
+                membership_id: AgenticProgramProjection::membership_id(agent, &team),
+                mode: AgentAttemptMode::Execute,
+                generation,
+            }),
+        )
+    };
+    let execution = format!("execution:{}", agents[0]);
+    assert_eq!(
+        service
+            .apply(&dispatch(&agents[0], &execution, 0))
+            .unwrap()
+            .status,
+        AgentActionStatus::Applied
+    );
+    let message = AgentAction::MessagePublish(
+        serde_json::from_value(json!({
+            "topic_ref":format!("topic:program-1"), "summary":"This task needs different expertise",
+            "intent":{"task_ref":task,"kind":"decline"}
+        }))
+        .unwrap(),
+    );
+    let decline = managed("decline", &team, &agents[0], message.clone());
+    for invalid in [
+        root("forged-decline", message.clone()),
+        managed("other-decline", &team, &agents[1], message.clone()),
+    ] {
+        assert_eq!(
+            service.apply(&invalid).unwrap().status,
+            AgentActionStatus::Rejected
+        );
+    }
+    // Prose is discussion only; it cannot consume the admitted opportunity.
+    let prose = managed(
+        "prose",
+        &team,
+        &agents[0],
+        AgentAction::MessagePublish(
+            serde_json::from_value(json!({
+                "topic_ref":"topic:program-1", "summary":"DECLINE: narrative only", "refs":[task]
+            }))
+            .unwrap(),
+        ),
+    );
+    assert_eq!(
+        service.apply(&prose).unwrap().status,
+        AgentActionStatus::Applied
+    );
+    assert_eq!(
+        service.project("program-1").unwrap().tasks[&task]
+            .active_attempts
+            .len(),
+        1
+    );
+    let applied = service.apply(&decline).unwrap();
+    assert_eq!(applied.status, AgentActionStatus::Applied);
+    let projection = service.project("program-1").unwrap();
+    let work = &projection.tasks[&task];
+    assert_eq!(work.status, AgenticTaskStatus::Published);
+    assert_eq!(work.failed_attempts, 0);
+    assert_eq!(work.claim_generation, 0);
+    assert!(work.active_attempts.is_empty());
+    let entry = projection.topics["topic:program-1"].last().unwrap();
+    assert_eq!(
+        entry.source_execution_id.as_deref(),
+        Some(execution.as_str())
+    );
+    assert_eq!(entry.intent_generation, Some(0));
+    let recovered = AgentActionService::new(store);
+    assert_eq!(recovered.project("program-1").unwrap(), projection);
+    assert!(recovered.apply(&decline).unwrap().duplicate);
+    let claim = |id: &str, agent: &str| {
+        managed(
+            id,
+            &team,
+            agent,
+            AgentAction::TaskClaim(TaskClaimInput {
+                task_ref: task.clone(),
+                reason: Some("I can perform this work".into()),
+            }),
+        )
+    };
+    assert_eq!(
+        recovered
+            .apply(&claim("late-claim", &agents[0]))
+            .unwrap()
+            .error
+            .unwrap()
+            .code,
+        "task_opportunity_declined"
+    );
+    assert_eq!(
+        recovered
+            .apply(&dispatch(&agents[0], "fresh-execution-same-generation", 0))
+            .unwrap()
+            .error
+            .unwrap()
+            .code,
+        "task_opportunity_declined"
+    );
+    assert_eq!(
+        recovered
+            .apply(&dispatch(&agents[1], "stale-generation", 7))
+            .unwrap()
+            .error
+            .unwrap()
+            .code,
+        "attempt_generation_stale"
+    );
+    let second_execution = format!("execution:{}", agents[1]);
+    assert_eq!(
+        recovered
+            .apply(&dispatch(&agents[1], &second_execution, 0))
+            .unwrap()
+            .status,
+        AgentActionStatus::Applied
+    );
+    assert_eq!(
+        recovered
+            .apply(&claim("successor-claim", &agents[1]))
+            .unwrap()
+            .status,
+        AgentActionStatus::Applied
+    );
+    let before_late = recovered.project("program-1").unwrap();
+    let mut late = decline.clone();
+    late.action_id = "late-decline".into();
+    assert_eq!(
+        recovered.apply(&late).unwrap().status,
+        AgentActionStatus::Rejected
+    );
+    assert_eq!(
+        recovered
+            .apply(&managed("claimed-decline", &team, &agents[1], message))
+            .unwrap()
+            .status,
+        AgentActionStatus::Rejected
+    );
+    assert_eq!(recovered.project("program-1").unwrap(), before_late);
+    // Even after the task's claim generation advances, the old physical run
+    // remains fenced; a new opportunity must be a different authenticated run.
+    let mut stale_outbox = before_late.clone();
+    let mut old_attempt = stale_outbox.tasks[&task].active_attempts[&second_execution].clone();
+    old_attempt.execution_id = execution.clone();
+    old_attempt.agent_id = agents[0].clone();
+    stale_outbox
+        .tasks
+        .get_mut(&task)
+        .unwrap()
+        .active_attempts
+        .insert(execution.clone(), old_attempt);
+    let late_failure = supervisor(
+        "late-failure",
+        &execution,
+        AgentAction::TaskAttemptFail(TaskAttemptFailInput {
+            task_ref: task.clone(),
+            execution_id: execution.clone(),
+            mode: AgentAttemptMode::Execute,
+            reason: "old physical failure".into(),
+            retryable: true,
+        }),
+    );
+    assert_eq!(
+        validate_transition(&stale_outbox, &late_failure, now_ms(), None)
+            .unwrap()
+            .0,
+        "task_claim_fence_mismatch"
+    );
+    let mut later = before_late;
+    later.tasks.get_mut(&task).unwrap().status = AgenticTaskStatus::Rework;
+    assert_eq!(
+        validate_transition(&later, &claim("later-old-run", &agents[0]), now_ms(), None)
+            .unwrap()
+            .0,
+        "task_opportunity_declined"
+    );
+}
+
+#[test]
+fn action_id_replay_requires_the_same_actor_and_payload_after_restart() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let action = root(
+        "stable-action",
+        AgentAction::TeamCreate(TeamCreateInput {
+            name: "Research".into(),
+            mission: "inspect original evidence".into(),
+            objective: None,
+        }),
+    );
+    let first = AgentActionService::new(Arc::clone(&store))
+        .apply(&action)
+        .unwrap();
+    assert_eq!(first.status, AgentActionStatus::Applied);
+    let recovered = AgentActionService::new(store);
+    let mut retry = action.clone();
+    retry.expected_revision = Some(first.revision);
+    let replay = recovered.apply(&retry).unwrap();
+    assert!(replay.duplicate);
+    assert_eq!(replay.changed_refs, first.changed_refs);
+    for changed_actor in [false, true] {
+        let mut conflict = action.clone();
+        if changed_actor {
+            conflict.actor.actor_id = "different-root".into();
+        } else if let AgentAction::TeamCreate(input) = &mut conflict.action {
+            input.mission = "different work".into();
+        }
+        let denied = recovered.apply(&conflict).unwrap();
+        assert_eq!(denied.status, AgentActionStatus::Rejected);
+        assert_eq!(denied.error.unwrap().code, "action_id_conflict");
+        assert_eq!(
+            recovered.project("program-1").unwrap().revision,
+            first.revision
+        );
+    }
+    let mut independent = action;
+    independent.action_id = "independent-new-action".into();
+    let second = recovered.apply(&independent).unwrap();
+    assert_eq!(second.status, AgentActionStatus::Applied);
+    assert!(!second.duplicate);
+    assert_ne!(second.changed_refs, first.changed_refs);
+    assert_eq!(recovered.project("program-1").unwrap().teams.len(), 2);
+}
+
+#[test]
+fn program_cache_uses_shared_hot_state_budget_without_evicting_foreign_pins_or_journal() {
+    use crate::execution_core::hot_state::{
+        HotResidentClass, HotStateConfig, RuntimeHotStatePlane,
+    };
+    let mut config = HotStateConfig::default();
+    config.memory.max_bytes = Some(8 * 1024);
+    let hot = RuntimeHotStatePlane::new(config.clone());
+    let residency = Arc::clone(hot.residency());
+    residency.upsert(
+        "foreign:pinned",
+        HotResidentClass::DerivedProjection,
+        "other-owner",
+        2_000,
+        Some(1),
+    );
+    assert!(residency.pin("foreign:pinned", "active-work"));
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let cache =
+        Arc::new(super::super::AgenticReadModel::new(100).with_residency(Arc::clone(&residency)));
+    let service = AgentActionService::new(Arc::clone(&store)).with_read_model(Arc::clone(&cache));
+    for index in 0..20 {
+        assert_eq!(
+            service
+                .apply(&root(
+                    &format!("budget-team-{index}"),
+                    AgentAction::TeamCreate(TeamCreateInput {
+                        name: format!("Budget team {index}"),
+                        mission: "preserve canonical facts while releasing derived cache memory"
+                            .into(),
+                        objective: None,
+                    })
+                ))
+                .unwrap()
+                .status,
+            AgentActionStatus::Applied
+        );
+    }
+    let expected = service.project("program-1").unwrap();
+    assert_eq!(expected.teams.len(), 20);
+    assert_eq!(
+        cache.len(),
+        0,
+        "an over-budget projection must not remain resident"
+    );
+    assert!(residency.snapshot("agentic-read-model:program-1").is_none());
+    assert_eq!(residency.resident_bytes(), 2_000);
+    assert_eq!(
+        residency.snapshot("foreign:pinned").unwrap().pin_reasons,
+        vec!["active-work"]
+    );
+    assert_eq!(
+        store.stream_revision(&program_stream("program-1")).unwrap(),
+        expected.revision
+    );
+    let cold = AgentActionService::new(Arc::clone(&store))
+        .project("program-1")
+        .unwrap();
+    assert_eq!(
+        cold, expected,
+        "cache eviction cannot erase or change journal facts"
+    );
+    config.memory.max_bytes = Some(1024 * 1024);
+    hot.reconfigure(&config).unwrap();
+    assert_eq!(service.project("program-1").unwrap(), expected);
+    assert_eq!(cache.len(), 1);
+    let resident = residency.snapshot("agentic-read-model:program-1").unwrap();
+    assert!(resident.estimated_bytes > 8 * 1024);
+    assert_eq!(resident.reconstruct_cursor, Some(expected.revision));
+    drop(service);
+    drop(cache);
+    assert!(residency.snapshot("agentic-read-model:program-1").is_none());
+    assert_eq!(residency.resident_bytes(), 2_000);
+    assert!(residency.snapshot("foreign:pinned").is_some());
+}
+
+#[test]
+fn read_model_large_histories_preserve_warm_identity_and_exact_one_and_ten_event_deltas() {
+    // Reducer/consumer semantics, not a PostgreSQL performance baseline. Events
+    // are seeded through the journal in one transaction to avoid benchmarking
+    // repeated fixture setup instead of the read path under test.
+    for history in [100u64, 1_000, 10_000] {
+        let store = Arc::new(RuntimeEventStore::for_test());
+        let service = AgentActionService::new(Arc::clone(&store));
+        let team = service
+            .apply(&root(
+                "large-team",
+                AgentAction::TeamCreate(TeamCreateInput {
+                    name: "Large history".into(),
+                    mission: "read only the relevant page".into(),
+                    objective: None,
+                }),
+            ))
+            .unwrap()
+            .changed_refs[0]
+            .clone();
+        let agent = service
+            .apply(&root(
+                "large-agent",
+                AgentAction::AgentInvite(AgentInviteInput {
+                    team_ref: team.clone(),
+                    role: "Reader".into(),
+                    mission: "consume exact deltas".into(),
+                    required_capabilities: vec![],
+                    existing_agent_ref: None,
+                    definition_ref: None,
+                    model_profile_ref: None,
+                    expertise_hints: vec![],
+                    execution_requirements: vec![],
+                }),
+            ))
+            .unwrap()
+            .changed_refs[0]
+            .clone();
+        let append = |count: u64| {
+            let stream = program_stream("program-1");
+            let head = store.stream_revision(&stream).unwrap();
+            store
+                .append_transaction(AppendTransactionRequest {
+                    transaction_id: format!("large:{head}:{count}"),
+                    expected_streams: vec![ExpectedStreamRevision {
+                        stream_id: stream.clone(),
+                        expected_revision: head,
+                    }],
+                    events: (1..=count)
+                        .map(|offset| {
+                            let id = format!("message:{:06}", head + offset);
+                            let envelope = root(
+                                &id,
+                                AgentAction::MessagePublish(MessagePublishInput {
+                                    topic_ref: "topic:program-1".into(),
+                                    summary: Some(format!("正文 {id}")),
+                                    content_ref: None,
+                                    refs: vec![],
+                                    recipients: vec![],
+                                    intent: None,
+                                    issue_dispositions: vec![],
+                                }),
+                            );
+                            RuntimeTransactionEventInput {
+                                event: RuntimeEventInput {
+                                    stream_id: stream.clone(),
+                                    scope: RuntimeEventScope::Program,
+                                    kind: ACTION_EVENT_KIND.into(),
+                                    status: Some("applied".into()),
+                                    actor: Some("root-1".into()),
+                                    refs: vec![],
+                                    payload: json!({"envelope":envelope,"entity_ref":id}),
+                                },
+                                idempotency_key: Some(format!("seed:{id}")),
+                                schema_version: 1,
+                            }
+                        })
+                        .collect(),
+                })
+                .unwrap();
+        };
+        let initial_head = store.stream_revision(&program_stream("program-1")).unwrap();
+        append(history - initial_head);
+        let initial = service.project_snapshot("program-1").unwrap();
+        assert_eq!(initial.revision, history);
+        let mut measurements = vec![];
+        for repeat in 0..5 {
+            let started = std::time::Instant::now();
+            let warm = service.project_snapshot("program-1").unwrap();
+            let warm_us = started.elapsed().as_micros();
+            assert!(Arc::ptr_eq(
+                &warm,
+                &service.project_snapshot("program-1").unwrap()
+            ));
+            let mut deltas = vec![];
+            for count in [1, 10] {
+                let old = service.project_snapshot("program-1").unwrap();
+                let old_entries = old.topics["topic:program-1"].len();
+                append(count);
+                let started = std::time::Instant::now();
+                let current = service.project_snapshot("program-1").unwrap();
+                let delta_us = started.elapsed().as_micros();
+                assert_eq!(current.revision, old.revision + count);
+                assert_eq!(
+                    current.topics["topic:program-1"].len(),
+                    old_entries + count as usize
+                );
+                assert_eq!(old.topics["topic:program-1"].len(), old_entries);
+                service
+                    .acknowledge_topic_observations(AgenticTopicObservationAck {
+                        program_id: "program-1".into(),
+                        execution_id: format!("large:{repeat}:{count}"),
+                        through_revision: old.revision,
+                        expected_cursor_revision: 0,
+                        observation_kind: TopicObservationKind::WorkerTransport,
+                    })
+                    .unwrap();
+                let page = service
+                    .topic_observations(
+                        "program-1",
+                        &agent,
+                        &team,
+                        &format!("large:{repeat}:{count}"),
+                        32,
+                        48 * 1024,
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(page.entries.len(), count as usize);
+                assert_eq!(
+                    page.entries.first().unwrap().entry.revision,
+                    old.revision + 1
+                );
+                assert_eq!(page.to_revision, current.revision);
+                deltas.push(json!({"delta":count,"elapsed_us":delta_us}));
+            }
+            measurements.push(json!({"repeat":repeat,"warm_us":warm_us,"deltas":deltas}));
+        }
+        println!(
+            "PROGRAM_READ_SEMANTICS {}",
+            json!({"initial_events":history,"backend":"ephemeral_fixture_not_pg_performance","samples":measurements})
+        );
+    }
+}
+
+#[test]
+fn read_snapshot_corruption_rebuilds_from_journal_and_repairs_the_checkpoint() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = AgentActionService::new(Arc::clone(&store));
+    service
+        .apply(&root(
+            "snapshot-team",
+            AgentAction::TeamCreate(TeamCreateInput {
+                name: "Original team".into(),
+                mission: "original source obligation".into(),
+                objective: None,
+            }),
+        ))
+        .unwrap();
+    let expected = service.project_snapshot("program-1").unwrap();
+    let checkpoint_id = read_model_projection_id("program-1");
+    let original = store
+        .projection_checkpoint(&checkpoint_id)
+        .unwrap()
+        .unwrap();
+    for case in ["body", "schema", "digest", "legacy", "ahead", "misbound"] {
+        let mut payload = original.payload.clone();
+        let mut source_cursor = original.source_cursor;
+        match case {
+            "body" => payload["projection"]["objective_summary"] = json!("forged valid JSON"),
+            "schema" => payload["schema_version"] = json!(999),
+            "digest" => payload["sha256"] = json!("sha256:wrong"),
+            "legacy" => payload = payload["projection"].clone(),
+            "ahead" => {
+                source_cursor += 10;
+                payload["projection"]["revision"] = json!(source_cursor);
+                payload["sha256"] = json!(format!(
+                    "sha256:{:x}",
+                    Sha256::digest(payload["projection"].to_string().as_bytes())
+                ));
+            }
+            "misbound" => {
+                payload["projection"]["program_id"] = json!("other-program");
+                payload["sha256"] = json!(format!(
+                    "sha256:{:x}",
+                    Sha256::digest(payload["projection"].to_string().as_bytes())
+                ));
+            }
+            _ => unreachable!(),
+        }
+        store
+            .put_projection_checkpoint(&checkpoint_id, source_cursor, &payload, now_ms())
+            .unwrap();
+        let restarted = AgentActionService::new(Arc::clone(&store));
+        let rebuilt = restarted.project_snapshot("program-1").unwrap();
+        assert_eq!(
+            serde_json::to_value(rebuilt.as_ref()).unwrap(),
+            serde_json::to_value(expected.as_ref()).unwrap(),
+            "{case}"
+        );
+        let repaired = store
+            .projection_checkpoint(&checkpoint_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(repaired.source_cursor, expected.revision, "{case}");
+        assert!(
+            decode_read_snapshot(&repaired, "program-1").is_some(),
+            "{case}"
+        );
+        assert!(matches!(
+            store.compare_and_repair_projection_checkpoint(
+                &checkpoint_id,
+                0,
+                repaired.revision - 1,
+                &json!(null),
+                now_ms(),
+            ),
+            Err(RuntimeEventStoreError::StaleRevision { .. })
+        ));
+        assert_eq!(
+            store
+                .projection_checkpoint(&checkpoint_id)
+                .unwrap()
+                .unwrap(),
+            repaired
+        );
+        assert_eq!(
+            store.stream_revision(&program_stream("program-1")).unwrap(),
+            expected.revision
+        );
+    }
+}
+
+#[test]
 fn shared_read_model_tracks_durable_head_across_service_handles() {
     let store = Arc::new(RuntimeEventStore::for_test());
     let read_model = Arc::new(super::super::AgenticReadModel::new(4));
@@ -91,7 +655,16 @@ fn shared_read_model_tracks_durable_head_across_service_handles() {
             }),
         ))
         .expect("first mutation");
-    let before = first.project("program-1").expect("first projection");
+    let before = first
+        .project_snapshot("program-1")
+        .expect("first projection");
+    let warm = first
+        .project_snapshot("program-1")
+        .expect("shared warm projection");
+    assert!(
+        Arc::ptr_eq(&before, &warm),
+        "a warm read must not copy the Program"
+    );
     assert_eq!(read_model.len(), 1);
 
     let second = AgentActionService::new(store).with_read_model(Arc::clone(&read_model));
@@ -105,10 +678,23 @@ fn shared_read_model_tracks_durable_head_across_service_handles() {
             }),
         ))
         .expect("delta mutation");
-    let after = second.project("program-1").expect("delta projection");
+    let after = second
+        .project_snapshot("program-1")
+        .expect("delta projection");
     assert!(after.revision > before.revision);
     assert_eq!(after.teams.len(), 2);
+    assert_eq!(before.teams.len(), 1, "a published snapshot is immutable");
+    assert!(!Arc::ptr_eq(&before, &after));
+    assert!(Arc::ptr_eq(
+        &after,
+        &first.project_snapshot("program-1").unwrap()
+    ));
     assert_eq!(read_model.len(), 1);
+    read_model.put(Arc::clone(&before));
+    assert!(
+        Arc::ptr_eq(&after, &read_model.get("program-1").unwrap()),
+        "a delayed reader cannot regress the shared cache"
+    );
 }
 
 #[test]
@@ -199,6 +785,7 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
         .topic_observations(
             "program-1",
             &cross_team_peer,
+            &team_b,
             "execution:cross-team-peer",
             16,
             48 * 1024,
@@ -216,6 +803,7 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
             execution_id: "execution:cross-team-peer".to_string(),
             through_revision: cross_page.to_revision,
             expected_cursor_revision: cross_page.cursor_revision,
+            observation_kind: super::TopicObservationKind::WorkerTransport,
         })
         .expect("acknowledge cross-Team page");
 
@@ -224,6 +812,7 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
         .topic_observations(
             "program-1",
             &cross_team_peer,
+            &team_b,
             "execution:cross-team-peer",
             16,
             48 * 1024,
@@ -231,7 +820,14 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
         .expect("restart query")
         .is_none());
     let own_team_page = restarted
-        .topic_observations("program-1", &peer, "execution:own-team-peer", 16, 48 * 1024)
+        .topic_observations(
+            "program-1",
+            &peer,
+            &team_a,
+            "execution:own-team-peer",
+            16,
+            48 * 1024,
+        )
         .expect("own-Team observations")
         .expect("Program and own-Team messages");
     assert_eq!(own_team_page.entries.len(), 2);
@@ -351,7 +947,7 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
             &team_a,
             &peer,
             AgentAction::StateInspect(StateInspectInput {
-                entry_ref: Some(private),
+                entry_ref: Some(private.clone()),
                 ..StateInspectInput::default()
             }),
         ))
@@ -359,6 +955,130 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
         .projection
         .unwrap();
     assert_eq!(denied["not_found"], true);
+    let mut lead = managed(
+        "lead-private-inspect",
+        &team_a,
+        &peer,
+        AgentAction::StateInspect(StateInspectInput {
+            entry_ref: Some(private),
+            ..Default::default()
+        }),
+    );
+    lead.actor.kind = AgentActorKind::TeamLead;
+    let hidden = service.apply(&lead).unwrap().projection.unwrap();
+    assert_eq!(hidden["not_found"], true);
+    assert!(!hidden.to_string().contains("recipient-only detail"));
+    service
+        .apply(&root(
+            "join-other-team",
+            AgentAction::MembershipUpdate(harness_contract::agent_action::MembershipUpdateInput {
+                team_ref: team_a.clone(),
+                agent_ref: cross_team_peer.clone(),
+                operation: harness_contract::agent_action::MembershipOperation::Join,
+                reason_ref: None,
+            }),
+        ))
+        .unwrap();
+    let unchanged = service
+        .apply(&managed(
+            "old-run-after-join",
+            &team_b,
+            &cross_team_peer,
+            AgentAction::StateInspect(StateInspectInput {
+                entry_ref: Some(own_topic.clone()),
+                ..Default::default()
+            }),
+        ))
+        .unwrap()
+        .projection
+        .unwrap();
+    assert_eq!(
+        unchanged["not_found"], true,
+        "new membership cannot broaden the old run's Team binding"
+    );
+    let new_scope = service
+        .apply(&managed(
+            "new-run-team-scope",
+            &team_a,
+            &cross_team_peer,
+            AgentAction::StateInspect(StateInspectInput {
+                entry_ref: Some(own_topic.clone()),
+                ..Default::default()
+            }),
+        ))
+        .unwrap()
+        .projection
+        .unwrap();
+    assert_ne!(new_scope["not_found"], true);
+    assert!(service
+        .topic_observations(
+            "program-1",
+            &cross_team_peer,
+            &team_b,
+            "execution:cross-team-peer",
+            16,
+            48 * 1024
+        )
+        .unwrap()
+        .is_none());
+    assert!(service
+        .topic_observations(
+            "program-1",
+            &cross_team_peer,
+            &team_a,
+            "execution:new-team-run",
+            16,
+            48 * 1024
+        )
+        .unwrap()
+        .unwrap()
+        .entries
+        .iter()
+        .any(|item| item.topic_ref == own_topic));
+    let directory: StateInspectInput =
+        serde_json::from_value(new_scope["directory_request"].clone()).unwrap();
+    let first_page = service
+        .apply(&managed(
+            "scoped-page",
+            &team_a,
+            &cross_team_peer,
+            AgentAction::StateInspect(directory),
+        ))
+        .unwrap()
+        .projection
+        .unwrap();
+    let next: StateInspectInput =
+        serde_json::from_value(first_page["next_request"].clone()).unwrap();
+    let valid_next = service
+        .apply(&managed(
+            "same-scope-page",
+            &team_a,
+            &cross_team_peer,
+            AgentAction::StateInspect(next.clone()),
+        ))
+        .unwrap();
+    assert_eq!(valid_next.status, AgentActionStatus::Observed);
+    let changed_scope = service
+        .apply(&managed(
+            "changed-scope-page",
+            &team_b,
+            &cross_team_peer,
+            AgentAction::StateInspect(next.clone()),
+        ))
+        .unwrap();
+    assert_eq!(changed_scope.status, AgentActionStatus::Rejected);
+    let mut changed_run = managed(
+        "changed-run-page",
+        &team_a,
+        &cross_team_peer,
+        AgentAction::StateInspect(next),
+    );
+    changed_run.actor.execution_id = Some("another-physical-run".into());
+    assert_eq!(
+        service.apply(&changed_run).unwrap().status,
+        AgentActionStatus::Rejected
+    );
+
     let membership = AgenticProgramProjection::membership_id(&peer, &team_a);
     let member = service
         .apply(&root(
@@ -492,10 +1212,12 @@ fn state_inspect_pages_indexes_and_never_falls_back_to_full_program_dump() {
 }
 
 #[test]
-fn complete_vertical_chain_is_durable_and_idempotent() {
+fn legacy_goal_terminal_recovery_is_durable_and_idempotent() {
     let store = Arc::new(RuntimeEventStore::for_test());
     let service = AgentActionService::new(Arc::clone(&store));
-    let goals = Arc::new(crate::execution_core::goal::GoalStore::new(store));
+    let goals = Arc::new(crate::execution_core::goal::GoalStore::new(Arc::clone(
+        &store,
+    )));
     goals
         .create(GoalContract {
             id: "goal:root-execution-1".to_string(),
@@ -754,38 +1476,39 @@ fn complete_vertical_chain_is_durable_and_idempotent() {
         crate::AgenticProgramStatus::CompletionRequested,
         "a foreign terminal fence must never verify the Program"
     );
-    let accepted_task = pending.tasks.values().next().expect("accepted task");
-    objective_supervisor
+    let rejected = objective_supervisor
         .reconcile(
             "goal:root-execution-1",
             request_revision,
             &format!("agentic-objective:program-1:request:{request_revision}"),
-            vec![ObjectiveObligation {
-                obligation_id: format!("agentic-task:{}", accepted_task.task_id),
-                required: true,
-                success_predicate: accepted_task.acceptance.clone(),
-                producer: Default::default(),
-                evidence_requirement: ObjectiveEvidenceRequirement {
-                    required_artifact_kinds: Vec::new(),
-                    independent_verifier_required: true,
-                    reread_required: false,
-                },
-                state: ObjectiveObligationState::Satisfied,
-                artifact_refs: accepted_task.artifact_refs.clone(),
-                evidence_refs: accepted_task.evidence_refs.clone(),
-                reread_receipts: Vec::new(),
-                verifier_decision: Some("accepted_by:independent-reviewer".to_string()),
-                diagnostic_code: None,
-            }],
-            vec![
-                "artifact://abc".to_string(),
-                "execution_graph:root-execution-1".to_string(),
-            ],
-            Vec::new(),
+            vec![],
+            vec![],
+            vec![],
             false,
-            "fault injection: Goal terminal committed before Program verdict binding",
+            "ordinary writer cannot split a new Program conclusion",
         )
-        .expect("Objective terminal");
+        .unwrap_err();
+    assert!(rejected.contains("program_terminal_authority"));
+    // Historical journal fault injection only. Production now commits Goal
+    // and Program atomically; it cannot create this pre-existing split state.
+    let mut historical = foreign_terminal;
+    historical.terminal.as_mut().unwrap().terminal_fence =
+        format!("agentic-objective:program-1:request:{request_revision}");
+    historical.terminal.as_mut().unwrap().reason = "historical terminal awaiting recovery".into();
+    historical.phase = "completed".into();
+    historical.revision += 1;
+    historical.criteria[0].status = AcceptanceStatus::Satisfied;
+    store
+        .append(crate::RuntimeEventInput {
+            stream_id: "goal:goal:root-execution-1".into(),
+            scope: crate::RuntimeEventScope::Goal,
+            kind: "goal.completed".into(),
+            status: Some("satisfied".into()),
+            actor: Some("test.historical_fault_injection".into()),
+            refs: vec![],
+            payload: serde_json::json!({"goal":historical}),
+        })
+        .unwrap();
     assert_eq!(
         service.project("program-1").expect("projection").status,
         crate::AgenticProgramStatus::CompletionRequested,
@@ -1221,7 +1944,7 @@ fn task_claim_requires_a_roster_agent_and_expired_lease_is_reclaimable() {
     task_projection.claimant = Some("agent:abandoned".to_string());
     task_projection.claim_execution_id = Some("execution:abandoned".to_string());
     task_projection.lease_expires_at_ms = Some(10);
-    assert!(validate_transition(&projection, &claimant, 11).is_none());
+    assert!(validate_transition(&projection, &claimant, 11, None).is_none());
 
     let expired_submit = managed(
         "expired-submit",
@@ -1238,7 +1961,7 @@ fn task_claim_requires_a_roster_agent_and_expired_lease_is_reclaimable() {
     task_projection.claimant = Some(agent);
     task_projection.claim_execution_id = expired_submit.actor.execution_id.clone();
     assert_eq!(
-        validate_transition(&projection, &expired_submit, 11),
+        validate_transition(&projection, &expired_submit, 11, None),
         Some(("task_claim_expired", task))
     );
 }
@@ -1502,7 +2225,8 @@ fn repeated_identical_review_failure_blocks_for_explicit_replan() {
                     &input.execution_id,
                     AgentAction::TaskAttemptFail(input.clone()),
                 ),
-                now_ms()
+                now_ms(),
+                None
             ),
             None
         );
@@ -1693,6 +2417,122 @@ fn program_projection_recovers_exactly_after_service_reconstruction() {
         .expect("idempotent replay after reopen");
     assert!(duplicate.duplicate);
     assert_eq!(duplicate.revision, projection.revision);
+}
+
+#[test]
+fn published_task_supersedes_across_teams_without_failure_and_rejects_invalid_replacements() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = AgentActionService::new(Arc::clone(&store));
+    let create_team = |id: &str| {
+        service
+            .apply(&root(
+                id,
+                AgentAction::TeamCreate(TeamCreateInput {
+                    name: id.into(),
+                    mission: "preserve the original obligation".into(),
+                    objective: None,
+                }),
+            ))
+            .unwrap()
+            .changed_refs[0]
+            .clone()
+    };
+    let first_team = create_team("source-team");
+    let second_team = create_team("replacement-team");
+    let publish = |id: &str, team: &str, dependencies: Vec<String>| {
+        service
+            .apply(&root(
+                id,
+                AgentAction::TaskPublish(TaskPublishInput {
+                    team_ref: team.into(),
+                    title: id.into(),
+                    objective: "produce verifiable evidence".into(),
+                    acceptance: "independently checked result".into(),
+                    required_capabilities: vec![],
+                    depends_on: dependencies,
+                    obligation_refs: vec![],
+                    purpose: Default::default(),
+                    execution_requirements: vec![],
+                    expertise_hints: vec![],
+                }),
+            ))
+            .unwrap()
+            .changed_refs[0]
+            .clone()
+    };
+    let source = publish("source-task", &first_team, vec![]);
+    let successor = publish("replacement-task", &second_team, vec![]);
+    let cyclic = publish("cyclic-task", &second_team, vec![source.clone()]);
+    let action = |replacements: Vec<String>| {
+        AgentAction::TaskSupersede(TaskSupersedeInput {
+            task_ref: source.clone(),
+            replacement_task_refs: replacements,
+            reason: "new evidence favors work by the other team before execution".into(),
+            evidence_refs: vec!["artifact://replanning-evidence".into()],
+        })
+    };
+    let before = service.project("program-1").unwrap();
+    assert_eq!(before.tasks[&source].status, AgenticTaskStatus::Published);
+    assert_eq!(before.tasks[&source].failed_attempts, 0);
+    for (id, replacements) in [
+        ("empty-replacement", vec![]),
+        ("self-replacement", vec![source.clone()]),
+        ("cyclic-replacement", vec![cyclic]),
+    ] {
+        let rejected = service.apply(&root(id, action(replacements))).unwrap();
+        assert_eq!(rejected.status, AgentActionStatus::Rejected, "{id}");
+        assert_eq!(
+            service.project("program-1").unwrap().revision,
+            before.revision
+        );
+    }
+    let mut foreign_lead = root("foreign-lead", action(vec![successor.clone()]));
+    foreign_lead.actor.kind = AgentActorKind::TeamLead;
+    foreign_lead.actor.team_id = Some(second_team.clone());
+    foreign_lead.actor.agent_id = Some("foreign-lead-agent".into());
+    foreign_lead.actor.execution_id = Some("foreign-lead-execution".into());
+    let rejected = service.apply(&foreign_lead).unwrap();
+    assert_eq!(rejected.status, AgentActionStatus::Rejected);
+    assert_eq!(
+        rejected.error.unwrap().code,
+        "cross_team_work_mutation_not_delegated"
+    );
+    assert_eq!(
+        service.project("program-1").unwrap().revision,
+        before.revision
+    );
+
+    let commit = root(
+        "root-cross-team-replacement",
+        action(vec![successor.clone()]),
+    );
+    let applied = service.apply(&commit).unwrap();
+    assert_eq!(applied.status, AgentActionStatus::Applied);
+    drop(service);
+    let recovered = AgentActionService::new(store);
+    let projection = recovered.project("program-1").unwrap();
+    let retired = &projection.tasks[&source];
+    assert_eq!(retired.status, AgenticTaskStatus::Superseded);
+    assert_eq!(retired.failed_attempts, 0);
+    assert_eq!(retired.objective, before.tasks[&source].objective);
+    assert_eq!(retired.acceptance, before.tasks[&source].acceptance);
+    assert_eq!(
+        retired.obligation_refs,
+        before.tasks[&source].obligation_refs
+    );
+    assert_eq!(retired.replacement_task_refs, vec![successor.clone()]);
+    assert_eq!(projection.tasks[&successor].team_id, second_team);
+    assert_eq!(
+        projection.tasks[&successor].status,
+        AgenticTaskStatus::Published
+    );
+    assert!(!crate::agentic::work_market::task_dependency_satisfied(
+        &projection,
+        &source
+    ));
+    let replay = recovered.apply(&commit).unwrap();
+    assert!(replay.duplicate);
+    assert_eq!(replay.revision, applied.revision);
 }
 
 #[test]
@@ -1987,4 +2827,123 @@ fn failed_task_supersede_is_cas_idempotent_recoverable_and_not_fake_completion()
         None,
         "ObjectiveSupervisor must require accepted active successors while retaining, not accepting, the superseded source"
     );
+}
+
+#[test]
+fn new_run_membership_authorizes_incremental_work_and_leave_revokes_it() {
+    use harness_contract::agent_action::{MembershipOperation, MembershipUpdateInput};
+    let service = AgentActionService::new(Arc::new(RuntimeEventStore::for_test()));
+    let mut teams = Vec::new();
+    for name in ["home", "joined"] {
+        teams.push(
+            service
+                .apply(&root(
+                    name,
+                    AgentAction::TeamCreate(TeamCreateInput {
+                        name: name.into(),
+                        mission: "collaborate".into(),
+                        objective: None,
+                    }),
+                ))
+                .unwrap()
+                .changed_refs[0]
+                .clone(),
+        );
+    }
+    let invite = |team: &str| {
+        AgentAction::AgentInvite(serde_json::from_value(json!({
+        "team_ref":team,"role":"ordinary contributor","mission":"question and extend evidence"
+    })).unwrap())
+    };
+    let agent_id = service
+        .apply(&root("member", invite(&teams[0])))
+        .unwrap()
+        .changed_refs[0]
+        .clone();
+    let publish = || {
+        AgentAction::TaskPublish(serde_json::from_value(json!({
+        "team_ref":teams[1],"title":"new contribution","objective":"resolve one cited gap","acceptance":"source-backed response"
+    })).unwrap())
+    };
+    for (label, action) in [
+        ("before-publish", publish()),
+        ("before-invite", invite(&teams[1])),
+    ] {
+        let before_rejected_write = service.project("program-1").unwrap();
+        assert_eq!(
+            service
+                .apply(&managed(label, &teams[0], &agent_id, action))
+                .unwrap()
+                .status,
+            harness_contract::agent_action::AgentActionStatus::Rejected
+        );
+        assert_eq!(
+            service.project("program-1").unwrap(),
+            before_rejected_write,
+            "a delegated Agent outside the Team must not write Program state"
+        );
+    }
+    for (operation, prefix, expected) in [
+        (
+            MembershipOperation::Join,
+            "joined",
+            harness_contract::agent_action::AgentActionStatus::Applied,
+        ),
+        (
+            MembershipOperation::Leave,
+            "left",
+            harness_contract::agent_action::AgentActionStatus::Rejected,
+        ),
+    ] {
+        let membership = managed(
+            &format!("membership-{prefix}"),
+            &teams[0],
+            &agent_id,
+            AgentAction::MembershipUpdate(MembershipUpdateInput {
+                agent_ref: agent_id.clone(),
+                team_ref: teams[1].clone(),
+                operation,
+                reason_ref: None,
+            }),
+        );
+        assert_eq!(
+            service.apply(&membership).unwrap().status,
+            harness_contract::agent_action::AgentActionStatus::Applied
+        );
+        for (label, action) in [("publish", publish()), ("invite", invite(&teams[1]))] {
+            let before_old_run_write = service.project("program-1").unwrap();
+            assert_eq!(
+                service
+                    .apply(&managed(
+                        &format!("old-run-{prefix}-{label}"),
+                        &teams[0],
+                        &agent_id,
+                        action.clone()
+                    ))
+                    .unwrap()
+                    .status,
+                harness_contract::agent_action::AgentActionStatus::Rejected
+            );
+            assert_eq!(
+                service.project("program-1").unwrap(),
+                before_old_run_write,
+                "a revoked delegated run must not write Program state"
+            );
+            let result = service
+                .apply(&managed(
+                    &format!("{prefix}-{label}"),
+                    &teams[1],
+                    &agent_id,
+                    action,
+                ))
+                .unwrap();
+            assert_eq!(result.status, expected, "{prefix}-{label}: {result:?}");
+        }
+    }
+    let projection = service.project("program-1").unwrap();
+    assert_eq!(projection.tasks.len(), 1);
+    assert!(projection
+        .tasks
+        .values()
+        .all(|task| task.claimant.is_none()));
 }

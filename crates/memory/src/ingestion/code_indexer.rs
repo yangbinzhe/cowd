@@ -377,7 +377,7 @@ impl CodeIndexer {
                     stats.symbols_found += symbols.len();
                     stats.edges_found += edges.len();
 
-                    // Auto-persist to SQLite if store is available
+                    // Auto-persist through the configured store when available.
                     if let Some(ref store) = self.store {
                         for sym in &symbols {
                             if let Err(e) = store.insert_symbol(sym).await {
@@ -415,7 +415,7 @@ impl CodeIndexer {
                 files = stats.files_processed,
                 symbols = stats.symbols_found,
                 edges = stats.edges_found,
-                "code_indexer: scan complete, persisted to SQLite"
+                "code_indexer: scan complete, persisted through configured store"
             );
         }
 
@@ -1829,7 +1829,6 @@ fn foo() -> i32 {
         use crate::store::EphemeralMemoryStore;
         use crate::store::MemoryStore;
 
-        let tmp = tempfile::TempDir::new().unwrap();
         let store = EphemeralMemoryStore::new();
 
         let caller = CodeSymbol {
@@ -1860,9 +1859,7 @@ fn foo() -> i32 {
             edge_type: SymbolEdgeType::Calls,
             file_path: "a.rs".into(),
         };
-        store
-            .index_file_symbols("a.rs", &[caller.clone(), callee.clone()], &[edge])
-            .unwrap();
+        store.insert_edge(&edge).await.unwrap();
 
         // Wrap in Arc<dyn MemoryStore> for CodeIndexer
         let store: std::sync::Arc<dyn MemoryStore> = std::sync::Arc::new(store);

@@ -1,4 +1,5 @@
 mod agent;
+pub(crate) mod agent_tool;
 mod agentic_program_wait;
 mod approval;
 mod materialize;

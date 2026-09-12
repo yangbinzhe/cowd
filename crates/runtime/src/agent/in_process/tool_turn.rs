@@ -1,6 +1,8 @@
 use super::*;
 
 pub(super) struct ScopedRuntimeToolExecutor {
+    pub(super) tool_batch:
+        Option<crate::execution_core::graph::executors::agent_tool::AgentToolBatchDispatcher>,
     pub(super) host: Arc<dyn RuntimeExecutionHost>,
     pub(super) allowed_tools: BTreeSet<String>,
     pub(super) session_id: String,
@@ -116,6 +118,18 @@ pub(super) fn tool_output_byte_length(output: &str) -> Option<u64> {
 /// the canonical receipt outputs and evidence the Agent already holds under
 /// its role lease; it never reads the live workspace or asks the model to
 /// reconstruct a side effect.
+pub(super) fn recoverable_effect_receipts(
+    receipts: &[crate::execution_core::graph::DurableAgentToolReceipt],
+) -> Vec<crate::execution_core::graph::DurableAgentToolReceipt> {
+    // Chunk digests attest physical reads, but do not restore source text to
+    // a resumed model. They must not force a presentation-only recovery.
+    receipts
+        .iter()
+        .filter(|receipt| receipt.outcome.tool_name != "evidence_retrieve")
+        .cloned()
+        .collect()
+}
+
 pub(super) fn recovered_agent_tool_receipt_prompt(
     receipts: &[crate::execution_core::graph::DurableAgentToolReceipt],
     agentic_protocol_pending: bool,
@@ -153,6 +167,27 @@ pub(super) fn agentic_task_protocol_pending(
     let Some(agentic) = packet.agentic_binding.as_ref() else {
         return Ok(false);
     };
+    if let harness_contract::agent::AgenticExecutionFocus::Coordination { wake_ref } =
+        &agentic.focus
+    {
+        let projection = services
+            .agent_action_service()
+            .project_snapshot(&agentic.program_id)
+            .map_err(|error| error.to_string())?;
+        let (_, wake) = projection
+            .coordination_wake_ref(wake_ref)
+            .ok_or("coordination_recovery_wake_missing")?;
+        let consumption = wake
+            .coordination
+            .as_ref()
+            .ok_or("coordination_recovery_not_registered")?;
+        if consumption.execution_id != packet.graph_id() || consumption.agent_id != agentic.agent_id
+        {
+            return Err("coordination_recovery_binding_mismatch".into());
+        }
+        return Ok(!consumption.settled
+            && !projection.coordination_replied(wake_ref, packet.graph_id(), &agentic.agent_id));
+    }
     let (task_id, mode) = match &agentic.focus {
         harness_contract::agent::AgenticExecutionFocus::TaskExecute { task_ref } => {
             (task_ref.as_str(), "execute")
@@ -166,7 +201,7 @@ pub(super) fn agentic_task_protocol_pending(
     let agent_id = agentic.agent_id.as_str();
     let projection = services
         .agent_action_service()
-        .project(program_id)
+        .project_snapshot(program_id)
         .map_err(|error| format!("Agent-first recovery projection failed: {error}"))?;
     let task = projection.tasks.get(task_id).ok_or_else(|| {
         format!("Agent-first recovery Program `{program_id}` has no Task `{task_id}`")
@@ -194,7 +229,6 @@ pub(super) struct AgentAutonomyCheckpoint {
     pub(super) prompt: String,
     pub(super) tool_ids: Vec<String>,
     pub(super) requires_tool_action: bool,
-    pub(super) agentic_topic_ack: Option<crate::agentic::AgenticTopicObservationAck>,
 }
 
 pub(super) fn autonomy_checkpoint_tool_plan(
@@ -292,6 +326,41 @@ pub(super) fn agent_autonomy_checkpoint(
         // Agent-first Program is the sole collaboration control plane.
         return Ok(None);
     };
+    if let harness_contract::agent::AgenticExecutionFocus::Coordination { wake_ref } =
+        &agentic.focus
+    {
+        let projection = services
+            .agent_action_service()
+            .project_snapshot(&agentic.program_id)
+            .map_err(|error| error.to_string())?;
+        let (topic, wake) = projection
+            .coordination_wake_ref(wake_ref)
+            .ok_or("coordination_checkpoint_wake_missing")?;
+        let consumption = wake
+            .coordination
+            .as_ref()
+            .ok_or("coordination_checkpoint_not_registered")?;
+        if consumption.execution_id != packet.graph_id()
+            || consumption.agent_id != agentic.agent_id
+            || consumption.membership_id != agentic.membership_id
+        {
+            return Err("coordination_checkpoint_binding_mismatch".into());
+        }
+        if consumption.settled
+            || projection.coordination_replied(wake_ref, packet.graph_id(), &agentic.agent_id)
+        {
+            return Ok(None);
+        }
+        if projection.coordination_team_id_for(&agentic.agent_id, wake.revision)
+            != Some(agentic.team_id.as_str())
+        {
+            return Err("coordination_checkpoint_scope_unavailable".into());
+        }
+        return Ok(Some(AgentAutonomyCheckpoint {
+            prompt: format!("Respond to the authorized coordination request through message_publish. Read relevant evidence and give a useful answer, challenge or actionable proposal; do not invent a reply or claim the original Task. Publish on `{topic}`, include `{wake_ref}` in refs, and ensure requester `{}` is a recipient (or use a public reply on this same authorized Topic). A durable response from your actual execution closes this opportunity; final prose alone does not.\n\n{}", wake.actor_id, serde_json::json!({"kind":"runtime_agent_autonomy_checkpoint", "attempt_mode":"coordination", "wake_ref":wake_ref, "request":wake})),
+            tool_ids: autonomy_checkpoint_tool_plan(packet, true, true), requires_tool_action: true,
+        }));
+    }
     let (task_id, mode) = match &agentic.focus {
         harness_contract::agent::AgenticExecutionFocus::TaskExecute { task_ref } => {
             (task_ref.as_str(), "execute")
@@ -305,7 +374,7 @@ pub(super) fn agent_autonomy_checkpoint(
     let agent_id = agentic.agent_id.as_str();
     let projection = services
         .agent_action_service()
-        .project(program_id)
+        .project_snapshot(program_id)
         .map_err(|error| format!("load Agent-first autonomy checkpoint: {error}"))?;
     let _member = projection
         .agents
@@ -334,18 +403,8 @@ pub(super) fn agent_autonomy_checkpoint(
         .get(&task.team_id)
         .map(|team| team.topic_ref.as_str())
         .ok_or_else(|| "Agent-first bound Task Team has no topic".to_string())?;
-    let already_declined = projection.topics.get(topic_ref).is_some_and(|entries| {
-        entries.iter().any(|entry| {
-            entry.actor_id == agent_id
-                && entry.refs.iter().any(|reference| reference == task_id)
-                && entry.summary.as_deref().is_some_and(|summary| {
-                    summary
-                        .trim_start()
-                        .to_ascii_lowercase()
-                        .starts_with("decline:")
-                })
-        })
-    });
+    let already_declined =
+        projection.declined_task_opportunity(task_id, agent_id, None, Some(packet.graph_id()));
     let mut actions = Vec::new();
     let mut requires_execution_tools = false;
     match (mode, task.status) {
@@ -369,9 +428,10 @@ pub(super) fn agent_autonomy_checkpoint(
                         "tool": "message_publish",
                         "input": {
                             "topic_ref": topic_ref,
-                            "summary": "DECLINE: replace with a concise role/capability mismatch",
+                            "summary": "Explain the role/capability mismatch for this opportunity",
                             "content_ref": null,
-                            "refs": [task.task_id]
+                            "refs": [task.task_id],
+                            "intent": {"task_ref": task.task_id, "kind": "decline"}
                         }
                     }
                 ]
@@ -412,33 +472,7 @@ pub(super) fn agent_autonomy_checkpoint(
         }
     }
 
-    let agentic_topic_page = services
-        .agent_action_service()
-        .topic_observations(program_id, agent_id, packet.graph_id(), 16, 48 * 1024)
-        .map_err(|error| format!("load Agent-first topic checkpoint: {error}"))?;
-    let (
-        agentic_topic_entries,
-        agentic_topic_from_revision,
-        agentic_topic_to_revision,
-        agentic_topic_ack,
-    ) = agentic_topic_page.map_or_else(
-        || (Vec::new(), 0, 0, None),
-        |page| {
-            let ack = crate::agentic::AgenticTopicObservationAck {
-                program_id: program_id.to_string(),
-                execution_id: packet.graph_id().to_string(),
-                through_revision: page.to_revision,
-                expected_cursor_revision: page.cursor_revision,
-            };
-            (
-                page.entries,
-                page.from_revision,
-                page.to_revision,
-                Some(ack),
-            )
-        },
-    );
-    if actions.is_empty() && agentic_topic_entries.is_empty() {
+    if actions.is_empty() {
         return Ok(None);
     }
     let checkpoint = serde_json::to_string(&serde_json::json!({
@@ -448,9 +482,6 @@ pub(super) fn agent_autonomy_checkpoint(
         "attempt_mode": mode,
         "task_ref": task_id,
         "required_actions": actions,
-        "unread_agentic_topic_entries": agentic_topic_entries,
-        "agentic_topic_from_revision": agentic_topic_from_revision,
-        "agentic_topic_to_revision": agentic_topic_to_revision,
     }))
     .map_err(|error| format!("serialize Agent autonomy checkpoint: {error}"))?;
     let requires_tool_action = !actions.is_empty();
@@ -458,11 +489,10 @@ pub(super) fn agent_autonomy_checkpoint(
         autonomy_checkpoint_tool_plan(packet, requires_tool_action, requires_execution_tools);
     Ok(Some(AgentAutonomyCheckpoint {
         prompt: format!(
-            "Runtime safe checkpoint committed after your prior model round. It contains only canonical Agent-first Program/Task state and unread public Team topic entries. Resolve the listed compact action with your native tools: if the bound Task fits, actively task_claim it before substantive execution; if it does not fit, do not claim and use the supplied message_publish option to explain the mismatch so the Team can reassign or replan. After a successful claim, do the work, commit a durable artifact, and submit exact evidence; in review mode inspect the submitted artifact and issue an independent task_review verdict. Do not invent identities, revisions, artifacts, sources, or completion. Preserve the substance and evidence of your earlier result and return a complete updated answer after the checkpoint is closed.\n\n{checkpoint}"
+            "Runtime safe checkpoint committed after your prior model round. It contains only canonical Agent-first Program/Task state. New authorized Topic entries are delivered separately at actual model safe points. Resolve the listed compact action with your native tools: if the bound Task fits, actively task_claim it before substantive execution; if it does not fit, do not claim and use the supplied message_publish option to explain the mismatch so the Team can reassign or replan. After a successful claim, do the work, commit a durable artifact, and submit exact evidence; in review mode inspect the submitted artifact and issue an independent task_review verdict. Do not invent identities, revisions, artifacts, sources, or completion. Preserve the substance and evidence of your earlier result and return a complete updated answer after the checkpoint is closed.\n\n{checkpoint}"
         ),
         tool_ids,
         requires_tool_action,
-        agentic_topic_ack,
     }))
 }
 
@@ -601,7 +631,11 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
         // "has no ToolHost implementation adapter".
         if matches!(
             tool_name,
-            "evidence_retrieve" | "artifact_publish" | "artifact_materialize"
+            "evidence_retrieve"
+                | "working_context"
+                | "private_note"
+                | "artifact_publish"
+                | "artifact_materialize"
         ) || is_agent_action_tool(tool_name)
         {
             if !self.allowed_tools.contains(tool_name) {
@@ -653,13 +687,27 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
     }
 
     fn owns_durable_tool_effect(&self, tool_name: &str) -> bool {
+        if tool_name == "artifact_materialize" {
+            return self.tool_batch.is_some() && self.allowed_tools.contains(tool_name);
+        }
         self.commit_service.is_some()
             && self.allowed_tools.contains(tool_name)
             && !matches!(
                 tool_name,
-                "tool_search" | "evidence_retrieve" | "artifact_publish" | "artifact_materialize"
+                "tool_search"
+                    | "evidence_retrieve"
+                    | "working_context"
+                    | "private_note"
+                    | "artifact_publish"
+                    | "artifact_materialize"
             )
             && !is_agent_action_tool(tool_name)
+    }
+
+    fn owns_tool_resource_admission(&self, tool_name: &str) -> bool {
+        self.tool_batch.is_some()
+            && tool_name != "checkpoint_create"
+            && self.owns_durable_tool_effect(tool_name)
     }
 
     fn model_delivery_requirement(
@@ -682,7 +730,11 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
         if tool_name == "checkpoint_create"
             || matches!(
                 tool_name,
-                "evidence_retrieve" | "artifact_publish" | "artifact_materialize"
+                "evidence_retrieve"
+                    | "working_context"
+                    | "private_note"
+                    | "artifact_publish"
+                    | "artifact_materialize"
             )
             || is_agent_action_tool(tool_name)
         {

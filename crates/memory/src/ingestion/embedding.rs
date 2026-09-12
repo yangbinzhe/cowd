@@ -20,11 +20,12 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tracing::{debug, warn};
 
@@ -129,6 +130,17 @@ pub struct EmbeddingClient {
     /// Provider-observed upper bound for this configured route/model revision.
     /// Clones share it; a newly configured client starts a fresh capability.
     learned_batch_cap: Arc<AtomicUsize>,
+    /// Authentication failure is route-wide, not a malformed text payload.
+    /// A replacement configured client is the explicit credential revision.
+    credentials_rejected: Arc<AtomicBool>,
+    /// Selected durable store owns successful, not-yet-consumed segments.
+    progress_store: Option<Arc<dyn crate::store::MemoryStore>>,
+}
+
+/// Completed original inputs remain usable even if a later provider batch fails.
+pub(crate) struct PartialEmbeddings {
+    pub vectors: Vec<Option<Vec<f32>>>,
+    pub error: Option<MemoryError>,
 }
 
 impl EmbeddingClient {
@@ -183,7 +195,69 @@ impl EmbeddingClient {
             deterministic_failures: Arc::new(RwLock::new(Vec::new())),
             request_gates: Arc::new(AsyncMutex::new(HashMap::new())),
             learned_batch_cap: Arc::new(AtomicUsize::new(initial_batch_cap)),
+            credentials_rejected: Arc::new(AtomicBool::new(false)),
+            progress_store: None,
         }
+    }
+
+    /// Retain successful segments in the selected store when a later batch
+    /// fails. Recreating a client with the same configuration resumes them.
+    /// Successful ordinary `embed` calls acknowledge their own checkpoints.
+    pub fn with_progress_store(mut self, store: Arc<dyn crate::store::MemoryStore>) -> Self {
+        self.progress_store = Some(store);
+        self
+    }
+
+    fn progress_key(&self, text: &str) -> String {
+        // Length-delimited canonical encoding prevents field-boundary collisions.
+        // Only the digest, never the credential or source text, enters the key.
+        let identity = serde_json::to_vec(&(
+            "embedding-segment.v1",
+            &self.config.api_url,
+            &self.config.model,
+            &self.config.api_key,
+            self.config.dimension,
+            self.effective_max_input_tokens(),
+            text,
+        ))
+        .expect("embedding identity is serializable");
+        format!("embedding-progress:v1:{:x}", Sha256::digest(identity))
+    }
+
+    pub(crate) fn configuration_identity(&self) -> String {
+        self.progress_key("")
+    }
+
+    async fn validate_vectors(&self, vectors: &[Vec<f32>]) -> Result<(), MemoryError> {
+        let mut dimension = self.detected_dimension.write().await;
+        for vector in vectors {
+            if vector.is_empty() || vector.iter().any(|value| !value.is_finite()) {
+                return Err(MemoryError::InvalidArgument(
+                    "embedding vector must be finite and nonempty".into(),
+                ));
+            }
+            match *dimension {
+                Some(expected) if expected != vector.len() => {
+                    return Err(MemoryError::InvalidArgument(format!(
+                        "embedding dimension mismatch: configured {expected}, provider returned {}",
+                        vector.len()
+                    )))
+                }
+                None => *dimension = Some(vector.len()),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Called only after the downstream vector artifact has been persisted.
+    pub(crate) async fn acknowledge_embeddings(&self, texts: &[&str]) -> Result<(), MemoryError> {
+        if let Some(store) = &self.progress_store {
+            for input in prepare_embedding_inputs(texts, self.effective_max_input_tokens())? {
+                store.kv_delete(&self.progress_key(&input.text)).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Returns `true` when a remote endpoint has been configured (non-empty
@@ -205,8 +279,30 @@ impl EmbeddingClient {
     /// Returns [`MemoryError::Store`] when the remote API returns an error or
     /// is not reachable, or when the remote service is not configured.
     pub async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, MemoryError> {
+        let partial = self.embed_partial(texts).await?;
+        if let Some(error) = partial.error {
+            return Err(error);
+        }
+        let vectors = partial
+            .vectors
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| MemoryError::Store("embedding result is incomplete".into()))?;
+        // Ordinary query callers consume the result directly. Ingestion uses
+        // embed_partial and acknowledges only after its durable index write.
+        self.acknowledge_embeddings(texts).await?;
+        Ok(vectors)
+    }
+
+    pub(crate) async fn embed_partial(
+        &self,
+        texts: &[&str],
+    ) -> Result<PartialEmbeddings, MemoryError> {
         if texts.is_empty() {
-            return Ok(Vec::new());
+            return Ok(PartialEmbeddings {
+                vectors: Vec::new(),
+                error: None,
+            });
         }
         if !self.is_remote_available() {
             return Err(MemoryError::Store(
@@ -215,47 +311,67 @@ impl EmbeddingClient {
         }
 
         let prepared = prepare_embedding_inputs(texts, self.effective_max_input_tokens())?;
-        let prepared_refs = prepared
-            .iter()
-            .map(|input| input.text.as_str())
-            .collect::<Vec<_>>();
-        let batch_size = self.learned_batch_cap.load(Ordering::Acquire).max(1);
-        let mut segment_vectors = Vec::with_capacity(prepared.len());
-
-        for chunk in prepared_refs.chunks(batch_size) {
-            let vectors = self.embed_chunk_with_adaptive_batch(chunk).await?;
-            segment_vectors.extend(vectors.into_iter().map(|(_, vector)| vector));
-        }
-
-        if segment_vectors.len() != prepared.len() {
-            return Err(MemoryError::Store(format!(
-                "embedding API returned {} vectors for {} prepared inputs",
-                segment_vectors.len(),
-                prepared.len()
-            )));
-        }
-
-        let results = coalesce_embedding_segments(texts.len(), &prepared, segment_vectors)?;
-
-        // Update detected dimension from first result.
-        if let Some(vec) = results.first() {
-            let dim = vec.len();
-            let mut guard = self.detected_dimension.write().await;
-            match *guard {
-                Some(expected) if expected != dim => {
-                    return Err(MemoryError::InvalidArgument(format!(
-                        "embedding dimension mismatch: configured {expected}, provider returned {dim}"
-                    )));
-                }
-                Some(_) => {}
-                None => {
-                    *guard = Some(dim);
-                    debug!(dimension = dim, "auto-detected embedding dimension");
+        let mut segment_vectors: Vec<Option<Vec<f32>>> = vec![None; prepared.len()];
+        if let Some(store) = &self.progress_store {
+            let keys = prepared
+                .iter()
+                .map(|input| self.progress_key(&input.text))
+                .collect::<Vec<_>>();
+            let restored = store
+                .kv_get_many(&keys)
+                .await?
+                .into_iter()
+                .map(|record| (record.key, record.value))
+                .collect::<HashMap<_, _>>();
+            for (index, key) in keys.iter().enumerate() {
+                if let Some(raw) = restored.get(key) {
+                    let vector: Vec<f32> = serde_json::from_str(raw).map_err(|error| {
+                        MemoryError::Store(format!("invalid embedding checkpoint: {error}"))
+                    })?;
+                    self.validate_vectors(std::slice::from_ref(&vector)).await?;
+                    segment_vectors[index] = Some(vector);
                 }
             }
         }
-
-        Ok(results)
+        let batch_size = self.learned_batch_cap.load(Ordering::Acquire).max(1);
+        let missing = prepared
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| segment_vectors[*index].is_none())
+            .map(|(index, input)| (index, input.text.as_str()))
+            .collect::<Vec<_>>();
+        let mut failure = None;
+        for chunk in missing.chunks(batch_size) {
+            let refs = chunk.iter().map(|(_, text)| *text).collect::<Vec<_>>();
+            let (vectors, error) = self.embed_chunk_with_adaptive_batch(&refs).await;
+            for (index, vector) in vectors {
+                segment_vectors[chunk[index].0] = Some(vector);
+            }
+            if error.is_some() {
+                failure = error;
+                break;
+            }
+        }
+        let mut results = vec![None; texts.len()];
+        for (input_index, result) in results.iter_mut().enumerate() {
+            let segments = prepared
+                .iter()
+                .enumerate()
+                .filter(|(_, input)| input.original_index == input_index)
+                .map(|(index, _)| segment_vectors[index].clone())
+                .collect::<Option<Vec<_>>>();
+            if let Some(segments) = segments {
+                let single = prepare_embedding_inputs(
+                    &[texts[input_index]],
+                    self.effective_max_input_tokens(),
+                )?;
+                *result = coalesce_embedding_segments(1, &single, segments)?.pop();
+            }
+        }
+        Ok(PartialEmbeddings {
+            vectors: results,
+            error: failure,
+        })
     }
 
     fn effective_max_input_tokens(&self) -> usize {
@@ -274,7 +390,7 @@ impl EmbeddingClient {
     async fn embed_chunk_with_adaptive_batch(
         &self,
         chunk: &[&str],
-    ) -> Result<Vec<(usize, Vec<f32>)>, MemoryError> {
+    ) -> (Vec<(usize, Vec<f32>)>, Option<MemoryError>) {
         // Explicit work stack avoids recursive async (boxing) while keeping
         // input order deterministic.
         let cap = self.learned_batch_cap.load(Ordering::Acquire).max(1);
@@ -288,7 +404,26 @@ impl EmbeddingClient {
         while let Some((base, batch)) = pending.pop() {
             match self.embed_batch(&batch).await {
                 Ok(raw) => {
+                    if let Err(error) = self
+                        .validate_vectors(
+                            &raw.iter()
+                                .map(|(_, vector)| vector.clone())
+                                .collect::<Vec<_>>(),
+                        )
+                        .await
+                    {
+                        return (results, Some(error));
+                    }
                     for (index, (_, vector)) in raw.into_iter().enumerate() {
+                        if let Some(store) = &self.progress_store {
+                            let value = serde_json::to_string(&vector)
+                                .expect("finite embedding is serializable");
+                            if let Err(error) =
+                                store.kv_put(&self.progress_key(batch[index]), &value).await
+                            {
+                                return (results, Some(error));
+                            }
+                        }
                         results.push((base + index, vector));
                     }
                 }
@@ -303,11 +438,11 @@ impl EmbeddingClient {
                     pending.push((base + half, batch[half..].to_vec()));
                     pending.push((base, batch[..half].to_vec()));
                 }
-                Err(error) => return Err(error),
+                Err(error) => return (results, Some(error)),
             }
         }
         results.sort_by_key(|(index, _)| *index);
-        Ok(results)
+        (results, None)
     }
 
     /// Embed a single text string.
@@ -377,6 +512,9 @@ impl EmbeddingClient {
             }
         };
         let _request_guard = request_gate.lock().await;
+        if self.credentials_rejected.load(Ordering::Acquire) {
+            return Err(MemoryError::EmbeddingCredentialsRequired);
+        }
         if let Some((_, message)) = self
             .deterministic_failures
             .read()
@@ -391,14 +529,19 @@ impl EmbeddingClient {
         let api_url = self.config.api_url.clone();
         let api_key = self.config.api_key.clone();
         let http = self.http.clone();
+        let credentials_rejected = self.credentials_rejected.clone();
 
         let result = retry_with_backoff(EMBED_MAX_RETRIES, EMBED_RETRY_BASE_DELAY_MS, move || {
             let model = model.clone();
             let api_url = api_url.clone();
             let api_key = api_key.clone();
             let http = http.clone();
+            let credentials_rejected = credentials_rejected.clone();
             let texts = texts.to_vec();
             async move {
+                if credentials_rejected.load(Ordering::Acquire) {
+                    return Err(MemoryError::EmbeddingCredentialsRequired);
+                }
                 let body = EmbedRequest {
                     model: &model,
                     input: &texts,
@@ -419,6 +562,12 @@ impl EmbeddingClient {
 
                 if !response.status().is_success() {
                     let status = response.status();
+                    if status == reqwest::StatusCode::UNAUTHORIZED {
+                        credentials_rejected.store(true, Ordering::Release);
+                        // Authentication response bodies may echo credentials;
+                        // expose only the typed state, never their raw text.
+                        return Err(MemoryError::EmbeddingCredentialsRequired);
+                    }
                     let body_text = response.text().await.unwrap_or_default();
                     warn!(
                         status = %status,
@@ -702,7 +851,12 @@ where
             // A provider-declared batch limit is deterministic. Retrying the
             // same oversized payload only adds backoff and duplicate 400s;
             // return immediately so the adaptive caller can split it.
-            Err(e) if is_deterministic_request_rejection(&e) => return Err(e),
+            Err(e)
+                if is_deterministic_request_rejection(&e)
+                    || matches!(e, MemoryError::EmbeddingCredentialsRequired) =>
+            {
+                return Err(e)
+            }
             Err(e) => {
                 last_error = Some(e);
                 if attempt + 1 < max_retries {
@@ -723,12 +877,139 @@ where
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::VectorConfig;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    pub(crate) async fn partial_server() -> (
+        String,
+        Arc<AtomicBool>,
+        Arc<Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/embeddings", listener.local_addr().unwrap());
+        let fail = Arc::new(AtomicBool::new(true));
+        let inputs = Arc::new(Mutex::new(Vec::new()));
+        let observed_fail = fail.clone();
+        let observed_inputs = inputs.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request: serde_json::Value =
+                    serde_json::from_slice(&read_request_body(&mut socket).await).unwrap();
+                let texts = request["input"].as_array().unwrap();
+                let (status, body) = if texts.len() > 1 {
+                    (
+                        "400 Bad Request",
+                        serde_json::json!({"error": "batch size is invalid"}),
+                    )
+                } else if observed_fail.load(Ordering::Acquire)
+                    && texts[0].as_str().unwrap().contains("fail")
+                {
+                    (
+                        "400 Bad Request",
+                        serde_json::json!({"error": "invalid input"}),
+                    )
+                } else {
+                    observed_inputs
+                        .lock()
+                        .unwrap()
+                        .push(texts[0].as_str().unwrap().to_owned());
+                    (
+                        "200 OK",
+                        serde_json::json!({"data": [{"index": 0, "embedding": [1.0, 2.0]}]}),
+                    )
+                };
+                let body = body.to_string();
+                socket.write_all(format!("HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        (url, fail, inputs, server)
+    }
+
+    #[tokio::test]
+    async fn adaptive_partial_success_survives_client_restart_until_consumer_acknowledges() {
+        let (url, fail, inputs, server) = partial_server().await;
+        let store: Arc<dyn crate::store::MemoryStore> =
+            Arc::new(crate::store::EphemeralMemoryStore::default());
+        let config = VectorConfig {
+            enabled: true,
+            api_url: url,
+            model: "partial".into(),
+            dimension: 2,
+            batch_size: 2,
+            ..Default::default()
+        };
+        let client = EmbeddingClient::new(config.clone()).with_progress_store(store.clone());
+        let first = client.embed_partial(&["good", "fail"]).await.unwrap();
+        assert!(first.error.is_some());
+        assert_eq!(first.vectors, vec![Some(vec![1.0, 2.0]), None]);
+        assert_eq!(*inputs.lock().unwrap(), vec!["good"]);
+        assert_eq!(store.list_key_values().await.unwrap().len(), 1);
+        drop(client);
+        fail.store(false, Ordering::Release);
+        let restored = EmbeddingClient::new(config.clone()).with_progress_store(store.clone());
+        let second = restored.embed_partial(&["good", "fail"]).await.unwrap();
+        assert!(second.error.is_none());
+        assert!(second.vectors.iter().all(Option::is_some));
+        assert_eq!(*inputs.lock().unwrap(), vec!["good", "fail"]);
+        assert_eq!(store.list_key_values().await.unwrap().len(), 2);
+        // A different credential/model/content cannot consume an old checkpoint.
+        let changed = EmbeddingClient::new(VectorConfig {
+            api_key: "fixture-new-credential".into(),
+            ..config
+        })
+        .with_progress_store(store.clone());
+        changed.embed_partial(&["good"]).await.unwrap();
+        assert_eq!(inputs.lock().unwrap().len(), 3);
+        assert!(!store
+            .list_key_values()
+            .await
+            .unwrap()
+            .iter()
+            .any(|record| record.key.contains("fixture-new-credential")
+                || record.value.contains("fixture-new-credential")));
+        restored
+            .acknowledge_embeddings(&["good", "fail"])
+            .await
+            .unwrap();
+        changed.acknowledge_embeddings(&["good"]).await.unwrap();
+        assert!(store.list_key_values().await.unwrap().is_empty());
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn partial_segment_is_not_published_as_complete_input_and_corruption_fails_closed() {
+        let (url, _, inputs, server) = partial_server().await;
+        let store: Arc<dyn crate::store::MemoryStore> =
+            Arc::new(crate::store::EphemeralMemoryStore::default());
+        let client = EmbeddingClient::new(VectorConfig {
+            enabled: true,
+            api_url: url,
+            model: "segmented".into(),
+            dimension: 2,
+            batch_size: 2,
+            max_input_tokens: 5,
+            ..Default::default()
+        })
+        .with_progress_store(store.clone());
+        let partial = client.embed_partial(&["goodfail"]).await.unwrap();
+        assert!(partial.error.is_some());
+        assert_eq!(partial.vectors, vec![None]);
+        assert!(!inputs.lock().unwrap().is_empty());
+        store
+            .kv_put(&client.progress_key("good"), "[1.0]")
+            .await
+            .unwrap();
+        assert!(client.embed_partial(&["good"]).await.is_err());
+        server.abort();
+        let _ = server.await;
+    }
 
     async fn read_request_body(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -966,6 +1247,80 @@ mod tests {
 
         assert!(is_batch_size_rejection(&error));
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn authentication_failure_waits_for_new_credentials_without_batch_learning_or_retry() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_request_body(&mut stream).await;
+                observed.fetch_add(1, Ordering::SeqCst);
+                stream.write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await.unwrap();
+            }
+        });
+        let config = VectorConfig {
+            enabled: true,
+            model: "credential-route".into(),
+            api_url: format!("http://{address}/embeddings"),
+            dimension: 2,
+            batch_size: 10,
+            ..VectorConfig::default()
+        };
+        let client = EmbeddingClient::new(config.clone());
+        for texts in [&["a", "b"][..], &["different"]] {
+            assert!(matches!(
+                client.clone().embed(texts).await,
+                Err(MemoryError::EmbeddingCredentialsRequired)
+            ));
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "same route waits rather than replaying 401"
+        );
+        assert_eq!(client.learned_batch_cap.load(Ordering::Acquire), 10);
+        assert!(client.deterministic_failures.read().await.is_empty());
+        let replacement = EmbeddingClient::new(VectorConfig {
+            api_key: "synthetic-updated-credential".into(),
+            ..config
+        });
+        assert!(matches!(
+            replacement.embed(&["a"]).await,
+            Err(MemoryError::EmbeddingCredentialsRequired)
+        ));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "new configuration may verify its credential once"
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn transient_rate_limit_and_server_errors_keep_the_bounded_retry_policy() {
+        for status in [429, 500, 503] {
+            let calls = AtomicUsize::new(0);
+            let result = retry_with_backoff(3, 0, || {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if call < 2 {
+                        Err(MemoryError::Store(format!("embedding API error {status}")))
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .await;
+            assert!(result.is_ok());
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+        }
     }
 
     #[tokio::test]

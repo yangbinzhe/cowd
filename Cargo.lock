@@ -1723,6 +1723,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "session",
+ "sha2 0.10.9",
  "storage",
  "tempfile",
  "thiserror",
@@ -2567,6 +2568,7 @@ dependencies = [
  "matrix-core",
  "matrix-repository",
  "memory",
+ "memory-postgres",
  "model-protocol",
  "plugins",
  "provider",
@@ -2596,6 +2598,7 @@ dependencies = [
 name = "runtime-postgres"
 version = "0.9.724"
 dependencies = [
+ "async-trait",
  "harness-contract",
  "postgres",
  "runtime",

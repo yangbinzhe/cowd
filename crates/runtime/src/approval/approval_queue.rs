@@ -979,6 +979,57 @@ impl ApprovalQueue {
             .or_else(|| restore_approval_request(&self.event_store, approval_id))
     }
 
+    /// A result is a decided journal fact, not a cached pending request or a
+    /// grant to declare the user's objective complete.
+    pub fn decision_result_snapshot(
+        &self,
+        session_id: &str,
+        approval_id: &str,
+    ) -> Result<(GlobalApprovalRequest, crate::ExpectedStreamRevision), String> {
+        let stream_id = format!("approval:{approval_id}");
+        let revision = self
+            .event_store
+            .stream_revision(&stream_id)
+            .map_err(|error| error.to_string())?;
+        let request = restore_approval_request(&self.event_store, approval_id)
+            .ok_or("external decision does not have a readable durable source")?;
+        if self
+            .event_store
+            .stream_revision(&stream_id)
+            .map_err(|error| error.to_string())?
+            != revision
+        {
+            return Err("external decision changed during retrieval; retry".into());
+        }
+        if request.source.session_id.as_deref() != Some(session_id)
+            || request.context.session_id.as_deref() != Some(session_id)
+        {
+            return Err("external decision is outside the authenticated Session".into());
+        }
+        let decision = request
+            .decision
+            .as_ref()
+            .ok_or("external decision is pending or unavailable")?;
+        if !matches!(
+            request.status,
+            ApprovalStatus::Approved | ApprovalStatus::Denied
+        ) || !matches!(
+            decision.actor.kind,
+            ApprovalDecisionActorKind::Human | ApprovalDecisionActorKind::Policy
+        ) || decision.actor.actor_id.trim().is_empty()
+            || (request.status == ApprovalStatus::Approved) != decision.approved
+        {
+            return Err("external result requires a current Human or Policy decision".into());
+        }
+        Ok((
+            request,
+            crate::ExpectedStreamRevision {
+                stream_id,
+                expected_revision: revision,
+            },
+        ))
+    }
+
     #[must_use]
     pub fn pending(&self) -> Vec<GlobalApprovalRequest> {
         self.requests
@@ -1961,6 +2012,50 @@ mod tests {
             evidence_refs: vec!["test.approval".to_string()],
             timeout_policy: ApprovalTimeoutPolicy::AutoDeny,
         }
+    }
+
+    #[test]
+    fn external_decision_snapshot_uses_the_journal_and_preserves_human_denial() {
+        let queue = queue();
+        let id = "external-decision-source";
+        queue
+            .submit_scoped(id, pending_request("decide proposed work"))
+            .unwrap();
+        assert!(queue
+            .decision_result_snapshot("session-approval", id)
+            .is_err());
+        let cold = ApprovalQueue::new(Arc::clone(&queue.event_store));
+        queue
+            .decide_surface_human("operator:verified", human_decision(id, false, "do not run"))
+            .unwrap();
+        // `cold` still has a pending hot entry; a result must read durable truth.
+        let (decision, source) = cold
+            .decision_result_snapshot("session-approval", id)
+            .unwrap();
+        assert_eq!(decision.status, ApprovalStatus::Denied);
+        assert_eq!(
+            decision.decision.as_ref().unwrap().actor.actor_id,
+            "operator:verified"
+        );
+        assert!(!decision.decision.as_ref().unwrap().approved);
+        assert_eq!(
+            source.expected_revision,
+            queue
+                .event_store
+                .stream_revision(&source.stream_id)
+                .unwrap()
+        );
+        assert!(cold
+            .decision_result_snapshot("foreign-session", id)
+            .is_err());
+        let restarted = ApprovalQueue::new(Arc::clone(&queue.event_store));
+        assert_eq!(
+            restarted
+                .decision_result_snapshot("session-approval", id)
+                .unwrap()
+                .0,
+            decision
+        );
     }
 
     #[test]

@@ -167,6 +167,10 @@ where
             .unwrap_or_default()
     }
 
+    pub(crate) fn bind_skill_task_objective(&mut self, objective: String) {
+        self.skill_task_objective = Some(objective);
+    }
+
     pub(super) async fn activate_skills_for_turn(
         &self,
         user_input: &str,
@@ -179,139 +183,174 @@ where
         }
 
         let turn_index = self.session_head().await.message_count;
-        let activation = SkillActivationEngine::activate(SkillActivationInput {
+        let decision = SkillActivationEngine::activate(SkillActivationInput {
             session_id: self.session_id().to_string(),
             turn_index,
-            query: user_input.to_string(),
+            query: self.skill_task_objective.as_ref().map_or_else(
+                || user_input.to_string(),
+                |objective| format!("{objective}\n\n{user_input}"),
+            ),
             capability_refs: Vec::new(),
             available_profiles: self.skill_profiles.clone(),
             agent_profile: self.agent_skill_profile.clone(),
         });
 
-        if let Some(invocation) = activation.selected_invocation.as_ref() {
-            let strategy = self.active_turn_strategy().ok_or_else(|| {
-                RuntimeError::new("Skill invocation requires the Host-admitted turn strategy owner")
-            })?;
-            let evaluation_isolated = strategy.resource_snapshot.sample_source.contains("corpus=");
-            let config_revision = if evaluation_isolated {
-                format!(
-                    "{}:evaluation:{:016x}",
-                    self.runtime_config_revision,
-                    model_protocol::fingerprint::stable_hash_bytes(
-                        strategy.resource_snapshot.sample_source.as_bytes(),
+        // Prepare the complete requested set before publishing any prompt or
+        // tool exposure. A missing later Skill must not leave ghost input for
+        // the next Provider attempt.
+        let mut prepared_items = Vec::new();
+        let mut prepared_tools = Vec::new();
+        for activation in &decision.activations {
+            if let Some(invocation) = activation.selected_invocation.as_ref() {
+                let strategy = self.active_turn_strategy().ok_or_else(|| {
+                    RuntimeError::new(
+                        "Skill invocation requires the Host-admitted turn strategy owner",
                     )
-                )
-            } else {
-                self.runtime_config_revision.clone()
-            };
-            let usage_context = crate::RuntimeSkillUsageContext {
-                workspace_identity: self.checkpoint_workspace_id.clone(),
-                workload_fingerprint: StrategyWorkloadFingerprint::from_understanding(
-                    &strategy.decision.strategy.understanding,
-                    strategy.decision.strategy.understanding.requires_write,
-                )
-                .digest(),
-                config_revision,
-                evaluation_environment: if evaluation_isolated {
-                    "harness_evaluation".to_string()
+                })?;
+                let evaluation_isolated =
+                    strategy.resource_snapshot.sample_source.contains("corpus=");
+                let config_revision = if evaluation_isolated {
+                    format!(
+                        "{}:evaluation:{:016x}",
+                        self.runtime_config_revision,
+                        model_protocol::fingerprint::stable_hash_bytes(
+                            strategy.resource_snapshot.sample_source.as_bytes(),
+                        )
+                    )
                 } else {
-                    "production".to_string()
-                },
-                execution_id: format!("turn:{}", strategy.decision_id),
-                session_id: strategy.session_ref.clone(),
-                turn_id: strategy.turn_ref.clone(),
-                observed_at_ms: now_ms(),
-            };
-            let asset = match self.skill_instruction_source.as_ref() {
-                Some(source) => source
-                    .load_instruction(invocation, &usage_context)
-                    .await
-                    .map_err(|error| {
-                        RuntimeError::new(format!(
-                            "runtime skill `{}` instruction page-in failed: {error}",
-                            invocation.skill_id
-                        ))
-                    })?,
-                None => self
-                    .skill_prompt_assets
-                    .iter()
-                    .find(|asset| asset.skill_id == invocation.skill_id)
-                    .cloned(),
-            };
-            if let Some(asset) = asset {
-                if let Ok(mut tool_refs) = self.active_skill_tool_refs.lock() {
-                    tool_refs.extend(asset.tool_refs.iter().cloned());
+                    self.runtime_config_revision.clone()
+                };
+                let usage_context = crate::RuntimeSkillUsageContext {
+                    workspace_identity: self.checkpoint_workspace_id.clone(),
+                    workload_fingerprint: StrategyWorkloadFingerprint::from_understanding(
+                        &strategy.decision.strategy.understanding,
+                        strategy.decision.strategy.understanding.requires_write,
+                    )
+                    .digest(),
+                    config_revision,
+                    evaluation_environment: if evaluation_isolated {
+                        "harness_evaluation".to_string()
+                    } else {
+                        "production".to_string()
+                    },
+                    execution_id: format!("turn:{}", strategy.decision_id),
+                    session_id: strategy.session_ref.clone(),
+                    turn_id: strategy.turn_ref.clone(),
+                    observed_at_ms: now_ms(),
+                };
+                let asset = match self.skill_instruction_source.as_ref() {
+                    Some(source) => source
+                        .load_instruction(invocation, &usage_context)
+                        .await
+                        .map_err(|error| {
+                            RuntimeError::new(format!(
+                                "runtime skill `{}` instruction page-in failed: {error}",
+                                invocation.skill_id
+                            ))
+                        })?,
+                    None => self
+                        .skill_prompt_assets
+                        .iter()
+                        .find(|asset| asset.skill_id == invocation.skill_id)
+                        .cloned(),
+                };
+                if asset.is_none()
+                    && invocation.adapter == harness_contract::skill::SkillAdapterKind::PromptOnly
+                {
+                    return Err(RuntimeError::new(format!(
+                        "runtime skill `{}` has no instruction asset for version {:?}",
+                        invocation.skill_id, invocation.skill_version
+                    )));
                 }
-                let mut item = ContextItem::new(
-                    format!(
-                        "runtime-skill:{}:{}",
-                        asset.skill_id, activation.activation.turn_index
-                    ),
-                    ContextSourceKind::Task,
-                    ContextRole::Instruction,
-                    format!(
-                        "# Activated skill: {}\nversion: {}\nsource: {}\n\n{}",
-                        asset.skill_id,
-                        asset.version.as_deref().unwrap_or("unversioned"),
-                        asset.source_ref,
-                        asset.content
-                    ),
-                );
-                item.authority = ContextAuthority::Project;
-                item.source_id = Some(format!("skill:{}", asset.skill_id));
-                item.source_version = asset.version.clone();
-                item.source_reason = Some("runtime selected prompt-only skill".to_string());
-                item.evidence = vec![asset.source_ref.clone()];
-                self.push_next_model_context_item(item);
+                if let Some(asset) = asset {
+                    if asset.skill_id != invocation.skill_id
+                        || asset.version != invocation.skill_version
+                    {
+                        return Err(RuntimeError::new(format!(
+                            "runtime skill `{}` instruction identity/version mismatch",
+                            invocation.skill_id
+                        )));
+                    }
+                    prepared_tools.extend(asset.tool_refs.iter().cloned());
+                    let mut item = ContextItem::new(
+                        format!(
+                            "runtime-skill:{}:{}",
+                            asset.skill_id, activation.activation.turn_index
+                        ),
+                        ContextSourceKind::Task,
+                        ContextRole::Instruction,
+                        format!(
+                            "# Activated skill: {}\nversion: {}\nsource: {}\n\n{}",
+                            asset.skill_id,
+                            asset.version.as_deref().unwrap_or("unversioned"),
+                            asset.source_ref,
+                            asset.content
+                        ),
+                    );
+                    item.authority = ContextAuthority::Project;
+                    item.source_id = Some(format!("skill:{}", asset.skill_id));
+                    item.source_version = asset.version.clone();
+                    item.source_reason = Some("runtime selected prompt-only skill".to_string());
+                    item.evidence = vec![asset.source_ref.clone()];
+                    prepared_items.push(item);
+                }
             }
         }
 
-        if activation.activation.selected.is_some() {
-            self.append_execution_runtime_event(
-                RuntimeEventScope::Skill,
-                "skill.activation.selected",
-                Some("completed".to_string()),
-                activation
-                    .activation
-                    .selected
-                    .iter()
-                    .map(|skill_id| RuntimeEventRef {
-                        kind: "skill".to_string(),
-                        id: skill_id.clone(),
-                    })
-                    .collect(),
-                serde_json::to_value(&activation.activation).unwrap_or_else(
-                    |error| serde_json::json!({ "serialization_error": error.to_string() }),
-                ),
-            );
-        }
+        for activation in &decision.activations {
+            if activation.activation.selected.is_some() {
+                self.append_execution_runtime_event(
+                    RuntimeEventScope::Skill,
+                    "skill.activation.selected",
+                    Some("completed".to_string()),
+                    activation
+                        .activation
+                        .selected
+                        .iter()
+                        .map(|skill_id| RuntimeEventRef {
+                            kind: "skill".to_string(),
+                            id: skill_id.clone(),
+                        })
+                        .collect(),
+                    serde_json::to_value(&activation.activation).unwrap_or_else(
+                        |error| serde_json::json!({ "serialization_error": error.to_string() }),
+                    ),
+                );
+            }
 
-        let Some(port) = self.session_journal_port.as_ref() else {
-            return Ok(());
-        };
-        let activation_event = activation.activation.to_runtime_session_event(0);
-        port.append_event(&activation_event)
-            .await
-            .map_err(|error| {
-                RuntimeError::new(format!(
-                    "runtime skill activation persistence failed for session {}: {error}",
-                    activation.activation.session_id
-                ))
-            })?;
-        if let Some(candidate) = memory_candidate_from_skill_activation(
-            &activation.activation,
-            &SkillMemoryPolicy::default(),
-        ) {
-            if let Some(event) =
-                skill_memory_candidate_session_event(&activation.activation, &candidate, 0)
-            {
-                port.append_event(&event).await.map_err(|error| {
+            let Some(port) = self.session_journal_port.as_ref() else {
+                continue;
+            };
+            let activation_event = activation.activation.to_runtime_session_event(0);
+            port.append_event(&activation_event)
+                .await
+                .map_err(|error| {
                     RuntimeError::new(format!(
-                        "runtime skill memory bridge persistence failed for session {}: {error}",
+                        "runtime skill activation persistence failed for session {}: {error}",
                         activation.activation.session_id
                     ))
                 })?;
+            if let Some(candidate) = memory_candidate_from_skill_activation(
+                &activation.activation,
+                &SkillMemoryPolicy::default(),
+            ) {
+                if let Some(event) =
+                    skill_memory_candidate_session_event(&activation.activation, &candidate, 0)
+                {
+                    port.append_event(&event).await.map_err(|error| {
+                        RuntimeError::new(format!(
+                        "runtime skill memory bridge persistence failed for session {}: {error}",
+                        activation.activation.session_id
+                    ))
+                    })?;
+                }
             }
+        }
+        if let Ok(mut tool_refs) = self.active_skill_tool_refs.lock() {
+            tool_refs.extend(prepared_tools);
+        }
+        for item in prepared_items {
+            self.push_next_model_context_item(item);
         }
         Ok(())
     }

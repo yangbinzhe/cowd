@@ -1547,6 +1547,69 @@ agent_executor_commands:
 }
 
 #[test]
+fn process_transport_limits_are_operator_owned_validated_and_manifest_bound() {
+    use super::{parse_trusted_agent_executor_commands, AgentProcessTransportLimits};
+    let parse = |limits: serde_json::Value, source| {
+        let value = JsonValue::parse(
+            &serde_json::json!({"agent_executor_commands": {
+                "worker": {"executable":"worker", "transport_limits":limits}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        parse_trusted_agent_executor_commands(
+            source,
+            value.as_object().unwrap(),
+            Path::new("fixture-config"),
+        )
+    };
+    let default = parse(serde_json::json!({}), ConfigSource::User)
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        default.transport_limits,
+        AgentProcessTransportLimits::default()
+    );
+    let limits = serde_json::json!({"frame_bytes":131072,"content_chunk_bytes":49152,
+        "pending_uploads":2,"pending_commands":3,"cached_tool_responses":2,
+        "stderr_tail_bytes":1024,"handshake_timeout_ms":2000});
+    let configured = parse(limits.clone(), ConfigSource::User).unwrap().remove(0);
+    assert_ne!(configured.manifest_digest, default.manifest_digest);
+    assert_eq!(configured.transport_limits.pending_commands, 3);
+    let spec = crate::agent_process_jsonl_adapter::ProcessJsonlSpec::from_config(&configured);
+    assert_eq!(spec.command_digest, configured.manifest_digest);
+    assert_eq!(spec.transport_limits, configured.transport_limits);
+    assert!(parse(limits, ConfigSource::Project).is_err());
+    for field in [
+        "frame_bytes",
+        "content_chunk_bytes",
+        "pending_uploads",
+        "pending_commands",
+        "cached_tool_responses",
+        "stderr_tail_bytes",
+        "handshake_timeout_ms",
+    ] {
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!("32"),
+        ] {
+            let mut value = serde_json::json!({});
+            value[field] = invalid;
+            assert!(parse(value, ConfigSource::User).is_err(), "{field}");
+        }
+    }
+    for invalid in [
+        serde_json::json!({"unknown":1}),
+        serde_json::json!({"pending_commands":1025}),
+        serde_json::json!({"frame_bytes":1,"content_chunk_bytes":2}),
+        serde_json::json!({"handshake_timeout_ms":600001}),
+    ] {
+        assert!(parse(invalid, ConfigSource::User).is_err());
+    }
+}
+
+#[test]
 fn gateway_webui_dir_reads_configured_static_asset_dir() {
     let root = temp_dir();
     let cwd = root.join("project");

@@ -26,8 +26,8 @@ use memory::{
 use postgres::{types::ToSql, Row};
 use serde::{de::DeserializeOwned, Serialize};
 use storage::{
-    PostgresClient, PostgresConnectionConfig, PostgresExecutor, PostgresMigrationSpec,
-    PostgresTransaction, SecretRefResolver,
+    PostgresClient, PostgresConnectionConfig, PostgresExecutor, PostgresMigrationMode,
+    PostgresMigrationSpec, PostgresTransaction, SecretRefResolver,
 };
 
 const MEMORY_DOMAIN: &str = "memory";
@@ -361,7 +361,9 @@ impl PostgresMemoryStore {
                     .apply_migrations(MEMORY_DOMAIN, MEMORY_MIGRATIONS)
                     .map_err(storage_memory_error)?;
                 let store = Self { executor };
-                store.backfill_authority_fingerprints()?;
+                if store.executor.migration_mode() == PostgresMigrationMode::Maintenance {
+                    store.backfill_authority_fingerprints()?;
+                }
                 Ok(store)
             },
             || MemoryError::Store("PostgreSQL memory initialization thread panicked".to_string()),
@@ -380,7 +382,9 @@ impl PostgresMemoryStore {
                     .apply_migrations(MEMORY_DOMAIN, MEMORY_MIGRATIONS)
                     .map_err(storage_memory_error)?;
                 let store = Self { executor };
-                store.backfill_authority_fingerprints()?;
+                if store.executor.migration_mode() == PostgresMigrationMode::Maintenance {
+                    store.backfill_authority_fingerprints()?;
+                }
                 Ok(store)
             },
             || MemoryError::Store("PostgreSQL memory connection thread panicked".to_string()),
@@ -832,11 +836,23 @@ impl MemoryStore for PostgresMemoryStore {
         run_memory_blocking(move || {
             let scope = query.scope.scope_key();
             let limit = limit_i64(query.limit.clamp(1, 256))?;
+            let visibility = serde_json::to_value(&query.visibility)
+                .map_err(|error| MemoryError::Store(error.to_string()))?;
+            let private = matches!(query.visibility, memory::AgentVisibility::Private);
             store.entries(
                 "SELECT payload FROM memory_entries
                   WHERE scope_key=$1 AND authority_fingerprint=$2
+                    AND payload->'visibility'=$4::jsonb
+                    AND (NOT $5::boolean OR ($6::text IS NOT NULL AND source_agent=$6))
                   ORDER BY updated_at DESC,id ASC LIMIT $3",
-                &[&scope, &query.fingerprint, &limit],
+                &[
+                    &scope,
+                    &query.fingerprint,
+                    &limit,
+                    &visibility,
+                    &private,
+                    &query.source_agent,
+                ],
             )
         })
         .await
@@ -1213,6 +1229,21 @@ impl MemoryStore for PostgresMemoryStore {
             connection.execute("INSERT INTO memory_kv(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", &[&key,&value]).map_err(postgres_memory_error)?;
             Ok(())
         }).await
+    }
+    async fn kv_delete(&self, key: &str) -> MemoryResult<()> {
+        let store = self.clone();
+        let key = key.to_string();
+        run_memory_blocking(move || {
+            let mut connection = store
+                .executor
+                .checkout_critical()
+                .map_err(storage_memory_error)?;
+            connection
+                .execute("DELETE FROM memory_kv WHERE key=$1", &[&key])
+                .map_err(postgres_memory_error)?;
+            Ok(())
+        })
+        .await
     }
     async fn kv_get(&self, key: &str) -> MemoryResult<Option<String>> {
         let store = self.clone();

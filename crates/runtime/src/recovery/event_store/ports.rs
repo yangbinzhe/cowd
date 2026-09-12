@@ -622,6 +622,17 @@ pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync {
         payload: &serde_json::Value,
         updated_at_ms: u64,
     ) -> RuntimeEventStoreResult<RuntimeProjectionCheckpoint>;
+    /// Replace a damaged derived checkpoint with a journal-rebuilt value.
+    /// Unlike ordinary CAS this permits source-cursor correction, but MUST
+    /// fence the existing revision and increment it (never delete/recreate).
+    fn compare_and_repair_projection_checkpoint(
+        &self,
+        projection_id: &str,
+        source_cursor: u64,
+        expected_revision: u64,
+        payload: &serde_json::Value,
+        updated_at_ms: u64,
+    ) -> RuntimeEventStoreResult<RuntimeProjectionCheckpoint>;
     fn delete_projection_checkpoint(&self, projection_id: &str) -> RuntimeEventStoreResult<bool>;
     fn event_by_idempotency_key(
         &self,

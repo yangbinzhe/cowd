@@ -3,6 +3,97 @@ use crate::config::{BudgetConfig, MemoryConfig};
 use crate::types::MemoryLayer;
 use crate::write_guard::WriteSource;
 
+#[tokio::test]
+async fn partial_embedding_is_persisted_by_real_index_before_failure_and_resumes_missing_only() {
+    let (url, fail, inputs, server) = crate::embedding::tests::partial_server().await;
+    let store: Arc<dyn MemoryStore> = Arc::new(crate::store::EphemeralMemoryStore::default());
+    let config = crate::config::VectorConfig {
+        enabled: true,
+        api_url: url,
+        model: "partial-index".into(),
+        dimension: 2,
+        batch_size: 2,
+        ..Default::default()
+    };
+    let capability = EmbeddingCapability::Remote {
+        client: crate::embedding::EmbeddingClient::new(config.clone())
+            .with_progress_store(store.clone()),
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("index.json");
+    let first_id = MemoryId::new_v4();
+    let second_id = MemoryId::new_v4();
+    let index = RwLock::new(VectorIndex::new(path.clone(), 2).unwrap());
+    assert!(embed_memory_entries(
+        &capability,
+        &index,
+        &[(first_id, "good".into()), (second_id, "fail".into())]
+    )
+    .await
+    .is_err());
+    drop(index);
+    let restored = RwLock::new(VectorIndex::load(path, 2).unwrap());
+    assert!(restored.read().contains(&first_id));
+    assert!(!restored.read().contains(&second_id));
+    assert!(
+        store.list_key_values().await.unwrap().is_empty(),
+        "only downstream-persisted success was acknowledged"
+    );
+    fail.store(false, Ordering::Release);
+    let capability = EmbeddingCapability::Remote {
+        client: crate::embedding::EmbeddingClient::new(config).with_progress_store(store.clone()),
+    };
+    assert_eq!(
+        embed_memory_entries(&capability, &restored, &[(second_id, "fail".into())])
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(*inputs.lock().unwrap(), vec!["good", "fail"]);
+    assert!(restored.read().contains(&second_id));
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn index_persistence_failure_keeps_embedding_checkpoint_for_restart() {
+    let (url, _, inputs, server) = crate::embedding::tests::partial_server().await;
+    let store: Arc<dyn MemoryStore> = Arc::new(crate::store::EphemeralMemoryStore::default());
+    let config = crate::config::VectorConfig {
+        enabled: true,
+        api_url: url,
+        model: "index-fault".into(),
+        dimension: 2,
+        ..Default::default()
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let blocked_path = temp.path().join("blocked");
+    std::fs::create_dir(&blocked_path).unwrap();
+    let capability = EmbeddingCapability::Remote {
+        client: crate::embedding::EmbeddingClient::new(config.clone())
+            .with_progress_store(store.clone()),
+    };
+    let id = MemoryId::new_v4();
+    let index = RwLock::new(VectorIndex::new(blocked_path, 2).unwrap());
+    assert!(
+        embed_memory_entries(&capability, &index, &[(id, "good".into())])
+            .await
+            .is_err()
+    );
+    assert_eq!(store.list_key_values().await.unwrap().len(), 1);
+    let restored = RwLock::new(VectorIndex::new(temp.path().join("recovered.json"), 2).unwrap());
+    let capability = EmbeddingCapability::Remote {
+        client: crate::embedding::EmbeddingClient::new(config).with_progress_store(store.clone()),
+    };
+    embed_memory_entries(&capability, &restored, &[(id, "good".into())])
+        .await
+        .unwrap();
+    assert_eq!(*inputs.lock().unwrap(), vec!["good"]);
+    assert!(store.list_key_values().await.unwrap().is_empty());
+    server.abort();
+    let _ = server.await;
+}
+
 fn test_config() -> MemoryConfig {
     MemoryConfig {
         budget: BudgetConfig {

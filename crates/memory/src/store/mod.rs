@@ -112,6 +112,10 @@ pub struct MemoryKeyValue {
 pub struct AuthorityLookup {
     pub fingerprint: String,
     pub scope: MemoryScope,
+    /// Conflict/deduplication cannot cross a visibility domain.
+    pub visibility: crate::types::AgentVisibility,
+    /// Private candidates must have the same source Agent before applying LIMIT.
+    pub source_agent: Option<String>,
     pub limit: usize,
 }
 
@@ -378,6 +382,9 @@ pub trait MemoryStore: Send + Sync {
 
     /// Retrieve a value by key. Returns None if key does not exist.
     async fn kv_get(&self, key: &str) -> Result<Option<String>>;
+
+    /// Delete an acknowledged auxiliary record. Missing keys are a no-op.
+    async fn kv_delete(&self, key: &str) -> Result<()>;
 
     /// Enumerate all durable auxiliary values for a quiesced migration. This
     /// is not intended for request-path cache access.

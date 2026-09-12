@@ -593,6 +593,9 @@ impl crate::store::MemoryStore for NoopStore {
     async fn kv_get(&self, _key: &str) -> crate::store::Result<Option<String>> {
         Self::unavailable()
     }
+    async fn kv_delete(&self, _key: &str) -> crate::store::Result<()> {
+        Self::unavailable()
+    }
     async fn list_key_values(&self) -> crate::store::Result<Vec<crate::store::MemoryKeyValue>> {
         Self::unavailable()
     }

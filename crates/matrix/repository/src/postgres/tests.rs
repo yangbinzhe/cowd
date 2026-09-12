@@ -1,11 +1,13 @@
-use std::env;
+#[path = "../../../../storage/test-support/postgres_scope.rs"]
+mod postgres_scope;
+use postgres_scope::PostgresTestScope;
 
 use matrix_core::{
     MatrixComputeJobInput, MatrixDataPlaneIngestPlanInput, MatrixEntityInput, MatrixFactInput,
     MatrixMetricDependencyInput, MatrixSourceEntityMapping, MatrixSourceKey,
     MatrixSourceRelationMapping,
 };
-use storage::{StaticSecretRefResolver, StorageDomainId, StorageEndpoint, StorageScope};
+use storage::{StorageDomainId, StorageEndpoint, StorageScope};
 
 use super::*;
 use crate::MatrixRecallQuery;
@@ -13,17 +15,9 @@ use crate::MatrixRecallQuery;
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 fn real_postgres_bounded_recall_matches_authorization_order_and_limit_contract() {
-    let url = env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
-    let resolver = StaticSecretRefResolver::new([("matrix.pg.recall".to_string(), url)]);
-    let repository = PostgresMatrixRepository::connect(
-        PostgresConnectionConfig::new(
-            "matrix-postgres-recall-test",
-            "matrix.pg.recall",
-            "cowd-matrix-postgres-recall-contract",
-        ),
-        &resolver,
-    )
-    .expect("postgres repository opens");
+    let fixture = PostgresTestScope::new();
+    let repository =
+        PostgresMatrixRepository::new(fixture.reconnect()).expect("postgres repository opens");
     for (id, snapshot, confidence) in [
         ("matrix-pg-recall-low", "snapshot-pg-authorized", 0.8),
         ("matrix-pg-recall-high", "snapshot-pg-authorized", 0.95),
@@ -61,17 +55,8 @@ fn real_postgres_bounded_recall_matches_authorization_order_and_limit_contract()
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 fn real_postgres_adapter_preserves_matrix_state_and_metric_semantics() {
-    let url = env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
-    let resolver = StaticSecretRefResolver::new([("matrix.pg.test".to_string(), url)]);
-    let target = PostgresMatrixRepository::connect(
-        PostgresConnectionConfig::new(
-            "matrix-postgres-integration-test",
-            "matrix.pg.test",
-            "cowd-matrix-postgres-contract",
-        ),
-        &resolver,
-    )
-    .expect("postgres target opens");
+    let fixture = PostgresTestScope::new();
+    let target = PostgresMatrixRepository::new(fixture.reconnect()).expect("postgres target opens");
     let source = target.clone();
     let entity = source
         .upsert_entity(&MatrixEntity::from_input(MatrixEntityInput {

@@ -1505,6 +1505,8 @@ impl MemoryKernel {
             .authority_candidates(AuthorityLookup {
                 fingerprint: incoming_key.clone(),
                 scope: incoming.scope.clone(),
+                visibility: incoming.visibility.clone(),
+                source_agent: incoming.source_agent.clone(),
                 limit: 64,
             })
             .await?;
@@ -1754,6 +1756,22 @@ pub(crate) fn default_scope_for_ctx(ctx: &MemoryTurnContext) -> MemoryScope {
 }
 
 fn memory_entry_visible_to_ctx(entry: &MemoryEntry, ctx: &MemoryTurnContext) -> bool {
+    let visibility_granted = match &entry.visibility {
+        AgentVisibility::Private => {
+            entry.source_agent.as_deref() == Some(ctx.agent_id.as_str())
+                || matches!(&entry.scope, MemoryScope::AgentInstance(owner) if owner == &ctx.agent_id)
+        }
+        AgentVisibility::TeamScoped(team) => {
+            ctx.team_id.as_deref() == Some(team.as_str())
+                && ctx
+                    .cognitive_read_scopes
+                    .contains(&harness_contract::agent::CognitiveReadScope::Team)
+        }
+        AgentVisibility::Shared => true,
+    };
+    if !visibility_granted {
+        return false;
+    }
     // Historic extraction treated every UserPreference as globally readable.
     // A private inferred topic preference is not workspace-wide authority even
     // when an older row already carries `scope=global`.
@@ -2829,5 +2847,34 @@ mod tests {
             .iter()
             .all(|id| entries_after_replay.iter().any(|entry| entry.id == *id)));
         assert!(second.memory_ids.is_empty() || second.memory_ids == first.memory_ids);
+    }
+    #[test]
+    fn private_and_team_visibility_require_the_current_agent_or_team_lease() {
+        use harness_contract::agent::CognitiveReadScope;
+        let owner =
+            MemoryTurnContext::new("same-session", "owner").with_project_id(Some("cowd".into()));
+        let other =
+            MemoryTurnContext::new("same-session", "other").with_project_id(Some("cowd".into()));
+        let mut entry = memory_entry("private", "private source", 0.0, 1.0, 0);
+        entry.source_agent = Some("owner".into());
+        entry.visibility = AgentVisibility::Private;
+        assert!(memory_entry_visible_to_ctx(&entry, &owner));
+        assert!(!memory_entry_visible_to_ctx(&entry, &other));
+        entry.source_agent = None;
+        assert!(!memory_entry_visible_to_ctx(&entry, &owner));
+        entry.visibility = AgentVisibility::Shared;
+        assert!(memory_entry_visible_to_ctx(&entry, &other));
+        entry.visibility = AgentVisibility::TeamScoped("team-a".into());
+        assert!(!memory_entry_visible_to_ctx(&entry, &owner));
+        let joined = owner
+            .clone()
+            .with_team_id(Some("team-a".into()))
+            .with_cognitive_read_scopes(vec![
+                CognitiveReadScope::Project,
+                CognitiveReadScope::Team,
+            ]);
+        assert!(memory_entry_visible_to_ctx(&entry, &joined));
+        let revoked = joined.with_cognitive_read_scopes(vec![CognitiveReadScope::Project]);
+        assert!(!memory_entry_visible_to_ctx(&entry, &revoked));
     }
 }

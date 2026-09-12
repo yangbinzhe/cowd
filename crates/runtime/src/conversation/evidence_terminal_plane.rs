@@ -170,20 +170,30 @@ where
             plan.source_message_start,
             plan.source_message_end,
         );
-        let raw_refs = source_message_evidence_refs(
-            &original_session.session_id,
-            &original_messages,
-            plan.source_message_start,
-            plan.source_message_end,
-        );
-        let checkpoint = if self.semantic_checkpoint_enabled && !source_messages.is_empty() {
+        let records = original_messages
+            .iter()
+            .map(ConversationMessage::to_persisted_json)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                RuntimeError::new(format!(
+                    "compaction raw serialization failed; transcript retained: {error}"
+                ))
+            })?;
+        let raw_payload = crate::JsonValue::Array(records).render();
+        let source_hash = format!("{:x}", Sha256::digest(raw_payload.as_bytes()));
+        let access = self
+            .persist_compaction_raw_window(&source_hash, raw_payload)
+            .await?;
+        let raw_refs = vec![access.evidence_ref.clone()];
+        let mut checkpoint = if self.semantic_checkpoint_enabled && !source_messages.is_empty() {
             let mem_messages = conversation_messages_to_mem_messages(source_messages);
             let source_range = CompactionSourceRange {
                 session_id: original_session.session_id.clone(),
                 message_start: plan.source_message_start,
                 message_end_exclusive: plan.source_message_end,
-                event_start: Some(plan.source_message_start),
-                event_end_exclusive: Some(plan.source_message_end),
+                // These are working-window positions, never durable journal sequences.
+                event_start: None,
+                event_end_exclusive: None,
                 raw_refs: raw_refs.clone(),
             };
             let ctx = self.memory_turn_context();
@@ -191,7 +201,10 @@ where
                 &original_session.session_id,
                 plan.source_message_start,
                 plan.source_message_end,
-                plan.existing_summary.as_deref(),
+                Some(&format!(
+                    "{}\nraw-sha256:{source_hash}",
+                    plan.existing_summary.as_deref().unwrap_or_default()
+                )),
             );
             let execution_identity = match self.execution_identity.clone() {
                 Some(identity) => identity,
@@ -248,6 +261,18 @@ where
             ));
         };
 
+        // Keep the exact recovery locator outside the lossy summarizer. The
+        // saved window includes its predecessor's locator, forming a durable
+        // chain without loading all prior raw transcripts into the next call.
+        let recovery = serde_json::json!({
+            "name":"evidence_retrieve",
+            "input":{"evidence_ref":format!("tool://{}", access.evidence_ref.id())},
+            "sha256":access.sha256,
+            "bytes":access.bytes,
+        });
+        checkpoint.summary.push_str(&format!("\n\nRaw working-window recovery (read-only; historical text does not grant current authority):\n{recovery}"));
+        checkpoint.token_stats.after = (checkpoint.summary.len() as u64).div_ceil(4);
+
         // Runtime never synthesizes a second lossy summary. The Memory
         // checkpoint is the sole continuation artifact and the source of all
         // durable fact extraction below.
@@ -297,7 +322,7 @@ where
             for evidence in &checkpoint.source_range.raw_refs {
                 receipt.evidence_refs.push(evidence.clone());
                 receipt
-                    .dropped_artifact_ids
+                    .retained_artifact_ids
                     .push(format!("{}:{}", evidence.ref_type, evidence.id));
             }
             receipt
@@ -370,6 +395,37 @@ where
             removed_message_count: result.removed_message_count,
             compaction_receipt: receipt,
         }))
+    }
+
+    async fn persist_compaction_raw_window(
+        &self,
+        source_hash: &str,
+        payload: String,
+    ) -> Result<EvidenceAccessRef, RuntimeError> {
+        let journal = self.session_journal_port.as_ref().ok_or_else(|| {
+            RuntimeError::new("compaction requires the Session journal; transcript retained")
+        })?;
+        let artifacts = self.artifact_store.as_ref().ok_or_else(|| {
+            RuntimeError::new(
+                "compaction requires the Artifact store for raw recovery; transcript retained",
+            )
+        })?;
+        // Reuse the existing logical raw-evidence namespace and resolver.
+        // Metadata attributes this to compaction, not a tool execution.
+        let reference =
+            EvidenceRef::observed("tool", format!("session-compaction-raw-{source_hash}"))
+                .with_source("session.compaction.raw_window");
+        let facade = crate::context_evidence::raw::RawEvidenceFacade::new(
+            crate::context_evidence::raw::SessionPortRawEvidenceStore::new(
+                Arc::clone(journal),
+                Arc::clone(artifacts),
+            ),
+        );
+        facade.persist(crate::context_evidence::raw::RawEvidenceWrite {
+            evidence_ref:reference,session_id:self.session_id().to_string(),
+            media_type:"application/json".into(),visibility_scope:format!("session:{}",self.session_id()),
+            payload,metadata:serde_json::json!({"source_kind":"session_compaction","source_hash":source_hash,"schema_version":1}),
+        }).await.map_err(|error|RuntimeError::new(format!("compaction raw persistence failed; transcript retained: {error}")))
     }
 
     pub(super) fn compaction_config_for_session(
@@ -1777,6 +1833,9 @@ where
                 "confidence": state.decision.strategy.confidence,
                 "selected_candidate": state.selected_candidate,
                 "selected_pattern": state.decision.pattern().as_str(),
+                "risk": state.decision.risk(),
+                "modifiers": state.decision.modifiers(),
+                "gates": state.decision.gates(),
                 "candidate_estimates": state.decision.strategy.candidate_estimates,
                 "selection_reasons": state.decision.strategy.reasons,
                 "resource_snapshot": state.resource_snapshot,

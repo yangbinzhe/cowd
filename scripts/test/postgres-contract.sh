@@ -9,28 +9,40 @@ cd "$ROOT"
 logs="$(mktemp -d)"
 trap 'rm -rf "$logs"' EXIT
 
-# Every contract case owns a logically empty target.  Several migration tests
-# deliberately reject a non-empty target database; sharing one disposable
-# schema made their result depend on execution order instead of the contract.
-# The caller has already supplied an isolated database, so resetting only its
-# `public` schema is safe and keeps the same connection/pool configuration.
-reset_disposable_schema() {
-  psql "$COWD_TEST_POSTGRES_URL" -v ON_ERROR_STOP=1 \
-    -c 'DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;' >/dev/null
+# Every Rust fixture explicitly owns its namespace, including reconnects.
+# Never reset public: URL search_path alone cannot scope PostgresExecutor.
+run_exact_pg_test() {
+  local test_name="$1"
+  local log="$2"
+  shift 2
+  local listing="${log}.list"
+  local -a matches=()
+  cargo test --locked --all-features "$@" "$test_name" \
+    -- --list --ignored 2>&1 | tee "$listing"
+  mapfile -t matches < <(awk -v name="$test_name" '
+    $NF == "test" {
+      full = $1; sub(/:$/, "", full)
+      count = split(full, parts, "::")
+      if (parts[count] == name) print full
+    }' "$listing")
+  if [[ "${#matches[@]}" -ne 1 ]]; then
+    echo "PostgreSQL contract requires exactly one listed ignored test: ${test_name}; found ${#matches[@]}" >&2
+    return 1
+  fi
+  cargo test --locked --all-features "$@" "${matches[0]}" \
+    -- --exact --ignored --nocapture --test-threads=1 2>&1 | tee "$log"
+  if ! rg -q '^test result: ok\. 1 passed; 0 failed;' "$log"; then
+    echo "PostgreSQL contract did not execute exactly one passing test: ${matches[0]}" >&2
+    return 1
+  fi
 }
 
 run_lib_test() {
   local package="$1"
   local test_name="$2"
   local log="$logs/${package}-${test_name}.log"
-  reset_disposable_schema
   echo "[postgres-contract] ${package} :: ${test_name}"
-  cargo test -p "$package" --lib "$test_name" \
-    -- --ignored --nocapture --test-threads=1 2>&1 | tee "$log"
-  if ! rg -q 'test result: ok\. 1 passed; 0 failed;' "$log"; then
-    echo "PostgreSQL contract did not execute exactly one passing test: ${package} :: ${test_name}" >&2
-    exit 1
-  fi
+  run_exact_pg_test "$test_name" "$log" -p "$package" --lib
 }
 
 run_lib_test_with_features() {
@@ -38,14 +50,8 @@ run_lib_test_with_features() {
   local features="$2"
   local test_name="$3"
   local log="$logs/${package}-${test_name}.log"
-  reset_disposable_schema
   echo "[postgres-contract] ${package} [${features}] :: ${test_name}"
-  cargo test -p "$package" --features "$features" --lib "$test_name" \
-    -- --ignored --nocapture --test-threads=1 2>&1 | tee "$log"
-  if ! rg -q 'test result: ok\. 1 passed; 0 failed;' "$log"; then
-    echo "PostgreSQL contract did not execute exactly one passing test: ${package} [${features}] :: ${test_name}" >&2
-    exit 1
-  fi
+  run_exact_pg_test "$test_name" "$log" -p "$package" --features "$features" --lib
 }
 
 run_integration_test() {
@@ -53,14 +59,8 @@ run_integration_test() {
   local target="$2"
   local test_name="$3"
   local log="$logs/${package}-${target}-${test_name}.log"
-  reset_disposable_schema
   echo "[postgres-contract] ${package} :: ${target} :: ${test_name}"
-  cargo test -p "$package" --test "$target" "$test_name" \
-    -- --ignored --nocapture --test-threads=1 2>&1 | tee "$log"
-  if ! rg -q 'test result: ok\. 1 passed; 0 failed;' "$log"; then
-    echo "PostgreSQL contract did not execute exactly one passing test: ${package} :: ${target} :: ${test_name}" >&2
-    exit 1
-  fi
+  run_exact_pg_test "$test_name" "$log" -p "$package" --test "$target"
 }
 
 # Fail before mutating the disposable database when a retired crate remains in
@@ -75,18 +75,27 @@ done < <(
 
 run_lib_test fact-postgres real_postgres_reopens_and_serializes_competing_fact_upserts
 run_lib_test fact-postgres real_postgres_bounded_recall_matches_authorization_order_and_limit_contract
+run_lib_test fact-postgres fact_catalog_snapshot_excludes_inflight_and_append_and_invalidates_updates_and_deletes
 run_lib_test surface-postgres real_postgres_preserves_contract_and_serializes_competing_delivery_claims
 run_lib_test memory-postgres real_postgres_memory_roundtrip
+run_lib_test memory-postgres real_postgres_embedding_partial_progress_survives_store_and_client_reopen
+run_lib_test memory-postgres real_postgres_authority_filters_private_and_team_domains_before_limit
 run_lib_test matrix-repository real_postgres_bounded_recall_matches_authorization_order_and_limit_contract
 run_lib_test matrix-repository real_postgres_adapter_preserves_matrix_state_and_metric_semantics
+run_lib_test matrix-repository matrix_catalog_snapshot_pages_all_granted_sources_and_fences_mutations
 run_lib_test runtime-postgres postgres_runtime_event_store_preserves_fences_outbox_restart_and_runtime_composition
+run_lib_test runtime-postgres postgres_sequence_pages_freeze_the_head_during_independent_concurrent_appends
 run_lib_test runtime-postgres postgres_task_store_preserves_restart_and_per_task_concurrency
 run_lib_test runtime-postgres postgres_artifact_repository_preserves_selector_and_scope_contract
+run_lib_test runtime-postgres postgres_artifact_catalog_excludes_inflight_and_later_receipts
 run_lib_test runtime-postgres projection_work_class_maps_background_without_downgrading_recovery
 run_lib_test connector-postgres postgres_resource_directory_migrates_restarts_and_handles_concurrency
 run_lib_test_with_features storage storage-postgres real_pool_set_isolates_background_saturation_from_critical_writes
 run_lib_test_with_features storage storage-postgres real_pool_set_resets_search_path_between_scoped_and_public_checkouts
 
+run_lib_test session-postgres postgres_fixture_namespaces_are_disjoint_and_drop_only_their_own_data
+run_lib_test session-postgres postgres_v23_preserves_existing_records_and_indexes_casefolded_listing
+run_lib_test session-postgres session_discovery_reaches_all_scopes_and_snapshot_messages_without_offset_drift
 run_lib_test session-postgres existing_postgres_outbox_schema_migrates_claim_fence_epoch_in_place
 run_lib_test session-postgres postgres_activation_index_and_manifest_repair_preserve_session_contract
 run_lib_test session-postgres postgres_fenced_terminal_commit_preserves_atomic_identity_contract
@@ -105,6 +114,52 @@ run_lib_test session-postgres postgres_presence_projection_is_mutable_and_does_n
 run_lib_test session-postgres postgres_usage_summary_decodes_bigint_aggregates
 
 run_integration_test session-postgres shared_backend_contract_test postgres_input_generation_and_claim_fence_contract
+run_integration_test session-postgres behavior_conformance test_create_and_get
+run_integration_test session-postgres behavior_conformance test_update_session
+run_integration_test session-postgres behavior_conformance test_upsert_session
+run_integration_test session-postgres behavior_conformance test_delete_session
+run_integration_test session-postgres behavior_conformance test_list_sessions
+run_integration_test session-postgres behavior_conformance scoped_message_search_preserves_authorized_results_when_other_sessions_rank_first
+run_integration_test session-postgres behavior_conformance list_sessions_by_workspace_root_filters_and_orders_by_activity
+run_integration_test session-postgres behavior_conformance list_sessions_page_applies_owner_grants_and_tombstone_visibility_in_sql
+run_integration_test session-postgres behavior_conformance list_sessions_page_escapes_like_wildcards
+run_integration_test session-postgres behavior_conformance literal_list_filter_covers_all_original_fields_without_expanding_authority
+run_integration_test session-postgres behavior_conformance get_events_limited_pages_from_sequence_and_counts_total
+run_integration_test session-postgres behavior_conformance get_events_by_type_pages_context_envelopes_only
+run_integration_test session-postgres behavior_conformance get_context_event_by_envelope_id_reads_json_payload
+run_integration_test session-postgres behavior_conformance append_context_envelope_event_if_absent_skips_duplicate_envelope_id
+run_integration_test session-postgres behavior_conformance delete_events_from_removes_tail_only
+run_integration_test session-postgres behavior_conformance delete_events_by_type_from_preserves_other_event_types
+run_integration_test session-postgres behavior_conformance next_event_sequence_uses_max_sequence_plus_one
+run_integration_test session-postgres behavior_conformance allocating_sequence_appends_contiguous_batch_atomically
+run_integration_test session-postgres behavior_conformance allocating_sequence_is_atomic_across_parallel_postgres_connections
+run_integration_test session-postgres behavior_conformance session_event_sequence_constraint_rejects_duplicate
+run_integration_test session-postgres behavior_conformance allocating_batch_rolls_back_when_runtime_envelope_is_invalid
+run_integration_test session-postgres behavior_conformance checkpoint_batch_timestamp_overflow_rolls_back_without_partial_event
+run_integration_test session-postgres behavior_conformance exact_message_reads_and_metadata_page_preserve_stable_identity
+run_integration_test session-postgres behavior_conformance branch_copy_uses_stable_cutoff_and_rejects_nonempty_target
+run_integration_test session-postgres behavior_conformance test_list_by_platform
+run_integration_test session-postgres behavior_conformance test_memory_associations
+run_integration_test session-postgres behavior_conformance test_prune_before
+run_integration_test session-postgres behavior_conformance source_message_and_outbox_are_atomic_and_idempotent
+run_integration_test session-postgres behavior_conformance classifier_rejections_are_auditable_terminal_inputs_and_never_runnable
+run_integration_test session-postgres behavior_conformance runtime_options_remain_opaque_and_durable_with_session_ingress
+run_integration_test session-postgres behavior_conformance claim_returns_only_each_session_runnable_head
+run_integration_test session-postgres behavior_conformance input_id_drives_reclassify_cancel_and_terminal_outcomes
+run_integration_test session-postgres behavior_conformance attached_supplement_can_roll_forward_as_a_new_turn
+run_integration_test session-postgres behavior_conformance generation_advance_closes_admission_and_fences_stale_claims
+run_integration_test session-postgres behavior_conformance claimed_target_loss_reclassifies_and_requeues_under_owner_fence
+run_integration_test session-postgres behavior_conformance source_transaction_rolls_back_when_outbox_identity_conflicts
+run_integration_test session-postgres behavior_conformance duplicate_input_id_rolls_back_message_and_outbox_atomically
+run_integration_test session-postgres behavior_conformance multiple_supplements_keep_distinct_turn_identities_for_one_target
+run_integration_test session-postgres behavior_conformance batched_execution_history_limits_turn_roots_after_filtering_related_inputs
+run_integration_test session-postgres behavior_conformance outbox_claim_lease_retry_block_manual_retry_and_ack_are_guarded
+run_integration_test session-postgres behavior_conformance outbox_lease_renewal_rejects_stale_ack_and_prevents_reclaim
+run_integration_test session-postgres behavior_conformance recovery_manifest_tracks_transcript_outbox_and_external_signals
+run_integration_test session-postgres behavior_conformance get_messages_from_sequence_pages_100k_history
+run_integration_test session-postgres behavior_conformance latest_checkpoint_lookup_uses_full_index_beyond_legacy_page_boundary
+run_integration_test session-postgres behavior_conformance context_index_reconciliation_is_complete_idempotent_and_repairable
+run_integration_test session-postgres behavior_conformance semantic_checkpoint_alone_enqueues_context_index_reconciliation
 run_integration_test session-postgres shared_backend_contract_test postgres_terminal_input_cursor_cas_contract
 run_integration_test session-postgres shared_backend_contract_test postgres_lifecycle_contract
 run_integration_test session-postgres shared_backend_contract_test postgres_branch_contract
@@ -112,9 +167,43 @@ run_integration_test session-postgres shared_backend_contract_test postgres_doma
 run_integration_test session-postgres shared_backend_contract_test postgres_application_execution_32_way_semantic_idempotency_contract
 run_integration_test session-postgres shared_backend_contract_test postgres_input_application_receipt_contract
 run_integration_test runtime-postgres backend_conformance postgres_runtime_events_survive_adapter_reconstruction
+run_integration_test runtime-postgres program_read_model production_program_read_model_has_bounded_warm_queries_and_recovers_corrupt_snapshots
+run_integration_test runtime-postgres execution_workload production_pg_execution_fixed_workload_and_cancel_release
 run_integration_test matrix-repository backend_conformance postgres_matrix_survives_adapter_reconstruction
 run_integration_test memory-postgres backend_conformance postgres_memory_survives_adapter_reconstruction
+run_integration_test memory-postgres backend_conformance postgres_memory_discovery_versions_content_and_lifecycle_atomically
+run_integration_test memory-postgres behavior_conformance insert_and_get_roundtrip
+run_integration_test memory-postgres behavior_conformance insert_or_replace
+run_integration_test memory-postgres behavior_conformance get_returns_none_for_missing
+run_integration_test memory-postgres behavior_conformance update_modifies_existing
+run_integration_test memory-postgres behavior_conformance delete_removes_entry
+run_integration_test memory-postgres behavior_conformance delete_idempotent
+run_integration_test memory-postgres behavior_conformance search_by_layer_filters_correctly
+run_integration_test memory-postgres behavior_conformance aggregate_counts_layers_health_and_inactive_lifecycle_without_loading_bodies
+run_integration_test memory-postgres behavior_conformance search_by_category_returns_matching
+run_integration_test memory-postgres behavior_conformance search_fts_finds_by_content
+run_integration_test memory-postgres behavior_conformance search_fts_returns_empty_for_no_match
+run_integration_test memory-postgres behavior_conformance list_metas_returns_summaries
+run_integration_test memory-postgres behavior_conformance list_metas_all_layers
+run_integration_test memory-postgres behavior_conformance list_all_returns_all_entries
+run_integration_test memory-postgres behavior_conformance tagged_lookup_is_scoped_bounded_and_source_aware
+run_integration_test memory-postgres behavior_conformance maintenance_scan_uses_stable_keyset_pages
+run_integration_test memory-postgres behavior_conformance get_meta_returns_metadata
+run_integration_test memory-postgres behavior_conformance get_meta_returns_none_for_missing
+run_integration_test memory-postgres behavior_conformance insert_preserves_all_fields
+run_integration_test memory-postgres behavior_conformance test_insert_and_query_symbol
+run_integration_test memory-postgres behavior_conformance test_symbol_full_text_search
+run_integration_test memory-postgres behavior_conformance test_get_callers
+run_integration_test memory-postgres behavior_conformance test_get_callees
+run_integration_test memory-postgres behavior_conformance test_symbol_conversation_link
+run_integration_test memory-postgres behavior_conformance test_find_conversations_by_symbol
 run_integration_test runtime reality_recall_port reality_recall_port_injects_only_fact_and_matrix_evidence_granted_by_the_binding
 run_integration_test runtime matrix_scenario_port matrix_scenario_port_requires_the_binding_snapshot_lease_and_emits_candidate_only_results
 run_lib_test runtime matrix_scenario_port_refuses_unleased_snapshot_and_returns_candidate_only
 run_lib_test runtime recall_port_injects_only_binding_leased_fact_and_matrix_evidence
+
+# This is a current-PG fixed-work baseline, not paid business E2E. Preserve the
+# complete measurements in the outer gate log before removing temporary files.
+export COWD_PG_MATRIX_REPORT="${COWD_PG_MATRIX_REPORT:-$logs/pg-workload-matrix.json}"
+run_integration_test runtime-postgres pg_workload_matrix production_postgres_fixed_workload_matrix_and_failure_recovery
+cat "$COWD_PG_MATRIX_REPORT"

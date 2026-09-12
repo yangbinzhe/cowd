@@ -171,8 +171,10 @@ pub(super) fn delegated_agent_receipt_event(
             actor: Some("governed_tool".to_string()),
             refs,
             payload: json!({
+                "idempotency_key": request.idempotency_key,
                 "sequence": request.observation_wave_sequence,
                 "effect_kind": effect_kind,
+                "effect_scope": request.authorization.as_ref().map(|authorization| &authorization.scope),
                 "authorized_scopes": request.authorized_scopes,
                 "outcome": bounded_tool_effect_outcome(outcome),
             }),

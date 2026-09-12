@@ -55,6 +55,7 @@ libc = "0.2.186"
 tempfile = "3"
 
 [dev-dependencies]
+memory-postgres = { path = "../memory-postgres" }
 fact-kernel = { path = "../fact-kernel", features = ["test-support"] }
 session-postgres = { path = "../session-postgres" }
 tokio = { version = "1", features = ["test-util"] }

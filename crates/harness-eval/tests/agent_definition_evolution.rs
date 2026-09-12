@@ -35,6 +35,16 @@ fn paired_definition_workload_executes_contract_samples_and_returns_runtime_owne
         objective: "Compare the baseline and candidate Definition under the same workload."
             .to_string(),
         acceptance: vec!["evidence".to_string()],
+        acceptance_checks: vec![
+            harness_contract::evaluation::EvaluationAcceptanceRequirement {
+                criterion: "evidence".into(),
+                check: harness_contract::evaluation::EvaluationAcceptanceCheck::Output {
+                    check: harness_contract::agent::OutputAcceptanceCheck::StructuredArtifact {
+                        name: "evidence".into(),
+                    },
+                },
+            },
+        ],
         allowed_tools: Vec::new(),
         allowed_skills: Vec::new(),
         resource_scopes: vec!["read:crates/runtime".to_string()],
@@ -91,6 +101,16 @@ fn evaluator_rejects_observations_not_bound_to_candidate_revision() {
             scenario_ref: "evolution/agent-definition".to_string(),
             objective: "Bind observations to exact revisions.".to_string(),
             acceptance: vec!["evidence".to_string()],
+            acceptance_checks: vec![
+                harness_contract::evaluation::EvaluationAcceptanceRequirement {
+                    criterion: "evidence".into(),
+                    check: harness_contract::evaluation::EvaluationAcceptanceCheck::Output {
+                        check: harness_contract::agent::OutputAcceptanceCheck::StructuredArtifact {
+                            name: "evidence".into(),
+                        },
+                    },
+                },
+            ],
             allowed_tools: Vec::new(),
             allowed_skills: Vec::new(),
             resource_scopes: vec!["read:crates/runtime".to_string()],
