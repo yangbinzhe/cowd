@@ -371,8 +371,9 @@ pub(crate) mod tests {
             "team_ref":team,"title":"Evidence","objective":"verify source","acceptance":"source checked","required_capabilities":required_capabilities
         })).unwrap())).changed_refs[0].clone();
         if task_execute {
-            // Dispatch the ready task in Execute mode so the process child holds
-            // a real Task execution claim and ordinary writes are admitted.
+            // G29 open: the synthetic fixture cannot yet produce a claim whose
+            // status/generation/active-attempt matches effect_authority. Port the
+            // agentic/execution harness claim+dispatch sequence here.
             let receipts = services
                 .dispatch_ready_agentic_work("coord-program")
                 .await
