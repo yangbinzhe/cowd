@@ -308,7 +308,10 @@ cat >>"$CONFIG_HOME/config.yaml" <<EOF
     models:
       - "$MODEL"
 permissions:
-  default_mode: danger-full-access
+  # Permission must match the scenario's declared business profile. Read-only
+  # research scenarios (e.g. group theory) run with COWD_EVAL_DEFAULT_MODE=read-only;
+  # autonomous scenarios keep the disposable-workspace default.
+  default_mode: "${COWD_EVAL_DEFAULT_MODE:-danger-full-access}"
 memory:
   enabled: true
 storage:
