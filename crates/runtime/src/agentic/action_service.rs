@@ -1760,7 +1760,19 @@ fn inspect_projection_page(
     if let Some(reference) = exact_ref {
         if let Some(goal) = goal {
             let value = if reference == goal.id {
-                Some(goal_summary(goal))
+                // Exact entity reads return the full objective. Directory pages keep
+                // their bounded labels, but a goal read must not hide the requirement
+                // behind the old 12000/4000 char thresholds.
+                Some({
+                    let mut summary = goal_summary(goal);
+                    if let Some(object) = summary.as_object_mut() {
+                        object.insert(
+                            "objective".to_string(),
+                            serde_json::Value::String(goal.objective.clone()),
+                        );
+                    }
+                    summary
+                })
             } else if let Some(criterion) = goal.criteria.iter().find(|item| item.id == reference) {
                 Some(json!({"criterion":criterion}))
             } else if let Some(obligation) = goal
