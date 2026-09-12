@@ -4446,12 +4446,10 @@ fn agentic_program_wait_resolution_lane(
                         .await?,
                     );
                 }
-                let expected_revision = checkpoint.as_ref().map_or(0, |value| value.revision);
                 event_store
-                    .compare_and_put_projection_checkpoint(
+                    .put_projection_checkpoint_retrying(
                         AGENTIC_PROGRAM_WAIT_RESOLVER_PROJECTION_ID,
                         page.scanned_through_cursor,
-                        expected_revision,
                         &serde_json::json!({
                             "source_cursor": page.scanned_through_cursor,
                             "programs": program_ids.len(),
@@ -4557,12 +4555,10 @@ fn agentic_settled_graph_resolution_lane(
                 }
                 // The checkpoint advances only after every matching join was
                 // either atomically resolved or proven inapplicable/terminal.
-                let expected_revision = checkpoint.as_ref().map_or(0, |value| value.revision);
                 event_store
-                    .compare_and_put_projection_checkpoint(
+                    .put_projection_checkpoint_retrying(
                         AGENTIC_SETTLED_GRAPH_RESOLVER_PROJECTION_ID,
                         page.scanned_through_cursor,
-                        expected_revision,
                         &serde_json::json!({
                             "source_cursor": page.scanned_through_cursor,
                             "resolved_graphs": touched_graphs.len(),

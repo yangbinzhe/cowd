@@ -127,9 +127,6 @@ async fn project_growth_page(
     if page.scanned_through_cursor > previous_cursor {
         let checkpoint_store = Arc::clone(&event_store);
         let source_cursor = page.scanned_through_cursor;
-        let expected_revision = checkpoint
-            .as_ref()
-            .map_or(0, |checkpoint| checkpoint.revision);
         let scanned_commits = page.scanned_commits;
         let matched_events = page.matched_events;
         tokio::task::spawn_blocking(move || {
@@ -137,10 +134,9 @@ async fn project_growth_page(
                 runtime::RuntimeProjectionWorkClass::Background,
                 || {
                     checkpoint_store
-                        .compare_and_put_projection_checkpoint(
+                        .put_projection_checkpoint_retrying(
                             GROWTH_PROJECTOR_ID,
                             source_cursor,
-                            expected_revision,
                             &serde_json::json!({
                                 "schema_version": GROWTH_EVENT_SCHEMA_VERSION,
                                 "source_cursor": source_cursor,

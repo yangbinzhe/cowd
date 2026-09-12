@@ -106,10 +106,9 @@ impl CollaborationExperienceProjector {
         // Output transactions precede the source cursor. A crash here causes
         // a safe replay, never a lost episode or a second pattern supporter.
         self.store
-            .compare_and_put_projection_checkpoint(
+            .put_projection_checkpoint_retrying(
                 PROJECTOR_ID,
                 page.scanned_through_cursor,
-                checkpoint.as_ref().map_or(0, |value| value.revision),
                 &json!({"matched_events": page.matched_events}),
                 episode::now_ms(),
             )

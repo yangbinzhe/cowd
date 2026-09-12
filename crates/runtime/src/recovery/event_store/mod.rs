@@ -384,6 +384,38 @@ impl RuntimeEventStore {
         )
     }
 
+    /// Compare-and-put a projection checkpoint, re-reading the authoritative row
+    /// revision and retrying on a stale revision. Projection writers race other
+    /// passes over the same row; callers that read the expected revision in a
+    /// separate step must use this to avoid dropping the write.
+    pub fn put_projection_checkpoint_retrying(
+        &self,
+        projection_id: &str,
+        source_cursor: u64,
+        payload: &serde_json::Value,
+        updated_at_ms: u64,
+    ) -> RuntimeEventStoreResult<RuntimeProjectionCheckpoint> {
+        let mut attempt = 0;
+        loop {
+            let expected_revision = self
+                .projection_checkpoint(projection_id)?
+                .map_or(0, |checkpoint| checkpoint.revision);
+            match self.compare_and_put_projection_checkpoint(
+                projection_id,
+                source_cursor,
+                expected_revision,
+                payload,
+                updated_at_ms,
+            ) {
+                Ok(checkpoint) => return Ok(checkpoint),
+                Err(RuntimeEventStoreError::StaleRevision { .. }) if attempt < 2 => {
+                    attempt += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// Fenced repair of an existing, damaged derived checkpoint from journal truth.
     pub fn compare_and_repair_projection_checkpoint(
         &self,

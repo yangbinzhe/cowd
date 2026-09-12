@@ -317,12 +317,9 @@ impl EvolutionSignalProjector {
             }
         }
         self.event_store
-            .compare_and_put_projection_checkpoint(
+            .put_projection_checkpoint_retrying(
                 LEGACY_BOOTSTRAP_ID,
                 last.commit_cursor,
-                checkpoint
-                    .as_ref()
-                    .map_or(0, |checkpoint| checkpoint.revision),
                 &serde_json::json!({
                     "transaction_index": last.transaction_index,
                     "legacy_signal_count": events.len(),
