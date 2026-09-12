@@ -1812,28 +1812,41 @@ impl RuntimeService {
             record.request_id,
             record.turn_id
         );
-        if self
+        let routed_bindings =
+            serde_json::to_value(&task_route.bindings).map_err(|error| error.to_string())?;
+        match self
             .session_data
             .stored_session_input_journal(&record.session_id, &routed_event_id)
             .await
             .map_err(|error| error.to_string())?
-            .is_none()
         {
-            self.session_data
-                .append_session_input_journal(
-                    &record.session_id,
-                    crate::session_runtime_data_port::SessionInputJournalKind::TaskRouted,
-                    serde_json::json!({
-                        "request_id": record.request_id,
-                        "turn_id": record.turn_id,
-                        "route_receipt": task_route.receipt,
-                        "bindings": task_route.bindings,
-                    }),
-                    chrono::Utc::now().timestamp_millis().max(0) as u64,
-                    &routed_event_id,
-                )
-                .await
-                .map_err(|error| error.to_string())?;
+            // Recovery of the same ingress reuses the original TaskRouted payload and
+            // created_at. If a different route is recomputed for the same turn identity,
+            // fail closed instead of silently keeping the older binding.
+            Some(stored) => {
+                if stored.payload.get("bindings") != Some(&routed_bindings) {
+                    return Err(format!(
+                        "session input journal conflict for {routed_event_id}: stored TaskRouted bindings differ from the requested turn"
+                    ));
+                }
+            }
+            None => {
+                self.session_data
+                    .append_session_input_journal(
+                        &record.session_id,
+                        crate::session_runtime_data_port::SessionInputJournalKind::TaskRouted,
+                        serde_json::json!({
+                            "request_id": record.request_id,
+                            "turn_id": record.turn_id,
+                            "route_receipt": task_route.receipt,
+                            "bindings": task_route.bindings,
+                        }),
+                        chrono::Utc::now().timestamp_millis().max(0) as u64,
+                        &routed_event_id,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
         }
         let organizer = runtime::MissionOrganizer::new(Arc::clone(&self.runtime_services));
         for binding in &task_route.bindings {

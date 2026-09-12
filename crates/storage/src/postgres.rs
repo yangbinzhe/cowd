@@ -190,6 +190,10 @@ pub struct PostgresExecutorMetrics {
     pub transaction_count: u64,
     pub transaction_commit_count: u64,
     pub transaction_rollback_count: u64,
+    pub transaction_hold_ms: u64,
+    pub transaction_hold_p50_ms: u64,
+    pub transaction_hold_p95_ms: u64,
+    pub transaction_hold_p99_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,6 +231,8 @@ struct PostgresExecutorCounters {
     transaction_count: AtomicU64,
     transaction_commit_count: AtomicU64,
     transaction_rollback_count: AtomicU64,
+    transaction_hold_ms: AtomicU64,
+    transaction_hold_buckets: [AtomicU64; CHECKOUT_WAIT_BUCKET_MS.len()],
 }
 
 impl Default for PostgresExecutorCounters {
@@ -242,6 +248,8 @@ impl Default for PostgresExecutorCounters {
             transaction_count: AtomicU64::new(0),
             transaction_commit_count: AtomicU64::new(0),
             transaction_rollback_count: AtomicU64::new(0),
+            transaction_hold_ms: AtomicU64::new(0),
+            transaction_hold_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 }
@@ -256,6 +264,17 @@ impl PostgresExecutorCounters {
             .position(|upper| elapsed_ms <= *upper)
             .unwrap_or(CHECKOUT_WAIT_BUCKET_MS.len() - 1);
         self.checkout_wait_buckets[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_transaction_hold(&self, elapsed: Duration) {
+        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        self.transaction_hold_ms
+            .fetch_add(elapsed_ms, Ordering::Relaxed);
+        let bucket = CHECKOUT_WAIT_BUCKET_MS
+            .iter()
+            .position(|upper| elapsed_ms <= *upper)
+            .unwrap_or(CHECKOUT_WAIT_BUCKET_MS.len() - 1);
+        self.transaction_hold_buckets[bucket].fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_query(&self, elapsed: Duration, failed: bool) {
@@ -339,6 +358,7 @@ struct PooledSearchPath(String);
 pub struct PostgresTransaction<'a> {
     inner: Option<Transaction<'a>>,
     counters: Arc<PostgresExecutorCounters>,
+    started: Instant,
 }
 
 /// Minimal backend-neutral SQL client surface used by domain helpers that work
@@ -562,6 +582,7 @@ impl PostgresConnection {
         Ok(PostgresTransaction {
             inner: Some(transaction),
             counters,
+            started: Instant::now(),
         })
     }
 }
@@ -606,6 +627,7 @@ impl<'a> PostgresTransaction<'a> {
                 .transaction_commit_count
                 .fetch_add(1, Ordering::Relaxed);
         }
+        self.counters.record_transaction_hold(self.started.elapsed());
         result
     }
 
@@ -624,6 +646,7 @@ impl<'a> PostgresTransaction<'a> {
                 .transaction_rollback_count
                 .fetch_add(1, Ordering::Relaxed);
         }
+        self.counters.record_transaction_hold(self.started.elapsed());
         result
     }
 }
@@ -634,6 +657,7 @@ impl Drop for PostgresTransaction<'_> {
     fn drop(&mut self) {
         if let Some(transaction) = self.inner.take() {
             in_postgres_driver_context(|| drop(transaction));
+            self.counters.record_transaction_hold(self.started.elapsed());
         }
     }
 }
@@ -861,6 +885,15 @@ impl PostgresExecutor {
                     total.transaction_rollback_count = total
                         .transaction_rollback_count
                         .saturating_add(metrics.transaction_rollback_count);
+                    total.transaction_hold_ms = total
+                        .transaction_hold_ms
+                        .saturating_add(metrics.transaction_hold_ms);
+                    total.transaction_hold_p50_ms =
+                        total.transaction_hold_p50_ms.max(metrics.transaction_hold_p50_ms);
+                    total.transaction_hold_p95_ms =
+                        total.transaction_hold_p95_ms.max(metrics.transaction_hold_p95_ms);
+                    total.transaction_hold_p99_ms =
+                        total.transaction_hold_p99_ms.max(metrics.transaction_hold_p99_ms);
                     total
                 },
             ),
@@ -1309,6 +1342,34 @@ fn pool_metrics(pool: &PostgresPoolInner) -> PostgresExecutorMetrics {
             .counters
             .transaction_rollback_count
             .load(Ordering::Relaxed),
+        transaction_hold_ms: pool.counters.transaction_hold_ms.load(Ordering::Relaxed),
+        transaction_hold_p50_ms: histogram_percentile(
+            &pool
+                .counters
+                .transaction_hold_buckets
+                .iter()
+                .map(|bucket| bucket.load(Ordering::Relaxed))
+                .collect::<Vec<_>>(),
+            50,
+        ),
+        transaction_hold_p95_ms: histogram_percentile(
+            &pool
+                .counters
+                .transaction_hold_buckets
+                .iter()
+                .map(|bucket| bucket.load(Ordering::Relaxed))
+                .collect::<Vec<_>>(),
+            95,
+        ),
+        transaction_hold_p99_ms: histogram_percentile(
+            &pool
+                .counters
+                .transaction_hold_buckets
+                .iter()
+                .map(|bucket| bucket.load(Ordering::Relaxed))
+                .collect::<Vec<_>>(),
+            99,
+        ),
     }
 }
 
@@ -1722,5 +1783,32 @@ mod tests {
             .expect("reopened query")
             .get(0);
         assert_eq!(value, "durable");
+    }
+
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn real_postgres_transaction_hold_is_measured_and_not_held_across_external_await() {
+        let pool_set = real_pool_set();
+        let executor = pool_set.executor();
+        let mut connection = executor.checkout_critical().expect("critical connection");
+        let mut transaction = connection.transaction().expect("transaction");
+        transaction
+            .query_one("SELECT 1", &[])
+            .expect("transaction query");
+        std::thread::sleep(Duration::from_millis(20));
+        transaction.commit().expect("commit");
+        let committed_hold = pool_set.health().metrics.transaction_hold_ms;
+        assert!(
+            committed_hold >= 20,
+            "transaction hold must include the in-transaction wait: {committed_hold}"
+        );
+        // An external await outside any transaction must not extend transaction hold.
+        std::thread::sleep(Duration::from_millis(30));
+        let after_hold = pool_set.health().metrics.transaction_hold_ms;
+        assert_eq!(
+            after_hold, committed_hold,
+            "external await must not hold a database transaction"
+        );
+        drop(connection);
     }
 }
