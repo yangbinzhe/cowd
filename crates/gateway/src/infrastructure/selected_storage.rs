@@ -654,7 +654,12 @@ mod tests {
             .verify_registered_migration_catalogs()
             .expect("registered migration catalogs");
         // No domain may fall back to a local file database.
-        for forbidden in ["session.sqlite", "memory.sqlite", "fact.sqlite", "matrix.sqlite"] {
+        for forbidden in [
+            "session.sqlite",
+            "memory.sqlite",
+            "fact.sqlite",
+            "matrix.sqlite",
+        ] {
             assert!(
                 !home.path().join(forbidden).exists(),
                 "{forbidden} must not be created by a PostgreSQL-only topology"

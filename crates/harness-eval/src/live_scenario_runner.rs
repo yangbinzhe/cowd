@@ -2982,10 +2982,9 @@ fn group_theory_presentation_checks(response: &str) -> Vec<Value> {
     let stages_present = required_stages.iter().all(|stage| response.contains(stage));
     // A read-only research scenario performs no execution. It must say so rather
     // than presenting a "simulation" as if it had actually run.
-    let unexecuted_simulation_declared =
-        ["未执行的模拟", "未执行模拟", "unexecuted simulation"]
-            .iter()
-            .any(|marker| response.contains(marker));
+    let unexecuted_simulation_declared = ["未执行的模拟", "未执行模拟", "unexecuted simulation"]
+        .iter()
+        .any(|marker| response.contains(marker));
     vec![
         json!({"name": "presentation_contains_c4", "passed": response.contains("C4")}),
         json!({"name": "presentation_lists_all_required_source_paths", "required": GROUP_THEORY_SOURCE_PATHS.len(), "passed": paths_present}),

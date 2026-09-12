@@ -627,7 +627,8 @@ impl<'a> PostgresTransaction<'a> {
                 .transaction_commit_count
                 .fetch_add(1, Ordering::Relaxed);
         }
-        self.counters.record_transaction_hold(self.started.elapsed());
+        self.counters
+            .record_transaction_hold(self.started.elapsed());
         result
     }
 
@@ -646,7 +647,8 @@ impl<'a> PostgresTransaction<'a> {
                 .transaction_rollback_count
                 .fetch_add(1, Ordering::Relaxed);
         }
-        self.counters.record_transaction_hold(self.started.elapsed());
+        self.counters
+            .record_transaction_hold(self.started.elapsed());
         result
     }
 }
@@ -657,7 +659,8 @@ impl Drop for PostgresTransaction<'_> {
     fn drop(&mut self) {
         if let Some(transaction) = self.inner.take() {
             in_postgres_driver_context(|| drop(transaction));
-            self.counters.record_transaction_hold(self.started.elapsed());
+            self.counters
+                .record_transaction_hold(self.started.elapsed());
         }
     }
 }
@@ -888,12 +891,15 @@ impl PostgresExecutor {
                     total.transaction_hold_ms = total
                         .transaction_hold_ms
                         .saturating_add(metrics.transaction_hold_ms);
-                    total.transaction_hold_p50_ms =
-                        total.transaction_hold_p50_ms.max(metrics.transaction_hold_p50_ms);
-                    total.transaction_hold_p95_ms =
-                        total.transaction_hold_p95_ms.max(metrics.transaction_hold_p95_ms);
-                    total.transaction_hold_p99_ms =
-                        total.transaction_hold_p99_ms.max(metrics.transaction_hold_p99_ms);
+                    total.transaction_hold_p50_ms = total
+                        .transaction_hold_p50_ms
+                        .max(metrics.transaction_hold_p50_ms);
+                    total.transaction_hold_p95_ms = total
+                        .transaction_hold_p95_ms
+                        .max(metrics.transaction_hold_p95_ms);
+                    total.transaction_hold_p99_ms = total
+                        .transaction_hold_p99_ms
+                        .max(metrics.transaction_hold_p99_ms);
                     total
                 },
             ),

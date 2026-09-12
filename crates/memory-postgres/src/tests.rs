@@ -357,7 +357,10 @@ fn real_postgres_knowledge_roundtrip_and_usage_persist_across_reopen() {
         KnowledgeNamespace::Project("pg-knowledge".to_string()),
         KnowledgeActivationPolicy::OnDemand,
         KnowledgeGovernanceLevel::Advisory,
-        DocumentContent::new("durable postgres knowledge", "knowledge roundtrip body marker"),
+        DocumentContent::new(
+            "durable postgres knowledge",
+            "knowledge roundtrip body marker",
+        ),
     );
     assert!(
         receipt
