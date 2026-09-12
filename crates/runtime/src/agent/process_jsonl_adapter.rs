@@ -3551,12 +3551,12 @@ send('result',result=json.loads(RESULT_JSON))
             .is_empty());
     }
 
-    // G29 WIP: the real child + unified ToolBatch path is wired, but the
-    // dispatched process-agent binding still does not expose write_file/read_file,
-    // so the bridge rejects the request before the host. Enable once the process
-    // agent's tool_contract_refs carry the file tools. Tracked in
-    // plan/.../evidence/I09/g29-real-subprocess-effect-design.md.
-    #[ignore = "G29 pending: process agent binding must expose write_file/read_file"]
+    // G29 WIP: the real child + unified ToolBatch path is wired and the packet
+    // does expose write_file, but this fixture dispatches a Coordination focus,
+    // and effect_authority rejects ordinary writes without an active Task
+    // execution claim. A TaskExecute-scoped process fixture is required.
+    // Tracked in plan/.../evidence/I09/g29-real-subprocess-effect-design.md.
+    #[ignore = "G29 pending: real write requires a TaskExecute-scoped process fixture (coordination focus rejects ordinary writes)"]
     #[tokio::test]
     async fn process_child_write_reads_isolated_file_with_runtime_receipts() {
         use std::os::unix::fs::PermissionsExt;
@@ -3602,20 +3602,23 @@ except Exception:
         let worker = fixture.workspace.path().join("effect-worker.py");
         std::fs::write(&worker, script).unwrap();
         std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // The effect gate exercises the process tool bridge, so expose the two
-        // file tools on the execution packet bound to the leased workspace.
-        let mut packet = fixture.packet.clone();
-        for tool in ["write_file", "read_file"] {
-            if !packet.allowed_tools.iter().any(|existing| existing == tool) {
-                packet.allowed_tools.push(tool.to_string());
-            }
-        }
+        // The effect gate exercises the process tool bridge, so the dispatched
+        // packet must already expose the file tools for the leased workspace.
+        assert!(
+            fixture
+                .packet
+                .allowed_tools
+                .iter()
+                .any(|tool| tool == "write_file"),
+            "admission did not expose write_file: {:?}",
+            fixture.packet.allowed_tools
+        );
         let result = tokio::time::timeout(
             Duration::from_secs(30),
             fixture
                 .services
                 .agent_runtime()
-                .execute_task(packet.clone()),
+                .execute_task(fixture.packet.clone()),
         )
         .await
         .expect("bounded test child")
