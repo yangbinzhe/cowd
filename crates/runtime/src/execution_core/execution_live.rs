@@ -1795,6 +1795,49 @@ impl ExecutionLiveStore {
         true
     }
 
+    /// Refresh only the cached durable row revision (and live revision when the
+    /// payload decodes). Safe to call while a caller holds the record-shard
+    /// lock because it never touches the shard.
+    fn refresh_durable_cache_revision(&self, execution_id: &str) {
+        let Ok(Some(checkpoint)) = self
+            .event_store
+            .projection_checkpoint(&live_projection_id(execution_id))
+        else {
+            return;
+        };
+        let revision = checkpoint.revision;
+        let source_cursor = checkpoint.source_cursor;
+        let updated_at_ms = checkpoint.updated_at_ms;
+        let mut checkpoints = self
+            .durable_checkpoints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Ok(record) = serde_json::from_value::<LiveExecutionRecord>(checkpoint.payload.clone())
+        else {
+            // The payload is always a live record today; if it is ever not, at
+            // least advance the row revision so the retry does not spin stale.
+            checkpoints
+                .entry(execution_id.to_string())
+                .and_modify(|durable| {
+                    durable.row_revision = durable.row_revision.max(revision);
+                    durable.source_cursor = durable.source_cursor.max(source_cursor);
+                    durable.updated_at_ms = durable.updated_at_ms.max(updated_at_ms);
+                });
+            return;
+        };
+        checkpoints.insert(
+            execution_id.to_string(),
+            DurableLiveCheckpoint {
+                source_cursor: checkpoint.source_cursor,
+                row_revision: checkpoint.revision,
+                live_revision: record.live.revision,
+                model_usage_generation: record.model_usage_generation,
+                model_usage_fence_generation: record.model_usage_fence_generation,
+                updated_at_ms: checkpoint.updated_at_ms,
+            },
+        );
+    }
+
     fn load_record(&self, execution_id: &str) -> Option<LiveExecutionRecord> {
         let checkpoint = self
             .event_store
@@ -1929,7 +1972,10 @@ impl ExecutionLiveStore {
                 }
                 Err(error) => {
                     if error.to_string().contains("revision mismatch") && attempt < 2 {
-                        let _ = self.reload_record_from_durable(&record.execution_id);
+                        // Refresh only the cached row revision. Callers may hold
+                        // the record-shard lock while persisting, so re-locking
+                        // the shard here would self-deadlock.
+                        self.refresh_durable_cache_revision(&record.execution_id);
                         attempt += 1;
                         continue;
                     }
