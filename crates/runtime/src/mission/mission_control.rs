@@ -1280,6 +1280,10 @@ fn mission_execution_status(
 ) -> String {
     use harness_contract::execution_graph::ExecutionNodeStatus;
 
+    // An empty graph has no terminal verdict. Never project it as completed.
+    if graph.nodes.is_empty() {
+        return "planned".to_string();
+    }
     if graph.nodes.iter().all(|node| node.status.is_terminal()) {
         if graph.nodes.iter().any(|node| {
             matches!(
@@ -1893,5 +1897,21 @@ mod tests {
             })
             .expect("append recovery-resolved event");
         assert_eq!(workspace_recovery_required_count(&services), 0);
+    }
+
+    #[test]
+    fn empty_execution_graph_is_not_projected_as_completed() {
+        let graph: harness_contract::execution_graph::ExecutionGraphProjection =
+            serde_json::from_value(serde_json::json!({
+                "graph_id": "empty-graph",
+                "revision": 1,
+                "objective": "no nodes yet",
+                "nodes": [],
+                "edges": [],
+                "commit_cursor": 0,
+                "terminal_result_ref": null,
+            }))
+            .expect("empty execution graph projection");
+        assert_eq!(mission_execution_status(&graph), "planned");
     }
 }
