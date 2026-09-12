@@ -209,17 +209,23 @@ pub(crate) mod tests {
         missing_graph: bool,
         process: Option<crate::ProcessJsonlSpec>,
     ) -> Fixture {
-        fixture_with_options(missing_graph, process, None, false).await
+        fixture_with_options(missing_graph, process, None, false, false).await
     }
 
     /// A write-capable variant used by the process-bridge effect gate: the leased
     /// scope includes `write:.` so a child can produce a real isolated file.
     pub(crate) async fn fixture_with_write_executor(process: crate::ProcessJsonlSpec) -> Fixture {
-        fixture_with_options(false, Some(process), None, true).await
+        fixture_with_options(false, Some(process), None, true, false).await
+    }
+
+    /// A TaskExecute-scoped process fixture. An ordinary write needs an active
+    /// Task execution claim, which a Coordination focus does not provide.
+    pub(crate) async fn fixture_with_process_task(process: crate::ProcessJsonlSpec) -> Fixture {
+        fixture_with_options(false, Some(process), None, true, true).await
     }
 
     pub(crate) async fn fixture_with_provider(provider: Arc<crate::ProviderRegistry>) -> Fixture {
-        fixture_with_options(false, None, Some(provider), false).await
+        fixture_with_options(false, None, Some(provider), false, false).await
     }
 
     async fn fixture_with_options(
@@ -227,6 +233,7 @@ pub(crate) mod tests {
         process: Option<crate::ProcessJsonlSpec>,
         provider: Option<Arc<crate::ProviderRegistry>>,
         write: bool,
+        task_execute: bool,
     ) -> Fixture {
         let workspace = tempfile::tempdir().unwrap();
         let (permission_ceiling, resource_scopes, required_capabilities) = if write {
@@ -363,6 +370,40 @@ pub(crate) mod tests {
         let task_ref = apply("task", &root, AgentAction::TaskPublish(serde_json::from_value(serde_json::json!({
             "team_ref":team,"title":"Evidence","objective":"verify source","acceptance":"source checked","required_capabilities":required_capabilities
         })).unwrap())).changed_refs[0].clone();
+        if task_execute {
+            // Dispatch the ready task in Execute mode so the process child holds
+            // a real Task execution claim and ordinary writes are admitted.
+            let receipts = services
+                .dispatch_ready_agentic_work("coord-program")
+                .await
+                .unwrap();
+            assert_eq!(receipts.len(), 1, "{receipts:?}");
+            let graph = services
+                .graph_state_store()
+                .load(&receipts[0].graph_id)
+                .unwrap();
+            let packet: AgentTaskPacket =
+                serde_json::from_str(&graph.nodes[0].payload_ref).unwrap();
+            assert!(matches!(
+                packet.agentic_binding.as_ref().unwrap().focus,
+                AgenticExecutionFocus::TaskExecute { .. }
+            ));
+            return Fixture {
+                services,
+                request: AgentActionEnvelope {
+                    action_id: "process-task".into(),
+                    actor: root,
+                    expected_revision: None,
+                    action: AgentAction::StateInspect(
+                        serde_json::from_value(serde_json::json!({})).unwrap(),
+                    ),
+                },
+                packet,
+                task_ref,
+                wake_ref: String::new(),
+                workspace,
+            };
+        }
         let mut author = root.clone();
         author.actor_id = owner.clone();
         author.agent_id = Some(owner);

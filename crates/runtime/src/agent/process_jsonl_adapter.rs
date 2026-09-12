@@ -3551,19 +3551,20 @@ send('result',result=json.loads(RESULT_JSON))
             .is_empty());
     }
 
-    // G29 WIP: the real child + unified ToolBatch path is wired and the packet
-    // does expose write_file, but this fixture dispatches a Coordination focus,
-    // and effect_authority rejects ordinary writes without an active Task
-    // execution claim. A TaskExecute-scoped process fixture is required.
-    // Tracked in plan/.../evidence/I09/g29-real-subprocess-effect-design.md.
-    #[ignore = "G29 pending: real write requires a TaskExecute-scoped process fixture (coordination focus rejects ordinary writes)"]
+    // G29 WIP: real child + host write/read + TaskExecute fixture are wired, but
+    // the synthetic fixture's Task claim/generation/lease does not match the
+    // program projection, so effect_authority rejects the write as stale.
+    // Close via the agentic/execution TaskExecute harness (which has a consistent
+    // claim) with a registered ProcessJsonl child. Tracked in
+    // plan/.../evidence/I09/g29-real-subprocess-effect-design.md.
+    #[ignore = "G29 pending: use the agentic/execution TaskExecute harness with a consistent Task claim"]
     #[tokio::test]
     async fn process_child_write_reads_isolated_file_with_runtime_receipts() {
         use std::os::unix::fs::PermissionsExt;
         sandbox_launcher::probe().expect("process effect gate requires sandbox launcher");
         let spec = ProcessJsonlSpec::new("command:effect", "effect-worker.py", vec![]);
         let fixture =
-            crate::agentic::coordination::tests::fixture_with_write_executor(spec.clone()).await;
+            crate::agentic::coordination::tests::fixture_with_process_task(spec.clone()).await;
         let mut returned = super::tests::completed_return(&fixture.packet);
         returned.observed_acceptance = Default::default();
         returned.runtime_observed_resource_scopes.clear();
