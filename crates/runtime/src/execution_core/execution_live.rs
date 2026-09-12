@@ -1329,9 +1329,34 @@ impl ExecutionLiveStore {
         status: ExecutionLiveStatus,
         session_generation: u64,
     ) -> Result<TerminalFenceClaim, String> {
-        // Reload the retained checkpoint so a worker retry observes a pending
-        // claim left before a process crash.
-        let _ = self.execution_live(execution_id);
+        // Terminal claims race live checkpoint writers. Refresh the durable row
+        // revision before the CAS and retry on a stale revision instead of
+        // surfacing a projection invariant failure to the caller.
+        let mut last_stale = None;
+        for attempt in 0..3 {
+            let _ = self.reload_record_from_durable(execution_id);
+            match self.claim_terminal_once(
+                execution_id,
+                terminal_ref.clone(),
+                status,
+                session_generation,
+            ) {
+                Err(error) if error.contains("revision mismatch") && attempt < 2 => {
+                    last_stale = Some(error);
+                }
+                other => return other,
+            }
+        }
+        Err(last_stale.unwrap_or_else(|| "terminal claim retry exhausted".to_string()))
+    }
+
+    fn claim_terminal_once(
+        &self,
+        execution_id: &str,
+        terminal_ref: String,
+        status: ExecutionLiveStatus,
+        session_generation: u64,
+    ) -> Result<TerminalFenceClaim, String> {
         let shard_index = self.record_shard(execution_id);
         let mut records = self.record_shards[shard_index]
             .lock()
@@ -1382,7 +1407,31 @@ impl ExecutionLiveStore {
         status: ExecutionLiveStatus,
         session_generation: u64,
     ) -> Result<TerminalFenceClaim, String> {
-        let _ = self.execution_live(execution_id);
+        let mut last_stale = None;
+        for attempt in 0..3 {
+            let _ = self.reload_record_from_durable(execution_id);
+            match self.finalize_terminal_once(
+                execution_id,
+                terminal_ref,
+                status,
+                session_generation,
+            ) {
+                Err(error) if error.contains("revision mismatch") && attempt < 2 => {
+                    last_stale = Some(error);
+                }
+                other => return other,
+            }
+        }
+        Err(last_stale.unwrap_or_else(|| "terminal finalize retry exhausted".to_string()))
+    }
+
+    fn finalize_terminal_once(
+        &self,
+        execution_id: &str,
+        terminal_ref: &str,
+        status: ExecutionLiveStatus,
+        session_generation: u64,
+    ) -> Result<TerminalFenceClaim, String> {
         let shard_index = self.record_shard(execution_id);
         let mut records = self.record_shards[shard_index]
             .lock()
@@ -1710,6 +1759,42 @@ impl ExecutionLiveStore {
             .collect()
     }
 
+    /// Force-refresh the in-memory record and durable row revision from the
+    /// authoritative checkpoint. Used before terminal claims so the CAS never
+    /// fails on a cached revision that another writer has already advanced.
+    fn reload_record_from_durable(&self, execution_id: &str) -> bool {
+        let Ok(Some(checkpoint)) = self
+            .event_store
+            .projection_checkpoint(&live_projection_id(execution_id))
+        else {
+            return false;
+        };
+        let Ok(record) = serde_json::from_value::<LiveExecutionRecord>(checkpoint.payload.clone())
+        else {
+            return false;
+        };
+        self.durable_checkpoints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                execution_id.to_string(),
+                DurableLiveCheckpoint {
+                    source_cursor: checkpoint.source_cursor,
+                    row_revision: checkpoint.revision,
+                    live_revision: record.live.revision,
+                    model_usage_generation: record.model_usage_generation,
+                    model_usage_fence_generation: record.model_usage_fence_generation,
+                    updated_at_ms: checkpoint.updated_at_ms,
+                },
+            );
+        let shard_index = self.record_shard(execution_id);
+        self.record_shards[shard_index]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(execution_id.to_string(), record);
+        true
+    }
+
     fn load_record(&self, execution_id: &str) -> Option<LiveExecutionRecord> {
         let checkpoint = self
             .event_store
@@ -1760,89 +1845,101 @@ impl ExecutionLiveStore {
         {
             return Ok(());
         }
-        let durable = self
-            .durable_checkpoints
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&record.execution_id)
-            .copied();
-        if durable.is_some_and(|checkpoint| checkpoint.live_revision > record.live.revision) {
-            return Ok(());
-        }
-        // Generation allocation is a durable lease operation and deliberately
-        // does not bump the user-visible live revision. A record clone made
-        // before that CAS may therefore arrive here with an equal or newer
-        // live revision. Preserve the monotonic lease/fence dimensions before
-        // serializing so such a clone cannot roll a restart back to an old
-        // generation. `Some` is an irreversible terminal fence.
-        let mut candidate = record.clone();
-        if let Some(checkpoint) = durable {
-            candidate.model_usage_generation = candidate
-                .model_usage_generation
-                .max(checkpoint.model_usage_generation);
-            candidate.model_usage_fence_generation = match (
-                candidate.model_usage_fence_generation,
-                checkpoint.model_usage_fence_generation,
-            ) {
-                (Some(left), Some(right)) => Some(left.max(right)),
-                (Some(value), None) | (None, Some(value)) => Some(value),
-                (None, None) => None,
-            };
-        }
-        let payload = match serde_json::to_value(&candidate) {
-            Ok(payload) => payload,
-            Err(error) => {
-                tracing::error!(
-                    execution_id = %record.execution_id,
-                    %error,
-                    "failed to serialize Runtime live execution checkpoint"
-                );
-                self.publish_record_residency(&candidate);
-                return Err(error.to_string());
+        // A concurrent live writer can advance the projection row between our
+        // cached revision and the CAS. Refresh the cached row revision and retry
+        // instead of dropping the checkpoint.
+        let mut attempt = 0;
+        loop {
+            let durable = self
+                .durable_checkpoints
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&record.execution_id)
+                .copied();
+            if durable.is_some_and(|checkpoint| checkpoint.live_revision > record.live.revision) {
+                return Ok(());
             }
-        };
-        let updated_at_ms = current_time_ms();
-        let source_cursor = durable.map_or_else(
-            || self.event_store.current_commit_cursor(),
-            |checkpoint| {
-                self.event_store
-                    .current_commit_cursor()
-                    .max(checkpoint.source_cursor)
-            },
-        );
-        let expected_revision = durable.map_or(0, |checkpoint| checkpoint.row_revision);
-        match self.event_store.compare_and_put_projection_checkpoint(
-            &live_projection_id(&record.execution_id),
-            source_cursor,
-            expected_revision,
-            &payload,
-            updated_at_ms,
-        ) {
-            Ok(checkpoint) => {
-                self.durable_checkpoints
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(
-                        record.execution_id.clone(),
-                        DurableLiveCheckpoint {
-                            source_cursor: checkpoint.source_cursor,
-                            row_revision: checkpoint.revision,
-                            live_revision: candidate.live.revision,
-                            model_usage_generation: candidate.model_usage_generation,
-                            model_usage_fence_generation: candidate.model_usage_fence_generation,
-                            updated_at_ms: checkpoint.updated_at_ms,
-                        },
+            // Generation allocation is a durable lease operation and deliberately
+            // does not bump the user-visible live revision. A record clone made
+            // before that CAS may therefore arrive here with an equal or newer
+            // live revision. Preserve the monotonic lease/fence dimensions before
+            // serializing so such a clone cannot roll a restart back to an old
+            // generation. `Some` is an irreversible terminal fence.
+            let mut candidate = record.clone();
+            if let Some(checkpoint) = durable {
+                candidate.model_usage_generation = candidate
+                    .model_usage_generation
+                    .max(checkpoint.model_usage_generation);
+                candidate.model_usage_fence_generation = match (
+                    candidate.model_usage_fence_generation,
+                    checkpoint.model_usage_fence_generation,
+                ) {
+                    (Some(left), Some(right)) => Some(left.max(right)),
+                    (Some(value), None) | (None, Some(value)) => Some(value),
+                    (None, None) => None,
+                };
+            }
+            let payload = match serde_json::to_value(&candidate) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    tracing::error!(
+                        execution_id = %record.execution_id,
+                        %error,
+                        "failed to serialize Runtime live execution checkpoint"
                     );
-                self.publish_record_residency(&candidate);
-                Ok(())
-            }
-            Err(error) => {
-                tracing::error!(
-                    execution_id = %record.execution_id,
-                    error = %error,
-                        "failed to persist Runtime live execution checkpoint"
-                );
-                Err(error.to_string())
+                    self.publish_record_residency(&candidate);
+                    return Err(error.to_string());
+                }
+            };
+            let updated_at_ms = current_time_ms();
+            let source_cursor = durable.map_or_else(
+                || self.event_store.current_commit_cursor(),
+                |checkpoint| {
+                    self.event_store
+                        .current_commit_cursor()
+                        .max(checkpoint.source_cursor)
+                },
+            );
+            let expected_revision = durable.map_or(0, |checkpoint| checkpoint.row_revision);
+            match self.event_store.compare_and_put_projection_checkpoint(
+                &live_projection_id(&record.execution_id),
+                source_cursor,
+                expected_revision,
+                &payload,
+                updated_at_ms,
+            ) {
+                Ok(checkpoint) => {
+                    self.durable_checkpoints
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(
+                            record.execution_id.clone(),
+                            DurableLiveCheckpoint {
+                                source_cursor: checkpoint.source_cursor,
+                                row_revision: checkpoint.revision,
+                                live_revision: candidate.live.revision,
+                                model_usage_generation: candidate.model_usage_generation,
+                                model_usage_fence_generation: candidate
+                                    .model_usage_fence_generation,
+                                updated_at_ms: checkpoint.updated_at_ms,
+                            },
+                        );
+                    self.publish_record_residency(&candidate);
+                    return Ok(());
+                }
+                Err(error) => {
+                    if error.to_string().contains("revision mismatch") && attempt < 2 {
+                        let _ = self.reload_record_from_durable(&record.execution_id);
+                        attempt += 1;
+                        continue;
+                    }
+                    tracing::error!(
+                        execution_id = %record.execution_id,
+                        error = %error,
+                            "failed to persist Runtime live execution checkpoint"
+                    );
+                    return Err(error.to_string());
+                }
             }
         }
     }
@@ -4133,5 +4230,42 @@ mod tests {
                 .and_then(|usage| usage.model),
             Some("effective-provider-model".to_string())
         );
+    }
+
+    #[test]
+    fn terminal_claim_recovers_from_a_stale_cached_row_revision() {
+        let event_store = Arc::new(RuntimeEventStore::for_test());
+        let store = ExecutionLiveStore::new(Arc::clone(&event_store));
+        let execution_id = "execution-stale-claim";
+        store.record_queued(
+            "session-stale",
+            execution_id.to_string(),
+            "turn-stale".to_string(),
+        );
+        // Simulate a concurrent writer advancing the durable projection row
+        // after this store cached its revision.
+        let projection_id = live_projection_id(execution_id);
+        let checkpoint = event_store
+            .projection_checkpoint(&projection_id)
+            .unwrap()
+            .expect("queued record persisted a checkpoint");
+        event_store
+            .compare_and_put_projection_checkpoint(
+                &projection_id,
+                checkpoint.source_cursor,
+                checkpoint.revision,
+                &checkpoint.payload,
+                current_time_ms(),
+            )
+            .expect("concurrent advance");
+        let claim = store
+            .claim_terminal(
+                execution_id,
+                "stale-claim".to_string(),
+                ExecutionLiveStatus::Cancelled,
+                1,
+            )
+            .expect("terminal claim retries a stale cached revision");
+        assert!(matches!(claim, TerminalFenceClaim::Claimed));
     }
 }

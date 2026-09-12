@@ -805,21 +805,6 @@ impl AgentActionService {
     fn remember_projection(&self, projection: &Arc<AgenticProgramProjection>) {
         self.read_model.put(Arc::clone(projection));
         let projection_id = read_model_projection_id(&projection.program_id);
-        let checkpoint = self
-            .store
-            .projection_checkpoint(&projection_id)
-            .ok()
-            .flatten();
-        if checkpoint.as_ref().is_some_and(|checkpoint| {
-            checkpoint.source_cursor >= projection.revision
-                && self
-                    .store
-                    .stream_revision(&program_stream(&projection.program_id))
-                    .is_ok_and(|head| checkpoint.source_cursor <= head)
-                && decode_read_snapshot(checkpoint, &projection.program_id).is_some()
-        }) {
-            return;
-        }
         let payload = match serde_json::to_value(projection.as_ref()) {
             Ok(payload) => payload,
             Err(error) => {
@@ -832,29 +817,56 @@ impl AgentActionService {
             Sha256::digest(payload.to_string().as_bytes())
         );
         let payload = json!({"schema_version":1,"projection":payload,"sha256":digest});
-        let repair_ahead = checkpoint.as_ref().is_some_and(|checkpoint| {
-            checkpoint.source_cursor > projection.revision
-                && self
-                    .store
-                    .stream_revision(&program_stream(&projection.program_id))
-                    .is_ok_and(|head| checkpoint.source_cursor > head)
-        });
-        let write = if repair_ahead {
-            RuntimeEventStore::compare_and_repair_projection_checkpoint
-        } else {
-            RuntimeEventStore::compare_and_put_projection_checkpoint
-        };
-        if let Err(error) = write(
-            &self.store,
-            &projection_id,
-            projection.revision,
-            checkpoint
-                .as_ref()
-                .map_or(0, |checkpoint| checkpoint.revision),
-            &payload,
-            now_ms(),
-        ) {
-            tracing::warn!(program_id = %projection.program_id, %error, "Agentic read snapshot persistence failed");
+        // Concurrent Program readers race the same snapshot row. Re-read the
+        // authoritative row revision and retry the CAS instead of dropping the
+        // snapshot on the first stale revision.
+        for attempt in 0..3 {
+            let checkpoint = self
+                .store
+                .projection_checkpoint(&projection_id)
+                .ok()
+                .flatten();
+            if checkpoint.as_ref().is_some_and(|checkpoint| {
+                checkpoint.source_cursor >= projection.revision
+                    && self
+                        .store
+                        .stream_revision(&program_stream(&projection.program_id))
+                        .is_ok_and(|head| checkpoint.source_cursor <= head)
+                    && decode_read_snapshot(checkpoint, &projection.program_id).is_some()
+            }) {
+                return;
+            }
+            let repair_ahead = checkpoint.as_ref().is_some_and(|checkpoint| {
+                checkpoint.source_cursor > projection.revision
+                    && self
+                        .store
+                        .stream_revision(&program_stream(&projection.program_id))
+                        .is_ok_and(|head| checkpoint.source_cursor > head)
+            });
+            let write = if repair_ahead {
+                RuntimeEventStore::compare_and_repair_projection_checkpoint
+            } else {
+                RuntimeEventStore::compare_and_put_projection_checkpoint
+            };
+            match write(
+                &self.store,
+                &projection_id,
+                projection.revision,
+                checkpoint
+                    .as_ref()
+                    .map_or(0, |checkpoint| checkpoint.revision),
+                &payload,
+                now_ms(),
+            ) {
+                Ok(_) => return,
+                Err(error) if error.to_string().contains("revision mismatch") && attempt < 2 => {
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(program_id = %projection.program_id, %error, "Agentic read snapshot persistence failed");
+                    return;
+                }
+            }
         }
     }
 
