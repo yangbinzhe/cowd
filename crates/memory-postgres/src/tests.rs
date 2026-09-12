@@ -344,3 +344,55 @@ async fn real_postgres_authority_filters_private_and_team_domains_before_limit()
         assert_eq!(rows[0].id, scoped.id);
     }
 }
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn real_postgres_knowledge_roundtrip_and_usage_persist_across_reopen() {
+    let fixture = PostgresTestScope::new();
+    let store: Arc<PostgresKnowledgeStore> = Arc::new(
+        PostgresKnowledgeStore::new(fixture.reconnect()).expect("owned knowledge namespace"),
+    );
+    let fabric = KnowledgeFabric::with_store(store.clone());
+    let receipt = fabric.ingest_document(
+        KnowledgeNamespace::Project("pg-knowledge".to_string()),
+        KnowledgeActivationPolicy::OnDemand,
+        KnowledgeGovernanceLevel::Advisory,
+        DocumentContent::new("durable postgres knowledge", "knowledge roundtrip body marker"),
+    );
+    assert!(
+        receipt
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("persist failed")),
+        "knowledge receipt must persist through PostgreSQL: {:?}",
+        receipt.warnings
+    );
+    let snapshot = store.snapshot().expect("knowledge snapshot");
+    assert_eq!(snapshot.corpus.len(), 1);
+    assert_eq!(snapshot.packs.len(), 1);
+    assert_eq!(snapshot.canon.len(), 1);
+    assert_eq!(snapshot.chunks.len(), receipt.chunks.len());
+    assert_eq!(snapshot.corpus[0].corpus_id, receipt.corpus.corpus_id);
+    assert_eq!(snapshot.packs[0].pack_id, receipt.pack.pack_id);
+
+    let signal = KnowledgeUsageSignal {
+        signal_id: format!("signal-{}", receipt.pack.pack_id),
+        session_id: "pg-knowledge-session".to_string(),
+        pack_id: receipt.pack.pack_id.clone(),
+        action: "activated".to_string(),
+        summary: "durable postgres usage".to_string(),
+        score_delta_bp: 10,
+        occurred_at: chrono::Utc::now(),
+    };
+    store.record_usage(&signal).expect("usage persisted");
+    drop(fabric);
+    drop(store);
+
+    let reopened =
+        PostgresKnowledgeStore::new(fixture.reconnect()).expect("reopened knowledge namespace");
+    let snapshot = reopened.snapshot().expect("reopened knowledge snapshot");
+    assert_eq!(snapshot.packs.len(), 1);
+    assert_eq!(snapshot.packs[0].pack_id, receipt.pack.pack_id);
+    assert_eq!(snapshot.usage.len(), 1);
+    assert_eq!(snapshot.usage[0].signal_id, signal.signal_id);
+}

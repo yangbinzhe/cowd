@@ -634,6 +634,35 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn pg_only_every_store_identity_composes_all_domains_over_postgres() {
+        let home = tempfile::tempdir().expect("config home");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let topology = SelectedStorageTopology::compose_for_test(home.path(), workspace.path())
+            .expect("isolated PostgreSQL topology");
+        assert_eq!(topology.backend_label(), "postgres");
+        let health = topology.health_projection();
+        assert_eq!(health["backend"], "postgres");
+        assert_eq!(health["effective_backend"], "postgres");
+        assert!(
+            health["endpoint_count"].as_u64().unwrap_or(0) > 0,
+            "registry must bind every configured domain endpoint"
+        );
+        // Registry: catalog verification stays callable and never falls back.
+        topology
+            .postgres_executor
+            .verify_registered_migration_catalogs()
+            .expect("registered migration catalogs");
+        // No domain may fall back to a local file database.
+        for forbidden in ["session.sqlite", "memory.sqlite", "fact.sqlite", "matrix.sqlite"] {
+            assert!(
+                !home.path().join(forbidden).exists(),
+                "{forbidden} must not be created by a PostgreSQL-only topology"
+            );
+        }
+    }
+
+    #[test]
     fn postgres_runtime_startup_does_not_depend_on_historical_cutover_manifest() {
         let home = tempfile::tempdir().expect("config home");
         let workspace = tempfile::tempdir().expect("workspace");
