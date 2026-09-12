@@ -3671,19 +3671,17 @@ where
             if let Some(protocol) =
                 delegated_agentic_protocol_state(self.services.as_ref(), ticket)?
             {
-                if !protocol.is_terminal() {
-                    return Err(NodeExecutorError::Poll {
-                        node_id: ticket.node_id.clone(),
-                        reason: format!(
-                            "Agent action receipt did not close Program Task `{}`",
-                            protocol.task_id
-                        ),
-                    });
+                // A successful `task_submit`/`task_review` call does not by itself
+                // prove the Program Task closed: the action can be applied while
+                // the task still needs evidence or a reviewer. Do not fail the
+                // tool node; leave the protocol open so the FinalAnswer path
+                // forces a continuation with `continuation_instruction` instead.
+                if protocol.is_terminal() {
+                    orchestration_terminal_summary = Some(format!(
+                        "Delegated collaboration Task `{}` completed its `{}` protocol with durable status {:?}.",
+                        protocol.task_id, protocol.mode, protocol.status
+                    ));
                 }
-                orchestration_terminal_summary = Some(format!(
-                    "Delegated collaboration Task `{}` completed its `{}` protocol with durable status {:?}.",
-                    protocol.task_id, protocol.mode, protocol.status
-                ));
             }
         }
         let action_fingerprint = tool_batch_fingerprint(&calls);
