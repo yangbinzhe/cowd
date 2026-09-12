@@ -3550,4 +3550,84 @@ send('result',result=json.loads(RESULT_JSON))
             .unwrap()
             .is_empty());
     }
+
+    // G29 WIP: the real child + unified ToolBatch path is wired, but the
+    // dispatched process-agent binding still does not expose write_file/read_file,
+    // so the bridge rejects the request before the host. Enable once the process
+    // agent's tool_contract_refs carry the file tools. Tracked in
+    // plan/.../evidence/I09/g29-real-subprocess-effect-design.md.
+    #[ignore = "G29 pending: process agent binding must expose write_file/read_file"]
+    #[tokio::test]
+    async fn process_child_write_reads_isolated_file_with_runtime_receipts() {
+        use std::os::unix::fs::PermissionsExt;
+        sandbox_launcher::probe().expect("process effect gate requires sandbox launcher");
+        let spec = ProcessJsonlSpec::new("command:effect", "effect-worker.py", vec![]);
+        let fixture =
+            crate::agentic::coordination::tests::fixture_with_write_executor(spec.clone()).await;
+        let mut returned = super::tests::completed_return(&fixture.packet);
+        returned.observed_acceptance = Default::default();
+        returned.runtime_observed_resource_scopes.clear();
+        returned.outcome = "wrote and reread the isolated proof file".into();
+        let script = r###"#!/usr/bin/env python3
+import sys,json,traceback
+hello=json.loads(sys.stdin.readline());seq=0
+identity={'run_id':hello['run_id'],'agent_id':hello['agent_id'],'protocol_version':2}
+def send(kind,**fields):
+ global seq
+ seq+=1;print(json.dumps(dict(identity,sequence=seq,kind=kind,**fields)),flush=True)
+def receive(): return json.loads(sys.stdin.readline())
+try:
+ send('ready',manifest_digest=hello['manifest_digest'],focus=hello['focus'],model_control='external_configured',capabilities={'commands':['result','error','action_request','context_ack'],'supports_recovery':False,'evidence_mode':'runtime_receipts','model_control':'external_configured'})
+ start=receive();packet=start['packet']
+ delta=start.get('context_delta')
+ if delta:
+  send('context_ack',delivery_id=delta['delivery_id']);assert receive()['kind']=='context_acknowledged'
+ send('action_request',request_id='effect-write',tool_name='write_file',input={'path':'.cowd/agentic/proof.txt','content':'process effect proof'})
+ answer=receive()
+ if 'error' in answer:
+  send('error',error='write_file: '+json.dumps(answer,ensure_ascii=False)[:700]);raise SystemExit(1)
+ assert json.loads(answer['output'])['bytes']>0,answer
+ send('action_request',request_id='effect-read',tool_name='read_file',input={'path':'.cowd/agentic/proof.txt'})
+ answer=receive()
+ if 'error' in answer:
+  send('error',error='read_file: '+json.dumps(answer,ensure_ascii=False)[:700]);raise SystemExit(1)
+ assert json.loads(answer['output'])['content']=='process effect proof',answer
+ send('result',result=json.loads(RESULT_JSON))
+except SystemExit:
+ raise
+except Exception:
+ send('error',error=traceback.format_exc()[-700:])
+ raise
+"###.replace("RESULT_JSON",&format!("{:?}",serde_json::to_string(&returned).unwrap()));
+        let worker = fixture.workspace.path().join("effect-worker.py");
+        std::fs::write(&worker, script).unwrap();
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The effect gate exercises the process tool bridge, so expose the two
+        // file tools on the execution packet bound to the leased workspace.
+        let mut packet = fixture.packet.clone();
+        for tool in ["write_file", "read_file"] {
+            if !packet.allowed_tools.iter().any(|existing| existing == tool) {
+                packet.allowed_tools.push(tool.to_string());
+            }
+        }
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            fixture
+                .services
+                .agent_runtime()
+                .execute_task(packet.clone()),
+        )
+        .await
+        .expect("bounded test child")
+        .unwrap();
+        assert!(result.failure.is_none(), "{result:?}");
+        let written = std::fs::read_to_string(
+            fixture
+                .services
+                .workspace_root()
+                .join(".cowd/agentic/proof.txt"),
+        )
+        .expect("child effect file must exist on the leased workspace");
+        assert_eq!(written, "process effect proof");
+    }
 }

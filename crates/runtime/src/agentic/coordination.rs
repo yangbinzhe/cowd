@@ -81,6 +81,60 @@ pub(crate) mod tests {
         ) -> crate::RuntimeToolExecutionOutcome {
             assert!(request.authorization.is_some());
             let services = self.0.get().unwrap().upgrade().unwrap();
+            // Real filesystem effects for the process-bridge gate. The child only
+            // reaches paths inside the disposable workspace it was leased.
+            let tool_input: serde_json::Value =
+                serde_json::from_str(&request.input).unwrap_or(serde_json::Value::Null);
+            match request.tool_name.as_str() {
+                "write_file" => {
+                    let path = tool_input
+                        .get("path")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("proof.txt");
+                    let content = tool_input
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    let target = services.workspace_root().join(path);
+                    if let Some(parent) = target.parent() {
+                        std::fs::create_dir_all(parent).unwrap();
+                    }
+                    std::fs::write(&target, content).unwrap();
+                    return crate::RuntimeToolExecutionOutcome {
+                        tool_use_id: request.tool_use_id.clone(),
+                        tool_name: request.tool_name.clone(),
+                        status: crate::RuntimeToolExecutionStatus::Executed,
+                        category: request.category,
+                        output: Some(
+                            serde_json::json!({"path": path, "bytes": content.len()}).to_string(),
+                        ),
+                        error: None,
+                        evidence_ref: format!("process-effect:{}", request.tool_use_id),
+                        observed_evidence: vec![],
+                    };
+                }
+                "read_file" => {
+                    let path = tool_input
+                        .get("path")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("proof.txt");
+                    let target = services.workspace_root().join(path);
+                    let content = std::fs::read_to_string(&target).unwrap_or_default();
+                    return crate::RuntimeToolExecutionOutcome {
+                        tool_use_id: request.tool_use_id.clone(),
+                        tool_name: request.tool_name.clone(),
+                        status: crate::RuntimeToolExecutionStatus::Executed,
+                        category: request.category,
+                        output: Some(
+                            serde_json::json!({"path": path, "content": content}).to_string(),
+                        ),
+                        error: None,
+                        evidence_ref: format!("process-effect:{}", request.tool_use_id),
+                        observed_evidence: vec![],
+                    };
+                }
+                _ => {}
+            }
             let actor = services
                 .resolve_agent_action_actor(request.parent_execution.as_ref().unwrap(), None)
                 .await
@@ -112,19 +166,31 @@ pub(crate) mod tests {
             _: &serde_json::Value,
         ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
             use harness_contract::{policy::*, tool::*};
-            if !AGENT_ACTION_TOOL_IDS.contains(&name) && name != "read_file" {
-                return None;
-            }
+            let (effect_kind, operation, permission) = match name {
+                "write_file" => (
+                    ToolEffectKind::Write,
+                    PermissionOperation::Write,
+                    ToolPermissionMode::WorkspaceWrite,
+                ),
+                "read_file" => (
+                    ToolEffectKind::Read,
+                    PermissionOperation::Read,
+                    ToolPermissionMode::ReadOnly,
+                ),
+                other if AGENT_ACTION_TOOL_IDS.contains(&other) => (
+                    ToolEffectKind::Read,
+                    PermissionOperation::Read,
+                    ToolPermissionMode::ReadOnly,
+                ),
+                _ => return None,
+            };
             Some(ToolEffectDescriptor {
                 tool_id: name.into(),
                 descriptor_hash: format!("coord-test:{name}"),
-                effect_kind: ToolEffectKind::Read,
+                effect_kind,
                 idempotency: ToolIdempotency::Idempotent,
-                scopes: vec![PermissionScope::new(
-                    PermissionResource::Tool,
-                    PermissionOperation::Read,
-                )],
-                required_permission: ToolPermissionMode::ReadOnly,
+                scopes: vec![PermissionScope::new(PermissionResource::Tool, operation)],
+                required_permission: permission,
                 approval_class: ToolApprovalClass::None,
                 uses_network: false,
                 spawns_process: false,
@@ -143,19 +209,39 @@ pub(crate) mod tests {
         missing_graph: bool,
         process: Option<crate::ProcessJsonlSpec>,
     ) -> Fixture {
-        fixture_with_options(missing_graph, process, None).await
+        fixture_with_options(missing_graph, process, None, false).await
+    }
+
+    /// A write-capable variant used by the process-bridge effect gate: the leased
+    /// scope includes `write:.` so a child can produce a real isolated file.
+    pub(crate) async fn fixture_with_write_executor(process: crate::ProcessJsonlSpec) -> Fixture {
+        fixture_with_options(false, Some(process), None, true).await
     }
 
     pub(crate) async fn fixture_with_provider(provider: Arc<crate::ProviderRegistry>) -> Fixture {
-        fixture_with_options(false, None, Some(provider)).await
+        fixture_with_options(false, None, Some(provider), false).await
     }
 
     async fn fixture_with_options(
         missing_graph: bool,
         process: Option<crate::ProcessJsonlSpec>,
         provider: Option<Arc<crate::ProviderRegistry>>,
+        write: bool,
     ) -> Fixture {
         let workspace = tempfile::tempdir().unwrap();
+        let (permission_ceiling, resource_scopes, required_capabilities) = if write {
+            (
+                harness_contract::policy::PermissionMode::WorkspaceWrite,
+                vec!["read:.".to_string(), "write:.".to_string()],
+                vec!["read".to_string(), "write".to_string()],
+            )
+        } else {
+            (
+                harness_contract::policy::PermissionMode::ReadOnly,
+                vec!["read:.".to_string()],
+                vec!["read".to_string()],
+            )
+        };
         let host = Arc::new(ActionHost::default());
         let mut builder =
             crate::RuntimeServices::test_builder(workspace.path().join("home"), workspace.path())
@@ -235,8 +321,8 @@ pub(crate) mod tests {
             required_team_count: 1,
             objective_summary: "coordinate evidence".into(),
             model_lease: "test".into(),
-            permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
-            resource_scopes: vec!["read:.".into()],
+            permission_ceiling: Some(permission_ceiling),
+            resource_scopes: resource_scopes.clone(),
             actor_id: "root:coord-session".into(),
             kind: AgentActorKind::Root,
             execution_id: None,
@@ -268,14 +354,14 @@ pub(crate) mod tests {
             .clone();
         let invite = |id: &str| {
             apply(id, &root, AgentAction::AgentInvite(serde_json::from_value(serde_json::json!({
-            "team_ref":team,"role":"Reader","mission":"check evidence","required_capabilities":["read"],
+            "team_ref":team,"role":"Reader","mission":"check evidence","required_capabilities":required_capabilities,
             "definition_ref":if id=="helper" {process_definition.as_deref()} else {None}
         })).unwrap())).changed_refs[0].clone()
         };
         let owner = invite("owner");
         let helper = invite("helper");
         let task_ref = apply("task", &root, AgentAction::TaskPublish(serde_json::from_value(serde_json::json!({
-            "team_ref":team,"title":"Evidence","objective":"verify source","acceptance":"source checked","required_capabilities":["read"]
+            "team_ref":team,"title":"Evidence","objective":"verify source","acceptance":"source checked","required_capabilities":required_capabilities
         })).unwrap())).changed_refs[0].clone();
         let mut author = root.clone();
         author.actor_id = owner.clone();
@@ -368,7 +454,7 @@ pub(crate) mod tests {
                         session_id: root.session_id,
                         turn_id: root.turn_id,
                         model_lease: root.model_lease,
-                        permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+                        permission_ceiling,
                         resource_scopes: root.resource_scopes,
                     },
                 )
