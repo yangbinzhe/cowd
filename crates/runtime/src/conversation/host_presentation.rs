@@ -1831,13 +1831,30 @@ pub(super) fn root_terminal_owned_elsewhere(
     goal_id: &str,
     completion: GoalCompletion,
 ) -> Result<bool, String> {
-    let agentic_supervisor = root_presentation
-        && agentic_program_owns_root_terminal(services, session_id, turn_id, graph_id)?;
-    let existing = services
+    let goal = services
         .goal_store()
         .get(goal_id)
-        .map_err(|error| format!("load Objective terminal before presentation: {error}"))?
-        .filter(|goal| goal.completion != GoalCompletion::Open);
+        .map_err(|error| format!("load Objective terminal before presentation: {error}"))?;
+    // A Goal bound to a live Agentic Program has exactly one terminal owner: the
+    // atomic Program conclusion. Delegated workers synthesize their task result
+    // but must not commit the shared Goal, or effect_authority rejects them with
+    // `program_terminal_authority`.
+    let program_bound = goal.as_ref().is_some_and(|goal| {
+        goal.execution_binding.as_ref().is_some_and(|binding| {
+            services
+                .agent_action_service()
+                .project_if_exists(&binding.agentic_program_id)
+                .ok()
+                .flatten()
+                .is_some()
+        })
+    });
+    if !root_presentation && program_bound && completion == GoalCompletion::Satisfied {
+        return Ok(true);
+    }
+    let agentic_supervisor = root_presentation
+        && agentic_program_owns_root_terminal(services, session_id, turn_id, graph_id)?;
+    let existing = goal.filter(|goal| goal.completion != GoalCompletion::Open);
     if let Some(goal) = existing {
         if goal.completion != completion {
             return Err(format!(
