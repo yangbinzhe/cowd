@@ -13,7 +13,7 @@ Surface（TUI / WebUI / Connector）
   -> Gateway（鉴权、API、SSE、审批投影、容量）
     -> Runtime（Session/Task/Mission/Execution）
       -> 执行图（节点并行：model/agent/tool/approval/verify/synthesize）
-      -> Storage（PostgreSQL 默认；SQLite 仅冷启动回退）
+      -> Storage（PostgreSQL 唯一）
 ```
 
 签名 APP 不进入 Core 的编译依赖图。Gateway 在启动时从 `apps.directories` 发现不可变 Bundle，经 trust store、manifest/catalog digest 与文件完整性准入后交给统一 supervisor；业务调用统一走 typed invoke/stream/TUI transport，APP 请求 Core effect 时只能通过签名 CoreBridge edge。
@@ -54,10 +54,8 @@ apps.directories -> verify/admit -> catalog -> supervisor -> isolated Worker
 
 ## 存储
 
-- `storage.backend=auto`（默认）：PG 优先，冷启动不可用/未配置时回退 SQLite，写 `fallback.json` 并标记 degraded；禁止热切换与双写。
-- `postgres` 为 fail-fast；`sqlite` 为纯本地模式。
-- 平迁命令：`cowd storage plan|upgrade|migrate|verify|cutover`；回退后 `cowd storage adopt-postgres` 显式接管。
-- 历史 SQLite 数据在 cutover 后归档（本机已归档并清理）。
+- `storage.backend=postgres`（唯一）：缺失/无效 `storage.postgres`、`auto`、`preferred`、`fallback`、`sqlite` 均 fail-closed，不创建本地回退数据库。
+- 平迁/维护命令：`cowd storage upgrade|verify|status`；不提供 SQLite 迁移/回退路径，不导入历史 SQLite 数据。
 
 ## 记忆（L0-L4）
 

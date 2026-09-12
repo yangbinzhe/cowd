@@ -206,6 +206,8 @@ run_contract() {
   run_step static_architecture_boundaries bash scripts/architecture/check-boundaries.sh
   run_step cargo_test_runtime_architecture cargo test -p runtime --test runtime_module_architecture
   run_step test_governance bash scripts/test/governance-gate.sh
+  run_step pg_only_gate node scripts/test/pg-only-gate.mjs
+  run_step pg_gates_negative node --test scripts/test/pg-gates.test.mjs
   run_step reference_bundle bash scripts/test/reference-app.sh
 }
 

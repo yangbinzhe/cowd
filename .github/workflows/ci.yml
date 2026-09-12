@@ -48,7 +48,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y tmux curl ripgrep iproute2 sqlite3 python3
+      - run: sudo apt-get update && sudo apt-get install -y tmux curl ripgrep iproute2 python3
       - run: scripts/validate.sh scenario
 
   build:

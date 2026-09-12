@@ -1688,4 +1688,39 @@ mod tests {
             .and_then(|row| row.get::<_, Option<String>>(0))
             .is_none());
     }
+
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn real_postgres_failure_is_fail_closed_and_committed_work_survives_reconnect() {
+        let fixture = crate::postgres_scope::PostgresTestScope::new();
+        let executor = fixture.reconnect();
+        {
+            let mut connection = executor.checkout_critical().expect("fixture connection");
+            connection
+                .batch_execute("CREATE TABLE g65_marker(value TEXT NOT NULL)")
+                .expect("marker table");
+            connection
+                .execute("INSERT INTO g65_marker(value) VALUES($1)", &[&"durable"])
+                .expect("marker insert");
+        }
+        // Cold start against an unreachable PostgreSQL endpoint must fail closed with a
+        // diagnosable error instead of opening any local fallback database.
+        let bad_url = "postgres://postgres:wrong@127.0.0.1:1/cowd_release_closure".to_string();
+        let resolver = StaticSecretRefResolver::new([("g65-bad".to_string(), bad_url)]);
+        let bad = PostgresConnectionConfig::new("g65_bad", "g65-bad", "g65-bad");
+        let error = PostgresExecutor::connect(bad, &resolver);
+        assert!(
+            error.is_err(),
+            "unreachable PostgreSQL must not silently fall back to a local store"
+        );
+        // Reconnecting the same owned namespace must retain already committed work.
+        let value: String = fixture
+            .reconnect()
+            .checkout_online_read()
+            .expect("reopened connection")
+            .query_one("SELECT value FROM g65_marker", &[])
+            .expect("reopened query")
+            .get(0);
+        assert_eq!(value, "durable");
+    }
 }

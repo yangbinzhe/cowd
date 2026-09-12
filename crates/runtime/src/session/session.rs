@@ -1563,7 +1563,7 @@ fn ensure_legacy_jsonl_session_persistence_enabled(path: &Path) -> Result<(), Se
         return Ok(());
     }
     Err(SessionError::Format(format!(
-        "legacy JSONL session persistence is disabled for {}; sessions are stored in SQLite. Use explicit import/export flows for local .jsonl/.json files.",
+        "legacy JSONL session persistence is disabled for {}; sessions are stored in PostgreSQL. Use explicit import/export flows for local .jsonl/.json files.",
         path.display()
     )))
 }
