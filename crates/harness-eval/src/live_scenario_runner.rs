@@ -338,6 +338,11 @@ fn controlled_live_prompt(spec_id: &str, prompt: String, telemetry_limit: Option
         // exact: the isolated workspace plus network reads, never the host.
         resource_scopes.push("workspace:.");
         resource_scopes.push("network:*");
+    } else {
+        // Read-only source-analysis scenarios must be able to read the isolated
+        // candidate workspace (`crates/...`) to ground their evidence. Without
+        // this lease every source read is denied by the resource ceiling.
+        resource_scopes.push("read:.");
     }
     let control = json!({
         "corpus_id": "live-scenarios-v1",

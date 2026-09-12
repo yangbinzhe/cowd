@@ -226,7 +226,12 @@ fn live_prompt_uses_an_optional_advisory_provider_token_telemetry_lease() {
     assert_eq!(control["provider_constraint"], "normal");
     assert_eq!(
         control["resource_scopes"],
-        json!(["provider", "provider_account", "provider_token_pool"])
+        json!([
+            "provider",
+            "provider_account",
+            "provider_token_pool",
+            "read:."
+        ])
     );
     assert_eq!(control["max_total_tokens"], 5_000_000);
     assert!(control["budget_lease_id"]
@@ -251,7 +256,8 @@ fn live_prompt_uses_an_optional_advisory_provider_token_telemetry_lease() {
             "provider",
             "provider_account",
             "provider_token_pool",
-            "read:Cargo.toml"
+            "read:Cargo.toml",
+            "read:."
         ])
     );
     assert!(tool_control.get("max_total_tokens").is_none());
