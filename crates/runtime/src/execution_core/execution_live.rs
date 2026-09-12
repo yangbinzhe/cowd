@@ -1970,15 +1970,14 @@ impl ExecutionLiveStore {
                     self.publish_record_residency(&candidate);
                     return Ok(());
                 }
+                Err(crate::RuntimeEventStoreError::StaleRevision { .. }) if attempt < 2 => {
+                    // Refresh only the cached row revision. Callers may hold the
+                    // record-shard lock while persisting, so re-locking the shard
+                    // here would self-deadlock.
+                    self.refresh_durable_cache_revision(&record.execution_id);
+                    attempt += 1;
+                }
                 Err(error) => {
-                    if error.to_string().contains("revision mismatch") && attempt < 2 {
-                        // Refresh only the cached row revision. Callers may hold
-                        // the record-shard lock while persisting, so re-locking
-                        // the shard here would self-deadlock.
-                        self.refresh_durable_cache_revision(&record.execution_id);
-                        attempt += 1;
-                        continue;
-                    }
                     tracing::error!(
                         execution_id = %record.execution_id,
                         error = %error,

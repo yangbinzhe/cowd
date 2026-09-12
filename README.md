@@ -184,7 +184,7 @@ Turn 对外保持一个可取消、可观察、可恢复的执行身份。停滞
     │   │             │  │  · LSP/file  │  │  DeepSeek/Qwen)   │   │
     │   └─────────────┘  └──────────────┘  └──────────────────┘   │
     │                                                              │
-    │   底层存储: storage (SQLite·PostgreSQL·Migration·Health)        │
+    │   底层存储: storage (PostgreSQL·Migration·Health)               │
     └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -240,7 +240,7 @@ Edge Source / Connector
      └── Matrix：结构化事实、证据链、可计算指标
 ```
 
-关键约束：SQLite 与 PostgreSQL 在同一事务内提交块数据和 receipt，只有最后一块成功才推进 watermark；指标仅支持受治理的 sum/ratio 合同。
+关键约束：块数据与 receipt 由 PostgreSQL 在同一事务内提交，只有最后一块成功才推进 watermark；指标仅支持受治理的 sum/ratio 合同。
 
 ### 5.3 Edge 与业务 App
 
