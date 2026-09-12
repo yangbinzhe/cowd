@@ -3557,7 +3557,7 @@ send('result',result=json.loads(RESULT_JSON))
     // Close via the agentic/execution TaskExecute harness (which has a consistent
     // claim) with a registered ProcessJsonl child. Tracked in
     // plan/.../evidence/I09/g29-real-subprocess-effect-design.md.
-    #[ignore = "G29 pending: use the agentic/execution TaskExecute harness with a consistent Task claim"]
+
     #[tokio::test]
     async fn process_child_write_reads_isolated_file_with_runtime_receipts() {
         use std::os::unix::fs::PermissionsExt;
@@ -3583,6 +3583,13 @@ try:
  delta=start.get('context_delta')
  if delta:
   send('context_ack',delivery_id=delta['delivery_id']);assert receive()['kind']=='context_acknowledged'
+ binding=packet.get('agentic_binding') or {}
+ focus=binding.get('focus') or {}
+ task_ref=focus.get('task_ref') or (packet.get('assignment') or {}).get('root_task_id')
+ send('action_request',request_id='claim',tool_name='task_claim',input={'task_ref':task_ref,'reason':'claim before isolated write'})
+ claim=receive()
+ if 'error' in claim:
+  send('error',error='task_claim: '+json.dumps(claim,ensure_ascii=False)[:700]);raise SystemExit(1)
  send('action_request',request_id='effect-write',tool_name='write_file',input={'path':'.cowd/agentic/proof.txt','content':'process effect proof'})
  answer=receive()
  if 'error' in answer:

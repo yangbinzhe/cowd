@@ -212,12 +212,6 @@ pub(crate) mod tests {
         fixture_with_options(missing_graph, process, None, false, false).await
     }
 
-    /// A write-capable variant used by the process-bridge effect gate: the leased
-    /// scope includes `write:.` so a child can produce a real isolated file.
-    pub(crate) async fn fixture_with_write_executor(process: crate::ProcessJsonlSpec) -> Fixture {
-        fixture_with_options(false, Some(process), None, true, false).await
-    }
-
     /// A TaskExecute-scoped process fixture. An ordinary write needs an active
     /// Task execution claim, which a Coordination focus does not provide.
     pub(crate) async fn fixture_with_process_task(process: crate::ProcessJsonlSpec) -> Fixture {
