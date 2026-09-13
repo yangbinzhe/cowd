@@ -1,7 +1,7 @@
 version: 2
-release_version: 0.9.724
-release_authority: docs/architecture/agent-first-model-framework-v0.9.724.md
-release_evidence: docs/evidence/agent-first-model-framework-v0.9.724.md
+release_version: 0.9.725
+release_authority: docs/architecture/agent-first-model-framework-v0.9.725.md
+release_evidence: docs/evidence/agent-first-model-framework-v0.9.725.md
 source_of_truth:
   execution: scripts/validate.sh
   inventory: scripts/test/inventory.sh
