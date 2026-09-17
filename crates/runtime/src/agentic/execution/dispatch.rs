@@ -1279,15 +1279,13 @@ impl RuntimeServices {
                 allowed_tools: admission.allowed_tools,
                 allowed_skills: admission.allowed_skills,
                 permission_ceiling: admission.permission_ceiling,
-                // The root selects a member's model at invite time via
-                // `model_profile_ref`; fall back to the program lease when the
-                // member carries no explicit profile. Runtime never hardcodes
-                // role tiers -- model choice stays the root's decision.
-                model_lease: member
-                    .model_profile_ref
-                    .clone()
-                    .filter(|profile| !profile.trim().is_empty())
-                    .unwrap_or_else(|| context.model_lease.clone()),
+                // `model_profile_ref` is a symbolic Agent-Definition profile
+                // (e.g. "default"/"coding"), not a provider model id, so it must
+                // NOT be used as the execution lease. Keep the concrete program
+                // lease; the member binding's `allowed_models` still constrains
+                // selection. A concrete per-member model would require resolving
+                // the Definition's allowed_models, not the profile label.
+                model_lease: context.model_lease.clone(),
                 budget_lease: ChildExecutionBudgetReservation::single(
                     format!("budget:{graph_id}"),
                     member.agent_id.clone(),

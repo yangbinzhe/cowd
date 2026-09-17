@@ -2741,6 +2741,12 @@ impl DelegatedAgenticProtocolState {
     /// attempt knows the concrete unmet criterion instead of repeating work.
     /// `review_reason` is durable on the Task but was previously write-only.
     fn rework_note(&self) -> String {
+        // Surface the reason only while the Task is actually in Rework, so a
+        // re-arming attempt after a physical review failure (which returns the
+        // Task to Published) cannot repeat a stale reason.
+        if self.status != crate::AgenticTaskStatus::Rework {
+            return String::new();
+        }
         match self.review_reason.as_deref() {
             Some(reason) if !reason.trim().is_empty() => format!(
                 " A previous review requested rework for this exact reason, which you must resolve before resubmitting: {reason}"

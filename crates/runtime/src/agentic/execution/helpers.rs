@@ -282,7 +282,7 @@ pub(super) fn task_objective(
             task.acceptance_checks.join("; ")
         ));
     }
-    if matches!(mode, DispatchMode::Execute) {
+    if matches!(mode, DispatchMode::Execute) && task.status == AgenticTaskStatus::Rework {
         if let Some(reason) = task.review_reason.as_deref().filter(|reason| !reason.trim().is_empty())
         {
             objective.push_str(&format!(

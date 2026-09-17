@@ -456,19 +456,13 @@ pub(crate) fn apply_task_review(
         task.evidence_refs.sort();
         task.evidence_refs.dedup();
         match input.decision {
-            TaskReviewDecision::Accept => {
-                task.status = AgenticTaskStatus::Accepted;
-                // S1-lite: expose task success for rework-rate / accepted-count
-                // metrics without adding projection fields.
-                crate::execution_core::performance::observe_count("agentic_task_accepted", 1);
-            }
+            TaskReviewDecision::Accept => task.status = AgenticTaskStatus::Accepted,
             TaskReviewDecision::Challenge | TaskReviewDecision::Rework => {
                 task.status = AgenticTaskStatus::Rework;
                 task.claimant = None;
                 task.claim_execution_id = None;
                 task.claimed_at_ms = None;
                 task.lease_expires_at_ms = None;
-                crate::execution_core::performance::observe_count("agentic_task_reworked", 1);
             }
         }
     }
