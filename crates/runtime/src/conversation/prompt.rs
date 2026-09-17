@@ -764,6 +764,7 @@ fn get_simple_system_section() -> String {
 
 fn get_simple_doing_tasks_section() -> String {
     let items = prepend_bullets(vec![
+        "Batch independent tool calls into one turn: when reads, searches, or Agent actions have no dependency between them, issue them together instead of one per turn. Runtime executes a tool batch concurrently, and every result returns in the next single step.".to_string(),
         "Read relevant code before changing it and keep changes tightly scoped to the request.".to_string(),
         "Do not add speculative abstractions, compatibility shims, or unrelated cleanup.".to_string(),
         "Do not create files unless they are required to complete the task.".to_string(),
@@ -990,6 +991,15 @@ mod tests {
         assert!(rendered.contains("small Agent actions incrementally"));
         assert!(rendered.contains("Runtime owns actor identity"));
         assert!(rendered.contains("independent Tasks"));
+    }
+
+    #[test]
+    fn prompt_instructs_batching_independent_tool_calls() {
+        let rendered = SystemPromptBuilder::new().render();
+        assert!(
+            rendered.contains("Batch independent tool calls into one turn"),
+            "the base prompt must instruct batching independent tool calls"
+        );
     }
 
     #[test]
