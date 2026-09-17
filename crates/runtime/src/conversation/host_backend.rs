@@ -281,18 +281,22 @@ where
                 // making nominal progress (dispatching, claiming), so a
                 // required-Team turn could otherwise run unbounded. Past the
                 // ceiling the turn ends as an honest partial with disclosure.
+                let collaboration_budget_elapsed = collaboration_budget_elapsed(
+                    state.collaboration_obligation.as_ref(),
+                    state.execution_role.is_delegated_leaf(),
+                    state.started_at.elapsed(),
+                    collaboration_wall_budget(),
+                );
                 let collaboration_ceiling_reached = collaboration_ceiling_reached(
                     state.collaboration_obligation.as_ref(),
                     state.execution_role.is_delegated_leaf(),
                     state.iterations,
                     state.safety_lease.max_model_steps,
                 );
-                let fuse_decision = if collaboration_ceiling_reached {
+                let fuse_decision = if collaboration_budget_elapsed || collaboration_ceiling_reached
+                {
                     crate::execution_core::SafetyFuseDecision::Block {
-                        reason: format!(
-                            "bounded convergence reached after {} model steps with the required verified-Team minimum still unmet; the objective is only partially satisfied and unresolved work stays in the Program projection",
-                            state.safety_lease.max_model_steps.saturating_mul(3)
-                        ),
+                        reason: "bounded convergence: the required verified-Team minimum is still unmet after the Agent-first collaboration budget; the objective is only partially satisfied, unresolved work stays in the Program projection, and Runtime stopped the turn instead of running unbounded".to_string(),
                     }
                 } else {
                     crate::execution_core::SafetyFusePolicy::evaluate(
@@ -2673,12 +2677,41 @@ fn next_unverified_model_step_streak(current: usize, made_verified_progress: boo
     }
 }
 
+/// Objective-level wall-clock budget for a required-Team collaboration turn.
+/// Configurable with `COWD_COLLABORATION_BUDGET_SECS`; default 1500s. The
+/// no-progress fuse cannot bound a turn that keeps making nominal progress, so
+/// this budget is what guarantees an in-bound honest terminal. Evaluation
+/// runners should set it below their own scenario safety wait.
+fn collaboration_wall_budget() -> std::time::Duration {
+    std::env::var("COWD_COLLABORATION_BUDGET_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map_or_else(
+            || std::time::Duration::from_secs(1500),
+            std::time::Duration::from_secs,
+        )
+}
+
+/// True when a required-Team collaboration turn has spent its objective-level
+/// wall-clock budget. Delegated leaves never inherit the root's budget, and a
+/// turn without a Team obligation is bounded by the no-progress fuse alone.
+fn collaboration_budget_elapsed(
+    obligation: Option<&harness_contract::strategy::CollaborationExecutionObligation>,
+    is_delegated_leaf: bool,
+    elapsed: std::time::Duration,
+    budget: std::time::Duration,
+) -> bool {
+    obligation.is_some_and(|obligation| obligation.minimum_team_count > 0)
+        && !is_delegated_leaf
+        && elapsed >= budget
+}
+
 /// True when an Agent-first collaboration turn has spent its absolute
 /// objective-level ceiling without reaching its verified-Team minimum. The
 /// no-progress fuse cannot fire while nominal progress continues, so this is
 /// the bound that guarantees an honest, in-bound terminal.
-fn collaboration_ceiling_reached(
-    obligation: Option<&harness_contract::strategy::CollaborationExecutionObligation>,
+fn collaboration_ceiling_reached(    obligation: Option<&harness_contract::strategy::CollaborationExecutionObligation>,
     is_delegated_leaf: bool,
     iterations: usize,
     max_model_steps: usize,
@@ -2763,6 +2796,42 @@ mod safety_fuse_streak_tests {
         ));
         // Without an obligation only the no-progress fuse decides.
         assert!(!collaboration_ceiling_reached(None, false, 999, 24));
+    }
+
+    #[test]
+    fn collaboration_wall_budget_bounds_required_team_turns() {
+        use super::{collaboration_budget_elapsed, collaboration_wall_budget};
+        use harness_contract::strategy::CollaborationExecutionObligation;
+        use std::time::Duration;
+        let obligation = CollaborationExecutionObligation {
+            minimum_team_count: 3,
+            exact_team_count: None,
+        };
+        assert!(collaboration_budget_elapsed(
+            Some(&obligation),
+            false,
+            Duration::from_secs(100),
+            Duration::from_secs(100)
+        ));
+        assert!(!collaboration_budget_elapsed(
+            Some(&obligation),
+            false,
+            Duration::from_secs(99),
+            Duration::from_secs(100)
+        ));
+        assert!(!collaboration_budget_elapsed(
+            Some(&obligation),
+            true,
+            Duration::from_secs(10_000),
+            Duration::from_secs(100)
+        ));
+        assert!(!collaboration_budget_elapsed(
+            None,
+            false,
+            Duration::from_secs(10_000),
+            Duration::from_secs(100)
+        ));
+        assert!(collaboration_wall_budget().as_secs() > 0);
     }
 }
 

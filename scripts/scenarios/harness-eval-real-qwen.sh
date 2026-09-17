@@ -341,6 +341,12 @@ gateway_env=(
   COWD_EVAL_CORPUS_ID=live-scenarios-v1
   COWD_MODEL_TEMPERATURE=0
 )
+# Optional objective-level wall-clock budget for required-Team collaboration
+# turns. Kept below the scenario safety wait so a non-converging turn ends as an
+# honest partial instead of hitting the external timeout.
+if [[ -n "${COWD_COLLABORATION_BUDGET_SECS:-}" ]]; then
+  gateway_env+=("COWD_COLLABORATION_BUDGET_SECS=$COWD_COLLABORATION_BUDGET_SECS")
+fi
 if [[ -n "$STAGED_CREDENTIAL_ENV" ]]; then
   gateway_env+=("$STAGED_CREDENTIAL_ENV=$PROVIDER_CREDENTIAL")
 fi
