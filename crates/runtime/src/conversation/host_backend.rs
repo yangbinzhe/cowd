@@ -120,6 +120,23 @@ where
         if self.state.lock().await.terminal_override.is_some() {
             return Ok(precommitted_terminal_outcome(ticket));
         }
+        {
+            // Objective-level wall-clock budget for a required-Team turn. Checked
+            // at the top of every root model step so it cannot be bypassed by the
+            // clean-terminal-synthesis short circuit below. The no-progress fuse
+            // cannot bound a turn that keeps making nominal progress.
+            let mut state = self.state.lock().await;
+            if collaboration_budget_elapsed(
+                state.collaboration_obligation.as_ref(),
+                state.execution_role.is_delegated_leaf(),
+                state.started_at.elapsed(),
+                collaboration_wall_budget(),
+            ) {
+                let disclosure = "Execution blocked safely: bounded convergence reached the Agent-first collaboration budget with the required verified-Team minimum still unmet. The objective is only partially satisfied and unresolved work stays in the Program projection; Runtime stopped the turn instead of running unbounded.".to_string();
+                state.terminal_override = Some((GoalCompletion::Partial, disclosure));
+                return Ok(precommitted_terminal_outcome(ticket));
+            }
+        }
         let delegated_protocol_at_step =
             delegated_agentic_protocol_state(self.services.as_ref(), ticket)?;
         if delegated_protocol_at_step.is_none() {

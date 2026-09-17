@@ -2058,6 +2058,25 @@ fn scenario_metrics(
         .map(|program| program.topics.values().map(Vec::len).sum::<usize>())
         .unwrap_or_default();
     let artifact_count = agentic_program.map_or(0, |program| program.artifacts.len());
+    // S1: a reviewer that requested rework records a durable reason on the Task,
+    // so this is the honest rework signal (not a replayable counter).
+    let reworked_tasks = agentic_program
+        .map(|program| {
+            active_agentic_tasks(program)
+                .filter(|task| task.review_reason.is_some())
+                .count()
+        })
+        .unwrap_or_default();
+    let rework_rate_bp = if accepted_tasks.saturating_add(reworked_tasks) == 0 {
+        0
+    } else {
+        u32::try_from(
+            reworked_tasks
+                .saturating_mul(10_000)
+                .saturating_div(accepted_tasks.saturating_add(reworked_tasks)),
+        )
+        .unwrap_or(0)
+    };
     let mut metrics = json!({
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
@@ -2075,6 +2094,8 @@ fn scenario_metrics(
         "team_count": teams.len().max(projected_health.team_count),
         "agentic_task_count": agentic_tasks,
         "accepted_agentic_task_count": accepted_tasks,
+        "reworked_agentic_task_count": reworked_tasks,
+        "rework_rate_bp": rework_rate_bp,
         "agentic_review_count": agentic_reviews,
         "agentic_topic_entry_count": topic_entries,
         "agentic_artifact_count": artifact_count,
