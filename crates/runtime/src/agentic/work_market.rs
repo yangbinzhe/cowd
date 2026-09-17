@@ -15,6 +15,15 @@ use super::program::{
 // deadline on healthy long-running work.
 pub(crate) const CLAIM_LEASE_MS: u64 = 90 * 1_000;
 
+// Bounded failure progress. Retries stay evidence-driven, but a Task that keeps
+// failing with *different* reasons can otherwise re-enter Rework forever and
+// park the root on the Program barrier (G56/G57 root non-finalization). After
+// this many physical/review failures the Task is forced `Blocked` so the
+// Program can reach an explicit terminal instead of an unbounded loop. A
+// materially improved retry still gets its opportunities before the bound.
+pub(crate) const MAX_TASK_EXECUTION_ATTEMPTS: u8 = 3;
+pub(crate) const MAX_TASK_REVIEW_ATTEMPTS: u8 = 3;
+
 pub(crate) fn apply_task_publish(
     projection: &mut AgenticProgramProjection,
     _envelope: &AgentActionEnvelope,
@@ -156,11 +165,14 @@ pub(crate) fn apply_task_attempt_fail(
                     task.claim_generation = task.claim_generation.saturating_add(1);
                 }
                 task.failed_attempts = task.failed_attempts.saturating_add(1);
+                let attempts_exhausted = task.failed_attempts >= MAX_TASK_EXECUTION_ATTEMPTS;
                 task.claimant = None;
                 task.claim_execution_id = None;
                 task.claimed_at_ms = None;
                 task.lease_expires_at_ms = None;
-                task.status = if input.retryable && !repeats_same_failure {
+                task.status = if attempts_exhausted {
+                    AgenticTaskStatus::Blocked
+                } else if input.retryable && !repeats_same_failure {
                     AgenticTaskStatus::Rework
                 } else if input.retryable {
                     AgenticTaskStatus::Blocked
@@ -175,7 +187,10 @@ pub(crate) fn apply_task_attempt_fail(
             AgentAttemptMode::Review => {
                 task.failed_review_attempts = task.failed_review_attempts.saturating_add(1);
                 task.review_generation = task.review_generation.saturating_add(1);
-                task.status = if input.retryable && !repeats_same_failure {
+                let reviews_exhausted = task.failed_review_attempts >= MAX_TASK_REVIEW_ATTEMPTS;
+                task.status = if reviews_exhausted {
+                    AgenticTaskStatus::Blocked
+                } else if input.retryable && !repeats_same_failure {
                     AgenticTaskStatus::Submitted
                 } else if input.retryable {
                     AgenticTaskStatus::Blocked
@@ -546,6 +561,70 @@ mod tests {
         assert_eq!(task.claim_generation, 1);
         assert_eq!(task.claim_execution_id.as_deref(), Some("execution"));
         assert!(task.lease_expires_at_ms.expect("renewed lease") > first_expiry);
+    }
+
+    #[test]
+    fn distinct_execution_failures_are_bounded_to_blocked() {
+        let mut projection = AgenticProgramProjection::empty("program", "objective");
+        projection.tasks.insert(
+            "task".to_string(),
+            AgenticTaskProjection {
+                task_id: "task".to_string(),
+                team_id: "team".to_string(),
+                title: "task".to_string(),
+                objective: "objective".to_string(),
+                acceptance: "durable evidence".to_string(),
+                required_capabilities: Vec::new(),
+                depends_on: Vec::new(),
+                status: AgenticTaskStatus::Rework,
+                claimant: None,
+                claim_generation: 0,
+                claim_execution_id: None,
+                claimed_at_ms: None,
+                lease_expires_at_ms: None,
+                active_attempts: Default::default(),
+                artifact_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                unresolved: Vec::new(),
+                review_reason: None,
+                reviewed_by: None,
+                failed_attempts: 0,
+                review_generation: 0,
+                failed_review_attempts: 0,
+                last_failure: None,
+                replacement_task_refs: Vec::new(),
+                supersede_evidence_refs: Vec::new(),
+                superseded_reason: None,
+                superseded_by: None,
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
+                cancel_requested_by: None,
+                cancel_reason_ref: None,
+                cancel_evidence_refs: Vec::new(),
+                pending_retirement: None,
+            },
+        );
+        // Distinct reasons defeat the same-failure veto, so the explicit bound
+        // must terminalize the Task instead of re-entering Rework forever.
+        for attempt in 1..=MAX_TASK_EXECUTION_ATTEMPTS {
+            let input = TaskAttemptFailInput {
+                task_ref: "task".to_string(),
+                execution_id: format!("execution-{attempt}"),
+                mode: AgentAttemptMode::Execute,
+                reason: format!("distinct failure {attempt}"),
+                retryable: true,
+            };
+            apply_task_attempt_fail(&mut projection, &input);
+        }
+        let task = &projection.tasks["task"];
+        assert_eq!(task.failed_attempts, MAX_TASK_EXECUTION_ATTEMPTS);
+        assert_eq!(
+            task.status,
+            AgenticTaskStatus::Blocked,
+            "bounded distinct failures must reach a terminal instead of looping"
+        );
     }
 
     #[test]
