@@ -276,11 +276,32 @@ where
             {
                 None
             } else {
-                match crate::execution_core::SafetyFusePolicy::evaluate(
-                    &state.safety_lease,
-                    state.consecutive_unverified_model_steps,
-                    made_progress,
-                ) {
+                // Absolute objective-level bound for Agent-first collaboration:
+                // the no-progress fuse cannot fire while the objective keeps
+                // making nominal progress (dispatching, claiming), so a
+                // required-Team turn could otherwise run unbounded. Past the
+                // ceiling the turn ends as an honest partial with disclosure.
+                let collaboration_ceiling_reached = collaboration_ceiling_reached(
+                    state.collaboration_obligation.as_ref(),
+                    state.execution_role.is_delegated_leaf(),
+                    state.iterations,
+                    state.safety_lease.max_model_steps,
+                );
+                let fuse_decision = if collaboration_ceiling_reached {
+                    crate::execution_core::SafetyFuseDecision::Block {
+                        reason: format!(
+                            "bounded convergence reached after {} model steps with the required verified-Team minimum still unmet; the objective is only partially satisfied and unresolved work stays in the Program projection",
+                            state.safety_lease.max_model_steps.saturating_mul(3)
+                        ),
+                    }
+                } else {
+                    crate::execution_core::SafetyFusePolicy::evaluate(
+                        &state.safety_lease,
+                        state.consecutive_unverified_model_steps,
+                        made_progress,
+                    )
+                };
+                match fuse_decision {
                     crate::execution_core::SafetyFuseDecision::Continue => None,
                     crate::execution_core::SafetyFuseDecision::Block { .. }
                         if delegated_protocol_at_step
@@ -2652,6 +2673,21 @@ fn next_unverified_model_step_streak(current: usize, made_verified_progress: boo
     }
 }
 
+/// True when an Agent-first collaboration turn has spent its absolute
+/// objective-level ceiling without reaching its verified-Team minimum. The
+/// no-progress fuse cannot fire while nominal progress continues, so this is
+/// the bound that guarantees an honest, in-bound terminal.
+fn collaboration_ceiling_reached(
+    obligation: Option<&harness_contract::strategy::CollaborationExecutionObligation>,
+    is_delegated_leaf: bool,
+    iterations: usize,
+    max_model_steps: usize,
+) -> bool {
+    obligation.is_some_and(|obligation| obligation.minimum_team_count > 0)
+        && !is_delegated_leaf
+        && iterations >= max_model_steps.saturating_mul(3)
+}
+
 /// Policy bound on how many times the Agent-first collaboration completion gate
 /// may re-drive the root before the turn terminates as an honest partial. This
 /// is a convergence bound, never a topology: the model still owns every
@@ -2696,6 +2732,37 @@ mod safety_fuse_streak_tests {
             collaboration_convergence_replan_bound(TaskComplexity::Strategic)
                 > collaboration_convergence_replan_bound(TaskComplexity::Moderate)
         );
+    }
+
+    #[test]
+    fn collaboration_ceiling_bounds_required_team_turns() {
+        use super::collaboration_ceiling_reached;
+        use harness_contract::strategy::CollaborationExecutionObligation;
+        let obligation = CollaborationExecutionObligation {
+            minimum_team_count: 3,
+            exact_team_count: None,
+        };
+        assert!(!collaboration_ceiling_reached(
+            Some(&obligation),
+            false,
+            5,
+            24
+        ));
+        assert!(collaboration_ceiling_reached(
+            Some(&obligation),
+            false,
+            72,
+            24
+        ));
+        // A delegated leaf never inherits the root's Team obligation.
+        assert!(!collaboration_ceiling_reached(
+            Some(&obligation),
+            true,
+            999,
+            24
+        ));
+        // Without an obligation only the no-progress fuse decides.
+        assert!(!collaboration_ceiling_reached(None, false, 999, 24));
     }
 }
 
