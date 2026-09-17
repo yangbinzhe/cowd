@@ -173,10 +173,12 @@ impl ProviderCapabilityProfile {
     }
 
     /// The single wire-boundary truth for "this exact model must not receive
-    /// an explicit `tool_choice` field". DeepSeek v4 and Qwen 3.7 Plus
-    /// thinking endpoints reject `tool_choice` with HTTP 400 even when no
+    /// an explicit `tool_choice` field". DeepSeek v4 and the Qwen 3.7/3.8
+    /// thinking endpoints reject `tool_choice` with HTTP 400
+    /// (`invalid_parameter_error`, "The tool_choice parameter does not support
+    /// being set to required or object in thinking mode") even when no
     /// `reasoning_effort` is sent. Omit the field unconditionally for these
-    /// exact model families unless a configured capability tag explicitly
+    /// exact model ids unless a configured capability tag explicitly
     /// overrides it. Both the Runtime capability gate and the provider
     /// payload builders call this helper so they cannot drift.
     #[must_use]
@@ -184,7 +186,7 @@ impl ProviderCapabilityProfile {
         model: &str,
         _reasoning_effort: Option<&str>,
     ) -> bool {
-        Self::is_deepseek_v4(model) || Self::is_qwen_37_plus(model)
+        Self::is_deepseek_v4(model) || Self::is_qwen_thinking_tool_choice_incompatible(model)
     }
 
     /// The canonical wire fact for OpenAI-compatible assistant continuation
@@ -207,12 +209,24 @@ impl ProviderCapabilityProfile {
         matches!(canonical, "deepseek-v4-pro" | "deepseek-v4-flash")
     }
 
-    /// Exact Qwen 3.7 Plus check. It matches the canonical model id only so
-    /// unrelated Qwen variants retain their configured/default capability.
-    fn is_qwen_37_plus(model: &str) -> bool {
+    /// Exact Qwen thinking-mode family check. These canonical ids reject an
+    /// explicit `tool_choice` (`required`/object) with HTTP 400 in thinking
+    /// mode. The match is on the canonical model id only so unrelated Qwen
+    /// variants retain their configured/default capability.
+    fn is_qwen_thinking_tool_choice_incompatible(model: &str) -> bool {
         let lowered = model.trim().to_ascii_lowercase();
         let canonical = lowered.rsplit('/').next().unwrap_or_default();
-        matches!(canonical, "qwen3.7-plus" | "qwen-3.7-plus")
+        matches!(
+            canonical,
+            "qwen3.7-plus"
+                | "qwen-3.7-plus"
+                | "qwen3.7-max"
+                | "qwen-3.7-max"
+                | "qwen3.8-max"
+                | "qwen-3.8-max"
+                | "qwen3.8-plus"
+                | "qwen-3.8-plus"
+        )
     }
 }
 
@@ -355,6 +369,32 @@ mod tests {
                 "DeepSeek v4 defaults to thinking mode and rejects tool_choice with 400"
             );
         }
+    }
+
+    #[test]
+    fn qwen_thinking_models_omit_explicit_tool_choice() {
+        for model in ["qwen3.7-plus", "qwen3.7-max", "qwen3.8-max", "qwen3.8-plus"] {
+            let profile =
+                ProviderCapabilityProfile::resolve(ProviderProtocol::Completions, model);
+            assert_eq!(
+                profile.supports_explicit_tool_choice.state,
+                CapabilityState::Unsupported,
+                "{model} thinking mode rejects tool_choice with HTTP 400"
+            );
+            assert_eq!(
+                profile.supports_tool_calls.state,
+                CapabilityState::Supported,
+                "{model}: tools stay advertised; only the explicit field is omitted"
+            );
+            assert!(ProviderCapabilityProfile::explicit_tool_choice_known_unsupported(model, None));
+        }
+        // An unrelated Qwen variant must not be downgraded by prefix guessing.
+        let unrelated =
+            ProviderCapabilityProfile::resolve(ProviderProtocol::Completions, "qwen3.6-flash");
+        assert_eq!(
+            unrelated.supports_explicit_tool_choice.state,
+            CapabilityState::Supported
+        );
     }
 
     #[test]

@@ -21,6 +21,19 @@ use crate::runtime_event_store::{DurableRuntimeEvent, RuntimeProjectionCheckpoin
 use crate::{CowdEvent, RuntimeEventStore};
 
 const LIVE_PROJECTION_PREFIX: &str = "execution-live:";
+
+// Typed, non-spoofable markers for live-checkpoint persistence outcomes. The
+// persistence path returns `String` errors, so these sentinels are produced
+// only from typed `RuntimeEventStoreError` variants: callers match these
+// instead of error prose (audit F3) and a terminal/pending claim is never
+// silently dropped when a concurrent writer advanced the durable row (F4).
+const LIVE_PERSIST_STALE_REVISION_MARKER: &str = "cowd-live-persist:stale-revision";
+const LIVE_PERSIST_SUPERSEDED_MARKER: &str = "cowd-live-persist:superseded";
+
+fn is_live_persist_retryable(message: &str) -> bool {
+    message.starts_with(LIVE_PERSIST_STALE_REVISION_MARKER)
+        || message.starts_with(LIVE_PERSIST_SUPERSEDED_MARKER)
+}
 // Keep enough canonical live text to repair a saturated Surface stream while
 // remaining bounded per active execution. The byte offset carried alongside
 // the snapshot makes truncation explicit instead of silently presenting a
@@ -1341,7 +1354,7 @@ impl ExecutionLiveStore {
                 status,
                 session_generation,
             ) {
-                Err(error) if error.contains("revision mismatch") && attempt < 2 => {
+                Err(error) if is_live_persist_retryable(&error) && attempt < 2 => {
                     last_stale = Some(error);
                 }
                 other => return other,
@@ -1416,7 +1429,7 @@ impl ExecutionLiveStore {
                 status,
                 session_generation,
             ) {
-                Err(error) if error.contains("revision mismatch") && attempt < 2 => {
+                Err(error) if is_live_persist_retryable(&error) && attempt < 2 => {
                     last_stale = Some(error);
                 }
                 other => return other,
@@ -1899,8 +1912,24 @@ impl ExecutionLiveStore {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(&record.execution_id)
                 .copied();
-            if durable.is_some_and(|checkpoint| checkpoint.live_revision > record.live.revision) {
-                return Ok(());
+            if let Some(checkpoint) = durable {
+                if checkpoint.live_revision > record.live.revision {
+                    // A concurrent writer advanced the durable row. A candidate
+                    // without terminal/pending-claim state is safe to drop, but a
+                    // candidate that carries a claim must never be silently
+                    // absorbed: surface a typed superseded outcome so callers
+                    // re-read durable truth and re-derive the claim instead of
+                    // receiving a bare `Ok(())` while the claim is lost (F4).
+                    let carries_claim = record.pending_terminal_claim.is_some()
+                        || is_terminal_live_status(record.live.status);
+                    if !carries_claim {
+                        return Ok(());
+                    }
+                    return Err(format!(
+                        "{LIVE_PERSIST_SUPERSEDED_MARKER}: durable live revision {} superseded candidate {}",
+                        checkpoint.live_revision, record.live.revision
+                    ));
+                }
             }
             // Generation allocation is a durable lease operation and deliberately
             // does not bump the user-visible live revision. A record clone made
@@ -1976,6 +2005,14 @@ impl ExecutionLiveStore {
                     // here would self-deadlock.
                     self.refresh_durable_cache_revision(&record.execution_id);
                     attempt += 1;
+                }
+                Err(error @ crate::RuntimeEventStoreError::StaleRevision { .. }) => {
+                    tracing::error!(
+                        execution_id = %record.execution_id,
+                        error = %error,
+                        "failed to persist Runtime live execution checkpoint"
+                    );
+                    return Err(format!("{LIVE_PERSIST_STALE_REVISION_MARKER}: {error}"));
                 }
                 Err(error) => {
                     tracing::error!(
@@ -2407,6 +2444,24 @@ fn update_usage_percent(usage: &mut ContextUsageProjection) {
 mod tests {
     use super::*;
     use crate::{CowdExecutionContext, RuntimeEventInput, RuntimeEventScope, RuntimeEventStore};
+
+    #[test]
+    fn live_persist_retryable_matches_only_typed_markers() {
+        // F3: retry classification is driven by the typed markers this module
+        // emits from `RuntimeEventStoreError`, never by error prose.
+        assert!(is_live_persist_retryable(&format!(
+            "{LIVE_PERSIST_STALE_REVISION_MARKER}: {LIVE_PERSIST_STALE_REVISION_MARKER}"
+        )));
+        assert!(is_live_persist_retryable(&format!(
+            "{LIVE_PERSIST_SUPERSEDED_MARKER}: durable 9 superseded candidate 8"
+        )));
+        assert!(!is_live_persist_retryable(
+            "runtime stream `x` revision mismatch: expected 1, actual 2"
+        ));
+        assert!(!is_live_persist_retryable(
+            "some unrelated provider error mentioning revision mismatch"
+        ));
+    }
 
     #[test]
     fn completed_tool_plan_is_visible_before_execution_and_counted_once() {

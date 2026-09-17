@@ -1848,7 +1848,9 @@ impl RuntimeServices {
                 .await
             {
                 Ok(_) => return Ok(true),
-                Err(error) if error.to_string().contains("revision mismatch") => continue,
+                Err(crate::execution_core::graph::ExecutionRunnerError::Commit(
+                    crate::execution_core::graph::ExecutionCommitError::StaleRevision { .. },
+                )) => continue,
                 Err(error) => {
                     return Err(RuntimeServicesError::SessionHandoffRecovery(
                         error.to_string(),

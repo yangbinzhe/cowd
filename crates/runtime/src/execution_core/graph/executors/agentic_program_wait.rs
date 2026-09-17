@@ -309,7 +309,14 @@ pub async fn resolve_agentic_program_wait(
             .and_then(|result| result.result_ref.as_deref())
             .and_then(wait_result_revision)
             .unwrap_or_default();
+        // The same-revision guard exists to stop a replayed Program event from
+        // re-releasing an already-resolved barrier. It must not defeat a
+        // `worker_quiescent` resume: when no child graph is active the barrier
+        // is genuinely releasable even if the Program revision never advanced,
+        // otherwise the root stays parked forever (G56/G57 root non-finalization).
+        let quiescent_resume = reason == "worker_quiescent";
         if !allow_same_revision_quiescence
+            && !quiescent_resume
             && projection.status == AgenticProgramStatus::Open
             && !all_tasks_accepted(&projection)
             && revision <= observed_revision

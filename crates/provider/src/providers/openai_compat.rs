@@ -3619,6 +3619,32 @@ mod tests {
     }
 
     #[test]
+    fn qwen_thinking_omits_explicit_tool_choice_on_the_wire() {
+        for model in ["qwen3.8-max", "qwen3.7-max", "qwen3.7-plus"] {
+            let payload = build_chat_completion_request(
+                &MessageRequest {
+                    model: model.to_string(),
+                    max_tokens: 64,
+                    messages: vec![InputMessage::user_text("inspect")],
+                    tools: Some(vec![ToolDefinition {
+                        name: "read_file".to_string(),
+                        description: None,
+                        input_schema: json!({"type":"object"}),
+                    }]),
+                    tool_choice: Some(ToolChoice::Auto),
+                    ..Default::default()
+                },
+                OpenAiCompatConfig::deepseek(),
+            );
+            assert!(
+                payload.get("tool_choice").is_none(),
+                "{model} thinking mode rejects an explicit tool_choice field with HTTP 400"
+            );
+            assert!(payload.get("tools").is_some());
+        }
+    }
+
+    #[test]
     fn responses_wire_omits_tool_choice_for_deepseek_v4_thinking() {
         let payload = build_responses_request(&MessageRequest {
             model: "deepseek-v4-pro".to_string(),

@@ -859,7 +859,7 @@ impl AgentActionService {
                 now_ms(),
             ) {
                 Ok(_) => return,
-                Err(error) if error.to_string().contains("revision mismatch") && attempt < 2 => {
+                Err(RuntimeEventStoreError::StaleRevision { .. }) if attempt < 2 => {
                     continue;
                 }
                 Err(error) => {
