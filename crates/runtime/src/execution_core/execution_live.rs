@@ -1915,14 +1915,14 @@ impl ExecutionLiveStore {
             if let Some(checkpoint) = durable {
                 if checkpoint.live_revision > record.live.revision {
                     // A concurrent writer advanced the durable row. A candidate
-                    // without terminal/pending-claim state is safe to drop, but a
-                    // candidate that carries a claim must never be silently
-                    // absorbed: surface a typed superseded outcome so callers
-                    // re-read durable truth and re-derive the claim instead of
-                    // receiving a bare `Ok(())` while the claim is lost (F4).
-                    let carries_claim = record.pending_terminal_claim.is_some()
-                        || is_terminal_live_status(record.live.status);
-                    if !carries_claim {
+                    // without a provisional terminal claim is safe to drop, but a
+                    // pending claim must never be silently absorbed: surface a
+                    // typed superseded outcome so callers re-read durable truth and
+                    // re-derive the claim instead of receiving a bare `Ok(())`
+                    // while the claim is lost (audit F4). `finalize_terminal_once`
+                    // clears the pending claim before persisting, and terminal
+                    // status is absorbing, so only the claim path needs this.
+                    if record.pending_terminal_claim.is_none() {
                         return Ok(());
                     }
                     return Err(format!(
