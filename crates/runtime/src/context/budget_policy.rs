@@ -133,6 +133,10 @@ pub struct MemoryBudgetLease {
 pub struct ToolOutputBudgetLease {
     pub max_total_tokens: usize,
     pub per_tool_max_tokens: usize,
+    /// Retained for configuration/API compatibility. The model-facing head/tail
+    /// split is derived from `per_tool_max_tokens` in
+    /// `context::evidence::truncate_head_tail`, which adapts to the model
+    /// window; fixed character counts are intentionally not applied.
     pub head_chars: usize,
     pub tail_chars: usize,
 }

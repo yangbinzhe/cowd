@@ -2296,7 +2296,63 @@ fn normalize_responses_response(model: &str, response: ResponsesApiResponse) -> 
 }
 
 fn parse_tool_arguments(arguments: &str) -> Value {
-    serde_json::from_str(arguments).unwrap_or_else(|_| json!({ "raw": arguments }))
+    match serde_json::from_str(arguments) {
+        Ok(value) => value,
+        Err(_) => repair_truncated_json(arguments).unwrap_or_else(|| json!({ "raw": arguments })),
+    }
+}
+
+/// Repair an unbalanced/truncated JSON object or array left open by a stream
+/// cut (codex/opencode parity; opencode uses a partial-JSON repair). This only
+/// closes structures that are still open at end-of-input, respecting strings
+/// and escapes, and never invents keys or values, so a repaired-but-wrong
+/// object is still rejected by the tool's own schema validation.
+fn repair_truncated_json(arguments: &str) -> Option<Value> {
+    let trimmed = arguments.trim_start();
+    let first = trimmed.chars().next()?;
+    if first != '{' && first != '[' {
+        return None;
+    }
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in trimmed.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+    if stack.is_empty() && !in_string {
+        // Balanced but invalid for some other reason; do not guess.
+        return None;
+    }
+    let mut repaired = trimmed.to_string();
+    if in_string {
+        repaired.push('"');
+    }
+    repaired = repaired.trim_end().to_string();
+    if repaired.ends_with(',') {
+        repaired.pop();
+    }
+    while let Some(closer) = stack.pop() {
+        repaired.push(closer);
+    }
+    serde_json::from_str(&repaired).ok()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3871,6 +3927,18 @@ mod tests {
             json!({"city": "Paris"})
         );
         assert_eq!(parse_tool_arguments("not-json"), json!({"raw": "not-json"}));
+        // Truncated-but-recoverable stream cuts are repaired conservatively.
+        assert_eq!(
+            parse_tool_arguments("{\"city\":\"Par"),
+            json!({"city": "Par"})
+        );
+        assert_eq!(parse_tool_arguments("{\"a\":[1,2"), json!({"a": [1, 2]}));
+        assert_eq!(parse_tool_arguments("{\"a\":1,"), json!({"a": 1}));
+        // Balanced-but-invalid input is never guessed.
+        assert_eq!(
+            parse_tool_arguments("{\"a\":}"),
+            json!({"raw": "{\"a\":}"})
+        );
     }
 
     #[test]
