@@ -332,17 +332,15 @@ impl GatewayToolExecutor {
             // survived a crash while its physical follow-up graph did not;
             // dispatch is deterministic and therefore safe to replay.
             if should_dispatch {
+                let dispatch_context = runtime::AgenticDispatchContext {
+                    session_id: envelope.actor.session_id.clone(),
+                    turn_id: envelope.actor.turn_id.clone(),
+                    model_lease: binding.model_lease.unwrap_or("default").to_string(),
+                    permission_ceiling: binding.permission_ceiling,
+                    resource_scopes: envelope.actor.resource_scopes.clone(),
+                };
                 match services
-                    .dispatch_agentic_followups(
-                        &envelope,
-                        runtime::AgenticDispatchContext {
-                            session_id: envelope.actor.session_id.clone(),
-                            turn_id: envelope.actor.turn_id.clone(),
-                            model_lease: binding.model_lease.unwrap_or("default").to_string(),
-                            permission_ceiling: binding.permission_ceiling,
-                            resource_scopes: envelope.actor.resource_scopes.clone(),
-                        },
-                    )
+                    .dispatch_agentic_followups(&envelope, dispatch_context.clone())
                     .await
                 {
                     Ok(dispatches) if !dispatches.is_empty() => {
@@ -367,6 +365,35 @@ impl GatewayToolExecutor {
                         observation.actionable.push(format!(
                             "Semantic action committed; physical Agent dispatch is deferred and remains recoverable: {error}"
                         ));
+                        // Bounded self-heal (L2'): the semantic action is durable
+                        // and dispatch is deterministic, so retry a few times in
+                        // the background instead of parking the Program until a
+                        // worker exits or the process restarts. A still-
+                        // inadmissible member (e.g. an invited member that has not
+                        // started) can become admissible once it does.
+                        // `DispatchFlight` single-flights concurrent retries.
+                        let retry_services = Arc::clone(&services);
+                        let retry_envelope = envelope.clone();
+                        let retry_context = dispatch_context.clone();
+                        tokio::spawn(async move {
+                            for delay_ms in [5_000u64, 15_000, 45_000] {
+                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                                match retry_services
+                                    .dispatch_agentic_followups(&retry_envelope, retry_context.clone())
+                                    .await
+                                {
+                                    Ok(dispatches) if !dispatches.is_empty() => {
+                                        tracing::info!(
+                                            program_id = %retry_envelope.actor.program_id,
+                                            admitted = dispatches.len(),
+                                            "deferred Agent dispatch recovered"
+                                        );
+                                        break;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        });
                     }
                 }
             }
