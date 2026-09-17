@@ -616,6 +616,31 @@ mod tests {
     }
 
     #[test]
+    fn the_implicit_collaboration_scenario_freezes_a_minimum_of_three_teams() {
+        // Exact live-scenario prompt (live_implicit_collaboration_obligation).
+        // Runtime receives only this text (the COWD_EVAL_CONTROL line is parsed
+        // separately), so this pins the end-to-end decision: no Team name and no
+        // explicit count, yet three independently verifiable, tool-backed
+        // responsibility domains must become an automatic Team obligation.
+        let prompt = "请对三个独立责任域分别取得只读工具证据并交叉核验，最后统一综合结论。\
+            责任域一核查策略选择与执行义务，责任域二核查状态持久化与恢复，责任域三核查最终验收与投影。\
+            必须列出至少三个本次实际读取的完整 `crates/.../*.rs` 源码路径，只陈述工具证据能够验证的事实；\
+            不要自行指定 Team、Agent、角色、模板或编排拓扑。\
+            只能使用 read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot 这些只读工具，不要调用 bash 或任何写工具。";
+        let decision = build_runtime_execution_decision(prompt, None);
+        assert_eq!(decision.strategy.understanding.required_team_count, 0);
+        assert_eq!(decision.strategy.understanding.independent_workstreams, 3);
+        assert_eq!(decision.pattern(), ExecutionPattern::Collaborate);
+        assert_eq!(
+            decision
+                .collaboration_obligation
+                .as_ref()
+                .map(|obligation| obligation.required_team_count()),
+            Some(3)
+        );
+    }
+
+    #[test]
     fn a_non_team_admission_never_freezes_an_automatic_obligation() {
         // A parallel-evidence admission short-circuits to Explore/ParallelTools
         // before the structural branch. The obligation must follow the admitted

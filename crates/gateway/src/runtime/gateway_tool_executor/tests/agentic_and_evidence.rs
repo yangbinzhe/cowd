@@ -234,6 +234,31 @@
             assert!(executor.execute_content_publication("artifact_publish", wrong, binding).await.is_err());
         }
 
+        // An explicitly selected but empty/whitespace-only text block must be
+        // refused: authored content must never become an empty Task artifact
+        // that only surfaces as a reviewer rework after burning the budget.
+        let empty_blocks = serde_json::json!([{"type": "text", "text": "   \n  "}]);
+        store.insert_message(&session::SessionMessage {
+            stable_message_id: "empty-publication-message".to_string(),
+            session_id: session_id.to_string(), sequence: 1, role: "assistant".to_string(),
+            content_json: empty_blocks.to_string(), blocks_count: 1,
+            tool_use_id: None, tool_name: None, token_usage_json: None, created_at_ms: 3,
+        }).await.expect("empty source block");
+        let empty_request = serde_json::json!({
+            "source": "message_block", "message_id": "empty-publication-message",
+            "block_index": 0,
+            "sha256": format!("{:x}", Sha256::digest(serde_json::to_vec(&empty_blocks[0]).unwrap())),
+            "media_type": "text/plain"
+        });
+        let empty_error = executor
+            .execute_content_publication("artifact_publish", empty_request, binding)
+            .await
+            .expect_err("empty text block must not publish");
+        assert!(
+            empty_error.to_string().contains("empty text block"),
+            "unexpected error: {empty_error}"
+        );
+
         let actor = root_agent_action_actor(RuntimeToolExecutionBinding {
             action_id: None,
             session_id: Some(session_id),
