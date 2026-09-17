@@ -108,19 +108,30 @@ impl RuntimeServices {
         if initial.status != super::super::program::AgenticProgramStatus::Open {
             return Ok(Vec::new());
         }
-        let mut requests = initial
+        // Reviewers are independent and gate Task closure. Admit Review
+        // requests before starting new Execute work so a `Submitted` Task is
+        // never starved of a distinct reviewer by a fresh Execute claim
+        // occupying every member (the observed flash stall: 6 running graphs
+        // and 7 `Submitted` tasks with no reviewer admitted).
+        let mut review_requests = initial
             .tasks
             .values()
             .filter_map(|task| {
-                if task_is_ready(&initial, &task.task_id) {
-                    Some((task.task_id.clone(), DispatchMode::Execute))
-                } else if task.status == AgenticTaskStatus::Submitted {
-                    Some((task.task_id.clone(), DispatchMode::Review))
-                } else {
-                    None
-                }
+                (task.status == AgenticTaskStatus::Submitted)
+                    .then(|| (task.task_id.clone(), DispatchMode::Review))
             })
             .collect::<Vec<_>>();
+        let mut execute_requests = initial
+            .tasks
+            .values()
+            .filter_map(|task| {
+                task_is_ready(&initial, &task.task_id)
+                    .then(|| (task.task_id.clone(), DispatchMode::Execute))
+            })
+            .collect::<Vec<_>>();
+        let mut requests = Vec::new();
+        requests.append(&mut review_requests);
+        requests.append(&mut execute_requests);
         requests.extend(coordination_requests(&initial));
         let mut receipts = Vec::new();
         let mut failures = Vec::new();
