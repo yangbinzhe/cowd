@@ -28,6 +28,11 @@ fn add_token_usage(total: &mut TokenUsage, usage: TokenUsage) {
 const INTERACTIVE_PROVIDER_ADMISSION_TIMEOUT_MS: u64 = 30_000;
 const DELEGATED_PROVIDER_ADMISSION_TIMEOUT_MS: u64 = 300_000;
 
+// Proactive context reduction fires when the fixed transcript already occupies
+// this percentage of the smallest configured candidate window. It pre-empts the
+// hard "cannot fit" failure through the existing semantic-checkpoint pipeline.
+const PROACTIVE_COMPACTION_PERCENT: usize = 90;
+
 /// Make Runtime's checked receipts legible to the terminal narrator even when
 /// the provider transport represents them only as native tool messages.
 ///
@@ -1287,7 +1292,25 @@ where
             self.pack_provider_attempt(&prompt, &request_messages, model, inventory)
                 .is_err()
         });
-        if no_candidate_can_fit {
+        // Proactive context reduction (K3): when the fixed history already
+        // occupies most of the smallest candidate window, the next turn has no
+        // room and a hard "cannot fit" failure is imminent. Compact ahead of
+        // that failure through the same semantic-checkpoint pipeline so long
+        // autonomous runs keep a smaller, cheaper working set. This is a
+        // measured pre-emption, not a fixed transcript-ratio timer.
+        let session_tokens = {
+            let session = self.session.read().await;
+            crate::compact::estimate_session_tokens(&session)
+        };
+        let smallest_window = model_candidates
+            .iter()
+            .map(|model| self.context_window_for_model(model))
+            .min()
+            .unwrap_or(0);
+        let proactive_compaction_due = smallest_window > 0
+            && session_tokens.saturating_mul(100)
+                >= (smallest_window as usize).saturating_mul(PROACTIVE_COMPACTION_PERCENT);
+        if no_candidate_can_fit || proactive_compaction_due {
             if let Some(turn_id) = self.session_input_stream.active_turn_id() {
                 let consumed = self
                     .consume_runtime_input_records(&turn_id, TurnInputCheckpoint::BeforeCompaction);
@@ -1296,31 +1319,48 @@ where
                     &consumed,
                 ));
             }
+            let threshold = if no_candidate_can_fit {
+                1
+            } else {
+                (smallest_window as usize).saturating_mul(PROACTIVE_COMPACTION_PERCENT) / 100
+            };
             let compaction = self
-                .compact_session_with_checkpoint(self.compaction_config_for_session(1))
+                .compact_session_with_checkpoint(self.compaction_config_for_session(threshold))
                 .await?;
-            if compaction.is_none() {
-                return Err(RuntimeError::new(
-                    "all provider candidates reject the required request context and no semantic compaction boundary is available",
-                ));
-            }
-            request_messages = self.session.read().await.messages_view();
-            prompt = self
-                .prepare_reality_context_with_budget_and_items(
-                    user_input,
-                    collection_budget,
-                    one_shot_context_items,
-                )
-                .await;
-            apply_runtime_controls(&mut prompt);
-            self.record_context_event(
-                "context_preflight_compaction",
-                "runtime",
-                "all provider candidates required semantic compaction before request dispatch",
-                9,
-            );
-            if let Ok(mut preflight_compaction) = self.turn_preflight_compaction.lock() {
-                *preflight_compaction = compaction;
+            match compaction {
+                None if no_candidate_can_fit => {
+                    return Err(RuntimeError::new(
+                        "all provider candidates reject the required request context and no semantic compaction boundary is available",
+                    ));
+                }
+                None => {
+                    // Proactive trigger found no compaction boundary; the request
+                    // still fits, so keep the original (uncompacted) request.
+                }
+                Some(compaction) => {
+                    request_messages = self.session.read().await.messages_view();
+                    prompt = self
+                        .prepare_reality_context_with_budget_and_items(
+                            user_input,
+                            collection_budget,
+                            one_shot_context_items,
+                        )
+                        .await;
+                    apply_runtime_controls(&mut prompt);
+                    self.record_context_event(
+                        "context_preflight_compaction",
+                        "runtime",
+                        if no_candidate_can_fit {
+                            "all provider candidates required semantic compaction before request dispatch"
+                        } else {
+                            "history approached the smallest candidate window; semantic compaction pre-empted the hard limit"
+                        },
+                        9,
+                    );
+                    if let Ok(mut preflight_compaction) = self.turn_preflight_compaction.lock() {
+                        *preflight_compaction = Some(compaction);
+                    }
+                }
             }
         }
         if let Some(turn_id) = self.session_input_stream.active_turn_id() {
