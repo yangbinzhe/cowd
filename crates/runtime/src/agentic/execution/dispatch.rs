@@ -1489,6 +1489,7 @@ mod cohort_tests {
                 title: "Dynamic task".to_string(),
                 objective: "Dynamic objective".to_string(),
                 acceptance: "Dynamic acceptance".to_string(),
+                acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
                 status: AgenticTaskStatus::Claimed,

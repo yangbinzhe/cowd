@@ -226,6 +226,7 @@ fn protocol_fixture_for_root(root: AgentActorBinding) -> AgenticProtocolFixture 
                 title: "Protocol result".to_string(),
                 objective: "produce one durable result".to_string(),
                 acceptance: "an independent reviewer accepts the submitted artifact".to_string(),
+                acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
 

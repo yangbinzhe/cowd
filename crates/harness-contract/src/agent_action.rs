@@ -139,6 +139,11 @@ pub struct TaskPublishInput {
     pub title: String,
     pub objective: String,
     pub acceptance: String,
+    /// Optional machine-checkable acceptance hints (advisory). Prose
+    /// `acceptance` stays authoritative; checks guide worker self-check and
+    /// reviewer evidence citation.
+    #[serde(default)]
+    pub acceptance_checks: Vec<String>,
     /// Optional semantic capability hints. The five portable execution
     /// effects are `read`, `search`, `write`, `test`, and `network`. Unknown
     /// domain labels are never treated as trusted permissions and never make

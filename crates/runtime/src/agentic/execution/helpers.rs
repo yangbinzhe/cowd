@@ -276,6 +276,12 @@ pub(super) fn task_objective(
             member.agent_id, task.task_id, task.acceptance, projection.program_id,
         ),
     };
+    if !task.acceptance_checks.is_empty() {
+        objective.push_str(&format!(
+            "\n\nAcceptance checks (advisory; the prose acceptance criterion stays authoritative -- use these to self-check and to cite concrete evidence): {}",
+            task.acceptance_checks.join("; ")
+        ));
+    }
     if matches!(mode, DispatchMode::Execute) {
         if let Some(reason) = task.review_reason.as_deref().filter(|reason| !reason.trim().is_empty())
         {

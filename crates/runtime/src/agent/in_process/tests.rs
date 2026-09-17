@@ -3303,6 +3303,7 @@ async fn cross_team_review_checkpoint_is_valid_but_cross_team_execution_is_fence
             title: "Cross-Team review target".to_string(),
             objective: "produce durable evidence".to_string(),
             acceptance: "independent review".to_string(),
+            acceptance_checks: Vec::new(),
             required_capabilities: vec!["read".to_string()],
             depends_on: Vec::new(),
 

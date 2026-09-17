@@ -1544,6 +1544,7 @@ mod tests {
                     title: "Collect source evidence".to_string(),
                     objective: "Establish the production baseline source".to_string(),
                     acceptance: "Record the source revision".to_string(),
+                    acceptance_checks: Vec::new(),
                     required_capabilities: vec!["read".to_string()],
                     depends_on: Vec::new(),
 
@@ -1564,6 +1565,7 @@ mod tests {
                     title: "Validate production baseline".to_string(),
                     objective: "Compare the live metric with its source evidence".to_string(),
                     acceptance: "Cite the source and state uncertainty".to_string(),
+                    acceptance_checks: Vec::new(),
                     required_capabilities: vec!["read".to_string()],
                     depends_on: vec![research_task_id.clone()],
 

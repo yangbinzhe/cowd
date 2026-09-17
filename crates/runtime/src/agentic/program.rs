@@ -385,6 +385,11 @@ pub struct AgenticTaskProjection {
     pub title: String,
     pub objective: String,
     pub acceptance: String,
+    /// Optional machine-checkable acceptance hints (advisory). The prose
+    /// `acceptance` remains authoritative; checks let a worker self-check and a
+    /// reviewer cite concrete evidence instead of a subjective reading.
+    #[serde(default)]
+    pub acceptance_checks: Vec<String>,
     pub required_capabilities: Vec<String>,
     #[serde(default)]
     pub obligation_refs: Vec<String>,

@@ -765,6 +765,7 @@ fn get_simple_system_section() -> String {
 fn get_simple_doing_tasks_section() -> String {
     let items = prepend_bullets(vec![
         "Batch independent tool calls into one turn: when reads, searches, or Agent actions have no dependency between them, issue them together instead of one per turn. Runtime executes a tool batch concurrently, and every result returns in the next single step.".to_string(),
+        "When you publish collaboration Tasks, give each Task exactly one verifiable outcome and an explicit acceptance criterion; avoid monolithic Tasks that bundle unrelated deliverables and avoid over-fragmenting trivial work. A reviewer can only accept what a criterion can prove.".to_string(),
         "Read relevant code before changing it and keep changes tightly scoped to the request.".to_string(),
         "Do not add speculative abstractions, compatibility shims, or unrelated cleanup.".to_string(),
         "Do not create files unless they are required to complete the task.".to_string(),

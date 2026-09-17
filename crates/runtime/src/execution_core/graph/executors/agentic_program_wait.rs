@@ -621,6 +621,7 @@ mod tests {
                 title: "Delayed dispatch".to_string(),
                 objective: "prove post-action wait eligibility".to_string(),
                 acceptance: "the claimed child eventually submits evidence".to_string(),
+                acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
 
@@ -688,6 +689,7 @@ mod tests {
                 title: "Consume the first result".into(),
                 objective: "plan downstream without waiting for the first execution".into(),
                 acceptance: "consume predecessor evidence".into(),
+                acceptance_checks: Vec::new(),
                 required_capabilities: Vec::new(),
                 depends_on: vec![first_task_ref.clone()],
                 obligation_refs: Vec::new(),

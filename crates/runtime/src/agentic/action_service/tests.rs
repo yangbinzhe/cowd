@@ -1327,6 +1327,7 @@ fn legacy_goal_terminal_recovery_is_durable_and_idempotent() {
                 title: "Research".to_string(),
                 objective: "Read source".to_string(),
                 acceptance: "artifact and evidence".to_string(),
+                acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
 
@@ -1631,6 +1632,7 @@ async fn production_artifact_authority_closes_submit_review_and_completion_chain
                 title: "Verified report".to_string(),
                 objective: "produce a grounded report".to_string(),
                 acceptance: "durable report and independent review".to_string(),
+                acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
 
@@ -1903,6 +1905,7 @@ fn task_claim_requires_a_roster_agent_and_expired_lease_is_reclaimable() {
                 title: "Recover".to_string(),
                 objective: "complete even after a worker crash".to_string(),
                 acceptance: "durable result".to_string(),
+                acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
 
@@ -2007,6 +2010,7 @@ fn one_physical_agent_execution_cannot_claim_two_active_tasks() {
                 title: "Task A".to_string(),
                 objective: "Task A".to_string(),
                 acceptance: "reviewed artifact".to_string(),
+                acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
 
@@ -2027,6 +2031,7 @@ fn one_physical_agent_execution_cannot_claim_two_active_tasks() {
                 title: "Task B".to_string(),
                 objective: "Task B".to_string(),
                 acceptance: "reviewed artifact".to_string(),
+                acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
 
@@ -2109,6 +2114,7 @@ fn repeated_identical_physical_failure_blocks_for_explicit_replan() {
                 title: "Bounded attempt".to_string(),
                 objective: "never loop forever".to_string(),
                 acceptance: "durable completion or blocker".to_string(),
+                acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
 
@@ -2191,6 +2197,7 @@ fn repeated_identical_review_failure_blocks_for_explicit_replan() {
                 title: "Review retry".to_string(),
                 objective: "prove review recovery".to_string(),
                 acceptance: "bounded independent review".to_string(),
+                acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
 
@@ -2448,6 +2455,7 @@ fn published_task_supersedes_across_teams_without_failure_and_rejects_invalid_re
                     title: id.into(),
                     objective: "produce verifiable evidence".into(),
                     acceptance: "independently checked result".into(),
+                    acceptance_checks: Vec::new(),
                     required_capabilities: vec![],
                     depends_on: dependencies,
                     obligation_refs: vec![],
@@ -2577,6 +2585,7 @@ fn failed_task_supersede_is_cas_idempotent_recoverable_and_not_fake_completion()
                 title: "Disproved approach".to_string(),
                 objective: "test the original hypothesis".to_string(),
                 acceptance: "reproducible evidence".to_string(),
+                acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
 
@@ -2598,6 +2607,7 @@ fn failed_task_supersede_is_cas_idempotent_recoverable_and_not_fake_completion()
                     title: title.to_string(),
                     objective: "replace the failed hypothesis with bounded evidence".to_string(),
                     acceptance: "independently reviewable artifact".to_string(),
+                    acceptance_checks: Vec::new(),
                     required_capabilities: vec!["read".to_string()],
                     depends_on,
 

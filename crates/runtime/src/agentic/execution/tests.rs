@@ -63,6 +63,7 @@ async fn heartbeat_waits_for_the_agents_real_claim_and_stops_at_graph_terminal()
                 title: "Real claim".to_string(),
                 objective: "prove ownership".to_string(),
                 acceptance: "claim is fenced to the Agent execution".to_string(),
+                acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
 
@@ -457,6 +458,7 @@ async fn exercise_reviewed_goal_delivery(
             title: "Evidence review".to_string(),
             objective: "review crates/runtime/Cargo.toml".to_string(),
             acceptance: "cite evidence".to_string(),
+            acceptance_checks: Vec::new(),
             required_capabilities: if delegated_effect {
                 vec!["python".into(), "verification".into(), "write".into()]
             } else {
@@ -800,6 +802,7 @@ async fn exercise_reviewed_goal_delivery(
             title: "Optional check".into(),
             objective: "check need for further work".into(),
             acceptance: "concrete evidence".into(),
+            acceptance_checks: Vec::new(),
             required_capabilities: vec!["read".into()],
             depends_on: vec![],
             obligation_refs: vec![],
@@ -1519,6 +1522,7 @@ async fn exercise_reviewed_goal_delivery(
                 title: "Inspect changed file".into(),
                 objective: "Read and review the actual changed file".into(),
                 acceptance: "Record the current Goal effect review".into(),
+                acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".into()],
                 depends_on: vec![],
                 obligation_refs: vec![],
@@ -2386,6 +2390,7 @@ async fn dispatch_tries_admissible_members_without_duplicate_model_work() {
                 title: "Read evidence".into(),
                 objective: "read evidence".into(),
                 acceptance: "evidence inspected".into(),
+                acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".into()],
                 depends_on: vec![],
                 obligation_refs: vec![],
@@ -2650,6 +2655,7 @@ fn semantic_capability_hints_translate_without_becoming_physical_authority() {
             title: "Run domain operation".to_string(),
             objective: "prove semantic labels are translated by Runtime".to_string(),
             acceptance: "a least-privilege physical capability set is derived".to_string(),
+            acceptance_checks: Vec::new(),
             required_capabilities: vec!["evidence-gathering".to_string()],
             depends_on: Vec::new(),
 
@@ -2758,6 +2764,7 @@ fn dispatch_rank_spreads_independent_tasks_to_idle_members() {
                 title: "Inspect manifests".to_string(),
                 objective: "inspect package metadata".to_string(),
                 acceptance: "report evidence".to_string(),
+                acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
 
@@ -2778,6 +2785,7 @@ fn dispatch_rank_spreads_independent_tasks_to_idle_members() {
                 title: "Verify exclusions".to_string(),
                 objective: "verify exclusion rules".to_string(),
                 acceptance: "report evidence".to_string(),
+                acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
 
@@ -2900,6 +2908,7 @@ async fn verify_startup_reconciliation(with_corrupt_program: bool) {
                 title: "Resume me".to_string(),
                 objective: "prove startup reconciliation".to_string(),
                 acceptance: "a real graph is admitted".to_string(),
+                acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
 
@@ -3101,6 +3110,7 @@ async fn startup_reconcile_fails_closed_after_partial_dispatch_without_duplicati
                 title: "Admissible read".to_string(),
                 objective: "admit one idempotent graph".to_string(),
                 acceptance: "the graph exists once".to_string(),
+                acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
 
@@ -3121,6 +3131,7 @@ async fn startup_reconcile_fails_closed_after_partial_dispatch_without_duplicati
                 title: "Unavailable connector action".to_string(),
                 objective: "remain durable until a matching Agent definition exists".to_string(),
                 acceptance: "startup must stay closed".to_string(),
+                acceptance_checks: Vec::new(),
                 required_capabilities: vec!["connector_action".to_string()],
                 depends_on: Vec::new(),
 
@@ -3215,6 +3226,7 @@ async fn action_followups_surface_partial_dispatch_failure_without_duplicating_a
                 title: "Admissible read".to_string(),
                 objective: "admit one deterministic graph".to_string(),
                 acceptance: "the graph exists once".to_string(),
+                acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
 
@@ -3235,6 +3247,7 @@ async fn action_followups_surface_partial_dispatch_failure_without_duplicating_a
                 title: "Unavailable connector action".to_string(),
                 objective: "remain durable until a matching Agent definition exists".to_string(),
                 acceptance: "the caller observes the deferred dispatch".to_string(),
+                acceptance_checks: Vec::new(),
                 required_capabilities: vec!["connector_action".to_string()],
                 depends_on: Vec::new(),
 
@@ -3377,6 +3390,7 @@ async fn startup_reconcile_releases_missing_graph_claim_without_waiting_for_leas
                 title: "Orphaned reservation".to_string(),
                 objective: "recover it".to_string(),
                 acceptance: "new graph admitted".to_string(),
+                acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
 
@@ -3501,6 +3515,7 @@ async fn cross_team_reviewer_resolves_own_identity_and_can_accept() {
                 title: "Cross-Team result".to_string(),
                 objective: "produce durable evidence".to_string(),
                 acceptance: "independent review".to_string(),
+                acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string(), "network".to_string()],
                 depends_on: Vec::new(),
 
