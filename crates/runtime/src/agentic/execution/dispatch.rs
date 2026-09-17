@@ -1031,6 +1031,12 @@ impl RuntimeServices {
                 })
         };
         if members.is_empty() {
+            tracing::info!(
+                program_id = %projection.program_id,
+                task_ref = %task.task_id,
+                mode = mode.as_str(),
+                "agentic dispatch deferred: roster has no eligible member"
+            );
             return Ok(Vec::new());
         }
         // Parallelism belongs between independent Tasks. Starting every
@@ -1063,6 +1069,18 @@ impl RuntimeServices {
             }
         }
         if selected.is_none() && (busy_eligible || rejected_members.is_empty()) {
+            // Silent deferral: every otherwise-eligible member is busy, or the
+            // roster admitted no member at all. Record it so a wedged Program is
+            // observable (and can be bounded) instead of only surfacing as the
+            // root's indefinite wait.
+            tracing::info!(
+                program_id = %projection.program_id,
+                task_ref = %task.task_id,
+                mode = mode.as_str(),
+                busy_eligible,
+                rejected = rejected_members.len(),
+                "agentic dispatch deferred: no free eligible member"
+            );
             return Ok(Vec::new());
         }
         let selected = selected.ok_or_else(|| {
