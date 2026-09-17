@@ -1211,6 +1211,24 @@ where
                         if blocked_program.is_none()
                             && verified_team_executions < required_team_executions
                         {
+                            state.collaboration_convergence_replans =
+                                state.collaboration_convergence_replans.saturating_add(1);
+                            let convergence_bound = collaboration_convergence_replan_bound(
+                                state.safety_lease.complexity,
+                            );
+                            if state.collaboration_convergence_replans > convergence_bound {
+                                // Bounded convergence: the verified-Team minimum
+                                // stays unmet after repeated replans. End the turn
+                                // as an honest partial with explicit disclosure
+                                // instead of replanning without end.
+                                let disclosure = format!(
+                                    "Bounded convergence reached after {convergence_bound} replan(s): observed {verified_team_executions} verified Team(s) against a required minimum of {required_team_executions}. The objective is only partially satisfied; unresolved work stays visible in the Agent-first Program. Runtime stopped replanning instead of looping without end. {}",
+                                    text
+                                );
+                                text = disclosure.clone();
+                                state.terminal_override =
+                                    Some((GoalCompletion::Partial, disclosure));
+                            } else {
                             state.assistant_messages.pop();
                             state.pending_transcript.remove(&ticket.node_id);
                             let reason = format!(
@@ -1255,6 +1273,7 @@ where
                                 "inline_model",
                                 "inline_model",
                             )];
+                            }
                         }
                         // ObjectiveSupervisor is the sole business completion
                         // authority. Once an Agentic Program is Verified, its
@@ -2633,6 +2652,23 @@ fn next_unverified_model_step_streak(current: usize, made_verified_progress: boo
     }
 }
 
+/// Policy bound on how many times the Agent-first collaboration completion gate
+/// may re-drive the root before the turn terminates as an honest partial. This
+/// is a convergence bound, never a topology: the model still owns every
+/// semantic decision, but it cannot replan without end while the verified-Team
+/// minimum stays unmet.
+fn collaboration_convergence_replan_bound(
+    complexity: harness_contract::core::TaskComplexity,
+) -> usize {
+    use harness_contract::core::TaskComplexity;
+    match complexity {
+        TaskComplexity::Trivial | TaskComplexity::Simple => 2,
+        TaskComplexity::Moderate => 3,
+        TaskComplexity::Complex => 4,
+        TaskComplexity::Strategic => 6,
+    }
+}
+
 #[cfg(test)]
 mod safety_fuse_streak_tests {
     use super::next_unverified_model_step_streak;
@@ -2642,6 +2678,24 @@ mod safety_fuse_streak_tests {
         assert_eq!(next_unverified_model_step_streak(23, true), 0);
         assert_eq!(next_unverified_model_step_streak(0, false), 1);
         assert_eq!(next_unverified_model_step_streak(1, false), 2);
+    }
+
+    #[test]
+    fn collaboration_convergence_bound_scales_with_complexity() {
+        use super::collaboration_convergence_replan_bound;
+        use harness_contract::core::TaskComplexity;
+        assert_eq!(
+            collaboration_convergence_replan_bound(TaskComplexity::Simple),
+            2
+        );
+        assert_eq!(
+            collaboration_convergence_replan_bound(TaskComplexity::Strategic),
+            6
+        );
+        assert!(
+            collaboration_convergence_replan_bound(TaskComplexity::Strategic)
+                > collaboration_convergence_replan_bound(TaskComplexity::Moderate)
+        );
     }
 }
 

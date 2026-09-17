@@ -691,6 +691,7 @@ where
             committed_terminal_completion: None,
             last_verified_progress: false,
             consecutive_unverified_model_steps: 0,
+            collaboration_convergence_replans: 0,
             reasoning_only_attempts: 0,
             force_text_only_next_model: evaluation_control
                 .as_ref()
@@ -3042,6 +3043,11 @@ struct TurnGraphState {
     /// Consecutive model steps with no new Runtime-verified evidence or state
     /// transition. Total iterations remain observability telemetry only.
     consecutive_unverified_model_steps: usize,
+    /// Bounded-convergence counter for the Agent-first collaboration completion
+    /// gate. Each time the gate re-drives the root because the verified-Team
+    /// minimum is unmet it advances; past the policy bound the turn terminates
+    /// as an honest partial instead of replanning without end.
+    collaboration_convergence_replans: usize,
     reasoning_only_attempts: u8,
     force_text_only_next_model: bool,
     force_tool_allowlist_next_model: Option<BTreeSet<String>>,
