@@ -1929,6 +1929,35 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         let error = format!("failed to bind runtime services: {error}");
         return Err(startup_registry.rollback(error).await);
     }
+    // Periodic agentic reconciliation (Y2b): re-admit deferred physical
+    // dispatch for every open Program so a Task that was Submitted (its
+    // independent Review graph not admitted) or a member that was
+    // invited-but-not-started cannot park the Program indefinitely.
+    {
+        let reconciliation_services = Arc::clone(&runtime_services);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                match reconciliation_services
+                    .reconcile_open_agentic_programs()
+                    .await
+                {
+                    Ok(admitted) if admitted > 0 => {
+                        tracing::info!(
+                            admitted,
+                            "periodic agentic reconciliation admitted work"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::debug!(%error, "periodic agentic reconciliation deferred");
+                    }
+                }
+            }
+        });
+    }
     let runtime_service = match RuntimeService::new_with_gateway_tasks(
         sessions.clone(),
         lease_registry.clone(),

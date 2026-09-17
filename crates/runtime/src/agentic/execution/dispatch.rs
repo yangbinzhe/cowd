@@ -630,6 +630,22 @@ impl RuntimeServices {
             .await
     }
 
+    /// Periodic reconciliation for every open Program: re-admit durable ready
+    /// work and settle stranded attempts / outstanding cancellations. This is
+    /// the recovery path for a deferred physical dispatch that no worker exit
+    /// or model action will retrigger -- e.g. an invited member that had not
+    /// started, or a Task that was `Submitted` while its independent Review
+    /// graph was never admitted. `DispatchFlight` keeps it idempotent.
+    pub async fn reconcile_open_agentic_programs(
+        self: &Arc<Self>,
+    ) -> Result<usize, String> {
+        let excluded_sessions = BTreeSet::new();
+        let receipts = self
+            .recover_agentic_programs_on_startup_excluding_sessions(&excluded_sessions)
+            .await?;
+        Ok(receipts.len())
+    }
+
     /// Reconcile open Programs only after their owning Session has hydrated.
     /// Programs for excluded Sessions remain durable and untouched for retry.
     pub async fn recover_agentic_programs_on_startup_excluding_sessions(
