@@ -230,7 +230,7 @@ impl TurnStrategyDecisionState {
             && selected_candidate != ExecutionCandidateKind::Team
         {
             return Err(
-                "an explicit Team execution obligation cannot be downgraded to a non-Team strategy"
+                "an admitted Team execution obligation cannot be downgraded to a non-Team strategy"
                     .to_string(),
             );
         }
@@ -263,7 +263,7 @@ impl TurnStrategyDecisionState {
             && selected_candidate != ExecutionCandidateKind::Team
         {
             return Err(
-                "an explicit Team execution obligation cannot be retargeted to a non-Team strategy"
+                "an admitted Team execution obligation cannot be retargeted to a non-Team strategy"
                     .to_string(),
             );
         }
@@ -486,13 +486,34 @@ fn build_runtime_execution_decision_inner(
             why: "complex evidence can be acquired through an evidence graph".to_string(),
         });
     }
-    let collaboration_obligation = explicit_collaboration_requested
-        .then(|| CollaborationExecutionObligation::for_explicit_request(&strategy.understanding))
-        .transpose()
-        .unwrap_or_else(|error| {
-            blocked_reasons.push(error);
-            None
-        });
+    let collaboration_obligation = if explicit_collaboration_requested {
+        CollaborationExecutionObligation::for_explicit_request(&strategy.understanding)
+            .map_err(|error| blocked_reasons.push(error))
+            .ok()
+    } else if !delegated_leaf
+        && resource_health.collaboration_available
+        && strategy.pattern == ExecutionPattern::Collaborate
+        && strategy.selected_candidate == ExecutionCandidateKind::Team
+        && harness_contract::strategy::automatic_team_is_structurally_required(
+            &strategy.understanding,
+        )
+    {
+        // The objective itself requires independent, tool-backed ownership.
+        // Freeze only a minimum bounded by the observed Team-slot ceiling; the
+        // model still chooses Teams, Agents, roles, Tasks and any Team count
+        // above the minimum.
+        let team_slot_ceiling = strategy.resource_snapshot.team_slots.clamp(2, 8) as u8;
+        Some(CollaborationExecutionObligation {
+            minimum_team_count: strategy
+                .understanding
+                .independent_workstreams
+                .min(team_slot_ceiling)
+                .clamp(2, 8),
+            exact_team_count: None,
+        })
+    } else {
+        None
+    };
 
     let catalog = ExecutionPatternCatalog::current();
     let recommended_spec = catalog.find(recommended_pattern);
@@ -565,11 +586,46 @@ mod tests {
     }
 
     #[test]
-    fn inferred_complexity_never_creates_a_hard_team_obligation() {
+    fn generic_complexity_without_structural_ownership_stays_advisory() {
+        // The obligation is a structural boundary, not a complexity heuristic:
+        // fewer than three independent tool-backed responsibility domains, or a
+        // Team prohibition, must stay advisory so the model keeps full agency.
+        for prompt in [
+            "全面审查 runtime 与 gateway 两个模块，分别给出工具证据后综合",
+            "全面审查 runtime gateway frontend 三个独立责任域，分别给出工具证据后综合，不要启动团队",
+        ] {
+            let decision = build_runtime_execution_decision(prompt, None);
+            assert!(decision.collaboration_obligation.is_none(), "{prompt}");
+        }
+    }
+
+    #[test]
+    fn independent_tool_backed_responsibility_domains_freeze_an_automatic_team_obligation() {
         let decision = build_runtime_execution_decision(
             "全面审查 runtime gateway frontend 三个独立责任域，分别给出工具证据后综合",
             None,
         );
+        assert_eq!(decision.pattern(), ExecutionPattern::Collaborate);
+        assert_eq!(
+            decision
+                .collaboration_obligation
+                .as_ref()
+                .map(|obligation| obligation.required_team_count()),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn a_non_team_admission_never_freezes_an_automatic_obligation() {
+        // A parallel-evidence admission short-circuits to Explore/ParallelTools
+        // before the structural branch. The obligation must follow the admitted
+        // Team decision, never the raw predicate, or the completion gate would
+        // require Teams the strategy never admitted.
+        let decision = build_runtime_execution_decision(
+            "并行审查 runtime gateway frontend 三个独立责任域，分别给出工具证据后综合",
+            None,
+        );
+        assert_ne!(decision.pattern(), ExecutionPattern::Collaborate);
         assert!(decision.collaboration_obligation.is_none());
     }
 

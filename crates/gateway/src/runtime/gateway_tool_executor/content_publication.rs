@@ -93,6 +93,11 @@ impl GatewayToolExecutor {
                 .await
                 .map_err(|error| ToolError::new(error.to_string()))?
                 .map_err(|error| ToolError::new(error.to_string()))?;
+                if bytes.is_empty() {
+                    return Err(ToolError::new(
+                        "artifact_publish refused an empty file: the selected file has 0 bytes. Write the findings, then retry with the file's exact sha256.",
+                    ));
+                }
                 services
                     .publish_authorized_content(&bytes, &sha256, &media_type, session_id)
                     .await
@@ -130,6 +135,11 @@ impl GatewayToolExecutor {
                     .get("text")
                     .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| ToolError::new("text block has no text"))?;
+                if text.trim().is_empty() {
+                    return Err(ToolError::new(
+                        "artifact_publish refused an empty text block: write the findings as response text and select that zero-based Text block, then retry.",
+                    ));
+                }
                 let text_hash = format!("{:x}", Sha256::digest(text.as_bytes()));
                 services
                     .publish_authorized_content(
@@ -157,6 +167,11 @@ impl GatewayToolExecutor {
                     .0
             }
         };
+        if artifact.bytes == 0 {
+            return Err(ToolError::new(
+                "artifact_publish refused an empty artifact: authored content must not be empty.",
+            ));
+        }
         Ok(
             serde_json::json!({"content_ref": artifact.selector, "sha256": artifact.sha256,
             "bytes": artifact.bytes, "media_type": artifact.media_type,

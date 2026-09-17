@@ -1412,16 +1412,15 @@ fn negative_benefit_is_exact_profile_scoped_expiring_and_veto_only() {
 }
 
 #[test]
-fn independent_evidence_without_explicit_team_constraint_stays_topology_neutral() {
+fn independent_evidence_freezes_a_structural_team_boundary() {
+    // Three independently verifiable, tool-backed responsibility domains are a
+    // structural ownership requirement: Runtime selects the Team candidate and
+    // freezes a minimum, while the model still chooses the topology.
     let decision = decide_strategy(&StrategyInput::from_prompt(
         "全面审查 runtime gateway frontend 三个独立责任域，分别给出工具证据后综合",
     ));
-    assert_ne!(decision.selected_candidate, ExecutionCandidateKind::Team);
-    assert_ne!(decision.pattern, ExecutionPattern::Collaborate);
-    assert!(decision
-        .reasons
-        .iter()
-        .any(|reason| { reason.contains("does not turn inferred workstreams") }));
+    assert_eq!(decision.selected_candidate, ExecutionCandidateKind::Team);
+    assert_eq!(decision.pattern, ExecutionPattern::Collaborate);
     let team = decision
         .candidate_estimates
         .iter()
@@ -1573,7 +1572,7 @@ fn singular_explicit_team_freezes_one_exact_team() {
 }
 
 #[test]
-fn inferred_responsibility_units_do_not_force_team_topology() {
+fn inferred_responsibility_units_require_a_team_without_prescribing_topology() {
     let input = StrategyInput::from_prompt(
         "请对三个独立责任域分别取得工具证据并交叉核验，最后统一综合结论",
     );
@@ -1581,18 +1580,20 @@ fn inferred_responsibility_units_do_not_force_team_topology() {
     assert_eq!(decision.understanding.required_team_count, 0);
     assert_eq!(decision.understanding.independent_workstreams, 3);
     assert!(decision.understanding.requires_tool_evidence);
-    assert_ne!(decision.selected_candidate, ExecutionCandidateKind::Team);
+    assert_eq!(decision.selected_candidate, ExecutionCandidateKind::Team);
 }
 
 #[test]
-fn topology_non_prescription_does_not_become_a_singular_team_obligation() {
+fn topology_non_prescription_freezes_a_minimum_without_a_singular_cardinality() {
     let prompt = "请对三个独立责任域分别取得只读工具证据并交叉核验，最后统一综合结论。责任域一核查策略选择与执行义务，责任域二核查状态持久化与恢复，责任域三核查最终验收与投影。必须列出至少三个本次实际读取的完整 crates/.../*.rs 源码路径；不要自行指定 Team、Agent、角色、模板或编排拓扑。";
     let decision = decide_strategy(&StrategyInput::from_prompt(prompt));
 
     assert_eq!(decision.understanding.required_team_count, 0);
     assert_eq!(decision.understanding.independent_workstreams, 3);
     assert!(!decision.understanding.requests_multi_agent);
-    assert_ne!(decision.selected_candidate, ExecutionCandidateKind::Team);
+    // No user-visible Team name or count is prescribed, yet the structural
+    // ownership boundary still selects the Team candidate and freezes a minimum.
+    assert_eq!(decision.selected_candidate, ExecutionCandidateKind::Team);
     assert_eq!(explicit_team_count(prompt), 0);
     assert!(!explicit_team_execution_required(prompt));
 }
@@ -1645,4 +1646,54 @@ fn execution_verbs_cannot_borrow_team_objects_from_another_clause() {
     ] {
         assert!(explicit_team_execution_required(prompt), "{prompt}");
     }
+}
+
+#[test]
+fn independent_tool_backed_responsibility_domains_require_a_structural_team() {
+    // The objective never names a Team and explicitly forbids the *user* from
+    // prescribing a topology, yet the work itself is three independently
+    // verifiable, tool-evidenced responsibility domains. Runtime materializes
+    // that ownership boundary instead of flattening it into one agent.
+    let prompt = "请对三个独立责任域分别取得只读工具证据并交叉核验，最后统一综合结论。\
+        责任域一核查策略选择与执行义务，责任域二核查状态持久化与恢复，责任域三核查最终验收与投影。\
+        必须列出至少三个本次实际读取的完整源码路径，只陈述工具证据能够验证的事实；\
+        不要自行指定 Team、Agent、角色、模板或编排拓扑。\
+        只能使用只读工具，不要调用 bash 或任何写工具。";
+    let understanding = understand(&StrategyInput::from_prompt(prompt));
+    assert!(
+        !understanding.forbids_team,
+        "a topology-prescription clause is not a Team prohibition"
+    );
+    assert_eq!(understanding.required_team_count, 0);
+    assert!(understanding.independent_workstreams >= 3);
+    assert!(understanding.requires_tool_evidence);
+    assert!(automatic_team_is_structurally_required(&understanding));
+    assert_eq!(
+        decide_strategy(&StrategyInput::from_prompt(prompt)).pattern,
+        ExecutionPattern::Collaborate
+    );
+}
+
+#[test]
+fn a_team_prohibition_single_domain_or_explicit_count_is_not_a_structural_obligation() {
+    // "不要启动团队" is a real prohibition, not a topology prescription.
+    let forbidden = understand(&StrategyInput::from_prompt(
+        "单独分析 runtime、memory、gateway 的职责边界并给出源码路径，不要启动团队。",
+    ));
+    assert!(forbidden.forbids_team);
+    assert!(!automatic_team_is_structurally_required(&forbidden));
+
+    // One responsibility domain is not independent ownership.
+    let single = understand(&StrategyInput::from_prompt(
+        "读取 runtime 模块源码并给出完整证据路径。",
+    ));
+    assert!(single.independent_workstreams < 3);
+    assert!(!automatic_team_is_structurally_required(&single));
+
+    // An explicit Team contract owns the count; the implicit predicate stays out.
+    let explicit = understand(&StrategyInput::from_prompt(
+        "启动三个责任域团队，只读工具取证并交叉核验。",
+    ));
+    assert!(explicit.required_team_count > 0);
+    assert!(!automatic_team_is_structurally_required(&explicit));
 }

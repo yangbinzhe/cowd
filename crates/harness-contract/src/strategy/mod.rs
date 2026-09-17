@@ -1873,10 +1873,13 @@ impl StrategyRouter {
                         || !estimate.quality_optimization_ready())
             })
         {
-            reasons.push(
+            reasons.push(if automatic_team_is_structurally_required(&understanding) {
+                "automatic Team is required by independently verifiable responsibility domains; historical calibration may tune capacity but cannot erase the current objective's ownership obligations"
+                    .to_string()
+            } else {
                 "automatic Team requires calibrated or observed topology evidence; Runtime does not turn inferred workstreams into a business topology obligation"
-                    .to_string(),
-            );
+                    .to_string()
+            });
         }
         let selected_candidate = if matches!(source, StrategyDecisionSource::ExperienceAdapted) {
             candidate_for_pattern(pattern).unwrap_or_else(|| {
@@ -2230,6 +2233,21 @@ fn candidate_estimate(
     }
 }
 
+/// An objective can itself require independent, tool-backed ownership: three
+/// or more independently verifiable responsibility domains that all demand
+/// acquired evidence. The predicate is semantic and data-derived -- no Team
+/// name, template, provider family, or price participates -- so historical
+/// calibration may tune capacity but cannot erase the current objective's
+/// ownership obligations. It is a convergence boundary, not a topology: the
+/// model still chooses Team count above the minimum, Agents, roles and Tasks.
+#[must_use]
+pub fn automatic_team_is_structurally_required(understanding: &TaskUnderstanding) -> bool {
+    !understanding.forbids_team
+        && understanding.required_team_count == 0
+        && understanding.independent_workstreams >= 3
+        && understanding.requires_tool_evidence
+}
+
 fn select_execution_candidate(
     understanding: &TaskUnderstanding,
     estimates: &[ExecutionCandidateEstimate],
@@ -2252,6 +2270,19 @@ fn select_execution_candidate(
             .map_or(ExecutionCandidateKind::Direct, |estimate| {
                 estimate.candidate
             });
+    }
+    // A current objective can itself require independent ownership. In that
+    // case calibration may tune capacity, but it cannot erase the need to
+    // materialize the accountable workstreams, so this branch precedes the
+    // calibrated-evidence gate below.
+    if automatic_team_is_structurally_required(understanding) {
+        if let Some(team) = estimates
+            .iter()
+            .find(|estimate| estimate.candidate == ExecutionCandidateKind::Team)
+            .filter(|estimate| estimate.eligible && estimate.expected_quality_lift_bp > 0)
+        {
+            return team.candidate;
+        }
     }
     // Automatic Team selection requires a genuinely multi-domain
     // topology and calibrated evidence. Duration and quality remain separate
