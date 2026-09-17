@@ -276,6 +276,14 @@ pub(super) fn task_objective(
             member.agent_id, task.task_id, task.acceptance, projection.program_id,
         ),
     };
+    if matches!(mode, DispatchMode::Execute) {
+        if let Some(reason) = task.review_reason.as_deref().filter(|reason| !reason.trim().is_empty())
+        {
+            objective.push_str(&format!(
+                "\n\nA previous review requested rework for this exact reason, which you must resolve before resubmitting: {reason}"
+            ));
+        }
+    }
     objective.push_str(&format!(
         "\n\nCurrent work directory: {}. This directory describes existing work, not evidence of its correctness. Inspect the exact Task and follow its artifact/evidence read requests before repeating prior work. Add only the contribution required by this Task objective and acceptance; reuse cited common background instead of restating or regenerating it. There is one result owner for each Task. Other members may contribute evidence, challenges and responses through authorized Topics without taking a second claim. You may propose narrower tasks or invite collaborators within your active memberships; preserve existing accepted results and source references when replanning.",
         serde_json::json!({

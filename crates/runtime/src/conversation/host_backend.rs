@@ -2684,6 +2684,9 @@ pub(super) struct DelegatedAgenticProtocolState {
     pub(super) artifact_refs: Vec<String>,
     pub(super) artifact_evidence_refs: Vec<String>,
     pub(super) owns_active_attempt: bool,
+    /// The reviewer's rework reason, surfaced to the worker on the next
+    /// `Rework` attempt so it knows what concretely must change to pass.
+    pub(super) review_reason: Option<String>,
 }
 
 impl DelegatedAgenticProtocolState {
@@ -2708,6 +2711,7 @@ impl DelegatedAgenticProtocolState {
     }
 
     pub(super) fn continuation_instruction(&self) -> String {
+        let rework_note = self.rework_note();
         match self.mode.as_str() {
             "review" => format!(
                 "Runtime collaboration protocol: review Task `{}` is still {:?}. Independently inspect the exact submitted artifact_refs [{}] through evidence refs [{}], then use `task_review`. Accept only if its acceptance criterion is proved; otherwise request rework with a concrete reason. Cite the inspected evidence and do not return prose before the durable review action succeeds. Program `{}`.",
@@ -2718,17 +2722,30 @@ impl DelegatedAgenticProtocolState {
                 self.program_id
             ),
             _ if self.artifact_refs.is_empty() => format!(
-                "Runtime collaboration protocol: execute Task `{}` is still {:?}. Publish an explicit file/hash via `artifact_publish`, or select an exact text block in the current response with `artifact_commit` content_ref=current_message_block:<zero-based-index>. Never assume a prior draft is selected. Commit the returned content_ref related to this exact Task, then call `task_submit` with its returned `artifact:...` changed_ref plus real durable source/test/tool evidence refs. Runtime binds artifact content automatically; do not duplicate the internal artifact:// selector as evidence. Do not return prose before durable submission succeeds. Program `{}`.",
-                self.task_id, self.status, self.program_id
+                "Runtime collaboration protocol: execute Task `{}` is still {:?}. Publish an explicit file/hash via `artifact_publish`, or select an exact text block in the current response with `artifact_commit` content_ref=current_message_block:<zero-based-index>. Never assume a prior draft is selected. Commit the returned content_ref related to this exact Task, then call `task_submit` with its returned `artifact:...` changed_ref plus real durable source/test/tool evidence refs. Runtime binds artifact content automatically; do not duplicate the internal artifact:// selector as evidence. Do not return prose before durable submission succeeds. Program `{}`.{}",
+                self.task_id, self.status, self.program_id, rework_note
             ),
             _ => format!(
-                "Runtime collaboration protocol: artifact evidence for Task `{}` is durable. Call `task_submit` now with artifact_refs [{}] and evidence_refs [{}]; do not repeat research, recommit the artifact, guess references, or return prose before submission succeeds. The Task is still {:?}. Program `{}`.",
+                "Runtime collaboration protocol: artifact evidence for Task `{}` is durable. Call `task_submit` now with artifact_refs [{}] and evidence_refs [{}]; do not repeat research, recommit the artifact, guess references, or return prose before submission succeeds. The Task is still {:?}. Program `{}`.{}",
                 self.task_id,
                 self.artifact_refs.join(", "),
                 self.artifact_evidence_refs.join(", "),
                 self.status,
-                self.program_id
+                self.program_id,
+                rework_note
             ),
+        }
+    }
+
+    /// The reviewer's rework reason, surfaced to the worker so a `Rework`
+    /// attempt knows the concrete unmet criterion instead of repeating work.
+    /// `review_reason` is durable on the Task but was previously write-only.
+    fn rework_note(&self) -> String {
+        match self.review_reason.as_deref() {
+            Some(reason) if !reason.trim().is_empty() => format!(
+                " A previous review requested rework for this exact reason, which you must resolve before resubmitting: {reason}"
+            ),
+            _ => String::new(),
         }
     }
 
@@ -2877,6 +2894,7 @@ pub(super) fn delegated_agentic_protocol_state(
             .map(|(_, content_ref)| content_ref.clone())
             .collect(),
         owns_active_attempt,
+        review_reason: task.review_reason.clone(),
     }))
 }
 
