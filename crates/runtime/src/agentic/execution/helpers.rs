@@ -241,6 +241,17 @@ pub(super) fn semantic_terms(value: &str) -> BTreeSet<String> {
     terms
 }
 
+/// Whether the frozen resource scopes admit authored workspace files. The
+/// scopes are the capability lease: a `read:` lease with no `workspace:`/`write:`
+/// scope means a worker must deliver through response text blocks instead of
+/// attempting a file write it is not authorized to perform.
+fn authored_file_write_allowed(resource_scopes: &[String]) -> bool {
+    resource_scopes.iter().any(|scope| {
+        let scope = scope.trim();
+        scope.starts_with("workspace:") || scope.starts_with("write:")
+    })
+}
+
 pub(super) fn task_objective(
     projection: &AgenticProgramProjection,
     task: &AgenticTaskProjection,
@@ -257,10 +268,14 @@ pub(super) fn task_objective(
         || format!("topic:{}", task.team_id),
         |team| team.topic_ref.clone(),
     );
+    let delivery = if authored_file_write_allowed(&projection.resource_scopes) {
+        "Produce long-form work in a workspace file, use read_file to obtain its exact sha256 and artifact_publish to publish it, then call artifact_commit with the returned content_ref."
+    } else {
+        "This Task lease is read-only: do NOT attempt to write files. Produce the findings as response text, then call artifact_commit with content_ref=current_message_block:<zero-based-index> selecting that exact non-empty Text block."
+    };
     let mut objective = match mode {
         DispatchMode::Coordination(_) => unreachable!("coordination objective handled above"),
-        DispatchMode::Execute => format!(
-            "You are Agent `{}` in Team `{}`. Role: {}. Mission: {}.\n\nWork item `{}`: {}\nObjective: {}\nAcceptance: {}\n\nFirst call state_inspect and inspect the current Program truth. If this work fits your role and capabilities, actively call task_claim for this exact task before doing substantive work; Runtime binds that claim to your immutable Agent identity and physical execution. If it is unsuitable or already owned, do not claim or submit it: explain the mismatch concisely and let the Team reassign or replan. After a successful claim, use workspace_snapshot to identify actual repository roots and document entries before searching files; follow returned continuation requests and never infer absence from a partial scan. Then act autonomously: choose and use the most effective available tools, and publish useful findings to topic:{} when collaboration benefits. Produce long-form work in a workspace file, use read_file to obtain its exact sha256 and artifact_publish to publish it, then call artifact_commit with the returned content_ref. For ordinary response text, explicitly select the intended zero-based Text block using content_ref=current_message_block:<index>; Runtime automatically binds the artifact to this claimed Task, while relates_to is only for additional semantic relations. Finally call task_submit: pass the collaboration `artifact:...` value returned in artifact_commit.changed_refs as artifact_refs, and pass real durable source/test/tool receipts as evidence_refs. Runtime automatically binds the artifact's content; do not copy its internal artifact:// content_ref into evidence_refs. Retain material uncertainty in task_submit.unresolved; distinguish measured facts from assumptions and estimates, and use Topic references for challenges and responses. Never submit before claiming, and never claim completion only in prose.",
+        DispatchMode::Execute => format!(            "You are Agent `{}` in Team `{}`. Role: {}. Mission: {}.\n\nWork item `{}`: {}\nObjective: {}\nAcceptance: {}\n\nFirst call state_inspect and inspect the current Program truth. If this work fits your role and capabilities, actively call task_claim for this exact task before doing substantive work; Runtime binds that claim to your immutable Agent identity and physical execution. If it is unsuitable or already owned, do not claim or submit it: explain the mismatch concisely and let the Team reassign or replan. After a successful claim, use workspace_snapshot to identify actual repository roots and document entries before searching files; follow returned continuation requests and never infer absence from a partial scan. Then act autonomously: choose and use the most effective available tools, and publish useful findings to topic:{} when collaboration benefits. {delivery} Runtime automatically binds the artifact to this claimed Task, while relates_to is only for additional semantic relations. Finally call task_submit: pass the collaboration `artifact:...` value returned in artifact_commit.changed_refs as artifact_refs, and pass real durable source/test/tool receipts as evidence_refs. Runtime automatically binds the artifact's content; do not copy its internal artifact:// content_ref into evidence_refs. Retain material uncertainty in task_submit.unresolved; distinguish measured facts from assumptions and estimates, and use Topic references for challenges and responses. Never submit before claiming, and never claim completion only in prose.",
             member.agent_id,
             task.team_id,
             member.role,
@@ -346,4 +361,19 @@ pub(super) fn now_ms() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod delivery_lease_tests {
+    use super::authored_file_write_allowed;
+
+    #[test]
+    fn read_only_leases_deliver_through_text_blocks() {
+        let read_only = vec!["provider".to_string(), "read:.".to_string()];
+        assert!(!authored_file_write_allowed(&read_only));
+        let writable = vec!["provider".to_string(), "workspace:.".to_string()];
+        assert!(authored_file_write_allowed(&writable));
+        let write_scoped = vec!["write:report.html".to_string()];
+        assert!(authored_file_write_allowed(&write_scoped));
+    }
 }
