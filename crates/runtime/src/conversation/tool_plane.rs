@@ -1304,7 +1304,14 @@ where
         // body size made even a tiny exact `read_file` JSON lose its `content`
         // field to head-tail truncation. Keep bounded headroom for the receipt
         // envelope while preserving the existing per-tool hard ceiling.
-        let requested = raw_tokens.saturating_add(96).min(per_tool_limit).max(1);
+        // Reserve a serialization allowance (codex parity, x1.2) so the receipt
+        // envelope and the omission marker are not themselves re-truncated when
+        // the message is serialized at the model boundary.
+        let requested = raw_tokens
+            .saturating_add(raw_tokens / 5)
+            .saturating_add(96)
+            .min(per_tool_limit)
+            .max(1);
         let granted = self
             .turn_context_ledger
             .lock()

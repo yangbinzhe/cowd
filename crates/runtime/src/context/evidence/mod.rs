@@ -39,7 +39,8 @@ pub fn build_tool_receipt(
     );
     let prefix_tokens = estimate_text_tokens(&fixed_prefix);
     let body_budget = token_budget.saturating_sub(prefix_tokens).max(1);
-    let body = summarize_body(tool_name, output, content_kind, body_budget);
+    let raw_lines = output.lines().count();
+    let body = summarize_body(tool_name, output, content_kind, body_budget, raw_tokens, raw_lines);
     let summary = format!("{fixed_prefix}{body}");
     let receipt_tokens = estimate_text_tokens(&summary);
     ModelReceipt {
@@ -72,6 +73,8 @@ fn summarize_body(
     output: &str,
     kind: EvidenceContentKind,
     token_budget: u64,
+    raw_tokens: u64,
+    raw_lines: usize,
 ) -> String {
     if output.is_empty() {
         return "No output.".to_string();
@@ -82,7 +85,7 @@ fn summarize_body(
         EvidenceContentKind::Error => summarize_error(output),
         EvidenceContentKind::Text | EvidenceContentKind::Media => output.to_string(),
     };
-    truncate_head_tail(&normalized, token_budget)
+    truncate_head_tail(&normalized, token_budget, raw_tokens, raw_lines)
 }
 
 fn summarize_json(tool_name: &str, output: &str) -> String {
@@ -182,7 +185,7 @@ fn summarize_error(output: &str) -> String {
     format!("Error tail: {}", lines[start..].join("\n"))
 }
 
-fn truncate_head_tail(value: &str, max_tokens: u64) -> String {
+fn truncate_head_tail(value: &str, max_tokens: u64, raw_tokens: u64, raw_lines: usize) -> String {
     if estimate_text_tokens(value) <= max_tokens {
         return value.to_string();
     }
@@ -195,7 +198,14 @@ fn truncate_head_tail(value: &str, max_tokens: u64) -> String {
         .iter()
         .skip(chars.len().saturating_sub(tail))
         .collect::<String>();
-    format!("{head_text}\n...[omitted; retrieve by evidence ref]...\n{tail_text}")
+    // Announce the original size and the omission so the model can decide to
+    // retrieve the full body by evidence ref instead of guessing (codex parity:
+    // "truncated output (original token count: N) / Total output lines: M").
+    let kept_tokens = estimate_text_tokens(&format!("{head_text}\n{tail_text}"));
+    let omitted_tokens = raw_tokens.saturating_sub(kept_tokens);
+    format!(
+        "{head_text}\n...[omitted {omitted_tokens} of {raw_tokens} tokens; {raw_lines} total lines; retrieve by evidence ref]...\n{tail_text}"
+    )
 }
 
 #[cfg(test)]
@@ -216,6 +226,25 @@ mod tests {
         assert!(receipt.summary.contains("tool://raw-1"));
         assert!(receipt.receipt_tokens <= 180);
         assert!(receipt.omitted_tokens > 0);
+    }
+
+    #[test]
+    fn truncated_receipt_announces_original_size_and_omission() {
+        let output = "line\n".repeat(4_000);
+        let receipt = build_tool_receipt(
+            "read_file",
+            &output,
+            false,
+            EvidenceRef::observed("tool", "big-raw"),
+            80,
+        );
+        assert!(receipt.truncated);
+        assert!(receipt.summary.contains("tool://big-raw"));
+        assert!(
+            receipt.summary.contains("omitted") && receipt.summary.contains("total lines"),
+            "the omission marker must announce the original size and line count: {}",
+            receipt.summary
+        );
     }
 
     #[test]
