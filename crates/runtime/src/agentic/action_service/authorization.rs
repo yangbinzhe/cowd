@@ -176,7 +176,7 @@ pub(super) fn validate_transition(
             if !input.content_ref.starts_with("artifact://") {
                 return Some((
                     "content_ref_unresolved",
-                    "Use artifact_publish or select an explicit current_message_block:<index> before committing".to_string(),
+                    "Commit a non-empty deliverable: use artifact_publish with a non-empty file, or select a current_message_block:<index> that actually contains the findings. An empty or absent Text block is never committed.".to_string(),
                 ));
             }
             None

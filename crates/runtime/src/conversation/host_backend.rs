@@ -3212,6 +3212,12 @@ pub(super) async fn resolve_explicit_agentic_content_refs(
         let Some(ContentBlock::Text { text }) = message.blocks.get(index) else {
             continue;
         };
+        if text.trim().is_empty() {
+            // An empty selection must never become an empty deliverable: leave
+            // the reference unresolved so the commit is rejected with
+            // actionable guidance instead of persisting a bodyless artifact.
+            continue;
+        }
         let mut scope = agentic_content_draft_scope(services, ticket);
         scope.node_id = format!("{}:selected-block:{index}", scope.node_id);
         let content_ref = persist_agentic_content_draft_for_scope(
