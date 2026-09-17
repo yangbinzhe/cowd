@@ -671,6 +671,7 @@ fn delegated_protocol_terminal_classification_is_mode_and_fence_aware() {
         artifact_refs: Vec::new(),
         artifact_evidence_refs: Vec::new(),
         owns_active_attempt,
+        review_reason: None,
     };
 
     assert!(!state("execute", crate::AgenticTaskStatus::Claimed, true).is_terminal());
@@ -686,6 +687,26 @@ fn delegated_protocol_terminal_classification_is_mode_and_fence_aware() {
 }
 
 #[test]
+fn rework_reason_is_surfaced_to_the_worker() {
+    let state = DelegatedAgenticProtocolState {
+        program_id: "program".to_string(),
+        task_id: "task".to_string(),
+        mode: "execute".to_string(),
+        status: crate::AgenticTaskStatus::Rework,
+        artifact_refs: Vec::new(),
+        artifact_evidence_refs: Vec::new(),
+        owns_active_attempt: true,
+        review_reason: Some("evidence does not prove the acceptance criterion".to_string()),
+    };
+    let instruction = state.continuation_instruction();
+    assert!(
+        instruction.contains("requested rework"),
+        "the continuation instruction must surface the rework reason: {instruction}"
+    );
+    assert!(instruction.contains("evidence does not prove the acceptance criterion"));
+}
+
+#[test]
 fn saturated_delegated_work_commits_its_next_action_without_text_only_detour() {
     let state = |mode: &str, status, owns_active_attempt| DelegatedAgenticProtocolState {
         program_id: "program".to_string(),
@@ -695,6 +716,7 @@ fn saturated_delegated_work_commits_its_next_action_without_text_only_detour() {
         artifact_refs: vec!["artifact:one".to_string()],
         artifact_evidence_refs: vec!["artifact://content".to_string()],
         owns_active_attempt,
+        review_reason: None,
     };
     let pending_review = state("review", crate::AgenticTaskStatus::Submitted, true);
     assert!(pending_delegated_action_is_ready(
@@ -738,6 +760,7 @@ fn active_delegated_protocol_exposes_only_its_irreducible_closure_action() {
         artifact_refs,
         artifact_evidence_refs: Vec::new(),
         owns_active_attempt: true,
+        review_reason: None,
     };
 
     assert_eq!(
