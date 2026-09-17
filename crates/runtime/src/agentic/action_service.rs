@@ -642,6 +642,26 @@ impl AgentActionService {
                 expected_streams,
                 events,
             })?;
+        // S1: task success/rework is measured at the commit boundary (after the
+        // replay guard and the durable append), never in the replayable
+        // projection fold, so replays and rebuilds cannot inflate the counts.
+        if let AgentAction::TaskReview(input) = &envelope.action {
+            match input.decision {
+                harness_contract::agent_action::TaskReviewDecision::Accept => {
+                    crate::execution_core::performance::observe_count(
+                        "agentic_task_accepted",
+                        1,
+                    );
+                }
+                harness_contract::agent_action::TaskReviewDecision::Challenge
+                | harness_contract::agent_action::TaskReviewDecision::Rework => {
+                    crate::execution_core::performance::observe_count(
+                        "agentic_task_reworked",
+                        1,
+                    );
+                }
+            }
+        }
         projection = self.project_snapshot(&envelope.actor.program_id)?;
         applied_observation(envelope, &projection, entity_ref, false)
     }

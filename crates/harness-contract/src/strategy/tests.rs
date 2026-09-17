@@ -1697,3 +1697,14 @@ fn a_team_prohibition_single_domain_or_explicit_count_is_not_a_structural_obliga
     assert!(explicit.required_team_count > 0);
     assert!(!automatic_team_is_structurally_required(&explicit));
 }
+
+#[test]
+fn domain_matching_respects_token_boundaries() {
+    // `latest` must not be read as the `test` domain, so two real component
+    // names stay two and no Team boundary is manufactured.
+    let understanding = understand(&StrategyInput::from_prompt(
+        "Review the latest backend and frontend changes and cite the evidence",
+    ));
+    assert_eq!(understanding.independent_workstreams, 2);
+    assert!(!automatic_team_is_structurally_required(&understanding));
+}

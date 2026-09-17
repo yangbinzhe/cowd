@@ -3004,6 +3004,32 @@ fn estimate_collaboration_lift(
     }
 }
 
+/// Match an ASCII domain term only at a token boundary. Plain `contains`
+/// reported a responsibility domain whenever a component name happened to be a
+/// substring of an unrelated word (`test` inside `latest`, `tui` inside
+/// `intuitive`), silently inflating the workstream width that feeds the
+/// structural collaboration boundary.
+fn contains_bounded_term(normalized: &str, term: &str) -> bool {
+    let mut start = 0;
+    while let Some(offset) = normalized[start..].find(term) {
+        let absolute = start + offset;
+        let before_ok = normalized[..absolute]
+            .chars()
+            .next_back()
+            .is_none_or(|character| !character.is_ascii_alphanumeric());
+        let after = absolute + term.len();
+        let after_ok = normalized[after..]
+            .chars()
+            .next()
+            .is_none_or(|character| !character.is_ascii_alphanumeric());
+        if before_ok && after_ok {
+            return true;
+        }
+        start = absolute + 1;
+    }
+    false
+}
+
 fn independent_workstreams(normalized: &str) -> u8 {
     let domains = [
         "runtime",
@@ -3021,7 +3047,7 @@ fn independent_workstreams(normalized: &str) -> u8 {
         "app-protocol",
     ]
     .iter()
-    .filter(|term| normalized.contains(**term))
+    .filter(|term| contains_bounded_term(normalized, term))
     .count();
     let explicit_team_handoff = if contains_any(
         normalized,
