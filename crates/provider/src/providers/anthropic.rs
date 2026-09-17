@@ -126,6 +126,11 @@ impl AnthropicClient {
         let endpoint = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let mut body = self.request_profile.render_json_body(request)?;
         strip_unsupported_beta_body_fields(&mut body);
+        if model_protocol::provider_capability::ProviderCapabilityProfile::supports_inline_cache_breakpoints(
+            &request.model,
+        ) {
+            apply_inline_cache_breakpoints(&mut body);
+        }
 
         let mut headers = vec![ProviderWireHeader {
             name: "content-type".to_string(),
@@ -997,6 +1002,63 @@ fn strip_unsupported_beta_body_fields(body: &mut Value) {
     }
 }
 
+/// Inject Anthropic prompt-cache breakpoints at the reusable prefix boundaries:
+/// the system prefix, the last tool definition, and the conversation tail.
+/// Anthropic accepts at most four explicit `cache_control` breakpoints per
+/// request; this places at most three and is a no-op for requests without a
+/// system prompt, tools, or messages. Only invoked for canonical Anthropic
+/// models (see `supports_inline_cache_breakpoints`); Anthropic-protocol proxies
+/// must not receive fields their upstream does not understand.
+fn apply_inline_cache_breakpoints(body: &mut Value) {
+    const BREAKPOINT_CAP: usize = 4;
+    let ephemeral = serde_json::json!({ "type": "ephemeral" });
+    let mut used = 0usize;
+
+    if let Some(system) = body.get_mut("system") {
+        if used < BREAKPOINT_CAP {
+            match system {
+                Value::String(text) => {
+                    let text = text.clone();
+                    *system = serde_json::json!([{
+                        "type": "text",
+                        "text": text,
+                        "cache_control": ephemeral,
+                    }]);
+                    used += 1;
+                }
+                Value::Array(blocks) => {
+                    if let Some(Value::Object(last)) = blocks.last_mut() {
+                        last.insert("cache_control".to_string(), ephemeral.clone());
+                        used += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if used < BREAKPOINT_CAP {
+        if let Some(Value::Array(tools)) = body.get_mut("tools") {
+            if let Some(Value::Object(last)) = tools.last_mut() {
+                last.insert("cache_control".to_string(), ephemeral.clone());
+                used += 1;
+            }
+        }
+    }
+
+    if used < BREAKPOINT_CAP {
+        if let Some(Value::Array(messages)) = body.get_mut("messages") {
+            if let Some(Value::Object(last)) = messages.last_mut() {
+                if let Some(Value::Array(content)) = last.get_mut("content") {
+                    if let Some(Value::Object(block)) = content.last_mut() {
+                        block.insert("cache_control".to_string(), ephemeral.clone());
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct AnthropicErrorEnvelope {
     error: AnthropicErrorBody,
@@ -1029,6 +1091,45 @@ mod tests {
     use crate::types::{ContentBlockDelta, InputMessage, MessageRequest};
 
     #[test]
+    fn claude_requests_carry_inline_cache_breakpoints_but_proxies_do_not() {
+        let client = AnthropicClient::new("k").with_base_url("https://provider.test");
+        let claude = MessageRequest {
+            model: "claude-3-7-sonnet".to_string(),
+            max_tokens: 64,
+            system: Some("stable system".to_string()),
+            messages: vec![InputMessage::user_text("inspect")],
+            tools: Some(vec![crate::types::ToolDefinition {
+                name: "read_file".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type":"object"}),
+            }]),
+            ..Default::default()
+        };
+        let body = client.wire_request(&claude).expect("wire").body;
+        assert!(
+            body["system"].is_array(),
+            "system becomes a cacheable block array"
+        );
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+
+        // Anthropic-protocol proxies must not receive cache_control fields.
+        let proxy = MessageRequest {
+            model: "gpt-5.6-terra".to_string(),
+            max_tokens: 64,
+            system: Some("stable system".to_string()),
+            messages: vec![InputMessage::user_text("inspect")],
+            ..Default::default()
+        };
+        let proxy_body = client.wire_request(&proxy).expect("wire").body;
+        assert!(proxy_body["system"].is_string());
+    }
+
+    #[test]
     fn wire_evidence_uses_the_transport_body_and_redacts_credentials() {
         let client = AnthropicClient::new("top-secret").with_base_url("https://provider.test");
         let request = MessageRequest {
@@ -1043,6 +1144,7 @@ mod tests {
             .render_json_body(&request)
             .expect("transport body");
         super::strip_unsupported_beta_body_fields(&mut expected);
+        super::apply_inline_cache_breakpoints(&mut expected);
 
         let wire = client.wire_request(&request).expect("wire evidence");
 

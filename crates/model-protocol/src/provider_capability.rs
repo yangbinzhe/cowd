@@ -189,6 +189,18 @@ impl ProviderCapabilityProfile {
         Self::is_deepseek_v4(model) || Self::is_qwen_thinking_tool_choice_incompatible(model)
     }
 
+    /// Anthropic-native models accept explicit `cache_control` breakpoints on
+    /// system / tools / the conversation tail. This is intentionally narrow:
+    /// Anthropic-protocol proxies (loopback bridges) must not receive fields
+    /// their upstream does not understand, so only canonical `claude*` ids opt
+    /// in here.
+    #[must_use]
+    pub fn supports_inline_cache_breakpoints(model: &str) -> bool {
+        let lowered = model.trim().to_ascii_lowercase();
+        let canonical = lowered.rsplit('/').next().unwrap_or_default();
+        canonical.starts_with("claude")
+    }
+
     /// The canonical wire fact for OpenAI-compatible assistant continuation
     /// messages. Configured and environment-derived provider routes must call
     /// this same resolver so constructor choice cannot change protocol
