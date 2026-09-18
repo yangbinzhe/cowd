@@ -3,7 +3,7 @@
 ## Authority and frozen baseline
 
 The implementation authority is sections 13--22 of
-`/media/yi/Datas/workspace/plan/0821-自主编排与跨Agent跨团队协同-版本审计与框架升级方案.md`.
+`/media/yi/Datas/workspace/plan/2026-08/0821-自主编排与跨Agent跨团队协同-版本审计与框架升级方案.md`.
 The earlier P0--P6 increment notes are evidence for their stated boundaries,
 not a substitute for the authority's B1--B12 and A12 closure.
 

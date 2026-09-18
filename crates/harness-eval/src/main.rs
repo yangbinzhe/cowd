@@ -196,7 +196,7 @@ fn run() -> Result<(), String> {
         }
         Some("terminal-gate") => {
             let evidence_dir = option_value(&args[1..], "--evidence-dir")
-                .unwrap_or_else(|| "../plan/0706-AIHarness终局100闭环升级/90-审计证据".to_string());
+                .unwrap_or_else(|| "../plan/2026-07/0706-AIHarness终局100闭环升级/90-审计证据".to_string());
             let report_json = option_value(&args[1..], "--report-json").map(PathBuf::from);
             let gate = terminal_gate_report_with_report(PathBuf::from(evidence_dir), report_json);
             let gate_json = serde_json::to_string_pretty(&gate)

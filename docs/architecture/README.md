@@ -3,8 +3,8 @@
 ## 运行时
 
 当前 Agent-first 架构权威及执行证据位于工作区外的
-`plan/cowd-agent-first-model-framework-2026-09-04.md` 与
-`plan/cowd-agent-first-implementation-board-2026-09-04.md`；当前代码对应的终态设计见
+`plan/2026-09/cowd-agent-first-model-framework-2026-09-04.md` 与
+`plan/2026-09/cowd-agent-first-implementation-board-2026-09-04.md`；当前代码对应的终态设计见
 [`agent-first-model-framework-v0.9.722.md`](agent-first-model-framework-v0.9.722.md)。本目录内 v0.9.715 及更早的
 collaboration/cache 方案只保留为历史事故与演化证据，不再定义生产控制面或验收口径。
 

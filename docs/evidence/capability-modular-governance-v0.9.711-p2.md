@@ -2,7 +2,7 @@
 
 ## Scope and provenance
 
-- Approved plan: `/media/yi/Datas/workspace/plan/0830-cowd-v0.9.711-capability-conserving-modular-governance/plan.md`
+- Approved plan: `/media/yi/Datas/workspace/plan/2026-08/0830-cowd-v0.9.711-capability-conserving-modular-governance/plan.md`
 - Approved plan SHA-256: `225b4286d5504bce28259302328d849384663064448b3a419fde4f8e1c4399a1`
 - Parent phase commit: `b36a0c20203c40d6412efab122ac52ad2b22934e`
 - Core branch: `master`

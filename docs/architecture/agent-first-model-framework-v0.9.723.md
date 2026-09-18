@@ -24,7 +24,7 @@ turn-varying material after it. Cache reports distinguish cold, eligible warm,
 and unknown tokens; cache economics never become a business-execution gate.
 
 The external implementation authority and gate matrix are maintained at
-`/media/yi/Datas/workspace/plan/cowd-pg-agentic-terminal-2026-09-07/`.
+`/media/yi/Datas/workspace/plan/2026-09/cowd-pg-agentic-terminal-2026-09-07/`.
 Release evidence is recorded in
 `docs/evidence/agent-first-model-framework-v0.9.723.md` and the external
 authority's `evidence/` tree.

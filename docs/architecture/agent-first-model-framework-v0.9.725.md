@@ -15,6 +15,6 @@ environment explicit and avoids coupling product validation to tmux server
 state or a host-specific temporary-directory policy.
 
 The implementation plan and gate matrix remain under
-`/media/yi/Datas/workspace/plan/cowd-pg-agentic-terminal-2026-09-07/`.
+`/media/yi/Datas/workspace/plan/2026-09/cowd-pg-agentic-terminal-2026-09-07/`.
 Release evidence is recorded in
 `docs/evidence/agent-first-model-framework-v0.9.725.md`.

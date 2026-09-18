@@ -1,7 +1,7 @@
 # Capability-conserving modular governance (v0.9.711)
 
 This release is governed by the approved and audited plan at
-`../plan/0830-cowd-v0.9.711-capability-conserving-modular-governance` and the
+`../plan/2026-08/0830-cowd-v0.9.711-capability-conserving-modular-governance` and the
 phase evidence `docs/evidence/capability-modular-governance-v0.9.711-p0.md`
 through `p6.md`, plus the final release evidence
 `docs/evidence/capability-modular-governance-v0.9.711.md`.

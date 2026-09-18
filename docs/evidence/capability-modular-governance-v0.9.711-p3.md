@@ -2,7 +2,7 @@
 
 Date: 2026-08-30
 
-Plan: `plan/0830-cowd-v0.9.711-capability-conserving-modular-governance/plan.md`
+Plan: `plan/2026-08/0830-cowd-v0.9.711-capability-conserving-modular-governance/plan.md`
 
 Approved plan SHA-256: `225b4286d5504bce28259302328d849384663064448b3a419fde4f8e1c4399a1`
 

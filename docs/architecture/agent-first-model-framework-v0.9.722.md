@@ -2,7 +2,7 @@
 
 日期：2026-09-05
 状态：实现权威；取代 v0.9.721 及更早的 Team recipe、V2 编排、模板驱动和双控制面方案。
-外部架构权威：`/media/yi/Datas/workspace/plan/cowd-agent-first-model-framework-2026-09-04.md`
+外部架构权威：`/media/yi/Datas/workspace/plan/2026-09/cowd-agent-first-model-framework-2026-09-04.md`
 
 ## 1. 终态目标
 
