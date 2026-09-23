@@ -3425,7 +3425,7 @@ fn select_one_shot_deliverable_text(
             return Some((*index, *text));
         }
     }
-    texts.into_iter().max_by_key(|(_, text)| text.len())
+    texts.into_iter().rev().next()
 }
 
 pub(super) async fn resolve_explicit_agentic_content_refs(

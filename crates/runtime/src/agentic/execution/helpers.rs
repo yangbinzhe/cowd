@@ -282,10 +282,15 @@ pub(super) fn task_objective(
     let delivery = objective_delivery_instruction(authored_file_write_allowed(
         &projection.resource_scopes,
     ));
+    let hard_rules = if authored_file_write_allowed(&projection.resource_scopes) {
+        "硬规则：正文为空会被拒绝；未领取不得提交；不确定的写入 unresolved，不得编造。"
+    } else {
+        "硬规则：交付物必须是**你撰写的分析报告**（结论、发现、风险、file:line 引用），**绝对不能**是源码原文的粘贴或文件内容的复述；正文为空会被拒绝；未领取不得提交；本租约只读，勿写文件；不确定的写入 unresolved，不得编造。"
+    };
     let mut objective = match mode {
         DispatchMode::Coordination(_) => unreachable!("coordination objective handled above"),
         DispatchMode::Execute => format!(
-            "你是 Agent `{}`（Team `{}`，角色 {}）。\n任务 `{}`：{}\n目标：{}\n验收：{}\n\n按序执行以下协议（不要增加其它步骤）：\n1) state_inspect 查看 Task 真相，确认可领取；\n2) task_claim 领取该确切 Task；\n3) 用只读工具取证：无依赖的调用放进同一批；\n4) 把结论写成一段**完整非空正文**，引用真实证据；\n{delivery}\n\n硬规则：正文为空会被拒绝；未领取不得提交；本租约只读，勿写文件；不确定的写入 unresolved，不得编造。\n可选：有对其它队有用的发现，可在 topic:{} 发布一条引用证据的摘要。",
+            "你是 Agent `{}`（Team `{}`，角色 {}）。\n任务 `{}`：{}\n目标：{}\n验收：{}\n\n按序执行以下协议（不要增加其它步骤）：\n1) state_inspect 查看 Task 真相，确认可领取；\n2) task_claim 领取该确切 Task；\n3) 用只读工具取证（无依赖的调用放进同一批）；\n4) **撰写审查报告**：把你的结论、发现、风险和 file:line 证据引用写成一段完整正文——这是交付物，**不是**源码复制；\n{delivery}\n\n{hard_rules}\n可选：有对其它队有用的发现，可在 topic:{} 发布一条引用证据的摘要。",
             member.agent_id,
             task.team_id,
             member.role,
