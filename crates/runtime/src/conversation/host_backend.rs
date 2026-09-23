@@ -3575,6 +3575,23 @@ where
                 detail: Some("executing tool batch".to_string()),
             });
         }
+        {
+            // A required-Team turn spends most of its wall clock inside tool
+            // batches rather than root model steps, so the objective budget must
+            // be enforced here too: otherwise the turn only ends at the external
+            // scenario wait instead of an in-bound honest terminal.
+            let mut state = self.state.lock().await;
+            if collaboration_budget_elapsed(
+                state.collaboration_obligation.as_ref(),
+                state.execution_role.is_delegated_leaf(),
+                state.started_at.elapsed(),
+                collaboration_wall_budget(),
+            ) {
+                let disclosure = "Execution blocked safely: bounded convergence reached the Agent-first collaboration budget with the required verified-Team minimum still unmet. The objective is only partially satisfied and unresolved work stays in the Program projection; Runtime stopped the turn instead of running unbounded.".to_string();
+                state.terminal_override = Some((GoalCompletion::Partial, disclosure));
+                return Ok(precommitted_terminal_outcome(ticket));
+            }
+        }
         let (prompter, iteration, session_id, model_lease, delegated_agent_role) = {
             let state = self.state.lock().await;
             (
