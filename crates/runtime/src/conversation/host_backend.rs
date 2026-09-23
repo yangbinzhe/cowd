@@ -3395,6 +3395,39 @@ pub(super) async fn persist_agentic_content_draft(
 
 /// A current-message source names an exact block. Never substitute a nearby
 /// paragraph or a previous draft when that block is absent.
+/// Choose the one-shot Task deliverable body from the model's response.
+///
+/// A weak model cannot reliably count response blocks, so a requested block is
+/// used only when it is substantive; otherwise the longest non-empty Text block
+/// of this response is delivered. The content is always the model's own words.
+fn select_one_shot_deliverable_text(
+    message: &ConversationMessage,
+    hint: Option<usize>,
+) -> Option<(usize, &str)> {
+    const SUBSTANTIVE_MIN_CHARS: usize = 200;
+    let texts: Vec<(usize, &str)> = message
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, block)| match block {
+            ContentBlock::Text { text } if !text.trim().is_empty() => {
+                Some((index, text.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    if let Some(hint) = hint {
+        if let Some((index, text)) = texts
+            .iter()
+            .find(|(index, _)| *index == hint)
+            .filter(|(_, text)| text.trim().len() >= SUBSTANTIVE_MIN_CHARS)
+        {
+            return Some((*index, *text));
+        }
+    }
+    texts.into_iter().max_by_key(|(_, text)| text.len())
+}
+
 pub(super) async fn resolve_explicit_agentic_content_refs(
     services: &crate::RuntimeServices,
     ticket: &NodeExecutionTicket,
@@ -3420,16 +3453,31 @@ pub(super) async fn resolve_explicit_agentic_content_refs(
                 .and_then(|reference| reference.strip_prefix("current_message_block:"))
                 .and_then(|index| index.parse::<usize>().ok())
         } else {
+            None
+        };
+        // One-shot deliverable: a weak model must not have to count response
+        // blocks. If `artifact_commit` names an exact block, honour it; for the
+        // one-shot submit instead take the requested block when it is
+        // substantive, otherwise the longest non-empty Text block of this
+        // response. Content is always the model's own words.
+        let one_shot_hint = if is_commit {
+            None
+        } else {
             value
                 .get("deliverable")
                 .and_then(|deliverable| deliverable.get("block_index"))
                 .and_then(serde_json::Value::as_u64)
                 .map(|index| index as usize)
         };
-        let Some(index) = index else {
-            continue;
+        let selected: Option<(usize, &str)> = if is_commit {
+            index.and_then(|index| match message.blocks.get(index) {
+                Some(ContentBlock::Text { text }) => Some((index, text.as_str())),
+                _ => None,
+            })
+        } else {
+            select_one_shot_deliverable_text(message, one_shot_hint)
         };
-        let Some(ContentBlock::Text { text }) = message.blocks.get(index) else {
+        let Some((selected_index, text)) = selected else {
             continue;
         };
         if text.trim().is_empty() {
@@ -3439,7 +3487,7 @@ pub(super) async fn resolve_explicit_agentic_content_refs(
             continue;
         }
         let mut scope = agentic_content_draft_scope(services, ticket);
-        scope.node_id = format!("{}:selected-block:{index}", scope.node_id);
+        scope.node_id = format!("{}:selected-block:{selected_index}", scope.node_id);
         let content_ref = persist_agentic_content_draft_for_scope(
             services,
             &scope,
