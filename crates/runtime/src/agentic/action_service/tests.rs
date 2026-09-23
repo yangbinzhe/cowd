@@ -1379,6 +1379,7 @@ fn legacy_goal_terminal_recovery_is_durable_and_idempotent() {
             &team_id,
             &agent_id,
             AgentAction::TaskSubmit(TaskSubmitInput {
+                deliverable: None,
                 task_ref: task_id.clone(),
                 artifact_refs: vec![artifact_ref.clone()],
                 evidence_refs: vec!["tool://source-observation".to_string()],
@@ -1684,6 +1685,7 @@ async fn production_artifact_authority_closes_submit_review_and_completion_chain
             &team,
             &worker,
             AgentAction::TaskSubmit(TaskSubmitInput {
+                deliverable: None,
                 task_ref: task.clone(),
                 artifact_refs: vec![artifact.clone()],
                 evidence_refs: vec![content.selector.clone()],
@@ -1954,6 +1956,7 @@ fn task_claim_requires_a_roster_agent_and_expired_lease_is_reclaimable() {
         &team,
         &agent,
         AgentAction::TaskSubmit(TaskSubmitInput {
+            deliverable: None,
             task_ref: task.clone(),
             artifact_refs: vec!["artifact:any".to_string()],
             evidence_refs: vec!["artifact://any".to_string()],

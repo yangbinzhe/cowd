@@ -254,6 +254,31 @@ pub struct TaskSubmitInput {
     /// accept verdict is the sole Task completion authority.
     #[serde(default)]
     pub unresolved: Vec<String>,
+    /// Optional one-shot deliverable. The model selects one non-empty Text
+    /// block from its own response; Runtime persists it through exactly the
+    /// same artifact path as `artifact_commit` (empty content is refused) and
+    /// binds it to this Task, so a single `task_submit` step is enough.
+    /// `artifact_refs` stays authoritative for file-backed or multi-part
+    /// deliverables; when both are present `artifact_refs` wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deliverable: Option<TaskOneShotDeliverable>,
+}
+
+/// One-shot Task deliverable selection. Only `block_index`/`kind`/`title` are
+/// authored by the model; `resolved_content_ref` is set by Runtime and must
+/// never be provided by a model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TaskOneShotDeliverable {
+    /// Zero-based index of the Text block in the current model response.
+    #[serde(default)]
+    pub block_index: usize,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub title: String,
+    /// Host-resolved durable `artifact://` selector. Runtime-filled only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_content_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -617,7 +642,11 @@ impl AgentAction {
             }
             Self::TaskSubmit(input) => {
                 required("task_ref", &input.task_ref)?;
-                if input.artifact_refs.is_empty() {
+                // A Task result is either an explicit set of committed
+                // artifact refs, or one one-shot deliverable block that
+                // Runtime expands into exactly that canonical path. An empty
+                // submission with neither is still rejected.
+                if input.artifact_refs.is_empty() && input.deliverable.is_none() {
                     return Err(AgentActionValidationError::Missing("artifact_refs"));
                 }
                 unique_nonempty("artifact_refs", &input.artifact_refs)?;
@@ -926,16 +955,32 @@ mod tests {
 
     #[test]
     fn task_submission_requires_a_real_artifact_reference() {
-        let action = AgentAction::TaskSubmit(TaskSubmitInput {
+        let empty = AgentAction::TaskSubmit(TaskSubmitInput {
             task_ref: "task-1".to_string(),
             artifact_refs: Vec::new(),
             evidence_refs: Vec::new(),
             unresolved: Vec::new(),
+            deliverable: None,
         });
         assert_eq!(
-            action.validate(),
+            empty.validate(),
             Err(AgentActionValidationError::Missing("artifact_refs"))
         );
+        // A one-shot deliverable is an equally real Task result: Runtime
+        // expands it into exactly the canonical artifact path.
+        let one_shot = AgentAction::TaskSubmit(TaskSubmitInput {
+            task_ref: "task-1".to_string(),
+            artifact_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            unresolved: Vec::new(),
+            deliverable: Some(TaskOneShotDeliverable {
+                block_index: 2,
+                kind: "report".to_string(),
+                title: "Result".to_string(),
+                resolved_content_ref: None,
+            }),
+        });
+        assert_eq!(one_shot.validate(), Ok(()));
     }
 
     #[test]

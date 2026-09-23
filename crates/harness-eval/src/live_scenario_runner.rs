@@ -2094,6 +2094,11 @@ fn scenario_metrics(
         "team_count": teams.len().max(projected_health.team_count),
         "agentic_task_count": agentic_tasks,
         "accepted_agentic_task_count": accepted_tasks,
+        "rounds_per_task": if agentic_tasks == 0 {
+            0
+        } else {
+            model_rounds / agentic_tasks as u64
+        },
         "reworked_agentic_task_count": reworked_tasks,
         "rework_rate_bp": rework_rate_bp,
         "agentic_review_count": agentic_reviews,

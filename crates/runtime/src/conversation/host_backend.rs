@@ -3402,18 +3402,31 @@ pub(super) async fn resolve_explicit_agentic_content_refs(
     calls: &mut [ModelToolCall],
 ) -> Result<(), NodeExecutorError> {
     for call in calls {
-        if call.name != harness_contract::agent_action::ARTIFACT_COMMIT_TOOL_ID {
+        let is_commit = call.name == harness_contract::agent_action::ARTIFACT_COMMIT_TOOL_ID;
+        let is_submit = call.name == harness_contract::agent_action::TASK_SUBMIT_TOOL_ID;
+        if !is_commit && !is_submit {
             continue;
         }
         let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&call.input) else {
             continue;
         };
-        let Some(index) = value
-            .get("content_ref")
-            .and_then(serde_json::Value::as_str)
-            .and_then(|reference| reference.strip_prefix("current_message_block:"))
-            .and_then(|index| index.parse::<usize>().ok())
-        else {
+        // Both shapes name exactly one Text block of THIS model response:
+        // `artifact_commit.content_ref=current_message_block:<i>` and the
+        // one-shot `task_submit.deliverable.block_index`.
+        let index = if is_commit {
+            value
+                .get("content_ref")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|reference| reference.strip_prefix("current_message_block:"))
+                .and_then(|index| index.parse::<usize>().ok())
+        } else {
+            value
+                .get("deliverable")
+                .and_then(|deliverable| deliverable.get("block_index"))
+                .and_then(serde_json::Value::as_u64)
+                .map(|index| index as usize)
+        };
+        let Some(index) = index else {
             continue;
         };
         let Some(ContentBlock::Text { text }) = message.blocks.get(index) else {
@@ -3421,7 +3434,7 @@ pub(super) async fn resolve_explicit_agentic_content_refs(
         };
         if text.trim().is_empty() {
             // An empty selection must never become an empty deliverable: leave
-            // the reference unresolved so the commit is rejected with
+            // the reference unresolved so the action is rejected with
             // actionable guidance instead of persisting a bodyless artifact.
             continue;
         }
@@ -3434,7 +3447,17 @@ pub(super) async fn resolve_explicit_agentic_content_refs(
             text,
         )
         .await?;
-        value["content_ref"] = serde_json::Value::String(content_ref);
+        if is_commit {
+            value["content_ref"] = serde_json::Value::String(content_ref);
+        } else if let Some(deliverable) = value
+            .get_mut("deliverable")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            deliverable.insert(
+                "resolved_content_ref".to_string(),
+                serde_json::Value::String(content_ref),
+            );
+        }
         call.input = serde_json::to_string(&value).map_err(|error| NodeExecutorError::Poll {
             node_id: ticket.node_id.clone(),
             reason: format!("encode selected content: {error}"),
@@ -3446,6 +3469,7 @@ pub(super) async fn resolve_explicit_agentic_content_refs(
 fn intent_requests_explicit_content(intent: &ModelStepIntent) -> bool {
     matches!(intent, ModelStepIntent::ToolCalls { calls } if calls.iter().any(|call| {
         call.name == harness_contract::agent_action::ARTIFACT_COMMIT_TOOL_ID
+            || call.name == harness_contract::agent_action::TASK_SUBMIT_TOOL_ID
     }))
 }
 

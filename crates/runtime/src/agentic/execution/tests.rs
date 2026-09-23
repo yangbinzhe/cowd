@@ -1,8 +1,9 @@
 use super::helpers::deterministic_graph_id;
 use super::*;
 use harness_contract::agent_action::{
-    AgentActorBinding, AgentActorKind, AgentInviteInput, ArtifactCommitInput, TaskClaimInput,
-    TaskPublishInput, TaskReviewDecision, TaskReviewInput, TaskSubmitInput, TeamCreateInput,
+    AgentActionStatus, AgentActorBinding, AgentActorKind, AgentInviteInput, ArtifactCommitInput,
+    TaskClaimInput, TaskOneShotDeliverable, TaskPublishInput, TaskReviewDecision, TaskReviewInput,
+    TaskSubmitInput, TeamCreateInput,
 };
 use harness_contract::skill::{
     SkillAdapterKind, SkillCapabilityProfile, SkillKind, SkillLifecycleStatus, SkillRiskLevel,
@@ -543,9 +544,9 @@ async fn exercise_reviewed_goal_delivery(
     assert!(!shared_prefix.contains(&task_ref));
     assert!(!shared_prefix.contains(&agent_ref));
     assert_eq!(packet.deadline_at_ms, u64::MAX);
-    assert!(packet.objective.contains("First call state_inspect"));
-    assert!(packet.objective.contains("actively call task_claim"));
-    assert!(packet.objective.contains("Never submit before claiming"));
+    assert!(packet.objective.contains("state_inspect"));
+    assert!(packet.objective.contains("task_claim"));
+    assert!(packet.objective.contains("未领取不得提交"));
     assert!(packet.objective.contains("Current work directory"));
     assert!(packet
         .objective
@@ -1080,6 +1081,7 @@ async fn exercise_reviewed_goal_delivery(
         actor: actor.clone(),
         expected_revision: None,
         action: AgentAction::TaskSubmit(TaskSubmitInput {
+            deliverable: None,
             task_ref: task_ref.clone(),
             artifact_refs: vec![artifact.clone()],
             evidence_refs: vec![content.selector.clone()],
@@ -3576,6 +3578,7 @@ async fn cross_team_reviewer_resolves_own_identity_and_can_accept() {
         &author,
         author_execution,
         AgentAction::TaskSubmit(TaskSubmitInput {
+            deliverable: None,
             task_ref: task.clone(),
             artifact_refs: vec![artifact],
             evidence_refs: vec![content.selector.clone()],
@@ -4765,4 +4768,260 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
             "{label}"
         );
     }
+}
+
+// ---- W2: one-shot Task deliverable ---------------------------------------------
+
+async fn one_shot_fixture() -> (
+    std::sync::Arc<RuntimeServices>,
+    String,
+    String,
+    String,
+    String,
+) {
+    let services = RuntimeServices::in_memory().expect("runtime");
+    services.publish_session_execution_policy(
+        "session-dispatch",
+        crate::permissions::SessionExecutionPolicyControl::from_policy(
+            harness_contract::policy::SessionExecutionPolicy::from_profile(
+                harness_contract::policy::AutonomyProfileId::Autonomous,
+                1,
+                harness_contract::policy::SessionExecutionPolicyOrigin::ConfigDefault,
+            ),
+        ),
+    );
+    let actions = services.agent_action_service();
+    let team = actions
+        .apply(&root(
+            "one-shot-team",
+            AgentAction::TeamCreate(TeamCreateInput {
+                name: "Solo".to_string(),
+                mission: "produce".to_string(),
+                objective: None,
+            }),
+        ))
+        .expect("team")
+        .changed_refs[0]
+        .clone();
+    let author = actions
+        .apply(&root(
+            "one-shot-author",
+            AgentAction::AgentInvite(AgentInviteInput {
+                team_ref: team.clone(),
+                role: "Author".to_string(),
+                mission: "produce evidence".to_string(),
+                required_capabilities: vec!["read".to_string()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
+            }),
+        ))
+        .expect("author")
+        .changed_refs[0]
+        .clone();
+    let task = actions
+        .apply(&root(
+            "one-shot-task",
+            AgentAction::TaskPublish(TaskPublishInput {
+                team_ref: team.clone(),
+                title: "One-shot result".to_string(),
+                objective: "produce durable evidence".to_string(),
+                acceptance: "independent review accepts the delivered body".to_string(),
+                acceptance_checks: Vec::new(),
+                required_capabilities: vec!["read".to_string()],
+                depends_on: Vec::new(),
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
+            }),
+        ))
+        .expect("task")
+        .changed_refs[0]
+        .clone();
+    let execution = "one-shot-execution".to_string();
+    actions
+        .apply(&agent(
+            "one-shot-claim",
+            &team,
+            &author,
+            &execution,
+            AgentAction::TaskClaim(TaskClaimInput {
+                task_ref: task.clone(),
+                reason: None,
+            }),
+        ))
+        .expect("claim");
+    (services, team, author, task, execution)
+}
+
+#[tokio::test]
+async fn one_shot_task_deliverable_expands_to_the_canonical_artifact_path() {
+    let (services, team, author, task, execution) = one_shot_fixture().await;
+    let actions = services.agent_action_service();
+    let content = services
+        .artifact_store()
+        .write_bytes(
+            harness_contract::context::ArtifactWriteDescriptor {
+                media_type: "text/markdown".to_string(),
+                visibility_scope: "session:session-dispatch".to_string(),
+                expected_bytes: None,
+                original_name: Some("one-shot.md".to_string()),
+            },
+            b"one-shot deliverable body",
+        )
+        .await
+        .expect("content");
+    let submit = agent(
+        "one-shot-submit",
+        &team,
+        &author,
+        &execution,
+        AgentAction::TaskSubmit(TaskSubmitInput {
+            task_ref: task.clone(),
+            artifact_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            unresolved: Vec::new(),
+            deliverable: Some(TaskOneShotDeliverable {
+                block_index: 0,
+                kind: "report".to_string(),
+                title: "One-shot report".to_string(),
+                resolved_content_ref: Some(content.selector.clone()),
+            }),
+        }),
+    );
+    let observation = services
+        .submit_agent_action(&submit)
+        .await
+        .expect("one-shot submit");
+    assert_eq!(
+        observation.status,
+        AgentActionStatus::Applied,
+        "{:?}",
+        observation.error
+    );
+    let program = actions.project("program-dispatch").expect("program");
+    let projection = program.tasks.get(&task).expect("task projection");
+    assert_eq!(projection.status, crate::AgenticTaskStatus::Submitted);
+    assert_eq!(
+        projection.artifact_refs.len(),
+        1,
+        "one-shot deliverable binds exactly one artifact"
+    );
+    let artifact_ref = &projection.artifact_refs[0];
+    assert!(artifact_ref.starts_with("artifact:"));
+    assert_eq!(
+        program
+            .artifacts
+            .get(artifact_ref)
+            .expect("registered artifact")
+            .content_ref,
+        content.selector
+    );
+}
+
+#[tokio::test]
+async fn one_shot_deliverable_is_ignored_when_artifact_refs_are_present() {
+    let (services, team, author, task, execution) = one_shot_fixture().await;
+    let actions = services.agent_action_service();
+    let explicit = services
+        .artifact_store()
+        .write_bytes(
+            harness_contract::context::ArtifactWriteDescriptor {
+                media_type: "text/markdown".to_string(),
+                visibility_scope: "session:session-dispatch".to_string(),
+                expected_bytes: None,
+                original_name: Some("explicit.md".to_string()),
+            },
+            b"explicit body",
+        )
+        .await
+        .expect("content");
+    let committed = actions
+        .apply(&agent(
+            "one-shot-explicit-commit",
+            &team,
+            &author,
+            &execution,
+            AgentAction::ArtifactCommit(ArtifactCommitInput {
+                content_ref: explicit.selector.clone(),
+                kind: "report".to_string(),
+                title: "Explicit report".to_string(),
+                relates_to: Vec::new(),
+            }),
+        ))
+        .expect("commit")
+        .changed_refs[0]
+        .clone();
+    let submit = agent(
+        "one-shot-submit-with-refs",
+        &team,
+        &author,
+        &execution,
+        AgentAction::TaskSubmit(TaskSubmitInput {
+            task_ref: task.clone(),
+            artifact_refs: vec![committed.clone()],
+            evidence_refs: vec![explicit.selector.clone()],
+            unresolved: Vec::new(),
+            deliverable: Some(TaskOneShotDeliverable {
+                block_index: 0,
+                kind: "ignored".to_string(),
+                title: "Ignored".to_string(),
+                resolved_content_ref: Some("artifact://not-used".to_string()),
+            }),
+        }),
+    );
+    services
+        .submit_agent_action(&submit)
+        .await
+        .expect("submit with refs");
+    let program = actions.project("program-dispatch").expect("program");
+    let projection = program.tasks.get(&task).expect("task projection");
+    assert_eq!(
+        projection.artifact_refs,
+        vec![committed],
+        "artifact_refs stays authoritative"
+    );
+}
+
+#[tokio::test]
+async fn one_shot_deliverable_without_a_resolved_ref_is_rejected() {
+    let (services, team, author, task, execution) = one_shot_fixture().await;
+    let submit = agent(
+        "one-shot-unresolved",
+        &team,
+        &author,
+        &execution,
+        AgentAction::TaskSubmit(TaskSubmitInput {
+            task_ref: task.clone(),
+            artifact_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            unresolved: Vec::new(),
+            deliverable: Some(TaskOneShotDeliverable {
+                block_index: 0,
+                kind: "report".to_string(),
+                title: "Unresolved".to_string(),
+                resolved_content_ref: None,
+            }),
+        }),
+    );
+    let observation = services
+        .submit_agent_action(&submit)
+        .await
+        .expect("submit returns an observation");
+    assert_eq!(
+        observation.status,
+        AgentActionStatus::Rejected,
+        "an unresolved one-shot deliverable must be rejected by authorization"
+    );
+    assert!(
+        observation
+            .error
+            .as_ref()
+            .is_some_and(|error| error.code == "task_submission_has_no_artifact"),
+        "unexpected rejection: {:?}",
+        observation.error
+    );
 }

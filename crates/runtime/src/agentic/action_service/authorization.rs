@@ -734,13 +734,22 @@ fn validate_task_submission(
     }) {
         return Some(("artifact_not_bound_to_active_claim", unowned.clone()));
     }
-    if input.artifact_refs.is_empty() {
+    // A one-shot deliverable is an equally real Task result: the host has
+    // already persisted its non-empty content, so the canonical artifact is
+    // synthesized at apply time instead of requiring a separate
+    // `artifact_commit` model step.
+    let one_shot_deliverable = input
+        .deliverable
+        .as_ref()
+        .and_then(|deliverable| deliverable.resolved_content_ref.as_deref())
+        .is_some_and(|content_ref| content_ref.starts_with("artifact://"));
+    if input.artifact_refs.is_empty() && !one_shot_deliverable {
         return Some((
             "task_submission_has_no_artifact",
             "commit substantive work, then submit its compact artifact reference".to_string(),
         ));
     }
-    if input.evidence_refs.is_empty() {
+    if input.evidence_refs.is_empty() && !one_shot_deliverable {
         return Some((
             "task_submission_has_no_evidence",
             "submit at least one durable tool:// or artifact:// evidence reference".to_string(),

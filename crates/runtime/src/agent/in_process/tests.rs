@@ -3367,6 +3367,7 @@ async fn cross_team_review_checkpoint_is_valid_but_cross_team_execution_is_fence
     apply_author(
         "submit",
         AgentAction::TaskSubmit(TaskSubmitInput {
+            deliverable: None,
             task_ref: task.clone(),
             artifact_refs: vec![artifact],
             evidence_refs: vec![content.selector],

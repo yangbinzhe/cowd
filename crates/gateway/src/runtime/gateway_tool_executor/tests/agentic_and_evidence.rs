@@ -285,6 +285,7 @@
 
         let action = harness_contract::agent_action::AgentAction::TaskSubmit(
             harness_contract::agent_action::TaskSubmitInput {
+                deliverable: None,
                 task_ref: "task:any".to_string(),
                 artifact_refs: vec!["artifact:any".to_string()],
                 evidence_refs: vec![format!("tool://{evidence_id}")],
@@ -588,6 +589,7 @@
 
         let direct_artifact = harness_contract::agent_action::AgentAction::TaskSubmit(
             harness_contract::agent_action::TaskSubmitInput {
+                deliverable: None,
                 task_ref: "task:any".to_string(),
                 artifact_refs: vec!["artifact:any".to_string()],
                 evidence_refs: vec![artifact.selector.clone()],
@@ -614,6 +616,7 @@
             .expect("foreign artifact");
         let foreign_evidence = harness_contract::agent_action::AgentAction::TaskSubmit(
             harness_contract::agent_action::TaskSubmitInput {
+                deliverable: None,
                 task_ref: "task:any".to_string(),
                 artifact_refs: vec!["artifact:any".to_string()],
                 evidence_refs: vec![foreign_artifact.selector],
@@ -628,6 +631,7 @@
 
         let fake_evidence = harness_contract::agent_action::AgentAction::TaskSubmit(
             harness_contract::agent_action::TaskSubmitInput {
+                deliverable: None,
                 task_ref: "task:any".to_string(),
                 artifact_refs: vec!["artifact:any".to_string()],
                 evidence_refs: vec!["tool://invented-receipt".to_string()],

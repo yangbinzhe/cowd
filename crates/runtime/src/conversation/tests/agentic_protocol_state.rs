@@ -582,6 +582,7 @@ async fn rework_attempt_cannot_reuse_artifacts_from_an_earlier_claim() {
             &fixture.author_ref,
             first_execution,
             AgentAction::TaskSubmit(TaskSubmitInput {
+                deliverable: None,
                 task_ref: fixture.task_ref.clone(),
                 artifact_refs: vec![stale_artifact.clone()],
                 evidence_refs: vec![stale_evidence.clone()],
@@ -628,6 +629,7 @@ async fn rework_attempt_cannot_reuse_artifacts_from_an_earlier_claim() {
             &fixture.author_ref,
             second_execution,
             AgentAction::TaskSubmit(TaskSubmitInput {
+                deliverable: None,
                 task_ref: fixture.task_ref.clone(),
                 artifact_refs: vec![stale_artifact],
                 evidence_refs: vec!["artifact://not-needed-for-rejection".to_string()],
@@ -885,6 +887,7 @@ async fn delegated_review_is_pending_only_until_its_durable_verdict() {
             &fixture.author_ref,
             execute_graph,
             AgentAction::TaskSubmit(TaskSubmitInput {
+                deliverable: None,
                 task_ref: fixture.task_ref.clone(),
                 artifact_refs: vec![artifact_ref.clone()],
                 evidence_refs: vec![content_ref.clone()],
@@ -1340,6 +1343,7 @@ async fn accepted_root_work_does_not_force_a_terminal_tool_or_promote_its_checkp
                 &fixture.author_ref,
                 "root-check-author",
                 AgentAction::TaskSubmit(TaskSubmitInput {
+                    deliverable: None,
                     task_ref: fixture.task_ref.clone(),
                     artifact_refs: vec![artifact],
                     evidence_refs: vec![content.clone()],

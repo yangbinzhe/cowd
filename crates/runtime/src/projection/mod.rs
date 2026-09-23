@@ -1631,6 +1631,7 @@ mod tests {
                 &analyst_id,
                 "execution-agentic-analyst",
                 AgentAction::TaskSubmit(TaskSubmitInput {
+                    deliverable: None,
                     task_ref: research_task_id.clone(),
                     artifact_refs: vec![research_artifact.clone()],
                     evidence_refs: vec!["tool://source-observation".to_string()],
@@ -1688,6 +1689,7 @@ mod tests {
                 &reviewer_id,
                 "execution-agentic-reviewer",
                 AgentAction::TaskSubmit(TaskSubmitInput {
+                    deliverable: None,
                     task_ref: synthesis_task_id.clone(),
                     artifact_refs: vec![final_artifact.clone()],
                     evidence_refs: vec!["tool://decision-validation".to_string()],

@@ -70,6 +70,31 @@ impl Drop for DispatchFlight {
     }
 }
 
+/// Lane-scoped model default for delegated Agent-first execution.
+///
+/// Weak-model landing: an operator may opt into different models per lane via
+/// environment (`COWD_AGENT_MODEL_WORKER` for Task execution,
+/// `COWD_AGENT_MODEL_REVIEWER` for independent review/coordination). When the
+/// variable is unset the concrete program lease is inherited unchanged, so
+/// existing behavior is untouched. The root's own model is never changed here.
+fn agentic_member_model_lease(context: &AgenticDispatchContext, mode: DispatchMode) -> String {
+    let key = match mode {
+        DispatchMode::Execute => "COWD_AGENT_MODEL_WORKER",
+        DispatchMode::Review | DispatchMode::Coordination(_) => "COWD_AGENT_MODEL_REVIEWER",
+    };
+    routed_lane_model(std::env::var(key).ok().as_deref(), &context.model_lease)
+}
+
+/// Pure lane routing decision: an explicit non-empty lane model wins, otherwise
+/// the concrete program lease is inherited unchanged (default = no behavior
+/// change).
+fn routed_lane_model(lane_model: Option<&str>, program_lease: &str) -> String {
+    lane_model
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| program_lease.to_string(), str::to_string)
+}
+
 fn agentic_supervisor_actor(
     projection: &AgenticProgramProjection,
     execution_id: Option<String>,
@@ -1279,13 +1304,12 @@ impl RuntimeServices {
                 allowed_tools: admission.allowed_tools,
                 allowed_skills: admission.allowed_skills,
                 permission_ceiling: admission.permission_ceiling,
-                // `model_profile_ref` is a symbolic Agent-Definition profile
-                // (e.g. "default"/"coding"), not a provider model id, so it must
-                // NOT be used as the execution lease. Keep the concrete program
-                // lease; the member binding's `allowed_models` still constrains
-                // selection. A concrete per-member model would require resolving
-                // the Definition's allowed_models, not the profile label.
-                model_lease: context.model_lease.clone(),
+                // `model_profile_ref` is a symbolic Agent-Definition profile (e.g.
+                // "default"/"coding"), not a provider model id, so it must NOT
+                // be used as the execution lease. A lane-scoped model default
+                // may be opted into via environment (weak-model landing); when
+                // unset the concrete program lease is inherited unchanged.
+                model_lease: agentic_member_model_lease(context, mode),
                 budget_lease: ChildExecutionBudgetReservation::single(
                     format!("budget:{graph_id}"),
                     member.agent_id.clone(),
@@ -1571,5 +1595,22 @@ mod cohort_tests {
         assert!(content.contains(&"x".repeat(50_000)));
         assert!(content.contains(&"t".repeat(50_000)));
         assert!(!content.contains("[bounded by Runtime]"));
+    }
+}
+
+#[cfg(test)]
+mod lane_routing_tests {
+    use super::routed_lane_model;
+
+    #[test]
+    fn lane_routing_is_opt_in_and_never_changes_the_default() {
+        // Unset (or blank) lane model inherits the concrete program lease.
+        assert_eq!(routed_lane_model(None, "program-model"), "program-model");
+        assert_eq!(routed_lane_model(Some("   "), "program-model"), "program-model");
+        // An explicit lane model wins for that lane only.
+        assert_eq!(
+            routed_lane_model(Some("deepseek-v4-flash"), "program-model"),
+            "deepseek-v4-flash"
+        );
     }
 }

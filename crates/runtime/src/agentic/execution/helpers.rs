@@ -252,6 +252,17 @@ fn authored_file_write_allowed(resource_scopes: &[String]) -> bool {
     })
 }
 
+/// Step 5 of the Worker protocol card. Reads best for weak models and stays a
+/// *guide*: the only hard rules are objective boundaries (non-empty body, claim
+/// first, read-only lease writes nothing) and are stated separately.
+fn objective_delivery_instruction(writable: bool) -> &'static str {
+    if writable {
+        "5) 把正文写入 workspace 文件 → read_file 取 sha256 → artifact_publish → artifact_commit → task_submit(task_ref 为该 Task, artifact_refs=[artifact:...], evidence_refs=[真实回执], unresolved=[保留事项])。"
+    } else {
+        "5) task_submit(task_ref 为该 Task, deliverable={\"block_index\":<正文所在 Text 块号>,\"kind\":\"report\",\"title\":\"<标题>\"}, evidence_refs=[真实回执], unresolved=[保留事项])。一步即可：Runtime 会把它转成与该 Task 绑定的 artifact。"
+    }
+}
+
 pub(super) fn task_objective(
     projection: &AgenticProgramProjection,
     task: &AgenticTaskProjection,
@@ -268,18 +279,16 @@ pub(super) fn task_objective(
         || format!("topic:{}", task.team_id),
         |team| team.topic_ref.clone(),
     );
-    let delivery = if authored_file_write_allowed(&projection.resource_scopes) {
-        "Produce long-form work in a workspace file, use read_file to obtain its exact sha256 and artifact_publish to publish it, then call artifact_commit with the returned content_ref."
-    } else {
-        "This Task lease is read-only: do NOT attempt to write files. Produce the findings as response text, then call artifact_commit with content_ref=current_message_block:<zero-based-index> selecting that exact non-empty Text block."
-    };
+    let delivery = objective_delivery_instruction(authored_file_write_allowed(
+        &projection.resource_scopes,
+    ));
     let mut objective = match mode {
         DispatchMode::Coordination(_) => unreachable!("coordination objective handled above"),
-        DispatchMode::Execute => format!(            "You are Agent `{}` in Team `{}`. Role: {}. Mission: {}.\n\nWork item `{}`: {}\nObjective: {}\nAcceptance: {}\n\nFirst call state_inspect and inspect the current Program truth. If this work fits your role and capabilities, actively call task_claim for this exact task before doing substantive work; Runtime binds that claim to your immutable Agent identity and physical execution. If it is unsuitable or already owned, do not claim or submit it: explain the mismatch concisely and let the Team reassign or replan. After a successful claim, use workspace_snapshot to identify actual repository roots and document entries before searching files; follow returned continuation requests and never infer absence from a partial scan. Then act autonomously: choose and use the most effective available tools, and publish useful findings to topic:{} when collaboration benefits. {delivery} Runtime automatically binds the artifact to this claimed Task, while relates_to is only for additional semantic relations. Finally call task_submit: pass the collaboration `artifact:...` value returned in artifact_commit.changed_refs as artifact_refs, and pass real durable source/test/tool receipts as evidence_refs. Runtime automatically binds the artifact's content; do not copy its internal artifact:// content_ref into evidence_refs. Retain material uncertainty in task_submit.unresolved; distinguish measured facts from assumptions and estimates, and use Topic references for challenges and responses. Never submit before claiming, and never claim completion only in prose.",
+        DispatchMode::Execute => format!(
+            "你是 Agent `{}`（Team `{}`，角色 {}）。\n任务 `{}`：{}\n目标：{}\n验收：{}\n\n按序执行以下协议（不要增加其它步骤）：\n1) state_inspect 查看 Task 真相，确认可领取；\n2) task_claim 领取该确切 Task；\n3) 用只读工具取证：无依赖的调用放进同一批；\n4) 把结论写成一段**完整非空正文**，引用真实证据；\n{delivery}\n\n硬规则：正文为空会被拒绝；未领取不得提交；本租约只读，勿写文件；不确定的写入 unresolved，不得编造。\n可选：有对其它队有用的发现，可在 topic:{} 发布一条引用证据的摘要。",
             member.agent_id,
             task.team_id,
             member.role,
-            member.mission,
             task.task_id,
             task.title,
             task.objective,
@@ -365,7 +374,7 @@ pub(super) fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod delivery_lease_tests {
-    use super::authored_file_write_allowed;
+    use super::{authored_file_write_allowed, objective_delivery_instruction};
 
     #[test]
     fn read_only_leases_deliver_through_text_blocks() {
@@ -375,5 +384,17 @@ mod delivery_lease_tests {
         assert!(authored_file_write_allowed(&writable));
         let write_scoped = vec!["write:report.html".to_string()];
         assert!(authored_file_write_allowed(&write_scoped));
+    }
+
+    #[test]
+    fn protocol_card_step_five_matches_the_lease() {
+        let read_only = objective_delivery_instruction(false);
+        assert!(read_only.contains("task_submit"));
+        assert!(read_only.contains("deliverable"));
+        assert!(!read_only.contains("artifact_publish"));
+
+        let writable = objective_delivery_instruction(true);
+        assert!(writable.contains("artifact_publish"));
+        assert!(writable.contains("artifact_commit"));
     }
 }

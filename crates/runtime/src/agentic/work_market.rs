@@ -420,13 +420,73 @@ pub(crate) fn apply_task_submit(
     envelope: &AgentActionEnvelope,
     input: &TaskSubmitInput,
 ) {
+    // One-shot deliverable: the host persisted the selected non-empty response
+    // block as durable content, so the canonical Task artifact is synthesized
+    // here through the same projection shape as `artifact_commit`. The id is a
+    // pure function of (program, actor, action, kind), so replay is stable.
+    let mut artifact_refs = input.artifact_refs.clone();
+    if artifact_refs.is_empty() {
+        if let Some(content_ref) = input
+            .deliverable
+            .as_ref()
+            .and_then(|deliverable| deliverable.resolved_content_ref.as_deref())
+        {
+            let artifact_ref = one_shot_artifact_ref(envelope);
+            let (kind, title) = input
+                .deliverable
+                .as_ref()
+                .map(|deliverable| {
+                    (
+                        if deliverable.kind.trim().is_empty() {
+                            "report".to_string()
+                        } else {
+                            deliverable.kind.clone()
+                        },
+                        deliverable.title.clone(),
+                    )
+                })
+                .unwrap_or_else(|| ("report".to_string(), String::new()));
+            let active_claim = projection.tasks.get(&input.task_ref).map(|task| {
+                (
+                    task.claim_execution_id.clone(),
+                    Some(task.claim_generation),
+                )
+            });
+            projection.artifacts.insert(
+                artifact_ref.clone(),
+                super::program::AgenticArtifactProjection {
+                    artifact_ref: artifact_ref.clone(),
+                    content_ref: content_ref.to_string(),
+                    kind,
+                    title,
+                    relates_to: vec![input.task_ref.clone()],
+                    committed_by: envelope.actor.actor_id.clone(),
+                    claim_execution_id: active_claim
+                        .as_ref()
+                        .and_then(|(execution_id, _)| execution_id.clone()),
+                    claim_generation: active_claim.as_ref().and_then(|(_, generation)| *generation),
+                },
+            );
+            artifact_refs.push(artifact_ref);
+        }
+    }
     let mut evidence_refs = input.evidence_refs.clone();
-    evidence_refs.extend(input.artifact_refs.iter().filter_map(|artifact_ref| {
+    evidence_refs.extend(artifact_refs.iter().filter_map(|artifact_ref| {
         projection
             .artifacts
             .get(artifact_ref)
             .map(|artifact| artifact.content_ref.clone())
     }));
+    if evidence_refs.is_empty() {
+        // The deliverable itself is durable evidence: keep the submission
+        // substantive without asking a weak model for a second selector.
+        evidence_refs.extend(artifact_refs.iter().filter_map(|artifact_ref| {
+            projection
+                .artifacts
+                .get(artifact_ref)
+                .map(|artifact| artifact.content_ref.clone())
+        }));
+    }
     evidence_refs.sort();
     evidence_refs.dedup();
     if let Some(task) = projection.tasks.get_mut(&input.task_ref) {
@@ -434,10 +494,29 @@ pub(crate) fn apply_task_submit(
             task.active_attempts.remove(execution_id);
         }
         task.status = AgenticTaskStatus::Submitted;
-        task.artifact_refs.clone_from(&input.artifact_refs);
+        task.artifact_refs.clone_from(&artifact_refs);
         task.evidence_refs = evidence_refs;
         task.unresolved.clone_from(&input.unresolved);
     }
+}
+
+/// Deterministic artifact id for a one-shot Task deliverable. Mirrors the
+/// canonical `artifact_commit` entity id derivation (program, actor, action,
+/// kind) so replays and rebuilds resolve to the same artifact.
+fn one_shot_artifact_ref(envelope: &AgentActionEnvelope) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(
+        format!(
+            "{}|{}|{}|{}",
+            envelope.actor.program_id,
+            envelope.actor.actor_id,
+            envelope.action_id,
+            envelope.action.kind()
+        )
+        .as_bytes(),
+    );
+    let encoded = format!("{digest:x}");
+    format!("artifact:{}", &encoded[..24])
 }
 
 pub(crate) fn apply_task_review(
