@@ -3970,11 +3970,28 @@ where
         } else if let Some(program) =
             root_agentic_program_projection(self.services.as_ref(), &session_id, &turn_id)
         {
+            // Durable collaboration deadline for this Program: the barrier
+            // itself carries it, so the periodic reconciliation releases the
+            // parked root at the budget even while every model step is idle.
+            let deadline_at_ms = {
+                let state = self.state.lock().await;
+                state
+                    .collaboration_obligation
+                    .as_ref()
+                    .is_some_and(|obligation| obligation.minimum_team_count > 0)
+                    .then(|| {
+                        let remaining = collaboration_wall_budget()
+                            .saturating_sub(state.started_at.elapsed());
+                        crate::tool_invocation::now_ms()
+                            .saturating_add(u64::try_from(remaining.as_millis()).unwrap_or(0))
+                    })
+            };
             crate::execution_core::graph::executors::AgenticProgramWaitRequest::for_active_root(
                 &program,
                 &ticket.graph_id,
                 self.services.graph_state_store(),
                 requested_agentic_worker_wait(&calls, &successful_call_ids),
+                deadline_at_ms,
             )
             .await
             .map_err(|reason| NodeExecutorError::Poll {

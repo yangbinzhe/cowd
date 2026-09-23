@@ -23,6 +23,12 @@ use crate::{
 pub struct AgenticProgramWaitRequest {
     pub program_id: String,
     pub root_execution_id: String,
+    /// Durable wall-clock deadline for the collaboration budget. The Program
+    /// journal remains semantic truth; this payload only binds the exact root
+    /// that may resume and the time by which it must. `None` on legacy
+    /// barriers and executor-created waits, which stay event-driven only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_at_ms: Option<u64>,
 }
 
 impl AgenticProgramWaitRequest {
@@ -33,6 +39,7 @@ impl AgenticProgramWaitRequest {
         root_execution_id: &str,
         state_store: &ExecutionGraphStateStore,
         wait_requested: bool,
+        deadline_at_ms: Option<u64>,
     ) -> Result<Option<Self>, String> {
         if !wait_requested
             || program.status != crate::AgenticProgramStatus::Open
@@ -47,6 +54,7 @@ impl AgenticProgramWaitRequest {
         Ok(dispatched.then(|| Self {
             program_id: program.program_id.clone(),
             root_execution_id: root_execution_id.to_string(),
+            deadline_at_ms,
         }))
     }
 }
@@ -272,9 +280,12 @@ pub async fn resolve_agentic_program_wait(
     let Some(root_execution_id) = projection.root_execution_id.as_deref() else {
         return Ok(0);
     };
+    let deadline_at_ms =
+        stored_barrier_deadline(state_store, root_execution_id, program_id).await?;
     let request = AgenticProgramWaitRequest {
         program_id: program_id.to_string(),
         root_execution_id: root_execution_id.to_string(),
+        deadline_at_ms,
     };
     let disposition = wait_disposition(&projection, &request, state_store).await?;
     let WaitDisposition::Resume { revision, reason } = disposition else {
@@ -297,8 +308,12 @@ pub async fn resolve_agentic_program_wait(
             node.kind == ExecutionNodeKind::Verify
                 && node.executor_kind == AgenticProgramWaitExecutor::KIND
                 && graph.node_statuses.get(&node.id) == Some(&ExecutionNodeStatus::WaitingExternal)
-                && serde_json::from_str::<AgenticProgramWaitRequest>(&node.payload_ref)
-                    .is_ok_and(|candidate| candidate == request)
+                && serde_json::from_str::<AgenticProgramWaitRequest>(&node.payload_ref).is_ok_and(
+                    |candidate| {
+                        candidate.program_id == request.program_id
+                            && candidate.root_execution_id == request.root_execution_id
+                    },
+                )
         });
         let Some(node) = candidate else {
             break;
@@ -315,8 +330,12 @@ pub async fn resolve_agentic_program_wait(
         // is genuinely releasable even if the Program revision never advanced,
         // otherwise the root stays parked forever (G56/G57 root non-finalization).
         let quiescent_resume = reason == "worker_quiescent";
+        // A budget resume is equally real even when the Program revision never
+        // advanced: the durable deadline is the release condition.
+        let budget_resume = reason == "collaboration_budget";
         if !allow_same_revision_quiescence
             && !quiescent_resume
+            && !budget_resume
             && projection.status == AgenticProgramStatus::Open
             && !all_tasks_accepted(&projection)
             && revision <= observed_revision
@@ -391,6 +410,37 @@ pub async fn reconcile_agentic_program_wait_for_settled_graph(
     Ok(resolved)
 }
 
+async fn stored_barrier_deadline(
+    state_store: &ExecutionGraphStateStore,
+    root_execution_id: &str,
+    program_id: &str,
+) -> Result<Option<u64>, String> {
+    // The parked barrier payload is the durable carrier of the collaboration
+    // deadline; a freshly built request has no deadline of its own.
+    let graph = state_store
+        .load_current_async(root_execution_id.to_string())
+        .await;
+    let Ok(graph) = graph else {
+        return Ok(None);
+    };
+    let deadline = graph
+        .nodes
+        .iter()
+        .find(|node| {
+            node.kind == ExecutionNodeKind::Verify
+                && node.executor_kind == AgenticProgramWaitExecutor::KIND
+                && graph.node_statuses.get(&node.id) == Some(&ExecutionNodeStatus::WaitingExternal)
+        })
+        .and_then(|node| {
+            serde_json::from_str::<AgenticProgramWaitRequest>(&node.payload_ref).ok()
+        })
+        .filter(|request| {
+            request.program_id == program_id && request.root_execution_id == root_execution_id
+        })
+        .and_then(|request| request.deadline_at_ms);
+    Ok(deadline)
+}
+
 async fn wait_disposition(
     projection: &AgenticProgramProjection,
     request: &AgenticProgramWaitRequest,
@@ -419,6 +469,18 @@ async fn wait_disposition(
         return Ok(WaitDisposition::Wait {
             revision: projection.revision,
             active_graphs: Vec::new(),
+        });
+    }
+    // The collaboration budget is a durable Program-bound deadline, not an
+    // actor-local limit. When it elapses the parked root must wake so its own
+    // honest terminal path can close the turn in-bound.
+    if request
+        .deadline_at_ms
+        .is_some_and(|deadline| now_ms() >= deadline)
+    {
+        return Ok(WaitDisposition::Resume {
+            revision: projection.revision,
+            reason: "collaboration_budget",
         });
     }
     if all_tasks_accepted(projection) {
@@ -642,6 +704,7 @@ mod tests {
             root_execution_id,
             services.graph_state_store(),
             true,
+            None,
         )
         .await
         .expect("derive pre-dispatch wait")
@@ -678,6 +741,7 @@ mod tests {
             root_execution_id,
             services.graph_state_store(),
             false,
+            None,
         )
         .await
         .expect("continue publishing while a child is active")
@@ -716,12 +780,14 @@ mod tests {
                 root_execution_id,
                 services.graph_state_store(),
                 true,
+                None,
             )
             .await
             .expect("derive dispatched wait"),
             Some(AgenticProgramWaitRequest {
                 program_id: program_id.to_string(),
                 root_execution_id: root_execution_id.to_string(),
+                deadline_at_ms: None,
             })
         );
     }
@@ -746,6 +812,7 @@ mod tests {
             serde_json::to_string(&AgenticProgramWaitRequest {
                 program_id: program_id.to_string(),
                 root_execution_id: root_execution_id.to_string(),
+                deadline_at_ms: None,
             })
             .expect("wait request"),
         );
