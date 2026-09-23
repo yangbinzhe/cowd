@@ -2699,7 +2699,7 @@ fn next_unverified_model_step_streak(current: usize, made_verified_progress: boo
 /// no-progress fuse cannot bound a turn that keeps making nominal progress, so
 /// this budget is what guarantees an in-bound honest terminal. Evaluation
 /// runners should set it below their own scenario safety wait.
-fn collaboration_wall_budget() -> std::time::Duration {
+pub(super) fn collaboration_wall_budget() -> std::time::Duration {
     std::env::var("COWD_COLLABORATION_BUDGET_SECS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())

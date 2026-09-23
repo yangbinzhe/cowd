@@ -1370,6 +1370,26 @@ where
                 }
                 state.terminal_notify.clone()
             };
+            // A required-Team turn must reach an in-bound honest terminal even
+            // while it only waits on child work: enforce the collaboration
+            // budget here, where the ingress owner already keeps the turn alive.
+            {
+                let mut state = state.lock().await;
+                let obligated = state
+                    .collaboration_obligation
+                    .as_ref()
+                    .is_some_and(|obligation| obligation.minimum_team_count > 0);
+                if obligated
+                    && !state.execution_role.is_delegated_leaf()
+                    && state.started_at.elapsed()
+                        >= collaboration_budget()
+                {
+                    state.failure = Some(
+                        "Execution blocked safely: bounded convergence reached the Agent-first collaboration budget with the required verified-Team minimum still unmet. The objective is only partially satisfied and unresolved work stays in the Program projection; Runtime stopped the turn instead of running unbounded.".to_string(),
+                    );
+                    break;
+                }
+            }
             let graph = services
                 .graph_state_store()
                 .load_async(&graph_id)
@@ -1390,7 +1410,11 @@ where
             if !has_program_barrier || !has_non_terminal_work {
                 break;
             }
-            notify.notified().await;
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                notify.notified(),
+            )
+            .await;
         }
         let mut state = state.lock().await;
         if let Some(error) = state.failure.take() {
@@ -1650,6 +1674,20 @@ where
         .unwrap_or_else(|_| panic!("turn executors must release the conversation runtime"))
         .into_inner();
     (runtime, result)
+}
+
+/// Objective-level wall-clock budget for a required-Team collaboration turn.
+/// Kept local to the ingress owner so the turn can always reach an in-bound
+/// honest terminal while it waits on child work.
+fn collaboration_budget() -> std::time::Duration {
+    std::env::var("COWD_COLLABORATION_BUDGET_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map_or_else(
+            || std::time::Duration::from_secs(1500),
+            std::time::Duration::from_secs,
+        )
 }
 
 const EVALUATION_TURN_CONTROL_PREFIX: &str = "COWD_EVAL_CONTROL ";

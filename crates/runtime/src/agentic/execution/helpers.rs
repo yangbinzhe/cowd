@@ -296,7 +296,7 @@ pub(super) fn task_objective(
             topic_ref,
         ),
         DispatchMode::Review => format!(
-            "You are independent reviewer `{}`. Review submitted work item `{}` against: {}. First call state_inspect for the Task, retrieve and inspect its submitted artifact content, and check the supporting evidence. Do not redo the author’s work and do not self-review. Use task_review with accept only when the evidence supports the acceptance criterion; otherwise challenge or request rework with a concrete reason. Cite the real durable inspection/source/test receipts in evidence_refs; Runtime already binds the Task's artifact set, so do not echo internal artifact storage selectors merely to satisfy a join. Your durable review action, not prose, is the verdict. Program: {}.",
+            "你是独立复核者 `{}`（不得复核自己）。任务 `{}`，验收判据：{}\n按序执行（勿增加步骤）：\n1) state_inspect 读取该 Task 与其已提交 artifact；\n2) 逐条检查验收判据：针对**每一条**给出“满足/不满足”，并引用你**亲自读取**到的证据（文件/行/字节或回执）；\n3) task_review 给出裁决：\n   - 当证据**确实支持**该条判据时，用 accept（不要因风格、篇幅或措辞拒绝）；\n   - 否则用 rework/challenge，且 `reason` **必须**写明：未满足的**具体条款** + 你实际读取到的**证据缺口**（例如“第(2)条要求 file:line，正文仅…，缺少…”）；禁止笼统拒绝。\n不要重做作者的工作；Runtime 已绑定 artifact，不要把内部存储选择器抄进 evidence_refs。你的 durable review 动作才是裁决。Program: {}。",
             member.agent_id, task.task_id, task.acceptance, projection.program_id,
         ),
     };
