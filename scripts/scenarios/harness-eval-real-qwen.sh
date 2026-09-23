@@ -196,7 +196,7 @@ resolve_installed_route() {
     echo "Qwen generation must use the qwen-tokenplan provider, got ${PROVIDER_ID}" >&2
     exit 2
   fi
-  if [[ "$model_lower" == deepseek* && "$provider_lower" != "deepseek" ]]; then
+  if [[ "$model_lower" == deepseek* && "$provider_lower" != "deepseek" && "$provider_lower" != "qwen-tokenplan" ]]; then
     echo "DeepSeek generation must use the configured deepseek provider, got ${PROVIDER_ID}" >&2
     exit 2
   fi
