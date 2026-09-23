@@ -192,7 +192,7 @@ resolve_installed_route() {
     echo "native Bailian generation is forbidden; Bailian is reserved for embedding only" >&2
     exit 2
   fi
-  if [[ "$model_lower" == qwen* && "$provider_lower" != "qwen-tokenplan" ]]; then
+  if [[ "$model_lower" == qwen* && "$provider_lower" != "qwen-tokenplan" && "$provider_lower" != "local-ninfer" ]]; then
     echo "Qwen generation must use the qwen-tokenplan provider, got ${PROVIDER_ID}" >&2
     exit 2
   fi
