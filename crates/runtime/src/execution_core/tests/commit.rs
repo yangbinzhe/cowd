@@ -98,6 +98,19 @@ fn readonly_effect() -> ToolEffectDescriptor {
     effect
 }
 
+/// Agent receipt request bound to the `order-graph`/`order-node`/attempt-7
+/// index stream used by the out-of-order recovery tests.
+fn request_with_parent(seq: u64, id: &str) -> crate::RuntimeToolExecutionRequest {
+    let mut request = request(id);
+    request.observation_wave_sequence = seq;
+    request.parent_execution = Some(harness_contract::execution_graph::ExecutionParentBinding {
+        execution_id: "order-graph".to_string(),
+        node_id: "order-node".to_string(),
+    });
+    request.parent_execution_attempt = Some(7);
+    request
+}
+
 fn agent_task_graph() -> ExecutionGraph {
     let packet = AgentTaskPacket {
         assignment: crate::test_support::agent_assignment(
@@ -345,6 +358,59 @@ fn delegated_agent_receipts_are_indexed_atomically_and_reload_without_scanning_e
     assert_eq!(recovered[0].sequence, request.observation_wave_sequence);
     assert_eq!(recovered[0].authorized_scopes, request.authorized_scopes);
     assert_eq!(recovered[0].outcome, outcome);
+}
+
+#[test]
+fn delegated_agent_receipts_reload_restores_causal_order_when_indexed_writes_are_out_of_sequence() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = ExecutionCommitService::new(Arc::clone(&store));
+    let later = {
+        let mut request = request_with_parent(2, "later");
+        request.authorized_scopes = vec!["read:src/late.rs".to_string()];
+        request
+    };
+    let earlier = {
+        let mut request = request_with_parent(1, "earlier");
+        request.authorized_scopes = vec!["read:src/early.rs".to_string()];
+        request
+    };
+    // Commit the higher causal sequence first so the index stream is
+    // appended in non-causal order; reload must restore causal order.
+    service
+        .commit_readonly_tool_receipts(&[(later.clone(), outcome("later", "later-durable"))])
+        .expect("commit higher-sequence receipt first");
+    service
+        .commit_readonly_tool_receipts(&[(earlier.clone(), outcome("earlier", "earlier-durable"))])
+        .expect("commit lower-sequence receipt second");
+
+    let recovered = service
+        .load_delegated_agent_tool_receipts("order-graph", "order-node", 7)
+        .expect("reload exact attempt receipts");
+    assert_eq!(recovered.len(), 2);
+    assert_eq!(recovered[0].sequence, 1);
+    assert_eq!(recovered[1].sequence, 2);
+    assert_eq!(recovered[0].outcome, outcome("earlier", "earlier-durable"));
+    assert_eq!(recovered[1].outcome, outcome("later", "later-durable"));
+}
+
+#[test]
+fn delegated_agent_receipts_reload_rejects_duplicate_causal_sequence() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = ExecutionCommitService::new(Arc::clone(&store));
+    let mut a = request_with_parent(1, "dup-a");
+    let mut b = request_with_parent(1, "dup-b");
+    service
+        .commit_readonly_tool_receipts(&[(a.clone(), outcome("dup-a", "a-durable"))])
+        .expect("commit first duplicate-sequence receipt");
+    service
+        .commit_readonly_tool_receipts(&[(b, outcome("dup-b", "b-durable"))])
+        .expect("commit second duplicate-sequence receipt");
+
+    assert!(matches!(
+        service.load_delegated_agent_tool_receipts("order-graph", "order-node", 7),
+        Err(ExecutionCommitError::InvalidCommand(message))
+            if message.contains("duplicate causal sequence")
+    ));
 }
 
 #[test]

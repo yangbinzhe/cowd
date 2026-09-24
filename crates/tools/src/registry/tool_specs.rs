@@ -113,7 +113,15 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "bash",
-            description: "Execute a shell command in the current workspace.",
+            description: "Execute a shell command in the current workspace. Prefer \
+                one-shot multi-step chains (&&, |, tee) over repeated single-step calls: each \
+                call is a separate turn of the budget. Output is budgeted: when stdout or stderr \
+                exceeds the budget, the visible text is a head+tail preview with an \
+                `[output truncated]` marker and the full output is persisted - the response \
+                includes `persistedOutputPath`; re-read the needed range via read_file instead \
+                of re-running the command. A truncated result is partial evidence; verify it \
+                before concluding. Prefer grep_search/read_file over bash grep/cat for \
+                file-content queries. Do not run interactive commands.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
