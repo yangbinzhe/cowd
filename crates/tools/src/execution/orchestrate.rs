@@ -53,6 +53,9 @@ enum StepKind {
         #[serde(default)]
         input: Value,
     },
+    Batch {
+        calls: Vec<BatchCall>,
+    },
     Map {
         over: String,
         tool: String,
@@ -98,6 +101,16 @@ enum StepKind {
         #[serde(default)]
         input: Value,
     },
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchCall {
+    #[serde(default)]
+    tool: String,
+    #[serde(default)]
+    input: Value,
+    #[serde(default, rename = "as")]
+    alias: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -189,6 +202,7 @@ pub(crate) fn run_orchestrate(lease: &ToolHostLease, input: &Value) -> Result<St
 fn step_descriptor(kind: &StepKind) -> (&'static str, Option<&str>) {
     match kind {
         StepKind::Call { tool, .. } => ("call", Some(tool)),
+        StepKind::Batch { .. } => ("batch", None),
         StepKind::Map { tool, .. } => ("map", Some(tool)),
         StepKind::Filter { .. } => ("filter", None),
         StepKind::Collect { .. } => ("collect", None),
@@ -263,6 +277,9 @@ pub fn requested_sub_call_tools(tool_name: &str, input: &Value) -> SubCallAuthor
             | StepKind::Map { tool, .. }
             | StepKind::When { tool, .. }
             | StepKind::Repeat { tool, .. } => names.push(tool.clone()),
+            StepKind::Batch { calls } => {
+                names.extend(calls.iter().map(|call| call.tool.clone()));
+            }
             StepKind::Compute { .. } => names.push("execute_code".to_string()),
             StepKind::Filter { .. } | StepKind::Collect { .. } => {}
         }
@@ -287,6 +304,48 @@ fn evaluate(
         StepKind::Call { tool, input } => {
             let resolved = resolve_value(input, state, None)?;
             call_tool(lease, tool, &resolved, total_calls)
+        }
+        StepKind::Batch { calls } => {
+            if calls.len() > MAX_MAP_ITEMS {
+                return Err(format!(
+                    "batch has {} calls, over the limit of {MAX_MAP_ITEMS}",
+                    calls.len()
+                ));
+            }
+            if *total_calls + calls.len() > MAX_TOTAL_CALLS {
+                return Err(format!(
+                    "tool_orchestrate exceeded the total sub-call limit of {MAX_TOTAL_CALLS}"
+                ));
+            }
+            let mut prepared = Vec::with_capacity(calls.len());
+            for call in calls {
+                prepared.push((
+                    call.alias.clone(),
+                    call.tool.clone(),
+                    resolve_value(&call.input, state, None)?,
+                ));
+            }
+            let items = prepared.clone();
+            let results = crate::executor::run_ordered_batch(prepared, None, |call| {
+                call_tool_uncounted(lease, &call.1, &call.2)
+            });
+            *total_calls += items.len();
+            let mut object = Map::new();
+            for (index, result) in results.into_iter().enumerate() {
+                let (alias, tool, _) = &items[index];
+                let key = alias.clone().unwrap_or_else(|| format!("{tool}[{index}]"));
+                match result.output {
+                    Some(value) => {
+                        object.insert(key, value);
+                    }
+                    None => {
+                        return Err(result
+                            .error
+                            .unwrap_or_else(|| format!("batch call `{tool}` failed")))
+                    }
+                }
+            }
+            Ok(Value::Object(object))
         }
         StepKind::Map {
             over,
@@ -728,13 +787,21 @@ mod tests {
                 {"id": "g", "op": "call", "tool": "glob_search", "input": {}},
                 {"id": "r", "op": "map", "over": "$g.filenames", "tool": "read_file", "input": {}},
                 {"id": "c", "op": "compute", "language": "python", "code": "print(1)", "input": []},
+                {"id": "b", "op": "batch", "calls": [{"tool": "tool_cache_stats", "input": {}}, {"tool": "workspace_snapshot", "input": {}}]},
                 {"id": "w", "op": "when", "if": {"ref": "$x", "present": true}, "tool": "grep_search", "input": {}}
             ]
         });
         match requested_sub_call_tools("tool_orchestrate", &input) {
             SubCallAuthorization::Requires(names) => assert_eq!(
                 names,
-                vec!["execute_code", "glob_search", "grep_search", "read_file"]
+                vec![
+                    "execute_code",
+                    "glob_search",
+                    "grep_search",
+                    "read_file",
+                    "tool_cache_stats",
+                    "workspace_snapshot"
+                ]
             ),
             other => panic!("unexpected: {other:?}"),
         }

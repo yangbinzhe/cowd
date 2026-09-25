@@ -165,6 +165,8 @@ fn capability_mapping(capability: &str) -> CapabilityMapping {
                 "grep_many",
                 "glob_search",
                 "glob_many",
+                "ast_grep_search",
+                "lsp",
                 "tool_search",
                 "context_retrieve",
             ],
@@ -339,6 +341,8 @@ mod tests {
         assert!(resolved.allowed_tools.contains("grep_many"));
         assert!(resolved.allowed_tools.contains("glob_search"));
         assert!(resolved.allowed_tools.contains("glob_many"));
+        assert!(resolved.allowed_tools.contains("ast_grep_search"));
+        assert!(resolved.allowed_tools.contains("lsp"));
         assert!(resolved.allowed_tools.contains("tool_search"));
         assert!(resolved.allowed_tools.contains("context_retrieve"));
         assert!(!resolved.allowed_tools.contains("task_claim"));

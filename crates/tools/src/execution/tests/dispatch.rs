@@ -1990,6 +1990,40 @@ fn tool_orchestrate_can_write_and_then_read_in_one_call() {
 }
 
 #[test]
+fn tool_orchestrate_runs_a_parallel_batch() {
+    let root = temp_path("tool-orchestrate-batch");
+    fs::create_dir_all(&root).expect("workspace");
+    fs::write(root.join("a.txt"), "alpha\n").expect("write a");
+    fs::write(root.join("b.txt"), "beta\n").expect("write b");
+
+    let output = execute_in_workspace(
+        &root,
+        "tool_orchestrate",
+        &json!({
+            "steps": [
+                {"id": "b", "op": "batch", "calls": [
+                    {"as": "a", "tool": "read_file", "input": {"path": "a.txt"}},
+                    {"as": "b2", "tool": "read_file", "input": {"path": "b.txt"}}
+                ]}
+            ],
+            "return": "$b"
+        }),
+    )
+    .expect("batch should succeed");
+    let parsed: serde_json::Value = serde_json::from_str(&output).expect("json");
+    assert!(parsed["result"]["a"]["file"]["content"]
+        .as_str()
+        .unwrap()
+        .contains("alpha"));
+    assert!(parsed["result"]["b2"]["file"]["content"]
+        .as_str()
+        .unwrap()
+        .contains("beta"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn tool_orchestrate_compute_runs_data_through_the_sandbox() {
     let root = temp_path("tool-orchestrate-compute");
     fs::create_dir_all(&root).expect("workspace");

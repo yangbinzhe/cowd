@@ -499,16 +499,29 @@ impl ScopedRuntimeToolExecutor {
             && !outcome.observed_evidence.is_empty()
         {
             let output = outcome.output.as_deref().unwrap_or_default();
+            // Composable orchestration outputs carry a `calls` trace. Bind its
+            // canonical hash into the evidence resource id so the sub-call set
+            // is independently identified, not just embedded in the blob.
+            let sub_calls_suffix = serde_json::from_str::<serde_json::Value>(output)
+                .ok()
+                .and_then(|value| value.get("calls").cloned())
+                .map(|calls| {
+                    format!(
+                        ":sub-calls:{:x}",
+                        Sha256::digest(calls.to_string().as_bytes())
+                    )
+                })
+                .unwrap_or_default();
             let access = harness_contract::context::EvidenceAccessRef::durable(
                 harness_contract::context::EvidenceRef::observed(
                     "delegated_agent_read_receipt",
-                    format!("{}:read-receipt", request.idempotency_key),
+                    format!("{}:read-receipt{sub_calls_suffix}", request.idempotency_key),
                 ),
                 format!("sha256:{:x}", Sha256::digest(output.as_bytes())),
                 u64::try_from(output.len().max(1)).unwrap_or(u64::MAX),
                 "application/vnd.cowd.tool-receipt+json",
                 format!(
-                    "event://execution-effect/{}/{}:read-receipt",
+                    "event://execution-effect/{}/{}:read-receipt{sub_calls_suffix}",
                     request.idempotency_key, request.idempotency_key
                 ),
                 format!("session:{}", self.session_id),
