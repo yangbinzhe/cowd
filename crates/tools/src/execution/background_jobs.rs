@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::bash::CapturedStream;
 
@@ -50,6 +50,17 @@ struct Job {
 fn registry() -> &'static Mutex<HashMap<(String, String), Arc<Job>>> {
     static JOBS: OnceLock<Mutex<HashMap<(String, String), Arc<Job>>>> = OnceLock::new();
     JOBS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static LEDGER_DIR_OVERRIDE: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_ledger_dir(dir: Option<std::path::PathBuf>) {
+    LEDGER_DIR_OVERRIDE.with(|slot| *slot.borrow_mut() = dir);
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -95,24 +106,45 @@ pub(crate) fn start_background_job(
         std::thread::spawn(move || drain(stream, capture));
     }
 
+    let started_at_ms = now_ms();
     let job = Arc::new(Job {
         job_id: job_id.clone(),
         pid,
-        command,
+        command: command.clone(),
         cwd,
-        started_at_ms: now_ms(),
+        started_at_ms,
         stdout,
         stderr,
         state: Arc::clone(&state),
         notified: AtomicBool::new(false),
     });
+    let ledger = ledger_dir();
+    if let Some(dir) = ledger.as_deref() {
+        write_ledger_in(dir, &job_id, pid, started_at_ms, &command, None);
+    }
 
+    let ledger_job_id = job_id.clone();
+    let ledger_command = command.clone();
     std::thread::spawn(move || {
         let status = child.wait();
-        let mut guard = lock(&state);
-        guard.finished = true;
-        guard.exit_code = status.ok().and_then(|status| status.code());
-        guard.finished_at_ms = Some(now_ms());
+        let exit_code = status.ok().and_then(|status| status.code());
+        let finished_at_ms = now_ms();
+        {
+            let mut guard = lock(&state);
+            guard.finished = true;
+            guard.exit_code = exit_code;
+            guard.finished_at_ms = Some(finished_at_ms);
+        }
+        if let Some(dir) = ledger.as_deref() {
+            write_ledger_in(
+                dir,
+                &ledger_job_id,
+                pid,
+                started_at_ms,
+                &ledger_command,
+                Some((exit_code, finished_at_ms)),
+            );
+        }
     });
 
     lock(registry()).insert((workspace_key(workspace_root), job_id.clone()), job);
@@ -211,6 +243,120 @@ fn kill_process_group(pid: u32) -> bool {
         let _ = pid;
         false
     }
+}
+
+/// Durable pid ledger directory (survives process restart).
+fn ledger_dir() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    if let Some(dir) = LEDGER_DIR_OVERRIDE.with(|slot| slot.borrow().clone()) {
+        std::fs::create_dir_all(&dir).ok()?;
+        return Some(dir);
+    }
+    let base = std::env::var_os("COWD_BASH_ARTIFACT_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+                .join(".cowd")
+                .join("storage")
+                .join("bash-artifacts")
+        })
+        .join("bg-jobs");
+    std::fs::create_dir_all(&base).ok()?;
+    Some(base)
+}
+
+fn write_ledger_in(
+    dir: &Path,
+    job_id: &str,
+    pid: u32,
+    started_at_ms: u64,
+    command: &str,
+    terminal: Option<(Option<i32>, u64)>,
+) {
+    let value = json!({
+        "jobId": job_id,
+        "pid": pid,
+        // process_group(0) makes the child its own group leader, so pgid == pid.
+        "pgid": pid,
+        "startedAtMs": started_at_ms,
+        "command": command,
+        "finishedAtMs": terminal.map(|(_, at)| at),
+        "exitCode": terminal.and_then(|(code, _)| code),
+    });
+    let _ = std::fs::write(dir.join(format!("{job_id}.json")), value.to_string());
+}
+
+/// Outcome of a startup reconciliation pass.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReconcileReport {
+    pub examined: usize,
+    pub reaped: usize,
+    pub marked_finished: usize,
+}
+
+fn process_group_alive(pgid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", "--", &format!("-{pgid}")])
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pgid;
+        false
+    }
+}
+
+/// Startup reconciliation (J2). Call once, before this process spawns any job:
+/// every ledger entry is therefore owned by a previous process, so a still-live
+/// process group is an orphan and is reaped; a dead one is marked terminal.
+/// Idempotent.
+pub fn reconcile_background_jobs() -> ReconcileReport {
+    let mut report = ReconcileReport::default();
+    let Some(dir) = ledger_dir() else {
+        return report;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return report;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension() != Some(std::ffi::OsStr::new("json")) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        report.examined += 1;
+        if value
+            .get("finishedAtMs")
+            .is_some_and(|finished| !finished.is_null())
+        {
+            continue;
+        }
+        let Some(pgid) = value.get("pgid").and_then(Value::as_u64).map(|v| v as u32) else {
+            continue;
+        };
+        if process_group_alive(pgid) {
+            kill_process_group(pgid);
+            report.reaped += 1;
+        } else {
+            report.marked_finished += 1;
+        }
+        if let Some(object) = value.as_object_mut() {
+            object.insert("finishedAtMs".to_string(), json!(now_ms()));
+            object.insert("reconciled".to_string(), json!(true));
+        }
+        let _ = std::fs::write(&path, value.to_string());
+    }
+    report
 }
 
 /// One completed job the runtime should surface to the next model turn.
@@ -331,5 +477,71 @@ mod tests {
         let root = std::env::temp_dir();
         assert!(job_status(&root, "bg-nope", None).is_err());
         assert!(kill_job(&root, "bg-nope").is_err());
+    }
+
+    #[test]
+    fn ledger_records_terminal_state() {
+        let dir = std::env::temp_dir().join(format!("bg-ledger-{}", now_ms()));
+        let jobs = dir.join("bg-jobs");
+        std::fs::create_dir_all(&jobs).unwrap();
+        set_ledger_dir(Some(jobs.clone()));
+        let root = std::env::temp_dir();
+        let command = "echo ledger-check";
+        let job_id =
+            start_background_job(spawn(command), command.to_string(), "/tmp".into(), &root);
+        let _ = wait_until_finished(&root, &job_id);
+        let ledger = jobs.join(format!("{job_id}.json"));
+        let mut finished = false;
+        for _ in 0..200 {
+            if let Ok(text) = std::fs::read_to_string(&ledger) {
+                if serde_json::from_str::<Value>(&text)
+                    .map(|value| value["finishedAtMs"].is_number())
+                    .unwrap_or(false)
+                {
+                    finished = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(finished, "ledger must record the terminal state");
+        set_ledger_dir(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reconcile_marks_dead_and_leaves_finished() {
+        let dir = std::env::temp_dir().join(format!("bg-reconcile-{}", now_ms()));
+        let jobs = dir.join("bg-jobs");
+        std::fs::create_dir_all(&jobs).unwrap();
+        set_ledger_dir(Some(jobs.clone()));
+        std::fs::write(
+            jobs.join("bg-dead.json"),
+            json!({"jobId":"bg-dead","pid":4000000,"pgid":4000000,"startedAtMs":1,"command":"x"})
+                .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            jobs.join("bg-done.json"),
+            json!({"jobId":"bg-done","pid":1,"pgid":1,"startedAtMs":1,"command":"x","finishedAtMs":2})
+                .to_string(),
+        )
+        .unwrap();
+
+        let report = reconcile_background_jobs();
+        assert_eq!(report.examined, 2);
+        assert_eq!(report.marked_finished, 1);
+        assert_eq!(report.reaped, 0);
+        let dead: Value =
+            serde_json::from_str(&std::fs::read_to_string(jobs.join("bg-dead.json")).unwrap())
+                .unwrap();
+        assert_eq!(dead["reconciled"], json!(true));
+        let done: Value =
+            serde_json::from_str(&std::fs::read_to_string(jobs.join("bg-done.json")).unwrap())
+                .unwrap();
+        assert_eq!(done["finishedAtMs"], json!(2));
+
+        set_ledger_dir(None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

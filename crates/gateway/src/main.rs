@@ -733,6 +733,17 @@ fn json_value_to_serde(v: &runtime::JsonValue) -> serde_json::Value {
 }
 
 pub fn backend_entry() {
+    // Startup reconciliation (S-03/J2): this is the single job host, so before
+    // it spawns any background job, reap process groups left behind by a
+    // previous Cowd host. A concurrent second host sharing the same HOME is not
+    // supported (single-owner assumption, 0812 §17.2 S4).
+    let report = tools::background_jobs::reconcile_background_jobs();
+    if report.reaped > 0 || report.marked_finished > 0 {
+        eprintln!(
+            "cowd: reconciled background jobs at startup (reaped={}, marked_finished={}, examined={})",
+            report.reaped, report.marked_finished, report.examined
+        );
+    }
     exit_on_error(run_backend_entry())
 }
 

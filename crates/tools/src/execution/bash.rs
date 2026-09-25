@@ -328,7 +328,8 @@ fn start_background_bash(
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // Own process group so the whole tree can be killed on cancel.
+        // Own process group so the whole tree can be killed on cancel (and so
+        // startup reconciliation can find/reap orphans by process group).
         command.process_group(0);
     }
     let child = command.spawn()?;
