@@ -882,7 +882,7 @@ impl LiveScenarioRunner {
             },
             LiveScenarioSpec {
                 id: "live_single_architecture_baseline",
-                prompt: "请单独完成一次复杂架构审查，不要启动团队：分别分析 runtime、memory、gateway 的职责边界、各自的 canonical state 或事件真相、一个潜在风险，并给出至少三个完整的 `crates/.../*.rs` 源码路径作为证据。只陈述本次实际读取到源码所能验证的结论；不要加入“无法确认/无法判断/未确认/需要进一步检查”之类的保留项。只能使用 read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot 这些只读工具，不要调用 bash 或任何写工具。",
+                prompt: "请单独完成一次复杂架构审查，不要启动团队。【强制第一步】必须先调用 read_file 逐个读取至少 3 个真实源码文件的内容（分别来自 crates/runtime/...、crates/memory/...、crates/gateway/...）；在成功读取至少 3 个源码文件内容之前，不要给出任何结论——仅枚举文件路径不算，必须真正读到文件内容。【第二步】基于你实际读到的源码内容，分别分析 runtime、memory、gateway 的职责边界、各自的 canonical state 或事件真相、一个潜在风险，并在结论里引用你实际读过的文件路径。只陈述本次实际读取到源码所能验证的结论；不要加入“无法确认/无法判断/未确认/需要进一步检查”之类的保留项。只能使用 read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot 这些只读工具，不要调用 bash 或任何写工具。",
                 acceptance: LiveAcceptance::ArchitectureQuality {
                     minimum_teams: 0,
                     minimum_claimed_cross_team_edges: 0,
