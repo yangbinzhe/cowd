@@ -1614,10 +1614,18 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
             Value::Array(tools.iter().map(openai_tool_definition).collect::<Vec<_>>());
     }
     if let Some(tool_choice) = &request.tool_choice {
-        if !ProviderCapabilityProfile::explicit_tool_choice_known_unsupported(
-            &request.model,
-            request.reasoning_effort.as_deref(),
-        ) {
+        // `tool_choice` is only valid when at least one tool schema is present;
+        // sending `required` (or a named tool) with an empty `tools` array is a
+        // 400 on strict OpenAI-compatible servers and stalls Agent execution.
+        if request
+            .tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty())
+            && !ProviderCapabilityProfile::explicit_tool_choice_known_unsupported(
+                &request.model,
+                request.reasoning_effort.as_deref(),
+            )
+        {
             payload["tool_choice"] = openai_tool_choice(tool_choice);
         }
     }
@@ -1698,10 +1706,15 @@ fn build_responses_request(request: &MessageRequest) -> Value {
         );
     }
     if let Some(tool_choice) = &request.tool_choice {
-        if !ProviderCapabilityProfile::explicit_tool_choice_known_unsupported(
-            &request.model,
-            request.reasoning_effort.as_deref(),
-        ) {
+        if request
+            .tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty())
+            && !ProviderCapabilityProfile::explicit_tool_choice_known_unsupported(
+                &request.model,
+                request.reasoning_effort.as_deref(),
+            )
+        {
             payload["tool_choice"] = responses_tool_choice(tool_choice);
         }
     }
@@ -3698,6 +3711,26 @@ mod tests {
             );
             assert!(payload.get("tools").is_some());
         }
+    }
+
+    #[test]
+    fn wire_omits_tool_choice_when_no_tools_are_present() {
+        // Regression: empty `tools` + `tool_choice=required` is a 400 on strict
+        // OpenAI-compatible servers and stalled Agent execution.
+        let request = MessageRequest {
+            model: "qwen3.8-27b".to_string(),
+            max_tokens: 64,
+            messages: vec![InputMessage::user_text("inspect")],
+            tools: Some(Vec::new()),
+            tool_choice: Some(ToolChoice::Any),
+            ..Default::default()
+        };
+        assert!(
+            build_chat_completion_request(&request, OpenAiCompatConfig::openai())
+                .get("tool_choice")
+                .is_none()
+        );
+        assert!(build_responses_request(&request).get("tool_choice").is_none());
     }
 
     #[test]
