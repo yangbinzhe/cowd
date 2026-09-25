@@ -175,11 +175,23 @@ fn capability_mapping(capability: &str) -> CapabilityMapping {
             required_mode: PermissionMode::ReadOnly,
         },
         "write" => CapabilityMapping {
-            tools: &["write_file", "edit_file", "apply_patch_transaction", "bash"],
+            tools: &[
+                "write_file",
+                "edit_file",
+                "apply_patch_transaction",
+                "bash",
+                "tool_orchestrate",
+            ],
             required_mode: PermissionMode::WorkspaceWrite,
         },
         "test" | "status" | "logs" => CapabilityMapping {
-            tools: &["bash", "execute_code", "read_file", "grep_search"],
+            tools: &[
+                "bash",
+                "execute_code",
+                "read_file",
+                "grep_search",
+                "tool_orchestrate",
+            ],
             required_mode: PermissionMode::WorkspaceWrite,
         },
         "rollback" => CapabilityMapping {

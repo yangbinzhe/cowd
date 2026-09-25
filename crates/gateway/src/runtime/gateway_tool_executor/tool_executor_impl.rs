@@ -161,14 +161,19 @@ impl ToolExecutor for GatewayToolExecutor {
     fn classify_tool_safety(
         &self,
         tool_name: &str,
-        _input: &str,
+        input: &str,
     ) -> Option<runtime::ToolSafetyCategory> {
-        self.tool_permission_mode(tool_name)
-            .map(|permission| match permission {
-                ToolPermissionMode::ReadOnly => runtime::ToolSafetyCategory::ReadOnly,
-                ToolPermissionMode::WorkspaceWrite => runtime::ToolSafetyCategory::WriteLocal,
-                ToolPermissionMode::DangerFullAccess => runtime::ToolSafetyCategory::Destructive,
-            })
+        // Derive from the input-sensitive effect descriptor so a composable tool
+        // (e.g. `tool_orchestrate`) escalates with its sub-calls, matching the
+        // delegated-agent executor instead of the static catalog mode.
+        let canonical = self.resolve_tool_name(tool_name)?;
+        let value: serde_json::Value =
+            serde_json::from_str(input).unwrap_or(serde_json::Value::Null);
+        let effect = self
+            .tool_host
+            .pin_snapshot()
+            .describe_effect(&canonical, &value);
+        Some(runtime::ToolSafetyCategory::from_effect(&effect))
     }
 
     fn collaboration_runtime_available(&self) -> bool {
