@@ -973,8 +973,12 @@ fn bash_tool_reports_success_exit_failure_timeout_and_background() {
             "bash",
             &json!({ "command": "sleep 1", "cwd": cwd, "run_in_background": true, "dangerouslyDisableSandbox": true, "workspaceAccess": "read_write" }),
         )
-        .expect_err("PID-only background execution is not a model capability (S-03)");
-    assert!(background.contains("S-03"));
+        .expect("background execution is a model capability");
+    let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
+    assert!(background_output["backgroundTaskId"]
+        .as_str()
+        .is_some_and(|id| id.starts_with("bg-")));
+    assert_eq!(background_output["backgroundedByUser"], true);
     let _ = fs::remove_dir_all(root);
 }
 

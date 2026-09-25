@@ -547,6 +547,8 @@ pub(crate) use executor::*;
 #[path = "host.rs"]
 pub mod host;
 pub use host::{ToolHost, ToolHostError, ToolHostLease, ToolHostSnapshot};
+#[path = "execution/background_jobs.rs"]
+pub mod background_jobs;
 #[path = "execution/bash.rs"]
 pub mod bash;
 #[path = "state/checkpoint.rs"]

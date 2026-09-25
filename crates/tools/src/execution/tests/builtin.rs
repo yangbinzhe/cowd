@@ -372,7 +372,11 @@ printf 'pwsh:%s' "$1"
         "power_shell",
         &json!({"command": "Write-Output hello", "run_in_background": true}),
     )
-    .expect_err("PID-only background execution is not a model capability (S-03)");
+    .expect("background powershell execution is a model capability");
+    let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
+    assert!(background_output["backgroundTaskId"]
+        .as_str()
+        .is_some_and(|id| id.starts_with("bg-")));
 
     std::env::set_var("PATH", original_path);
     let _ = std::fs::remove_dir_all(dir);
@@ -380,7 +384,6 @@ printf 'pwsh:%s' "$1"
     let output: serde_json::Value = serde_json::from_str(&result).expect("json");
     assert_eq!(output["stdout"], "pwsh:Write-Output hello");
     assert!(output["stderr"].as_str().expect("stderr").is_empty());
-    assert!(background.contains("S-03"));
 }
 
 #[test]

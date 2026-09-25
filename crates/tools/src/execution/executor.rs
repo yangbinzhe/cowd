@@ -76,6 +76,30 @@ fn run_bash(lease: &ToolHostLease, input: BashCommandInput) -> Result<String, St
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BackgroundTaskStatusInput {
+    job_id: String,
+    #[serde(default)]
+    tail: Option<usize>,
+}
+
+fn run_background_task_status(lease: &ToolHostLease, input: &Value) -> Result<String, String> {
+    let parsed: BackgroundTaskStatusInput = from_value(input)?;
+    crate::background_jobs::job_status(lease.workspace_root(), &parsed.job_id, parsed.tail)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BackgroundTaskKillInput {
+    job_id: String,
+}
+
+fn run_background_task_kill(lease: &ToolHostLease, input: &Value) -> Result<String, String> {
+    let parsed: BackgroundTaskKillInput = from_value(input)?;
+    crate::background_jobs::kill_job(lease.workspace_root(), &parsed.job_id)
+}
+
+#[derive(Debug, Deserialize)]
 struct AstGrepSearchInput {
     pattern: String,
     language: String,

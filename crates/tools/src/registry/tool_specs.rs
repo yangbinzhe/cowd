@@ -44,6 +44,7 @@ pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
         | "question"
         | "ask_user_question"
         | "tool_search"
+        | "background_task_status"
         | "structured_output"
         | "current_time"
         | "get_context_remaining"
@@ -57,6 +58,7 @@ pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
         | "checkpoint_restore"
         | "notebook_edit"
         | "todo_write"
+        | "background_task_kill"
         | "config"
         | "enter_plan_mode"
         | "exit_plan_mode" => "builtin.workspace_write",
@@ -126,8 +128,10 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 visible text is a head+tail preview with an `[output truncated]` marker and the \
                 full output is persisted - the response includes `persistedOutputPath`; re-read \
                 the needed range via read_file instead of re-running the command. A truncated \
-                result is partial evidence; verify it before concluding. Do not run interactive \
-                commands.",
+                result is partial evidence; verify it before concluding. For long-running work, set \
+                run_in_background=true to detach and return a job id; query it with \
+                background_task_status and cancel it with background_task_kill. Do not run \
+                interactive commands.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -140,6 +144,11 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                         "description": "Wall-clock timeout in milliseconds (default: no tool-level timeout; maximum: 300000)."
                     },
                     "description": { "type": "string" },
+                    "run_in_background": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Run detached and return a job id instead of waiting; query it with background_task_status and cancel it with background_task_kill."
+                    },
                     "env": {
                         "type": "object",
                         "properties": {
@@ -174,6 +183,37 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "background_task_status",
+            description: "Inspect a background bash job started with \
+                run_in_background: its command, running/finished state, exit code, elapsed time, \
+                byte counts, persistedOutputPath, and a head+tail preview. Set `tail` to return \
+                only the last N bytes (incremental tailing) instead of the full preview.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "jobId": { "type": "string" },
+                    "tail": { "type": "integer", "minimum": 1, "maximum": 65536 }
+                },
+                "required": ["jobId"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "background_task_kill",
+            description: "Cancel a background bash job started with run_in_background by killing \
+                its process group. The terminal state is recorded and surfaced on the next turn.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "jobId": { "type": "string" }
+                },
+                "required": ["jobId"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
         },
         ToolSpec {
             name: "read_file",

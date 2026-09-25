@@ -399,6 +399,20 @@ where
                 let Ok(runtime) = runtime_receiver.await else {
                     return;
                 };
+                // S-03/A2: surface completed background bash jobs to the next
+                // model turn as runtime-owned, tool-authority context.
+                for completion in
+                    tools::background_jobs::take_completions(services.workspace_root())
+                {
+                    let mut item = crate::ContextItem::new(
+                        format!("background-job:{}", completion.job_id),
+                        crate::ContextSourceKind::ToolTrace,
+                        crate::ContextRole::TaskState,
+                        completion.summary,
+                    );
+                    item.authority = crate::ContextAuthority::Tool;
+                    runtime.push_next_model_context_item(item);
+                }
                 let (runtime, result) = match ingress {
                     Some((ingress, execution_id)) => {
                         // Scope every provider/tool/approval event to the

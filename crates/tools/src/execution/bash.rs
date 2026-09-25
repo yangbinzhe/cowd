@@ -251,20 +251,7 @@ pub fn execute_bash_in_workspace(
     let workspace_root = workspace_root.as_ref().canonicalize()?;
     let cwd = resolve_cwd(input.cwd.as_deref(), &workspace_root)?;
     if input.run_in_background.unwrap_or(false) {
-        let mut prepared = prepare_command(&input, &workspace_root, &cwd, false)?;
-        let child = prepared
-            .command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-        return Ok(BashCommandOutput {
-            background_task_id: Some(child.id().to_string()),
-            backgrounded_by_user: Some(true),
-            assistant_auto_backgrounded: Some(false),
-            sandbox_status: Some(prepared.sandbox_status),
-            ..BashCommandOutput::blank(&input, false, None)
-        });
+        return start_background_bash(&input, &workspace_root, &cwd);
     }
     execute_bash_sync(input, workspace_root, cwd)
 }
@@ -298,12 +285,6 @@ pub fn reject_model_escalation_fields(input: &BashCommandInput) -> Result<(), St
             );
         }
     }
-    if input.run_in_background.unwrap_or(false) {
-        return Err(
-            "bash run_in_background is not exposed as a model capability until durable lifecycle management lands (S-03)"
-                .to_string(),
-        );
-    }
     Ok(())
 }
 
@@ -328,6 +309,46 @@ fn resolve_cwd(cwd: Option<&str>, workspace_root: &Path) -> io::Result<PathBuf> 
         }
         None => Ok(workspace_root.to_path_buf()),
     }
+}
+
+/// Spawn a background bash job with piped output, register it in the
+/// process-local job registry, and return a handle the model can query or kill.
+fn start_background_bash(
+    input: &BashCommandInput,
+    workspace_root: &Path,
+    cwd: &Path,
+) -> io::Result<BashCommandOutput> {
+    let mut prepared = prepare_command(input, workspace_root, cwd, false)?;
+    let sandbox_status = prepared.sandbox_status;
+    let mut command = prepared.command;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Own process group so the whole tree can be killed on cancel.
+        command.process_group(0);
+    }
+    let child = command.spawn()?;
+    let job_id = crate::background_jobs::start_background_job(
+        child,
+        input.command.clone(),
+        cwd.to_string_lossy().into_owned(),
+        workspace_root,
+    );
+    Ok(BashCommandOutput {
+        stdout: format!(
+            "Started background job {job_id}. Query it with background_task_status; cancel it with background_task_kill."
+        ),
+        stderr: String::new(),
+        background_task_id: Some(job_id),
+        backgrounded_by_user: Some(true),
+        assistant_auto_backgrounded: Some(false),
+        sandbox_status: Some(sandbox_status),
+        ..BashCommandOutput::blank(input, false, None)
+    })
 }
 
 fn execute_bash_sync(
@@ -403,20 +424,7 @@ pub async fn execute_bash_async_in_workspace(
     let workspace_root = workspace_root.as_ref().canonicalize()?;
     let cwd = resolve_cwd(input.cwd.as_deref(), &workspace_root)?;
     if input.run_in_background.unwrap_or(false) {
-        let mut prepared = prepare_command(&input, &workspace_root, &cwd, false)?;
-        let child = prepared
-            .command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-        return Ok(BashCommandOutput {
-            background_task_id: Some(child.id().to_string()),
-            backgrounded_by_user: Some(true),
-            assistant_auto_backgrounded: Some(false),
-            sandbox_status: Some(prepared.sandbox_status),
-            ..BashCommandOutput::blank(&input, false, None)
-        });
+        return start_background_bash(&input, &workspace_root, &cwd);
     }
 
     let prepared = prepare_command(&input, &workspace_root, &cwd, false)?;
@@ -557,7 +565,7 @@ impl BashProgressState {
     }
 }
 
-struct CapturedStream {
+pub(crate) struct CapturedStream {
     head_limit: usize,
     tail_limit: usize,
     persist_threshold: u64,
@@ -570,7 +578,7 @@ struct CapturedStream {
 }
 
 impl CapturedStream {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             head_limit: effective_head_bytes(),
             tail_limit: effective_tail_bytes(),
@@ -584,7 +592,7 @@ impl CapturedStream {
         }
     }
 
-    fn push(&mut self, chunk: &[u8]) {
+    pub(crate) fn push(&mut self, chunk: &[u8]) {
         if chunk.is_empty() {
             return;
         }
@@ -641,6 +649,38 @@ impl CapturedStream {
             rendered.extend_from_slice(&self.tail);
         }
         (rendered, path, artifact_bytes, self.truncated)
+    }
+
+    pub(crate) fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
+    pub(crate) fn is_truncated(&self) -> bool {
+        self.truncated
+    }
+
+    pub(crate) fn artifact_path(&self) -> Option<&Path> {
+        self.artifact.as_ref().map(|(path, _)| path.as_path())
+    }
+
+    /// Last `limit` bytes of the rolling tail window (live output for a running
+    /// job). Used by `background_task_status` for incremental tailing.
+    pub(crate) fn tail_string(&self, limit: usize) -> String {
+        let start = self.tail.len().saturating_sub(limit);
+        String::from_utf8_lossy(&self.tail[start..]).into_owned()
+    }
+
+    /// Head+tail preview, mirroring `finish`'s rendering without consuming.
+    pub(crate) fn preview(&self) -> String {
+        let mut rendered = self.head.clone();
+        if self.truncated {
+            if !rendered.is_empty() && !rendered.ends_with(b"\n") {
+                rendered.push(b'\n');
+            }
+            rendered.extend_from_slice(b"\n[output truncated]\n");
+            rendered.extend_from_slice(&self.tail);
+        }
+        String::from_utf8_lossy(&rendered).into_owned()
     }
 }
 
@@ -1125,9 +1165,8 @@ mod tests {
 
         let mut background = base.clone();
         background.run_in_background = Some(true);
-        assert!(reject_model_escalation_fields(&background)
-            .expect_err("run_in_background must be rejected")
-            .contains("S-03"));
+        // background execution is a first-class model capability now (S-03).
+        assert!(reject_model_escalation_fields(&background).is_ok());
     }
 
     #[test]
