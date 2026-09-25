@@ -159,10 +159,12 @@ impl ProviderResourceConfig {
 
     #[must_use]
     pub fn policy_for_model(&self, model: &str) -> ProviderQuotaPolicy {
-        self.models
-            .get(model)
-            .map(|policy| policy.quota)
-            .unwrap_or_else(|| default_model_policy(model, self.fallback))
+        clamp_provider_concurrency(
+            self.models
+                .get(model)
+                .map(|policy| policy.quota)
+                .unwrap_or_else(|| default_model_policy(model, self.fallback)),
+        )
     }
 
     #[must_use]
@@ -184,10 +186,12 @@ impl ProviderResourceConfig {
 
     #[must_use]
     pub fn account_policy(&self, account: &str) -> ProviderQuotaPolicy {
-        self.accounts
-            .get(account)
-            .map(|policy| policy.quota)
-            .unwrap_or(self.global)
+        clamp_provider_concurrency(
+            self.accounts
+                .get(account)
+                .map(|policy| policy.quota)
+                .unwrap_or(self.global),
+        )
     }
 
     #[must_use]
@@ -251,6 +255,34 @@ impl ProviderResourceConfig {
 pub struct ProviderResourceGeneration {
     pub quotas: Vec<(ExecutionResourceKind, ResourceQuota)>,
     pub reserves: Vec<(ExecutionResourceKind, usize)>,
+}
+
+/// Operator override for the provider request-concurrency ceiling
+/// (`COWD_PROVIDER_MAX_CONCURRENCY`). Lets a low-concurrency local model be
+/// driven without the server rejecting requests that wait for admission. The
+/// interactive reserve is lowered to one so the ceiling can reach the
+/// validation floor; a value that would fail validation is ignored (fail-safe).
+fn clamp_provider_concurrency(policy: ProviderQuotaPolicy) -> ProviderQuotaPolicy {
+    let Some(maximum) = std::env::var("COWD_PROVIDER_MAX_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|maximum| *maximum < policy.maximum)
+    else {
+        return policy;
+    };
+    let minimum = policy.minimum.min(maximum).max(2);
+    let interactive_reserve = 1.min(minimum.saturating_sub(1));
+    let target = policy.target.min(maximum).max(minimum);
+    let clamped = ProviderQuotaPolicy {
+        minimum,
+        target,
+        maximum,
+        interactive_reserve,
+    };
+    if clamped.validate("COWD_PROVIDER_MAX_CONCURRENCY").is_err() {
+        return policy;
+    }
+    clamped
 }
 
 fn default_model_policy(model: &str, fallback: ProviderQuotaPolicy) -> ProviderQuotaPolicy {
