@@ -1176,8 +1176,17 @@ where
             .cloned()
             .collect::<BTreeSet<_>>();
         self.api_client.configure_tool_exposure(exposure_projection);
+        // A `required` tool choice is invalid (`400 tool_choice requires at
+        // least one tool`) when no tool schema is exposed; fail closed to an
+        // omitted choice instead of sending an invalid request.
+        let tool_choice_required = one_shot_tool_required && !exposed_tool_ids.is_empty();
+        let tool_choice_required_tool_name = if tool_choice_required {
+            one_shot_required_tool_name
+        } else {
+            None
+        };
         self.api_client
-            .configure_tool_choice(one_shot_tool_required, one_shot_required_tool_name);
+            .configure_tool_choice(tool_choice_required, tool_choice_required_tool_name);
 
         // Tool schemas are part of the request budget. Read their inventory
         // only after Runtime has made the exposure decision.
