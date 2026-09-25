@@ -1929,6 +1929,14 @@ fn tool_orchestrate_maps_and_aggregates_readonly_queries_in_one_call() {
         parsed["steps"]["r"].as_array().expect("map output").len(),
         2
     );
+    let trace = parsed["calls"].as_array().expect("calls trace");
+    assert_eq!(trace.len(), 3);
+    assert_eq!(trace[0]["op"], "call");
+    assert_eq!(trace[0]["tool"], "glob_search");
+    assert_eq!(trace[0]["status"], "ok");
+    assert_eq!(trace[1]["op"], "map");
+    assert_eq!(trace[1]["calls"], 2);
+    assert_eq!(trace[2]["op"], "collect");
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -1978,6 +1986,51 @@ fn tool_orchestrate_compute_runs_data_through_the_sandbox() {
 
     let parsed: serde_json::Value = serde_json::from_str(&output).expect("json");
     assert_eq!(parsed["result"], json!(5));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn tool_orchestrate_supports_filter_when_and_repeat() {
+    let root = temp_path("tool-orchestrate-flow");
+    fs::create_dir_all(&root).expect("workspace");
+    fs::write(root.join("a.txt"), "alpha\n").expect("write a");
+    fs::write(root.join("b.txt"), "gamma\n").expect("write b");
+
+    let output = execute_in_workspace(
+        &root,
+        "tool_orchestrate",
+        &json!({
+            "steps": [
+                {"id": "g", "op": "call", "tool": "glob_search", "input": {"pattern": "*.txt"}},
+                {"id": "files", "op": "map", "over": "$g.filenames", "tool": "read_file", "input": {"path": "$item"}, "field": "file"},
+                {"id": "gamma", "op": "filter", "over": "$files", "field": "content", "contains": "gamma"},
+                {"id": "count", "op": "collect", "over": "$gamma", "agg": "count"},
+                {"id": "branch", "op": "when", "if": {"ref": "$count", "equals": 1}, "tool": "read_file", "input": {"path": "b.txt"}},
+                {"id": "looped", "op": "repeat", "max": 3, "while": {"ref": "$count", "equals": 1}, "tool": "read_file", "input": {"path": "a.txt"}}
+            ],
+            "return": "$count"
+        }),
+    )
+    .expect("flow should succeed");
+
+    let parsed: serde_json::Value = serde_json::from_str(&output).expect("json");
+    assert_eq!(parsed["result"], json!(1));
+    assert_eq!(parsed["steps"]["count"], json!(1));
+    assert_eq!(
+        parsed["steps"]["gamma"].as_array().expect("filtered").len(),
+        1
+    );
+    assert!(parsed["steps"]["branch"]["file"]["content"]
+        .as_str()
+        .expect("branch content")
+        .contains("gamma"));
+    let trace = parsed["calls"].as_array().expect("trace");
+    let repeat = trace
+        .iter()
+        .find(|entry| entry["op"] == "repeat")
+        .expect("repeat trace");
+    assert_eq!(repeat["calls"], 3);
 
     let _ = fs::remove_dir_all(&root);
 }

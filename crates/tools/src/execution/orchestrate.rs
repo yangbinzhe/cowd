@@ -135,16 +135,92 @@ pub(crate) fn run_orchestrate(lease: &ToolHostLease, input: &Value) -> Result<St
     }
     let mut state: State = BTreeMap::new();
     let mut total_calls = 0usize;
+    let mut calls_trace: Vec<Value> = Vec::new();
     for step in &parsed.steps {
-        let value = evaluate(lease, &step.kind, &state, &mut total_calls)?;
-        state.insert(step.id.clone(), value);
+        let before = total_calls;
+        let started = std::time::Instant::now();
+        let (op, tool) = step_descriptor(&step.kind);
+        match evaluate(lease, &step.kind, &state, &mut total_calls) {
+            Ok(value) => {
+                calls_trace.push(step_trace(
+                    &step.id,
+                    op,
+                    tool,
+                    total_calls - before,
+                    "ok",
+                    None,
+                    started,
+                ));
+                state.insert(step.id.clone(), value);
+            }
+            Err(error) => {
+                calls_trace.push(step_trace(
+                    &step.id,
+                    op,
+                    tool,
+                    total_calls - before,
+                    "error",
+                    Some(&error),
+                    started,
+                ));
+                return Err(format!(
+                    "tool_orchestrate step `{}` ({op}) failed: {error}; trace: {}",
+                    step.id,
+                    serde_json::to_string(&calls_trace).unwrap_or_default()
+                ));
+            }
+        }
     }
     let result = match parsed.ret.as_deref() {
         Some(reference) => resolve_ref(reference, &state, None)?,
         None => Value::Object(state.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
     };
-    serde_json::to_string_pretty(&json!({ "steps": state, "result": result }))
-        .map_err(|error| error.to_string())
+    serde_json::to_string_pretty(&json!({
+        "calls": calls_trace,
+        "steps": state,
+        "result": result
+    }))
+    .map_err(|error| error.to_string())
+}
+
+/// The dispatch a step performs, for the model-visible evidence trace.
+fn step_descriptor(kind: &StepKind) -> (&'static str, Option<&str>) {
+    match kind {
+        StepKind::Call { tool, .. } => ("call", Some(tool)),
+        StepKind::Map { tool, .. } => ("map", Some(tool)),
+        StepKind::Filter { .. } => ("filter", None),
+        StepKind::Collect { .. } => ("collect", None),
+        StepKind::Compute { .. } => ("compute", Some("execute_code")),
+        StepKind::When { tool, .. } => ("when", Some(tool)),
+        StepKind::Repeat { tool, .. } => ("repeat", Some(tool)),
+    }
+}
+
+fn step_trace(
+    step_id: &str,
+    op: &str,
+    tool: Option<&str>,
+    calls: usize,
+    status: &str,
+    error: Option<&str>,
+    started: std::time::Instant,
+) -> Value {
+    let mut object = Map::new();
+    object.insert("stepId".to_string(), json!(step_id));
+    object.insert("op".to_string(), json!(op));
+    if let Some(tool) = tool {
+        object.insert("tool".to_string(), json!(tool));
+    }
+    object.insert("calls".to_string(), json!(calls));
+    object.insert("status".to_string(), json!(status));
+    if let Some(error) = error {
+        object.insert("error".to_string(), json!(error));
+    }
+    object.insert(
+        "durationMs".to_string(),
+        json!(started.elapsed().as_millis() as u64),
+    );
+    Value::Object(object)
 }
 
 /// What a composite (orchestration) tool wants to dispatch, so the

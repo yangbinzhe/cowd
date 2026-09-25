@@ -603,7 +603,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 {op:\"repeat\", id, max (<=25), while:{ref,...}, tool, input}; \
                 {op:\"compute\", id, language:\"python|javascript\", code, input} - data arrives in `_input`. \
                 Only read-only query tools are allowed; compute runs in the read-only, network-off sandbox. \
-                Use `return:\"$<id>\"` to select the result.",
+                Use `return:\"$<id>\"` to select the result. The response includes a `calls` trace \
+                (stepId/op/tool/calls/status/durationMs) of every step for evidence.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
