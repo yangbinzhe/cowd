@@ -1900,3 +1900,84 @@ fn workspace_snapshot_observes_ignore_overrides_and_external_changes() {
     );
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn tool_orchestrate_maps_and_aggregates_readonly_queries_in_one_call() {
+    let root = temp_path("tool-orchestrate");
+    fs::create_dir_all(&root).expect("workspace");
+    fs::write(root.join("a.txt"), "alpha\nbeta\n").expect("write a");
+    fs::write(root.join("b.txt"), "gamma\n").expect("write b");
+
+    let output = execute_in_workspace(
+        &root,
+        "tool_orchestrate",
+        &json!({
+            "steps": [
+                {"id": "g", "op": "call", "tool": "glob_search", "input": {"pattern": "*.txt"}},
+                {"id": "r", "op": "map", "over": "$g.filenames", "tool": "read_file", "input": {"path": "$item"}},
+                {"id": "n", "op": "collect", "over": "$r", "agg": "count"}
+            ],
+            "return": "$n"
+        }),
+    )
+    .expect("orchestrate should succeed");
+
+    let parsed: serde_json::Value = serde_json::from_str(&output).expect("json");
+    assert_eq!(parsed["result"], json!(2));
+    assert_eq!(parsed["steps"]["g"]["numFiles"], 2);
+    assert_eq!(
+        parsed["steps"]["r"].as_array().expect("map output").len(),
+        2
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn tool_orchestrate_rejects_non_readonly_tools() {
+    let root = temp_path("tool-orchestrate-reject");
+    fs::create_dir_all(&root).expect("workspace");
+
+    let error = execute_in_workspace(
+        &root,
+        "tool_orchestrate",
+        &json!({
+            "steps": [
+                {"id": "w", "op": "call", "tool": "write_file", "input": {"path": "x.txt", "content": "x"}}
+            ]
+        }),
+    )
+    .expect_err("write tools must be rejected by tool_orchestrate");
+    assert!(error.contains("read-only"), "unexpected error: {error}");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn tool_orchestrate_compute_runs_data_through_the_sandbox() {
+    let root = temp_path("tool-orchestrate-compute");
+    fs::create_dir_all(&root).expect("workspace");
+
+    let output = execute_in_workspace(
+        &root,
+        "tool_orchestrate",
+        &json!({
+            "steps": [
+                {
+                    "id": "c",
+                    "op": "compute",
+                    "language": "python",
+                    "code": "print(sum(item['n'] for item in _input))",
+                    "input": [{"n": 2}, {"n": 3}]
+                }
+            ],
+            "return": "$c"
+        }),
+    )
+    .expect("compute orchestrate should succeed");
+
+    let parsed: serde_json::Value = serde_json::from_str(&output).expect("json");
+    assert_eq!(parsed["result"], json!(5));
+
+    let _ = fs::remove_dir_all(&root);
+}

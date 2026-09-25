@@ -55,6 +55,7 @@ pub(crate) fn execute_with_lease(
         "tool_batch_readonly" => from_value::<ToolBatchReadonlyInput>(input)
             .and_then(|parsed| run_tool_batch_readonly(lease, parsed)),
         "tool_cache_stats" => to_pretty_json(lease.cache().stats()),
+        "tool_orchestrate" => run_orchestrate(lease, input),
         "web_fetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
         "web_search" => from_value::<WebSearchInput>(input).and_then(run_web_search),
         "skill_install_plan" => from_value::<SkillInstallPlanInput>(input)

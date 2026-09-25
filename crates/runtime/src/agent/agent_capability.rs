@@ -154,6 +154,7 @@ fn capability_mapping(capability: &str) -> CapabilityMapping {
                 "read_file",
                 "read_many",
                 "workspace_snapshot",
+                "tool_orchestrate",
                 "context_retrieve",
             ],
             required_mode: PermissionMode::ReadOnly,

@@ -39,6 +39,9 @@ pub(crate) use dispatch::execute_with_lease;
 #[path = "builtin.rs"]
 mod builtin;
 use builtin::*;
+#[path = "orchestrate.rs"]
+mod orchestrate;
+pub(crate) use orchestrate::run_orchestrate;
 
 #[cfg(test)]
 pub fn execute_tool_for_test(name: &str, input: &Value) -> Result<String, String> {
@@ -734,7 +737,7 @@ fn is_prepared_readonly_tool(name: &str) -> bool {
     )
 }
 
-fn is_allowed_readonly_batch_tool(name: &str) -> bool {
+pub(crate) fn is_allowed_readonly_batch_tool(name: &str) -> bool {
     matches!(
         name,
         "read_file"

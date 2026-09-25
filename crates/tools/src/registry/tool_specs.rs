@@ -41,6 +41,7 @@ pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
         | "question"
         | "ask_user_question"
         | "tool_search"
+        | "tool_orchestrate"
         | "structured_output"
         | "current_time"
         | "get_context_remaining"
@@ -586,6 +587,35 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 42 }
                 },
                 "required": ["calls"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "tool_orchestrate",
+            description: "Run a bounded, read-only program over workspace query tools in ONE call. \
+                Steps run in order and share results through `$<id>` references, so one call can \
+                fetch, map, filter and aggregate instead of many single calls. Step shapes: \
+                {op:\"call\", id, tool, input}; {op:\"map\", id, over:\"$<id>.list\", tool, input (use $item), field?}; \
+                {op:\"filter\", id, over, field, contains|equals}; \
+                {op:\"collect\", id, over, agg:\"count|first|last|join|sum\", field?, separator?}; \
+                {op:\"when\", id, if:{ref, present|equals|contains|nonEmpty}, tool, input}; \
+                {op:\"repeat\", id, max (<=25), while:{ref,...}, tool, input}; \
+                {op:\"compute\", id, language:\"python|javascript\", code, input} - data arrives in `_input`. \
+                Only read-only query tools are allowed; compute runs in the read-only, network-off sandbox. \
+                Use `return:\"$<id>\"` to select the result.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 50,
+                        "items": { "type": "object" }
+                    },
+                    "return": { "type": "string" }
+                },
+                "required": ["steps"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,
