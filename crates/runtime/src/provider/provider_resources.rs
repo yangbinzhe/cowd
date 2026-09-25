@@ -15,8 +15,6 @@ const TOKEN_PRESSURE_UNITS_PER_CONCURRENCY_SLOT: usize = 32;
 // several delegated provider calls to make progress. Interactive reserve is
 // protection for a root turn, not permission to starve every Team Agent.
 const MIN_DEGRADED_FOREGROUND_REQUESTS: usize = 4;
-const ORDINARY_SLOTS_PER_MAX_TOKEN_REQUEST: usize =
-    TOKEN_PRESSURE_PER_REQUEST.div_ceil(TOKEN_PRESSURE_UNITS_PER_CONCURRENCY_SLOT);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,12 +50,10 @@ impl ProviderQuotaPolicy {
                 self.interactive_reserve, self.minimum
             ));
         }
-        if self.maximum.saturating_sub(self.interactive_reserve)
-            < ORDINARY_SLOTS_PER_MAX_TOKEN_REQUEST
-        {
+        if self.maximum.saturating_sub(self.interactive_reserve) < 1 {
             return Err(format!(
-                "{context}: maximum {} minus interactive reserve {} must leave at least {} ordinary slots for one maximum token-pressure request",
-                self.maximum, self.interactive_reserve, ORDINARY_SLOTS_PER_MAX_TOKEN_REQUEST
+                "{context}: maximum {} minus interactive reserve {} must leave at least one request slot",
+                self.maximum, self.interactive_reserve
             ));
         }
         Ok(self)
@@ -270,8 +266,8 @@ fn clamp_provider_concurrency(policy: ProviderQuotaPolicy) -> ProviderQuotaPolic
     else {
         return policy;
     };
-    let minimum = policy.minimum.min(maximum).max(2);
-    let interactive_reserve = 1.min(minimum.saturating_sub(1));
+    let minimum = policy.minimum.min(maximum).max(1);
+    let interactive_reserve = policy.interactive_reserve.min(minimum.saturating_sub(1));
     let target = policy.target.min(maximum).max(minimum);
     let clamped = ProviderQuotaPolicy {
         minimum,
@@ -294,9 +290,13 @@ fn default_model_policy(model: &str, fallback: ProviderQuotaPolicy) -> ProviderQ
 }
 
 fn token_pressure_policy(account: ProviderQuotaPolicy) -> ProviderQuotaPolicy {
+    // The pressure pool must always admit at least one request (its demand is up
+    // to `TOKEN_PRESSURE_PER_REQUEST`), independent of how few request-count
+    // slots the operator allows.
     let maximum = account
         .maximum
-        .saturating_mul(TOKEN_PRESSURE_UNITS_PER_CONCURRENCY_SLOT);
+        .saturating_mul(TOKEN_PRESSURE_UNITS_PER_CONCURRENCY_SLOT)
+        .max(TOKEN_PRESSURE_PER_REQUEST);
     let reserve = account
         .interactive_reserve
         .saturating_mul(TOKEN_PRESSURE_UNITS_PER_CONCURRENCY_SLOT);
@@ -429,10 +429,17 @@ mod tests {
             .expect_err("reserve equal to adaptive minimum must fail");
         assert!(error.contains("must remain below adaptive minimum"));
 
-        let error = ProviderQuotaPolicy::new(9, 12, 15, 8)
+        // A one-request concurrency ceiling is valid: a low-concurrency local
+        // model must be configurable down to a single request.
+        ProviderQuotaPolicy::new(1, 1, 1, 0)
             .validate("provider")
-            .expect_err("maximum must admit a maximum token-pressure request");
-        assert!(error.contains("must leave at least 8 ordinary slots"));
+            .expect("one request slot must be admissible");
+    }
+
+    #[test]
+    fn pressure_pool_admits_one_request_even_at_minimum_concurrency() {
+        let pressure = token_pressure_policy(ProviderQuotaPolicy::new(1, 1, 1, 0));
+        assert!(pressure.maximum >= TOKEN_PRESSURE_PER_REQUEST);
     }
 
     #[tokio::test]
