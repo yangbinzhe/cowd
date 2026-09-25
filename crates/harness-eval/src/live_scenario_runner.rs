@@ -902,7 +902,7 @@ impl LiveScenarioRunner {
             },
             LiveScenarioSpec {
                 id: "live_team_projection",
-                prompt: "【强制首动作】必须**先**连续调用 `team_create` 创建满至少 3 个 Team；在创建满 3 个 Team 之前，禁止调用任何探索/只读工具（glob_search、workspace_snapshot 等），也禁止输出长篇计划；建队必须是你最先做的事。另外，在给出最终结论前，必须先用 read_file 至少读取 3 个 `crates/.../*.rs` 文件的内容。【建队后】这是 Agent-first 复杂架构审查。根据 runtime、memory、gateway 的责任边界自主创建至少三个有真实 Task 的 Team；不要套用固定 Team 名、固定角色或每队固定人数。无依赖审查必须物理并发，跨组件综合 Task 必须 depends_on 至少两个已 accepted 的上游 Task，并通过 topic 的 artifact/evidence refs 消费其结果。每项 Task 都要由 Agent 领取、提交 artifact/evidence，并由不同 Agent 独立 review。最终 artifact 列出至少三个本次实际读取的完整 `crates/.../*.rs` 路径。只使用只读源码工具与 Agent Action，不用 bash 或写文件工具。",
+                prompt: "【强制首动作】必须**先**连续调用 `team_create` 创建满至少 3 个 Team；在创建满 3 个 Team 之前，禁止调用任何探索/只读工具（glob_search、workspace_snapshot 等），也禁止输出长篇计划；建队必须是你最先做的事。【读取纪律】只读工具的输出**可能被截断**（返回 head+tail 预览并给 `persistedOutputPath` / `nextOffset`），这是**正常现象**，不是错误：请用 `read_file` 的 `offset`/`limit` 只读你需要的小范围，或按 `nextOffset` 续读；**禁止反复重试整文件读取**；遇到截断必须**继续推进**（建任务、派工、提交），不要卡在读取上。【建队后】这是 Agent-first 复杂架构审查。根据 runtime、memory、gateway 的责任边界自主创建至少三个有真实 Task 的 Team；不要套用固定 Team 名、固定角色或每队固定人数。无依赖审查必须物理并发，跨组件综合 Task 必须 depends_on 至少两个已 accepted 的上游 Task，并通过 topic 的 artifact/evidence refs 消费其结果。每项 Task 都要由 Agent 领取、提交 artifact/evidence，并由不同 Agent 独立 review。最终 artifact 列出至少三个本次实际读取的完整 `crates/.../*.rs` 路径。只使用只读源码工具与 Agent Action，不用 bash 或写文件工具。",
                 acceptance: LiveAcceptance::ArchitectureQuality {
                     minimum_teams: 3,
                     minimum_claimed_cross_team_edges: 2,
