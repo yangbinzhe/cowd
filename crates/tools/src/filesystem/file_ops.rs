@@ -23,7 +23,7 @@ const MAX_SEARCH_RESULTS: usize = 100;
 /// Default line window used when callers omit an explicit read limit.
 const DEFAULT_READ_LINE_LIMIT: usize = 1_000;
 
-const TRUNCATED_READ_GUIDANCE: &str = "This is a bounded window, not the whole file. For ordinary analysis, use grep_search (or grep_many) to locate relevant logic instead of scanning consecutive offsets. If the task explicitly requires whole-file or EOF coverage, call read_file again with complete=true; complete mode is still protected by the file-size safety ceiling.";
+const TRUNCATED_READ_GUIDANCE: &str = "This is a bounded window, not the whole file. Prefer a few larger reads over many small slices: to continue exactly where this window ended, call read_file again with offset=nextOffset. Use grep_search (or grep_many) to locate specific content in very large files instead of scanning consecutive offsets. If the task explicitly requires whole-file or EOF coverage, call read_file again with complete=true; complete mode is still protected by the file-size safety ceiling.";
 
 /// Maximum file size that can be written (10 MB).
 const MAX_WRITE_SIZE: usize = 10 * 1024 * 1024;
@@ -66,6 +66,15 @@ pub struct ReadFileOutput {
     pub truncated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guidance: Option<String>,
+    /// When `truncated`, the `offset` to pass on the next `read_file` call to
+    /// continue exactly where this window ended. Makes large-file paging
+    /// deterministic instead of forcing the model to recompute line numbers.
+    #[serde(
+        default,
+        rename = "nextOffset",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub next_offset: Option<usize>,
     pub file: TextFilePayload,
 }
 
@@ -460,6 +469,7 @@ pub fn read_file(
         kind: String::from("text"),
         truncated,
         guidance: truncated.then(|| TRUNCATED_READ_GUIDANCE.to_string()),
+        next_offset: truncated.then_some(end_index),
         file: TextFilePayload {
             file_path: absolute_path.to_string_lossy().into_owned(),
             content: selected,
@@ -736,10 +746,48 @@ mod tests {
         assert_eq!(output.file.start_line, 1);
         assert!(output.file.content.ends_with("line-999"));
         assert!(output.truncated);
+        assert_eq!(output.next_offset, Some(DEFAULT_READ_LINE_LIMIT));
         assert!(output
             .guidance
             .as_deref()
             .is_some_and(|guidance| guidance.contains("grep_search")));
+        assert!(output
+            .guidance
+            .as_deref()
+            .is_some_and(|guidance| guidance.contains("nextOffset")));
+    }
+
+    #[test]
+    fn next_offset_continues_exactly_where_the_window_ended() {
+        let path = temp_path("paged-read.txt");
+        let policy = policy_for(&path);
+        let content = (0..1_250)
+            .map(|line| format!("line-{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        write_file(&policy, path.to_string_lossy().as_ref(), &content)
+            .expect("write should succeed");
+
+        let first = read_file(&policy, path.to_string_lossy().as_ref(), None, None, false)
+            .expect("first page should succeed");
+        assert!(first.truncated);
+        let next = first
+            .next_offset
+            .expect("truncated read must expose nextOffset");
+
+        let second = read_file(
+            &policy,
+            path.to_string_lossy().as_ref(),
+            Some(next),
+            None,
+            false,
+        )
+        .expect("second page should succeed");
+        assert_eq!(second.file.start_line, next + 1);
+        assert_eq!(second.file.num_lines, 1_250 - next);
+        assert!(!second.truncated);
+        assert_eq!(second.next_offset, None);
+        assert!(second.file.content.ends_with("line-1249"));
     }
 
     #[test]

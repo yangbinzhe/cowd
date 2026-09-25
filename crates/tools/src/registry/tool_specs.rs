@@ -115,13 +115,16 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             name: "bash",
             description: "Execute a shell command in the current workspace. Prefer \
                 one-shot multi-step chains (&&, |, tee) over repeated single-step calls: each \
-                call is a separate turn of the budget. Output is budgeted: when stdout or stderr \
-                exceeds the budget, the visible text is a head+tail preview with an \
-                `[output truncated]` marker and the full output is persisted - the response \
-                includes `persistedOutputPath`; re-read the needed range via read_file instead \
-                of re-running the command. A truncated result is partial evidence; verify it \
-                before concluding. Prefer grep_search/read_file over bash grep/cat for \
-                file-content queries. Do not run interactive commands.",
+                call is a separate turn of the budget. The shell is the right tool for search, \
+                count, filter and transform with small output (grep, find, wc, sort, awk, sed, \
+                cut): one chain can locate and summarize in a single call. For reading raw file \
+                content, use read_file (a bounded line window) - do not cat large files into \
+                context. Output is budgeted: when stdout or stderr exceeds the budget, the \
+                visible text is a head+tail preview with an `[output truncated]` marker and the \
+                full output is persisted - the response includes `persistedOutputPath`; re-read \
+                the needed range via read_file instead of re-running the command. A truncated \
+                result is partial evidence; verify it before concluding. Do not run interactive \
+                commands.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -171,7 +174,14 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "read_file",
-            description: "Read a workspace text file. By default this returns a bounded line window; for ordinary large-file analysis, use grep_search first and read matching regions. When the task explicitly requires whole-file or EOF coverage, set complete=true to return the entire file under the file-size safety ceiling. If complete=true is sent with an inherited offset or limit, complete coverage safely takes precedence.",
+            description: "Read a workspace text file, returning a bounded line window. \
+                Prefer one larger read over many small slices: when a file matters, read a \
+                substantial window rather than many tiny ones. Use grep_search to locate \
+                specific content in very large files. When the window is truncated, \
+                `nextOffset` is the offset to pass next to continue where it ended. When the \
+                task explicitly requires whole-file or EOF coverage, set complete=true to \
+                return the entire file under the file-size safety ceiling; complete=true \
+                takes precedence over an inherited offset or limit.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1133,7 +1143,7 @@ mod tests {
     use crate::permissions::PermissionMode;
 
     #[test]
-    fn source_inspection_tools_promote_search_before_bounded_reads() {
+    fn read_file_guides_bounded_window_and_deterministic_pagination() {
         let specs = mvp_tool_specs();
         let read_file = specs
             .iter()
@@ -1145,13 +1155,35 @@ mod tests {
             .expect("grep_search spec");
 
         assert!(read_file.description.contains("bounded"));
-        assert!(read_file.description.contains("grep_search first"));
+        assert!(read_file.description.contains("one larger read"));
+        assert!(read_file.description.contains("nextOffset"));
         assert!(read_file.description.contains("complete=true"));
         assert_eq!(
             read_file.input_schema["properties"]["complete"]["type"],
             "boolean"
         );
         assert!(grep_search.description.contains("Preferred locator"));
+    }
+
+    #[test]
+    fn bash_description_guides_small_output_shell_and_read_file_for_content() {
+        let specs = mvp_tool_specs();
+        let bash = specs
+            .iter()
+            .find(|spec| spec.name == "bash")
+            .expect("bash spec");
+
+        // Behaviour disclosure must stay truthful (09 IV.4).
+        assert!(bash.description.contains("persistedOutputPath"));
+        assert!(bash.description.contains("[output truncated]"));
+        // D1: the shell is for small-output search/aggregate, and raw content
+        // reads go through read_file instead of `cat` so the model stops
+        // iterating small tools. The old blanket bash-forbid must be gone.
+        assert!(bash.description.contains("read_file"));
+        assert!(bash.description.contains("small output"));
+        assert!(!bash
+            .description
+            .contains("Prefer grep_search/read_file over bash"));
     }
 
     #[test]
