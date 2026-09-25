@@ -309,6 +309,7 @@ where
                     state.execution_role.is_delegated_leaf(),
                     state.iterations,
                     state.safety_lease.max_model_steps,
+                    collaboration_step_ceiling_mult(),
                 );
                 let fuse_decision = if collaboration_budget_elapsed || collaboration_ceiling_reached
                 {
@@ -2694,48 +2695,199 @@ fn next_unverified_model_step_streak(current: usize, made_verified_progress: boo
     }
 }
 
-/// Objective-level wall-clock budget for a required-Team collaboration turn.
-/// Configurable with `COWD_COLLABORATION_BUDGET_SECS`; default 1500s. The
-/// no-progress fuse cannot bound a turn that keeps making nominal progress, so
-/// this budget is what guarantees an in-bound honest terminal. Evaluation
-/// runners should set it below their own scenario safety wait.
-pub(super) fn collaboration_wall_budget() -> std::time::Duration {
+/// How many consecutive identical (same tool set, canonical args and result)
+/// tool batches before a loop-breaker notice is injected into the next model
+/// request. The notice is advisory: it gives a weak model a chance to correct
+/// itself instead of hard-stopping a turn that may still be productive.
+pub(super) fn loop_nudge_after() -> usize {
+    std::env::var("COWD_LOOP_NUDGE_AFTER")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(3)
+}
+
+/// Opt-in hard stop for identical-call loops. Default **off**: matching the
+/// loop-breaker-first posture of leading agents, the notice is advisory unless
+/// an operator explicitly enables the circuit breaker.
+pub(super) fn loop_hard_stop_enabled() -> bool {
+    matches!(
+        std::env::var("COWD_LOOP_HARD_STOP").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
+/// Identical-call streak at which the opt-in hard stop fires.
+pub(super) fn loop_block_after() -> usize {
+    std::env::var("COWD_LOOP_BLOCK_AFTER")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(5)
+}
+
+/// Pollers legitimately re-issue identical calls while waiting on external
+/// progress, so an unchanged result is expected rather than a loop. They are
+/// exempt from the identical-call notice to avoid false positives.
+fn is_loop_nudge_repeatable_tool(tool_name: &str) -> bool {
+    let lower = tool_name.to_ascii_lowercase();
+    lower == "process" || lower.ends_with("_get_result") || lower.ends_with("_poll")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LoopGuardAction {
+    Continue,
+    Nudge { streak: usize },
+    Block { streak: usize },
+}
+
+/// Decide what (if anything) to do about a consecutive identical-call streak.
+/// Nudge-first; a hard stop only when the operator opted in.
+#[must_use]
+pub(super) fn evaluate_loop_guard(
+    streak: usize,
+    nudge_after: usize,
+    hard_stop: bool,
+    block_after: usize,
+) -> LoopGuardAction {
+    if streak == 0 || streak < nudge_after {
+        return LoopGuardAction::Continue;
+    }
+    if hard_stop && streak >= block_after {
+        return LoopGuardAction::Block { streak };
+    }
+    LoopGuardAction::Nudge { streak }
+}
+
+/// Per-turn cap on how many times a single tool may run within one turn.
+/// `COWD_TOOL_CAP_DEFAULT` applies to every tool; `COWD_TOOL_CAP_<TOOL>` (the
+/// upper-cased tool name) overrides it for one tool. `0` (the default)
+/// disables the cap entirely.
+pub(super) fn tool_scope_cap(tool_name: &str) -> usize {
+    let specific = format!(
+        "COWD_TOOL_CAP_{}",
+        tool_name.to_ascii_uppercase().replace('-', "_")
+    );
+    std::env::var(&specific)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .or_else(|| {
+            std::env::var("COWD_TOOL_CAP_DEFAULT")
+                .ok()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+        })
+        .unwrap_or(0)
+}
+
+/// Opt-in result deduplication. When enabled, large byte-identical duplicate
+/// tool-result payloads are replaced by a short reference stub so a repeating
+/// model cannot inflate the context. Default **off**.
+pub(super) fn loop_stub_results_enabled() -> bool {
+    matches!(
+        std::env::var("COWD_LOOP_STUB_RESULTS").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
+/// Payloads smaller than this are not worth stubbing: the stub itself plus the
+/// lost locality would outweigh the savings. Error results are never stubbed.
+const IDENTICAL_RESULT_STUB_MIN_CHARS: usize = 512;
+
+/// Replace large byte-identical duplicate tool-result payloads with a short
+/// reference stub. Returns the number of payloads stubbed. Pure and directly
+/// unit-testable; callers only invoke it when `COWD_LOOP_STUB_RESULTS` is on.
+fn stub_duplicate_result_payloads(messages: &mut [ConversationMessage]) -> usize {
+    let mut first_seen: std::collections::HashMap<(String, String), String> =
+        std::collections::HashMap::new();
+    let mut stubbed = 0usize;
+    for message in messages.iter_mut() {
+        for block in message.blocks.iter_mut() {
+            let ContentBlock::ToolResult {
+                tool_use_id,
+                tool_name,
+                output,
+                is_error,
+            } = block
+            else {
+                continue;
+            };
+            if *is_error || output.len() < IDENTICAL_RESULT_STUB_MIN_CHARS {
+                continue;
+            }
+            let key = (tool_name.clone(), output.clone());
+            match first_seen.get(&key) {
+                Some(origin) => {
+                    *output = format!(
+                        "[duplicate identical `{tool_name}` result omitted; see {origin}]"
+                    );
+                    stubbed = stubbed.saturating_add(1);
+                }
+                None => {
+                    first_seen.insert(key, format!("tool_call:{tool_use_id}"));
+                }
+            }
+        }
+    }
+    stubbed
+}
+
+/// Optional objective-level wall-clock cost ceiling for a required-Team
+/// collaboration turn. Configurable with `COWD_COLLABORATION_BUDGET_SECS`;
+/// **unset or `0` disables it** (the default). When enabled it is deliberately
+/// a rare last-resort cost guard, not the primary terminus: the no-progress
+/// fuse, the loop-breaker and the tool caps bound turns by *progress/side
+/// effects*, while this only bounds raw spend. A turn that keeps making real
+/// progress must never be fused by elapsed time alone.
+pub(super) fn collaboration_wall_budget() -> Option<std::time::Duration> {
     std::env::var("COWD_COLLABORATION_BUDGET_SECS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|seconds| *seconds > 0)
-        .map_or_else(
-            || std::time::Duration::from_secs(1500),
-            std::time::Duration::from_secs,
-        )
+        .map(std::time::Duration::from_secs)
 }
 
-/// True when a required-Team collaboration turn has spent its objective-level
-/// wall-clock budget. Delegated leaves never inherit the root's budget, and a
-/// turn without a Team obligation is bounded by the no-progress fuse alone.
+/// True when a required-Team collaboration turn has spent its **enabled**
+/// objective-level wall-clock ceiling. A `None` budget (the default) never
+/// fires. Delegated leaves never inherit the root's budget, and a turn without
+/// a Team obligation is bounded by the no-progress fuse alone.
 fn collaboration_budget_elapsed(
     obligation: Option<&harness_contract::strategy::CollaborationExecutionObligation>,
     is_delegated_leaf: bool,
     elapsed: std::time::Duration,
-    budget: std::time::Duration,
+    budget: Option<std::time::Duration>,
 ) -> bool {
-    obligation.is_some_and(|obligation| obligation.minimum_team_count > 0)
-        && !is_delegated_leaf
-        && elapsed >= budget
+    budget.is_some_and(|budget| {
+        obligation.is_some_and(|obligation| obligation.minimum_team_count > 0)
+            && !is_delegated_leaf
+            && elapsed >= budget
+    })
 }
 
-/// True when an Agent-first collaboration turn has spent its absolute
-/// objective-level ceiling without reaching its verified-Team minimum. The
-/// no-progress fuse cannot fire while nominal progress continues, so this is
-/// the bound that guarantees an honest, in-bound terminal.
-fn collaboration_ceiling_reached(    obligation: Option<&harness_contract::strategy::CollaborationExecutionObligation>,
+/// Optional multiplier for the objective-level **step** ceiling. `0` (the
+/// default) disables it. Steps, like seconds, are orthogonal to progress, so
+/// this is likewise an operator-selectable guard rather than the primary
+/// terminus.
+pub(super) fn collaboration_step_ceiling_mult() -> usize {
+    std::env::var("COWD_COLLABORATION_STEP_CEILING_MULT")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+/// True when an Agent-first collaboration turn has spent its **enabled**
+/// absolute step ceiling without reaching its verified-Team minimum. A `0`
+/// multiplier (the default) never fires.
+fn collaboration_ceiling_reached(
+    obligation: Option<&harness_contract::strategy::CollaborationExecutionObligation>,
     is_delegated_leaf: bool,
     iterations: usize,
     max_model_steps: usize,
+    multiplier: usize,
 ) -> bool {
-    obligation.is_some_and(|obligation| obligation.minimum_team_count > 0)
+    multiplier > 0
+        && obligation.is_some_and(|obligation| obligation.minimum_team_count > 0)
         && !is_delegated_leaf
-        && iterations >= max_model_steps.saturating_mul(3)
+        && iterations >= max_model_steps.saturating_mul(multiplier)
 }
 
 /// Policy bound on how many times the Agent-first collaboration completion gate
@@ -2796,28 +2948,39 @@ mod safety_fuse_streak_tests {
             Some(&obligation),
             false,
             5,
-            24
+            24,
+            3
         ));
         assert!(collaboration_ceiling_reached(
             Some(&obligation),
             false,
             72,
-            24
+            24,
+            3
         ));
         // A delegated leaf never inherits the root's Team obligation.
         assert!(!collaboration_ceiling_reached(
             Some(&obligation),
             true,
             999,
-            24
+            24,
+            3
         ));
         // Without an obligation only the no-progress fuse decides.
-        assert!(!collaboration_ceiling_reached(None, false, 999, 24));
+        assert!(!collaboration_ceiling_reached(None, false, 999, 24, 3));
+        // A zero multiplier disables the ceiling entirely (the default).
+        assert!(!collaboration_ceiling_reached(
+            Some(&obligation),
+            false,
+            999_999,
+            24,
+            0
+        ));
     }
 
     #[test]
     fn collaboration_wall_budget_bounds_required_team_turns() {
-        use super::{collaboration_budget_elapsed, collaboration_wall_budget};
+        use super::collaboration_budget_elapsed;
         use harness_contract::strategy::CollaborationExecutionObligation;
         use std::time::Duration;
         let obligation = CollaborationExecutionObligation {
@@ -2828,27 +2991,96 @@ mod safety_fuse_streak_tests {
             Some(&obligation),
             false,
             Duration::from_secs(100),
-            Duration::from_secs(100)
+            Some(Duration::from_secs(100))
         ));
         assert!(!collaboration_budget_elapsed(
             Some(&obligation),
             false,
             Duration::from_secs(99),
-            Duration::from_secs(100)
+            Some(Duration::from_secs(100))
         ));
         assert!(!collaboration_budget_elapsed(
             Some(&obligation),
             true,
             Duration::from_secs(10_000),
-            Duration::from_secs(100)
+            Some(Duration::from_secs(100))
         ));
         assert!(!collaboration_budget_elapsed(
             None,
             false,
             Duration::from_secs(10_000),
-            Duration::from_secs(100)
+            Some(Duration::from_secs(100))
         ));
-        assert!(collaboration_wall_budget().as_secs() > 0);
+        // Disabled (the default) never bounds by time, no matter how long the
+        // turn has run: a turn that keeps making real progress must not be
+        // fused by elapsed time alone.
+        assert!(!collaboration_budget_elapsed(
+            Some(&obligation),
+            false,
+            Duration::from_secs(10_000_000),
+            None
+        ));
+    }
+
+    #[test]
+    fn loop_guard_is_nudge_first_with_opt_in_hard_stop() {
+        use super::{evaluate_loop_guard, LoopGuardAction};
+        assert_eq!(
+            evaluate_loop_guard(0, 3, false, 5),
+            LoopGuardAction::Continue
+        );
+        assert_eq!(
+            evaluate_loop_guard(2, 3, false, 5),
+            LoopGuardAction::Continue
+        );
+        assert_eq!(
+            evaluate_loop_guard(3, 3, false, 5),
+            LoopGuardAction::Nudge { streak: 3 }
+        );
+        // Advisory by default: even far past the block threshold it only nudges.
+        assert_eq!(
+            evaluate_loop_guard(50, 3, false, 5),
+            LoopGuardAction::Nudge { streak: 50 }
+        );
+        // With the opt-in circuit breaker it blocks at the block threshold.
+        assert_eq!(
+            evaluate_loop_guard(4, 3, true, 5),
+            LoopGuardAction::Nudge { streak: 4 }
+        );
+        assert_eq!(
+            evaluate_loop_guard(5, 3, true, 5),
+            LoopGuardAction::Block { streak: 5 }
+        );
+    }
+
+    #[test]
+    fn duplicate_result_payloads_are_stubbed_except_errors_and_small_payloads() {
+        use super::{stub_duplicate_result_payloads, ContentBlock, ConversationMessage};
+        let big = "x".repeat(600);
+        let small = "tiny".to_string();
+        let mut messages = vec![
+            ConversationMessage::tool_result("call-1", "read_file", big.clone(), false),
+            ConversationMessage::tool_result("call-2", "read_file", big.clone(), false),
+            ConversationMessage::tool_result("call-3", "read_file", small.clone(), false),
+            ConversationMessage::tool_result("call-4", "read_file", small.clone(), false),
+            ConversationMessage::tool_result("call-5", "read_file", big.clone(), true),
+        ];
+        let stubbed = stub_duplicate_result_payloads(&mut messages);
+        // Only the second large successful payload is a stub candidate: small
+        // payloads are left alone and error payloads are never stubbed.
+        assert_eq!(stubbed, 1);
+        let outputs = messages
+            .iter()
+            .map(|message| match message.blocks.first() {
+                Some(ContentBlock::ToolResult { output, .. }) => output.clone(),
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(outputs[0], big);
+        assert!(outputs[1].contains("duplicate identical"));
+        assert_eq!(outputs[2], small);
+        assert_eq!(outputs[3], small);
+        assert_eq!(outputs[4], big);
     }
 }
 
@@ -3979,9 +4211,10 @@ where
                     .collaboration_obligation
                     .as_ref()
                     .is_some_and(|obligation| obligation.minimum_team_count > 0)
-                    .then(|| {
-                        let remaining = collaboration_wall_budget()
-                            .saturating_sub(state.started_at.elapsed());
+                    .then(|| collaboration_wall_budget())
+                    .flatten()
+                    .map(|budget| {
+                        let remaining = budget.saturating_sub(state.started_at.elapsed());
                         crate::tool_invocation::now_ms()
                             .saturating_add(u64::try_from(remaining.as_millis()).unwrap_or(0))
                     })
@@ -4389,6 +4622,80 @@ where
         } else {
             state.consecutive_low_novelty_batches = 0;
         }
+        // ---- Loop-breaker and targeted runaway caps (nudge-first) ----------
+        // A batch that repeats the same tool set, canonical arguments AND the
+        // same result is an identical call. Advise the model (default) and only
+        // hard stop when the operator opted into the circuit breaker. Pollers
+        // are exempt because an unchanged result is their normal contract.
+        let loop_repeatable = !calls.is_empty()
+            && calls
+                .iter()
+                .all(|call| is_loop_nudge_repeatable_tool(&call.name));
+        let batch_result_digest = terminal_evidence_digest(&result.messages);
+        if loop_repeatable {
+            state.identical_action_streak = 0;
+            state.identical_action_digest.clear();
+            state.identical_action_result_digest.clear();
+        } else if state.identical_action_digest == action_fingerprint
+            && state.identical_action_result_digest == batch_result_digest
+        {
+            state.identical_action_streak = state.identical_action_streak.saturating_add(1);
+        } else {
+            state.identical_action_digest = action_fingerprint.clone();
+            state.identical_action_result_digest = batch_result_digest;
+            state.identical_action_streak = 1;
+        }
+        match evaluate_loop_guard(
+            state.identical_action_streak,
+            loop_nudge_after(),
+            loop_hard_stop_enabled(),
+            loop_block_after(),
+        ) {
+            LoopGuardAction::Nudge { streak } => {
+                let mut item = ContextItem::new(
+                    format!("loop-breaker:{}:{}", ticket.node_id, streak),
+                    ContextSourceKind::ToolTrace,
+                    ContextRole::Instruction,
+                    format!(
+                        "This is the {streak}th consecutive identical tool call (same tools, same arguments, same result). Do not repeat it: change the arguments, use a different tool, or proceed with the evidence you already have."
+                    ),
+                );
+                item.authority = ContextAuthority::System;
+                item.visibility = ContextVisibility::Private;
+                state.pending_next_model_context.push(item);
+            }
+            LoopGuardAction::Block { streak } => {
+                state.terminal_override = Some((
+                    GoalCompletion::Partial,
+                    format!(
+                        "Execution blocked safely: {streak} consecutive identical tool calls with an identical result (possible loop). Retained evidence and progress were preserved. Continue with a new constraint, additional evidence, or an explicit replan."
+                    ),
+                ));
+            }
+            LoopGuardAction::Continue => {}
+        }
+        // Targeted per-turn runaway caps (optional; `0` disables each cap).
+        for call in &calls {
+            let key = call.name.to_ascii_lowercase();
+            *state.per_turn_tool_counts.entry(key).or_insert(0) += 1;
+        }
+        if let Some((tool, count, cap)) = calls
+            .iter()
+            .filter_map(|call| {
+                let key = call.name.to_ascii_lowercase();
+                let count = state.per_turn_tool_counts.get(&key).copied().unwrap_or(0);
+                let cap = tool_scope_cap(&key);
+                (cap > 0 && count > cap).then_some((key, count, cap))
+            })
+            .next()
+        {
+            state.terminal_override = Some((
+                GoalCompletion::Partial,
+                format!(
+                    "Execution blocked safely: tool `{tool}` exceeded its per-turn cap ({count} > {cap}); retained evidence and progress were preserved. Continue with a new constraint, additional evidence, or an explicit replan."
+                ),
+            ));
+        }
         if let Some(protocol) = delegated_protocol_after_batch.as_ref() {
             // An artifact is intermediate collaboration evidence, not the
             // Task's semantic terminal. Keep the Agent action channel open
@@ -4417,6 +4724,34 @@ where
             repeated_evidence_saturation,
             state.successful_tool_calls > 0,
         );
+        // A stalled/failing turn gets an explicit, advisory notice before the
+        // existing forced-synthesis or fail-closed paths engage. Delegated
+        // protocol closure has its own authoritative continuation, so it is
+        // left untouched.
+        if repeated_local_failures && !pending_delegated_action {
+            let mut item = ContextItem::new(
+                format!("tool-failure-nudge:{}", ticket.node_id),
+                ContextSourceKind::ToolTrace,
+                ContextRole::Instruction,
+                "The same tool calls failed again with no retained evidence. Do not repeat them unchanged: change the arguments, use a different tool, or report the blocker."
+                    .to_string(),
+            );
+            item.authority = ContextAuthority::System;
+            item.visibility = ContextVisibility::Private;
+            state.pending_next_model_context.push(item);
+        }
+        if repeated_evidence_saturation && !pending_delegated_action {
+            let mut item = ContextItem::new(
+                format!("evidence-saturation-nudge:{}", ticket.node_id),
+                ContextSourceKind::ToolTrace,
+                ContextRole::Instruction,
+                "Recent tool calls added no new evidence coverage. Stop re-acquiring: use the receipts you already have or converge on the answer."
+                    .to_string(),
+            );
+            item.authority = ContextAuthority::System;
+            item.visibility = ContextVisibility::Private;
+            state.pending_next_model_context.push(item);
+        }
         if pending_delegated_action {
             // Evidence saturation for delegated work is not a presentation
             // terminal. The business terminal is the next durable protocol
@@ -4505,7 +4840,17 @@ where
             state.collaboration_obligation.as_ref(),
             &newly_completed_program_team_ids,
         );
-        state.tool_results.extend(result.messages);
+        if loop_stub_results_enabled() && state.identical_action_streak >= 2 && failed == 0 {
+            // Opt-in context dedup for a repeating model: replace large
+            // byte-identical duplicate payloads in the retained transcript with
+            // a short reference stub. Evidence stays keyed by tool_call id, so
+            // dedup only shrinks redundant context.
+            let mut deduped = result.messages;
+            stub_duplicate_result_payloads(&mut deduped);
+            state.tool_results.extend(deduped);
+        } else {
+            state.tool_results.extend(result.messages);
+        }
         if completed_root_team_this_batch {
             // A verified collaboration terminal leaves only presentation.
             state.force_text_only_next_model = true;

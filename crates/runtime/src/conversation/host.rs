@@ -728,6 +728,10 @@ where
             successful_tool_calls: 0,
             tool_receipts_observed: recovered_tool_receipt_count,
             duplicate_tool_calls: 0,
+            identical_action_digest: String::new(),
+            identical_action_result_digest: String::new(),
+            identical_action_streak: 0,
+            per_turn_tool_counts: BTreeMap::new(),
             write_attempt_paths: Vec::new(),
             required_write_for_completion: false,
             required_workspace_write_scopes: Vec::new(),
@@ -1379,13 +1383,13 @@ where
                     .collaboration_obligation
                     .as_ref()
                     .is_some_and(|obligation| obligation.minimum_team_count > 0);
-                if obligated
+                let budget_elapsed = obligated
                     && !state.execution_role.is_delegated_leaf()
-                    && state.started_at.elapsed()
-                        >= collaboration_budget()
-                {
+                    && collaboration_budget()
+                        .is_some_and(|budget| state.started_at.elapsed() >= budget);
+                if budget_elapsed {
                     state.failure = Some(
-                        "Execution blocked safely: bounded convergence reached the Agent-first collaboration budget with the required verified-Team minimum still unmet. The objective is only partially satisfied and unresolved work stays in the Program projection; Runtime stopped the turn instead of running unbounded.".to_string(),
+                        "Execution blocked safely: bounded convergence reached the Agent-first collaboration cost ceiling with the required verified-Team minimum still unmet. The objective is only partially satisfied and unresolved work stays in the Program projection; Runtime stopped the turn instead of spending without bound.".to_string(),
                     );
                     break;
                 }
@@ -1676,18 +1680,18 @@ where
     (runtime, result)
 }
 
-/// Objective-level wall-clock budget for a required-Team collaboration turn.
-/// Kept local to the ingress owner so the turn can always reach an in-bound
-/// honest terminal while it waits on child work.
-fn collaboration_budget() -> std::time::Duration {
+/// Optional objective-level wall-clock cost ceiling for a required-Team
+/// collaboration turn. Kept local to the ingress owner so an **enabled**
+/// ceiling can still reach an in-bound honest terminal while it waits on child
+/// work. Unset or `0` disables it (the default): the wait loop is otherwise
+/// bounded by child progress and the turn's own guardrails, never by elapsed
+/// time alone.
+fn collaboration_budget() -> Option<std::time::Duration> {
     std::env::var("COWD_COLLABORATION_BUDGET_SECS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|seconds| *seconds > 0)
-        .map_or_else(
-            || std::time::Duration::from_secs(1500),
-            std::time::Duration::from_secs,
-        )
+        .map(std::time::Duration::from_secs)
 }
 
 const EVALUATION_TURN_CONTROL_PREFIX: &str = "COWD_EVAL_CONTROL ";
@@ -3145,6 +3149,15 @@ struct TurnGraphState {
     /// recovery may only synthesize once from retained evidence.
     tool_receipts_observed: usize,
     duplicate_tool_calls: u64,
+    /// Consecutive identical tool batches (same tool set, canonical arguments
+    /// and result). Drives the loop-breaker notice; any differing call or
+    /// result resets it. Per-turn, like the other guardrail counters.
+    identical_action_digest: String,
+    identical_action_result_digest: String,
+    identical_action_streak: usize,
+    /// Per-turn call counts keyed by lower-case tool name, for the optional
+    /// targeted runaway-tool caps (`COWD_TOOL_CAP_*`).
+    per_turn_tool_counts: BTreeMap<String, usize>,
     write_attempt_paths: Vec<String>,
     required_write_for_completion: bool,
     /// Exact workspace write obligations parsed from the user objective. When
