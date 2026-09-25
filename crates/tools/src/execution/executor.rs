@@ -813,7 +813,7 @@ struct BatchToolOutput {
 }
 
 #[derive(Debug, Serialize)]
-struct BatchToolItemOutput {
+pub(crate) struct BatchToolItemOutput {
     index: usize,
     status: String,
     #[serde(rename = "durationMs")]
