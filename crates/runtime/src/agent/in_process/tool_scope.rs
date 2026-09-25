@@ -614,6 +614,17 @@ impl ScopedRuntimeToolExecutor {
                         observed_bytes,
                         observed_evidence,
                     });
+                // J3: remember the owning Session for a freshly started
+                // background job (delegated-agent path).
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&output) {
+                    if let Some(job_id) = value.get("backgroundTaskId").and_then(|id| id.as_str()) {
+                        tools::background_jobs::register_owner(
+                            &self.workspace_root,
+                            job_id,
+                            &self.session_id,
+                        );
+                    }
+                }
                 Ok(output)
             }
             RuntimeToolExecutionStatus::BlockedPermission => Err(ToolError::new(

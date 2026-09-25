@@ -1049,6 +1049,14 @@ impl SessionService {
         else {
             return Ok(false);
         };
+        // J3 fence: a closed Session must not leave background bash jobs behind.
+        let reaped = tools::background_jobs::kill_by_owner(session_id, "session_closed");
+        if !reaped.is_empty() {
+            eprintln!(
+                "cowd: session {session_id} closed; reconciled {} background job(s)",
+                reaped.len()
+            );
+        }
         match record.status.as_str() {
             "deleted" if disposition == session::SessionCloseDisposition::Delete => {
                 return Ok(true);

@@ -74,6 +74,17 @@ impl GatewayToolExecutor {
             .await
             .map_err(|error| ToolError::new(error.to_string()))??
         };
+        // J3: remember which Session owns a freshly started background job so a
+        // later Session deletion can fence and reap it.
+        if let (Some(session_id), Ok(value)) = (
+            self.runtime_session_id.as_deref(),
+            serde_json::from_str::<serde_json::Value>(&output),
+        ) {
+            if let Some(job_id) = value.get("backgroundTaskId").and_then(|id| id.as_str()) {
+                let workspace = self.tool_host.pin_snapshot().workspace_root().to_path_buf();
+                tools::background_jobs::register_owner(&workspace, job_id, session_id);
+            }
+        }
         Ok(harness_contract::context::ToolOutputDraft::bounded_inline(
             output,
         ))

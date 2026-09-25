@@ -33,6 +33,10 @@ struct JobState {
     finished: bool,
     exit_code: Option<i32>,
     finished_at_ms: Option<u64>,
+    /// Owning Session/execution id (J3), set by the runtime/gateway.
+    owner: Option<String>,
+    /// Cleanup evidence reason when the job was cancelled (J5).
+    cleanup: Option<String>,
 }
 
 struct Job {
@@ -120,7 +124,7 @@ pub(crate) fn start_background_job(
     });
     let ledger = ledger_dir();
     if let Some(dir) = ledger.as_deref() {
-        write_ledger_in(dir, &job_id, pid, started_at_ms, &command, None);
+        write_ledger_in(dir, &job_id, pid, started_at_ms, &command, None, None, None);
     }
 
     let ledger_job_id = job_id.clone();
@@ -129,12 +133,13 @@ pub(crate) fn start_background_job(
         let status = child.wait();
         let exit_code = status.ok().and_then(|status| status.code());
         let finished_at_ms = now_ms();
-        {
+        let (owner, cleanup) = {
             let mut guard = lock(&state);
             guard.finished = true;
             guard.exit_code = exit_code;
             guard.finished_at_ms = Some(finished_at_ms);
-        }
+            (guard.owner.clone(), guard.cleanup.clone())
+        };
         if let Some(dir) = ledger.as_deref() {
             write_ledger_in(
                 dir,
@@ -143,6 +148,8 @@ pub(crate) fn start_background_job(
                 started_at_ms,
                 &ledger_command,
                 Some((exit_code, finished_at_ms)),
+                owner.as_deref(),
+                cleanup.as_deref(),
             );
         }
     });
@@ -245,6 +252,41 @@ fn kill_process_group(pid: u32) -> bool {
     }
 }
 
+/// J3: attach the owning Session/execution to a live job. Called by the
+/// runtime/gateway when it observes a `backgroundTaskId` in a tool result.
+pub fn register_owner(workspace_root: &Path, job_id: &str, owner_id: &str) -> bool {
+    match find(workspace_root, job_id) {
+        Some(job) => {
+            lock(&job.state).owner = Some(owner_id.to_string());
+            true
+        }
+        None => false,
+    }
+}
+
+/// J3: kill every live job owned by `owner_id` (across workspaces), recording
+/// `reason` as cleanup evidence. Returns the killed job ids.
+pub fn kill_by_owner(owner_id: &str, reason: &str) -> Vec<String> {
+    let jobs: Vec<Arc<Job>> = {
+        let map = lock(registry());
+        map.values()
+            .filter(|job| {
+                let guard = lock(&job.state);
+                guard.owner.as_deref() == Some(owner_id) && !guard.finished
+            })
+            .cloned()
+            .collect()
+    };
+    let mut killed = Vec::new();
+    for job in jobs {
+        lock(&job.state).cleanup = Some(reason.to_string());
+        if kill_process_group(job.pid) {
+            killed.push(job.job_id.clone());
+        }
+    }
+    killed
+}
+
 /// Durable pid ledger directory (survives process restart).
 fn ledger_dir() -> Option<std::path::PathBuf> {
     #[cfg(test)]
@@ -274,6 +316,8 @@ fn write_ledger_in(
     started_at_ms: u64,
     command: &str,
     terminal: Option<(Option<i32>, u64)>,
+    owner: Option<&str>,
+    cleanup: Option<&str>,
 ) {
     let value = json!({
         "jobId": job_id,
@@ -284,6 +328,8 @@ fn write_ledger_in(
         "command": command,
         "finishedAtMs": terminal.map(|(_, at)| at),
         "exitCode": terminal.and_then(|(code, _)| code),
+        "owner": owner,
+        "cleanup": cleanup,
     });
     let _ = std::fs::write(dir.join(format!("{job_id}.json")), value.to_string());
 }
@@ -540,6 +586,29 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(jobs.join("bg-done.json")).unwrap())
                 .unwrap();
         assert_eq!(done["finishedAtMs"], json!(2));
+
+        set_ledger_dir(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn owner_registration_fences_jobs_by_session() {
+        let dir = std::env::temp_dir().join(format!("bg-owner-{}", now_ms()));
+        let jobs = dir.join("bg-jobs");
+        std::fs::create_dir_all(&jobs).unwrap();
+        set_ledger_dir(Some(jobs.clone()));
+        let root = std::env::temp_dir();
+        let command = "sleep 30";
+        let job_id =
+            start_background_job(spawn(command), command.to_string(), "/tmp".into(), &root);
+
+        assert!(register_owner(&root, &job_id, "session-A"));
+        let killed = kill_by_owner("session-A", "session_closed");
+        assert_eq!(killed, vec![job_id.clone()]);
+        let status = wait_until_finished(&root, &job_id);
+        assert_eq!(status["running"], json!(false));
+        // A different owner fences nothing.
+        assert!(kill_by_owner("session-B", "session_closed").is_empty());
 
         set_ledger_dir(None);
         let _ = std::fs::remove_dir_all(&dir);
