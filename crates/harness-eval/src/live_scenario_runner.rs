@@ -4257,6 +4257,33 @@ fn has_successful_runtime_tool_completion(
     expected_tool_name: &str,
     expected_target_path: &str,
 ) -> bool {
+    // Reading via a batch is still reading the same file, and the model may
+    // pass an absolute path. Accept equivalent tools and path forms so the
+    // acceptance checks the *action*, not a presentation choice.
+    let accepts_tool = |name: &str| match expected_tool_name {
+        "read_file" => matches!(name, "read_file" | "read_many"),
+        other => name == other,
+    };
+    let target = expected_target_path.trim_start_matches("./");
+    let accepts_path = |path: &str| {
+        let path = path.trim_start_matches("./");
+        path == target || path.ends_with(&format!("/{target}"))
+    };
+    let input_path = |input: &Value| -> Option<String> {
+        input
+            .get("path")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .or_else(|| {
+                input
+                    .get("files")
+                    .and_then(Value::as_array)
+                    .and_then(|files| files.first())
+                    .and_then(|file| file.get("path"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            })
+    };
     timeline
         .get("events")
         .and_then(Value::as_array)
@@ -4266,21 +4293,18 @@ fn has_successful_runtime_tool_completion(
             event.get("kind").and_then(Value::as_str) == Some("tool.invocation.completed")
                 && event.get("status").and_then(Value::as_str) == Some("completed")
                 && event.pointer("/payload/status").and_then(Value::as_str) == Some("completed")
-                && event.pointer("/payload/tool_name").and_then(Value::as_str)
-                    == Some(expected_tool_name)
+                && event
+                    .pointer("/payload/tool_name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| accepts_tool(name))
                 && event.pointer("/payload/is_error").and_then(Value::as_bool) == Some(false)
                 && event
                     .pointer("/payload/input_preview")
                     .and_then(Value::as_str)
                     .and_then(|input| serde_json::from_str::<Value>(input).ok())
-                    .and_then(|input| {
-                        input
-                            .get("path")
-                            .and_then(Value::as_str)
-                            .map(ToString::to_string)
-                    })
+                    .and_then(|input| input_path(&input))
                     .as_deref()
-                    == Some(expected_target_path)
+                    .is_some_and(|path| accepts_path(path))
                 && ["invocation_id", "tool_call_id"].iter().all(|key| {
                     event
                         .get("payload")

@@ -1609,18 +1609,25 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
         payload["stream_options"] = json!({ "include_usage": true });
     }
 
-    if let Some(tools) = &request.tools {
+    if let Some(tools) = request.tools.as_ref().filter(|tools| !tools.is_empty()) {
         payload["tools"] =
             Value::Array(tools.iter().map(openai_tool_definition).collect::<Vec<_>>());
     }
     if let Some(tool_choice) = &request.tool_choice {
-        // `tool_choice` is only valid when at least one tool schema is present;
-        // sending `required` (or a named tool) with an empty `tools` array is a
-        // 400 on strict OpenAI-compatible servers and stalls Agent execution.
-        if request
-            .tools
-            .as_ref()
-            .is_some_and(|tools| !tools.is_empty())
+        // `tool_choice` is only valid when at least one tool schema is present,
+        // and a named tool must be among them; strict OpenAI-compatible servers
+        // reject the request otherwise, which stalls Agent execution.
+        let choice_available = match tool_choice {
+            ToolChoice::Tool { name } => request
+                .tools
+                .as_ref()
+                .is_some_and(|tools| tools.iter().any(|tool| &tool.name == name)),
+            _ => request
+                .tools
+                .as_ref()
+                .is_some_and(|tools| !tools.is_empty()),
+        };
+        if choice_available
             && !ProviderCapabilityProfile::explicit_tool_choice_known_unsupported(
                 &request.model,
                 request.reasoning_effort.as_deref(),
@@ -1697,7 +1704,7 @@ fn build_responses_request(request: &MessageRequest) -> Value {
         "stream": request.stream,
     });
 
-    if let Some(tools) = &request.tools {
+    if let Some(tools) = request.tools.as_ref().filter(|tools| !tools.is_empty()) {
         payload["tools"] = Value::Array(
             tools
                 .iter()
@@ -1706,10 +1713,17 @@ fn build_responses_request(request: &MessageRequest) -> Value {
         );
     }
     if let Some(tool_choice) = &request.tool_choice {
-        if request
-            .tools
-            .as_ref()
-            .is_some_and(|tools| !tools.is_empty())
+        let choice_available = match tool_choice {
+            ToolChoice::Tool { name } => request
+                .tools
+                .as_ref()
+                .is_some_and(|tools| tools.iter().any(|tool| &tool.name == name)),
+            _ => request
+                .tools
+                .as_ref()
+                .is_some_and(|tools| !tools.is_empty()),
+        };
+        if choice_available
             && !ProviderCapabilityProfile::explicit_tool_choice_known_unsupported(
                 &request.model,
                 request.reasoning_effort.as_deref(),
@@ -3725,12 +3739,33 @@ mod tests {
             tool_choice: Some(ToolChoice::Any),
             ..Default::default()
         };
-        assert!(
-            build_chat_completion_request(&request, OpenAiCompatConfig::openai())
-                .get("tool_choice")
-                .is_none()
-        );
-        assert!(build_responses_request(&request).get("tool_choice").is_none());
+        for payload in [
+            build_chat_completion_request(&request, OpenAiCompatConfig::openai()),
+            build_responses_request(&request),
+        ] {
+            assert!(payload.get("tool_choice").is_none());
+            assert!(payload.get("tools").is_none());
+        }
+
+        // A named tool that is not among the exposed schemas must not be forced.
+        let named = MessageRequest {
+            tools: Some(vec![ToolDefinition {
+                name: "read_file".to_string(),
+                description: None,
+                input_schema: json!({"type":"object"}),
+            }]),
+            tool_choice: Some(ToolChoice::Tool {
+                name: "write_file".to_string(),
+            }),
+            ..request
+        };
+        for payload in [
+            build_chat_completion_request(&named, OpenAiCompatConfig::openai()),
+            build_responses_request(&named),
+        ] {
+            assert!(payload.get("tool_choice").is_none());
+            assert!(payload.get("tools").is_some());
+        }
     }
 
     #[test]
