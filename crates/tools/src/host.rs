@@ -323,12 +323,24 @@ impl ToolHostLease {
             .catalog
             .canonical_name(tool_id)
             .unwrap_or_else(|| tool_id.to_string());
-        let permission = self
+        let mut permission = self
             .snapshot
             .catalog
             .required_permission(&canonical_id)
             .unwrap_or(ToolPermissionMode::DangerFullAccess);
-        let resolver = self.snapshot.catalog.effect_resolver(&canonical_id);
+        let mut resolver = self.snapshot.catalog.effect_resolver(&canonical_id);
+        if canonical_id == "tool_orchestrate" {
+            // The orchestration effect is the strictest effect among its
+            // sub-calls. The resolver cannot see the catalog, so escalate here
+            // and let `builtin.orchestrate` shape the descriptor. Unparseable
+            // input fails closed to DangerFullAccess.
+            permission =
+                orchestration_escalated_permission(&self.snapshot.catalog, input, permission);
+            resolver = harness_contract::tool::ToolEffectResolverSpec {
+                resolver_id: "builtin.orchestrate".to_string(),
+                resolver_version: 1,
+            };
+        }
         resolve_registered_tool_effect(&resolver, &canonical_id, input, permission)
     }
 
@@ -913,6 +925,27 @@ fn parse_mcp_runtime_id(tool_id: &str) -> Option<(&str, &str)> {
     }
 }
 
+/// Strictest catalog permission among the tools an orchestration input will
+/// dispatch, folding in the orchestration tool's own catalog floor. Failures to
+/// parse the input fail closed to `DangerFullAccess`.
+fn orchestration_escalated_permission(
+    catalog: &ToolCatalog,
+    input: &Value,
+    floor: ToolPermissionMode,
+) -> ToolPermissionMode {
+    match crate::requested_sub_call_tools("tool_orchestrate", input) {
+        crate::SubCallAuthorization::Requires(names) => names.iter().fold(floor, |acc, name| {
+            let sub = catalog
+                .required_permission(name)
+                .unwrap_or(ToolPermissionMode::DangerFullAccess);
+            crate::tool_orchestrator::stricter_permission(acc, sub)
+        }),
+        crate::SubCallAuthorization::NotOrchestration | crate::SubCallAuthorization::Invalid(_) => {
+            ToolPermissionMode::DangerFullAccess
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1235,5 +1268,45 @@ mod tests {
             Some(("filesystem", "read__file"))
         );
         assert_eq!(parse_mcp_runtime_id("runtime_tool"), None);
+    }
+
+    #[test]
+    fn tool_orchestrate_effect_escalates_to_the_strictest_sub_call() {
+        use harness_contract::tool::ToolEffectKind;
+
+        let host = ToolHost::builtin("orchestrate-effect", std::env::temp_dir());
+        let lease = host.pin_snapshot();
+
+        let read_only = lease.describe_effect(
+            "tool_orchestrate",
+            &serde_json::json!({
+                "steps": [{"id": "g", "op": "call", "tool": "grep_search", "input": {"pattern": "x"}}]
+            }),
+        );
+        assert_eq!(read_only.effect_kind, ToolEffectKind::Read);
+        assert_eq!(read_only.required_permission, ToolPermissionMode::ReadOnly);
+        assert_eq!(
+            read_only.approval_class,
+            harness_contract::tool::ToolApprovalClass::None
+        );
+
+        let writes = lease.describe_effect(
+            "tool_orchestrate",
+            &serde_json::json!({
+                "steps": [{"id": "w", "op": "call", "tool": "write_file", "input": {"path": "x", "content": "y"}}]
+            }),
+        );
+        assert_eq!(writes.effect_kind, ToolEffectKind::Write);
+        assert_eq!(
+            writes.required_permission,
+            ToolPermissionMode::WorkspaceWrite
+        );
+
+        // Unparseable input fails closed.
+        let invalid = lease.describe_effect("tool_orchestrate", &serde_json::json!({"bad": true}));
+        assert_eq!(
+            invalid.required_permission,
+            ToolPermissionMode::DangerFullAccess
+        );
     }
 }

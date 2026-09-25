@@ -1,4 +1,4 @@
-//! Declarative read-only orchestration (`tool_orchestrate`).
+//! Declarative orchestration (`tool_orchestrate`).
 //!
 //! One model call can express a small bounded program over the workspace:
 //! sequential calls, a `map` over a result list, `filter`/`collect`
@@ -7,10 +7,12 @@
 //! no general expression language is needed, which keeps it auditable and
 //! friendly to weaker models.
 //!
-//! Safety boundary: every sub-call is restricted to the curated read-only batch
-//! allow-list (`is_allowed_readonly_batch_tool`). `tool_orchestrate` therefore
-//! cannot widen the model's authority: it only composes tools the model can
-//! already call, and never mutates the workspace. `compute` reuses the existing
+//! Safety boundary: every sub-call is restricted to
+//! `is_allowed_orchestration_tool` (read-only query tools plus workspace
+//! writes) AND, at the runtime/gateway, to the caller's own allow-list before
+//! delegation. Write steps run in declaration order under the per-call scope
+//! lock, and the call's effect escalates to the strictest sub-call, so a write
+//! orchestration requires write authorization. `compute` reuses the existing
 //! kernel-hardened, read-only, network-off `execute_code` sandbox.
 
 use std::collections::BTreeMap;
@@ -19,7 +21,7 @@ use base64::Engine;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
-use crate::executor::{execute_with_lease, is_allowed_readonly_batch_tool};
+use crate::executor::{execute_with_lease, is_allowed_orchestration_tool};
 use crate::ToolHostLease;
 
 /// Upper bounds keep one orchestration call bounded in calls and output.
@@ -295,18 +297,35 @@ fn evaluate(
             let list = resolve_ref(over, state, None)?;
             let items = list
                 .as_array()
-                .ok_or_else(|| format!("map.over `{over}` must resolve to an array"))?;
+                .ok_or_else(|| format!("map.over `{over}` must resolve to an array"))?
+                .clone();
             if items.len() > MAX_MAP_ITEMS {
                 return Err(format!(
                     "map.over has {} items, over the limit of {MAX_MAP_ITEMS}",
                     items.len()
                 ));
             }
-            let mut outputs = Vec::with_capacity(items.len());
-            for item in items {
-                let resolved = resolve_value(input, state, Some(item))?;
-                let output = call_tool(lease, tool, &resolved, total_calls)?;
-                outputs.push(select_field(output, field.as_deref()));
+            if *total_calls + items.len() > MAX_TOTAL_CALLS {
+                return Err(format!(
+                    "tool_orchestrate exceeded the total sub-call limit of {MAX_TOTAL_CALLS}"
+                ));
+            }
+            // Bounded parallel fan-out, matching `read_many`/`grep_many`.
+            let results = crate::executor::run_ordered_batch(items.clone(), None, |item| {
+                let resolved = resolve_value(input, state, Some(&item))?;
+                call_tool_uncounted(lease, tool, &resolved)
+            });
+            *total_calls += items.len();
+            let mut outputs = Vec::with_capacity(results.len());
+            for result in results {
+                match result.output {
+                    Some(value) => outputs.push(select_field(value, field.as_deref())),
+                    None => {
+                        return Err(result
+                            .error
+                            .unwrap_or_else(|| "map sub-call failed".to_string()))
+                    }
+                }
             }
             Ok(Value::Array(outputs))
         }
@@ -411,12 +430,18 @@ fn call_tool(
     input: &Value,
     total_calls: &mut usize,
 ) -> Result<Value, String> {
-    if !is_allowed_readonly_batch_tool(tool) {
+    bump(total_calls)?;
+    call_tool_uncounted(lease, tool, input)
+}
+
+/// Dispatch one allowed sub-call without touching the shared call counter, so
+/// the `map` step can fan out in parallel and count once.
+fn call_tool_uncounted(lease: &ToolHostLease, tool: &str, input: &Value) -> Result<Value, String> {
+    if !is_allowed_orchestration_tool(tool) {
         return Err(format!(
-            "tool_orchestrate is read-only: `{tool}` is not an allowed query tool"
+            "tool_orchestrate cannot dispatch `{tool}`: not an allowed orchestration tool"
         ));
     }
-    bump(total_calls)?;
     let output = execute_with_lease(lease, tool, input)?;
     Ok(serde_json::from_str(&output).unwrap_or(Value::String(output)))
 }

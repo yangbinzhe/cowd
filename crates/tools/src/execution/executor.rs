@@ -754,6 +754,23 @@ pub(crate) fn is_allowed_readonly_batch_tool(name: &str) -> bool {
     )
 }
 
+/// Tools `tool_orchestrate` may dispatch: the read-only query set plus
+/// workspace writes. `tool_orchestrate` itself is excluded (no nesting), and
+/// every name is additionally checked against the caller's allow-list by the
+/// runtime/gateway before delegation.
+pub(crate) fn is_allowed_orchestration_tool(name: &str) -> bool {
+    is_allowed_readonly_batch_tool(name)
+        || matches!(
+            name,
+            "write_file"
+                | "edit_file"
+                | "apply_patch_transaction"
+                | "notebook_edit"
+                | "todo_write"
+                | "checkpoint_restore"
+        )
+}
+
 #[derive(Debug, Serialize)]
 struct BatchToolOutput {
     #[serde(rename = "type")]
@@ -814,7 +831,7 @@ fn batch_output_internal(
     }
 }
 
-fn run_ordered_batch<T, F>(
+pub(crate) fn run_ordered_batch<T, F>(
     items: Vec<T>,
     max_concurrency: Option<usize>,
     operation: F,

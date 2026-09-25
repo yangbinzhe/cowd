@@ -24,7 +24,15 @@ pub fn resolve_registered_tool_effect(
     input: &Value,
     catalog_permission: ToolPermissionMode,
 ) -> ToolEffectDescriptor {
-    let mut properties = resolve_effect_properties(resolver, tool_id, input);
+    // `builtin.orchestrate` derives its effect from the caller-computed
+    // escalated permission (the strictest effect among the orchestrated
+    // sub-calls). The resolver itself cannot see the catalog, so the escalated
+    // strength is passed in as `catalog_permission`.
+    let mut properties = if resolver.resolver_id == "builtin.orchestrate" {
+        orchestration_properties(catalog_permission, resource_target(input))
+    } else {
+        resolve_effect_properties(resolver, tool_id, input)
+    };
     properties.required_permission =
         stricter_permission(properties.required_permission, catalog_permission);
 
@@ -565,6 +573,61 @@ fn is_known_read_only_words(words: &[String]) -> bool {
     }
 }
 
+/// Effect properties for an orchestration tool, derived from the strictest
+/// sub-call permission the caller escalated to.
+fn orchestration_properties(
+    permission: ToolPermissionMode,
+    target: Option<String>,
+) -> EffectProperties {
+    match permission {
+        ToolPermissionMode::ReadOnly => EffectProperties {
+            effect_kind: ToolEffectKind::Read,
+            idempotency: ToolIdempotency::Idempotent,
+            scopes: vec![scope(
+                PermissionResource::Tool,
+                PermissionOperation::Read,
+                target,
+            )],
+            required_permission: ToolPermissionMode::ReadOnly,
+            approval_class: ToolApprovalClass::None,
+            uses_network: false,
+            spawns_process: false,
+            mutates_packages: false,
+            mutates_system: false,
+        },
+        ToolPermissionMode::WorkspaceWrite => EffectProperties {
+            effect_kind: ToolEffectKind::Write,
+            idempotency: ToolIdempotency::Unknown,
+            scopes: vec![scope(
+                PermissionResource::Tool,
+                PermissionOperation::Write,
+                target,
+            )],
+            required_permission: ToolPermissionMode::WorkspaceWrite,
+            approval_class: ToolApprovalClass::Policy,
+            uses_network: false,
+            spawns_process: false,
+            mutates_packages: false,
+            mutates_system: false,
+        },
+        ToolPermissionMode::DangerFullAccess => EffectProperties {
+            effect_kind: ToolEffectKind::Destructive,
+            idempotency: ToolIdempotency::Unknown,
+            scopes: vec![scope(
+                PermissionResource::Tool,
+                PermissionOperation::Control,
+                target,
+            )],
+            required_permission: ToolPermissionMode::DangerFullAccess,
+            approval_class: ToolApprovalClass::User,
+            uses_network: false,
+            spawns_process: true,
+            mutates_packages: false,
+            mutates_system: false,
+        },
+    }
+}
+
 fn conservative_unknown(target: Option<String>) -> EffectProperties {
     EffectProperties {
         effect_kind: ToolEffectKind::Unknown,
@@ -605,7 +668,10 @@ fn tool_id_target(name: &str, input: &Value) -> Option<String> {
     resource_target(input).or_else(|| Some(name.to_string()))
 }
 
-fn stricter_permission(left: ToolPermissionMode, right: ToolPermissionMode) -> ToolPermissionMode {
+pub(crate) fn stricter_permission(
+    left: ToolPermissionMode,
+    right: ToolPermissionMode,
+) -> ToolPermissionMode {
     if permission_rank(left) >= permission_rank(right) {
         left
     } else {

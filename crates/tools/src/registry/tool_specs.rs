@@ -22,6 +22,9 @@ pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
         // with a bounded timeout/output budget.  It must not inherit the
         // arbitrary host-shell descriptor used by `bash`.
         "execute_code" => "builtin.sandboxed_command",
+        // Effect is the strictest effect among the orchestrated sub-calls; the
+        // host computes the escalation and this resolver shapes the descriptor.
+        "tool_orchestrate" => "builtin.orchestrate",
         "read_file"
         | "read_many"
         | "glob_search"
@@ -41,7 +44,6 @@ pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
         | "question"
         | "ask_user_question"
         | "tool_search"
-        | "tool_orchestrate"
         | "structured_output"
         | "current_time"
         | "get_context_remaining"
@@ -602,7 +604,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 {op:\"when\", id, if:{ref, present|equals|contains|nonEmpty}, tool, input}; \
                 {op:\"repeat\", id, max (<=25), while:{ref,...}, tool, input}; \
                 {op:\"compute\", id, language:\"python|javascript\", code, input} - data arrives in `_input`. \
-                Only read-only query tools are allowed; compute runs in the read-only, network-off sandbox. \
+                Any tool the caller is authorized for may be orchestrated; write steps run in declaration \
+                order and the call's effect escalates to the strictest sub-call (a write orchestration \
+                therefore needs write authorization). compute runs in the read-only, network-off sandbox. \
                 Use `return:\"$<id>\"` to select the result. The response includes a `calls` trace \
                 (stepId/op/tool/calls/status/durationMs) of every step for evidence.",
             input_schema: json!({

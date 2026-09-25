@@ -1942,7 +1942,7 @@ fn tool_orchestrate_maps_and_aggregates_readonly_queries_in_one_call() {
 }
 
 #[test]
-fn tool_orchestrate_rejects_non_readonly_tools() {
+fn tool_orchestrate_rejects_tools_outside_the_orchestration_allow_list() {
     let root = temp_path("tool-orchestrate-reject");
     fs::create_dir_all(&root).expect("workspace");
 
@@ -1951,12 +1951,40 @@ fn tool_orchestrate_rejects_non_readonly_tools() {
         "tool_orchestrate",
         &json!({
             "steps": [
-                {"id": "w", "op": "call", "tool": "write_file", "input": {"path": "x.txt", "content": "x"}}
+                {"id": "b", "op": "call", "tool": "bash", "input": {"command": "echo hi"}}
             ]
         }),
     )
-    .expect_err("write tools must be rejected by tool_orchestrate");
-    assert!(error.contains("read-only"), "unexpected error: {error}");
+    .expect_err("bash must not be orchestrated");
+    assert!(error.contains("bash"), "unexpected error: {error}");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn tool_orchestrate_can_write_and_then_read_in_one_call() {
+    let root = temp_path("tool-orchestrate-write");
+    fs::create_dir_all(&root).expect("workspace");
+
+    let output = execute_in_workspace(
+        &root,
+        "tool_orchestrate",
+        &json!({
+            "steps": [
+                {"id": "w", "op": "call", "tool": "write_file", "input": {"path": "made.txt", "content": "written by orchestrate\n"}},
+                {"id": "r", "op": "call", "tool": "read_file", "input": {"path": "made.txt"}}
+            ],
+            "return": "$r"
+        }),
+    )
+    .expect("write+read orchestration should succeed");
+
+    let parsed: serde_json::Value = serde_json::from_str(&output).expect("json");
+    assert!(parsed["result"]["file"]["content"]
+        .as_str()
+        .expect("content")
+        .contains("written by orchestrate"));
+    assert!(root.join("made.txt").exists());
 
     let _ = fs::remove_dir_all(&root);
 }
