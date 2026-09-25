@@ -2589,6 +2589,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
+ "tools",
  "tracing",
  "uuid",
  "walkdir",

@@ -10,6 +10,7 @@ impl GatewayToolExecutor {
             .ok_or_else(|| ToolError::new(format!("tool `{tool_name}` is not registered")))?;
         let value: serde_json::Value = serde_json::from_str(input)
             .map_err(|error| self.input_contract_error(&tool_name, error))?;
+        self.reject_orchestrated_tools_outside_allow_list(&tool_name, &value)?;
         if tool_name == "tool_search"
             || is_gateway_runtime_control_tool(&tool_name)
             || is_gateway_context_tool(&tool_name)
@@ -29,7 +30,7 @@ impl GatewayToolExecutor {
                         session_id: self.runtime_session_id.as_deref(),
                         authorized_scopes: &[],
                         memory_context: self.runtime_memory_context.as_ref(),
-                reality_context: None,
+                        reality_context: None,
                         model_lease: self.runtime_model_lease.as_deref(),
                         parent_execution: None,
                         execution_decision: None,
@@ -88,7 +89,10 @@ impl GatewayToolExecutor {
             ToolError::new("evidence_retrieve requires the workspace RuntimeServices")
         })?;
         let selector = input.evidence_ref.clone();
-        if !selector.starts_with("tool://") && !selector.starts_with("artifact://") && !selector.starts_with("approval:v1:") {
+        if !selector.starts_with("tool://")
+            && !selector.starts_with("artifact://")
+            && !selector.starts_with("approval:v1:")
+        {
             return serde_json::to_string_pretty(&serde_json::json!({
                 "kind": "evidence_retrieve",
                 "evidence_ref": input.evidence_ref,
@@ -100,9 +104,14 @@ impl GatewayToolExecutor {
         }
         let store = services.artifact_store();
         let artifact = if selector.starts_with("approval:v1:") {
-            let session_id = session_id.ok_or_else(|| ToolError::new("external decisions require an authenticated Session"))?;
-            services.approval_result_content(session_id, &selector).await
-                .map_err(ToolError::new)?.0
+            let session_id = session_id.ok_or_else(|| {
+                ToolError::new("external decisions require an authenticated Session")
+            })?;
+            services
+                .approval_result_content(session_id, &selector)
+                .await
+                .map_err(ToolError::new)?
+                .0
         } else if let Some(evidence_id) = selector.strip_prefix("tool://") {
             let Some(session_id) = session_id else {
                 return serde_json::to_string_pretty(&serde_json::json!({
@@ -166,9 +175,14 @@ impl GatewayToolExecutor {
         let (content, encoding) = match std::str::from_utf8(&bytes) {
             Ok(text) => (text.to_string(), "utf8"),
             Err(_) => {
-                if input.query.is_some() { return Err(ToolError::new("binary evidence does not support a text query; read without query or materialize the exact artifact")); }
+                if input.query.is_some() {
+                    return Err(ToolError::new("binary evidence does not support a text query; read without query or materialize the exact artifact"));
+                }
                 use base64::Engine;
-                (base64::engine::general_purpose::STANDARD.encode(&bytes), "base64")
+                (
+                    base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    "base64",
+                )
             }
         };
         let page = evidence_content_page(&content, &artifact.sha256, &input)?;

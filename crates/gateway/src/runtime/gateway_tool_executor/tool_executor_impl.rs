@@ -35,6 +35,7 @@ impl ToolExecutor for GatewayToolExecutor {
         }
         let value = serde_json::from_str(input)
             .map_err(|error| self.input_contract_error(tool_name, error))?;
+        self.reject_orchestrated_tools_outside_allow_list(tool_name, &value)?;
         let result = if tool_name == "tool_search" {
             self.execute_search_tool(value)
         } else if is_gateway_runtime_control_tool(tool_name) || is_gateway_context_tool(tool_name) {
@@ -185,5 +186,36 @@ impl ToolExecutor for GatewayToolExecutor {
             .runtime_execution_decision
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(decision);
+    }
+}
+
+impl GatewayToolExecutor {
+    /// A composite orchestration tool dispatches sub-calls from inside the
+    /// tools crate, bypassing `execute_output`'s top-level allow-list check.
+    /// Validate every requested sub-call before delegation so the call fails
+    /// closed and no sub-call runs. A missing allow-list means unrestricted,
+    /// matching the executor's existing semantics.
+    fn reject_orchestrated_tools_outside_allow_list(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> Result<(), ToolError> {
+        match tools::requested_sub_call_tools(tool_name, input) {
+            tools::SubCallAuthorization::NotOrchestration => Ok(()),
+            tools::SubCallAuthorization::Invalid(reason) => Err(ToolError::new(reason)),
+            tools::SubCallAuthorization::Requires(names) => {
+                let Some(allowed) = self.allowed_tools.as_ref() else {
+                    return Ok(());
+                };
+                for name in names {
+                    if !allowed.contains(&name) {
+                        return Err(ToolError::new(format!(
+                            "orchestrated tool `{name}` is not enabled by the current --allowedTools setting"
+                        )));
+                    }
+                }
+                Ok(())
+            }
+        }
     }
 }

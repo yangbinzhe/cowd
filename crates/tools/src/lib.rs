@@ -542,6 +542,7 @@ fn value_hash(value: &Value) -> String {
 }
 #[path = "execution/executor.rs"]
 pub mod executor;
+pub use executor::orchestrate::{requested_sub_call_tools, SubCallAuthorization};
 pub(crate) use executor::*;
 #[path = "host.rs"]
 pub mod host;

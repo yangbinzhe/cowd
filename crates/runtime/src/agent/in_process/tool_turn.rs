@@ -531,6 +531,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
                 "tool `{tool_name}` is outside the AgentTaskPacket allow-list"
             )));
         }
+        reject_orchestrated_tools_outside_allow_list(&self.allowed_tools, tool_name, input)?;
         let normalized_input = normalize_delegated_resource_paths(
             tool_name,
             input,
@@ -653,6 +654,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
                 "agent tool authorization does not match the allowed tool request",
             ));
         }
+        reject_orchestrated_tools_outside_allow_list(&self.allowed_tools, tool_name, input)?;
         let normalized_input = normalize_delegated_resource_paths(
             tool_name,
             input,
@@ -747,6 +749,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
                 "agent tool authorization does not match the allowed tool request",
             ));
         }
+        reject_orchestrated_tools_outside_allow_list(&self.allowed_tools, tool_name, input)?;
         let normalized_input = normalize_delegated_resource_paths(
             tool_name,
             input,
@@ -787,5 +790,105 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
         self.host
             .delegated_tool_effect_descriptor(tool_name, &input)
             .map(|effect| crate::ToolSafetyCategory::from_effect(&effect))
+    }
+}
+
+/// A composite orchestration tool dispatches sub-calls from inside the tools
+/// crate, which would otherwise bypass this executor's `allowed_tools` check.
+/// Validate every requested sub-call up front so the whole call fails closed
+/// before any sub-call executes.
+fn reject_orchestrated_tools_outside_allow_list(
+    allowed: &std::collections::BTreeSet<String>,
+    tool_name: &str,
+    input: &str,
+) -> Result<(), ToolError> {
+    let parsed =
+        serde_json::from_str::<serde_json::Value>(input).unwrap_or(serde_json::Value::Null);
+    match tools::requested_sub_call_tools(tool_name, &parsed) {
+        tools::SubCallAuthorization::NotOrchestration => Ok(()),
+        tools::SubCallAuthorization::Invalid(reason) => Err(ToolError::new(reason)),
+        tools::SubCallAuthorization::Requires(names) => {
+            for name in names {
+                if !allowed.contains(&name) {
+                    return Err(ToolError::new(format!(
+                        "orchestrated tool `{name}` is outside the AgentTaskPacket allow-list"
+                    )));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn allowed(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    #[test]
+    fn rejects_orchestrated_tools_outside_the_allow_list() {
+        let input = serde_json::json!({
+            "steps": [
+                {"id": "g", "op": "call", "tool": "glob_search", "input": {}},
+                {"id": "r", "op": "map", "over": "$g.filenames", "tool": "read_file", "input": {}}
+            ]
+        })
+        .to_string();
+
+        assert!(reject_orchestrated_tools_outside_allow_list(
+            &allowed(&["glob_search", "read_file"]),
+            "tool_orchestrate",
+            &input
+        )
+        .is_ok());
+
+        let error = reject_orchestrated_tools_outside_allow_list(
+            &allowed(&["glob_search"]),
+            "tool_orchestrate",
+            &input,
+        )
+        .expect_err("read_file is not allowed");
+        assert!(error.to_string().contains("read_file"), "got: {error}");
+
+        assert!(reject_orchestrated_tools_outside_allow_list(
+            &allowed(&[]),
+            "read_file",
+            "{\"path\":\"x\"}"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn compute_requires_execute_code_in_the_allow_list() {
+        let input = serde_json::json!({
+            "steps": [{"id": "c", "op": "compute", "language": "python", "code": "print(1)", "input": []}]
+        })
+        .to_string();
+        assert!(reject_orchestrated_tools_outside_allow_list(
+            &allowed(&["execute_code"]),
+            "tool_orchestrate",
+            &input
+        )
+        .is_ok());
+        assert!(reject_orchestrated_tools_outside_allow_list(
+            &allowed(&[]),
+            "tool_orchestrate",
+            &input
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn invalid_orchestration_input_fails_closed() {
+        assert!(reject_orchestrated_tools_outside_allow_list(
+            &allowed(&["read_file"]),
+            "tool_orchestrate",
+            "not json"
+        )
+        .is_err());
     }
 }

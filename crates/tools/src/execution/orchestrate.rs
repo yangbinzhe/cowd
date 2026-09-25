@@ -147,6 +147,58 @@ pub(crate) fn run_orchestrate(lease: &ToolHostLease, input: &Value) -> Result<St
         .map_err(|error| error.to_string())
 }
 
+/// What a composite (orchestration) tool wants to dispatch, so the
+/// authorization owner can fail closed *before* any delegation happens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubCallAuthorization {
+    /// The tool is not a composite orchestrator; no extra check applies.
+    NotOrchestration,
+    /// The tool will dispatch exactly these tools; each must be authorized.
+    Requires(Vec<String>),
+    /// The composite input cannot be trusted; the caller must reject it.
+    Invalid(String),
+}
+
+/// Extract the literal tool names an orchestration input would dispatch.
+///
+/// Reuses the same `OrchestrateInput`/`StepKind` parser the evaluator uses, so
+/// the authorization set can never drift from what actually runs. `compute`
+/// requires `execute_code`. A `tool` value containing `$` is rejected: tool
+/// names are literals, never reference-resolved. Returns `NotOrchestration`
+/// for every non-orchestration tool.
+pub fn requested_sub_call_tools(tool_name: &str, input: &Value) -> SubCallAuthorization {
+    if tool_name != "tool_orchestrate" {
+        return SubCallAuthorization::NotOrchestration;
+    }
+    let parsed: OrchestrateInput = match serde_json::from_value(input.clone()) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return SubCallAuthorization::Invalid(format!(
+                "tool_orchestrate input is invalid: {error}"
+            ))
+        }
+    };
+    let mut names = Vec::new();
+    for step in &parsed.steps {
+        match &step.kind {
+            StepKind::Call { tool, .. }
+            | StepKind::Map { tool, .. }
+            | StepKind::When { tool, .. }
+            | StepKind::Repeat { tool, .. } => names.push(tool.clone()),
+            StepKind::Compute { .. } => names.push("execute_code".to_string()),
+            StepKind::Filter { .. } | StepKind::Collect { .. } => {}
+        }
+    }
+    if let Some(bad) = names.iter().find(|name| name.contains('$')) {
+        return SubCallAuthorization::Invalid(format!(
+            "orchestrated tool name `{bad}` must be a literal, not a $reference"
+        ));
+    }
+    names.sort();
+    names.dedup();
+    SubCallAuthorization::Requires(names)
+}
+
 fn evaluate(
     lease: &ToolHostLease,
     kind: &StepKind,
@@ -566,5 +618,43 @@ mod tests {
         assert!(!is_reference("$HOME/x"));
         assert!(is_reference("$item.path"));
         assert!(is_reference("$m"));
+    }
+
+    #[test]
+    fn extracts_literal_sub_calls_and_maps_compute_to_execute_code() {
+        let input = json!({
+            "steps": [
+                {"id": "g", "op": "call", "tool": "glob_search", "input": {}},
+                {"id": "r", "op": "map", "over": "$g.filenames", "tool": "read_file", "input": {}},
+                {"id": "c", "op": "compute", "language": "python", "code": "print(1)", "input": []},
+                {"id": "w", "op": "when", "if": {"ref": "$x", "present": true}, "tool": "grep_search", "input": {}}
+            ]
+        });
+        match requested_sub_call_tools("tool_orchestrate", &input) {
+            SubCallAuthorization::Requires(names) => assert_eq!(
+                names,
+                vec!["execute_code", "glob_search", "grep_search", "read_file"]
+            ),
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(
+            requested_sub_call_tools("read_file", &json!({})),
+            SubCallAuthorization::NotOrchestration
+        );
+    }
+
+    #[test]
+    fn rejects_reference_tool_names_and_unparseable_input() {
+        let referenced = json!({
+            "steps": [{"id": "x", "op": "call", "tool": "$item.name", "input": {}}]
+        });
+        assert!(matches!(
+            requested_sub_call_tools("tool_orchestrate", &referenced),
+            SubCallAuthorization::Invalid(_)
+        ));
+        assert!(matches!(
+            requested_sub_call_tools("tool_orchestrate", &json!({"bad": true})),
+            SubCallAuthorization::Invalid(_)
+        ));
     }
 }

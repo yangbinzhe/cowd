@@ -40,7 +40,7 @@ pub(crate) use dispatch::execute_with_lease;
 mod builtin;
 use builtin::*;
 #[path = "orchestrate.rs"]
-mod orchestrate;
+pub mod orchestrate;
 pub(crate) use orchestrate::run_orchestrate;
 
 #[cfg(test)]
