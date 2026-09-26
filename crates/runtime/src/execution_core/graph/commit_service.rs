@@ -1823,16 +1823,44 @@ impl ExecutionCommitService {
         });
         let mut events = vec![graph_input];
         events.extend(domain_events);
-        let request = AppendTransactionRequest {
-            transaction_id,
-            expected_streams,
-            events,
-        };
-        let transaction = match terminal {
-            Some(terminal) => self
-                .event_store
-                .append_transaction_with_terminal(request, terminal)?,
-            None => self.event_store.append_transaction(request)?,
+        // A concurrent writer of the same execution-lineage stream can move it
+        // between the preflight read and this append. The lineage events carry
+        // stable idempotency keys, so refresh only the lineage fences to their
+        // current revision and retry instead of failing the tool call.
+        let lineage_streams = expected_streams
+            .iter()
+            .filter(|source| source.stream_id.starts_with("execution-lineage:"))
+            .map(|source| source.stream_id.clone())
+            .collect::<BTreeSet<_>>();
+        const MAX_LINEAGE_RETRIES: usize = 8;
+        let mut attempt = 0;
+        let transaction = loop {
+            attempt += 1;
+            let request = AppendTransactionRequest {
+                transaction_id: transaction_id.clone(),
+                expected_streams: expected_streams.clone(),
+                events: events.clone(),
+            };
+            let result = match terminal.as_ref() {
+                Some(terminal) => self
+                    .event_store
+                    .append_transaction_with_terminal(request, terminal.clone()),
+                None => self.event_store.append_transaction(request),
+            };
+            match result {
+                Ok(transaction) => break transaction,
+                Err(RuntimeEventStoreError::StaleRevision { ref stream_id, .. })
+                    if attempt < MAX_LINEAGE_RETRIES && lineage_streams.contains(stream_id) =>
+                {
+                    for source in expected_streams.iter_mut() {
+                        if lineage_streams.contains(&source.stream_id) {
+                            source.expected_revision =
+                                self.event_store.stream_revision(&source.stream_id)?;
+                        }
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
         };
         let mut committed_graph = graph.clone();
         committed_graph.recovery_cursor.commit_cursor = transaction.commit_cursor;
