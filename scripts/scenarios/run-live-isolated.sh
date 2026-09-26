@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
-# Run ONE live scenario against a FRESH, disposable PostgreSQL database, then
-# drop it. This removes the cross-run fixture pollution that made results
-# non-reproducible when a shared database was reused.
+# Run ONE live scenario against a FRESH PostgreSQL database.
+#
+# Each run provisions a uniquely named database so cross-run fixture pollution
+# cannot make results non-reproducible. By DEFAULT the database is RETAINED
+# afterwards so a failure can be investigated in detail (logs + mid-process
+# content) and the run can be resumed from a breakpoint or from any point
+# (Cowd natively recovers the durable execution graph from the same database
+# and session). Set COWD_EVAL_KEEP_DB=0 to drop it as before.
 #
 # Generic by design: point COWD_PG_BASE_URL at any maintenance database (any
-# host/port/user); the wrapper creates a uniquely named database, runs the
-# standard scenario harness against it, and always drops it afterwards.
+# host/port/user).
 #
 # Usage:
 #   COWD_PG_BASE_URL='postgres://user:pass@host:port/postgres' \
 #   COWD_EVAL_LIVE_SCENARIOS=live_tool_evidence \
 #   (optional) COWD_EVAL_SCENARIO_TIMEOUT_SECS=900 \
+#   (optional) COWD_EVAL_KEEP_DB=0   # drop the fresh database afterwards \
 #   bash scripts/scenarios/run-live-isolated.sh
 set -euo pipefail
 
@@ -19,6 +24,7 @@ cd "$ROOT"
 
 : "${COWD_PG_BASE_URL:=postgres://postgres:cowd-owned-local-fixture@127.0.0.1:32772/postgres}"
 : "${COWD_EVAL_LIVE_SCENARIOS:?set COWD_EVAL_LIVE_SCENARIOS to exactly one scenario id}"
+: "${COWD_EVAL_KEEP_DB:=1}"
 
 command -v psql >/dev/null || { echo 'psql is required to provision the fresh eval database' >&2; exit 2; }
 
@@ -28,9 +34,16 @@ DB_URL="${COWD_PG_BASE_URL%/*}/$DB_NAME"
 cleanup() {
   local status=$?
   trap - EXIT
-  psql "$COWD_PG_BASE_URL" -v ON_ERROR_STOP=0 \
-    -c "DROP DATABASE IF EXISTS \"$DB_NAME\" WITH (FORCE)" >/dev/null 2>&1 || true
-  echo "dropped fresh eval database: $DB_NAME" >&2
+  if [[ "$COWD_EVAL_KEEP_DB" == "1" ]]; then
+    echo "RETAINED eval database: $DB_NAME" >&2
+    echo "  url: $DB_URL" >&2
+    echo "  inspect: psql \"$DB_URL\"" >&2
+    echo "  resume : rerun with COWD_TEST_POSTGRES_URL=\"$DB_URL\" and the same session" >&2
+  else
+    psql "$COWD_PG_BASE_URL" -v ON_ERROR_STOP=0 \
+      -c "DROP DATABASE IF EXISTS \"$DB_NAME\" WITH (FORCE)" >/dev/null 2>&1 || true
+    echo "dropped fresh eval database: $DB_NAME" >&2
+  fi
   exit "$status"
 }
 trap cleanup EXIT
