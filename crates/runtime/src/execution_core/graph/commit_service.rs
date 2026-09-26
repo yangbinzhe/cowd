@@ -228,6 +228,37 @@ impl ExecutionCommitService {
         if receipts.is_empty() {
             return Ok(());
         }
+        // Optimistic concurrency: this wave snapshots the current stream
+        // revisions and appends with compare-and-set. Concurrent read receipts
+        // from the same Agent share one `execution-agent-receipts:*` stream, so
+        // a wave can lose a race that has nothing to do with the tool result
+        // (observed as `revision mismatch` on `agent:N`). The write is
+        // idempotent (stable keys plus the pre-check inside), so retry the whole
+        // wave on a stale revision instead of failing an otherwise-good call.
+        const MAX_ATTEMPTS: u8 = 8;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match self.commit_readonly_tool_receipts_once(receipts) {
+                Ok(()) => return Ok(()),
+                Err(ExecutionCommitError::EventStore(
+                    RuntimeEventStoreError::StaleRevision { .. },
+                )) if attempt < MAX_ATTEMPTS => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn commit_readonly_tool_receipts_once(
+        &self,
+        receipts: &[(
+            crate::RuntimeToolExecutionRequest,
+            crate::RuntimeToolExecutionOutcome,
+        )],
+    ) -> Result<(), ExecutionCommitError> {
+        if receipts.is_empty() {
+            return Ok(());
+        }
         let mut expected_streams = BTreeMap::<String, u64>::new();
         let mut events = Vec::with_capacity(receipts.len().saturating_mul(2));
         let mut receipt_keys = Vec::with_capacity(receipts.len());
@@ -461,6 +492,32 @@ impl ExecutionCommitService {
     }
 
     pub fn commit_tool_effect(
+        &self,
+        request: &crate::RuntimeToolExecutionRequest,
+        effect: &ToolEffectDescriptor,
+        outcome: &crate::RuntimeToolExecutionOutcome,
+    ) -> Result<(), ExecutionCommitError> {
+        if effect.effect_kind == ToolEffectKind::Read {
+            return Ok(());
+        }
+        // Same optimistic-concurrency retry as the read wave: concurrent effect
+        // receipts from one Agent share its `execution-agent-receipts:*` stream,
+        // so a stale-revision CAS is retryable (the receipt keys are stable).
+        const MAX_ATTEMPTS: u8 = 8;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match self.commit_tool_effect_once(request, effect, outcome) {
+                Ok(()) => return Ok(()),
+                Err(ExecutionCommitError::EventStore(
+                    RuntimeEventStoreError::StaleRevision { .. },
+                )) if attempt < MAX_ATTEMPTS => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn commit_tool_effect_once(
         &self,
         request: &crate::RuntimeToolExecutionRequest,
         effect: &ToolEffectDescriptor,
