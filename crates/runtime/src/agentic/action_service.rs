@@ -1408,12 +1408,35 @@ impl AgentActionService {
                 });
             }
             if let Some(task) = projection.tasks.get(scope_ref) {
+                let artifacts = task
+                    .artifact_refs
+                    .iter()
+                    .filter_map(|id| projection.artifacts.get(id))
+                    .collect::<Vec<_>>();
+                // A reviewer must be able to read the submitted deliverable
+                // without parsing nested artifact JSON or rebuilding an opaque
+                // content hash. Hand back ready-to-read content references, so
+                // `read("task://X")` is immediately followed by `read(<ref>)`.
+                let read_requests = artifacts
+                    .iter()
+                    .map(|artifact| {
+                        json!({
+                            "artifact_ref": artifact.artifact_ref,
+                            "read_request": { "evidence_ref": artifact.content_ref },
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let read_request = artifacts
+                    .first()
+                    .map(|artifact| json!({ "evidence_ref": artifact.content_ref }));
                 return json!({
                     "program_id": projection.program_id,
                     "revision": projection.revision,
                     "task": task,
                     "issues": super::issues::issues(projection).into_iter().filter(|issue| issue.source_ref == task.task_id).collect::<Vec<_>>(),
-                    "artifacts": task.artifact_refs.iter().filter_map(|id| projection.artifacts.get(id)).collect::<Vec<_>>(),
+                    "artifacts": artifacts,
+                    "read_requests": read_requests,
+                    "read_request": read_request,
                 });
             }
             if let Some(artifact) = projection.artifacts.get(scope_ref) {
