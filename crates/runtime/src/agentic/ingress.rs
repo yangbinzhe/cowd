@@ -45,6 +45,12 @@ fn is_review_source_changed_retry(error: &str) -> bool {
     if error.contains("review_requires_current_physical_reads") {
         return true;
     }
+    // A review attempt whose generation no longer matches an already-reviewed or
+    // reworked Task is stale; bound it the same way so it settles instead of
+    // looping, and a fresh attempt can be dispatched.
+    if error.contains("review physical attempt is stale") {
+        return true;
+    }
     (error.contains("review policy source changed")
         || error.contains("effect review source changed")
         || error.contains("delegated effect source changed"))
