@@ -121,24 +121,51 @@ pub(super) async fn renew_agentic_claim_if_active(
     {
         return false;
     }
-    let action_id = format!(
-        "runtime-claim-heartbeat:{execution_id}:{}",
-        task.lease_expires_at_ms.unwrap_or_default()
-    );
-    services
-        .submit_agent_action(&AgentActionEnvelope {
-            action_id,
-            actor: actor.clone(),
-            expected_revision: None,
-            action: AgentAction::TaskClaim(harness_contract::agent_action::TaskClaimInput {
-                task_ref: task_ref.to_string(),
-                reason: Some("physical Agent graph remains active".to_string()),
+    // A lease renewal is control-plane bookkeeping, not a semantic Program
+    // mutation. Appending one compact in-place event avoids the full governed
+    // action path (authorization, validation, projection apply and follow-up
+    // dispatch) on every heartbeat, which dominated large runs where task_claim
+    // accounted for ~92% of all actions. The projection consumes the event
+    // below by extending the existing lease in place, without a new generation.
+    let generation = action_service
+        .project(&actor.program_id)
+        .map(|projection| projection.revision)
+        .unwrap_or_default();
+    let event = crate::RuntimeTransactionEventInput {
+        event: crate::RuntimeEventInput {
+            stream_id: format!("agentic-program:{}", actor.program_id),
+            scope: crate::RuntimeEventScope::Program,
+            kind: "agentic.task_lease_renewed".to_string(),
+            status: Some("renewed".to_string()),
+            actor: actor.agent_id.clone(),
+            refs: Vec::new(),
+            payload: serde_json::json!({
+                "task_ref": task_ref,
+                "agent_id": actor.agent_id,
+                "execution_id": execution_id,
             }),
+        },
+        idempotency_key: Some(format!("claim-lease-renewed:{execution_id}:{generation}")),
+        schema_version: 1,
+    };
+    services
+        .event_store()
+        .append_transaction(crate::AppendTransactionRequest {
+            transaction_id: format!(
+                "claim-lease-renewed:{}:{execution_id}:{generation}",
+                actor.program_id
+            ),
+            expected_streams: vec![crate::ExpectedStreamRevision {
+                stream_id: format!("agentic-program:{}", actor.program_id),
+                expected_revision: generation,
+            }],
+            events: vec![event],
         })
-        .await
-        .is_ok_and(|observation| {
-            observation.status == harness_contract::agent_action::AgentActionStatus::Applied
+        .map_err(|error| {
+            tracing::debug!(%error, "agentic claim heartbeat renewal deferred");
+            error
         })
+        .is_ok()
 }
 
 pub(crate) struct AgenticClaimHeartbeatGuard {
