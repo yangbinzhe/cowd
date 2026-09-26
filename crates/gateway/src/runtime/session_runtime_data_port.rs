@@ -149,11 +149,16 @@ impl runtime::SessionRuntimeQueryPort for GatewaySessionRuntimePort {
         let service = self.service()?;
         let mut from_sequence = 0;
         // A model may cite the stable logical id while dropping the opaque
-        // content suffix of the durable receipt. Resolve such a reference only
-        // when it matches exactly one recorded receipt; an ambiguous prefix is
-        // refused so evidence integrity is never guessed.
+        // content suffix of the durable receipt, or keep the call id but invent
+        // the content hash. Resolve such a reference only when it matches
+        // exactly one recorded receipt; an ambiguous match is refused. Every
+        // resolution binds to the recorded receipt, so a wrong hash can never
+        // select wrong content.
+        let stem = evidence_call_id_stem(evidence_id);
         let mut prefix_match: Option<harness_contract::context::EvidenceAccessRef> = None;
         let mut prefix_ambiguous = false;
+        let mut stem_match: Option<harness_contract::context::EvidenceAccessRef> = None;
+        let mut stem_ambiguous = false;
         loop {
             let Some((_, events)) = service
                 .stored_domain_events_by_kind_page(
@@ -195,6 +200,16 @@ impl runtime::SessionRuntimeQueryPort for GatewaySessionRuntimePort {
                                 &event.payload,
                             );
                     }
+                } else if stem.is_some_and(|stem| recorded.starts_with(stem)) {
+                    if stem_match.is_some() {
+                        stem_ambiguous = true;
+                    } else {
+                        stem_match =
+                            runtime::context_evidence::raw::access_from_persisted_payload(
+                                recorded,
+                                &event.payload,
+                            );
+                    }
                 }
             }
             if next_sequence <= from_sequence {
@@ -207,8 +222,22 @@ impl runtime::SessionRuntimeQueryPort for GatewaySessionRuntimePort {
         if prefix_ambiguous {
             return Ok(None);
         }
-        Ok(prefix_match)
+        if prefix_match.is_some() {
+            return Ok(prefix_match);
+        }
+        if stem_ambiguous {
+            return Ok(None);
+        }
+        Ok(stem_match)
     }
+}
+
+/// The stable call id of a `tool://` receipt with a trailing hex content hash
+/// removed. A model can keep the call id while inventing the hash; resolving by
+/// this stem is safe because it still binds to the recorded durable receipt.
+fn evidence_call_id_stem(reference: &str) -> Option<&str> {
+    let (stem, suffix) = reference.rsplit_once('-')?;
+    (suffix.len() >= 8 && suffix.chars().all(|c| c.is_ascii_hexdigit())).then_some(stem)
 }
 
 #[async_trait]
@@ -515,5 +544,24 @@ impl GatewaySessionRuntimePort {
         session_id: &str,
     ) -> Result<Option<session::SessionInputAdmission>, session::SessionError> {
         self.service()?.session_input_admission(session_id).await
+    }
+}
+
+#[cfg(test)]
+mod evidence_stem_tests {
+    use super::evidence_call_id_stem;
+
+    #[test]
+    fn strips_only_a_trailing_hex_hash() {
+        assert_eq!(
+            evidence_call_id_stem("tool-raw-call_00_abc-259d045e871d6413"),
+            Some("tool-raw-call_00_abc")
+        );
+        // No hash suffix: the whole id is the stem.
+        assert_eq!(evidence_call_id_stem("tool-raw-call_00_abc"), None);
+        // A non-hex suffix is part of the call id, not a hash.
+        assert_eq!(evidence_call_id_stem("tool-raw-call_00_abc-zz"), None);
+        // Short suffix is not treated as a content hash.
+        assert_eq!(evidence_call_id_stem("tool-raw-call_00_abc-dead"), None);
     }
 }
