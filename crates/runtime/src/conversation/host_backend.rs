@@ -2898,13 +2898,7 @@ fn collaboration_ceiling_reached(
 fn collaboration_convergence_replan_bound(
     complexity: harness_contract::core::TaskComplexity,
 ) -> usize {
-    use harness_contract::core::TaskComplexity;
-    match complexity {
-        TaskComplexity::Trivial | TaskComplexity::Simple => 2,
-        TaskComplexity::Moderate => 3,
-        TaskComplexity::Complex => 4,
-        TaskComplexity::Strategic => 6,
-    }
+    crate::execution_core::ComplexityBudget::derive(complexity).convergence_replans
 }
 
 #[cfg(test)]
@@ -4695,6 +4689,28 @@ where
                     "Execution blocked safely: tool `{tool}` exceeded its per-turn cap ({count} > {cap}); retained evidence and progress were preserved. Continue with a new constraint, additional evidence, or an explicit replan."
                 ),
             ));
+        }
+        // Weak-model auto-downgrade (advisory): a collaborating turn whose
+        // guardrail signals are hot is steered to converge with the topology it
+        // already has instead of grinding on an ever-more-expensive Team
+        // protocol. Termination semantics are unchanged; this is a nudge.
+        if state.collaboration_obligation.is_some()
+            && crate::execution_core::strategy_decision::collaboration_downgrade_recommended(
+                state.identical_action_streak,
+                state.consecutive_low_novelty_batches,
+                state.consecutive_tool_failure_batches,
+            )
+        {
+            let mut item = ContextItem::new(
+                format!("collaboration-downgrade-nudge:{}", ticket.node_id),
+                ContextSourceKind::ToolTrace,
+                ContextRole::Instruction,
+                "Collaboration is stalling (repeated identical calls, no new coverage, or repeated failures). Stop chasing the Team minimum: converge with the Teams, Agents and evidence you already have, or report the blocker honestly. A smaller honest result is better than an unbounded attempt."
+                    .to_string(),
+            );
+            item.authority = ContextAuthority::System;
+            item.visibility = ContextVisibility::Private;
+            state.pending_next_model_context.push(item);
         }
         if let Some(protocol) = delegated_protocol_after_batch.as_ref() {
             // An artifact is intermediate collaboration evidence, not the

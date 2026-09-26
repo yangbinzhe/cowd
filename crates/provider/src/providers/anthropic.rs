@@ -1002,6 +1002,25 @@ fn strip_unsupported_beta_body_fields(body: &mut Value) {
     }
 }
 
+/// Build the Anthropic `cache_control` marker for a breakpoint. The default is
+/// the provider's 5-minute ephemeral tier; the 1-hour tier is opt-in because
+/// it is billed differently and only pays off for long-lived cohorts.
+fn cache_control_marker(extended_ttl: bool) -> Value {
+    if extended_ttl {
+        serde_json::json!({ "type": "ephemeral", "ttl": "1h" })
+    } else {
+        serde_json::json!({ "type": "ephemeral" })
+    }
+}
+
+/// Whether the extended prompt-cache TTL is requested via
+/// `COWD_ANTHROPIC_CACHE_TTL=1h`.
+fn anthropic_cache_ttl_1h() -> bool {
+    std::env::var("COWD_ANTHROPIC_CACHE_TTL")
+        .ok()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("1h"))
+}
+
 /// Inject Anthropic prompt-cache breakpoints at the reusable prefix boundaries:
 /// the system prefix, the last tool definition, and the conversation tail.
 /// Anthropic accepts at most four explicit `cache_control` breakpoints per
@@ -1011,7 +1030,7 @@ fn strip_unsupported_beta_body_fields(body: &mut Value) {
 /// must not receive fields their upstream does not understand.
 fn apply_inline_cache_breakpoints(body: &mut Value) {
     const BREAKPOINT_CAP: usize = 4;
-    let ephemeral = serde_json::json!({ "type": "ephemeral" });
+    let ephemeral = cache_control_marker(anthropic_cache_ttl_1h());
     let mut used = 0usize;
 
     if let Some(system) = body.get_mut("system") {
@@ -1073,11 +1092,25 @@ struct AnthropicErrorBody {
 
 #[cfg(test)]
 mod tests {
-    use super::{retry_after_from_headers, ALT_REQUEST_ID_HEADER, REQUEST_ID_HEADER};
+    use super::{
+        cache_control_marker, retry_after_from_headers, ALT_REQUEST_ID_HEADER, REQUEST_ID_HEADER,
+    };
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn cache_control_marker_tiers() {
+        assert_eq!(
+            cache_control_marker(false),
+            serde_json::json!({ "type": "ephemeral" })
+        );
+        assert_eq!(
+            cache_control_marker(true),
+            serde_json::json!({ "type": "ephemeral", "ttl": "1h" })
+        );
+    }
 
     use model_protocol::oauth::{
         clear_oauth_credentials, load_oauth_credentials, save_oauth_credentials, OAuthConfig,

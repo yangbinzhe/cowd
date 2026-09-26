@@ -112,6 +112,70 @@ pub fn complexity_reasons(
     reasons
 }
 
+/// Advisory team-formation plan derived from complexity, the observed
+/// independent workstreams and the available Team-slot ceiling. Advisory only:
+/// the model owns Team purpose, roles and the Task graph. This exists so the
+/// framework can bound over-fragmentation, encode when delegation is worth it,
+/// and expose an auditable recommendation instead of leaving team count to a
+/// single trigger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TeamFormationPlan {
+    pub recommended_teams: u8,
+    pub max_teams: u8,
+    pub role_differentiation: bool,
+}
+
+#[must_use]
+pub fn team_formation_plan(
+    complexity: TaskComplexity,
+    independent_workstreams: u8,
+    team_slot_ceiling: u8,
+) -> TeamFormationPlan {
+    let ceiling = team_slot_ceiling.clamp(2, 8);
+    let (floor, cap) = match complexity {
+        // Simple work never needs a Team; a single agent (or light delegation)
+        // is cheaper and faster.
+        TaskComplexity::Trivial | TaskComplexity::Simple => (0, 0),
+        // Moderate work may delegate but should not fan out into a Team of
+        // Teams.
+        TaskComplexity::Moderate => (0, ceiling.min(3)),
+        // Complex work benefits from at least two independent Teams but stays
+        // capped so it does not over-fragment.
+        TaskComplexity::Complex => (2, ceiling.min(6)),
+        // Strategic work may use the full available ceiling.
+        TaskComplexity::Strategic => (2, ceiling),
+    };
+    if cap == 0 {
+        return TeamFormationPlan {
+            recommended_teams: 0,
+            max_teams: 0,
+            role_differentiation: false,
+        };
+    }
+    let recommended = independent_workstreams.clamp(floor, cap);
+    TeamFormationPlan {
+        recommended_teams: recommended,
+        max_teams: cap,
+        role_differentiation: recommended >= 2,
+    }
+}
+
+/// Advise whether a struggling collaboration turn should stop chasing its Team
+/// minimum and degrade toward a lighter topology. Consumes the behavioral
+/// guardrail signals (identical-call streak, low-novelty streak, failure
+/// streak) so a weak model that keeps looping or repeating failures is steered
+/// to converge instead of grinding on an ever-more-expensive Team protocol.
+/// Advisory: the caller decides, and existing termination semantics are
+/// unchanged.
+#[must_use]
+pub const fn collaboration_downgrade_recommended(
+    identical_action_streak: usize,
+    low_novelty_streak: usize,
+    failure_streak: usize,
+) -> bool {
+    failure_streak >= 2 || low_novelty_streak >= 3 || identical_action_streak >= 3
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeExecutionDecision {
     pub decision_id: String,
@@ -630,7 +694,16 @@ fn build_runtime_execution_decision_inner(
 
     let catalog = ExecutionPatternCatalog::current();
     let recommended_spec = catalog.find(recommended_pattern);
-    let complexity_reasons = complexity_reasons(&strategy.understanding);
+    let team_plan = team_formation_plan(
+        strategy.understanding.complexity,
+        strategy.understanding.independent_workstreams,
+        u8::try_from(strategy.resource_snapshot.team_slots.clamp(2, 8)).unwrap_or(8),
+    );
+    let mut complexity_reasons = complexity_reasons(&strategy.understanding);
+    complexity_reasons.push(format!(
+        "team-formation: recommended_teams={} max_teams={} role_differentiation={}",
+        team_plan.recommended_teams, team_plan.max_teams, team_plan.role_differentiation
+    ));
     RuntimeExecutionDecision {
         decision_id: format!("execution-decision-{}", Uuid::new_v4()),
         decision_revision: 1,
@@ -999,6 +1072,10 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason.starts_with("complexity resolved:")));
+        assert!(team
+            .reasons
+            .iter()
+            .any(|reason| reason.starts_with("team-formation:")));
     }
 
     #[test]
@@ -1012,5 +1089,45 @@ mod tests {
         assert!(reasons
             .iter()
             .any(|r| r.starts_with("complexity resolved:")));
+    }
+
+    #[test]
+    fn team_formation_plan_encodes_when_delegation_is_worth_it() {
+        // Simple work never recommends a Team.
+        let simple = team_formation_plan(TaskComplexity::Simple, 5, 8);
+        assert_eq!(simple.recommended_teams, 0);
+        assert_eq!(simple.max_teams, 0);
+        assert!(!simple.role_differentiation);
+
+        // Moderate work can delegate but is capped: never a Team of Teams.
+        let moderate = team_formation_plan(TaskComplexity::Moderate, 6, 8);
+        assert_eq!(moderate.recommended_teams, 3);
+        assert_eq!(moderate.max_teams, 3);
+
+        // Complex work floors at two Teams and differentiates roles.
+        let complex = team_formation_plan(TaskComplexity::Complex, 1, 8);
+        assert_eq!(complex.recommended_teams, 2);
+        assert!(complex.role_differentiation);
+
+        // Strategic work tracks observed workstreams up to the ceiling.
+        let strategic = team_formation_plan(TaskComplexity::Strategic, 4, 8);
+        assert_eq!(strategic.recommended_teams, 4);
+        assert_eq!(strategic.max_teams, 8);
+
+        // The Team-slot ceiling is honoured and clamped to a sane range.
+        let capped = team_formation_plan(TaskComplexity::Strategic, 12, 5);
+        assert_eq!(capped.recommended_teams, 5);
+        assert_eq!(capped.max_teams, 5);
+    }
+
+    #[test]
+    fn collaboration_downgrade_tracks_the_guardrail_signals() {
+        // A healthy collaboration turn keeps its contract.
+        assert!(!collaboration_downgrade_recommended(0, 0, 0));
+        assert!(!collaboration_downgrade_recommended(2, 2, 1));
+        // Any sustained guardrail signal recommends degrading the topology.
+        assert!(collaboration_downgrade_recommended(3, 0, 0));
+        assert!(collaboration_downgrade_recommended(0, 3, 0));
+        assert!(collaboration_downgrade_recommended(0, 0, 2));
     }
 }

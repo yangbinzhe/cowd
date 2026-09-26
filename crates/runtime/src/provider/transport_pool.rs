@@ -21,6 +21,15 @@ const DEFAULT_PROVIDER_CACHE_WARM_TTL: Duration = Duration::from_secs(5 * 60);
 /// actual byte-identical prefix of the first request. Exact extensions always
 /// remain coordinated regardless of total length.
 const MIN_COMMON_PREFIX_COORDINATION_RATIO_BP: usize = 5_000;
+
+/// Self-check: true when a warm request reuses less than half of its
+/// model-visible prefix, the regime where prompt caching stops paying off.
+/// Surfaced for observability so a prefix-stability regression is visible
+/// without waiting for a cost report.
+#[must_use]
+pub(crate) fn low_structural_reuse(ratio_bp: u32) -> bool {
+    ratio_bp < MIN_COMMON_PREFIX_COORDINATION_RATIO_BP as u32
+}
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderWirePrefixObservation {
     pub cache_identity_sha256: String,
@@ -477,6 +486,14 @@ impl ProviderTransportPool {
         } else {
             Some("model_visible_prefix_diverged".to_string())
         };
+        if best.is_some() && low_structural_reuse(structural_reuse_ratio_bp) {
+            tracing::debug!(
+                cache_identity_sha256 = %cache_identity_sha256,
+                structural_reuse_ratio_bp,
+                invalidation_reason = invalidation_reason.as_deref().unwrap_or(""),
+                "low provider prompt structural reuse"
+            );
+        }
         history.push_back(CachedProviderPrompt {
             request_id,
             bytes: prompt.into(),

@@ -27,6 +27,48 @@ pub enum SafetyFuseDecision {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SafetyFusePolicy;
 
+/// Single complexity-keyed budget table. Every bound that must scale with
+/// complexity (the stall-step fuse here, the convergence-replan bound in the
+/// host, and any future dimension) reads this one table instead of each site
+/// re-deriving its own mapping, so the dimensions can never drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComplexityBudget {
+    /// Consecutive unverified model steps tolerated before the stall fuse may
+    /// fire (only when no progress was made).
+    pub max_model_steps: usize,
+    /// Times the collaboration completion gate may re-drive the root before it
+    /// terminates as an honest partial.
+    pub convergence_replans: usize,
+}
+
+impl ComplexityBudget {
+    #[must_use]
+    pub const fn derive(complexity: TaskComplexity) -> Self {
+        match complexity {
+            TaskComplexity::Trivial => Self {
+                max_model_steps: 4,
+                convergence_replans: 2,
+            },
+            TaskComplexity::Simple => Self {
+                max_model_steps: 8,
+                convergence_replans: 2,
+            },
+            TaskComplexity::Moderate => Self {
+                max_model_steps: 14,
+                convergence_replans: 3,
+            },
+            TaskComplexity::Complex => Self {
+                max_model_steps: 24,
+                convergence_replans: 4,
+            },
+            TaskComplexity::Strategic => Self {
+                max_model_steps: 32,
+                convergence_replans: 6,
+            },
+        }
+    }
+}
+
 impl SafetyFusePolicy {
     #[must_use]
     pub fn derive(
@@ -34,13 +76,7 @@ impl SafetyFusePolicy {
         complexity: TaskComplexity,
         explicit_user_limit: Option<usize>,
     ) -> ExecutionBudgetLease {
-        let base_steps = match complexity {
-            TaskComplexity::Trivial => 4,
-            TaskComplexity::Simple => 8,
-            TaskComplexity::Moderate => 14,
-            TaskComplexity::Complex => 24,
-            TaskComplexity::Strategic => 32,
-        };
+        let base_steps = ComplexityBudget::derive(complexity).max_model_steps;
         let max_model_steps =
             explicit_user_limit.map_or(base_steps, |limit| base_steps.min(limit.max(1)));
         ExecutionBudgetLease {
@@ -143,5 +179,21 @@ mod tests {
             SafetyFusePolicy::evaluate(&lease, 3, false),
             SafetyFuseDecision::Block { .. }
         ));
+    }
+
+    #[test]
+    fn complexity_budget_is_the_single_source_for_every_dimension() {
+        let strategic = ComplexityBudget::derive(TaskComplexity::Strategic);
+        assert_eq!(strategic.max_model_steps, 32);
+        assert_eq!(strategic.convergence_replans, 6);
+        let simple = ComplexityBudget::derive(TaskComplexity::Simple);
+        assert_eq!(simple.max_model_steps, 8);
+        assert_eq!(simple.convergence_replans, 2);
+        // The fuse derives its step bound from the same table, so the two
+        // dimensions cannot drift.
+        assert_eq!(
+            SafetyFusePolicy::derive(1_000_000, TaskComplexity::Moderate, None).max_model_steps,
+            ComplexityBudget::derive(TaskComplexity::Moderate).max_model_steps
+        );
     }
 }
