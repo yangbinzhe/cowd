@@ -9,6 +9,52 @@ use harness_contract::agent::{
 // records overruns and borrowing but never rejects or shrinks an Agent model
 // request, so this estimate cannot become a business-execution budget gate.
 const AGENTIC_TASK_CAPACITY_ESTIMATE_TOKENS: u64 = 1_000_000;
+
+/// Consecutive deferral counts keyed by `program|task|mode`. A Program that
+/// keeps deferring the very same dispatch past the bound is wedged, not merely
+/// busy, so it is escalated instead of spinning forever.
+static DISPATCH_STARVATION: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::BTreeMap<String, usize>>,
+> = std::sync::OnceLock::new();
+
+fn dispatch_starvation_ledger(
+) -> &'static std::sync::Mutex<std::collections::BTreeMap<String, usize>> {
+    DISPATCH_STARVATION.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+/// Consecutive deferrals tolerated for one dispatch key before escalation.
+/// Configurable via `COWD_DISPATCH_STARVATION_LIMIT` (default 12).
+fn dispatch_starvation_bound() -> usize {
+    std::env::var("COWD_DISPATCH_STARVATION_LIMIT")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(12)
+}
+
+fn dispatch_starvation_record(key: &str) -> usize {
+    let mut ledger = dispatch_starvation_ledger()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let counter = ledger.entry(key.to_string()).or_insert(0);
+    *counter = counter.saturating_add(1);
+    *counter
+}
+
+fn dispatch_starvation_clear(key: &str) {
+    let mut ledger = dispatch_starvation_ledger()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ledger.remove(key);
+}
+
+fn dispatch_starvation_key(
+    program_id: &str,
+    task_ref: &str,
+    mode: DispatchMode,
+) -> String {
+    format!("{program_id}|{task_ref}|{}", mode.as_str())
+}
 pub(super) fn agentic_shared_prompt_package(
     projection: &AgenticProgramProjection,
     team_id: &str,
@@ -1123,18 +1169,39 @@ impl RuntimeServices {
         if selected.is_none() && (busy_eligible || rejected_members.is_empty()) {
             // Silent deferral: every otherwise-eligible member is busy, or the
             // roster admitted no member at all. Record it so a wedged Program is
-            // observable (and can be bounded) instead of only surfacing as the
-            // root's indefinite wait.
+            // observable, and bound it: the SAME dispatch deferring past the
+            // limit is starvation, not transient busyness.
+            let starvation_key =
+                dispatch_starvation_key(&projection.program_id, &task.task_id, mode);
+            let consecutive = dispatch_starvation_record(&starvation_key);
             tracing::info!(
                 program_id = %projection.program_id,
                 task_ref = %task.task_id,
                 mode = mode.as_str(),
                 busy_eligible,
                 rejected = rejected_members.len(),
+                consecutive_deferrals = consecutive,
                 "agentic dispatch deferred: no free eligible member"
             );
+            if consecutive > dispatch_starvation_bound() {
+                // Escalate as a real failure so the reconcile path records it
+                // and the Program can reach an honest bounded terminal instead
+                // of spinning on the same deferred dispatch forever.
+                return Err(format!(
+                    "agentic_dispatch_starvation:{}:{}:{}: deferred {consecutive} consecutive times with no free eligible member",
+                    projection.program_id,
+                    task.task_id,
+                    mode.as_str()
+                ));
+            }
             return Ok(Vec::new());
         }
+        // A dispatch succeeded for this key: the starvation streak is broken.
+        dispatch_starvation_clear(&dispatch_starvation_key(
+            &projection.program_id,
+            &task.task_id,
+            mode,
+        ));
         let selected = selected.ok_or_else(|| {
             format!(
                 "agentic_no_admissible_member:{}:{}: {}",
@@ -1612,5 +1679,27 @@ mod lane_routing_tests {
             routed_lane_model(Some("deepseek-v4-flash"), "program-model"),
             "deepseek-v4-flash"
         );
+    }
+
+    #[test]
+    fn dispatch_starvation_ledger_counts_then_clears() {
+        use super::{
+            dispatch_starvation_bound, dispatch_starvation_clear, dispatch_starvation_key,
+            dispatch_starvation_record, DispatchMode,
+        };
+        let key = dispatch_starvation_key("program-test", "task-test", DispatchMode::Execute);
+        dispatch_starvation_clear(&key);
+        assert_eq!(dispatch_starvation_record(&key), 1);
+        assert_eq!(dispatch_starvation_record(&key), 2);
+        // A different key is tracked independently.
+        let other = dispatch_starvation_key("program-test", "task-other", DispatchMode::Execute);
+        dispatch_starvation_clear(&other);
+        assert_eq!(dispatch_starvation_record(&other), 1);
+        // A successful dispatch clears the streak for its own key.
+        dispatch_starvation_clear(&key);
+        assert_eq!(dispatch_starvation_record(&key), 1);
+        dispatch_starvation_clear(&key);
+        dispatch_starvation_clear(&other);
+        assert!(dispatch_starvation_bound() >= 1);
     }
 }

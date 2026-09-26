@@ -10,6 +10,38 @@ pub(crate) struct PreparedProgramConclusion {
     pub policy_sources: Vec<crate::ExpectedStreamRevision>,
 }
 
+/// Durable Program event emitted when the completion gate rejects a request and
+/// re-opens the Program. Mirrors the Projection constant; the Goal owner reads
+/// it only to bound an unbounded re-open loop.
+const COMPLETION_REOPENED_EVENT_KIND: &str = "agentic.completion_reopened";
+
+/// After this many rejected completion requests a Program stops re-opening and
+/// terminates as an honest Blocked result instead of looping. Configurable via
+/// `COWD_COMPLETION_REOPEN_BOUND` (default 6). This complements the progress
+/// fuse: it bounds a loop that keeps *requesting* completion without ever
+/// producing a final answer, which the no-progress fuse alone cannot see.
+fn completion_reopen_bound() -> usize {
+    std::env::var("COWD_COMPLETION_REOPEN_BOUND")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(6)
+}
+
+/// Count the durable completion-reopen events already recorded for a Program.
+fn completion_reopen_count(event_store: &crate::RuntimeEventStore, program_id: &str) -> usize {
+    let stream_id = format!("agentic-program:{program_id}");
+    event_store
+        .list_stream_after(&stream_id, 0, u64::MAX, usize::MAX, usize::MAX)
+        .map(|events| {
+            events
+                .iter()
+                .filter(|event| event.kind == COMPLETION_REOPENED_EVENT_KIND)
+                .count()
+        })
+        .unwrap_or(0)
+}
+
 fn review_covers_current_goal(
     goal: &GoalContract,
     program: &AgenticProgramProjection,
@@ -353,6 +385,7 @@ impl GoalStore {
             "agentic-objective:{}:request:{}",
             program.program_id, request.program_revision
         );
+        let reopen_count = completion_reopen_count(&self.event_store, &program.program_id);
         let (kind, status) = if gaps.is_empty() {
             goal.completion = GoalCompletion::Satisfied;
             goal.phase = "completed".into();
@@ -367,7 +400,7 @@ impl GoalStore {
                 committed_at_ms: crate::tool_invocation::now_ms(),
             });
             ("goal.completed", "satisfied")
-        } else {
+        } else if reopen_count < completion_reopen_bound() {
             goal.phase = "waiting".into();
             goal.waiting = Some(harness_contract::goal::WaitDescriptor {
                 reason_code: "completion_gap".into(),
@@ -376,6 +409,27 @@ impl GoalStore {
                 generation: request.program_revision,
             });
             ("goal.completion_waiting", "open")
+        } else {
+            // Bounded convergence: the completion gate has reopened this
+            // Program repeatedly without the gaps resolving. Terminate as an
+            // honest blocked result instead of re-opening without end. The
+            // Goal owner still authors the terminal; the Program only binds it.
+            goal.completion = GoalCompletion::Blocked;
+            goal.phase = "completed".into();
+            goal.waiting = None;
+            goal.terminal = Some(ObjectiveTerminal {
+                kind: ObjectiveTerminalKind::Blocked,
+                terminal_fence: fence.clone(),
+                authority_revision: request.program_revision,
+                reason: format!(
+                    "completion gate reopened {reopen_count} time(s) without resolving the recorded gaps: {}",
+                    gaps.join("; ")
+                ),
+                evidence_refs: goal.evidence_refs.clone(),
+                diagnostics: Vec::new(),
+                committed_at_ms: crate::tool_invocation::now_ms(),
+            });
+            ("goal.blocked", "blocked")
         };
         validate_goal(&goal)?;
         let event = goal_event(
@@ -1035,5 +1089,18 @@ mod tests {
             original.obligations[0].state,
             ObjectiveObligationState::Open
         );
+    }
+
+    #[test]
+    fn completion_reopen_bound_is_positive_by_default() {
+        // A malformed or unset override must still yield a usable bound so the
+        // reopen loop is always bounded.
+        assert!(completion_reopen_bound() >= 1);
+    }
+
+    #[test]
+    fn completion_reopen_count_is_zero_without_reopen_events() {
+        let store = crate::RuntimeEventStore::for_test();
+        assert_eq!(completion_reopen_count(&store, "absent-program"), 0);
     }
 }
