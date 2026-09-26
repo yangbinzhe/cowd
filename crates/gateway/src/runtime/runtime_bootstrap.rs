@@ -369,7 +369,7 @@ pub(crate) fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition
         RuntimeToolDefinition {
             name: "read".to_string(),
             description: Some(
-                "Read any Runtime fact through one canonical reference. Schemes: program://, task://, team://, agent://, topic://, issue://, criterion://, obligation://, review:// read Program directory entries; tool:// reads a tool receipt (the short call id is enough, the content hash is optional); artifact:// reads durable content; session://, fact://, matrix://, memory:// read authorized history and leased knowledge. Prefer this over context_retrieve, evidence_retrieve, and state_inspect. Workspace file bytes still use read_file/glob_search/grep_search. Pass the returned cursor/limit back to page."
+                "Read any Runtime fact through one canonical reference. Schemes: program://, task://, team://, agent://, topic://, issue://, criterion://, obligation://, review:// read Program directory entries; node://<graph_id>/<node_id> reads one execution-graph node (status, result, evidence refs, and its input/output edges); tool:// reads a tool receipt (the short call id is enough, the content hash is optional); artifact:// reads durable content; session://, fact://, matrix://, memory:// read authorized history and leased knowledge. Prefer this over context_retrieve, evidence_retrieve, and state_inspect. Workspace file bytes still use read_file/glob_search/grep_search. Pass the returned cursor/limit back to page."
                     .to_string(),
             ),
             input_schema: json!({

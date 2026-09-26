@@ -628,6 +628,57 @@ impl GatewayToolExecutor {
         .map_err(|error| ToolError::new(error.to_string()))?
     }
 
+    /// Whole-node view from execution-graph truth: identity, status, result,
+    /// evidence refs and the input/output edges around the node. Phase B of the
+    /// unified read design, so a collaborator can inspect one node in a single
+    /// read instead of stitching several tools together.
+    async fn read_graph_node(&self, graph_id: &str, node_id: &str) -> Result<String, ToolError> {
+        let services = self.runtime_services.get().cloned().ok_or_else(|| {
+            ToolError::new("`read` node:// requires the workspace RuntimeServices")
+        })?;
+        let graph = services
+            .graph_state_store()
+            .load_async(graph_id.to_string())
+            .await
+            .map_err(|error| {
+                ToolError::new(format!("node read could not load graph `{graph_id}`: {error}"))
+            })?;
+        let Some(spec) = graph.nodes.iter().find(|spec| spec.id == node_id) else {
+            return Err(ToolError::new(format!(
+                "graph `{graph_id}` has no node `{node_id}`"
+            )));
+        };
+        let result = graph.node_results.get(node_id);
+        let value = serde_json::json!({
+            "graph_id": graph.id,
+            "graph_revision": graph.revision,
+            "node_id": node_id,
+            "kind": spec.kind,
+            "executor": spec.executor_kind,
+            "status": graph.node_statuses.get(node_id),
+            "result_ref": result.and_then(|result| result.result_ref.clone()),
+            "summary": result.and_then(|result| result.summary.clone()),
+            "evidence_refs": result
+                .map(|result| result.evidence_refs.clone())
+                .unwrap_or_default(),
+            "failure": result.and_then(|result| result.failure.clone()),
+            "usage": result.map(|result| result.usage.clone()),
+            "inputs": graph
+                .edges
+                .iter()
+                .filter(|edge| edge.to == node_id)
+                .map(|edge| serde_json::json!({ "from": edge.from, "kind": edge.kind }))
+                .collect::<Vec<_>>(),
+            "outputs": graph
+                .edges
+                .iter()
+                .filter(|edge| edge.from == node_id)
+                .map(|edge| serde_json::json!({ "to": edge.to, "kind": edge.kind }))
+                .collect::<Vec<_>>(),
+        });
+        serde_json::to_string_pretty(&value).map_err(|error| ToolError::new(error.to_string()))
+    }
+
     /// One read entry for every Runtime-addressable fact. The reference scheme
     /// selects an existing authorized reader, so authorization, revision fences,
     /// and durability are unchanged. This is a facade, not a second data path.
@@ -636,6 +687,14 @@ impl GatewayToolExecutor {
         input: UnifiedReadRequest,
         binding: RuntimeToolExecutionBinding<'_>,
     ) -> Result<String, ToolError> {
+        // `node://` is a whole execution-graph node view, not a delegation to a
+        // program reader; resolve it directly from graph truth.
+        if let harness_contract::refs::Address::Node { graph, node } =
+            harness_contract::refs::Address::parse(&input.reference)
+                .map_err(|error| ToolError::new(error.to_string()))?
+        {
+            return self.read_graph_node(&graph, &node).await;
+        }
         let (delegate, mut delegated) =
             unified_read_delegation(&input.reference).map_err(ToolError::new)?;
         if let Some(limit) = input.limit {
