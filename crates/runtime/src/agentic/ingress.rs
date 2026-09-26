@@ -38,6 +38,13 @@ static REVIEW_SOURCE_CHANGED_STREAK: LazyLock<Mutex<HashMap<String, u32>>> =
 /// strings are authored by Runtime (`review_evidence/policy.rs`), never by a
 /// provider or model.
 fn is_review_source_changed_retry(error: &str) -> bool {
+    // A reviewer that has not opened the submitted body is a retry class too.
+    // Bounding it prevents an artifact whose body cannot be read from looping
+    // forever; after the bound the attempt settles and the Task can be
+    // reworked or reassigned to a reviewer that reads it.
+    if error.contains("review_requires_current_physical_reads") {
+        return true;
+    }
     (error.contains("review policy source changed")
         || error.contains("effect review source changed")
         || error.contains("delegated effect source changed"))
@@ -327,7 +334,7 @@ impl RuntimeServices {
                                 .await;
                             return match settlement {
                                 Ok(()) => Err(format!(
-                                    "review attempt settled after {streak} source-changed rejections: {error}"
+                                    "review attempt settled after {streak} retryable rejections: {error}"
                                 )),
                                 Err(settle_error) => Err(format!(
                                     "{error}; runtime review-attempt settlement failed: {settle_error}"
