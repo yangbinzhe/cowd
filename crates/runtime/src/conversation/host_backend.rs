@@ -1236,12 +1236,24 @@ where
                             &state.session_id,
                             &state.turn_id,
                         );
+                        // Count Teams that have actually delivered accepted work.
+                        // Requiring the whole Program to already be Verified made
+                        // this always 0 while the root itself was the one that had
+                        // to request verification, so the root could never
+                        // converge and only ever replanned (or stopped partial).
                         let verified_team_executions = agentic_program
                             .as_ref()
-                            .filter(|program| {
-                                program.status == crate::AgenticProgramStatus::Verified
-                            })
-                            .map_or(0, |program| program.teams.len());
+                            .map_or(0, |program| {
+                                program
+                                    .tasks
+                                    .values()
+                                    .filter(|task| {
+                                        task.status == crate::AgenticTaskStatus::Accepted
+                                    })
+                                    .map(|task| task.team_id.clone())
+                                    .collect::<std::collections::BTreeSet<_>>()
+                                    .len()
+                            });
                         let blocked_program = agentic_program.as_ref().filter(|program| {
                             program.status == crate::AgenticProgramStatus::Blocked
                         });
