@@ -291,6 +291,17 @@ impl GatewayToolExecutor {
                     ));
                 }
             };
+            // An exact Program reference and a search/page cursor are mutually
+            // exclusive. When a weak model supplies both, honour the exact
+            // reference instead of rejecting the whole action.
+            if tool_name == "state_inspect" {
+                if let Some(object) = value.as_object_mut() {
+                    if object.contains_key("entry_ref") || object.contains_key("scope_ref") {
+                        object.remove("page_cursor");
+                        object.remove("query");
+                    }
+                }
+            }
             let action = parse_agent_action(tool_name, value)
                 .map_err(|error| self.input_contract_error(tool_name, error))?;
             let resolved_content_ref = match &action {
