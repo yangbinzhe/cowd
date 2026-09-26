@@ -571,8 +571,8 @@ impl AgentAction {
                 if (input.page_cursor.is_some() || input.query.is_some())
                     && (input.scope_ref.is_some() || input.entry_ref.is_some())
                 {
-                    return Err(AgentActionValidationError::Invalid(
-                        "page_cursor_with_exact_ref",
+                    return Err(AgentActionValidationError::Rejected(
+                        "state_inspect accepts either an exact `entry_ref`/`scope_ref` OR a `query`/`page_cursor`, not both; drop the cursor to read the exact reference",
                     ));
                 }
             }
@@ -855,6 +855,10 @@ pub enum AgentActionValidationError {
     Duplicate(&'static str),
     #[error("agent action field `{0}` has an invalid canonical form")]
     Invalid(&'static str),
+    /// A cross-field rule failed. The payload is a full instruction, not a
+    /// field name, so the model sees what to change instead of a phantom field.
+    #[error("{0}")]
+    Rejected(&'static str),
 }
 
 fn required(field: &'static str, value: &str) -> Result<(), AgentActionValidationError> {

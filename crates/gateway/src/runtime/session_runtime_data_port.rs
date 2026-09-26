@@ -148,6 +148,12 @@ impl runtime::SessionRuntimeQueryPort for GatewaySessionRuntimePort {
     ) -> Result<Option<harness_contract::context::EvidenceAccessRef>, session::SessionError> {
         let service = self.service()?;
         let mut from_sequence = 0;
+        // A model may cite the stable logical id while dropping the opaque
+        // content suffix of the durable receipt. Resolve such a reference only
+        // when it matches exactly one recorded receipt; an ambiguous prefix is
+        // refused so evidence integrity is never guessed.
+        let mut prefix_match: Option<harness_contract::context::EvidenceAccessRef> = None;
+        let mut prefix_ambiguous = false;
         loop {
             let Some((_, events)) = service
                 .stored_domain_events_by_kind_page(
@@ -158,21 +164,37 @@ impl runtime::SessionRuntimeQueryPort for GatewaySessionRuntimePort {
                 )
                 .await?
             else {
-                return Ok(None);
+                break;
             };
             if events.is_empty() {
-                return Ok(None);
+                break;
             }
             let mut next_sequence = from_sequence;
             for stored in events {
                 next_sequence = next_sequence.max(stored.sequence.saturating_add(1));
                 let event = session::SessionDomainEvent::from_session_event(&stored)
                     .map_err(|error| session::SessionError::Store(error.to_string()))?;
-                if let Some(access) = runtime::context_evidence::raw::access_from_persisted_payload(
-                    evidence_id,
-                    &event.payload,
-                ) {
-                    return Ok(Some(access));
+                let Some(recorded) =
+                    runtime::context_evidence::raw::persisted_evidence_id(&event.payload)
+                else {
+                    continue;
+                };
+                if recorded == evidence_id {
+                    return Ok(runtime::context_evidence::raw::access_from_persisted_payload(
+                        evidence_id,
+                        &event.payload,
+                    ));
+                }
+                if recorded.starts_with(evidence_id) {
+                    if prefix_match.is_some() {
+                        prefix_ambiguous = true;
+                    } else {
+                        prefix_match =
+                            runtime::context_evidence::raw::access_from_persisted_payload(
+                                recorded,
+                                &event.payload,
+                            );
+                    }
                 }
             }
             if next_sequence <= from_sequence {
@@ -182,6 +204,10 @@ impl runtime::SessionRuntimeQueryPort for GatewaySessionRuntimePort {
             }
             from_sequence = next_sequence;
         }
+        if prefix_ambiguous {
+            return Ok(None);
+        }
+        Ok(prefix_match)
     }
 }
 

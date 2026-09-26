@@ -33,6 +33,14 @@ pub struct RawEvidenceRead {
 /// `tool://` is the stable logical identity exposed to models, while the
 /// ArtifactStore selector is deliberately opaque.  Every resolver must use
 /// this canonical mapping instead of guessing that both identifiers match.
+/// The stable logical `tool://` identity recorded by `evidence.raw.persisted`.
+/// Used to resolve a model-supplied reference that dropped the opaque content
+/// suffix by an unambiguous prefix instead of failing the whole action.
+#[must_use]
+pub fn persisted_evidence_id(payload: &Value) -> Option<&str> {
+    payload.get("evidence_id")?.as_str()
+}
+
 #[must_use]
 pub fn access_from_persisted_payload(
     evidence_id: &str,
