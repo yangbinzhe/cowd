@@ -272,7 +272,12 @@ impl RuntimeServices {
             AgentAction::ObjectiveReview(input) if input.decision == harness_contract::agent_action::ObjectiveReviewDecision::Satisfied)
             || matches!(&envelope.action, AgentAction::TaskReview(input)
                 if input.decision == harness_contract::agent_action::TaskReviewDecision::Accept);
-        let review = if positive_review {
+        // The physical-read guard must cover every verdict, not only accept:
+        // otherwise a reviewer can return rework from metadata alone, never open
+        // the submitted body, and the Task can never be independently accepted.
+        let is_review =
+            positive_review || matches!(&envelope.action, AgentAction::TaskReview(_));
+        let review = if is_review {
             // Resolve both the result set and its manifest from one projection.
             let program = actions
                 .project(&envelope.actor.program_id)
@@ -286,7 +291,7 @@ impl RuntimeServices {
                         .ok_or("review Task not found")?
                         .artifact_refs
                 }
-                _ => unreachable!("positive review classification"),
+                _ => unreachable!("review classification"),
             };
             let key = review_attempt_key(envelope);
             match self
@@ -303,7 +308,10 @@ impl RuntimeServices {
             {
                 Ok(review) => {
                     clear_review_streak(&key);
-                    Some(review)
+                    // Only a positive verdict carries the verification forward;
+                    // a negative verdict already satisfied the physical-read
+                    // guard above and applies as before.
+                    positive_review.then_some(review)
                 }
                 Err(error) => {
                     if is_review_source_changed_retry(&error) {
