@@ -596,6 +596,27 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
                         .delegated_tool_effect_descriptor(tool_name, &input)
                 });
         }
+        if tool_name == "tool_search" {
+            // Advertised in this agent's discovery receipt, but a read-only
+            // control-plane capability rather than a governed host effect.
+            // Resolve it with a synthetic read-only descriptor so a delegated
+            // agent can activate deferred tools instead of being rejected with
+            // a missing-descriptor error before it can do any real work.
+            return Some(harness_contract::tool::ToolEffectDescriptor {
+                tool_id: "tool_search".to_string(),
+                descriptor_hash: "delegated-agent:tool-search:v1".to_string(),
+                effect_kind: harness_contract::tool::ToolEffectKind::Read,
+                idempotency: harness_contract::tool::ToolIdempotency::Idempotent,
+                scopes: Vec::new(),
+                required_permission: harness_contract::tool::ToolPermissionMode::ReadOnly,
+                approval_class: harness_contract::tool::ToolApprovalClass::None,
+                uses_network: false,
+                spawns_process: false,
+                mutates_packages: false,
+                mutates_system: false,
+                assessment: harness_contract::policy::EffectAssessment::default(),
+            });
+        }
         self.allowed_tools.contains(tool_name).then(|| {
             let normalized = normalize_delegated_resource_value(
                 tool_name,
