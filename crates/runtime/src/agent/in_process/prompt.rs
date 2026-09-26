@@ -127,6 +127,16 @@ pub(super) fn system_prompt(
             ));
         }
     }
+    if tool_names
+        .iter()
+        .any(|tool| tool.eq_ignore_ascii_case("tool_search"))
+    {
+        // Make the deferred-tool mechanic explicit so the model does not have to
+        // guess why a tool it expects is not callable.
+        prompt.push(
+            "Tool availability: `tool_search` activates deferred tools. A deferred tool is not callable until it is activated, and an activated tool becomes callable on the next automatic request in this same turn. If a tool you need is not in this request's contract, call `tool_search` once with a focused query instead of assuming it is unavailable.".to_string(),
+        );
+    }
     // Every section above is derived from the immutable AgentTaskPacket,
     // Binding, resource lease and host inventory. Request-local clocks,
     // working-state deltas, memory and evidence capsules are appended after

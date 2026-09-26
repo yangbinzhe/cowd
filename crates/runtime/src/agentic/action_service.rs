@@ -440,6 +440,17 @@ impl AgentActionService {
                 // loop bounded by the reopen count.
                 self.record_completion_rejection(&projection, envelope, &message);
             }
+            // T3.0 diagnostic: surface the exact rejection code so a failing
+            // tool call (e.g. task_review accept) is readable, not a bare
+            // "execution_error". Logs only; no behaviour change.
+            tracing::warn!(
+                code,
+                action = %envelope.action.kind(),
+                program_id = %envelope.actor.program_id,
+                agent_id = envelope.actor.agent_id.as_deref().unwrap_or("-"),
+                message = %message,
+                "agent action rejected at transition validation"
+            );
             return Ok(rejected(envelope, projection.revision, code, &message));
         }
         // A Task may support several original Goal conditions, but it cannot
