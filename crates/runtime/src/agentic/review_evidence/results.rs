@@ -243,13 +243,6 @@ pub(super) async fn resolve_result(
         ));
         continuation = prior.continuation;
     }
-    let session_source = crate::ExpectedStreamRevision {
-        stream_id: format!("session:{}", actor.session_id),
-        expected_revision: services
-            .event_store()
-            .stream_revision(&format!("session:{}", actor.session_id))
-            .map_err(|error| error.to_string())?,
-    };
     let mut resolved = ResolvedReviewResult {
         result_sources: vec![],
         reference: reference.into(),
@@ -262,7 +255,12 @@ pub(super) async fn resolve_result(
         artifact_kinds: BTreeSet::new(),
         producers: vec![],
         effect_cursor: None,
-        effect_sources: vec![session_source],
+        // The reviewed scope is the physical producers' canonical receipt
+        // streams, appended below. The root Session stream is written by active
+        // coordinators and is not part of the reviewed Task's effects, so
+        // including it made an independent review fail whenever anything else
+        // in the Session moved between two reads of the same review call.
+        effect_sources: vec![],
         effect_scopes: vec![],
         unscoped_effect: false,
     };

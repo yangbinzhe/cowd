@@ -252,6 +252,22 @@ pub(crate) fn effect_review_snapshot(
     effect_sources: &[String],
 ) -> Result<RootReviewPolicySnapshot, String> {
     let stream_id = format!("session:{}", program.session_id);
+    // A review that cites delegated effect sources is scoped to those streams.
+    // The root Session stream is written by active coordinators and is not part
+    // of the reviewed Task's effects, so fencing it made an independent review
+    // fail whenever anything else in the Session moved. Only a review with no
+    // delegated source (a root/objective-scope review) is fenced on the Session.
+    let session_in_scope = effect_sources.is_empty();
+    let mut digest = Sha256::new();
+    digest.update(
+        goal.map_or(program.objective_id.as_str(), |goal| goal.id.as_str())
+            .as_bytes(),
+    );
+    let mut last_effect_cursor = 0;
+    let mut planned_effects = BTreeSet::new();
+    let mut terminal_calls = BTreeSet::new();
+    let mut session_fence: Option<ExpectedStreamRevision> = None;
+    if session_in_scope {
     let revision = store
         .stream_revision(&stream_id)
         .map_err(|error| error.to_string())?;
@@ -265,15 +281,7 @@ pub(crate) fn effect_review_snapshot(
     } else {
         0
     };
-    let mut digest = Sha256::new();
-    digest.update(
-        goal.map_or(program.objective_id.as_str(), |goal| goal.id.as_str())
-            .as_bytes(),
-    );
     let mut offset = 0;
-    let mut last_effect_cursor = 0;
-    let mut planned_effects = BTreeSet::new();
-    let mut terminal_calls = BTreeSet::new();
     loop {
         let events = store.list_stream_page_desc(&stream_id, 64, offset)?;
         if events.is_empty() {
@@ -366,6 +374,11 @@ pub(crate) fn effect_review_snapshot(
                 .into(),
         );
     }
+    session_fence = Some(ExpectedStreamRevision {
+        stream_id: stream_id.clone(),
+        expected_revision: revision,
+    });
+    }
     let mut additional_sources = Vec::new();
     for source in effect_sources.iter().collect::<BTreeSet<_>>() {
         if !source.starts_with("execution-agent-receipts:") {
@@ -432,14 +445,22 @@ pub(crate) fn effect_review_snapshot(
             expected_revision: revision,
         });
     }
+    // The primary fence is the Session stream for a root-scope review, or the
+    // first delegated effect source otherwise.
+    let source = match session_fence {
+        Some(fence) => fence,
+        None => {
+            if additional_sources.is_empty() {
+                return Err("effect review has no fence source".into());
+            }
+            additional_sources.remove(0)
+        }
+    };
     Ok(RootReviewPolicySnapshot {
         additional_sources,
         digest: format!("{:x}", digest.finalize()),
         last_effect_cursor,
-        source: ExpectedStreamRevision {
-            stream_id,
-            expected_revision: revision,
-        },
+        source,
     })
 }
 
