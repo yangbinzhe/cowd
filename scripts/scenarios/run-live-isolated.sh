@@ -24,7 +24,22 @@ cd "$ROOT"
 
 : "${COWD_PG_BASE_URL:=postgres://postgres:cowd-owned-local-fixture@127.0.0.1:32772/postgres}"
 : "${COWD_EVAL_LIVE_SCENARIOS:?set COWD_EVAL_LIVE_SCENARIOS to exactly one scenario id}"
-: "${COWD_EVAL_KEEP_DB:=1}"
+
+# Retention policy: keep the fresh database ONLY for long, complex full-flow
+# scenarios, which can break mid-run and then need the database for resume and
+# troubleshooting. Light/temporary scenario runs are cleaned up so databases
+# never accumulate. Override explicitly with COWD_EVAL_KEEP_DB=1 (force keep)
+# or COWD_EVAL_KEEP_DB=0 (force drop).
+if [[ -z "${COWD_EVAL_KEEP_DB:-}" ]]; then
+  case "$COWD_EVAL_LIVE_SCENARIOS" in
+    live_autonomous_collaboration_deepseek|live_qwen38_large_scale_collaboration|live_group_theory_ai_research_simulation)
+      COWD_EVAL_KEEP_DB=1
+      ;;
+    *)
+      COWD_EVAL_KEEP_DB=0
+      ;;
+  esac
+fi
 
 command -v psql >/dev/null || { echo 'psql is required to provision the fresh eval database' >&2; exit 2; }
 
