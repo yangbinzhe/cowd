@@ -47,3 +47,8 @@ plan/
 .cc/
 .sandbox-home/
 .sandbox-tmp/
+
+# Live-eval scenario artifacts written into the candidate workspace.
+/group-theory-eval/
+/group-theory-ai-eval/
+/group-theory-ai-autonomous-evaluation.html
