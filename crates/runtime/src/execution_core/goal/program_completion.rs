@@ -15,6 +15,11 @@ pub(crate) struct PreparedProgramConclusion {
 /// it only to bound an unbounded re-open loop.
 const COMPLETION_REOPENED_EVENT_KIND: &str = "agentic.completion_reopened";
 
+/// A completion request rejected at authorization (never applied). Counted with
+/// reopens so the bounded-convergence terminus also covers a root that keeps
+/// requesting completion and is rejected before a reopen can be recorded.
+const COMPLETION_REJECTED_EVENT_KIND: &str = "agentic.completion_rejected";
+
 /// After this many rejected completion requests a Program stops re-opening and
 /// terminates as an honest Blocked result instead of looping. Configurable via
 /// `COWD_COMPLETION_REOPEN_BOUND` (default 6). This complements the progress
@@ -36,7 +41,10 @@ fn completion_reopen_count(event_store: &crate::RuntimeEventStore, program_id: &
         .map(|events| {
             events
                 .iter()
-                .filter(|event| event.kind == COMPLETION_REOPENED_EVENT_KIND)
+                .filter(|event| {
+                    event.kind == COMPLETION_REOPENED_EVENT_KIND
+                        || event.kind == COMPLETION_REJECTED_EVENT_KIND
+                })
                 .count()
         })
         .unwrap_or(0)

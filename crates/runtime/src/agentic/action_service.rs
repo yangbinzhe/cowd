@@ -26,6 +26,11 @@ const ACTION_EVENT_KIND: &str = "agentic.action_applied";
 const PROGRAM_OPENED_EVENT_KIND: &str = "agentic.program_opened";
 const OBJECTIVE_VERDICT_EVENT_KIND: &str = "agentic.objective_verdict_bound";
 const COMPLETION_REOPENED_EVENT_KIND: &str = "agentic.completion_reopened";
+/// A completion request rejected at *authorization* (before it is applied).
+/// These never became a durable reopen, so a Program could loop requesting
+/// completion forever without the bounded-convergence reopen count ever
+/// seeing it. Recorded durably so that loop is still bounded.
+const COMPLETION_REJECTED_EVENT_KIND: &str = "agentic.completion_rejected";
 const TOPIC_CURSOR_EVENT_KIND: &str = "agentic.topic_observation_acknowledged";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -423,6 +428,14 @@ impl AgentActionService {
         if let Some((code, message)) =
             validate_transition(&projection, envelope, now_ms(), self.graphs.as_ref())
         {
+            if code == "objective_not_verifiable"
+                && matches!(envelope.action, AgentAction::ObjectiveCompleteRequest(_))
+            {
+                // F2b: an authorization-time completion rejection never became a
+                // durable reopen, so record it durably to keep the completion
+                // loop bounded by the reopen count.
+                self.record_completion_rejection(&projection, envelope, &message);
+            }
             return Ok(rejected(envelope, projection.revision, code, &message));
         }
         // A Task may support several original Goal conditions, but it cannot
@@ -1064,6 +1077,49 @@ impl AgentActionService {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or_default();
         Ok((through_revision, cursor_revision))
+    }
+
+    /// Record a durable marker for a completion request rejected at
+    /// authorization. Best-effort: a failed append must not change the
+    /// rejection disposition the caller already computed.
+    fn record_completion_rejection(
+        &self,
+        projection: &AgenticProgramProjection,
+        envelope: &AgentActionEnvelope,
+        gap: &str,
+    ) {
+        let stream_id = program_stream(&projection.program_id);
+        let event = RuntimeTransactionEventInput {
+            event: RuntimeEventInput {
+                stream_id,
+                scope: RuntimeEventScope::Program,
+                kind: COMPLETION_REJECTED_EVENT_KIND.to_string(),
+                status: Some("rejected".to_string()),
+                actor: Some(envelope.actor.actor_id.clone()),
+                refs: vec![RuntimeEventRef {
+                    kind: "objective".to_string(),
+                    id: envelope.actor.objective_id.clone(),
+                }],
+                payload: json!({
+                    "program_id": projection.program_id,
+                    "request_action_id": envelope.action_id,
+                    "gap": gap,
+                }),
+            },
+            idempotency_key: Some(format!(
+                "completion-rejected:{}",
+                envelope.action_id
+            )),
+            schema_version: 1,
+        };
+        let _ = self.store.append_transaction(AppendTransactionRequest {
+            transaction_id: format!(
+                "completion-rejected:{}:{}",
+                projection.program_id, envelope.action_id
+            ),
+            expected_streams: Vec::new(),
+            events: vec![event],
+        });
     }
 
     /// Commit the Goal decision and the exact Program request disposition in
