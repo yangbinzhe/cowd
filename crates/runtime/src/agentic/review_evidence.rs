@@ -593,7 +593,15 @@ impl RuntimeServices {
                     {
                         continue;
                     }
-                    if event.payload["tool_name"] != "evidence_retrieve" {
+                    // `read` is the unified facade; a tool:// or artifact:// read
+                    // through it resolves the same durable receipt as
+                    // `evidence_retrieve`, so it must count as a physical read.
+                    // Non-evidence `read` calls simply have no full_output_ref
+                    // and are skipped below.
+                    if !matches!(
+                        event.payload["tool_name"].as_str(),
+                        Some("evidence_retrieve" | "read")
+                    ) {
                         if let Some(effect) = results::tool_effect(self, &event)? {
                             if effect.effect_kind == harness_contract::tool::ToolEffectKind::Read {
                                 record_effect_observation(
