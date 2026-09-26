@@ -8,6 +8,11 @@ pub(super) struct AgenticExecutionAdmission {
     pub(super) allowed_tools: Vec<String>,
     pub(super) allowed_skills: Vec<String>,
     pub(super) permission_ceiling: PermissionMode,
+    /// Requested capabilities that had no usable tool in the admitted ToolHost
+    /// snapshot (diagnostic; a degradation, not a failure).
+    pub(super) missing_capabilities: Vec<String>,
+    /// The tool alternatives that would have satisfied those capabilities.
+    pub(super) missing_tool_alternatives: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -81,7 +86,7 @@ pub(super) fn resolve_agentic_execution_admission(
             &context.resource_scopes,
         )
     });
-    let allowed_tools = intersect_agentic_tools(
+    let (allowed_tools, missing_capabilities, missing_tool_alternatives) = intersect_agentic_tools(
         &resolved,
         &requested_tools,
         &skill_tool_refs,
@@ -94,6 +99,8 @@ pub(super) fn resolve_agentic_execution_admission(
         allowed_tools,
         allowed_skills,
         permission_ceiling: session_ceiling,
+        missing_capabilities,
+        missing_tool_alternatives,
     })
 }
 
@@ -368,14 +375,15 @@ pub(super) fn tool_effect_has_resource_lease(
     })
 }
 
+// Return the admitted tool subset plus the missing-capability diagnostics.
 pub(super) fn intersect_agentic_tools(
     resolved: &ResolvedAgentCapability,
     requested_tools: &BTreeSet<String>,
     skill_tool_refs: &BTreeSet<String>,
     host_snapshot: Option<&AgenticToolHostSnapshot>,
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, Vec<String>, Vec<String>), String> {
     let Some(host_snapshot) = host_snapshot else {
-        return Ok(requested_tools.iter().cloned().collect());
+        return Ok((requested_tools.iter().cloned().collect(), Vec::new(), Vec::new()));
     };
     let host_tools = &host_snapshot.tools;
     let host_binding = bind_agent_capability_to_host(resolved, host_tools);
@@ -429,5 +437,9 @@ pub(super) fn intersect_agentic_tools(
             missing_effect_capabilities.join(",")
         ));
     }
-    Ok(requested_tools.intersection(&host_tools).cloned().collect())
+    Ok((
+        requested_tools.intersection(&host_tools).cloned().collect(),
+        host_binding.missing_capabilities,
+        host_binding.missing_tool_alternatives,
+    ))
 }

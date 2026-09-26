@@ -105,6 +105,62 @@ fn dispatch_starvation_key(
 ) -> String {
     format!("{program_id}|{task_ref}|{}", mode.as_str())
 }
+
+/// Opt-in verbose tool-contract logging (`COWD_TOOL_CONTRACT_TRACE=1`). Only
+/// affects logs, never authorization.
+fn tool_contract_trace() -> bool {
+    matches!(
+        std::env::var("COWD_TOOL_CONTRACT_TRACE").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
+/// Record a durable milestone when an Agent's requested capability had no usable
+/// tool. This makes the *reason* a tool is missing auditable (which step of the
+/// capability→tool→host intersection dropped it) instead of a silent gap.
+fn record_tool_contract_milestone(
+    services: &Arc<RuntimeServices>,
+    projection: &AgenticProgramProjection,
+    task: &AgenticTaskProjection,
+    member: &AgentMemberProjection,
+    mode: DispatchMode,
+    admission: &AgenticExecutionAdmission,
+) {
+    let event = crate::RuntimeTransactionEventInput {
+        event: crate::RuntimeEventInput {
+            stream_id: format!("agentic-program:{}", projection.program_id),
+            scope: crate::RuntimeEventScope::Program,
+            kind: "agentic.tool_contract".to_string(),
+            status: Some("degraded".to_string()),
+            actor: Some(member.agent_id.clone()),
+            refs: Vec::new(),
+            payload: serde_json::json!({
+                "program_id": projection.program_id,
+                "task_ref": task.task_id,
+                "agent_id": member.agent_id,
+                "mode": mode.as_str(),
+                "allowed_tools": admission.allowed_tools,
+                "missing_capabilities": admission.missing_capabilities,
+                "missing_tool_alternatives": admission.missing_tool_alternatives,
+            }),
+        },
+        idempotency_key: Some(format!(
+            "tool-contract:{}:{}:{}",
+            projection.program_id, task.task_id, member.agent_id
+        )),
+        schema_version: 1,
+    };
+    let _ = services
+        .event_store()
+        .append_transaction(crate::AppendTransactionRequest {
+            transaction_id: format!(
+                "tool-contract:{}:{}:{}",
+                projection.program_id, task.task_id, member.agent_id
+            ),
+            expected_streams: Vec::new(),
+            events: vec![event],
+        });
+}
 pub(super) fn agentic_shared_prompt_package(
     projection: &AgenticProgramProjection,
     team_id: &str,
@@ -1216,6 +1272,30 @@ impl RuntimeServices {
         for member in members {
             match resolve_agentic_execution_admission(self, member, task, context, mode) {
                 Ok(admission) => {
+                    // Tool-contract diagnostics: make the resolved tool set and
+                    // any missing capability visible instead of a silent drop.
+                    if !admission.missing_capabilities.is_empty() {
+                        tracing::warn!(
+                            program_id = %projection.program_id,
+                            task_ref = %task.task_id,
+                            agent_id = %member.agent_id,
+                            mode = mode.as_str(),
+                            allowed_tools = %admission.allowed_tools.join(","),
+                            missing_capabilities = %admission.missing_capabilities.join(","),
+                            missing_tool_alternatives = %admission.missing_tool_alternatives.join(","),
+                            "agent tool contract degraded: requested capability lacks a usable tool"
+                        );
+                        record_tool_contract_milestone(self, projection, task, member, mode, &admission);
+                    } else if tool_contract_trace() {
+                        tracing::info!(
+                            program_id = %projection.program_id,
+                            task_ref = %task.task_id,
+                            agent_id = %member.agent_id,
+                            mode = mode.as_str(),
+                            allowed_tools = %admission.allowed_tools.join(","),
+                            "agent tool contract resolved"
+                        );
+                    }
                     if member_busy(member) {
                         busy_eligible = true;
                         continue;

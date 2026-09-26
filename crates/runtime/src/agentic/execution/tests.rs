@@ -2607,10 +2607,12 @@ fn admission_intersects_multiple_definition_skills_and_custom_tools() {
     let snapshot = AgenticToolHostSnapshot {
         tools: requested.clone(),
     };
-    let allowed = intersect_agentic_tools(&resolved, &requested, &skill_tools, Some(&snapshot))
-        .expect("custom tools are admitted from the active skill and host intersection");
+    let (allowed, missing_capabilities, _missing_tool_alternatives) =
+        intersect_agentic_tools(&resolved, &requested, &skill_tools, Some(&snapshot))
+            .expect("custom tools are admitted from the active skill and host intersection");
     assert!(allowed.contains(&"custom_data_lookup".to_string()));
     assert!(allowed.contains(&"custom_report_reader".to_string()));
+    assert!(missing_capabilities.is_empty());
 }
 
 #[test]
