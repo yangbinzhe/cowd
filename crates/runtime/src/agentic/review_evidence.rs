@@ -662,11 +662,20 @@ impl RuntimeServices {
                 }
             }
         }
-        let missing = coverage
-            .values()
-            .filter(|state| !state.complete())
-            .map(|state| state.proof.result_ref.clone())
-            .collect::<Vec<_>>();
+        // If the runtime already handed this reviewer the submitted bodies (a
+        // durable `agentic.review_body_prefetched` attestation for the same
+        // reviewer execution), the physical-read coverage is satisfied without a
+        // separate tool read.
+        let body_prefetched = self.review_body_prefetched(&actor, program);
+        let missing = if body_prefetched {
+            Vec::new()
+        } else {
+            coverage
+                .values()
+                .filter(|state| !state.complete())
+                .map(|state| state.proof.result_ref.clone())
+                .collect::<Vec<_>>()
+        };
         if !missing.is_empty() {
             return Err(format!("review_requires_current_physical_reads:{}; use evidence_retrieve and follow every next_request for the current result", missing.join(",")));
         }
@@ -709,6 +718,33 @@ impl RuntimeServices {
                     })
                     .collect(),
             },
+        })
+    }
+
+    /// True when the runtime handed this reviewer the submitted bodies for its
+    /// exact review execution (a durable prefetch attestation), which satisfies
+    /// the physical-read requirement without a separate tool read.
+    fn review_body_prefetched(
+        &self,
+        actor: &harness_contract::agent_action::AgentActorBinding,
+        program: &crate::AgenticProgramProjection,
+    ) -> bool {
+        let stream_id = format!("agentic-program:{}", program.program_id);
+        let Ok(events) = self.event_store().list_stream(&stream_id) else {
+            return false;
+        };
+        events.iter().any(|event| {
+            event.kind == "agentic.review_body_prefetched"
+                && event
+                    .payload
+                    .get("program_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(program.program_id.as_str())
+                && event
+                    .payload
+                    .get("execution_id")
+                    .and_then(serde_json::Value::as_str)
+                    == actor.execution_id.as_deref()
         })
     }
 }

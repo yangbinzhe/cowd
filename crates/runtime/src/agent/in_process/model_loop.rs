@@ -971,6 +971,47 @@ async fn prefetch_review_bodies(
     if sections.is_empty() {
         return None;
     }
+    // Durable attestation: the runtime handed this reviewer the submitted
+    // bodies, so the physical-read guard is satisfied without a separate tool
+    // read. Best-effort; the prompt still carries the bodies regardless.
+    let stream_id = format!("agentic-program:{}", agentic.program_id);
+    if let Ok(revision) = services.event_store().stream_revision(&stream_id) {
+        let event = crate::RuntimeTransactionEventInput {
+            event: crate::RuntimeEventInput {
+                stream_id: stream_id.clone(),
+                scope: crate::RuntimeEventScope::Program,
+                kind: "agentic.review_body_prefetched".to_string(),
+                status: Some("prefetched".to_string()),
+                actor: Some(agentic.agent_id.clone()),
+                refs: Vec::new(),
+                payload: serde_json::json!({
+                    "program_id": agentic.program_id,
+                    "task_ref": task.task_id,
+                    "agent_id": agentic.agent_id,
+                    "execution_id": packet.graph_id(),
+                    "artifact_refs": task.artifact_refs,
+                }),
+            },
+            idempotency_key: Some(format!(
+                "review-body-prefetched:{}:{}",
+                agentic.program_id,
+                packet.graph_id()
+            )),
+            schema_version: 1,
+        };
+        let _ = services.event_store().append_transaction(crate::AppendTransactionRequest {
+            transaction_id: format!(
+                "review-body-prefetched:{}:{}",
+                agentic.program_id,
+                packet.graph_id()
+            ),
+            expected_streams: vec![crate::ExpectedStreamRevision {
+                stream_id,
+                expected_revision: revision,
+            }],
+            events: vec![event],
+        });
+    }
     Some(format!(
         "\n\n## Submitted artifact bodies for this review\nJudge from these exact submitted contents, not from metadata:\n{}",
         sections.join("\n\n")
