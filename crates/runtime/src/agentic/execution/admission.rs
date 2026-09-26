@@ -380,11 +380,16 @@ pub(super) fn intersect_agentic_tools(
     let host_tools = &host_snapshot.tools;
     let host_binding = bind_agent_capability_to_host(resolved, host_tools);
     if !host_binding.missing_capabilities.is_empty() {
-        return Err(format!(
-            "Agent execution capabilities are unavailable after policy and ToolHost intersection: {}; acceptable tools: {}",
-            host_binding.missing_capabilities.join(","),
-            host_binding.missing_tool_alternatives.join(",")
-        ));
+        // A requested capability without a usable tool is a *degradation*, not
+        // a dispatch failure. Returning Err here turned one unavailable tool
+        // into a "no admissible member" starvation loop. Admit with the
+        // available tool subset and record the gap, so the Agent can proceed
+        // (and report the limitation) while the missing contract stays visible.
+        tracing::warn!(
+            missing_capabilities = %host_binding.missing_capabilities.join(","),
+            acceptable_tools = %host_binding.missing_tool_alternatives.join(","),
+            "agent admission degraded: requested capability lacks a usable tool"
+        );
     }
     let required_tools = AGENT_ACTION_TOOL_IDS
         .iter()

@@ -1366,6 +1366,14 @@ where
         // owner and turn backends alive until a resumed Synthesize node
         // commits the terminal summary; returning here used to drop the weak
         // backends, strand the Program, and requeue the same paid request.
+        // Progress-based stall bound for the ingress wait loop (see below).
+        let turn_stall_checks_bound: u32 = std::env::var("COWD_TURN_STALL_CHECKS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(30);
+        let mut last_progress_key: Option<String> = None;
+        let mut stalled_checks: u32 = 0;
         loop {
             let notify = {
                 let state = state.lock().await;
@@ -1412,6 +1420,34 @@ where
                     .is_terminal()
             });
             if !has_program_barrier || !has_non_terminal_work {
+                break;
+            }
+            // Bounded convergence, progress-based (never wall-clock): if the
+            // graph's node statuses do not change for a bounded number of
+            // checks, the turn is in a no-progress cycle (starvation/deadlock),
+            // so end it honestly instead of waiting without bound. A turn that
+            // keeps making progress never triggers this.
+            let progress_key = {
+                let mut key = String::new();
+                for (id, status) in &graph.node_statuses {
+                    key.push_str(id);
+                    key.push('=');
+                    key.push_str(&format!("{status:?}"));
+                    key.push(';');
+                }
+                key
+            };
+            if last_progress_key.as_deref() == Some(progress_key.as_str()) {
+                stalled_checks = stalled_checks.saturating_add(1);
+            } else {
+                last_progress_key = Some(progress_key);
+                stalled_checks = 0;
+            }
+            if stalled_checks >= turn_stall_checks_bound {
+                let mut state = state.lock().await;
+                state.failure = Some(format!(
+                    "Execution blocked safely: no verified progress for {stalled_checks} consecutive checks (bound {turn_stall_checks_bound}) while the Agent-first Program barrier stayed open (possible starvation/deadlock). The objective is only partially satisfied and unresolved work stays in the Program projection; Runtime stopped the turn instead of waiting without bound."
+                ));
                 break;
             }
             let _ = tokio::time::timeout(

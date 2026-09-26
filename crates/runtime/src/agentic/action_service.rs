@@ -26,6 +26,10 @@ const ACTION_EVENT_KIND: &str = "agentic.action_applied";
 const PROGRAM_OPENED_EVENT_KIND: &str = "agentic.program_opened";
 const OBJECTIVE_VERDICT_EVENT_KIND: &str = "agentic.objective_verdict_bound";
 const COMPLETION_REOPENED_EVENT_KIND: &str = "agentic.completion_reopened";
+/// A lightweight in-place claim-lease renewal. Unlike `agentic.action_applied`
+/// (a full governed action), this only extends the existing claim's lease, so a
+/// long-running Agent does not churn durable actions just to stay alive.
+const TASK_LEASE_RENEWED_EVENT_KIND: &str = "agentic.task_lease_renewed";
 /// A completion request rejected at *authorization* (before it is applied).
 /// These never became a durable reopen, so a Program could loop requesting
 /// completion forever without the bounded-convergence reopen count ever
@@ -1488,6 +1492,31 @@ fn apply_projection_events(
                     .cloned()
                     .unwrap_or_else(|| json!([])),
             )?;
+            projection.revision = event.sequence;
+            continue;
+        }
+        if event.kind == TASK_LEASE_RENEWED_EVENT_KIND {
+            let task_ref = event
+                .payload
+                .get("task_ref")
+                .and_then(serde_json::Value::as_str);
+            let agent_id = event
+                .payload
+                .get("agent_id")
+                .and_then(serde_json::Value::as_str);
+            let execution_id = event
+                .payload
+                .get("execution_id")
+                .and_then(serde_json::Value::as_str);
+            if let Some(task) = task_ref.and_then(|task_ref| projection.tasks.get_mut(task_ref)) {
+                let same_owner = task.status == AgenticTaskStatus::Claimed
+                    && task.claimant.as_deref() == agent_id
+                    && task.claim_execution_id.as_deref() == execution_id;
+                if same_owner {
+                    task.lease_expires_at_ms =
+                        Some(event.created_at_ms.saturating_add(super::work_market::claim_lease_ms()));
+                }
+            }
             projection.revision = event.sequence;
             continue;
         }

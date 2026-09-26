@@ -10,15 +10,23 @@ use harness_contract::agent::{
 // request, so this estimate cannot become a business-execution budget gate.
 const AGENTIC_TASK_CAPACITY_ESTIMATE_TOKENS: u64 = 1_000_000;
 
-/// Consecutive deferral counts keyed by `program|task|mode`. A Program that
-/// keeps deferring the very same dispatch past the bound is wedged, not merely
-/// busy, so it is escalated instead of spinning forever.
+/// Deferral state keyed by `program|task|mode`: consecutive count and the
+/// earliest time this dispatch may be retried. A repeatedly-deferred dispatch
+/// backs off exponentially so a wedged Program is not re-attempted (and logged)
+/// on every reconcile tick, while a genuine stall is still bounded and
+/// escalated. This is anti-idle-spin backoff; it never kills work.
 static DISPATCH_STARVATION: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::BTreeMap<String, usize>>,
+    std::sync::Mutex<std::collections::BTreeMap<String, DispatchStarvationState>>,
 > = std::sync::OnceLock::new();
 
+#[derive(Debug, Clone, Copy)]
+struct DispatchStarvationState {
+    count: usize,
+    next_attempt_at_ms: u64,
+}
+
 fn dispatch_starvation_ledger(
-) -> &'static std::sync::Mutex<std::collections::BTreeMap<String, usize>> {
+) -> &'static std::sync::Mutex<std::collections::BTreeMap<String, DispatchStarvationState>> {
     DISPATCH_STARVATION.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
 }
 
@@ -32,13 +40,46 @@ fn dispatch_starvation_bound() -> usize {
         .unwrap_or(12)
 }
 
+/// Exponential backoff (base 500ms, capped 30s) for repeated identical
+/// deferrals, so an unchanged starved dispatch is not re-attempted every tick.
+fn dispatch_starvation_backoff_ms(count: usize) -> u64 {
+    let shift = u32::try_from(count.saturating_sub(1).min(6)).unwrap_or(6);
+    500u64.saturating_mul(1u64 << shift).min(30_000)
+}
+
 fn dispatch_starvation_record(key: &str) -> usize {
+    let now = crate::tool_invocation::now_ms();
     let mut ledger = dispatch_starvation_ledger()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let counter = ledger.entry(key.to_string()).or_insert(0);
-    *counter = counter.saturating_add(1);
-    *counter
+    let entry = ledger
+        .entry(key.to_string())
+        .or_insert(DispatchStarvationState {
+            count: 0,
+            next_attempt_at_ms: 0,
+        });
+    entry.count = entry.count.saturating_add(1);
+    // Only arm backoff from the second consecutive deferral onward, so the
+    // first deferral keeps normal retry semantics (and does not skip a dispatch
+    // that would otherwise succeed once a member frees).
+    entry.next_attempt_at_ms = if entry.count >= 2 {
+        now.saturating_add(dispatch_starvation_backoff_ms(entry.count))
+    } else {
+        0
+    };
+    entry.count
+}
+
+/// True while a starved dispatch is inside its backoff window: skip it silently
+/// (no re-attempt, no log) until the window elapses.
+fn dispatch_starvation_backing_off(key: &str) -> bool {
+    let now = crate::tool_invocation::now_ms();
+    let ledger = dispatch_starvation_ledger()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ledger
+        .get(key)
+        .is_some_and(|state| now < state.next_attempt_at_ms)
 }
 
 fn dispatch_starvation_clear(key: &str) {
@@ -1030,6 +1071,13 @@ impl RuntimeServices {
         context: &AgenticDispatchContext,
         _trigger: &AgentActionEnvelope,
     ) -> Result<Vec<AgenticDispatchReceipt>, String> {
+        // Anti-idle-spin: a dispatch that keeps deferring backs off; skip it
+        // silently until its backoff window elapses instead of re-attempting
+        // (and logging) on every reconcile tick.
+        let starvation_key = dispatch_starvation_key(&projection.program_id, task_ref, mode);
+        if dispatch_starvation_backing_off(&starvation_key) {
+            return Ok(Vec::new());
+        }
         // Program status is business truth, not renewed execution authority.
         // Late submissions and startup recovery must respect the owning root's
         // terminal fence, even when its business objective remains unresolved.
