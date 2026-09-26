@@ -511,11 +511,17 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             "agent.execution.started",
             "provider-backed child execution admitted",
         );
+        // A review execution must start with the submitted bodies in context, so
+        // even a reviewer that verdicts on its first turn judges from the exact
+        // content instead of metadata (which the runtime rejects).
+        let mut first_prompt = String::from(
+            "Begin the bounded role using the Runtime-attested shared Team context and private role brief above. Return verified findings, evidence, and genuine gaps.",
+        );
+        if let Some(bodies) = prefetch_review_bodies(services.as_ref(), &packet).await {
+            first_prompt.push_str(&bodies);
+        }
         let result = runtime
-            .submit_turn(
-                "Begin the bounded role using the Runtime-attested shared Team context and private role brief above. Return verified findings, evidence, and genuine gaps.",
-                &SharedPrompter::none(),
-            )
+            .submit_turn(&first_prompt, &SharedPrompter::none())
             .await;
         let mut summary = match result {
             Ok(summary) => summary,
