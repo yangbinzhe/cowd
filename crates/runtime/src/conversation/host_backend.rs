@@ -3676,7 +3676,8 @@ pub(super) async fn resolve_explicit_agentic_content_refs(
         let is_commit = call.name == harness_contract::agent_action::ARTIFACT_COMMIT_TOOL_ID;
         let is_submit = call.name == harness_contract::agent_action::TASK_SUBMIT_TOOL_ID;
         let is_review = call.name == harness_contract::agent_action::TASK_REVIEW_TOOL_ID;
-        if !is_commit && !is_submit && !is_review {
+        let is_publish = call.name == harness_contract::agent_action::MESSAGE_PUBLISH_TOOL_ID;
+        if !is_commit && !is_submit && !is_review && !is_publish {
             continue;
         }
         let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&call.input) else {
@@ -3684,15 +3685,15 @@ pub(super) async fn resolve_explicit_agentic_content_refs(
         };
         // Normalize bare evidence references to their durable scheme so a model
         // that dropped `tool://`/`artifact://` is not rejected with
-        // unsupported_evidence_ref.
+        // unsupported_evidence_ref / issue_disposition_requires_durable_evidence.
         normalize_bare_evidence_refs(&mut value);
-        if is_review {
-            // A review verdict carries no publishable body; only its evidence
-            // references needed normalizing above.
+        if is_review || is_publish {
+            // A review verdict and a discussion publish carry no publishable
+            // artifact body; only their evidence references needed normalizing.
             call.input = serde_json::to_string(&value).map_err(|error| {
                 NodeExecutorError::Poll {
                     node_id: ticket.node_id.clone(),
-                    reason: format!("encode normalized review evidence: {error}"),
+                    reason: format!("encode normalized evidence: {error}"),
                 }
             })?;
             continue;
@@ -3828,17 +3829,52 @@ fn normalize_bare_evidence_refs(value: &mut serde_json::Value) {
         return;
     };
     for field in ["evidence_refs", "result_refs"] {
-        let Some(array) = object.get_mut(field).and_then(|value| value.as_array_mut()) else {
-            continue;
-        };
-        for entry in array.iter_mut() {
-            let Some(raw) = entry.as_str() else {
+        if let Some(array) = object.get_mut(field).and_then(|value| value.as_array_mut()) {
+            normalize_ref_array(array);
+        }
+    }
+    // An issue disposition also carries durable references that must be
+    // canonical: a bare reason_ref/evidence_refs previously failed
+    // issue_disposition_requires_durable_evidence.
+    if let Some(dispositions) = object
+        .get_mut("issue_dispositions")
+        .and_then(|value| value.as_array_mut())
+    {
+        for disposition in dispositions {
+            let Some(entry) = disposition.as_object_mut() else {
                 continue;
             };
-            let normalized = normalize_bare_evidence_ref(raw);
-            if normalized != raw {
-                *entry = serde_json::Value::String(normalized);
+            let reason = entry
+                .get("reason_ref")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            if let Some(raw) = reason {
+                let normalized = normalize_bare_evidence_ref(&raw);
+                if normalized != raw {
+                    entry.insert(
+                        "reason_ref".to_string(),
+                        serde_json::Value::String(normalized),
+                    );
+                }
             }
+            if let Some(array) = entry
+                .get_mut("evidence_refs")
+                .and_then(|value| value.as_array_mut())
+            {
+                normalize_ref_array(array);
+            }
+        }
+    }
+}
+
+fn normalize_ref_array(array: &mut [serde_json::Value]) {
+    for entry in array.iter_mut() {
+        let Some(raw) = entry.as_str() else {
+            continue;
+        };
+        let normalized = normalize_bare_evidence_ref(raw);
+        if normalized != raw {
+            *entry = serde_json::Value::String(normalized);
         }
     }
 }
