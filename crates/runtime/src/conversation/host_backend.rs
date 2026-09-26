@@ -3695,25 +3695,35 @@ pub(super) async fn resolve_explicit_agentic_content_refs(
                 .and_then(serde_json::Value::as_u64)
                 .map(|index| index as usize)
         };
-        let selected: Option<(usize, &str)> = if is_commit {
+        // `message://current` names the whole response instead of one block, so a
+        // weak model never has to count blocks; the resolver selects this same
+        // response's longest substantive Text block. A blank response is still
+        // refused, so no bodyless artifact is ever persisted.
+        let whole_message = is_commit
+            && value
+                .get("content_ref")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|reference| reference == "message://current");
+        let selected: Option<(usize, &str)> = if !is_commit {
+            select_one_shot_deliverable_text(message, one_shot_hint)
+        } else if whole_message {
+            select_one_shot_deliverable_text(message, None)
+        } else {
             match index {
                 Some(index) if index < message.blocks.len() => match &message.blocks[index] {
                     ContentBlock::Text { text } if !text.trim().is_empty() => {
                         Some((index, text.as_str()))
                     }
-                    // In range but not a non-empty Text block: the model named
-                    // a real block that is not its body. Fall back to this same
-                    // response's longest non-empty Text block rather than fail
-                    // the commit; the content is still the model's own words.
+                    // In range but not a non-empty Text block: the model named a
+                    // real block that is not its body. Fall back to this same
+                    // response's longest non-empty Text block rather than fail the
+                    // commit; the content is still the model's own words.
                     _ => select_one_shot_deliverable_text(message, Some(index)),
                 },
-                // Out of range stays unresolved by contract: a missing block
-                // must never substitute unrelated content (for example a
-                // preamble paragraph) for the deliverable.
+                // Out of range stays unresolved by contract: a missing block must
+                // never substitute unrelated content such as a preamble paragraph.
                 _ => None,
             }
-        } else {
-            select_one_shot_deliverable_text(message, one_shot_hint)
         };
         let Some((selected_index, text)) = selected else {
             continue;

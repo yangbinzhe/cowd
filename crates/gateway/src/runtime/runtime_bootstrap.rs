@@ -468,7 +468,7 @@ fn agent_action_tool_definitions() -> Vec<RuntimeToolDefinition> {
         ),
         agent_action_definition::<action::ArtifactCommitInput>(
             action::ARTIFACT_COMMIT_TOOL_ID,
-            "Commit an explicit artifact_publish content_ref, or content_ref=current_message_block:<zero-based-index> to select exactly one Text block in this response. A missing block never falls back to another paragraph or previous draft. Never put the content body in JSON.",
+            "Attach a deliverable body in one of three ways. Preferred and easiest: content_ref=message://current selects this whole response's substantive body, so you never count blocks. Or content_ref=artifact_publish:... for a file you published. Or content_ref=current_message_block:<zero-based-index> to pick exactly one Text block; an out-of-range index never falls back to another paragraph. Never put the content body in JSON.",
         ),
         agent_action_definition::<action::ObjectiveUpdateInput>(
             action::OBJECTIVE_UPDATE_TOOL_ID,

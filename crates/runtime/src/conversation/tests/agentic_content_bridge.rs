@@ -358,6 +358,38 @@ async fn explicit_block_publication_excludes_preamble_and_rejects_out_of_range()
 }
 
 #[tokio::test]
+async fn whole_message_commit_selects_the_substantive_body() {
+    let services = crate::RuntimeServices::in_memory().unwrap();
+    let ticket = agentic_content_bridge_ticket("whole-message-graph", "model", 1);
+    let body = format!("REPORT-BODY:{}:END", "evidence ".repeat(60));
+    let message = ConversationMessage::assistant(vec![
+        ContentBlock::Text {
+            text: "I will prepare a report.".into(),
+        },
+        ContentBlock::Text { text: body.clone() },
+    ]);
+    let mut calls = vec![explicit_content_commit_call("body")];
+    calls[0].input = calls[0]
+        .input
+        .replace("current_message_block:0", "message://current");
+    resolve_explicit_agentic_content_refs(services.as_ref(), &ticket, &message, &mut calls)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&calls[0].input).unwrap();
+    let content_ref = value["content_ref"].as_str().expect("resolved content ref");
+    assert!(content_ref.starts_with("artifact://"), "got {content_ref}");
+    let artifact = services.artifact_store().resolve(content_ref).unwrap();
+    assert_eq!(
+        services
+            .artifact_store()
+            .read(&artifact, "execution:whole-message-graph", None)
+            .await
+            .unwrap(),
+        body.as_bytes()
+    );
+}
+
+#[tokio::test]
 async fn growing_program_checkpoint_materializes_one_relevant_body_and_preserves_originals() {
     let services = crate::RuntimeServices::in_memory().unwrap();
     let mut program = crate::AgenticProgramProjection::empty("bounded-checkpoint", "original-goal");
