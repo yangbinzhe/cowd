@@ -717,6 +717,28 @@ impl GatewayToolExecutor {
         input: ContextRetrieveRequest,
         binding: RuntimeToolExecutionBinding<'_>,
     ) -> Result<String, ToolError> {
+        // Infer the source from an exact reference instead of rejecting a model
+        // that named the reference but omitted or mismatched the source. The
+        // reference prefix is authoritative for what is being read.
+        let mut input = input;
+        if input.entry_ref.is_some()
+            && !matches!(
+                input.source,
+                ContextRetrieveSource::Program
+                    | ContextRetrieveSource::Fact
+                    | ContextRetrieveSource::Matrix
+            )
+        {
+            input.source = match input.entry_ref.as_deref() {
+                Some(reference) if reference.starts_with("fact:") => ContextRetrieveSource::Fact,
+                Some(reference) if reference.starts_with("matrix:") => {
+                    ContextRetrieveSource::Matrix
+                }
+                _ => ContextRetrieveSource::Program,
+            };
+        } else if input.memory_id.is_some() && input.source != ContextRetrieveSource::Memory {
+            input.source = ContextRetrieveSource::Memory;
+        }
         let query = input
             .query
             .as_deref()
