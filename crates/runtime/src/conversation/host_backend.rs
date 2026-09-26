@@ -3663,12 +3663,28 @@ pub(super) async fn resolve_explicit_agentic_content_refs(
     for call in calls {
         let is_commit = call.name == harness_contract::agent_action::ARTIFACT_COMMIT_TOOL_ID;
         let is_submit = call.name == harness_contract::agent_action::TASK_SUBMIT_TOOL_ID;
-        if !is_commit && !is_submit {
+        let is_review = call.name == harness_contract::agent_action::TASK_REVIEW_TOOL_ID;
+        if !is_commit && !is_submit && !is_review {
             continue;
         }
         let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&call.input) else {
             continue;
         };
+        // Normalize bare evidence references to their durable scheme so a model
+        // that dropped `tool://`/`artifact://` is not rejected with
+        // unsupported_evidence_ref.
+        normalize_bare_evidence_refs(&mut value);
+        if is_review {
+            // A review verdict carries no publishable body; only its evidence
+            // references needed normalizing above.
+            call.input = serde_json::to_string(&value).map_err(|error| {
+                NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason: format!("encode normalized review evidence: {error}"),
+                }
+            })?;
+            continue;
+        }
         // Both shapes name exactly one Text block of THIS model response:
         // `artifact_commit.content_ref=current_message_block:<i>` and the
         // one-shot `task_submit.deliverable.block_index`.
@@ -3773,6 +3789,46 @@ pub(super) async fn resolve_explicit_agentic_content_refs(
         })?;
     }
     Ok(())
+}
+
+/// Prefix a bare evidence reference with its durable scheme. A weak model may
+/// cite `tool-raw-call_...` or `art_...` without the `tool://`/`artifact://`
+/// prefix; the identity is unambiguous, so normalize it instead of rejecting.
+fn normalize_bare_evidence_ref(reference: &str) -> String {
+    let trimmed = reference.trim();
+    if trimmed.contains("://") {
+        return trimmed.to_string();
+    }
+    if trimmed.starts_with("tool-") || trimmed.starts_with("tool_") {
+        return format!("tool://{trimmed}");
+    }
+    if trimmed.starts_with("artifact-")
+        || trimmed.starts_with("art_")
+        || trimmed.starts_with("sha256:")
+    {
+        return format!("artifact://{trimmed}");
+    }
+    trimmed.to_string()
+}
+
+fn normalize_bare_evidence_refs(value: &mut serde_json::Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    for field in ["evidence_refs", "result_refs"] {
+        let Some(array) = object.get_mut(field).and_then(|value| value.as_array_mut()) else {
+            continue;
+        };
+        for entry in array.iter_mut() {
+            let Some(raw) = entry.as_str() else {
+                continue;
+            };
+            let normalized = normalize_bare_evidence_ref(raw);
+            if normalized != raw {
+                *entry = serde_json::Value::String(normalized);
+            }
+        }
+    }
 }
 
 fn intent_requests_explicit_content(intent: &ModelStepIntent) -> bool {
