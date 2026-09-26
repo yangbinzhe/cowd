@@ -43,17 +43,27 @@ fi
 
 command -v psql >/dev/null || { echo 'psql is required to provision the fresh eval database' >&2; exit 2; }
 
-DB_NAME="cowd_eval_$(date +%s)_$RANDOM"
-DB_URL="${COWD_PG_BASE_URL%/*}/$DB_NAME"
+# A retained database can be reused to continue an earlier run instead of
+# provisioning a fresh one. A reused database is NEVER dropped, regardless of
+# COWD_EVAL_KEEP_DB, so a long complex run can always be resumed again.
+REUSED_DB=0
+if [[ -n "${COWD_EVAL_REUSE_DB_URL:-}" ]]; then
+  DB_URL="$COWD_EVAL_REUSE_DB_URL"
+  DB_NAME="${DB_URL##*/}"
+  REUSED_DB=1
+else
+  DB_NAME="cowd_eval_$(date +%s)_$RANDOM"
+  DB_URL="${COWD_PG_BASE_URL%/*}/$DB_NAME"
+fi
 
 cleanup() {
   local status=$?
   trap - EXIT
-  if [[ "$COWD_EVAL_KEEP_DB" == "1" ]]; then
+  if [[ "$REUSED_DB" == "1" || "$COWD_EVAL_KEEP_DB" == "1" ]]; then
     echo "RETAINED eval database: $DB_NAME" >&2
     echo "  url: $DB_URL" >&2
     echo "  inspect: psql \"$DB_URL\"" >&2
-    echo "  resume : rerun with COWD_TEST_POSTGRES_URL=\"$DB_URL\" and the same session" >&2
+    echo "  resume : rerun with COWD_EVAL_REUSE_DB_URL=\"$DB_URL\"" >&2
   else
     psql "$COWD_PG_BASE_URL" -v ON_ERROR_STOP=0 \
       -c "DROP DATABASE IF EXISTS \"$DB_NAME\" WITH (FORCE)" >/dev/null 2>&1 || true
@@ -63,9 +73,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-psql "$COWD_PG_BASE_URL" -v ON_ERROR_STOP=1 \
-  -c "CREATE DATABASE \"$DB_NAME\"" >/dev/null
-echo "created fresh eval database: $DB_NAME" >&2
+if [[ "$REUSED_DB" == "0" ]]; then
+  psql "$COWD_PG_BASE_URL" -v ON_ERROR_STOP=1 \
+    -c "CREATE DATABASE \"$DB_NAME\"" >/dev/null
+  echo "created fresh eval database: $DB_NAME" >&2
+else
+  echo "reusing retained eval database: $DB_NAME" >&2
+fi
 
 export COWD_TEST_POSTGRES_URL="$DB_URL"
 bash scripts/scenarios/harness-eval-real-qwen.sh
