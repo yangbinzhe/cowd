@@ -559,9 +559,15 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                 );
                 break;
             }
-            let Some(checkpoint) = agent_autonomy_checkpoint(&services, &packet)? else {
+            let Some(mut checkpoint) = agent_autonomy_checkpoint(&services, &packet)? else {
                 break;
             };
+            // A review checkpoint carries the submitted bodies directly, so a
+            // weak reviewer judges from the artifact content rather than from
+            // metadata alone (which the runtime rejects).
+            if let Some(bodies) = prefetch_review_bodies(services.as_ref(), &packet).await {
+                checkpoint.prompt.push_str(&bodies);
+            }
             let checkpoint_digest = {
                 let receipts = tool_executor
                     .receipts
@@ -913,4 +919,60 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             }
         }
     }
+}
+
+/// Read the submitted artifact bodies for a review checkpoint (bounded) so the
+/// reviewer can judge from the content rather than from metadata alone. Returns
+/// `None` for a non-review packet or when nothing readable was submitted.
+async fn prefetch_review_bodies(
+    services: &RuntimeServices,
+    packet: &AgentTaskPacket,
+) -> Option<String> {
+    let agentic = packet.agentic_binding.as_ref()?;
+    let harness_contract::agent::AgenticExecutionFocus::TaskReview { task_ref } = &agentic.focus
+    else {
+        return None;
+    };
+    let projection = services
+        .agent_action_service()
+        .project(&agentic.program_id)
+        .ok()?;
+    let task = projection.tasks.get(task_ref)?;
+    if task.artifact_refs.is_empty() {
+        return None;
+    }
+    const MAX_BODY_BYTES: usize = 16 * 1024;
+    let mut sections = Vec::new();
+    for artifact_ref in &task.artifact_refs {
+        let Some(artifact) = projection.artifacts.get(artifact_ref) else {
+            continue;
+        };
+        let Ok(record) = services.artifact_store().resolve(&artifact.content_ref) else {
+            continue;
+        };
+        let Ok(bytes) = services
+            .artifact_store()
+            .read(&record, &record.visibility_scope, None)
+            .await
+        else {
+            continue;
+        };
+        let truncated = bytes.len() > MAX_BODY_BYTES;
+        let mut body =
+            String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_BODY_BYTES)]).into_owned();
+        if truncated {
+            body.push_str("\n… [truncated; read the artifact reference for the remainder]");
+        }
+        sections.push(format!(
+            "### {artifact_ref} (content_ref: {})\n{body}",
+            artifact.content_ref
+        ));
+    }
+    if sections.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "\n\n## Submitted artifact bodies for this review\nJudge from these exact submitted contents, not from metadata:\n{}",
+        sections.join("\n\n")
+    ))
 }
