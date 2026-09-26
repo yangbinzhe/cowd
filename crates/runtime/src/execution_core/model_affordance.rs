@@ -18,6 +18,20 @@ pub fn runtime_execution_guidance_prompt_with_tool_exposure(
     runtime_execution_guidance_prompt_with_tool_exposure_mode(decision, exposure, false)
 }
 
+/// Render the collaboration constraint so the model can tell an advisory
+/// obligation from a hard terminal requirement. Without this, a model that
+/// reads "generic complexity never requires a preset topology" cannot know
+/// that terminal verification rejects fewer than the required Team count.
+fn collaboration_constraint(decision: &RuntimeExecutionDecision) -> String {
+    match decision.collaboration_obligation.as_ref() {
+        Some(obligation) if obligation.minimum_team_count > 0 => format!(
+            "HARD minimum_teams={0}: terminal verification rejects completion until at least {0} distinct Teams have accepted independently reviewed Tasks; form them explicitly, because a single-agent effort or prose role split cannot satisfy it.",
+            obligation.minimum_team_count
+        ),
+        _ => "none".to_string(),
+    }
+}
+
 /// Render a pressure-aware contract for small-context models. The native
 /// schemas remain the authority; this mode drops only duplicated catalog
 /// prose because deferred names are not callable until a later discovery
@@ -86,24 +100,18 @@ pub fn runtime_execution_guidance_prompt_with_tool_exposure_mode(
             decision.complexity(),
             decision.risk(),
             decision.execution_mode(),
-            decision.collaboration_obligation.as_ref().map_or_else(
-                || "none".to_string(),
-                |obligation| format!("minimum_teams={}", obligation.minimum_team_count)
-            ),
+            collaboration_constraint(decision),
             contract_instruction,
             tool_contract,
         );
     }
     format!(
-        "## Runtime environment contract\nevidence_mode={:?}; complexity={:?}; risk={:?}; execution_mode={:?}\nCollaboration execution constraint: {}\nContract instruction: {}\n{}\nThe model owns Team purpose, roles, Tasks, dependencies, discussion, review choices, replanning, and synthesis. Runtime binds identities, permissions, revisions, leases, execution, durable receipts, and terminal verification. Use any active small Agent action when collaboration adds value; generic complexity never requires a preset topology. Keep long content in normal output or files and pass compact durable references through actions. Inspect current Program state after rejection or recovery instead of repeating an unchanged action.",
+        "## Runtime environment contract\nevidence_mode={:?}; complexity={:?}; risk={:?}; execution_mode={:?}\nCollaboration execution constraint: {}\nContract instruction: {}\n{}\nThe model owns Team purpose, roles, Tasks, dependencies, discussion, review choices, replanning, and synthesis. Runtime binds identities, permissions, revisions, leases, execution, durable receipts, and terminal verification. Use any active small Agent action when collaboration adds value; generic complexity alone never requires a preset topology, but when a HARD minimum_teams is stated above it is enforced by terminal verification. Keep long content in normal output or files and pass compact durable references through actions. Inspect current Program state after rejection or recovery instead of repeating an unchanged action.",
         decision.evidence_mode,
         decision.complexity(),
         decision.risk(),
         decision.execution_mode(),
-        decision.collaboration_obligation.as_ref().map_or_else(
-            || "none".to_string(),
-            |obligation| format!("minimum_teams={}", obligation.minimum_team_count)
-        ),
+        collaboration_constraint(decision),
         contract_instruction,
         tool_contract,
     )
@@ -151,7 +159,8 @@ mod tests {
         let prompt = runtime_execution_guidance_prompt(&decision);
 
         assert!(decision.collaboration_obligation.is_none());
-        assert!(prompt.contains("generic complexity never requires a preset topology"));
+        assert!(prompt.contains("generic complexity alone never requires a preset topology"));
+        assert!(!prompt.contains("HARD minimum_teams="));
         for legacy in ["recommended_pattern=", "template_id"] {
             assert!(!prompt.contains(legacy), "legacy planner token: {legacy}");
         }
@@ -166,7 +175,8 @@ mod tests {
         let prompt = runtime_execution_guidance_prompt(&decision);
 
         assert!(decision.collaboration_obligation.is_some());
-        assert!(prompt.contains("minimum_teams=3"));
+        assert!(prompt.contains("HARD minimum_teams=3"));
+        assert!(prompt.contains("terminal verification rejects completion"));
         assert!(prompt.contains("requires real collaboration"));
     }
 
