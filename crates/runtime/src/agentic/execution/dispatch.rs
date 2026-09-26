@@ -89,6 +89,15 @@ fn dispatch_starvation_clear(key: &str) {
     ledger.remove(key);
 }
 
+/// Consecutive deferrals recorded for a dispatch key (0 if none). Used to age
+/// starved work forward so a long-waiting Task is retried before newer ones.
+fn dispatch_starvation_count(key: &str) -> usize {
+    let ledger = dispatch_starvation_ledger()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ledger.get(key).map_or(0, |state| state.count)
+}
+
 fn dispatch_starvation_key(
     program_id: &str,
     task_ref: &str,
@@ -242,6 +251,16 @@ impl RuntimeServices {
             })
             .collect::<Vec<_>>();
         let mut requests = Vec::new();
+        // Aging: retry the most-deferred (longest-waiting) ready Tasks first so
+        // a repeatedly-starved Task is not perpetually out-competed by newer
+        // ones. Stable for equal counts.
+        execute_requests.sort_by_key(|(task_ref, mode)| {
+            std::cmp::Reverse(dispatch_starvation_count(&dispatch_starvation_key(
+                program_id,
+                task_ref,
+                *mode,
+            )))
+        });
         requests.append(&mut review_requests);
         requests.append(&mut execute_requests);
         requests.extend(coordination_requests(&initial));
