@@ -555,6 +555,9 @@ pub(crate) fn apply_task_review(
                 task.claim_execution_id = None;
                 task.claimed_at_ms = None;
                 task.lease_expires_at_ms = None;
+                // Drop every stale attempt so the reworked Task is immediately
+                // eligible for a fresh execute dispatch and does not look busy.
+                task.active_attempts.clear();
             }
         }
     }

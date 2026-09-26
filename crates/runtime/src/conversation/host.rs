@@ -1427,8 +1427,21 @@ where
             // checks, the turn is in a no-progress cycle (starvation/deadlock),
             // so end it honestly instead of waiting without bound. A turn that
             // keeps making progress never triggers this.
+            // The root graph's own node statuses do not change while child
+            // graphs (a reworked Task's redo, a fresh review) make durable
+            // progress. Include the Agent-first Program revision, which advances
+            // on every child action, so healthy descendant work is not mistaken
+            // for a stall.
+            let (session_id, turn_id) = {
+                let state = state.lock().await;
+                (state.session_id.clone(), state.turn_id.clone())
+            };
+            let program_revision =
+                root_agentic_program_projection(services.as_ref(), &session_id, &turn_id)
+                    .map(|program| program.revision)
+                    .unwrap_or_default();
             let progress_key = {
-                let mut key = String::new();
+                let mut key = format!("program:{program_revision};");
                 for (id, status) in &graph.node_statuses {
                     key.push_str(id);
                     key.push('=');
