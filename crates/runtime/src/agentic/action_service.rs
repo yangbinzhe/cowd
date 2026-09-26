@@ -395,15 +395,39 @@ impl AgentActionService {
             let goal = crate::execution_core::GoalStore::new(Arc::clone(&self.store))
                 .get(&format!("goal:{root}"))
                 .map_err(AgentActionServiceError::EventStore)?;
-            let snapshot = super::review_evidence::effect_review_snapshot(
-                &self.store,
-                &projection,
-                goal.as_ref(),
-                &verification
-                    .expect("effect digest requires proof")
-                    .effect_source_refs,
-            )
-            .map_err(AgentActionServiceError::EventStore)?;
+            let effect_sources = &verification
+                .expect("effect digest requires proof")
+                .effect_source_refs;
+            // The snapshot fences the root Session stream (and delegated effect
+            // streams) at one revision. Under concurrent writers the stream can
+            // move during the multi-page scan, which used to surface as a hard
+            // tool error on an otherwise correct review. Retry the scan a bounded
+            // number of times so a transient race is not reported as a failure;
+            // a genuinely unstable set still fails after the bound, so the
+            // digest/revision fence keeps its correctness guarantee.
+            let snapshot = {
+                const MAX_ATTEMPTS: u8 = 8;
+                let mut attempt = 0;
+                loop {
+                    attempt += 1;
+                    match super::review_evidence::effect_review_snapshot(
+                        &self.store,
+                        &projection,
+                        goal.as_ref(),
+                        effect_sources,
+                    ) {
+                        Ok(snapshot) => break snapshot,
+                        Err(error)
+                            if attempt < MAX_ATTEMPTS
+                                && (error.contains("source changed")
+                                    || error.contains("retry current effects")) =>
+                        {
+                            std::thread::yield_now();
+                        }
+                        Err(error) => return Err(AgentActionServiceError::EventStore(error)),
+                    }
+                }
+            };
             if snapshot.digest != digest {
                 return Ok(rejected(
                     envelope,
