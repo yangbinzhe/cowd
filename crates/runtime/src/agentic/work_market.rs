@@ -13,7 +13,20 @@ use super::program::{
 // corresponding physical Agent graph is active; after a crash the absence of
 // heartbeats makes the work reclaimable without imposing a task-quality
 // deadline on healthy long-running work.
-pub(crate) const CLAIM_LEASE_MS: u64 = 90 * 1_000;
+//
+// 90s is the default. Each renewal is a full durable `task_claim` action, so on
+// a large long-running collaboration the renewal rate dominates applied
+// actions. `COWD_CLAIM_LEASE_SECS` raises the lease (and therefore lengthens the
+// renewal interval) to cut that churn; crash recovery still reclaims an
+// abandoned claim via the stranded-attempt sweep once the lease lapses.
+pub(crate) fn claim_lease_ms() -> u64 {
+    std::env::var("COWD_CLAIM_LEASE_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(90)
+        .saturating_mul(1_000)
+}
 
 // Bounded failure progress. Retries stay evidence-driven, but a Task that keeps
 // failing with *different* reasons can otherwise re-enter Rework forever and
@@ -234,7 +247,7 @@ pub(crate) fn apply_task_claim(
         task.claim_execution_id
             .clone_from(&envelope.actor.execution_id);
         task.claimed_at_ms = Some(applied_at_ms);
-        task.lease_expires_at_ms = Some(applied_at_ms.saturating_add(CLAIM_LEASE_MS));
+        task.lease_expires_at_ms = Some(applied_at_ms.saturating_add(claim_lease_ms()));
     }
 }
 

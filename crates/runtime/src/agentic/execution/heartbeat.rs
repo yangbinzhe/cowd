@@ -1,6 +1,8 @@
 use super::*;
 
-const CLAIM_HEARTBEAT_INTERVAL_MS: u64 = super::super::work_market::CLAIM_LEASE_MS / 3;
+fn claim_heartbeat_interval_ms() -> u64 {
+    super::super::work_market::claim_lease_ms() / 3
+}
 
 pub(super) fn agentic_claim_actor(
     projection: &AgenticProgramProjection,
@@ -206,7 +208,7 @@ pub(super) async fn run_agentic_claim_heartbeat(
     // polling timer is needed while unclaimed: the physical worker owns this
     // guard and aborts it on every exit path.
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_millis(
-        CLAIM_HEARTBEAT_INTERVAL_MS,
+        claim_heartbeat_interval_ms(),
     ));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // `interval` ticks immediately; consume that tick so Runtime never
