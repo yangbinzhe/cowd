@@ -3787,14 +3787,31 @@ pub(super) async fn resolve_explicit_agentic_content_refs(
         .await?;
         if is_commit {
             value["content_ref"] = serde_json::Value::String(content_ref);
-        } else if let Some(deliverable) = value
-            .get_mut("deliverable")
-            .and_then(serde_json::Value::as_object_mut)
-        {
-            deliverable.insert(
-                "resolved_content_ref".to_string(),
-                serde_json::Value::String(content_ref),
-            );
+        } else {
+            // A submission with no artifact reference must still carry a durable
+            // body: attach this response's resolved content as its deliverable so
+            // it is never rejected with task_submission_has_no_artifact.
+            let has_artifact = value
+                .get("artifact_refs")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|references| !references.is_empty());
+            match value
+                .get_mut("deliverable")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                Some(deliverable) => {
+                    deliverable.insert(
+                        "resolved_content_ref".to_string(),
+                        serde_json::Value::String(content_ref),
+                    );
+                }
+                None if !has_artifact => {
+                    value["deliverable"] = serde_json::json!({
+                        "resolved_content_ref": content_ref,
+                    });
+                }
+                None => {}
+            }
         }
         call.input = serde_json::to_string(&value).map_err(|error| NodeExecutorError::Poll {
             node_id: ticket.node_id.clone(),
