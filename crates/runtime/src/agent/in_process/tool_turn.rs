@@ -461,6 +461,13 @@ pub(super) fn agent_autonomy_checkpoint(
                 "acceptance": task.acceptance,
                 "artifact_refs": task.artifact_refs,
                 "evidence_refs": task.evidence_refs,
+                // A verdict is only independent if it is grounded in the
+                // submitted body, not in metadata. Read each artifact body
+                // first, then decide; the read tools are in this contract.
+                "required_protocol": [
+                    "read every submitted artifact body with `read` on the artifact:// reference or `evidence_retrieve` before judging; metadata alone is not evidence",
+                    "then issue exactly one independent task_review verdict"
+                ],
                 "tool": "task_review",
             }));
         }
