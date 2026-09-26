@@ -64,10 +64,18 @@ cleanup() {
     echo "  url: $DB_URL" >&2
     echo "  inspect: psql \"$DB_URL\"" >&2
     echo "  resume : rerun with COWD_EVAL_REUSE_DB_URL=\"$DB_URL\"" >&2
+    if [[ -n "${WORKSPACE_DIR:-}" && -d "$WORKSPACE_DIR" ]]; then
+      echo "  workspace (artifacts + process content): $WORKSPACE_DIR" >&2
+    fi
   else
     psql "$COWD_PG_BASE_URL" -v ON_ERROR_STOP=0 \
       -c "DROP DATABASE IF EXISTS \"$DB_NAME\" WITH (FORCE)" >/dev/null 2>&1 || true
     echo "dropped fresh eval database: $DB_NAME" >&2
+    if [[ -n "${WORKSPACE_DIR:-}" && -d "$WORKSPACE_DIR" ]]; then
+      git -C "$ROOT" worktree remove --force "$WORKSPACE_DIR" >/dev/null 2>&1 \
+        || rm -rf "$WORKSPACE_DIR"
+      echo "removed isolated workspace: $WORKSPACE_DIR" >&2
+    fi
   fi
   exit "$status"
 }
@@ -79,6 +87,22 @@ if [[ "$REUSED_DB" == "0" ]]; then
   echo "created fresh eval database: $DB_NAME" >&2
 else
   echo "reusing retained eval database: $DB_NAME" >&2
+fi
+
+# Each run works in its own checkout so generated artifacts never pollute the
+# candidate repository and every run's process content stays in one folder for
+# troubleshooting. A git worktree is a full checkout, so scenarios that read
+# repository source still work while their writes stay isolated.
+WS_ROOT="${COWD_EVAL_WORKSPACE_ROOT:-/tmp/cowd-eval-workspaces}"
+WORKSPACE_DIR="$WS_ROOT/$DB_NAME"
+mkdir -p "$WS_ROOT"
+export COWD_EVAL_WORKSPACE="$WORKSPACE_DIR"
+if [[ ! -d "$WORKSPACE_DIR" ]]; then
+  if ! git -C "$ROOT" worktree add --detach "$WORKSPACE_DIR" HEAD >/dev/null 2>&1; then
+    echo "failed to create isolated worktree at $WORKSPACE_DIR" >&2
+    exit 2
+  fi
+  echo "created isolated workspace: $WORKSPACE_DIR" >&2
 fi
 
 export COWD_TEST_POSTGRES_URL="$DB_URL"
