@@ -3695,18 +3695,33 @@ pub(super) async fn resolve_explicit_agentic_content_refs(
                 .and_then(serde_json::Value::as_u64)
                 .map(|index| index as usize)
         };
-        // `message://current` names the whole response instead of one block, so a
-        // weak model never has to count blocks; the resolver selects this same
-        // response's longest substantive Text block. A blank response is still
-        // refused, so no bodyless artifact is ever persisted.
-        let whole_message = is_commit
-            && value
+        // The commit reference can be:
+        //   artifact://...            -> already durable; leave it untouched
+        //   current_message_block:<i> -> exactly one Text block of this response
+        //   message://current         -> this whole response's body
+        //   missing / anything else   -> this whole response's body
+        // A weak model must never persist a bodyless artifact, so every
+        // unresolvable reference falls back to the model's own words here. An
+        // empty response is still refused below, and an out-of-range explicit
+        // block stays unresolved by contract.
+        let raw_ref = if is_commit {
+            value
                 .get("content_ref")
                 .and_then(serde_json::Value::as_str)
-                .is_some_and(|reference| reference == "message://current");
+                .unwrap_or("")
+        } else {
+            ""
+        };
+        let is_artifact_ref = raw_ref.starts_with("artifact://");
+        let is_block_ref = raw_ref.starts_with("current_message_block:");
         let selected: Option<(usize, &str)> = if !is_commit {
             select_one_shot_deliverable_text(message, one_shot_hint)
-        } else if whole_message {
+        } else if is_artifact_ref {
+            // A durable artifact reference already carries its own body.
+            None
+        } else if !is_block_ref {
+            // `message://current`, an empty reference, or any other unusable
+            // value: use this response's longest substantive Text block.
             select_one_shot_deliverable_text(message, None)
         } else {
             match index {
@@ -3714,10 +3729,8 @@ pub(super) async fn resolve_explicit_agentic_content_refs(
                     ContentBlock::Text { text } if !text.trim().is_empty() => {
                         Some((index, text.as_str()))
                     }
-                    // In range but not a non-empty Text block: the model named a
-                    // real block that is not its body. Fall back to this same
-                    // response's longest non-empty Text block rather than fail the
-                    // commit; the content is still the model's own words.
+                    // In range but not a non-empty Text block: fall back to this
+                    // response's longest non-empty Text block.
                     _ => select_one_shot_deliverable_text(message, Some(index)),
                 },
                 // Out of range stays unresolved by contract: a missing block must
