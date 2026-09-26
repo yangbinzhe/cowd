@@ -366,6 +366,25 @@ pub(crate) fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition
             required_permission: ToolPermissionMode::ReadOnly,
             effect_resolver: runtime_effect_resolver("runtime.readonly"),
         },
+        RuntimeToolDefinition {
+            name: "read".to_string(),
+            description: Some(
+                "Read any Runtime fact through one canonical reference. Schemes: program://, task://, team://, agent://, topic://, issue://, criterion://, obligation://, review:// read Program directory entries; tool:// reads a tool receipt (the short call id is enough, the content hash is optional); artifact:// reads durable content; session://, fact://, matrix://, memory:// read authorized history and leased knowledge. Prefer this over context_retrieve, evidence_retrieve, and state_inspect. Workspace file bytes still use read_file/glob_search/grep_search. Pass the returned cursor/limit back to page."
+                    .to_string(),
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "reference": { "type": "string", "description": "Canonical `scheme://target` reference, for example task://task:abc, tool://tool-raw-call_00_..., artifact://sha256:..., session://<session_id>" },
+                    "cursor": { "type": "string", "description": "Opaque continuation returned by a previous read" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 64 }
+                },
+                "required": ["reference"],
+                "additionalProperties": false
+            }),
+            required_permission: ToolPermissionMode::ReadOnly,
+            effect_resolver: runtime_effect_resolver("runtime.readonly"),
+        },
     ];
     definitions.push(RuntimeToolDefinition {
         name: "artifact_publish".into(),

@@ -495,6 +495,11 @@ impl GatewayToolExecutor {
                 .execute_evidence_retrieve(input, binding.session_id, binding.authorized_scopes)
                 .await;
         }
+        if tool_name == "read" {
+            let input: UnifiedReadRequest = serde_json::from_value(value)
+                .map_err(|error| self.input_contract_error(tool_name, error))?;
+            return self.execute_unified_read(input, binding).await;
+        }
         if tool_name == "runtime_capabilities" {
             let input: RuntimeCapabilitiesRequest = serde_json::from_value(value)
                 .map_err(|error| self.input_contract_error(tool_name, error))?;
@@ -621,6 +626,31 @@ impl GatewayToolExecutor {
         })
         .await
         .map_err(|error| ToolError::new(error.to_string()))?
+    }
+
+    /// One read entry for every Runtime-addressable fact. The reference scheme
+    /// selects an existing authorized reader, so authorization, revision fences,
+    /// and durability are unchanged. This is a facade, not a second data path.
+    async fn execute_unified_read(
+        &self,
+        input: UnifiedReadRequest,
+        binding: RuntimeToolExecutionBinding<'_>,
+    ) -> Result<String, ToolError> {
+        let (delegate, mut delegated) =
+            unified_read_delegation(&input.reference).map_err(ToolError::new)?;
+        if let Some(limit) = input.limit {
+            if delegate != "state_inspect" {
+                delegated["limit"] = serde_json::json!(limit);
+            }
+        }
+        if let Some(cursor) = input.cursor {
+            match delegate {
+                "state_inspect" => delegated["page_cursor"] = serde_json::json!(cursor),
+                "context_retrieve" => delegated["content_cursor"] = serde_json::json!(cursor),
+                _ => delegated["cursor"] = serde_json::json!(cursor),
+            }
+        }
+        Box::pin(self.execute_runtime_tool_with_binding(delegate, delegated, binding)).await
     }
 
     async fn execute_context_retrieve(
@@ -1213,5 +1243,99 @@ impl GatewayToolExecutor {
             }
         };
         serialize_context_result(&value).map_err(|error| ToolError::new(error.to_string()))
+    }
+}
+
+/// Map one canonical reference to the existing authorized reader that owns it.
+/// Pure and total: the facade cannot invent a second data path, so a new scheme
+/// must be added here deliberately and routed through a reader that already
+/// enforces authorization, revision fences, and durability.
+fn unified_read_delegation(reference: &str) -> Result<(&'static str, serde_json::Value), String> {
+    use harness_contract::refs::Address;
+    let address = Address::parse(reference).map_err(|error| error.to_string())?;
+    let delegation = match address {
+        Address::Tool(id) => (
+            "evidence_retrieve",
+            serde_json::json!({ "evidence_ref": format!("tool://{id}") }),
+        ),
+        Address::Artifact(id) => (
+            "evidence_retrieve",
+            serde_json::json!({ "evidence_ref": format!("artifact://{id}") }),
+        ),
+        Address::Session(id) => (
+            "context_retrieve",
+            serde_json::json!({ "source": "session_history", "session_id": id }),
+        ),
+        Address::Memory(id) => (
+            "context_retrieve",
+            serde_json::json!({ "source": "memory", "memory_id": id }),
+        ),
+        Address::Fact(id) => (
+            "context_retrieve",
+            serde_json::json!({ "source": "fact", "entry_ref": id }),
+        ),
+        Address::Matrix(id) => (
+            "context_retrieve",
+            serde_json::json!({ "source": "matrix", "entry_ref": id }),
+        ),
+        Address::Program(id)
+        | Address::Task(id)
+        | Address::Team(id)
+        | Address::Agent(id)
+        | Address::Topic(id)
+        | Address::Issue(id)
+        | Address::Criterion(id)
+        | Address::Obligation(id)
+        | Address::Review(id)
+        | Address::Bare(id) => (
+            "state_inspect",
+            serde_json::json!({ "entry_ref": id }),
+        ),
+        Address::File(_) | Address::Dir(_) | Address::Node { .. } => {
+            return Err(
+                "`read` resolves Runtime references (program/task/team/agent/topic/issue/criterion/obligation/review/tool/artifact/session/fact/matrix/memory). Use read_file, glob_search, or grep_search for file:// and dir:// content."
+                    .to_string(),
+            );
+        }
+    };
+    Ok(delegation)
+}
+
+#[cfg(test)]
+mod unified_read_tests {
+    use super::unified_read_delegation;
+
+    #[test]
+    fn routes_each_scheme_to_its_authorized_reader() {
+        let (reader, value) = unified_read_delegation("task://task:abc").expect("task routes");
+        assert_eq!(reader, "state_inspect");
+        assert_eq!(value["entry_ref"], "task:abc");
+
+        let (reader, value) =
+            unified_read_delegation("tool://tool-raw-call_00_x-abc").expect("tool routes");
+        assert_eq!(reader, "evidence_retrieve");
+        assert_eq!(value["evidence_ref"], "tool://tool-raw-call_00_x-abc");
+
+        let (reader, _) =
+            unified_read_delegation("artifact://sha256:deadbeef").expect("artifact routes");
+        assert_eq!(reader, "evidence_retrieve");
+
+        let (reader, value) =
+            unified_read_delegation("session://sess:1").expect("session routes");
+        assert_eq!(reader, "context_retrieve");
+        assert_eq!(value["source"], "session_history");
+
+        // A legacy bare id still resolves through the Program directory.
+        let (reader, value) = unified_read_delegation("task:abc").expect("bare routes");
+        assert_eq!(reader, "state_inspect");
+        assert_eq!(value["entry_ref"], "task:abc");
+    }
+
+    #[test]
+    fn file_and_dir_content_redirect_to_the_workspace_tools() {
+        assert!(unified_read_delegation("file://src/main.rs").is_err());
+        assert!(unified_read_delegation("dir://crates").is_err());
+        assert!(unified_read_delegation("node://g/n").is_err());
+        assert!(unified_read_delegation("weird://x").is_err());
     }
 }

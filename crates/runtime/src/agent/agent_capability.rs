@@ -88,6 +88,9 @@ pub fn resolve_agent_capability(request: AgentCapabilityRequest) -> ResolvedAgen
     // entry point. The tool itself enforces the exact Agent/Session/Project/
     // Team Binding, so this does not grant broad Memory or Session access.
     allowed_tools.insert("context_retrieve".to_string());
+    // One unified read entry across Runtime schemes; it delegates to the same
+    // authorized readers, so it grants no new authority.
+    allowed_tools.insert("read".to_string());
     allowed_tools.insert("working_context".to_string());
     allowed_tools.insert("private_note".to_string());
     // Agent-first actions are injected only by the dynamic Program dispatcher
@@ -248,6 +251,7 @@ pub(crate) fn capability_mapping_authorizes_tool(
                     | "working_context"
                     | "private_note"
                     | "evidence_retrieve"
+                    | "read"
                     | "artifact_publish"
             ))
     {
