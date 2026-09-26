@@ -2,6 +2,25 @@
 
 use super::*;
 
+/// Whether the provider tool schema must stay byte-stable across steps.
+///
+/// Delegated leaves already use a stable schema (their tool set is fixed). The
+/// root uses exposure-filtered schemas so `tool_search` can grow the set, which
+/// shifts the tools array and breaks the provider prompt-cache prefix. This is
+/// overridable per run so the cache tradeoff can be measured without changing
+/// the default:
+///   * `COWD_STABLE_TOOL_SCHEMA=1` — stable for every role (larger but
+///     cache-friendly prompt);
+///   * `COWD_STABLE_TOOL_SCHEMA=0` — only the existing default behaviour is kept
+///     for delegated leaves, root stays dynamic.
+fn stable_tool_schema(delegated_leaf: bool) -> bool {
+    match std::env::var("COWD_STABLE_TOOL_SCHEMA").ok().as_deref() {
+        Some("1") | Some("true") => true,
+        Some("0") | Some("false") => false,
+        _ => delegated_leaf,
+    }
+}
+
 impl<T> StandardRuntimeHost<T>
 where
     T: ToolExecutor,
@@ -43,7 +62,7 @@ where
                 active_model.clone(),
                 config.tool_definitions,
             )?
-            .with_stable_tool_schema(config.execution_role.is_delegated_leaf())
+            .with_stable_tool_schema(stable_tool_schema(config.execution_role.is_delegated_leaf()))
             .with_execution_supervisor(services.execution_supervisor())
             .with_emit_output(config.emit_output)
             .with_stream_callback(config.stream_callback.clone()),
