@@ -16,6 +16,7 @@ use crate::types::{
 };
 use crate::{ProviderWireHeader, ProviderWireRequest};
 use model_protocol::provider_capability::ProviderCapabilityProfile;
+use sha2::{Digest, Sha256};
 
 use super::{preflight_message_request, Provider, ProviderFuture};
 
@@ -1757,8 +1758,46 @@ fn build_responses_request(request: &MessageRequest) -> Value {
     if let Some(effort) = &request.reasoning_effort {
         payload["reasoning"] = json!({ "effort": effort });
     }
+    if let Some(key) = prompt_cache_key_for(request) {
+        // OpenAI Responses route cache affinity from this key. Derive it from
+        // the immutable shared cohort so sibling agents agree and the key is
+        // stable across turns; never randomize it per request.
+        payload["prompt_cache_key"] = json!(key);
+    }
 
     payload
+}
+
+/// OpenAI-family models that route prompt-cache affinity from
+/// `prompt_cache_key`. Other OpenAI-compatible servers (DeepSeek, Qwen, local
+/// engines) are deliberately excluded: they either auto-cache by prefix or may
+/// reject an unknown field, so sending it would risk a needless failure.
+fn is_openai_prompt_cache_family(model: &str) -> bool {
+    let model = strip_routing_prefix(model).to_ascii_lowercase();
+    model.starts_with("gpt-")
+        || model.starts_with("o1")
+        || model.starts_with("o3")
+        || model.starts_with("o4")
+        || model.starts_with("chatgpt")
+}
+
+/// Deterministic, cohort-scoped `prompt_cache_key` derived from the immutable
+/// shared system prefix. Returns `None` when there is no cohort prefix or the
+/// model is not OpenAI-family. Stable across requests so the provider can reuse
+/// its cache instead of re-routing.
+fn prompt_cache_key_for(request: &MessageRequest) -> Option<String> {
+    if !is_openai_prompt_cache_family(&request.model) {
+        return None;
+    }
+    let prefix = request
+        .system_cache_prefix
+        .as_deref()
+        .filter(|prefix| !prefix.is_empty())?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"cowd.prompt_cache_key.v1\0");
+    hasher.update(prefix.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    Some(format!("cowd-{}", &digest[..24]))
 }
 
 /// Preserve the immutable cohort as its own wire item. Length-framed request
@@ -4522,6 +4561,59 @@ mod tests {
             "shared-program"
         );
         assert_eq!(responses["input"][1]["content"][0]["text"], "team-a");
+    }
+
+    #[test]
+    fn openai_responses_derive_a_stable_cohort_prompt_cache_key() {
+        let cohort = MessageRequest {
+            model: "gpt-5.2-codex".to_string(),
+            max_tokens: 128,
+            system: Some("shared-program\n\nteam-a".to_string()),
+            system_cache_prefix: Some("shared-program".to_string()),
+            messages: vec![InputMessage::user_text("inspect")],
+            ..Default::default()
+        };
+        let sibling = MessageRequest {
+            model: "gpt-5.2-codex".to_string(),
+            max_tokens: 128,
+            system: Some("shared-program\n\nteam-b".to_string()),
+            system_cache_prefix: Some("shared-program".to_string()),
+            messages: vec![InputMessage::user_text("inspect")],
+            ..Default::default()
+        };
+        let first = build_responses_request(&cohort);
+        let second = build_responses_request(&sibling);
+        let key = first["prompt_cache_key"]
+            .as_str()
+            .expect("openai-family responses carry a cache key");
+        assert!(key.starts_with("cowd-"));
+        // Same cohort prefix ⇒ same key across sibling agents (cache affinity).
+        assert_eq!(first["prompt_cache_key"], second["prompt_cache_key"]);
+
+        // Non-OpenAI-family models never send the field (unknown-field safety).
+        let local = MessageRequest {
+            model: "deepseek-v4-flash".to_string(),
+            max_tokens: 128,
+            system: Some("shared-program\n\nteam-a".to_string()),
+            system_cache_prefix: Some("shared-program".to_string()),
+            messages: vec![InputMessage::user_text("inspect")],
+            ..Default::default()
+        };
+        assert!(build_responses_request(&local)
+            .get("prompt_cache_key")
+            .is_none());
+
+        // No cohort prefix ⇒ no key.
+        let no_prefix = MessageRequest {
+            model: "gpt-5.2-codex".to_string(),
+            max_tokens: 128,
+            system: Some("shared-program".to_string()),
+            messages: vec![InputMessage::user_text("inspect")],
+            ..Default::default()
+        };
+        assert!(build_responses_request(&no_prefix)
+            .get("prompt_cache_key")
+            .is_none());
     }
 
     #[test]

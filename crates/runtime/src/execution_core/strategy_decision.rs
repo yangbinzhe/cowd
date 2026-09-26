@@ -13,6 +13,105 @@ use super::pattern_catalog::{ExecutionPatternCatalog, RuntimeCompileTarget};
 use crate::context_runtime::ContextProfile;
 use crate::evidence_planner::EvidenceAcquisitionMode;
 
+/// Execution topology **class** licensed by a Runtime decision. The model still
+/// owns every semantic choice (Team purpose, roles, Tasks, dependencies); this
+/// only names the *class of topology* the decision permits, derived from
+/// complexity, the selected pattern and the frozen collaboration obligation. It
+/// is additive observability: existing `collaboration_obligation`/pattern
+/// semantics are unchanged and remain the source of truth for enforcement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionMode {
+    /// One agent, no delegation.
+    SingleAgent,
+    /// One root delegating bounded work without a Team contract.
+    DelegatedSubagent,
+    /// A preset role protocol (debate / review-fix / incident / JPS).
+    PresetProtocol,
+    /// Agent-first multi-Team collaboration.
+    MultiTeamCollaboration,
+    /// Collaboration plus independent sub-agent work outside any Team.
+    Hybrid,
+}
+
+/// Derive the execution-mode class from already-decided facts. Pure and
+/// side-effect free so it can be regression-tested independently of the wire.
+#[must_use]
+pub fn derive_execution_mode(
+    complexity: TaskComplexity,
+    pattern: ExecutionPattern,
+    minimum_team_count: u8,
+    independent_workstreams: u8,
+) -> ExecutionMode {
+    if minimum_team_count >= 2 {
+        // A frozen multi-Team obligation always wins; extra independent
+        // workstreams alongside it make the topology hybrid.
+        return if independent_workstreams >= 2 {
+            ExecutionMode::Hybrid
+        } else {
+            ExecutionMode::MultiTeamCollaboration
+        };
+    }
+    let wants_delegation = independent_workstreams >= 2
+        || matches!(
+            complexity,
+            TaskComplexity::Complex | TaskComplexity::Strategic
+        );
+    match pattern {
+        ExecutionPattern::Collaborate => ExecutionMode::MultiTeamCollaboration,
+        ExecutionPattern::Deliberate => ExecutionMode::PresetProtocol,
+        ExecutionPattern::Supervise => ExecutionMode::DelegatedSubagent,
+        ExecutionPattern::Execute | ExecutionPattern::Explore => {
+            if wants_delegation {
+                ExecutionMode::DelegatedSubagent
+            } else {
+                ExecutionMode::SingleAgent
+            }
+        }
+        ExecutionPattern::Direct => ExecutionMode::SingleAgent,
+    }
+}
+
+/// Human-readable chain explaining *why* a complexity level was resolved. The
+/// level itself is decided in `harness-contract`; this makes the inputs that
+/// drove it observable on the decision record so classification can be audited
+/// and tuned instead of being an opaque function.
+#[must_use]
+pub fn complexity_reasons(
+    understanding: &harness_contract::strategy::TaskUnderstanding,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if understanding.requests_multi_agent {
+        reasons.push("complexity: multi-agent requested".to_string());
+    }
+    if understanding.requests_deep_plan {
+        reasons.push("complexity: deep plan requested".to_string());
+    }
+    if understanding.requests_parallelism {
+        reasons.push("complexity: parallelism requested".to_string());
+    }
+    if understanding.requires_external_facts {
+        reasons.push("complexity: external facts required".to_string());
+    }
+    if understanding.requires_tool_evidence {
+        reasons.push("complexity: tool evidence required".to_string());
+    }
+    if understanding.requires_write {
+        reasons.push("complexity: workspace write required".to_string());
+    }
+    if understanding.likely_single_file {
+        reasons.push("complexity: likely single file".to_string());
+    }
+    if understanding.independent_workstreams >= 2 {
+        reasons.push(format!(
+            "complexity: independent workstreams={}",
+            understanding.independent_workstreams
+        ));
+    }
+    reasons.push(format!("complexity resolved: {:?}", understanding.complexity));
+    reasons
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeExecutionDecision {
     pub decision_id: String,
@@ -65,6 +164,20 @@ impl RuntimeExecutionDecision {
     #[must_use]
     pub const fn complexity(&self) -> TaskComplexity {
         self.strategy.understanding.complexity
+    }
+
+    /// The topology class this decision licenses. Derived, not stored, so it
+    /// always agrees with the frozen pattern/obligation it is computed from.
+    #[must_use]
+    pub fn execution_mode(&self) -> ExecutionMode {
+        derive_execution_mode(
+            self.strategy.understanding.complexity,
+            self.strategy.pattern,
+            self.collaboration_obligation
+                .as_ref()
+                .map_or(0, |obligation| obligation.minimum_team_count),
+            self.strategy.understanding.independent_workstreams,
+        )
     }
 }
 
@@ -517,6 +630,7 @@ fn build_runtime_execution_decision_inner(
 
     let catalog = ExecutionPatternCatalog::current();
     let recommended_spec = catalog.find(recommended_pattern);
+    let complexity_reasons = complexity_reasons(&strategy.understanding);
     RuntimeExecutionDecision {
         decision_id: format!("execution-decision-{}", Uuid::new_v4()),
         decision_revision: 1,
@@ -547,6 +661,7 @@ fn build_runtime_execution_decision_inner(
             .into_iter()
             .chain(recommended_spec.map(|spec| spec.summary.clone()))
             .chain(context_profile.map(|profile| format!("context profile: {profile:?}")))
+            .chain(complexity_reasons)
             .collect(),
     }
 }
@@ -827,5 +942,75 @@ mod tests {
         assert_eq!(decision.pattern(), ExecutionPattern::Collaborate);
         assert!(decision.executable);
         assert!(decision.blocked_reasons.is_empty());
+    }
+
+    #[test]
+    fn execution_mode_tracks_topology_class_not_just_complexity() {
+        // A frozen multi-Team obligation wins regardless of pattern/complexity.
+        assert_eq!(
+            derive_execution_mode(TaskComplexity::Simple, ExecutionPattern::Execute, 3, 0),
+            ExecutionMode::MultiTeamCollaboration
+        );
+        // Teams plus extra independent workstreams is hybrid.
+        assert_eq!(
+            derive_execution_mode(TaskComplexity::Complex, ExecutionPattern::Execute, 2, 3),
+            ExecutionMode::Hybrid
+        );
+        // No obligation, simple direct work stays single agent.
+        assert_eq!(
+            derive_execution_mode(TaskComplexity::Simple, ExecutionPattern::Direct, 0, 0),
+            ExecutionMode::SingleAgent
+        );
+        // No obligation, strategic work delegates.
+        assert_eq!(
+            derive_execution_mode(
+                TaskComplexity::Strategic,
+                ExecutionPattern::Execute,
+                0,
+                0
+            ),
+            ExecutionMode::DelegatedSubagent
+        );
+        // No obligation, moderate single-workstream execute stays single agent.
+        assert_eq!(
+            derive_execution_mode(TaskComplexity::Moderate, ExecutionPattern::Execute, 0, 1),
+            ExecutionMode::SingleAgent
+        );
+        // Deliberate maps to a preset role protocol.
+        assert_eq!(
+            derive_execution_mode(
+                TaskComplexity::Moderate,
+                ExecutionPattern::Deliberate,
+                0,
+                0
+            ),
+            ExecutionMode::PresetProtocol
+        );
+    }
+
+    #[test]
+    fn execution_mode_is_derived_from_the_decision_record() {
+        let team = build_runtime_execution_decision(
+            "use multi-agent collaboration to review runtime, gateway, and memory",
+            None,
+        );
+        assert_eq!(team.execution_mode(), ExecutionMode::MultiTeamCollaboration);
+        assert!(team
+            .reasons
+            .iter()
+            .any(|reason| reason.starts_with("complexity resolved:")));
+    }
+
+    #[test]
+    fn complexity_reasons_expose_the_classification_inputs() {
+        let decision = build_runtime_execution_decision(
+            "use multi-agent collaboration to review runtime, gateway, memory and session",
+            None,
+        );
+        let reasons = complexity_reasons(&decision.strategy.understanding);
+        assert!(reasons.iter().any(|r| r.contains("multi-agent requested")));
+        assert!(reasons
+            .iter()
+            .any(|r| r.starts_with("complexity resolved:")));
     }
 }
