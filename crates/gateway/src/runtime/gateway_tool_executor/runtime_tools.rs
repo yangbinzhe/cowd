@@ -1085,14 +1085,9 @@ impl GatewayToolExecutor {
                 let query = query
                     .as_deref()
                     .ok_or_else(|| ToolError::new("session_catalog requires a focused query"))?;
-                if input
-                    .scope
-                    .is_some_and(|scope| scope != ContextRetrieveScope::WorkspaceSessions)
-                {
-                    return Err(ToolError::new(
-                        "session_catalog supports workspace_sessions scope only",
-                    ));
-                }
+                // `session_catalog` is always a workspace-wide discovery (the
+                // scope below is fixed), so a different model-supplied scope is
+                // ignored rather than rejected.
                 let Some(history) = services.session_history_reader() else {
                     return serialize_context_result(&serde_json::json!({"kind":"runtime.context_retrieval","source":"session_catalog","status":"degraded","reason":"session history reader is not configured","selected":[]})).map_err(|e|ToolError::new(e.to_string()));
                 };
