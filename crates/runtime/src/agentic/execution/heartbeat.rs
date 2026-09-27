@@ -125,47 +125,61 @@ pub(super) async fn renew_agentic_claim_if_active(
     // mutation. Appending one compact in-place event avoids the full governed
     // action path (authorization, validation, projection apply and follow-up
     // dispatch) on every heartbeat, which dominated large runs where task_claim
-    // accounted for ~92% of all actions. The projection consumes the event
-    // below by extending the existing lease in place, without a new generation.
-    let generation = action_service
-        .project(&actor.program_id)
-        .map(|projection| projection.revision)
-        .unwrap_or_default();
-    let event = crate::RuntimeTransactionEventInput {
-        event: crate::RuntimeEventInput {
-            stream_id: format!("agentic-program:{}", actor.program_id),
-            scope: crate::RuntimeEventScope::Program,
-            kind: "agentic.task_lease_renewed".to_string(),
-            status: Some("renewed".to_string()),
-            actor: actor.agent_id.clone(),
-            refs: Vec::new(),
-            payload: serde_json::json!({
-                "task_ref": task_ref,
-                "agent_id": actor.agent_id,
-                "execution_id": execution_id,
-            }),
-        },
-        idempotency_key: Some(format!("claim-lease-renewed:{execution_id}:{generation}")),
-        schema_version: 1,
-    };
-    services
-        .event_store()
-        .append_transaction(crate::AppendTransactionRequest {
-            transaction_id: format!(
-                "claim-lease-renewed:{}:{execution_id}:{generation}",
-                actor.program_id
-            ),
-            expected_streams: vec![crate::ExpectedStreamRevision {
-                stream_id: format!("agentic-program:{}", actor.program_id),
-                expected_revision: generation,
-            }],
-            events: vec![event],
-        })
-        .map_err(|error| {
-            tracing::debug!(%error, "agentic claim heartbeat renewal deferred");
-            error
-        })
-        .is_ok()
+    // accounted for ~92% of all actions.
+    //
+    // It must be resilient: a single CAS conflict under concurrent Program
+    // writes must NOT terminate the heartbeat guard, or the claim would silently
+    // expire and every later submit would be rejected as `task_claim_expired`.
+    // Re-read the revision and retry a bounded number of times.
+    const MAX_ATTEMPTS: u8 = 8;
+    let stream_id = format!("agentic-program:{}", actor.program_id);
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let generation = action_service
+            .project(&actor.program_id)
+            .map(|projection| projection.revision)
+            .unwrap_or_default();
+        let event = crate::RuntimeTransactionEventInput {
+            event: crate::RuntimeEventInput {
+                stream_id: stream_id.clone(),
+                scope: crate::RuntimeEventScope::Program,
+                kind: "agentic.task_lease_renewed".to_string(),
+                status: Some("renewed".to_string()),
+                actor: actor.agent_id.clone(),
+                refs: Vec::new(),
+                payload: serde_json::json!({
+                    "task_ref": task_ref,
+                    "agent_id": actor.agent_id,
+                    "execution_id": execution_id,
+                }),
+            },
+            idempotency_key: Some(format!("claim-lease-renewed:{execution_id}:{generation}")),
+            schema_version: 1,
+        };
+        match services
+            .event_store()
+            .append_transaction(crate::AppendTransactionRequest {
+                transaction_id: format!(
+                    "claim-lease-renewed:{}:{execution_id}:{generation}",
+                    actor.program_id
+                ),
+                expected_streams: vec![crate::ExpectedStreamRevision {
+                    stream_id: stream_id.clone(),
+                    expected_revision: generation,
+                }],
+                events: vec![event],
+            }) {
+            Ok(_) => return true,
+            Err(crate::RuntimeEventStoreError::StaleRevision { .. }) if attempt < MAX_ATTEMPTS => {
+                continue;
+            }
+            Err(error) => {
+                tracing::debug!(%error, "agentic claim heartbeat renewal deferred");
+                return false;
+            }
+        }
+    }
 }
 
 pub(crate) struct AgenticClaimHeartbeatGuard {
