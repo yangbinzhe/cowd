@@ -1386,6 +1386,54 @@ where
         if execution_role.owns_root_presentation()
             && completion == harness_contract::goal::GoalCompletion::Satisfied
         {
+            // A success presentation while a real completion gap remains means the
+            // root finished too early. Do not fail the turn: return the root to
+            // continue (bounded) with the gap disclosed, so it can classify
+            // outstanding issues and get every Task accepted before completing.
+            if let Some(gap) = crate::agentic::agentic_program_completion_gap(
+                self.services.as_ref(),
+                &session_id,
+                &turn_id,
+            ) {
+                let continue_gap = {
+                    let mut state = self.state.lock().await;
+                    let bound = completion_gap_continuation_bound();
+                    if state.completion_gap_continuations < bound {
+                        state.completion_gap_continuations =
+                            state.completion_gap_continuations.saturating_add(1);
+                        true
+                    } else {
+                        tracing::warn!(
+                            gap = %gap,
+                            bound,
+                            "completion gap continuation bound reached; presenting the honest terminal instead of continuing"
+                        );
+                        false
+                    }
+                };
+                if continue_gap {
+                    let iteration = self.state.lock().await.iterations;
+                    let next = dynamic_node(
+                        ticket,
+                        iteration,
+                        "completion-gap-continuation",
+                        ExecutionNodeKind::InlineModel,
+                        "inline_model",
+                        "inline_model",
+                    );
+                    return Ok(NodeExecutionOutcome::new(completed_result(
+                        Some(format!("{}:completion-gap-continuation", ticket.graph_id)),
+                        ExecutionUsage::default(),
+                    ))
+                    .with_replan(ExecutionGraphReplan {
+                        nodes: vec![next.clone()],
+                        edges: dynamic_edges(&ticket.node_id, &[next]),
+                        reason: format!(
+                            "Objective completion gap remains; continue working before presenting success: {gap}"
+                        ),
+                    }));
+                }
+            }
             let _ = self
                 .services
                 .drive_agentic_objective_completion(&session_id, &turn_id, &ticket.graph_id)
@@ -1830,6 +1878,18 @@ where
         }
         Ok(())
     }
+}
+
+/// Bounded number of times a success presentation is returned to continue
+/// because a real Objective completion gap remains. Defaults to 5; override
+/// with `COWD_COMPLETION_GAP_CONTINUATIONS`. Beyond the bound the turn presents
+/// its honest terminal instead of looping.
+fn completion_gap_continuation_bound() -> u8 {
+    std::env::var("COWD_COMPLETION_GAP_CONTINUATIONS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u8>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(5)
 }
 
 /// Resolve terminal ownership before emitting a Goal event. Agent-first

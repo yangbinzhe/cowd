@@ -429,33 +429,8 @@ impl RuntimeServices {
             return Ok(true);
         }
         // Cite exactly the accepted work; an empty result set is not completable.
-        let mut result_refs = Vec::new();
-        let mut evidence_refs = Vec::new();
-        for task in program.tasks.values() {
-            if task.status != crate::AgenticTaskStatus::Accepted {
-                continue;
-            }
-            result_refs.extend(task.artifact_refs.iter().cloned());
-            evidence_refs.extend(task.evidence_refs.iter().cloned());
-        }
-        // `completion_gap` treats the first known artifact in result_refs as the
-        // primary integration proof and walks that Task's transitive accepted
-        // `depends_on`. Order so the most cross-Team-integrated artifact leads;
-        // otherwise an alphabetically-first per-Team artifact makes the
-        // integration check fail even though a synthesis artifact exists.
-        result_refs.sort_by_key(|reference| {
-            std::cmp::Reverse(objective_artifact_integration_score(&program, reference))
-        });
-        result_refs.dedup();
-        evidence_refs.sort();
-        evidence_refs.dedup();
-        if result_refs.is_empty() {
+        let Some(input) = completion_objective_input(&program) else {
             return Ok(false);
-        }
-        let input = harness_contract::agent_action::ObjectiveCompleteRequestInput {
-            result_refs,
-            evidence_refs,
-            unresolved: Vec::new(),
         };
         // The single authoritative gate: never force an incomplete objective.
         if let Some(gap) = crate::agentic::supervision::completion_gap(&program, &input) {
@@ -550,6 +525,62 @@ impl RuntimeServices {
         }
         Ok(())
     }
+}
+
+/// Build the Objective completion input a root would cite: every accepted
+/// Task's durable artifacts and evidence, with the most cross-Team-integrated
+/// artifact first (the completion gap treats the first known artifact as the
+/// primary integration proof). Returns `None` when no accepted artifact exists,
+/// because an empty result set is not completable. Shared by the completion
+/// drive and the completion-gap query so their judgement cannot drift.
+fn completion_objective_input(
+    program: &crate::AgenticProgramProjection,
+) -> Option<harness_contract::agent_action::ObjectiveCompleteRequestInput> {
+    let mut result_refs = Vec::new();
+    let mut evidence_refs = Vec::new();
+    for task in program.tasks.values() {
+        if task.status != crate::AgenticTaskStatus::Accepted {
+            continue;
+        }
+        result_refs.extend(task.artifact_refs.iter().cloned());
+        evidence_refs.extend(task.evidence_refs.iter().cloned());
+    }
+    result_refs.sort_by_key(|reference| {
+        std::cmp::Reverse(objective_artifact_integration_score(program, reference))
+    });
+    result_refs.dedup();
+    evidence_refs.sort();
+    evidence_refs.dedup();
+    if result_refs.is_empty() {
+        return None;
+    }
+    Some(harness_contract::agent_action::ObjectiveCompleteRequestInput {
+        result_refs,
+        evidence_refs,
+        unresolved: Vec::new(),
+    })
+}
+
+/// The completion gap that currently blocks an Objective, if any. Read-only:
+/// used to decide whether a root's success presentation must be returned to
+/// continue working instead of failing the turn.
+pub fn agentic_program_completion_gap(
+    services: &crate::RuntimeServices,
+    session_id: &str,
+    turn_id: &str,
+) -> Option<String> {
+    let objective_id = harness_contract::agent_action::root_objective_id(session_id, turn_id);
+    let program_id = harness_contract::agent_action::program_id_for_objective(&objective_id);
+    let program = services
+        .agent_action_service()
+        .project_if_exists(&program_id)
+        .ok()
+        .flatten()?;
+    if program.status != crate::AgenticProgramStatus::Open {
+        return None;
+    }
+    let input = completion_objective_input(&program)?;
+    crate::agentic::supervision::completion_gap(&program, &input)
 }
 
 /// Count the distinct Teams a submitted artifact integrates: the accepted Task
@@ -704,6 +735,38 @@ mod tests {
         assert_eq!(
             objective_artifact_integration_score(&program, "artifact:final"),
             4
+        );
+    }
+
+    #[test]
+    fn completion_input_leads_with_the_synthesis_and_is_none_without_artifacts() {
+        use crate::AgenticTaskStatus::Accepted;
+        let mut program = crate::AgenticProgramProjection::empty("program", "objective");
+        program.tasks.insert(
+            "task:empty".to_string(),
+            task_fixture("task:empty", "team:a", Accepted, vec![], vec![]),
+        );
+        assert!(completion_objective_input(&program).is_none());
+
+        program.tasks.insert(
+            "task:audit".to_string(),
+            task_fixture("task:audit", "team:a", Accepted, vec![], vec!["artifact:a"]),
+        );
+        program.tasks.insert(
+            "task:syn".to_string(),
+            task_fixture(
+                "task:syn",
+                "team:s",
+                Accepted,
+                vec!["task:audit"],
+                vec!["artifact:final"],
+            ),
+        );
+        let input = completion_objective_input(&program).expect("completion input");
+        assert_eq!(
+            input.result_refs.first().map(String::as_str),
+            Some("artifact:final"),
+            "the cross-Team synthesis artifact must lead result_refs"
         );
     }
 

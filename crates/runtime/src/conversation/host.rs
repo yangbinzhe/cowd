@@ -692,6 +692,7 @@ where
             last_verified_progress: false,
             consecutive_unverified_model_steps: 0,
             collaboration_convergence_replans: 0,
+            completion_gap_continuations: 0,
             started_at: std::time::Instant::now(),
             reasoning_only_attempts: 0,
             force_text_only_next_model: evaluation_control
@@ -3148,6 +3149,11 @@ struct TurnGraphState {
     /// minimum is unmet it advances; past the policy bound the turn terminates
     /// as an honest partial instead of replanning without end.
     collaboration_convergence_replans: usize,
+    /// Bounded count of times a success presentation was returned to continue
+    /// because a real Objective completion gap remained. Replans change the
+    /// root graph node statuses, so the generic no-progress bound cannot fence
+    /// this loop; this counter does.
+    completion_gap_continuations: u8,
     /// When this turn's model loop started. Used only for the objective-level
     /// wall-clock budget that bounds a required-Team collaboration turn, which
     /// the no-progress fuse cannot bound while nominal progress continues.
