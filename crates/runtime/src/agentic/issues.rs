@@ -123,3 +123,164 @@ pub(crate) fn completion_gap(projection: &AgenticProgramProjection) -> Option<St
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agentic::program::{AgenticProgramProjection, AgenticTaskProjection, AgenticTaskStatus};
+    use harness_contract::agent_action::{
+        AgentActorBinding, AgentAction, AgentActionEnvelope, IssueDisposition,
+        IssueDispositionKind, MessagePublishInput,
+    };
+
+    fn projection_with_issue() -> (AgenticProgramProjection, String) {
+        let mut projection = AgenticProgramProjection::empty("program", "objective");
+        projection.tasks.insert(
+            "task:1".to_string(),
+            AgenticTaskProjection {
+                task_id: "task:1".to_string(),
+                team_id: "team:1".to_string(),
+                title: "t".to_string(),
+                objective: "o".to_string(),
+                acceptance: "a".to_string(),
+                acceptance_checks: Vec::new(),
+                required_capabilities: Vec::new(),
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
+                depends_on: Vec::new(),
+                status: AgenticTaskStatus::Accepted,
+                claimant: None,
+                claim_generation: 0,
+                claim_execution_id: None,
+                claimed_at_ms: None,
+                lease_expires_at_ms: None,
+                active_attempts: Default::default(),
+                artifact_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                unresolved: vec!["external crate metadata is missing".to_string()],
+                review_reason: None,
+                reviewed_by: None,
+                failed_attempts: 0,
+                review_generation: 0,
+                failed_review_attempts: 0,
+                last_failure: None,
+                replacement_task_refs: Vec::new(),
+                supersede_evidence_refs: Vec::new(),
+                superseded_reason: None,
+                superseded_by: None,
+                cancel_requested_by: None,
+                cancel_reason_ref: None,
+                cancel_evidence_refs: Vec::new(),
+                pending_retirement: None,
+            },
+        );
+        let issue_ref = issues(&projection)
+            .into_iter()
+            .next()
+            .expect("one issue")
+            .issue_ref;
+        (projection, issue_ref)
+    }
+
+    fn root_envelope() -> AgentActionEnvelope {
+        let actor = AgentActorBinding {
+            objective_id: "objective".into(),
+            program_id: "program".into(),
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            root_execution_id: Some("graph".into()),
+            required_team_count: 3,
+            objective_summary: "objective".into(),
+            model_lease: "default".into(),
+            permission_ceiling: None,
+            resource_scopes: Vec::new(),
+            actor_id: "root:session".into(),
+            kind: AgentActorKind::Root,
+            execution_id: None,
+            team_id: None,
+            agent_id: None,
+        };
+        AgentActionEnvelope {
+            action_id: "publish".into(),
+            actor,
+            expected_revision: None,
+            action: AgentAction::MessagePublish(MessagePublishInput {
+                topic_ref: "topic:program".into(),
+                summary: None,
+                content_ref: None,
+                refs: Vec::new(),
+                recipients: Vec::new(),
+                intent: None,
+                issue_dispositions: Vec::new(),
+            }),
+        }
+    }
+
+    fn publish(dispositions: Vec<IssueDisposition>) -> MessagePublishInput {
+        MessagePublishInput {
+            topic_ref: "topic:program".into(),
+            summary: None,
+            content_ref: None,
+            refs: Vec::new(),
+            recipients: Vec::new(),
+            intent: None,
+            issue_dispositions: dispositions,
+        }
+    }
+
+    #[test]
+    fn prose_reason_with_runtime_entity_anchor_is_accepted() {
+        let (projection, issue_ref) = projection_with_issue();
+        let input = publish(vec![IssueDisposition {
+            issue_ref,
+            disposition: IssueDispositionKind::Disclose,
+            reason_ref: "DISCLOSED, non-blocking: external crate metadata unavailable".into(),
+            evidence_refs: vec!["task:1".into()],
+        }]);
+        assert_eq!(
+            validate_dispositions(&projection, &root_envelope(), &input),
+            None
+        );
+    }
+
+    #[test]
+    fn receipt_evidence_is_still_accepted() {
+        let (projection, issue_ref) = projection_with_issue();
+        let input = publish(vec![IssueDisposition {
+            issue_ref,
+            disposition: IssueDispositionKind::Resolved,
+            reason_ref: "tool://receipt".into(),
+            evidence_refs: vec!["artifact://art_1".into()],
+        }]);
+        assert_eq!(
+            validate_dispositions(&projection, &root_envelope(), &input),
+            None
+        );
+    }
+
+    #[test]
+    fn non_durable_evidence_is_rejected() {
+        let (projection, issue_ref) = projection_with_issue();
+        let input = publish(vec![IssueDisposition {
+            issue_ref,
+            disposition: IssueDispositionKind::Disclose,
+            reason_ref: "some prose".into(),
+            evidence_refs: vec!["free text, not a reference".into()],
+        }]);
+        assert!(validate_dispositions(&projection, &root_envelope(), &input).is_some());
+    }
+
+    #[test]
+    fn unknown_issue_is_rejected() {
+        let (projection, _) = projection_with_issue();
+        let input = publish(vec![IssueDisposition {
+            issue_ref: "issue:not-real".into(),
+            disposition: IssueDispositionKind::Disclose,
+            reason_ref: "tool://receipt".into(),
+            evidence_refs: vec!["task:1".into()],
+        }]);
+        assert!(validate_dispositions(&projection, &root_envelope(), &input).is_some());
+    }
+}

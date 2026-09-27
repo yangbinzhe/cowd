@@ -568,4 +568,14 @@ mod tests {
         assert_eq!(bump_review_streak(key), 1);
         clear_review_streak(key);
     }
+
+    #[tokio::test]
+    async fn drive_completion_declines_without_a_program() {
+        let services = crate::RuntimeServices::in_memory().expect("services");
+        let driven = services
+            .drive_agentic_objective_completion("session", "turn", "graph")
+            .await
+            .expect("no error");
+        assert!(!driven, "no Program means no completion to drive");
+    }
 }
