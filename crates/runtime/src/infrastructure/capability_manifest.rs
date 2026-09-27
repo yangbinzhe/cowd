@@ -195,7 +195,7 @@ pub fn runtime_capability_primer() -> String {
         "Read Runtime facts through one canonical reference with `read`, for example task://<task_ref>, agent://<agent_id>, tool://<short_call_id>, artifact://<hash>, session://<session_id>. The scheme selects the authorized reader; do not guess field names on the legacy readers.",
         "Keep long reasoning and deliverables in normal content or workspace files. Action payloads carry compact semantic fields and durable refs.",
         "A Task is complete only after a real claimant submits durable evidence and a different Agent accepts it.",
-        "Request Objective completion only after every required Team has members and accepted work, the final artifact is durable and reviewed, and no objective-level blocker remains. Accepted Task limitations remain visible disclosures and are not a second completion veto.",
+        "Before you finish, drive the Objective terminal: once every required Team has accepted work, the final artifact is durable and independently reviewed, and no objective-level blocker remains, call `objective_complete_request` and then let the Runtime verify it. A final answer without that action does not close the Objective. Accepted Task limitations remain visible disclosures and are not a second completion veto.",
         "On rejection or restart, inspect current state and continue from the returned revision; never repeat an unchanged failing action.",
     ]
     .join("\n")
