@@ -79,19 +79,29 @@ pub(crate) fn validate_dispositions(
                 disposition.issue_ref.clone(),
             ));
         };
-        // The issue is source-bound to a Runtime-created Task, so that Task is
-        // the issue's own durable anchor. Accept it alongside tool://artifact://
-        // receipts, otherwise a root with no unrelated receipt to hand can never
-        // classify its own source-bound issues.
+        // Durable evidence lives in `evidence_refs`: a tool/artifact receipt, a
+        // Runtime entity anchor (the source-bound Task/Issue), or the issue's own
+        // source. `reason_ref` is a human reason and may legitimately be prose,
+        // so it is not required to be a reference.
         let source_anchor = issue.source_ref.as_str();
-        if !std::iter::once(&disposition.reason_ref)
-            .chain(&disposition.evidence_refs)
-            .all(|reference| {
-                reference.starts_with("artifact://")
-                    || reference.starts_with("tool://")
-                    || reference == source_anchor
-            })
-        {
+        let durable = |reference: &str| {
+            reference.starts_with("artifact://")
+                || reference.starts_with("tool://")
+                || reference.starts_with("task:")
+                || reference.starts_with("issue:")
+                || reference.starts_with("program:")
+                || reference == source_anchor
+        };
+        let all_evidence_durable = disposition
+            .evidence_refs
+            .iter()
+            .all(|reference| durable(reference));
+        let has_durable_anchor = disposition
+            .evidence_refs
+            .iter()
+            .any(|reference| durable(reference))
+            || durable(&disposition.reason_ref);
+        if !all_evidence_durable || !has_durable_anchor {
             return Some((
                 "issue_disposition_requires_durable_evidence",
                 disposition.issue_ref.clone(),
