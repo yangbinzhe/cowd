@@ -613,36 +613,23 @@ impl RuntimeExecutionSupervisor {
         Ok((slot, generation))
     }
 
-    /// Open the sole graph-driver gate after ordered durable recovery and
-    /// wake every graph admitted while the gate was closed exactly once.
-    pub(crate) async fn release_recovered_graphs(&self) -> Result<usize, ExecutionRunnerError> {
-        let deferred = {
-            let mut gate = self
-                .graph_producer_gate
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if gate.released {
-                return Ok(0);
-            }
-            gate.released = true;
-            std::mem::take(&mut gate.deferred_graphs)
-        };
-        if deferred.is_empty() {
-            return Ok(0);
+    /// Open the sole graph-driver gate after ordered durable recovery and hand
+    /// back the graphs admitted while it was closed, WITHOUT waking them. The
+    /// caller decides which are bound enough to wake: a conversation-owned
+    /// graph must not be woken before its Session host rebinds the turn-scoped
+    /// executors, or the node fails as `executor ... is unavailable`.
+    pub(crate) fn take_deferred_recovered_graphs(&self) -> Vec<String> {
+        let mut gate = self
+            .graph_producer_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if gate.released {
+            return Vec::new();
         }
-        self.ensure_dispatcher()?;
-        let count = deferred.len();
-        for graph_id in deferred {
-            self.sender
-                .send(SupervisorMessage::Wake(graph_id))
-                .await
-                .map_err(|_| {
-                    ExecutionRunnerError::SupervisorUnavailable(
-                        "execution recovery admission queue is closed".to_string(),
-                    )
-                })?;
-        }
-        Ok(count)
+        gate.released = true;
+        std::mem::take(&mut gate.deferred_graphs)
+            .into_iter()
+            .collect()
     }
 
     pub(crate) async fn spawn_owned(

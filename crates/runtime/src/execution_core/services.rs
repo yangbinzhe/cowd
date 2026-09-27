@@ -1596,17 +1596,36 @@ impl RuntimeServices {
     pub async fn release_recovered_producers(
         self: &Arc<Self>,
     ) -> Result<usize, RuntimeServicesError> {
-        let recovered_graphs = self
+        let deferred = self
             .execution_supervisor
-            .release_recovered_graphs()
-            .await
-            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+            .take_deferred_recovered_graphs();
         self.start_background_reactors()?;
+        let mut released = 0usize;
+        for graph_id in deferred {
+            // Wake only a recovered graph whose turn-scoped executors are bound.
+            // A conversation-owned graph (inline_model/tool_batch/synthesize) is
+            // bound by the Session host after it restores the turn context;
+            // waking it here races that binding and fails the node as
+            // `executor ... is unavailable`. Unbound graphs stay deferred and are
+            // driven by the Session host itself once it restores the context.
+            let bound = match self.graph_state_store().load_async(&graph_id).await {
+                Ok(graph) => self.graph_executors_are_bound(&graph),
+                Err(_) => false,
+            };
+            if !bound {
+                continue;
+            }
+            if let Err(error) = self.execution_supervisor.notify_graph(&graph_id).await {
+                tracing::warn!(graph_id, %error, "bound recovered graph could not be woken");
+                continue;
+            }
+            released += 1;
+        }
         tracing::info!(
-            recovered_graphs,
-            "ordered Runtime recovery released autonomous producers"
+            released,
+            "ordered Runtime recovery released bound autonomous producers"
         );
-        Ok(recovered_graphs)
+        Ok(released)
     }
 
     pub fn install_session_ports(

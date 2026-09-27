@@ -2758,7 +2758,7 @@ impl RuntimeServices {
 }
 
 impl RuntimeServices {
-    fn graph_executors_are_bound(&self, graph: &ExecutionGraph) -> bool {
+    pub(crate) fn graph_executors_are_bound(&self, graph: &ExecutionGraph) -> bool {
         graph.nodes.iter().all(|node| {
             let executor = match node.executor_kind.as_str() {
                 "inline_model" => Some(self.model_step_executor.as_ref()),

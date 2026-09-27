@@ -2100,6 +2100,17 @@ async fn session_integrated_runtime_holds_all_autonomous_producers_until_recover
         .session_ports(ports.clone(), ports.clone(), ports.clone(), ports)
         .build()
         .expect("session-integrated Runtime");
+    // Bind this graph's conversation-scoped executor. Release wakes only graphs
+    // whose turn-scoped executors are bound; an unbound graph is deliberately
+    // held for its Session host instead of being woken into `unavailable`.
+    services
+        .tool_batch_executor()
+        .install_resolver(Arc::new(ServiceScopedResolver {
+            payload_ref: "{}".to_string(),
+            backend: Arc::new(ServiceScopedBackend {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        }));
     assert!(matches!(
         services
             .execution_supervisor()
