@@ -2114,6 +2114,7 @@ fn inspect_projection_page(
         .chain(super::issues::issues(projection).into_iter().map(|issue| json!({
             "entry_ref": issue.issue_ref, "kind": "issue", "label": issue.description,
             "source_ref": issue.source_ref, "disposition": issue.disposition,
+            "unclassified": issue.disposition.is_none(),
         })))
         .chain(goal.into_iter().flat_map(goal_directory_entries));
     // Keep only the next page plus one look-ahead entry. Discovery can scan

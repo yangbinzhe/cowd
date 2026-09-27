@@ -2498,10 +2498,18 @@ fn compact_agentic_program_checkpoint(
             "disposition":issue.disposition.as_ref().map(|value| value.disposition),
             "read_request":{"name":"state_inspect","input":{"entry_ref":issue.issue_ref}}
         })).collect::<Vec<_>>(),
+        // Completion is rejected until every issue is classified; name the exact
+        // outstanding ones so the root can dispose them in one message_publish
+        // instead of guessing whether any remain.
+        "unclassified_issue_refs": issues
+            .iter()
+            .filter(|issue| issue.disposition.is_none())
+            .map(|issue| issue.issue_ref.clone())
+            .collect::<Vec<_>>(),
         "unresolved_count": program.unresolved.len(),
         "next_actions": next_actions,
         "terminal_action": terminal_action.as_ref().map(RootAgenticTerminalAction::checkpoint_detail),
-        "instruction": "Use this Runtime projection as current truth. You may continue planning, publish dependent or independent Tasks, and coordinate while members execute. When ready to wait for active workers, call state_inspect with wait_for_workers=true; Runtime waits without provider polling. Do not recreate committed entities. Before completion, classify retained issue_refs through message_publish.issue_dispositions with durable reasons/evidence (must_resolve, disclose, or resolved); a disposition may cite a tool://artifact:// receipt OR the issue's own source_ref, which is its Runtime-created anchor. Keep estimates and assumptions labelled; only the Goal verifier can certify the original objective.",
+        "instruction": "Use this Runtime projection as current truth. You may continue planning, publish dependent or independent Tasks, and coordinate while members execute. When ready to wait for active workers, call state_inspect with wait_for_workers=true; Runtime waits without provider polling. Do not recreate committed entities. Completion is rejected while any entry remains in `unclassified_issue_refs`: classify EVERY issue_ref there through one message_publish.issue_dispositions (must_resolve, disclose, or resolved) with durable reasons/evidence (a tool://artifact:// receipt OR the issue's own source_ref, its Runtime-created anchor). Keep estimates and assumptions labelled; only the Goal verifier can certify the original objective.",
     })
     .to_string()
 }
