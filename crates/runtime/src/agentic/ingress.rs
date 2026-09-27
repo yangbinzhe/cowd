@@ -438,7 +438,14 @@ impl RuntimeServices {
             result_refs.extend(task.artifact_refs.iter().cloned());
             evidence_refs.extend(task.evidence_refs.iter().cloned());
         }
-        result_refs.sort();
+        // `completion_gap` treats the first known artifact in result_refs as the
+        // primary integration proof and walks that Task's transitive accepted
+        // `depends_on`. Order so the most cross-Team-integrated artifact leads;
+        // otherwise an alphabetically-first per-Team artifact makes the
+        // integration check fail even though a synthesis artifact exists.
+        result_refs.sort_by_key(|reference| {
+            std::cmp::Reverse(objective_artifact_integration_score(&program, reference))
+        });
         result_refs.dedup();
         evidence_refs.sort();
         evidence_refs.dedup();
@@ -545,6 +552,44 @@ impl RuntimeServices {
     }
 }
 
+/// Count the distinct Teams a submitted artifact integrates: the accepted Task
+/// whose `artifact_refs` contain it plus that Task's transitive accepted
+/// `depends_on`. Mirrors `agentic::supervision::integrated_accepted_tasks`, so
+/// the Objective completion request can lead with the synthesis artifact.
+fn objective_artifact_integration_score(
+    program: &crate::AgenticProgramProjection,
+    artifact_ref: &str,
+) -> usize {
+    let mut teams = std::collections::BTreeSet::new();
+    let mut visited = std::collections::BTreeSet::new();
+    let mut pending = program
+        .tasks
+        .values()
+        .filter(|task| {
+            task.status == crate::AgenticTaskStatus::Accepted
+                && task
+                    .artifact_refs
+                    .iter()
+                    .any(|reference| reference == artifact_ref)
+        })
+        .map(|task| task.task_id.clone())
+        .collect::<Vec<_>>();
+    while let Some(task_ref) = pending.pop() {
+        if !visited.insert(task_ref.clone()) {
+            continue;
+        }
+        let Some(task) = program.tasks.get(&task_ref) else {
+            continue;
+        };
+        if task.status != crate::AgenticTaskStatus::Accepted {
+            continue;
+        }
+        teams.insert(task.team_id.clone());
+        pending.extend(task.depends_on.iter().cloned());
+    }
+    teams.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,6 +623,88 @@ mod tests {
         // The streak restarts after a settlement or a clean verdict.
         assert_eq!(bump_review_streak(key), 1);
         clear_review_streak(key);
+    }
+
+    fn task_fixture(
+        task_id: &str,
+        team_id: &str,
+        status: crate::AgenticTaskStatus,
+        depends_on: Vec<&str>,
+        artifact_refs: Vec<&str>,
+    ) -> crate::AgenticTaskProjection {
+        crate::AgenticTaskProjection {
+            task_id: task_id.to_string(),
+            team_id: team_id.to_string(),
+            title: task_id.to_string(),
+            objective: "o".into(),
+            acceptance: "a".into(),
+            acceptance_checks: Vec::new(),
+            required_capabilities: Vec::new(),
+            obligation_refs: Vec::new(),
+            purpose: Default::default(),
+            execution_requirements: Vec::new(),
+            expertise_hints: Vec::new(),
+            depends_on: depends_on.into_iter().map(str::to_string).collect(),
+            status,
+            claimant: None,
+            claim_generation: 0,
+            claim_execution_id: None,
+            claimed_at_ms: None,
+            lease_expires_at_ms: None,
+            active_attempts: Default::default(),
+            artifact_refs: artifact_refs.into_iter().map(str::to_string).collect(),
+            evidence_refs: Vec::new(),
+            unresolved: Vec::new(),
+            review_reason: None,
+            reviewed_by: None,
+            failed_attempts: 0,
+            review_generation: 0,
+            failed_review_attempts: 0,
+            last_failure: None,
+            replacement_task_refs: Vec::new(),
+            supersede_evidence_refs: Vec::new(),
+            superseded_reason: None,
+            superseded_by: None,
+            cancel_requested_by: None,
+            cancel_reason_ref: None,
+            cancel_evidence_refs: Vec::new(),
+            pending_retirement: None,
+        }
+    }
+
+    #[test]
+    fn synthesis_artifact_outranks_a_single_team_artifact() {
+        use crate::AgenticTaskStatus::Accepted;
+        let mut program = crate::AgenticProgramProjection::empty("program", "objective");
+        for (id, team, artifact) in [
+            ("task:a", "team:a", "artifact:a"),
+            ("task:b", "team:b", "artifact:b"),
+            ("task:c", "team:c", "artifact:c"),
+        ] {
+            program.tasks.insert(
+                id.to_string(),
+                task_fixture(id, team, Accepted, vec![], vec![artifact]),
+            );
+        }
+        program.tasks.insert(
+            "task:synthesis".to_string(),
+            task_fixture(
+                "task:synthesis",
+                "team:s",
+                Accepted,
+                vec!["task:a", "task:b", "task:c"],
+                vec!["artifact:final"],
+            ),
+        );
+        // A per-team artifact covers one team; the synthesis covers four.
+        assert_eq!(
+            objective_artifact_integration_score(&program, "artifact:a"),
+            1
+        );
+        assert_eq!(
+            objective_artifact_integration_score(&program, "artifact:final"),
+            4
+        );
     }
 
     #[tokio::test]
