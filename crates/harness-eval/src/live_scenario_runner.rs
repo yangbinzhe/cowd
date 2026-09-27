@@ -25,6 +25,9 @@ const LARGE_SCALE_SCENARIO_ID: &str = "live_qwen38_large_scale_collaboration";
 const AUTONOMOUS_DEEPSEEK_SCENARIO_ID: &str = "live_autonomous_collaboration_deepseek";
 const AUTONOMOUS_DEEPSEEK_OUTPUT_PATH: &str = "group-theory-ai-autonomous-evaluation.html";
 const IMPLICIT_COLLABORATION_SCENARIO_ID: &str = "live_implicit_collaboration_obligation";
+/// A deliberately small, short collaboration used to exercise the whole
+/// team/task/review/completion loop at a scale a weak local model can finish.
+const SMALL_TEAM_SCENARIO_ID: &str = "live_small_two_team_collaboration";
 const RELEASE_CERTIFICATION_SCENARIOS: [&str; 6] = [
     "live_direct_terminal",
     "live_tool_evidence",
@@ -115,6 +118,33 @@ fn autonomous_deepseek_scenario_enabled() -> bool {
         AUTONOMOUS_DEEPSEEK_SCENARIO_ID,
         env_flag_enabled("COWD_EVAL_AUTONOMOUS_COLLABORATION"),
     )
+}
+
+fn small_team_scenario_enabled() -> bool {
+    let selected = selected_live_scenario_ids();
+    scenario_enabled(
+        selected.as_ref(),
+        SMALL_TEAM_SCENARIO_ID,
+        env_flag_enabled("COWD_EVAL_SMALL_TEAM"),
+    )
+}
+
+/// Two Teams over two independent responsibility domains, each with a bounded
+/// Task that reads one real source file, is independently reviewed, and feeds a
+/// short cross-Team synthesis. Small enough for a weak local model to close the
+/// loop, representative of the full contract (teams, tasks, review, integration).
+fn small_team_spec() -> Result<LiveScenarioSpec, String> {
+    let prompt = "This is a small, bounded Agent-first collaboration in an isolated workspace. Cover exactly TWO independent responsibility domains: (1) the runtime execution boundary (crates/runtime), and (2) the gateway tool/authority boundary (crates/gateway). Autonomously create TWO Teams with real Tasks; do not reuse fixed names or fixed member counts. Each Team must read at least ONE real source file under its crate with a read-only tool and cite the exact `crates/.../*.rs` path it actually opened. Every Task must be claimed by an Agent, submitted with a durable artifact/evidence reference, and independently reviewed by a different Agent. Publish ONE cross-Team synthesis Task that depends_on both upstream Tasks and consumes their accepted artifacts, then submit it for independent review. Do not invent files, links, or tool output; keep any unresolved item explicit. Use only read-only tools and Agent actions; do not use bash or write files.";
+    Ok(LiveScenarioSpec {
+        id: SMALL_TEAM_SCENARIO_ID,
+        prompt,
+        acceptance: LiveAcceptance::ArchitectureQuality {
+            minimum_teams: 2,
+            minimum_claimed_cross_team_edges: 1,
+            evidence_profile: ArchitectureEvidenceProfile::Basic,
+        },
+        timeout: LiveScenarioTimeout::team(),
+    })
 }
 
 #[derive(Deserialize)]
@@ -922,6 +952,10 @@ impl LiveScenarioRunner {
             },
         ];
         for (enabled, build_spec) in [
+            (
+                small_team_scenario_enabled(),
+                small_team_spec as fn() -> Result<LiveScenarioSpec, String>,
+            ),
             (
                 group_theory_research_scenario_enabled(),
                 group_theory_spec as fn() -> Result<LiveScenarioSpec, String>,
