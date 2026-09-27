@@ -387,6 +387,107 @@ impl RuntimeServices {
         }
     }
 
+    /// When the Agent-first collaboration is objectively complete but the root
+    /// never requested completion (a weak model can finish its final answer
+    /// without emitting the action), submit the mechanical completion request on
+    /// the root's behalf so the existing durable reconciliation produces the
+    /// Objective terminal.
+    ///
+    /// Safety: the actor is built only from Program lineage (never model JSON),
+    /// the action still crosses `submit_agent_action` authorization, and nothing
+    /// is submitted unless `completion_gap` confirms the objective is genuinely
+    /// completable — a real gap is never masked. Returns `true` only when a
+    /// request is durably applied or an existing one was driven to reconcile.
+    pub async fn drive_agentic_objective_completion(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        root_execution_id: &str,
+    ) -> Result<bool, String> {
+        let objective_id = harness_contract::agent_action::root_objective_id(session_id, turn_id);
+        let program_id = harness_contract::agent_action::program_id_for_objective(&objective_id);
+        let Some(program) = self
+            .agent_action_service()
+            .project_if_exists(&program_id)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(false);
+        };
+        // Only the Program that owns this exact root terminal is eligible.
+        if program.objective_id != objective_id
+            || program.session_id != session_id
+            || program.turn_id != turn_id
+            || program.root_execution_id.as_deref() != Some(root_execution_id)
+            || program.status != crate::AgenticProgramStatus::Open
+        {
+            return Ok(false);
+        }
+        // A request already exists: drive reconciliation rather than overwriting
+        // the single completion-request slot.
+        if program.completion_request.is_some() {
+            let _ = self.reconcile_agentic_completion_request(&program_id);
+            return Ok(true);
+        }
+        // Cite exactly the accepted work; an empty result set is not completable.
+        let mut result_refs = Vec::new();
+        let mut evidence_refs = Vec::new();
+        for task in program.tasks.values() {
+            if task.status != crate::AgenticTaskStatus::Accepted {
+                continue;
+            }
+            result_refs.extend(task.artifact_refs.iter().cloned());
+            evidence_refs.extend(task.evidence_refs.iter().cloned());
+        }
+        result_refs.sort();
+        result_refs.dedup();
+        evidence_refs.sort();
+        evidence_refs.dedup();
+        if result_refs.is_empty() {
+            return Ok(false);
+        }
+        let input = harness_contract::agent_action::ObjectiveCompleteRequestInput {
+            result_refs,
+            evidence_refs,
+            unresolved: Vec::new(),
+        };
+        // The single authoritative gate: never force an incomplete objective.
+        if crate::agentic::supervision::completion_gap(&program, &input).is_some() {
+            return Ok(false);
+        }
+        let actor = harness_contract::agent_action::AgentActorBinding {
+            objective_id: program.objective_id.clone(),
+            program_id: program.program_id.clone(),
+            session_id: program.session_id.clone(),
+            turn_id: program.turn_id.clone(),
+            root_execution_id: program.root_execution_id.clone(),
+            required_team_count: program.required_team_count,
+            objective_summary: program.objective_summary.clone(),
+            model_lease: program.model_lease.clone(),
+            permission_ceiling: Some(program.permission_ceiling),
+            resource_scopes: program.resource_scopes.clone(),
+            actor_id: format!("root:{session_id}"),
+            kind: harness_contract::agent_action::AgentActorKind::Root,
+            execution_id: None,
+            team_id: None,
+            agent_id: None,
+        };
+        let envelope = AgentActionEnvelope {
+            action_id: format!("objective-complete-request:runtime:{}", program.revision),
+            actor,
+            expected_revision: None,
+            action: AgentAction::ObjectiveCompleteRequest(input),
+        };
+        let observation = self.submit_agent_action(&envelope).await?;
+        if observation.status != harness_contract::agent_action::AgentActionStatus::Applied {
+            return Ok(false);
+        }
+        // Reduce the request now so the deterministic Objective verdict is
+        // durable before the caller presents; the durable lane would also do
+        // this, but doing it here removes an asynchronous window.
+        let _ = self.reconcile_agentic_completion_request(&program_id);
+        Ok(true)
+    }
+
     /// Settle the exact reviewed Task as a durable review-attempt failure so the
     /// bounded `MAX_TASK_REVIEW_ATTEMPTS` policy can reach its terminal. Only
     /// delegated Task review is settled; objective review is not a Task attempt.

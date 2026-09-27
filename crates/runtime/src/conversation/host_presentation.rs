@@ -1378,6 +1378,19 @@ where
         ));
         outcome.delivery_envelope = Some(envelope.clone());
         outcome.terminal_presentation = presentation.clone();
+        // A weak model can finish its final answer without emitting the
+        // Objective completion request. Drive it deterministically — only when
+        // the collaboration is objectively complete (`completion_gap` gates it)
+        // — so the verified Objective terminal exists and this presentation
+        // defers to it instead of failing.
+        if execution_role.owns_root_presentation()
+            && completion == harness_contract::goal::GoalCompletion::Satisfied
+        {
+            let _ = self
+                .services
+                .drive_agentic_objective_completion(&session_id, &turn_id, &ticket.graph_id)
+                .await;
+        }
         let terminal_owned = root_terminal_owned_elsewhere(
             self.services.as_ref(),
             execution_role.owns_root_presentation(),
