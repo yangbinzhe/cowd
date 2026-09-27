@@ -1158,28 +1158,53 @@ impl ExecutionGraphRunner {
             if let Some(presentation) = outcome.terminal_presentation.clone() {
                 current.terminal_presentation = Some(presentation);
             }
-            let transition = if let Some(replan) = outcome.replan {
-                self.commit_service
-                    .transition_node_with_replan_async(
-                        current,
-                        node_id.clone(),
-                        outcome.result,
-                        outcome.domain_events,
-                        replan.nodes,
-                        replan.edges,
-                        replan.reason,
-                    )
-                    .await
-            } else {
-                self.commit_service
-                    .transition_node_async(
-                        current,
-                        node_id.clone(),
-                        outcome.result.status,
-                        Some(outcome.result),
-                        outcome.domain_events,
-                    )
-                    .await
+            // A concurrent writer can advance this graph stream between the
+            // load and the commit. The node outcome is already durable, so
+            // re-load and retry the same transition instead of failing the whole
+            // execution driver with a raw `revision mismatch`.
+            const MAX_TRANSITION_ATTEMPTS: usize = 8;
+            let mut attempt = 0;
+            let transition = loop {
+                attempt += 1;
+                let result = if let Some(replan) = outcome.replan.clone() {
+                    self.commit_service
+                        .transition_node_with_replan_async(
+                            current.clone(),
+                            node_id.clone(),
+                            outcome.result.clone(),
+                            outcome.domain_events.clone(),
+                            replan.nodes,
+                            replan.edges,
+                            replan.reason,
+                        )
+                        .await
+                } else {
+                    self.commit_service
+                        .transition_node_async(
+                            current.clone(),
+                            node_id.clone(),
+                            outcome.result.status,
+                            Some(outcome.result.clone()),
+                            outcome.domain_events.clone(),
+                        )
+                        .await
+                };
+                match result {
+                    Ok(receipt) => break Ok(receipt),
+                    Err(ExecutionCommitError::EventStore(
+                        crate::runtime_event_store::RuntimeEventStoreError::StaleRevision { .. },
+                    )) if attempt < MAX_TRANSITION_ATTEMPTS => {
+                        current = self.state_store.load_async(graph_id).await?;
+                        if current.node_statuses.get(&node_id)
+                            != Some(&ExecutionNodeStatus::Running)
+                        {
+                            break Err(ExecutionCommitError::InvalidCommand(
+                                "node transition superseded by a concurrent writer".to_string(),
+                            ));
+                        }
+                    }
+                    Err(error) => break Err(error),
+                }
             };
             if let Err(error) = transition {
                 let aborted = self
