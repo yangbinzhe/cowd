@@ -451,7 +451,18 @@ impl RuntimeServices {
             unresolved: Vec::new(),
         };
         // The single authoritative gate: never force an incomplete objective.
-        if crate::agentic::supervision::completion_gap(&program, &input).is_some() {
+        if let Some(gap) = crate::agentic::supervision::completion_gap(&program, &input) {
+            tracing::info!(
+                program_id = %program_id,
+                accepted_tasks = program
+                    .tasks
+                    .values()
+                    .filter(|task| task.status == crate::AgenticTaskStatus::Accepted)
+                    .count(),
+                result_refs = input.result_refs.len(),
+                gap = %gap,
+                "drive_agentic_objective_completion declined: objective not objectively complete"
+            );
             return Ok(false);
         }
         let actor = harness_contract::agent_action::AgentActorBinding {
