@@ -1067,65 +1067,106 @@ impl LiveScenarioRunner {
         let started = Instant::now();
         let mut trace = Vec::new();
         let timeout = spec.timeout.with_cap(self.timeout_cap);
-        let actor = SessionActor::create(
-            &self.client,
-            &self.base_url,
-            self.model.as_deref(),
-            "harness-eval-live",
-        );
+        // Resume mode reattaches to a retained session's in-flight turn instead
+        // of creating a new session and posting a new prompt: the Runtime
+        // recovers the durable execution graph from the same database and
+        // session, so the spent model work is continued rather than redone.
+        let resume_session = std::env::var("COWD_EVAL_RESUME_SESSION")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let actor = match &resume_session {
+            Some(session_id) => {
+                SessionActor::resume(&self.client, &self.base_url, session_id, "harness-eval-live")
+            }
+            None => SessionActor::create(
+                &self.client,
+                &self.base_url,
+                self.model.as_deref(),
+                "harness-eval-live",
+            ),
+        };
         let Ok(mut actor) = actor else {
             return failed_scenario(spec, started, trace, actor.err().unwrap_or_default());
         };
         trace.extend(actor.drain_trace());
         let session_id = actor.session_id().to_string();
-        let prompt = if spec.id == "live_qwen38_large_scale_collaboration" {
-            format!("{}{}", spec.prompt, LARGE_SCALE_TERMINAL_COVERAGE_CLAUSE)
-        } else {
-            spec.prompt.to_string()
-        };
-        let prompt = controlled_live_prompt(spec.id, prompt, provider_token_telemetry_limit);
-        let admission = actor.post_mutation(
-            &format!("/api/sessions/{session_id}/messages"),
-            json!({
-                "content": prompt,
-                "idempotency_key": format!("live-eval-{}", uuid::Uuid::new_v4()),
-            }),
-        );
-        trace.extend(actor.drain_trace());
-        let admission = match admission {
-            Ok(value) => value,
-            Err(error) => {
-                return failed_scenario_with_session(
-                    spec,
-                    started,
-                    trace,
-                    session_id,
-                    error,
-                    Value::Null,
-                );
+        let (execution_id, turn_id) = if resume_session.is_some() {
+            match self.execution_live_observation(&session_id) {
+                Ok(observation) => {
+                    let execution_id = observation
+                        .summary
+                        .get("execution_id")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                        .map(ToString::to_string);
+                    let Some(execution_id) = execution_id else {
+                        return failed_scenario_with_session(
+                            spec,
+                            started,
+                            trace,
+                            session_id,
+                            "resume found no in-flight session execution to observe".to_string(),
+                            Value::Null,
+                        );
+                    };
+                    let turn_id = self.root_execution_turn_id(&execution_id);
+                    (Some(execution_id), turn_id)
+                }
+                Err(error) => {
+                    return failed_scenario_with_session(
+                        spec, started, trace, session_id, error, Value::Null,
+                    );
+                }
             }
+        } else {
+            let prompt = if spec.id == "live_qwen38_large_scale_collaboration" {
+                format!("{}{}", spec.prompt, LARGE_SCALE_TERMINAL_COVERAGE_CLAUSE)
+            } else {
+                spec.prompt.to_string()
+            };
+            let prompt = controlled_live_prompt(spec.id, prompt, provider_token_telemetry_limit);
+            let admission = actor.post_mutation(
+                &format!("/api/sessions/{session_id}/messages"),
+                json!({
+                    "content": prompt,
+                    "idempotency_key": format!("live-eval-{}", uuid::Uuid::new_v4()),
+                }),
+            );
+            trace.extend(actor.drain_trace());
+            let admission = match admission {
+                Ok(value) => value,
+                Err(error) => {
+                    return failed_scenario_with_session(
+                        spec,
+                        started,
+                        trace,
+                        session_id,
+                        error,
+                        Value::Null,
+                    );
+                }
+            };
+            let execution_id = admission
+                .get("execution")
+                .and_then(|execution| execution.get("graph_id"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(ToString::to_string);
+            let turn_id = admission
+                .pointer("/execution/turn_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(ToString::to_string);
+            (execution_id, turn_id)
         };
-        let execution_id = admission
-            .get("execution")
-            .and_then(|execution| execution.get("graph_id"))
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .map(ToString::to_string);
-        let turn_id = admission
-            .pointer("/execution/turn_id")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .map(ToString::to_string);
         let Some(execution_id_ref) = execution_id.as_deref() else {
             return failed_scenario_with_session(
                 spec,
                 started,
                 trace,
                 session_id,
-                format!(
-                    "message admission lacks canonical execution.graph_id: {}",
-                    summarize_json(&admission)
-                ),
+                "scenario admission lacks canonical execution.graph_id".to_string(),
                 Value::Null,
             );
         };
@@ -1136,10 +1177,7 @@ impl LiveScenarioRunner {
                 trace,
                 session_id,
                 execution_id,
-                format!(
-                    "message admission lacks canonical execution.turn_id: {}",
-                    summarize_json(&admission)
-                ),
+                "scenario admission lacks canonical execution.turn_id".to_string(),
                 Value::Null,
             );
         };
@@ -1475,6 +1513,23 @@ impl LiveScenarioRunner {
             summary,
             response_body_bytes,
         })
+    }
+
+    /// Read the turn id bound to a root execution, used to continue a resumed
+    /// scenario's acceptance checks without posting a new prompt.
+    fn root_execution_turn_id(&self, execution_id: &str) -> Option<String> {
+        let path = format!("/api/runtime/executions/{execution_id}?detail_scope=summary");
+        let projection = self.get_json(&path).ok()?;
+        projection
+            .get("turn_id")
+            .or_else(|| {
+                projection
+                    .get("identity")
+                    .and_then(|identity| identity.get("turn_id"))
+            })
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(ToString::to_string)
     }
 
     /// A delegated AgentTask shares the parent session's durable message

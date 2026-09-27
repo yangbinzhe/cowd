@@ -62,6 +62,34 @@ impl<'a> SessionActor<'a> {
         Ok(actor)
     }
 
+    /// Reattach to an existing durable session instead of creating a new one, so
+    /// a retained evaluation database continues its in-flight turn (the Runtime
+    /// recovers the durable execution graph from the same database and session).
+    pub(crate) fn resume(
+        client: &'a Client,
+        base_url: &str,
+        session_id: &str,
+        surface_id: &str,
+    ) -> Result<Self, String> {
+        let base_url = base_url.trim_end_matches('/').to_string();
+        let mut actor = Self {
+            client,
+            base_url,
+            surface_id: surface_id.to_string(),
+            observer_id: surface_id.to_string(),
+            session_id: session_id.to_string(),
+            active: false,
+            trace: vec![trace_entry(
+                "RESUME",
+                "/api/sessions",
+                json!({"session_id": session_id}),
+                Ok(&json!({"session_id": session_id})),
+            )],
+        };
+        actor.attach_and_acquire()?;
+        Ok(actor)
+    }
+
     pub(crate) fn session_id(&self) -> &str {
         &self.session_id
     }
