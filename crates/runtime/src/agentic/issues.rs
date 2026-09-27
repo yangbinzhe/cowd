@@ -70,19 +70,26 @@ pub(crate) fn validate_dispositions(
     }
     let known = issues(projection);
     for disposition in &input.issue_dispositions {
-        if !known
+        let Some(issue) = known
             .iter()
-            .any(|issue| issue.issue_ref == disposition.issue_ref)
-        {
+            .find(|issue| issue.issue_ref == disposition.issue_ref)
+        else {
             return Some((
                 "issue_source_changed_or_not_found",
                 disposition.issue_ref.clone(),
             ));
-        }
+        };
+        // The issue is source-bound to a Runtime-created Task, so that Task is
+        // the issue's own durable anchor. Accept it alongside tool://artifact://
+        // receipts, otherwise a root with no unrelated receipt to hand can never
+        // classify its own source-bound issues.
+        let source_anchor = issue.source_ref.as_str();
         if !std::iter::once(&disposition.reason_ref)
             .chain(&disposition.evidence_refs)
             .all(|reference| {
-                reference.starts_with("artifact://") || reference.starts_with("tool://")
+                reference.starts_with("artifact://")
+                    || reference.starts_with("tool://")
+                    || reference == source_anchor
             })
         {
             return Some((

@@ -2501,7 +2501,7 @@ fn compact_agentic_program_checkpoint(
         "unresolved_count": program.unresolved.len(),
         "next_actions": next_actions,
         "terminal_action": terminal_action.as_ref().map(RootAgenticTerminalAction::checkpoint_detail),
-        "instruction": "Use this Runtime projection as current truth. You may continue planning, publish dependent or independent Tasks, and coordinate while members execute. When ready to wait for active workers, call state_inspect with wait_for_workers=true; Runtime waits without provider polling. Do not recreate committed entities. Before completion, classify retained issue_refs through message_publish.issue_dispositions with durable reasons/evidence: must_resolve, disclose, or resolved. Keep estimates and assumptions labelled; only the Goal verifier can certify the original objective.",
+        "instruction": "Use this Runtime projection as current truth. You may continue planning, publish dependent or independent Tasks, and coordinate while members execute. When ready to wait for active workers, call state_inspect with wait_for_workers=true; Runtime waits without provider polling. Do not recreate committed entities. Before completion, classify retained issue_refs through message_publish.issue_dispositions with durable reasons/evidence (must_resolve, disclose, or resolved); a disposition may cite a tool://artifact:// receipt OR the issue's own source_ref, which is its Runtime-created anchor. Keep estimates and assumptions labelled; only the Goal verifier can certify the original objective.",
     })
     .to_string()
 }
