@@ -493,6 +493,15 @@ async fn wait_disposition(
         active_agentic_child_graphs(&request.root_execution_id, &request.program_id, state_store)
             .await?;
     if active_graphs.is_empty() {
+        // "No active child graph" is not the same as "every dispatched task
+        // settled": a child link may not be durable yet. Never read a missing
+        // link as completion while a task is still live (PLAN C5-6).
+        if has_unsettled_tasks(projection) {
+            return Ok(WaitDisposition::Wait {
+                revision: projection.revision,
+                active_graphs,
+            });
+        }
         return Ok(WaitDisposition::Resume {
             revision: projection.revision,
             reason: "worker_quiescent",
@@ -510,6 +519,25 @@ fn all_tasks_accepted(projection: &AgenticProgramProjection) -> bool {
             .tasks
             .values()
             .all(|task| task.status == AgenticTaskStatus::Accepted)
+}
+
+/// Tasks that were dispatched into the Program but have not settled yet.
+///
+/// `Published`/`Claimed`/`Submitted`/`Rework`/`CancelRequested` are all live:
+/// the owning Agent may still be working, or its child graph link may simply
+/// not be durable yet. Treating "no active child graph" as completion while any
+/// of these exist is exactly the missing-link-reads-as-done bug (PLAN C5-6).
+fn has_unsettled_tasks(projection: &AgenticProgramProjection) -> bool {
+    projection.tasks.values().any(|task| {
+        matches!(
+            task.status,
+            AgenticTaskStatus::Published
+                | AgenticTaskStatus::Claimed
+                | AgenticTaskStatus::Submitted
+                | AgenticTaskStatus::Rework
+                | AgenticTaskStatus::CancelRequested
+        )
+    })
 }
 
 async fn active_agentic_child_graphs(
