@@ -1,6 +1,12 @@
 use crate::error::ApiError;
 use crate::types::StreamEvent;
 
+/// Upper bound on a single, not-yet-terminated SSE frame. A well-behaved
+/// upstream always terminates frames with `\n\n` / `\r\n\r\n`; a peer that
+/// keeps streaming bytes without a delimiter would otherwise grow `buffer`
+/// without bound (and every `push` rescans it, making the cost quadratic).
+const MAX_SSE_FRAME_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Debug, Default)]
 pub struct SseParser {
     buffer: Vec<u8>,
@@ -29,7 +35,7 @@ impl SseParser {
         self.buffer.extend_from_slice(chunk);
         let mut events = Vec::new();
 
-        while let Some(frame) = self.next_frame() {
+        while let Some(frame) = self.next_frame()? {
             if let Some(event) = self.parse_frame_with_context(&frame)? {
                 events.push(event);
             }
@@ -56,7 +62,7 @@ impl SseParser {
         parse_frame_with_provider(frame, provider, model)
     }
 
-    fn next_frame(&mut self) -> Option<String> {
+    fn next_frame(&mut self) -> Result<Option<String>, ApiError> {
         let separator = self
             .buffer
             .windows(2)
@@ -67,15 +73,24 @@ impl SseParser {
                     .windows(4)
                     .position(|window| window == b"\r\n\r\n")
                     .map(|position| (position, 4))
-            })?;
+            });
+        let Some((position, separator_len)) = separator else {
+            if self.buffer.len() > MAX_SSE_FRAME_BYTES {
+                return Err(ApiError::InvalidSseFrame(
+                    "stream frame exceeded the maximum size without a terminator",
+                ));
+            }
+            return Ok(None);
+        };
 
-        let (position, separator_len) = separator;
         let frame = self
             .buffer
             .drain(..position + separator_len)
             .collect::<Vec<_>>();
         let frame_len = frame.len().saturating_sub(separator_len);
-        Some(String::from_utf8_lossy(&frame[..frame_len]).into_owned())
+        Ok(Some(
+            String::from_utf8_lossy(&frame[..frame_len]).into_owned(),
+        ))
     }
 }
 
@@ -352,5 +367,15 @@ mod tests {
             .expect("usage should be present");
         assert_eq!(usage.cache_creation_input_tokens, 20);
         assert_eq!(usage.cache_read_input_tokens, 30);
+    }
+
+    #[test]
+    fn unterminated_frame_beyond_cap_is_rejected() {
+        let mut parser = SseParser::new();
+        let chunk = vec![b'a'; super::MAX_SSE_FRAME_BYTES + 1];
+        let error = parser
+            .push(&chunk)
+            .expect_err("a frame without a terminator must not grow without bound");
+        assert!(matches!(error, crate::error::ApiError::InvalidSseFrame(_)));
     }
 }
