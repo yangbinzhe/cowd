@@ -2028,8 +2028,10 @@ impl ExecutionGraphRunner {
             return Ok(());
         }
         // A failed start, executor panic, or node-local failure is a failure of
-        // that node, not a safety boundary. Keep it retryable so recovery and
-        // replan can decide the next move instead of permanently blocking it.
+        // that node, not a safety boundary. It is terminal (`Failed` has no
+        // outgoing transition), so it must not advertise retryability
+        // (PLAN C3-P-g / I5). Recovery/replan act on the isolated node instead
+        // of a `retryable` flag the graph state machine does not honour.
         let terminal_status = ExecutionNodeStatus::Failed;
         let result = ExecutionNodeResult {
             status: terminal_status,
@@ -2039,7 +2041,7 @@ impl ExecutionGraphRunner {
             failure: Some(harness_contract::execution_graph::ExecutionFailure {
                 kind: "node_execution_isolated_failure".to_string(),
                 message: reason,
-                retryable: true,
+                retryable: false,
                 evidence_refs: Vec::new(),
             }),
             usage: Default::default(),

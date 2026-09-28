@@ -414,7 +414,10 @@ fn blocked(
         failure: Some(ExecutionFailure {
             kind: kind.to_string(),
             message: message.to_string(),
-            retryable: true,
+            // A terminal status must not claim retryability: `Blocked` has no
+            // outgoing transition in the graph state machine, so `retryable:true`
+            // here was a promise the runtime never kept (PLAN C3-P-g / I5).
+            retryable: false,
             evidence_refs: Vec::new(),
         }),
         usage: ExecutionUsage {
