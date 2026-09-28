@@ -301,6 +301,11 @@ struct ActiveProcess {
     limits: AgentProcessTransportLimits,
 }
 
+/// A command the child never acknowledges must not block its caller forever.
+/// The command slot stays occupied until terminal cleanup, so a dropped caller
+/// cannot silently free capacity (PLAN R-06).
+const COMMAND_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 struct PendingProcessCommand {
     expected_run_revision: u64,
     completion: tokio::sync::oneshot::Sender<Result<(), AgentCommandRejectReason>>,
@@ -667,9 +672,11 @@ impl AgentRuntimeBackend for ProcessJsonlAdapter {
                 })
                 .await
                 .map_err(|_| AgentCommandRejectReason::UnsupportedByBackend)??;
-                acknowledged
-                    .await
-                    .map_err(|_| AgentCommandRejectReason::UnsupportedByBackend)?
+                match tokio::time::timeout(COMMAND_ACK_TIMEOUT, acknowledged).await {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(_)) => Err(AgentCommandRejectReason::UnsupportedByBackend),
+                    Err(_) => Err(AgentCommandRejectReason::UnsupportedByBackend),
+                }
             }
         }
     }
