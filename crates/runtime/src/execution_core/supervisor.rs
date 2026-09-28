@@ -1847,6 +1847,14 @@ mod completion_pump_tests {
             self.panic_nodes.insert(node_id.to_string());
             self
         }
+
+        /// Register this fake executor under another node kind. Used by tests
+        /// that must exercise a production-authorized `WaitingExternal` origin
+        /// (see harness-contract `WAITING_EXTERNAL_EXECUTOR_KINDS` / PLAN C4).
+        fn with_kind(mut self, kind: &'static str) -> Self {
+            self.kind = kind;
+            self
+        }
     }
 
     #[async_trait]
@@ -2380,12 +2388,14 @@ mod completion_pump_tests {
 
     #[tokio::test]
     async fn foreground_terminal_wait_does_not_mistake_external_quiescence_for_completion() {
-        let executor = Arc::new(PumpTestExecutor::new([]));
+        let executor = Arc::new(PumpTestExecutor::new([]).with_kind("agentic_program_wait"));
         let supervisor = Arc::new(test_supervisor(executor));
         let mut graph = ExecutionGraph::new("foreground waits for durable terminal truth");
         graph.id = "foreground-terminal-wait".to_string();
         crate::test_support::attach_execution_graph_lineage(&mut graph);
-        graph.nodes = vec![test_node("external-wait")];
+        let mut external_wait = test_node("external-wait");
+        external_wait.executor_kind = "agentic_program_wait".to_string();
+        graph.nodes = vec![external_wait];
         let graph_id = graph.id.clone();
         let waiting = {
             let supervisor = supervisor.clone();

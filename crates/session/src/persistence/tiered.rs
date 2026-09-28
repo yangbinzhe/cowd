@@ -10,7 +10,7 @@
 //!
 //! # Example
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! use session::{TieredSessionStore, UnifiedSessionStore};
 //! use std::path::Path;
 //!

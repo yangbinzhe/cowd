@@ -1,6 +1,15 @@
 use super::{ExecutionGraph, ExecutionNodeResult, ExecutionNodeStatus};
 use thiserror::Error;
 
+/// Executor kinds allowed to park a node in [`ExecutionNodeStatus::WaitingExternal`].
+///
+/// `WaitingExternal` can only be left by a matching external resolution, so it
+/// is reserved for executors that own a real, durably-registered external
+/// dependency: the Agent-first Program barrier (resolved by child receipts) and
+/// the approval gate (resolved by the approval queue). See PLAN C4.
+pub const WAITING_EXTERNAL_EXECUTOR_KINDS: &[&str] =
+    &["agentic_program_wait", "approval", "session_dispatch"];
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ExecutionTransitionError {
     #[error("execution graph revision mismatch: expected {expected}, actual {actual}")]
@@ -39,6 +48,27 @@ pub fn apply_node_transition(
             from,
             to,
         });
+    }
+    // C4 A/B gate: only executors that declare an external-wait contract may
+    // park a node in `WaitingExternal`. `WaitingExternal` is the one non-terminal
+    // status the graph can only leave via a matching external resolution, so an
+    // arbitrary executor minting it would strand the node forever. Every other
+    // executor must reach a self-verifiable terminal/waiting state instead.
+    if to == ExecutionNodeStatus::WaitingExternal {
+        let authorized = next
+            .nodes
+            .iter()
+            .find(|node| node.id == node_id)
+            .is_some_and(|node| {
+                WAITING_EXTERNAL_EXECUTOR_KINDS.contains(&node.executor_kind.as_str())
+            });
+        if !authorized {
+            return Err(ExecutionTransitionError::Illegal {
+                node_id: node_id.to_string(),
+                from,
+                to,
+            });
+        }
     }
     next.node_statuses.insert(node_id.to_string(), to);
     if let Some(result) = result {
