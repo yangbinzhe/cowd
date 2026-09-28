@@ -717,7 +717,13 @@ where
     F: std::future::Future<Output = Result<T, ApiError>>,
 {
     match tokio::runtime::Handle::try_current() {
-        Ok(handle) => handle.block_on(future),
+        // `Handle::block_on` panics when called from inside a Tokio runtime,
+        // and blocking a worker thread would be wrong even if it did not.
+        // Refuse with a typed error instead of a process-level panic; the
+        // caller is synchronous and must not run in an async context (PLAN G-02).
+        Ok(_) => Err(ApiError::Auth(
+            "cannot refresh OAuth synchronously from inside a Tokio runtime".to_string(),
+        )),
         Err(_) => tokio::runtime::Runtime::new()
             .map_err(ApiError::from)?
             .block_on(future),
