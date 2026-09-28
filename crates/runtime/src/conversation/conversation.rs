@@ -865,6 +865,28 @@ pub enum AssistantEvent {
     },
 }
 
+/// Whether an assistant event represents real semantic progress (and may
+/// therefore refresh the provider idle deadline). Empty lifecycle frames —
+/// item boundaries and the initial provider-identity frame — must not, or a
+/// peer could keep a stalled stream "alive" by sending only those (PLAN C6-1).
+fn assistant_event_is_semantic(event: &AssistantEvent) -> bool {
+    match event {
+        AssistantEvent::ProviderModel { .. }
+        | AssistantEvent::ItemStarted { .. }
+        | AssistantEvent::ItemCompleted { .. } => false,
+        AssistantEvent::TextDelta(text)
+        | AssistantEvent::ReasoningSummaryDelta(text)
+        | AssistantEvent::PrivateReasoningDelta(text)
+        | AssistantEvent::SignatureDelta(text) => !text.is_empty(),
+        AssistantEvent::ToolUse { .. }
+        | AssistantEvent::Usage(_)
+        | AssistantEvent::MessageStop
+        | AssistantEvent::ToolStart { .. }
+        | AssistantEvent::ToolProgress { .. }
+        | AssistantEvent::ToolComplete { .. } => true,
+    }
+}
+
 #[derive(Debug)]
 struct ModelStreamItemState {
     identity: crate::CausalItemIdentity,
@@ -1690,10 +1712,15 @@ async fn consume_provider_stream_with_activity(
         };
         match event {
             Ok(event) => {
-                if let Some(policy) = timeout_policy {
-                    semantic_deadline = Instant::now()
-                        .checked_add(policy.idle.saturating_add(policy.heartbeat_grace))
-                        .or(semantic_deadline);
+                // Only semantic progress refreshes the idle deadline. Empty
+                // lifecycle frames (content_block_stop / message_start / item
+                // boundaries) must not keep a stalled stream alive (PLAN C6-1).
+                if timeout_policy.is_some() && assistant_event_is_semantic(&event) {
+                    if let Some(policy) = timeout_policy {
+                        semantic_deadline = Instant::now()
+                            .checked_add(policy.idle.saturating_add(policy.heartbeat_grace))
+                            .or(semantic_deadline);
+                    }
                 }
                 let (stop, ready) = match reducer.apply(event, Instant::now()) {
                     Ok(applied) => applied,
