@@ -672,7 +672,7 @@ impl MemoryStore for PostgresMemoryStore {
         run_memory_blocking(move || {
             let mut connection = store
                 .executor
-                .checkout_online_read()
+                .checkout_critical()
                 .map_err(storage_memory_error)?;
             let row = connection
                 .query_opt("SELECT payload FROM memory_entries WHERE id=$1", &[&id])
@@ -681,11 +681,20 @@ impl MemoryStore for PostgresMemoryStore {
                 return Ok(None);
             };
             let entry = entry_from_json(row.try_get(0).map_err(postgres_memory_error)?)?;
-            let mut accessed = entry.clone();
-            accessed.access_count = accessed.access_count.saturating_add(1);
-            accessed.last_accessed_at = Some(chrono::Utc::now());
-            drop(connection);
-            store.update_entry(&accessed)?;
+            // Record the access hit by touching only the access fields inside the
+            // JSON payload. Rewriting the whole row for a bump used to clobber a
+            // concurrent content update with a stale read (PLAN M-01).
+            let accessed_at = chrono::Utc::now().to_rfc3339();
+            connection
+                .execute(
+                    "UPDATE memory_entries SET payload = jsonb_set(
+                        jsonb_set(payload, '{access_count}',
+                            to_jsonb(COALESCE(payload->>'access_count','0')::bigint + 1)),
+                        '{last_accessed_at}', to_jsonb($2::text))
+                     WHERE id=$1",
+                    &[&id, &accessed_at],
+                )
+                .map_err(postgres_memory_error)?;
             Ok(Some(entry))
         })
         .await
