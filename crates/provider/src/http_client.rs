@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::error::ApiError;
 
 const HTTP_PROXY_KEYS: [&str; 2] = ["HTTP_PROXY", "http_proxy"];
@@ -71,7 +73,18 @@ pub fn build_http_client() -> Result<reqwest::Client, ApiError> {
 /// and `https_proxy` fields and is registered as both an HTTP and HTTPS
 /// proxy so a single value can route every outbound request.
 pub fn build_http_client_with(config: &ProxyConfig) -> Result<reqwest::Client, ApiError> {
-    let mut builder = reqwest::Client::builder().no_proxy();
+    // reqwest has no default connect deadline, so a black-holed endpoint would
+    // otherwise pin a worker (and its capacity lease) forever. Bound the
+    // *connect* only: total request time is deliberately NOT capped here so
+    // long model calls stay unbounded by design (PLAN G-01 / I1).
+    let connect_timeout = std::env::var("COWD_HTTP_CONNECT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map_or(Duration::from_secs(10), Duration::from_secs);
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(connect_timeout);
 
     let no_proxy = config
         .no_proxy
