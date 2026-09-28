@@ -1775,7 +1775,13 @@ async fn consume_provider_stream_with_activity(
     // the foreground turn indefinitely. Aborting is safe here because only
     // descriptor-certified read-only candidates enter this lane.
     let provider_failed = failure.is_some();
-    let joined = if provider_failed && !early_workers.is_empty() {
+    // A speculative early read must not hold the foreground turn whatever the
+    // provider outcome is: bound the drain and abort the read-only workers that
+    // outlive it, on success as well as failure (PLAN R-05). Aborting is safe
+    // because only descriptor-certified read-only candidates enter this lane.
+    let joined = if early_workers.is_empty() {
+        Vec::new()
+    } else {
         match tokio::time::timeout(
             FAILED_PROVIDER_EARLY_TOOL_DRAIN_GRACE,
             futures::future::join_all(early_workers.iter_mut()),
@@ -1792,14 +1798,16 @@ async fn consume_provider_stream_with_activity(
                     }
                 }
                 crate::execution_core::performance::observe_count(
-                    "early_tool_aborted_after_provider_failure_total",
+                    if provider_failed {
+                        "early_tool_aborted_after_provider_failure_total"
+                    } else {
+                        "early_tool_aborted_after_provider_success_total"
+                    },
                     aborted,
                 );
                 futures::future::join_all(early_workers).await
             }
         }
-    } else {
-        futures::future::join_all(early_workers).await
     };
     let mut early_tool_receipts = Vec::new();
     for result in joined {
