@@ -308,7 +308,12 @@ impl ScopeLockLease {
         if self.released {
             return;
         }
-        if let Ok(mut guard) = self.shared.state.lock() {
+        {
+            let mut guard = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             guard.active.remove(&self.id);
         }
         for lock in self.process_locks.drain(..).rev() {
@@ -459,7 +464,12 @@ impl Drop for PendingRegistration {
         if !self.active {
             return;
         }
-        if let Ok(mut guard) = self.shared.state.lock() {
+        {
+            let mut guard = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             guard.pending.retain(|pending| pending.id != self.id);
         }
         self.shared.changed.notify_waiters();

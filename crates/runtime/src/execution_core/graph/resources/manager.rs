@@ -911,9 +911,12 @@ impl ExecutionResourceManager {
     }
 
     fn prune_drained_ephemeral_resources(&self) {
-        if let Ok(mut state) = self.shared.state.lock() {
-            remove_drained_resources(&mut state);
-        }
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        remove_drained_resources(&mut state);
     }
 
     async fn admit_with_timeout(
@@ -1716,7 +1719,12 @@ impl ExecutionResourceLease {
         if self.released {
             return;
         }
-        if let Ok(mut guard) = self.shared.state.lock() {
+        {
+            let mut guard = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             for (kind, _) in &self.demands {
                 if let Some(state) = guard.resources.get_mut(kind) {
                     state.active.remove(&self.lease_id);
@@ -1748,7 +1756,12 @@ impl WaiterRegistration {
         if !self.active {
             return;
         }
-        if let Ok(mut guard) = self.shared.state.lock() {
+        {
+            let mut guard = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             guard.waiters.retain(|waiter| waiter.id != self.waiter_id);
             let observed_at_ms = now_ms();
             let queue_wait_ms = duration_millis(self.started.elapsed());
