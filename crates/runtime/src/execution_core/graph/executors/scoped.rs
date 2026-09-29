@@ -155,6 +155,53 @@ impl ScopedNodeExecutor {
     }
 }
 
+/// Bounded cancellation of the physical work owned by `ticket` (PLAN W3 / R-02).
+///
+/// `cancel` waits for the physical work to quiesce indefinitely, which is right
+/// for a real write but must not block turn terminalization forever. After
+/// `budget` we stop waiting, but we do NOT drop the physical future: its
+/// scope/resource lease lives inside it, so dropping it would release a lock
+/// mid-write. Instead we keep the lease alive and drive the retained future to
+/// completion on a detached task, so the physical owner releases its own
+/// admission when it truly finishes.
+async fn cancel_scoped_bounded(
+    executor: &ScopedNodeExecutor,
+    ticket: &NodeExecutionTicket,
+    budget: std::time::Duration,
+) -> Result<(), NodeExecutorError> {
+    let pending = {
+        let mut physical = executor
+            .physical
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        physical
+            .entry(ScopedNodeExecutor::physical_key(ticket, ""))
+            .or_insert(None);
+        physical
+            .iter()
+            .filter(|(key, _)| ScopedNodeExecutor::owns_key(ticket, key))
+            .filter_map(|(_, work)| work.clone())
+            .collect::<Vec<_>>()
+    };
+    let retained = pending.clone();
+    match tokio::time::timeout(budget, futures::future::join_all(pending)).await {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            let orphaned = retained.len() as u64;
+            for work in retained {
+                tokio::spawn(async move {
+                    let _ = work.await;
+                });
+            }
+            crate::execution_core::performance::observe_count(
+                "scoped_cancel_orphaned_total",
+                orphaned,
+            );
+            Ok(())
+        }
+    }
+}
+
 #[async_trait]
 impl NodeExecutor for ScopedNodeExecutor {
     fn kind(&self) -> &str {
@@ -233,7 +280,8 @@ impl NodeExecutor for ScopedNodeExecutor {
         }
     }
     async fn after_commit(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
-        self.cancel(ticket).await?;
+        cancel_scoped_bounded(self, ticket, std::time::Duration::from_secs(5))
+            .await?;
         self.physical
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -264,6 +312,7 @@ impl NodeExecutor for ScopedNodeExecutor {
         futures::future::join_all(pending).await;
         Ok(())
     }
+
     fn cancellation_requires_quiescence(&self, _ticket: &NodeExecutionTicket) -> bool {
         // Admission can race this query. Even an InlineModel with no leaf yet
         // must atomically close leaf admission and drain through cancel().
@@ -307,7 +356,8 @@ impl NodeExecutor for ScopedNodeExecutor {
         ticket: &NodeExecutionTicket,
         _: &str,
     ) -> Result<(), NodeExecutorError> {
-        self.cancel(ticket).await?;
+        cancel_scoped_bounded(self, ticket, std::time::Duration::from_secs(5))
+            .await?;
         self.cancellation_finalized(ticket);
         Ok(())
     }
