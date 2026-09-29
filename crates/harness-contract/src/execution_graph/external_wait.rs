@@ -17,7 +17,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-use super::{ExecutionGraph, ExecutionNodeSpec, ExecutionNodeStatus};
+use super::{ExecutionGraph, ExecutionNodeSpec};
 
 /// Executor kinds permitted to park a node in [`ExecutionNodeStatus::WaitingExternal`].
 ///

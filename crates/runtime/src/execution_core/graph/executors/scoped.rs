@@ -280,8 +280,10 @@ impl NodeExecutor for ScopedNodeExecutor {
         }
     }
     async fn after_commit(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
-        self.cancel_bounded(ticket, std::time::Duration::from_secs(5))
-            .await?;
+        // The success path must not abandon an in-flight physical write: wait
+        // for it. Bounded cancellation is reserved for cancel/abort paths, where
+        // stopping is the point (PLAN W3 / R-02).
+        self.cancel(ticket).await?;
         self.physical
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
