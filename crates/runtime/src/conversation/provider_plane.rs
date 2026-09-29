@@ -492,6 +492,7 @@ where
                     effective_provider_identity,
                     first_event_at,
                     first_text_at: _,
+                    stop_reason: _,
                     early_tool_receipts: _,
                     early_tool_deferrals: _,
                     response_completed_at_ms,
@@ -1394,6 +1395,10 @@ where
         let mut calibration_retries = BTreeSet::new();
         let mut provider_retries = BTreeMap::<String, u8>::new();
         let mut provider_attempt_sequence = 0_u32;
+        // A `length` truncation may be continued with a bounded assistant
+        // prefix, at most once per model step (PLAN W2 Step4).
+        let mut continuations = 0_u32;
+        const MAX_PROVIDER_CONTINUATIONS: u32 = 1;
         while let Some((model, provider_account_key)) =
             self.next_available_provider_candidate(&mut candidates)
         {
@@ -1520,6 +1525,7 @@ where
                 effective_provider_identity,
                 first_event_at,
                 first_text_at,
+                stop_reason,
                 early_tool_receipts,
                 early_tool_deferrals,
                 response_completed_at_ms,
@@ -1633,6 +1639,35 @@ where
                 continue;
             }
 
+            // Bounded continuation: a `length` truncation can be continued with
+            // the committed text as an assistant prefix, but only once per model
+            // step and only while nothing fences the retry (PLAN W2 Step4).
+            if stop_reason.as_deref() == Some("length")
+                && !provider_retry_is_fenced(provider_retry_fenced, early_tool_receipts.len())
+                && continuations < MAX_PROVIDER_CONTINUATIONS
+            {
+                continuations = continuations.saturating_add(1);
+                let mut materialized = request_messages.materialize();
+                if !text.trim().is_empty() {
+                    materialized.push(ConversationMessage {
+                        role: crate::session::MessageRole::Assistant,
+                        blocks: vec![ContentBlock::Text { text: text.clone() }],
+                        usage: None,
+                    });
+                }
+                request_messages = HistoryView::from(materialized);
+                crate::execution_core::performance::observe_count(
+                    "provider_step_continuation_total",
+                    1,
+                );
+                tracing::debug!(
+                    model,
+                    attempts = continuations,
+                    "model step hit the output ceiling; continuing with a bounded prefix"
+                );
+                candidates.push_front(model);
+                continue;
+            }
             canonicalize_model_tool_names(&mut calls, self.tool_executor.as_ref());
             let requested_tool_call_count = calls.len();
             let transcript_calls = calls.clone();

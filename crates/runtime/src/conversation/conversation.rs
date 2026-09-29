@@ -925,6 +925,8 @@ struct ModelStreamReducer {
     effective_provider_identity: Option<harness_contract::outcome::ProviderIdentity>,
     first_event_at: Option<Instant>,
     first_text_at: Option<Instant>,
+    /// The provider's terminal reason, kept once (the first boundary wins).
+    stop_reason: Option<String>,
     terminal_presentation: Option<(String, String)>,
 }
 
@@ -1067,6 +1069,7 @@ impl ModelStreamReducer {
             effective_provider_identity: None,
             first_event_at: None,
             first_text_at: None,
+            stop_reason: None,
             terminal_presentation: None,
         }
     }
@@ -1442,7 +1445,14 @@ impl ModelStreamReducer {
                 self.complete_incomplete_items()?;
                 true
             }
-            AssistantEvent::MessageBoundary { .. } => false,
+            AssistantEvent::MessageBoundary { stop_reason } => {
+                // The first terminal reason is the only one that counts: a
+                // provider repeating it must not reset the boundary.
+                if self.stop_reason.is_none() {
+                    self.stop_reason = stop_reason;
+                }
+                false
+            }
             AssistantEvent::ToolStart { .. }
             | AssistantEvent::ToolProgress { .. }
             | AssistantEvent::ToolComplete { .. } => false,
@@ -1496,6 +1506,7 @@ impl ModelStreamReducer {
             effective_provider_identity: self.effective_provider_identity,
             first_event_at: self.first_event_at,
             first_text_at: self.first_text_at,
+            stop_reason: self.stop_reason,
             early_tool_receipts: Vec::new(),
             early_tool_deferrals: Vec::new(),
             response_completed_at_ms: now_ms(),
@@ -1584,6 +1595,9 @@ struct CollectedProviderStream {
     effective_provider_identity: Option<harness_contract::outcome::ProviderIdentity>,
     first_event_at: Option<Instant>,
     first_text_at: Option<Instant>,
+    /// The provider's terminal reason (`length` means the step was truncated by
+    /// the output ceiling and may be continued with a bounded prefix).
+    stop_reason: Option<String>,
     early_tool_receipts: Vec<EarlyToolExecutionReceipt>,
     early_tool_deferrals: Vec<EarlyToolDeferral>,
     response_completed_at_ms: u64,
