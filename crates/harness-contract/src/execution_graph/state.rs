@@ -1,14 +1,6 @@
+use super::external_wait::WAITING_EXTERNAL_EXECUTOR_KINDS;
 use super::{ExecutionGraph, ExecutionNodeResult, ExecutionNodeStatus};
 use thiserror::Error;
-
-/// Executor kinds allowed to park a node in [`ExecutionNodeStatus::WaitingExternal`].
-///
-/// `WaitingExternal` can only be left by a matching external resolution, so it
-/// is reserved for executors that own a real, durably-registered external
-/// dependency: the Agent-first Program barrier (resolved by child receipts) and
-/// the approval gate (resolved by the approval queue). See PLAN C4.
-pub const WAITING_EXTERNAL_EXECUTOR_KINDS: &[&str] =
-    &["agentic_program_wait", "approval", "session_dispatch"];
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ExecutionTransitionError {

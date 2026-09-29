@@ -1,11 +1,13 @@
 //! Canonical contracts for all stateful AI harness execution.
 
 mod contract;
+mod external_wait;
 mod projection;
 mod state;
 mod validation;
 
 pub use contract::*;
+pub use external_wait::*;
 pub use projection::*;
 pub use state::*;
 pub use validation::*;
