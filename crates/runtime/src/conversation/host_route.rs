@@ -614,6 +614,10 @@ where
                 // The turn executors still held the ConversationRuntime, so the
                 // runtime could not be returned; refuse further turns instead
                 // of pretending the host is still usable (PLAN W4).
+                crate::execution_core::performance::observe_count(
+                    "conversation_runtime_poisoned_total",
+                    1,
+                );
                 self.runtime = None;
                 self.poisoned = true;
             }
@@ -643,6 +647,10 @@ where
         if let Some(runtime) = runtime {
             self.runtime = Some(runtime);
         } else {
+            crate::execution_core::performance::observe_count(
+                "conversation_runtime_poisoned_total",
+                1,
+            );
             self.poisoned = true;
         }
         Ok(())
