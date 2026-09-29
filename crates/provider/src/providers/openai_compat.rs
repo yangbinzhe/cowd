@@ -623,9 +623,16 @@ struct OpenAiSseParser {
     provider: String,
     model: String,
     wire_protocol: OpenAiWireProtocol,
+    /// Incremental scan cursor: frames already drained, so a growing buffer is
+    /// not rescanned from byte 0 on every push (PLAN C6 / W2 Step5).
+    scan_cursor: usize,
 }
 
 impl OpenAiSseParser {
+    /// A frame that never terminates must not grow the buffer without bound
+    /// (aligned with `provider/src/sse.rs`; PLAN C6).
+    const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+
     fn with_context(
         provider: impl Into<String>,
         model: impl Into<String>,
@@ -636,6 +643,7 @@ impl OpenAiSseParser {
             provider: provider.into(),
             model: model.into(),
             wire_protocol,
+            scan_cursor: 0,
         }
     }
 
@@ -643,7 +651,22 @@ impl OpenAiSseParser {
         self.buffer.extend_from_slice(chunk);
         let mut events = Vec::new();
 
-        while let Some(frame) = next_sse_frame(&mut self.buffer) {
+        loop {
+            let Some((position, separator_len)) =
+                find_sse_separator(&self.buffer, self.scan_cursor)
+            else {
+                // Keep the last few bytes in the next scan so a separator split
+                // across two chunks is still found.
+                self.scan_cursor = self.buffer.len().saturating_sub(3);
+                break;
+            };
+            let frame = self
+                .buffer
+                .drain(..position + separator_len)
+                .collect::<Vec<_>>();
+            let frame_len = frame.len().saturating_sub(separator_len);
+            let frame = String::from_utf8_lossy(&frame[..frame_len]).into_owned();
+            self.scan_cursor = 0;
             let event = match self.wire_protocol {
                 OpenAiWireProtocol::Completions => {
                     parse_chat_sse_frame(&frame, &self.provider, &self.model)?
@@ -655,6 +678,12 @@ impl OpenAiSseParser {
             if let Some(event) = event {
                 events.push(event);
             }
+        }
+
+        if self.buffer.len() > Self::MAX_FRAME_BYTES {
+            return Err(ApiError::InvalidSseFrame(
+                "stream frame exceeded the maximum size without a terminator",
+            ));
         }
 
         Ok(events)
@@ -2630,22 +2659,18 @@ fn longest_compat_tool_prefix_suffix(text: &str) -> String {
     String::new()
 }
 
-fn next_sse_frame(buffer: &mut Vec<u8>) -> Option<String> {
-    let separator = buffer
-        .windows(2)
-        .position(|window| window == b"\n\n")
-        .map(|position| (position, 2))
-        .or_else(|| {
-            buffer
-                .windows(4)
-                .position(|window| window == b"\r\n\r\n")
-                .map(|position| (position, 4))
-        })?;
-
-    let (position, separator_len) = separator;
-    let frame = buffer.drain(..position + separator_len).collect::<Vec<_>>();
-    let frame_len = frame.len().saturating_sub(separator_len);
-    Some(String::from_utf8_lossy(&frame[..frame_len]).into_owned())
+fn find_sse_separator(buffer: &[u8], from: usize) -> Option<(usize, usize)> {
+    let start = from.min(buffer.len());
+    if let Some(relative) = buffer[start..].windows(2).position(|window| window == b"\n\n") {
+        return Some((start + relative, 2));
+    }
+    if let Some(relative) = buffer[start..]
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+    {
+        return Some((start + relative, 4));
+    }
+    None
 }
 
 fn parse_chat_sse_frame(
@@ -3836,6 +3861,17 @@ mod tests {
         parser
             .push(contents.as_bytes())
             .expect("fixture parses as Chat Completions SSE")
+    }
+
+    #[test]
+    fn parser_rejects_an_unterminated_frame_beyond_the_cap() {
+        let mut parser =
+            OpenAiSseParser::with_context("provider", "model", OpenAiWireProtocol::Completions);
+        let chunk = vec![b'a'; OpenAiSseParser::MAX_FRAME_BYTES + 1];
+        let error = parser
+            .push(&chunk)
+            .expect_err("a frame without a terminator must not grow without bound");
+        assert!(matches!(error, ApiError::InvalidSseFrame(_)));
     }
 
     #[test]
