@@ -1517,6 +1517,31 @@ impl ExecutionCommitService {
                         "node `{node_id}` is not a resolvable external wait"
                     )));
                 }
+                // Bind the resolution to the durable subject the wait parked
+                // on, so a forged correlation cannot complete the node. A barrier
+                // parks on `agentic-program-wait:{program}:revision:{rev}` and
+                // resolves with `agentic-program-wait:{program}:{node}:{rev}`;
+                // every other wait is subject-anchored (correlation == parked
+                // subject reference) (PLAN W1 / C4).
+                let anchored = match parked.as_deref() {
+                    Some(parked_ref) if parked_ref.starts_with("agentic-program-wait:") => {
+                        let parts = parked_ref.split(':').collect::<Vec<_>>();
+                        // `agentic-program-wait:{program}:revision:{rev}` is 4
+                        // segments; the resolve correlation is
+                        // `agentic-program-wait:{program}:{node}:{rev}`.
+                        parts.len() == 4
+                            && correlation_id
+                                .starts_with(&format!("agentic-program-wait:{}:", parts[1]))
+                            && correlation_id.ends_with(&format!(":{}", parts[3]))
+                    }
+                    Some(parked_ref) => correlation_id == parked_ref,
+                    None => false,
+                };
+                if !anchored {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "external-wait resolution correlation does not match the parked subject"
+                    )));
+                }
                 *status = ExecutionNodeStatus::Completed;
                 next.node_results.insert(
                     node_id.clone(),

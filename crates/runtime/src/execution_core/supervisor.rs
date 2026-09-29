@@ -2435,7 +2435,7 @@ mod completion_pump_tests {
                     expected_revision: projection.revision,
                     node_id: "external-wait".to_string(),
                     result_ref: "external:resolved".to_string(),
-                    correlation_id: "foreground-terminal-wait:resolved".to_string(),
+                    correlation_id: "external:pending".to_string(),
                 },
             )
             .await
