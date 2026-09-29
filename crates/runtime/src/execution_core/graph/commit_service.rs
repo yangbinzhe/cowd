@@ -1493,6 +1493,30 @@ impl ExecutionCommitService {
                         "node `{node_id}` is not waiting for an external result"
                     )));
                 }
+                // C4 hardening: the node must be owned by an authorized
+                // external-wait executor and must carry the durable parking
+                // result recorded when it entered WaitingExternal. This rejects
+                // a malformed or forged resolve that targets a node which was
+                // never properly parked (PLAN W1 / C4).
+                let node_kind = next
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == *node_id)
+                    .map(|node| node.executor_kind.as_str())
+                    .unwrap_or("");
+                let parked = next
+                    .node_results
+                    .get(node_id)
+                    .and_then(|result| result.result_ref.clone());
+                if !harness_contract::execution_graph::WAITING_EXTERNAL_EXECUTOR_KINDS
+                    .contains(&node_kind)
+                    || correlation_id.trim().is_empty()
+                    || parked.is_none()
+                {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "node `{node_id}` is not a resolvable external wait"
+                    )));
+                }
                 *status = ExecutionNodeStatus::Completed;
                 next.node_results.insert(
                     node_id.clone(),
