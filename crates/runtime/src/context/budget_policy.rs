@@ -177,9 +177,17 @@ impl RuntimeBudgetPlan {
             .saturating_sub(reserved_response);
 
         let profile_multiplier = profile_multiplier(inputs.profile);
-        let tool_total = scaled_budget(subsystem_budget_tokens, 0.08, 256, 120_000) as usize;
-        let tool_single =
-            scaled_budget(tool_total as u64, 0.24, 128, 32_000).min(tool_total as u64) as usize;
+        // Tool output is the *primary* channel through which evidence reaches the
+        // model, and a single source file in this repository is routinely
+        // 5k-10k tokens. The old 8%/24% sizing granted ~4k tokens per call on a
+        // 256k-window model, which truncated every source body and - worse -
+        // made the *third* read starve the turn's whole tool lease, so later
+        // reads collapsed to a ~600-character omission stub. The model then
+        // cannot verify anything and burns rounds re-reading. Size the lease so
+        // a whole file (and a small batch) fits, with a hard per-call floor.
+        let tool_total = scaled_budget(subsystem_budget_tokens, 0.28, 8_192, 120_000) as usize;
+        let tool_single = scaled_budget(tool_total as u64, 0.5, 32_000, 32_000)
+            .min(tool_total as u64) as usize;
         let subagent_default_budget =
             scaled_budget(subsystem_budget_tokens, profile_multiplier, 512, 160_000);
         let predicted_branch_tokens =
@@ -299,6 +307,52 @@ mod tests {
         assert!(plan.subagent_default_budget > DEFAULT_SUBAGENT_BUDGET_TOKENS as u64);
         assert_eq!(plan.team_total_budget, plan.subagent_default_budget);
         assert!(plan.tool_result_budget.per_tool_max_tokens > 10_000);
+    }
+
+    /// Regression for the live-scenario failure where every source read was
+    /// replaced by a ~600-character omission stub.
+    ///
+    /// `step-3.7-flash` has a 262,144-token window and a typical source file in
+    /// this repo is 5k-10k tokens. The old lease (8% of the subsystem budget,
+    /// 24% of that per call) granted ~4,026 tokens per read on that model, so a
+    /// single whole file never fitted and the third read exhausted the turn's
+    /// entire tool lease - every later read collapsed to a head+tail stub and
+    /// the model could verify nothing.
+    #[test]
+    fn a_typical_source_file_fits_the_tool_lease_whole() {
+        let plan = RuntimeBudgetPlan::derive(RuntimeBudgetInputs::new(262_144, 32_768));
+        let lease = plan.tool_result_budget;
+
+        assert!(
+            lease.per_tool_max_tokens >= 32_000,
+            "one whole source file (5k-10k tokens) plus head-room must fit a single call, got {}",
+            lease.per_tool_max_tokens
+        );
+        assert!(
+            lease.max_total_tokens >= 58_000,
+            "the turn lease must cover several whole-file reads, got {}",
+            lease.max_total_tokens
+        );
+        // A small batch (five average files) must still fit inside one turn.
+        assert!(lease.max_total_tokens >= 5 * 7_733);
+        // The per-call ceiling must stay a real ceiling, not swallow the turn.
+        assert!(lease.per_tool_max_tokens <= lease.max_total_tokens);
+    }
+
+    #[test]
+    fn a_huge_batch_is_still_bounded_so_one_call_cannot_own_the_turn() {
+        // Batch tools concatenate N bodies into a single receipt, so the
+        // per-call ceiling is what stops `read_many` of a whole crate from
+        // consuming the entire turn lease in one call.
+        let plan = RuntimeBudgetPlan::derive(RuntimeBudgetInputs::new(1_000_000, 128_000));
+        let lease = plan.tool_result_budget;
+
+        assert_eq!(lease.max_total_tokens, 120_000, "total stays clamped");
+        assert!(
+            lease.per_tool_max_tokens < lease.max_total_tokens / 2,
+            "one call must not be able to consume the whole turn lease: {}",
+            lease.per_tool_max_tokens
+        );
     }
 
     #[test]

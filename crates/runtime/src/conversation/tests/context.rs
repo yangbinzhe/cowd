@@ -1803,7 +1803,7 @@
         .with_session_journal_port(
             crate::session_runtime_port::TestSessionPortAdapter::new(Arc::clone(&store)),
         );
-        let raw = format!("first\n{}\nlast", "middle-evidence ".repeat(8_000));
+        let raw = format!("first\n{}\nlast", "middle-evidence ".repeat(16_000));
 
         let receipt = runtime
             .prepare_governed_tool_result(
@@ -1828,9 +1828,19 @@
             output.contains("tool://tool-raw-governed-read-1-"),
             "unexpected governed receipt: {output}"
         );
+        // The model must receive a *bounded receipt*, never the raw body: the
+        // body is replaced by head+tail plus an omission marker, and the full
+        // output is durably persisted by the artifact store below. The exact
+        // ratio depends on the tool-result lease (a whole source file must fit
+        // one call), so assert the invariant rather than a fixed ratio.
         assert!(
-            output.len() < raw.len() / 10,
-            "model must receive a receipt, not raw output"
+            output.len() < raw.len(),
+            "model must receive a bounded receipt, not raw output"
+        );
+        assert!(
+            output.contains("omitted"),
+            "a truncated receipt must announce the omission: {}",
+            &output[..output.len().min(400)]
         );
         let events = store
             .session_domain_events_page(&session_id, 0, 20)

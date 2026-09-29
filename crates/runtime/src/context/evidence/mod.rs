@@ -85,7 +85,7 @@ fn summarize_body(
         EvidenceContentKind::Error => summarize_error(output),
         EvidenceContentKind::Text | EvidenceContentKind::Media => output.to_string(),
     };
-    truncate_head_tail(&normalized, token_budget, raw_tokens, raw_lines)
+    truncate_head_tail(tool_name, &normalized, token_budget, raw_tokens, raw_lines)
 }
 
 fn summarize_json(tool_name: &str, output: &str) -> String {
@@ -185,7 +185,13 @@ fn summarize_error(output: &str) -> String {
     format!("Error tail: {}", lines[start..].join("\n"))
 }
 
-fn truncate_head_tail(value: &str, max_tokens: u64, raw_tokens: u64, raw_lines: usize) -> String {
+fn truncate_head_tail(
+    tool_name: &str,
+    value: &str,
+    max_tokens: u64,
+    raw_tokens: u64,
+    raw_lines: usize,
+) -> String {
     if estimate_text_tokens(value) <= max_tokens {
         return value.to_string();
     }
@@ -203,8 +209,17 @@ fn truncate_head_tail(value: &str, max_tokens: u64, raw_tokens: u64, raw_lines: 
     // "truncated output (original token count: N) / Total output lines: M").
     let kept_tokens = estimate_text_tokens(&format!("{head_text}\n{tail_text}"));
     let omitted_tokens = raw_tokens.saturating_sub(kept_tokens);
+    // The recovery instruction must be an action the model can actually take.
+    // A bare "retrieve by evidence ref" is not: there is no model-facing tool
+    // that resolves a `tool://` URI, so the model concludes the evidence is
+    // unreachable and repeats the same call. Name the concrete call instead.
+    let recovery = if matches!(tool_name, "read_file" | "read_many") {
+        "re-read the needed window with read_file(path, offset=nextOffset, limit=...) instead of re-reading the same range"
+    } else {
+        "narrow the query (concrete path/pattern, smaller head_limit) or read the persisted output by range instead of repeating this call"
+    };
     format!(
-        "{head_text}\n...[omitted {omitted_tokens} of {raw_tokens} tokens; {raw_lines} total lines; retrieve by evidence ref]...\n{tail_text}"
+        "{head_text}\n...[omitted {omitted_tokens} of {raw_tokens} tokens; {raw_lines} total lines; {recovery}]...\n{tail_text}"
     )
 }
 
@@ -244,6 +259,46 @@ mod tests {
             receipt.summary.contains("omitted") && receipt.summary.contains("total lines"),
             "the omission marker must announce the original size and line count: {}",
             receipt.summary
+        );
+    }
+
+    #[test]
+    fn truncation_recovery_names_a_call_the_model_can_actually_make() {
+        // Regression: the omission marker used to say only "retrieve by evidence
+        // ref". No model-facing tool resolves a `tool://` URI, so the model
+        // concluded the evidence was unreachable ("工具被禁用") and repeated the
+        // same call for dozens of rounds. The marker must name a real next call.
+        let big = "fn evidence() {}\n".repeat(2_000);
+
+        let read = build_tool_receipt(
+            "read_file",
+            &big,
+            false,
+            EvidenceRef::observed("tool", "raw-read"),
+            40,
+        );
+        assert!(
+            read.summary.contains("read_file") && read.summary.contains("offset=nextOffset"),
+            "a read truncation must name the windowed re-read: {}",
+            read.summary
+        );
+        assert!(
+            !read.summary.contains("retrieve by evidence ref"),
+            "an unresolvable evidence URI must not be offered as the recovery: {}",
+            read.summary
+        );
+
+        let search = build_tool_receipt(
+            "grep_search",
+            &big,
+            false,
+            EvidenceRef::observed("tool", "raw-grep"),
+            40,
+        );
+        assert!(
+            search.summary.contains("narrow") || search.summary.contains("persisted"),
+            "a non-read truncation must name a narrower query or a ranged read: {}",
+            search.summary
         );
     }
 
