@@ -1207,7 +1207,7 @@ async fn actual_delegated_model_safe_point_receives_delta_and_only_success_ackno
         runtime.set_context_profile(ContextProfile::SubAgent);
         let parent = services.graph_state_store().load(parent_id).unwrap();
         let lineage = parent.lineage.clone().unwrap();
-        let (_runtime, result) = submit_owned_conversation_turn_with_ingress(
+        let outcome = submit_owned_conversation_turn_with_ingress(
             runtime,
             Arc::clone(&services),
             "Read the bounded source and preserve peer evidence",
@@ -1223,6 +1223,7 @@ async fn actual_delegated_model_safe_point_receives_delta_and_only_success_ackno
             false,
         )
         .await;
+        let (_runtime, result) = outcome.expect("delegated leaf turn is reclaimable");
         if let Ok(summary) = &result {
             assert_ne!(
                 summary.terminal_completion,

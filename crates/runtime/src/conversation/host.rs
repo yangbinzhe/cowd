@@ -128,13 +128,17 @@ where
     T: ToolExecutor,
 {
     runtime: Option<crate::ConversationRuntime<ProviderRuntimeClient, T>>,
+    /// Set when the conversation runtime could not be returned to this host
+    /// (its turn executors still held it). A poisoned host refuses further
+    /// turns instead of pretending to be usable.
+    poisoned: bool,
     /// A submitted graph owns the conversation runtime until it emits this
     /// completion.  Keeping the receiver in the host is deliberate: if the
     /// caller drops its future, the graph can still return the runtime to the
     /// same host before a later turn is admitted.
     inflight_turn: Option<
         tokio::sync::oneshot::Receiver<(
-            crate::ConversationRuntime<ProviderRuntimeClient, T>,
+            Option<crate::ConversationRuntime<ProviderRuntimeClient, T>>,
             Result<TurnSummary, RuntimeError>,
         )>,
     >,
@@ -310,10 +314,13 @@ pub async fn submit_owned_conversation_turn<C, T>(
     content: &str,
     prompter: &SharedPrompter,
     lineage: harness_contract::execution_graph::ExecutionGraphLineage,
-) -> (
-    crate::ConversationRuntime<C, T>,
-    Result<TurnSummary, RuntimeError>,
-)
+) -> Result<
+    (
+        crate::ConversationRuntime<C, T>,
+        Result<TurnSummary, RuntimeError>,
+    ),
+    RuntimeError,
+>
 where
     C: ApiClient + Clone + Send + Sync + 'static,
     T: ToolExecutor,
@@ -541,10 +548,13 @@ async fn submit_owned_conversation_turn_with_ingress<C, T>(
     execution_role: TurnExecutionRole,
     recovered_tool_receipt_count: usize,
     recovered_tool_receipts_require_text_only: bool,
-) -> (
-    crate::ConversationRuntime<C, T>,
-    Result<TurnSummary, RuntimeError>,
-)
+) -> Result<
+    (
+        crate::ConversationRuntime<C, T>,
+        Result<TurnSummary, RuntimeError>,
+    ),
+    RuntimeError,
+>
 where
     C: ApiClient + Clone + Send + Sync + 'static,
     T: ToolExecutor,
@@ -572,7 +582,7 @@ where
     let session = runtime.session_snapshot().await;
     let evaluation_control = match evaluation_turn_control(content) {
         Ok(control) => control,
-        Err(error) => return (runtime, Err(error)),
+        Err(error) => return Ok((runtime, Err(error))),
     };
     let _evaluation_provider_token_guard = match evaluation_control.as_ref().and_then(|control| {
         match (&control.budget_lease_id, control.max_total_tokens) {
@@ -588,7 +598,7 @@ where
                 runtime = runtime.with_evaluation_provider_token_lease(guard.lease());
                 Some(guard)
             }
-            Err(error) => return (runtime, Err(error)),
+            Err(error) => return Ok((runtime, Err(error))),
         },
         None => None,
     };
@@ -602,7 +612,7 @@ where
     let _evaluation_resource_guard = match evaluation_control.as_ref() {
         Some(control) => match EvaluationResourceQuotaGuard::apply(&services, control) {
             Ok(guard) => Some(guard),
-            Err(error) => return (runtime, Err(error)),
+            Err(error) => return Ok((runtime, Err(error))),
         },
         None => None,
     };
@@ -611,12 +621,12 @@ where
     let session_id = session.session_id;
     if let Some(lineage) = execution_lineage.as_ref() {
         if lineage.session_id != session_id {
-            return (
+            return Ok((
                 runtime,
                 Err(RuntimeError::new(
                     "execution lineage session does not match the owned conversation session",
                 )),
-            );
+            ));
         }
     }
     let turn_ref = ingress
@@ -1725,9 +1735,11 @@ where
         }
     }
     let runtime = Arc::try_unwrap(runtime)
-        .unwrap_or_else(|_| panic!("turn executors must release the conversation runtime"))
+        .map_err(|_| RuntimeError::new(
+            "turn executors still hold the conversation runtime; the turn is refused rather than aborting the process",
+        ))?
         .into_inner();
-    (runtime, result)
+    Ok((runtime, result))
 }
 
 /// Optional objective-level wall-clock cost ceiling for a required-Team

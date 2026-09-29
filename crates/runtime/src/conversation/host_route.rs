@@ -133,6 +133,7 @@ where
 
         Ok(Self {
             runtime: Some(runtime),
+            poisoned: false,
             inflight_turn: None,
             services,
             execution_parent: config.execution_parent,
@@ -411,7 +412,8 @@ where
             self.recovered_tool_receipts_require_text_only;
         let (runtime_sender, runtime_receiver) =
             tokio::sync::oneshot::channel::<crate::ConversationRuntime<ProviderRuntimeClient, T>>();
-        let (completion_sender, completion_receiver) = tokio::sync::oneshot::channel();
+        let (completion_sender, completion_receiver) =
+            tokio::sync::oneshot::channel::<(Option<crate::ConversationRuntime<ProviderRuntimeClient, T>>, Result<TurnSummary, RuntimeError>)>();
         let execution_supervisor = Arc::clone(services.execution_supervisor());
         if let Err(error) = execution_supervisor
             .spawn_owned("conversation_turn", Box::pin(async move {
@@ -446,7 +448,7 @@ where
                                 Ok(lease) => Some(lease),
                                 Err(error) => {
                                     let _ = completion_sender
-                                        .send((runtime, Err(RuntimeError::new(error))));
+                                        .send((Some(runtime), Err(RuntimeError::new(error))));
                                     return;
                                 }
                             },
@@ -511,42 +513,46 @@ where
                                 ingress.input_sequence
                             )),
                         };
-                        let completed = match fence {
-                            Ok(fence) => {
-                                submit_owned_conversation_turn_with_ingress(
-                                    runtime.with_session_execution_fence(fence),
-                                    services,
-                                    &content,
-                                    &prompter,
-                                    Some(ingress),
-                                    execution_parent,
-                                    execution_lineage,
-                                    execution_role,
-                                    recovered_tool_receipt_count,
-                                    recovered_tool_receipts_require_text_only,
-                                )
-                                .await
-                            }
-                            Err(error) => (runtime, Err(RuntimeError::new(error))),
+                        let (runtime, result) = match fence {
+                            Ok(fence) => match submit_owned_conversation_turn_with_ingress(
+                                runtime.with_session_execution_fence(fence),
+                                services,
+                                &content,
+                                &prompter,
+                                Some(ingress),
+                                execution_parent,
+                                execution_lineage,
+                                execution_role,
+                                recovered_tool_receipt_count,
+                                recovered_tool_receipts_require_text_only,
+                            )
+                            .await
+                            {
+                                Ok((runtime, result)) => (Some(runtime), result),
+                                Err(error) => (None, Err(error)),
+                            },
+                            Err(error) => (Some(runtime), Err(RuntimeError::new(error))),
                         };
                         drop(execution_scope);
                         drop(execution_bus_lease);
-                        completed
+                        (runtime, result)
                     }
-                    None => {
-                        submit_owned_conversation_turn_with_ingress(
-                            runtime,
-                            services,
-                            &content,
-                            &prompter,
-                            None,
-                            execution_parent,
-                            execution_lineage,
-                            execution_role,
-                            recovered_tool_receipt_count,
-                            recovered_tool_receipts_require_text_only,
-                        )
-                        .await
+                    None => match submit_owned_conversation_turn_with_ingress(
+                        runtime,
+                        services,
+                        &content,
+                        &prompter,
+                        None,
+                        execution_parent,
+                        execution_lineage,
+                        execution_role,
+                        recovered_tool_receipt_count,
+                        recovered_tool_receipts_require_text_only,
+                    )
+                    .await
+                    {
+                        Ok((runtime, result)) => (Some(runtime), result),
+                        Err(error) => (None, Err(error)),
                     }
                 };
                 let _ = completion_sender.send((runtime, result));
@@ -585,7 +591,16 @@ where
                 "submitted Runtime turn ended before recovery: {error}"
             ))
         })?;
-        self.runtime = Some(runtime);
+        match runtime {
+            Some(runtime) => self.runtime = Some(runtime),
+            None => {
+                // The turn executors still held the ConversationRuntime, so the
+                // runtime could not be returned; refuse further turns instead
+                // of pretending the host is still usable (PLAN W4).
+                self.runtime = None;
+                self.poisoned = true;
+            }
+        }
         result
     }
 
@@ -608,7 +623,11 @@ where
                 "interrupted Runtime turn ended before recovery: {error}"
             ))
         })?;
-        self.runtime = Some(runtime);
+        if let Some(runtime) = runtime {
+            self.runtime = Some(runtime);
+        } else {
+            self.poisoned = true;
+        }
         Ok(())
     }
 

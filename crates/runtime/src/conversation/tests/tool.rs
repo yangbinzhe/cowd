@@ -1378,7 +1378,9 @@
                 )],
             })
             .expect("canonical test Task");
-        submit_owned_conversation_turn(runtime, services, content, prompter, lineage).await
+        submit_owned_conversation_turn(runtime, services, content, prompter, lineage)
+            .await
+            .expect("turn result is reclaimable")
     }
 
     fn standard_host_for_recovery_test() -> StandardRuntimeHost<NoopToolExecutor> {
@@ -1533,7 +1535,7 @@
 
         assert!(
             sender
-                .send((runtime, Err(RuntimeError::new("cancelled test turn"))))
+                .send((Some(runtime), Err(RuntimeError::new("cancelled test turn"))))
                 .is_ok(),
             "cancelling the request waiter must not drop the host-owned receiver"
         );

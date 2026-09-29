@@ -300,7 +300,8 @@ async fn empty_answer_is_blocked_by_finalization_gate() {
         &SharedPrompter::none(),
         lineage,
     )
-    .await;
+    .await
+    .expect("turn result is reclaimable");
     let summary = summary.expect("turn should complete with a gate message");
     let observation =
         HarnessObservation::from_summary("empty_answer_gate", &summary).into_scenario_observation();
