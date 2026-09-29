@@ -1992,20 +1992,73 @@ fn rate_per_second(count: u64, duration_ms: u64) -> Option<f64> {
     Some(count as f64 / (duration_ms as f64 / 1_000.0))
 }
 
+/// PLAN E1/E3/E5: the first request of every turn must already expose the
+/// orchestration verb, the canonical fact reader and the read-only reduction
+/// primitive.
+///
+/// Regression for the live-scenario failure where `tool_orchestrate`,
+/// `execute_code` and `read` were all deferred: with only `read_file` /
+/// `grep_search` / `glob_search` visible the model had no way to batch, no way
+/// to reduce across files, and no way to resolve the `tool://` reference its
+/// own truncation marker told it to use. It therefore re-issued the same
+/// single-file read for 26 rounds, 767k input tokens, and verified nothing.
+#[test]
+fn first_request_exposes_orchestrate_reduce_and_canonical_read() {
+    let bootstrap = bootstrap_tool_ids(harness_contract::tool::ToolPermissionMode::ReadOnly);
+
+    for required in [
+        // the verb: one instruction drives a bounded program
+        "tool_orchestrate",
+        // read-only reduction: gather/aggregate/branch without line-by-line reads
+        "execute_code",
+        // canonical fact reader: makes `tool://` evidence refs retrievable
+        "read",
+        // baseline evidence tools
+        "read_file",
+        "grep_search",
+        "glob_search",
+    ] {
+        assert!(
+            bootstrap.iter().any(|tool| tool.as_str() == required),
+            "bootstrap must expose `{required}` on the first request; got {bootstrap:?}"
+        );
+    }
+}
+
 fn bootstrap_tool_ids(
     _maximum_permission: harness_contract::tool::ToolPermissionMode,
 ) -> Vec<String> {
     let mut bootstrap = vec![
-        "tool_search".to_string(),
-        "context_retrieve".to_string(),
-        "runtime_capabilities".to_string(),
+        // Discovery / governance surface.
+        "tool_search",
+        "runtime_capabilities",
+        "context_retrieve",
         // Managed Team roles must acquire their first bounded source receipt
         // before a required escalation.  These core read-only evidence tools
         // therefore cannot be deferred: an exposure miss terminates the
         // provider step before the role reaches its Runtime-owned checkpoint.
-        "glob_search".to_string(),
-        "grep_search".to_string(),
-        "read_file".to_string(),
+        "glob_search",
+        "grep_search",
+        "read_file",
+        "workspace_snapshot",
+        // PLAN E1: `tool_orchestrate` is the one primitive that lets a single
+        // instruction drive a bounded program (up to 400 tool calls in one
+        // turn, with map/filter/repeat/when/compute). It was deferred, so the
+        // model never saw it and fell back to one call per round - the direct
+        // cause of the 26-round / 767k-token failure. It must be visible on
+        // the first request of every turn.
+        "tool_orchestrate",
+        // PLAN E5 (prerequisite): `execute_code` is the ONLY read-only-tier
+        // reduction primitive. Without it a ReadOnly session has no way to
+        // gather, aggregate or branch across many files, and the model is
+        // forced into line-by-line reading. Kernel-hardened, network-off.
+        "execute_code",
+        // PLAN E3 (recovery path): the omission marker tells the model to
+        // retrieve the full body by evidence ref. `read` resolves canonical
+        // Runtime references (tool://, artifact://, memory://, task://, ...);
+        // without it that instruction is a dead end and the model concludes
+        // the evidence is unreachable.
+        "read",
     ];
     // The stable Agent action prefix is always available. These actions write
     // only Runtime collaboration facts; concrete workspace/external effects
@@ -2013,9 +2066,12 @@ fn bootstrap_tool_ids(
     bootstrap.extend(
         harness_contract::agent_action::AGENT_ACTION_TOOL_IDS
             .iter()
-            .map(|tool| (*tool).to_string()),
+            .map(|tool| *tool),
     );
     bootstrap
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
 }
 
 fn tool_exposure_for_catalog(

@@ -618,7 +618,7 @@ pub use prompt::{
     ProjectContext, PromptBuildError, SystemPromptBuilder, COWD_IDENTITY_CONTRACT_VERSION,
     SYSTEM_PROMPT_CACHE_COHORT_BOUNDARY, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
-pub use prompt_assembly::{PromptAssembly, PromptContextPacket};
+pub use prompt_assembly::{PromptAssembly, PromptComposition, PromptContextPacket};
 pub use provider::{detect_provider_kind, model_context_window_with_overrides, ProviderKind};
 pub use provider_outcome_selector::{
     select_provider_from_outcome_snapshot, ProviderSelectionCandidateReceipt,

@@ -1,4 +1,5 @@
 // Canonical dispatch, filesystem, search, cache, and mutation coverage.
+use super::super::executor::is_allowed_orchestration_tool;
 #[test]
 fn vision_analyze_prepares_png_payload_end_to_end() {
     let _guard = env_lock();
@@ -1945,24 +1946,44 @@ fn tool_orchestrate_maps_and_aggregates_readonly_queries_in_one_call() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// PLAN E2 changed *where* the orchestration authorization boundary lives.
+///
+/// It used to be a hand-copied 17-name allow-list inside this crate, which also
+/// meant `bash` could never be composed even by a session that was explicitly
+/// authorized to run shell commands. The boundary is now:
+///
+/// * this crate: the tool must exist in the canonical catalog and must not be
+///   `tool_orchestrate` itself (no nesting);
+/// * the runtime/gateway: every sub-call must be in the caller's own allow-list
+///   (`agent::in_process::tool_turn::reject_orchestrated_tools_outside_allow_list`,
+///   covered by its own tests, where the allow-list is
+///   `resolved.allowed_tools ∩ host_tools` and therefore already permission
+///   gated).
+///
+/// So this test now pins the *catalog* boundary: an unknown tool fails closed
+/// here, and a known tool is admitted here and gated one layer up.
 #[test]
-fn tool_orchestrate_rejects_tools_outside_the_orchestration_allow_list() {
-    let root = temp_path("tool-orchestrate-reject");
-    fs::create_dir_all(&root).expect("workspace");
-
-    let error = execute_in_workspace(
-        &root,
-        "tool_orchestrate",
-        &json!({
-            "steps": [
-                {"id": "b", "op": "call", "tool": "bash", "input": {"command": "echo hi"}}
-            ]
-        }),
-    )
-    .expect_err("bash must not be orchestrated");
-    assert!(error.contains("bash"), "unexpected error: {error}");
-
-    let _ = fs::remove_dir_all(&root);
+fn tool_orchestrate_admits_catalog_tools_and_rejects_unknown_ones() {
+    assert!(
+        is_allowed_orchestration_tool("bash"),
+        "a session authorized for shell may now compose it"
+    );
+    assert!(
+        is_allowed_orchestration_tool("read_file"),
+        "read_file was always composable"
+    );
+    assert!(
+        is_allowed_orchestration_tool("skill_install_plan"),
+        "long-tail catalog tools are composable too"
+    );
+    assert!(
+        !is_allowed_orchestration_tool("definitely_not_a_tool"),
+        "an unknown name must fail closed"
+    );
+    assert!(
+        !is_allowed_orchestration_tool("tool_orchestrate"),
+        "orchestration must never nest"
+    );
 }
 
 #[test]

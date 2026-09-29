@@ -424,7 +424,10 @@ fn run_read_file(lease: &ToolHostLease, input: ReadFileInput) -> Result<String, 
     let Some(authority) = lease.read_cache_authority_digest() else {
         return to_pretty_json(operation()?);
     };
-    let fingerprint = file_fingerprint(&resolved);
+    // A windowed read fingerprints at most 16 KiB; an explicit whole-file
+    // (`complete`) read keeps the full content hash so an EOF receipt stays
+    // bound to the exact bytes.
+    let fingerprint = file_fingerprint(&resolved, input.complete);
     let scope = file_cache_scope(&resolved);
     let cache_input = serde_json::to_string(
         &json!({"input":input,"fingerprint":fingerprint,"authority":authority}),
@@ -448,7 +451,7 @@ fn run_read_file(lease: &ToolHostLease, input: ReadFileInput) -> Result<String, 
             }
             let token = lease.cache().epoch_token(&scope);
             let output = to_pretty_json(operation()?)?;
-            if file_fingerprint(&resolved) == fingerprint {
+            if file_fingerprint(&resolved, input.complete) == fingerprint {
                 if let Some(token) = token {
                     lease.cache().put_if_current(
                         lease.workspace_id(),
@@ -647,21 +650,24 @@ fn file_cache_scope(path: &Path) -> String {
     format!("file:{}", path.to_string_lossy())
 }
 
-fn file_fingerprint(resolved: &Path) -> String {
-    let content_hash = match std::fs::File::open(resolved) {
-        Ok(mut file) => {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            let mut buffer = [0_u8; 8192];
-            loop {
-                match file.read(&mut buffer) {
-                    Ok(0) => break format!("{:016x}", hasher.finish()),
-                    Ok(read) => buffer[..read].hash(&mut hasher),
-                    Err(_) => break String::from("unreadable"),
-                }
-            }
-        }
-        Err(_) => String::from("missing"),
-    };
+/// Content fingerprint for the read cache.
+///
+/// A cache *hit* must not cost a full file read. The previous implementation
+/// hashed every byte before the flight, so serving a hit still paid
+/// `O(file size)` - for a 30 KiB source file that is 30 KiB of I/O per hit,
+/// across every file of a multi-file batch.
+///
+/// `exact = false` (the common windowed read) now fingerprints
+/// `len + mtime_nanos + sha256(head 8 KiB) + sha256(tail 8 KiB)`: at most
+/// 16 KiB of reads regardless of file size. A same-length edit that lands in
+/// the middle of a large file is still caught by the head+tail hashes when it
+/// touches either end, and by `mtime_nanos` otherwise (cowd's own writes also
+/// invalidate the cache scope explicitly, so internal edits never go stale).
+///
+/// `exact = true` (an explicit whole-file / EOF read) keeps the full content
+/// hash: an EOF receipt must be bound to the exact bytes it claims to have
+/// read end to end.
+pub(super) fn file_fingerprint(resolved: &Path, exact: bool) -> String {
     let Ok(metadata) = std::fs::metadata(resolved) else {
         return format!("missing:{}", resolved.to_string_lossy());
     };
@@ -671,12 +677,64 @@ fn file_fingerprint(resolved: &Path) -> String {
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
-    format!(
+    let head = format!(
         "file:{}:{}:{}",
         resolved.to_string_lossy(),
         metadata.len(),
         modified
-    ) + &format!(":{content_hash}")
+    );
+    if exact {
+        return head + &format!(":{}", full_content_hash(resolved));
+    }
+    format!("{}:{}", head, bounded_content_hash(resolved, metadata.len()))
+}
+
+pub(super) const FINGERPRINT_EDGE_BYTES: usize = 8 * 1024;
+
+/// Hash the first and last `FINGERPRINT_EDGE_BYTES` of a file.
+pub(super) fn bounded_content_hash(resolved: &Path, len: u64) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Ok(mut file) = std::fs::File::open(resolved) else {
+        return String::from("missing");
+    };
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut buffer = [0_u8; FINGERPRINT_EDGE_BYTES];
+    // head
+    match file.read(&mut buffer) {
+        Ok(0) => return String::from("empty"),
+        Ok(read) => buffer[..read].hash(&mut hasher),
+        Err(_) => return String::from("unreadable"),
+    };
+    // tail (only when the file is larger than one edge, so small files stay exact)
+    let len = usize::try_from(len).unwrap_or(usize::MAX);
+    if len > FINGERPRINT_EDGE_BYTES {
+        let tail_start = len.saturating_sub(FINGERPRINT_EDGE_BYTES) as u64;
+        if file.seek(SeekFrom::Start(tail_start)).is_ok() {
+            match file.read(&mut buffer) {
+                Ok(read) => buffer[..read].hash(&mut hasher),
+                Err(_) => return String::from("unreadable"),
+            };
+        }
+    }
+    format!("{:016x}", hasher.finish())
+}
+
+/// Hash every byte of a file. Reserved for explicit whole-file / EOF reads,
+/// where the receipt must be bound to the exact content.
+pub(super) fn full_content_hash(resolved: &Path) -> String {
+    let Ok(mut file) = std::fs::File::open(resolved) else {
+        return String::from("missing");
+    };
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break format!("{:016x}", hasher.finish()),
+            Ok(read) => buffer[..read].hash(&mut hasher),
+            Err(_) => break String::from("unreadable"),
+        }
+    }
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -778,21 +836,27 @@ pub(crate) fn is_allowed_readonly_batch_tool(name: &str) -> bool {
     )
 }
 
-/// Tools `tool_orchestrate` may dispatch: the read-only query set plus
-/// workspace writes. `tool_orchestrate` itself is excluded (no nesting), and
-/// every name is additionally checked against the caller's allow-list by the
-/// runtime/gateway before delegation.
+/// Tools `tool_orchestrate` may dispatch.
+///
+/// PLAN E2: the vocabulary is the canonical built-in catalog, not a hand-copied
+/// subset. The previous allow-list named 17 tools, so three quarters of the
+/// inventory (`ast_grep_search`, `execute_code`, `lsp`, the skill/checkpoint
+/// families, ...) could not be composed at all - the model was pushed back into
+/// one-call-per-round.
+///
+/// Safety is unchanged: `tool_orchestrate` itself is excluded (no nesting), and
+/// the runtime/gateway additionally checks every sub-call against the caller's
+/// own allow-list before delegation
+/// (`agent::in_process::tool_turn::reject_orchestrated_tools_outside_allow_list`),
+/// so widening this set cannot grant a tool the caller was not already
+/// authorized to invoke directly.
 pub(crate) fn is_allowed_orchestration_tool(name: &str) -> bool {
-    is_allowed_readonly_batch_tool(name)
-        || matches!(
-            name,
-            "write_file"
-                | "edit_file"
-                | "apply_patch_transaction"
-                | "notebook_edit"
-                | "todo_write"
-                | "checkpoint_restore"
-        )
+    if name == "tool_orchestrate" {
+        return false;
+    }
+    crate::mvp_tool_specs()
+        .iter()
+        .any(|spec| spec.name == name)
 }
 
 #[derive(Debug, Serialize)]

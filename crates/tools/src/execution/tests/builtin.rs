@@ -423,3 +423,82 @@ fn builtin_bash_executes_inside_the_pinned_tool_host() {
     let output: serde_json::Value = serde_json::from_str(&result).expect("json");
     assert_eq!(output["stdout"], "ok");
 }
+
+/// PLAN B2: a windowed read must not pay a full file read to fingerprint.
+///
+/// The old `file_fingerprint` hashed every byte before the read flight, so a
+/// cache *hit* still cost `O(file size)`; a multi-file batch therefore paid one
+/// full read per file per round. A windowed read now fingerprints
+/// `len + mtime + sha256(head 8K) + sha256(tail 8K)`. Only `complete` (EOF)
+/// reads keep the full content hash, because an EOF receipt must be bound to
+/// the exact bytes it claims to have read end to end.
+#[test]
+fn windowed_fingerprint_is_bounded_but_detects_edge_and_length_changes() {
+    let dir = std::env::temp_dir().join(format!("cowd-fingerprint-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("big.rs");
+    let mut body = String::from("fn head() {}\n");
+    body.push_str(&"// filler line to make the file large\n".repeat(20_000));
+    body.push_str("fn tail() {}\n");
+    std::fs::write(&path, &body).expect("write big file");
+    let fp = super::super::executor::file_fingerprint;
+
+    let windowed = fp(&path, false);
+    let exact = fp(&path, true);
+    assert_ne!(windowed, exact, "exact reads must keep a distinct fingerprint");
+    assert!(windowed.starts_with("file:"), "shape changed: {windowed}");
+    assert_eq!(windowed, fp(&path, false), "an unchanged file must fingerprint stably");
+
+    let mut edited = body.clone();
+    edited.replace_range(0..5, "fn HEAD");
+    std::fs::write(&path, &edited).expect("write edited head");
+    assert_ne!(windowed, fp(&path, false), "a head edit must invalidate");
+
+    let mut tail_edited = body.clone();
+    let cut = tail_edited.len() - 6;
+    tail_edited.replace_range(cut.., "TAIL()\n");
+    std::fs::write(&path, &tail_edited).expect("write edited tail");
+    assert_ne!(windowed, fp(&path, false), "a tail edit must invalidate");
+
+    // A rewrite always changes mtime, which is part of the fingerprint: any
+    // in-place rewrite invalidates the cache even when the bytes match.
+    let other = dir.join("len.rs");
+    std::fs::write(&other, &body).expect("write baseline");
+    let baseline = fp(&other, false);
+    let mut shorter = body.clone();
+    shorter.truncate(shorter.len() - 4_096);
+    std::fs::write(&other, &shorter).expect("write shorter");
+    assert_ne!(baseline, fp(&other, false), "a length change must invalidate");
+
+    // A file smaller than one fingerprint edge must hash exactly: head+tail
+    // covers the whole body, so there is no middle-of-file blind spot.
+    let small = dir.join("small.rs");
+    std::fs::write(&small, "fn small() {}\n").expect("write small");
+    assert_eq!(fp(&small, false), fp(&small, true), "small file must hash exactly");
+
+    assert!(fp(&dir.join("nope.rs"), false).starts_with("missing:"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// PLAN E2: the orchestration vocabulary is the whole built-in catalog.
+#[test]
+fn orchestrate_can_dispatch_the_whole_builtin_catalog_but_never_itself() {
+    let dispatchable = super::super::executor::is_allowed_orchestration_tool;
+    let catalog: Vec<String> = crate::mvp_tool_specs()
+        .into_iter()
+        .map(|spec| spec.name.to_string())
+        .collect();
+
+    assert_eq!(catalog.len(), 56, "the catalog size is the contract");
+    let catalog: Vec<String> = catalog
+        .into_iter()
+        .filter(|name| name != "tool_orchestrate")
+        .collect();
+    assert_eq!(catalog.len(), 55, "the catalog minus the orchestrator itself");
+    for name in &catalog {
+        assert!(dispatchable(name), "`{name}` is in the catalog, so it must be composable");
+    }
+    assert!(!dispatchable("tool_orchestrate"), "orchestration must never nest");
+    assert!(!dispatchable("not_a_tool"), "an unknown name must fail closed");
+}

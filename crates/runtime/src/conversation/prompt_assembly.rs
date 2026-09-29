@@ -2,6 +2,58 @@ use std::collections::BTreeMap;
 
 use crate::context_runtime::{ContextAuthority, ContextItem, ContextRole, ContextSourceKind};
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+/// PLAN A1: per-region byte composition of the prompt side of a request.
+///
+/// Deliberately byte counts and not token estimates: the point is to make the
+/// provider prefix auditable, and the Provider prompt cache is keyed on the
+/// serialized bytes. `stable_system_bytes` is the only region that must never
+/// change between requests; every other region is a candidate divergence site.
+pub struct PromptComposition {
+    /// Leading trusted-system segments shared by one Provider cache cohort.
+    pub stable_system_bytes: usize,
+    /// Remaining trusted-system segments: immutable for this execution but may
+    /// differ between sibling Agents.
+    pub cohort_tail_bytes: usize,
+    /// Segments emitted after the dynamic boundary (request-local: clocks,
+    /// working-set deltas, memory, evidence capsules, skills).
+    pub dynamic_system_bytes: usize,
+    /// Immutable user-role data shared by one exact cache cohort.
+    pub cache_cohort_user_prefix_bytes: usize,
+    /// Immutable but role-private user brief from a frozen packet.
+    pub immutable_user_prefix_bytes: usize,
+    /// Rendered Runtime-attested context packets.
+    pub runtime_context_bytes: usize,
+    /// Same bytes split by `ContextSourceKind` (memory / knowledge / fact /
+    /// matrix / task / workspace / ...), so a divergence can be attributed to a
+    /// named source rather than to "context".
+    pub contextual_packet_bytes: std::collections::BTreeMap<String, usize>,
+}
+
+impl PromptComposition {
+    /// Total prompt-side bytes across all six regions.
+    #[must_use]
+    pub fn total_bytes(&self) -> usize {
+        self.stable_system_bytes
+            + self.cohort_tail_bytes
+            + self.dynamic_system_bytes
+            + self.cache_cohort_user_prefix_bytes
+            + self.immutable_user_prefix_bytes
+            + self.runtime_context_bytes
+    }
+
+    /// Fraction of the prompt side that is guaranteed byte-stable across
+    /// requests (basis points). A falling value predicts a falling hit rate.
+    #[must_use]
+    pub fn stable_share_bp(&self) -> u32 {
+        let total = self.total_bytes();
+        if total == 0 {
+            return 0;
+        }
+        u32::try_from(self.stable_system_bytes.saturating_mul(10_000) / total).unwrap_or(10_000)
+    }
+}
+
 /// A runtime-owned prompt packet that is deliberately sent outside the provider
 /// system channel. Context is evidence or guidance, never a policy authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +175,57 @@ impl PromptAssembly {
             immutable_user_prefix: Vec::new(),
             runtime_context: runtime,
             contextual_packets: Vec::new(),
+        }
+    }
+
+    /// Byte composition of the prompt-side request segments.
+    ///
+    /// PLAN A1: the request's six regions must be individually measurable.
+    /// Without this, a falling cache hit rate can only be described as
+    /// "it dropped" - there is no way to tell whether the divergence is in the
+    /// stable system head, the tool schemas, memory, skills, the context fence
+    /// or the message tail. Every number here is a byte count over the
+    /// model-visible serialization of that region.
+    #[must_use]
+    pub fn composition(&self) -> PromptComposition {
+        let stable_system_bytes = self
+            .trusted_system
+            .iter()
+            .take(self.cache_cohort_segment_count)
+            .map(|segment| segment.len())
+            .sum();
+        let cohort_tail_bytes = self
+            .trusted_system
+            .iter()
+            .skip(self.cache_cohort_segment_count)
+            .map(|segment| segment.len())
+            .sum();
+        let dynamic_system_bytes = self.runtime_context.iter().map(String::len).sum();
+        let cache_cohort_user_prefix_bytes =
+            self.cache_cohort_user_prefix.iter().map(String::len).sum();
+        let immutable_user_prefix_bytes =
+            self.immutable_user_prefix.iter().map(String::len).sum();
+        let mut contextual_packet_bytes = std::collections::BTreeMap::new();
+        let mut contextual_packets_total = 0_usize;
+        for packet in &self.contextual_packets {
+            let rendered = packet.render_for_user_context().len();
+            contextual_packets_total = contextual_packets_total.saturating_add(rendered);
+            let key = format!("{:?}", packet.source);
+            let entry = contextual_packet_bytes.entry(key).or_insert(0_usize);
+            *entry = entry.saturating_add(rendered);
+        }
+        PromptComposition {
+            stable_system_bytes,
+            cohort_tail_bytes,
+            dynamic_system_bytes,
+            cache_cohort_user_prefix_bytes,
+            immutable_user_prefix_bytes,
+            // `dynamic_system_bytes` already measures the system-channel side of
+            // this region (`self.runtime_context`); this field is the
+            // user-role rendering of the same region, kept separate so the two
+            // renderings can never double-count.
+            runtime_context_bytes: contextual_packets_total,
+            contextual_packet_bytes,
         }
     }
 
@@ -709,5 +812,85 @@ mod tests {
             .expect("stable prefix")
             .contains("Runtime clock"));
         assert_eq!(assembly.runtime_system_segments(), [clock]);
+    }
+}
+
+#[cfg(test)]
+mod composition_tests {
+    use super::*;
+
+    #[test]
+    fn composition_reports_each_region_and_stable_share() {
+        let mut assembly = PromptAssembly::new(vec![
+            "stable-head".to_string(),
+            crate::SYSTEM_PROMPT_CACHE_COHORT_BOUNDARY.to_string(),
+            "cohort-tail".to_string(),
+            crate::SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string(),
+            "dynamic-memory".to_string(),
+        ]);
+        assembly.cache_cohort_user_prefix = vec!["cohort-user".to_string()];
+        assembly.immutable_user_prefix = vec!["role-brief".to_string()];
+        assembly.runtime_context = vec!["request-local".to_string()];
+
+        let composition = assembly.composition();
+        assert_eq!(composition.stable_system_bytes, "stable-head".len());
+        assert_eq!(composition.cohort_tail_bytes, "cohort-tail".len());
+        assert_eq!(
+            composition.dynamic_system_bytes,
+            "request-local".len(),
+            "the dynamic system region is `runtime_context`, overwritten below"
+        );
+        assert_eq!(
+            composition.cache_cohort_user_prefix_bytes,
+            "cohort-user".len()
+        );
+        assert_eq!(
+            composition.immutable_user_prefix_bytes,
+            "role-brief".len()
+        );
+        assert_eq!(
+            composition.total_bytes(),
+            "stable-head".len()
+                + "cohort-tail".len()
+                + "request-local".len()
+                + "cohort-user".len()
+                + "role-brief".len()
+        );
+        // The dynamic region is split per ContextSourceKind so a divergence is
+        // attributable to a named source instead of "context".
+        assert!(
+            composition.contextual_packet_bytes.is_empty(),
+            "no packets were packed in this fixture"
+        );
+        let stable_share = composition.stable_share_bp();
+        assert!(stable_share > 0 && stable_share < 10_000, "{stable_share}");
+    }
+
+    #[test]
+    fn contextual_packets_are_attributed_by_source_kind() {
+        let mut assembly = PromptAssembly::new(vec!["head".to_string()]);
+        let mut item = crate::context_runtime::ContextItem::new(
+            "m1",
+            crate::context_runtime::ContextSourceKind::Memory,
+            crate::context_runtime::ContextRole::Evidence,
+            "a remembered fact",
+        );
+        item.authority = crate::context_runtime::ContextAuthority::Session;
+        item.source_id = Some("memory-1".to_string());
+        item.evidence = vec!["tool://raw-1".to_string()];
+        assembly.contextual_packets = vec![super::PromptContextPacket::from_item(&item)];
+
+        let composition = assembly.composition();
+        assert!(
+            composition.runtime_context_bytes > 0,
+            "a packed packet must be measured"
+        );
+        assert!(
+            composition
+                .contextual_packet_bytes
+                .contains_key("Memory"),
+            "memory bytes must be attributable: {:?}",
+            composition.contextual_packet_bytes
+        );
     }
 }
