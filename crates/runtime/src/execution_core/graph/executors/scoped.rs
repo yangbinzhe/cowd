@@ -280,7 +280,7 @@ impl NodeExecutor for ScopedNodeExecutor {
         }
     }
     async fn after_commit(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
-        cancel_scoped_bounded(self, ticket, std::time::Duration::from_secs(5))
+        self.cancel_bounded(ticket, std::time::Duration::from_secs(5))
             .await?;
         self.physical
             .lock()
@@ -313,6 +313,13 @@ impl NodeExecutor for ScopedNodeExecutor {
         Ok(())
     }
 
+    async fn cancel_bounded(
+        &self,
+        ticket: &NodeExecutionTicket,
+        budget: std::time::Duration,
+    ) -> Result<(), NodeExecutorError> {
+        cancel_scoped_bounded(self, ticket, budget).await
+    }
     fn cancellation_requires_quiescence(&self, _ticket: &NodeExecutionTicket) -> bool {
         // Admission can race this query. Even an InlineModel with no leaf yet
         // must atomically close leaf admission and drain through cancel().
@@ -356,7 +363,7 @@ impl NodeExecutor for ScopedNodeExecutor {
         ticket: &NodeExecutionTicket,
         _: &str,
     ) -> Result<(), NodeExecutorError> {
-        cancel_scoped_bounded(self, ticket, std::time::Duration::from_secs(5))
+        self.cancel_bounded(ticket, std::time::Duration::from_secs(5))
             .await?;
         self.cancellation_finalized(ticket);
         Ok(())

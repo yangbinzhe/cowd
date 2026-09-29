@@ -832,7 +832,7 @@ impl ExecutionGraphRunner {
                 drop(active);
                 drop(coordination);
                 for start in aborted {
-                    let _ = start.executor.cancel(&start.ticket).await;
+                    let _ = start.executor.cancel_bounded(&start.ticket, Duration::from_secs(5)).await;
                     self.record_resource_terminal(
                         start.resource_kind.as_ref(),
                         start.resource_queue_wait,
@@ -845,7 +845,7 @@ impl ExecutionGraphRunner {
         }
         drop(coordination);
         for start in superseded {
-            let _ = start.executor.cancel(&start.ticket).await;
+            let _ = start.executor.cancel_bounded(&start.ticket, Duration::from_secs(5)).await;
             self.record_resource_terminal(
                 start.resource_kind.as_ref(),
                 start.resource_queue_wait,
@@ -1266,7 +1266,7 @@ impl ExecutionGraphRunner {
                     .await
                     .remove(&(graph_id.to_string(), node_id))
                 {
-                    let _ = active.executor.cancel(&active.ticket).await;
+                    let _ = active.executor.cancel_bounded(&active.ticket, Duration::from_secs(5)).await;
                 }
                 Ok(None)
             }
@@ -1467,7 +1467,9 @@ impl ExecutionGraphRunner {
                     .lock()
                     .await
                     .remove(&(ticket.graph_id.clone(), ticket.node_id.clone()));
-                let _ = executor.cancel(&ticket).await;
+                let _ = executor
+                    .cancel_bounded(&ticket, Duration::from_secs(5))
+                    .await;
                 self.record_resource_terminal(
                     resource_kind.as_ref(),
                     resource_queue_wait,
@@ -1582,9 +1584,11 @@ impl ExecutionGraphRunner {
                 outcome = executor.poll_or_await(&ticket) => outcome,
                 () = tokio::time::sleep(remaining) => {
                     if executor.cancellation_requires_quiescence(&ticket) {
-                        executor.cancel(&ticket).await?;
+                        executor
+                            .cancel_bounded(&ticket, Duration::from_secs(5))
+                            .await?;
                     } else {
-                    match tokio::time::timeout(Duration::from_secs(5), executor.cancel(&ticket)).await {
+                    match tokio::time::timeout(Duration::from_secs(5), executor.cancel_bounded(&ticket, Duration::from_secs(5))).await {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => tracing::warn!(
                             graph_id = ticket.graph_id,
@@ -2126,7 +2130,7 @@ impl ExecutionGraphRunner {
                     | ExecutionGraphCommand::CancelNode { .. }
             ) {
                 for (node_id, executor, ticket) in cancellation_finalizer.active() {
-                    if let Err(error) = executor.cancel(ticket).await {
+                    if let Err(error) = executor.cancel_bounded(ticket, Duration::from_secs(5)).await {
                         cancellation_errors.push((node_id.clone(), error));
                     }
                 }

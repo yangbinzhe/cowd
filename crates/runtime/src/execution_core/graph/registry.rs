@@ -128,6 +128,16 @@ pub trait NodeExecutor: Send + Sync {
     async fn cancel(&self, _ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
         Ok(())
     }
+    /// Bounded cancellation. Defaults to the unbounded `cancel`; an executor
+    /// that owns physical work overrides this to stop waiting after `budget`
+    /// without dropping the physical future (PLAN W3 / R-02).
+    async fn cancel_bounded(
+        &self,
+        ticket: &NodeExecutionTicket,
+        _budget: std::time::Duration,
+    ) -> Result<(), NodeExecutorError> {
+        self.cancel(ticket).await
+    }
     /// Physical effects cannot be abandoned by a cancellation propagation timeout.
     fn cancellation_requires_quiescence(&self, _ticket: &NodeExecutionTicket) -> bool {
         false
