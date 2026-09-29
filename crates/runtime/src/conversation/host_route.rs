@@ -314,6 +314,11 @@ where
         prompter: &SharedPrompter,
     ) -> Result<TurnSummary, RuntimeError> {
         self.restore_inflight_turn().await?;
+        if self.poisoned {
+            return Err(RuntimeError::new(
+                "conversation runtime was not returned to this host; the turn is refused",
+            ));
+        }
         let Some(runtime) = self.runtime.take() else {
             return Err(RuntimeError::new(
                 "Runtime host has no conversation available for this turn",
@@ -330,6 +335,11 @@ where
         ingress: TurnIngressRef,
     ) -> Result<TurnSummary, RuntimeError> {
         self.restore_inflight_turn().await?;
+        if self.poisoned {
+            return Err(RuntimeError::new(
+                "conversation runtime was not returned to this host; the ingress turn is refused",
+            ));
+        }
         let Some(runtime) = self.runtime.take() else {
             return Err(RuntimeError::new(
                 "Runtime host has no conversation available for ingress execution",
@@ -401,6 +411,13 @@ where
         ingress: Option<(TurnIngressRef, String)>,
     ) -> Result<(), RuntimeError> {
         debug_assert!(self.inflight_turn.is_none());
+        if self.poisoned {
+            // The runtime was not returned to this host; accepting another turn
+            // would run on a runtime nobody owns (PLAN W4).
+            return Err(RuntimeError::new(
+                "conversation runtime was not returned to this host; the turn is refused",
+            ));
+        }
         let services = Arc::clone(&self.services);
         let content = content.to_string();
         let prompter = prompter.clone();

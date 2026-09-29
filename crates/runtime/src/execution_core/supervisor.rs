@@ -1896,7 +1896,7 @@ mod completion_pump_tests {
             if ticket.node_id == "external-wait" {
                 return Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
                     status: ExecutionNodeStatus::WaitingExternal,
-                    result_ref: Some("external:pending".to_string()),
+                    result_ref: Some("agentic-program-wait:external-wait:revision:1".to_string()),
                     wait_class: Some(
                         harness_contract::execution_graph::ExternalWaitClass::Barrier,
                     ),
@@ -2438,8 +2438,9 @@ mod completion_pump_tests {
                 ExecutionGraphCommand::ResolveExternal {
                     expected_revision: projection.revision,
                     node_id: "external-wait".to_string(),
-                    result_ref: "external:resolved".to_string(),
-                    correlation_id: "external:pending".to_string(),
+                    result_ref: "agentic-program-checkpoint:external-wait:revision:1:resolved"
+                        .to_string(),
+                    correlation_id: "agentic-program-wait:external-wait:node:1".to_string(),
                 },
             )
             .await

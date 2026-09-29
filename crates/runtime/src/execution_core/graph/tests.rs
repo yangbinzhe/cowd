@@ -442,6 +442,7 @@ impl NodeExecutor for BlockingPostCommitExecutor {
                         kind: ExecutionEdgeKind::DependsOn,
                     }],
                     reason: "post-commit coordination regression".to_string(),
+                    framework_authored: false,
                 },
             ),
         )
@@ -495,6 +496,7 @@ impl NodeExecutor for ReplanRaceExecutor {
                         kind: ExecutionEdgeKind::DependsOn,
                     }],
                     reason: "late dynamic tool".to_string(),
+                    framework_authored: false,
                 },
             ),
         )
@@ -1871,6 +1873,7 @@ fn terminal_replan_is_one_transaction_and_survives_projection_restart() {
                 kind: ExecutionEdgeKind::DependsOn,
             }],
             "model requested tool".to_string(),
+            false,
         )
         .unwrap();
 

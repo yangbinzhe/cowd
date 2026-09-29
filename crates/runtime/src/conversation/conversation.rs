@@ -1665,8 +1665,13 @@ async fn consume_provider_stream_with_activity(
     // with non-empty deltas but make no syntactically meaningful progress. Bound
     // it per attempt (generously above any legitimate single-step output) so such
     // a stream fails instead of running without bound (PLAN W2 Step2 / N1).
+    // Reasoning deltas are bounded separately (and much more generously) because
+    // a legitimate "think first, act later" step can be far larger than the
+    // answer itself; killing it would be a capability loss (PLAN W2 / review).
     const MAX_UNBOUNDED_CONTENT_BYTES: u64 = 8 * 1024 * 1024;
+    const MAX_UNBOUNDED_REASONING_BYTES: u64 = 64 * 1024 * 1024;
     let mut unbounded_content_bytes: u64 = 0;
+    let mut unbounded_reasoning_bytes: u64 = 0;
     loop {
         let next = if let Some(policy) = timeout_policy {
             loop {
@@ -1748,23 +1753,32 @@ async fn consume_provider_stream_with_activity(
                 // Accumulate raw content until a step boundary resets it. A peer
                 // cannot keep a step alive with content alone (PLAN W2 Step2).
                 match &event {
-                    AssistantEvent::TextDelta(text)
-                    | AssistantEvent::ReasoningSummaryDelta(text)
-                    | AssistantEvent::PrivateReasoningDelta(text) => {
+                    AssistantEvent::TextDelta(text) => {
                         unbounded_content_bytes =
                             unbounded_content_bytes.saturating_add(text.len() as u64);
                     }
+                    AssistantEvent::ReasoningSummaryDelta(text)
+                    | AssistantEvent::PrivateReasoningDelta(text) => {
+                        // Reasoning is not a step boundary, so it accounts
+                        // against its own, far larger bound.
+                        unbounded_reasoning_bytes =
+                            unbounded_reasoning_bytes.saturating_add(text.len() as u64);
+                    }
                     AssistantEvent::ToolUse { .. } | AssistantEvent::MessageStop => {
                         unbounded_content_bytes = 0;
+                        unbounded_reasoning_bytes = 0;
                     }
                     _ => {}
                 }
-                if unbounded_content_bytes > MAX_UNBOUNDED_CONTENT_BYTES {
+                let content_exhausted = unbounded_content_bytes > MAX_UNBOUNDED_CONTENT_BYTES;
+                let reasoning_exhausted = unbounded_reasoning_bytes > MAX_UNBOUNDED_REASONING_BYTES;
+                if content_exhausted || reasoning_exhausted {
                     resource_result_class =
                         crate::execution_core::graph::ResourceResultClass::Failed;
                     failure = Some(RuntimeError::new(format!(
-                        "provider stream exceeded {} MiB of content without a step boundary",
-                        MAX_UNBOUNDED_CONTENT_BYTES / (1024 * 1024)
+                        "provider stream exceeded {} MiB of content / {} MiB of reasoning without a step boundary",
+                        MAX_UNBOUNDED_CONTENT_BYTES / (1024 * 1024),
+                        MAX_UNBOUNDED_REASONING_BYTES / (1024 * 1024)
                     )));
                     break;
                 }

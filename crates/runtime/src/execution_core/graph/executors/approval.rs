@@ -266,10 +266,14 @@ impl NodeExecutor for ApprovalNodeExecutor {
             GlobalApprovalStatus::Skipped if skip_allowed => ExecutionNodeStatus::Completed,
             GlobalApprovalStatus::Skipped => ExecutionNodeStatus::Failed,
             GlobalApprovalStatus::Denied => ExecutionNodeStatus::Failed,
-            // A timed-out (no-response) approval is not an authority decision;
-            // it must not terminate the task on a system-imposed clock. Keep it
-            // non-terminal so the runtime can replan / re-confirm (PLAN C3-P-l).
-            GlobalApprovalStatus::TimedOut => ExecutionNodeStatus::WaitingExternal,
+            // A timed-out (no-response) approval is not an authority decision,
+            // so it must not terminate the task on a system-imposed clock. It
+            // stays on the approval queue, which owns the only deciding
+            // authority; the node therefore stays `WaitingApproval` until the
+            // queue (or the autonomy profile) reaches a real decision
+            // (PLAN C3-P-l). Parking it in `WaitingExternal` would leave it with
+            // no resolver at all, i.e. a permanent stall.
+            GlobalApprovalStatus::TimedOut => ExecutionNodeStatus::WaitingApproval,
             GlobalApprovalStatus::Cancelled | GlobalApprovalStatus::Superseded => {
                 ExecutionNodeStatus::Cancelled
             }

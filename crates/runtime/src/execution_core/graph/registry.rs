@@ -73,6 +73,13 @@ pub struct ExecutionGraphReplan {
     pub nodes: Vec<ExecutionNodeSpec>,
     pub edges: Vec<ExecutionEdge>,
     pub reason: String,
+    /// True when the runtime itself authored this replan (for example the
+    /// event-driven Agentic Program barrier). Framework-authored replans are
+    /// exempt from the external-wait executor gate in `validate_replan`, because
+    /// the graph compiler -- not an executor outcome -- is the producer
+    /// (PLAN W1 / C4).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub framework_authored: bool,
 }
 
 impl NodeExecutionOutcome {

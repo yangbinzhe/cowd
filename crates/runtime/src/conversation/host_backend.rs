@@ -217,6 +217,7 @@ where
                 nodes,
                 reason: "Runtime prefetched exact immutable upstream-change evidence before reviewer synthesis"
                     .to_string(),
+                framework_authored: true,
             }));
         }
         let (
@@ -421,6 +422,7 @@ where
                 nodes: vec![synthesize.clone()],
                 edges: dynamic_edges(&ticket.node_id, &[synthesize]),
                 reason: "safety fuse requested an honest blocked synthesis".to_string(),
+                framework_authored: true,
             });
             outcome.domain_events.push(
                 self.services
@@ -2111,6 +2113,7 @@ where
                             nodes: next,
                             edges,
                             reason: "provider intent advanced the turn graph".to_string(),
+                            framework_authored: true,
                         });
                 for (index, upstream) in upstream_observations.iter().enumerate() {
                     outcome.domain_events.push(
@@ -2597,6 +2600,7 @@ where
                     nodes: vec![next.clone()],
                     edges: dynamic_edges(&ticket.node_id, &[next]),
                     reason: replan_reason,
+                    framework_authored: true,
                 });
                 Ok(outcome)
             }
@@ -3938,6 +3942,7 @@ fn precommitted_terminal_outcome(ticket: &NodeExecutionTicket) -> NodeExecutionO
         edges: dynamic_edges(&ticket.node_id, &[synthesize]),
         reason: "verified Team terminal result bypassed duplicate parent model execution"
             .to_string(),
+        framework_authored: true,
     })
 }
 
@@ -5581,6 +5586,7 @@ where
                 edges: dynamic_edges(&ticket.node_id, &replan_nodes),
                 nodes: replan_nodes,
                 reason: replan_reason,
+                framework_authored: true,
             });
         }
         Ok(outcome)

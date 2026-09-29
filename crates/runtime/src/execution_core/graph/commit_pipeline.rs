@@ -312,6 +312,7 @@ pub(super) fn is_lineage_stream_conflict(
 pub(super) fn validate_replan(
     graph: &ExecutionGraph,
     nodes: &[ExecutionNodeSpec],
+    framework_authored: bool,
 ) -> Result<(), ExecutionCommitError> {
     let existing = graph
         .nodes
@@ -330,14 +331,18 @@ pub(super) fn validate_replan(
             "replan must add at least one uniquely identified node".to_string(),
         ));
     }
-    // A replan is executor-authored. It must not synthesize a node whose
-    // executor owns an external-wait contract, or a rogue executor could mint
-    // an unresolvable WaitingExternal (or bypass the barrier/approval/
-    // handoff authority) from a normal outcome (PLAN W1 / C4, AS6).
-    if let Some(node) = nodes.iter().find(|node| {
+    // An executor-authored replan must not synthesize a node whose executor
+    // owns an external-wait contract, or a rogue executor could mint an
+    // unresolvable WaitingExternal (or bypass the barrier/approval/handoff
+    // authority) from a normal outcome (PLAN W1 / C4, AS6). The runtime's own
+    // replans (the event-driven Program barrier) are exempt: they are produced
+    // by the graph compiler, not by an executor outcome.
+    let unauthorized_wait = nodes.iter().find(|node| {
         harness_contract::execution_graph::WAITING_EXTERNAL_EXECUTOR_KINDS
             .contains(&node.executor_kind.as_str())
-    }) {
+    });
+    if !framework_authored && unauthorized_wait.is_some() {
+        let node = unauthorized_wait.unwrap();
         return Err(ExecutionCommitError::InvalidReplan(format!(
             "replan may not introduce external-wait executor `{}`",
             node.executor_kind

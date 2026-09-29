@@ -948,9 +948,9 @@ where
             .with_replan(ExecutionGraphReplan {
                 nodes: vec![next.clone()],
                 edges: dynamic_edges(&ticket.node_id, &[next]),
-                reason:
-                    "new durable Session input crossed the final-answer barrier; terminal candidate was superseded"
-                        .to_string(),
+                reason: "new durable Session input crossed the final-answer barrier; terminal candidate was superseded"
+                    .to_string(),
+                framework_authored: true,
             });
             let observation_identity = {
                 let state = self.state.lock().await;
@@ -1295,6 +1295,7 @@ where
                     "{} newer durable Session input(s) superseded the terminal presentation before commit",
                     late_inputs.len()
                 ),
+                framework_authored: true,
             }));
         }
         let now_ms = crate::tool_invocation::now_ms();
@@ -1431,6 +1432,7 @@ where
                         reason: format!(
                             "Objective completion gap remains; continue working before presenting success: {gap}"
                         ),
+                        framework_authored: true,
                     }));
                 }
             }

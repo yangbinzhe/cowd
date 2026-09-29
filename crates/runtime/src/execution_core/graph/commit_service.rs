@@ -1210,9 +1210,10 @@ impl ExecutionCommitService {
         nodes: Vec<ExecutionNodeSpec>,
         edges: Vec<ExecutionEdge>,
         reason: String,
+        framework_authored: bool,
     ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
         validate_executor_domain_events(&domain_events)?;
-        validate_replan(graph, &nodes)?;
+        validate_replan(graph, &nodes, framework_authored)?;
         let from = *graph
             .node_statuses
             .get(node_id)
@@ -1274,6 +1275,7 @@ impl ExecutionCommitService {
         nodes: Vec<ExecutionNodeSpec>,
         edges: Vec<ExecutionEdge>,
         reason: String,
+        framework_authored: bool,
     ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
         let service = self.clone();
         tokio::task::spawn_blocking(move || {
@@ -1285,6 +1287,7 @@ impl ExecutionCommitService {
                 nodes,
                 edges,
                 reason,
+                framework_authored,
             )
         })
         .await
@@ -1298,7 +1301,7 @@ impl ExecutionCommitService {
         edges: Vec<ExecutionEdge>,
         reason: String,
     ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
-        validate_replan(graph, &nodes)?;
+        validate_replan(graph, &nodes, false)?;
         let added_node_ids = nodes.iter().map(|node| node.id.clone()).collect::<Vec<_>>();
         let mut next = graph.clone();
         for node in &nodes {
@@ -1528,24 +1531,28 @@ impl ExecutionCommitService {
                         "node `{node_id}` is not a resolvable external wait"
                     )));
                 }
-                // Bind the resolution to the durable subject the wait parked
-                // on, so a forged correlation cannot complete the node. A barrier
-                // parks on `agentic-program-wait:{program}:revision:{rev}` and
-                // resolves with `agentic-program-wait:{program}:{node}:{rev}`;
-                // every other wait is subject-anchored (correlation == parked
-                // subject reference) (PLAN W1 / C4).
+                // Bind the resolution to the durable subject the wait parked on,
+                // so a forged correlation cannot complete the node (PLAN W1 / C4).
+                //
+                // * Class A barrier: parks on
+                //   `agentic-program-wait:{program}:revision:{rev}` and resolves
+                //   with `agentic-program-wait:{program}:{node}:{rev}` — same
+                //   program and revision.
+                // * Class B authoritative: parks on
+                //   `session_handoff_accepted:{subject}:{receipt}` and must be
+                //   resolved with exactly that subject, so the parked reference
+                //   has to quote it.
                 let anchored = match parked.as_deref() {
                     Some(parked_ref) if parked_ref.starts_with("agentic-program-wait:") => {
                         let parts = parked_ref.split(':').collect::<Vec<_>>();
-                        // `agentic-program-wait:{program}:revision:{rev}` is 4
-                        // segments; the resolve correlation is
-                        // `agentic-program-wait:{program}:{node}:{rev}`.
                         parts.len() == 4
                             && correlation_id
                                 .starts_with(&format!("agentic-program-wait:{}:", parts[1]))
                             && correlation_id.ends_with(&format!(":{}", parts[3]))
                     }
-                    Some(parked_ref) => correlation_id == parked_ref,
+                    Some(parked_ref) => parked_ref.starts_with(&format!(
+                        "session_handoff_accepted:{correlation_id}:"
+                    )),
                     None => false,
                 };
                 if !anchored {

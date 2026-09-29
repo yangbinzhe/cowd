@@ -407,15 +407,36 @@ impl NodeExecutor for SessionDispatchNodeExecutor {
                 node_id: ticket.node_id.clone(),
                 reason,
             })?;
+        // A `session_handoff:` wait is a class-B authoritative wait. Its durable
+        // subject is the handoff command's own correlation id, so the parked
+        // result reference carries that subject explicitly and the resolver must
+        // reproduce it (PLAN W1 / C4).
+        let handoff_subject = ticket
+            .payload_ref
+            .strip_prefix("session_handoff:")
+            .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+            .and_then(|value| {
+                value
+                    .get("handoff")
+                    .and_then(|value| value.get("correlation_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            });
+        let parked_result_ref = match &handoff_subject {
+            Some(subject) => format!("session_handoff_accepted:{subject}:{routed}"),
+            None => routed.clone(),
+        };
         Ok(NodeExecutionOutcome {
             result: ExecutionNodeResult {
-                status: if ticket.payload_ref.starts_with("session_handoff:") {
+                status: if handoff_subject.is_some() {
                     ExecutionNodeStatus::WaitingExternal
                 } else {
                     ExecutionNodeStatus::Completed
                 },
-                result_ref: Some(routed.clone()),
-                wait_class: None,
+                result_ref: Some(parked_result_ref.clone()),
+                wait_class: handoff_subject
+                    .is_some()
+                    .then_some(harness_contract::execution_graph::ExternalWaitClass::Authoritative),
                 summary: Some("Session input was routed to the target execution graph".to_string()),
                 failure: None,
                 usage: Default::default(),

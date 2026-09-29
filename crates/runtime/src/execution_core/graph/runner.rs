@@ -1176,6 +1176,7 @@ impl ExecutionGraphRunner {
                             replan.nodes,
                             replan.edges,
                             replan.reason,
+                            replan.framework_authored,
                         )
                         .await
                 } else {
