@@ -433,19 +433,122 @@ async fn real_postgres_symbol_memory_link_is_idempotent_with_null_turn_index() {
     );
 }
 
+fn scenario_entity(scope: &str, index: usize) -> memory::entity::Entity {
+    let now = chrono::Utc::now();
+    memory::entity::Entity {
+        id: format!("entity-{scope}-{index}"),
+        name: format!("entity {scope} {index}"),
+        entity_type: memory::entity::EntityType::Concept,
+        confidence: 0.5,
+        frequency: 1,
+        first_seen: now,
+        last_seen: now,
+        source_ids: Vec::new(),
+        source_type: "kg-concurrency-test".to_string(),
+    }
+}
+
+fn scenario_triple(scope: &str, index: usize) -> memory::entity::Triple {
+    memory::entity::Triple {
+        id: format!("triple-{scope}-{index}"),
+        subject_id: format!("entity-{scope}-{index}"),
+        predicate: "depends_on".to_string(),
+        object_id: format!("entity-{scope}-{}", index + 1),
+        valid_from: None,
+        valid_to: None,
+        source: Some("kg-concurrency-test".to_string()),
+        confidence: 0.5,
+        created_at: chrono::Utc::now(),
+        source_agent: None,
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+async fn real_postgres_knowledge_graph_scopes_never_cross_wipe_under_concurrency() {
+    // PLAN M-02 / W5: a snapshot replace must only ever touch its own scope,
+    // and turn-end maintenance (which snapshots the whole in-memory KG) must
+    // not wipe rows another writer owns.
+    let fixture = PostgresTestScope::new();
+    let store = PostgresMemoryStore::new(fixture.reconnect()).expect("owned memory namespace");
+    const SCOPES: usize = 4;
+
+    // Seed every scope with a distinct baseline so a cross-wipe is observable.
+    for s in 0..SCOPES {
+        let scope = format!("scope-{s}");
+        store
+            .save_knowledge_graph(
+                &scope,
+                &(0..50).map(|i| scenario_entity(&scope, i)).collect::<Vec<_>>(),
+                &(0..50).map(|i| scenario_triple(&scope, i)).collect::<Vec<_>>(),
+            )
+            .await
+            .expect("seed knowledge graph");
+    }
+
+    // Concurrent writers: each scope re-snapshots a *different* count. With a
+    // whole-table DELETE (the old behaviour) every writer would erase the
+    // other scopes; scoping must make the writes independent.
+    let mut handles = Vec::new();
+    for s in 0..SCOPES {
+        let store = Arc::new(store.clone());
+        let scope = format!("scope-{s}");
+        handles.push(tokio::spawn(async move {
+            let entities = (0..80 + s).map(|i| scenario_entity(&scope, i)).collect::<Vec<_>>();
+            let triples = (0..80 + s).map(|i| scenario_triple(&scope, i)).collect::<Vec<_>>();
+            store
+                .save_knowledge_graph(&scope, &entities, &triples)
+                .await
+                .expect("concurrent knowledge graph write");
+        }));
+    }
+    for h in handles {
+        h.await.expect("writer task joins");
+    }
+
+    for s in 0..SCOPES {
+        let scope = format!("scope-{s}");
+        let entities = store.load_entities(&scope).await.expect("load entities");
+        let triples = store.load_triples(&scope).await.expect("load triples");
+        assert_eq!(
+            entities.len(),
+            80 + s,
+            "scope {scope} lost or gained entities (cross-scope wipe)"
+        );
+        assert_eq!(
+            triples.len(),
+            80 + s,
+            "scope {scope} lost or gained triples (cross-scope wipe)"
+        );
+    }
+
+    // A smaller snapshot must replace only its own scope, not merge into it.
+    store
+        .save_knowledge_graph("scope-0", &[scenario_entity("scope-0", 0)], &[scenario_triple("scope-0", 0)])
+        .await
+        .expect("smaller snapshot");
+    assert_eq!(
+        store.load_entities("scope-0").await.expect("reload scope-0").len(),
+        1,
+        "a snapshot replace must be a replace, not a merge"
+    );
+    assert_eq!(store.load_entities("scope-1").await.expect("reload scope-1").len(), 81);
+}
+
+
 #[tokio::test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 async fn real_postgres_empty_knowledge_graph_snapshot_is_rejected() {
-    // Regression for PLAN M-02 / W5 Step2: a failed/empty KG load must never
-    // silently clear durable entities/triples.
-    let fixture = PostgresTestScope::new();
-    let store = PostgresMemoryStore::new(fixture.reconnect()).expect("owned memory namespace");
-    let error = store
-        .save_knowledge_graph(memory::store::KG_DEFAULT_SCOPE, &[], &[])
-        .await
-        .expect_err("an empty snapshot must be refused");
-    assert!(
-        error.to_string().contains("empty snapshot"),
-        "unexpected error: {error}"
-    );
+// Regression for PLAN M-02 / W5 Step2: a failed/empty KG load must never
+// silently clear durable entities/triples.
+let fixture = PostgresTestScope::new();
+let store = PostgresMemoryStore::new(fixture.reconnect()).expect("owned memory namespace");
+let error = store
+    .save_knowledge_graph(memory::store::KG_DEFAULT_SCOPE, &[], &[])
+    .await
+    .expect_err("an empty snapshot must be refused");
+assert!(
+    error.to_string().contains("empty snapshot"),
+    "unexpected error: {error}"
+);
 }
