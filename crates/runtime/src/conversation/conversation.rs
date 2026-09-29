@@ -880,7 +880,11 @@ fn assistant_event_is_semantic(event: &AssistantEvent) -> bool {
     match event {
         AssistantEvent::ProviderModel { .. }
         | AssistantEvent::ItemStarted { .. }
-        | AssistantEvent::ItemCompleted { .. } => false,
+        | AssistantEvent::ItemCompleted { .. }
+        // A boundary only carries the terminal reason; it is not progress and
+        // must not refresh the idle deadline (a peer could emit stop_reason on
+        // every frame). See PLAN W2 Step2/Step3.
+        | AssistantEvent::MessageBoundary { .. } => false,
         AssistantEvent::TextDelta(text)
         | AssistantEvent::ReasoningSummaryDelta(text)
         | AssistantEvent::PrivateReasoningDelta(text)
@@ -888,7 +892,6 @@ fn assistant_event_is_semantic(event: &AssistantEvent) -> bool {
         AssistantEvent::ToolUse { .. }
         | AssistantEvent::Usage(_)
         | AssistantEvent::MessageStop
-        | AssistantEvent::MessageBoundary { .. }
         | AssistantEvent::ToolStart { .. }
         | AssistantEvent::ToolProgress { .. }
         | AssistantEvent::ToolComplete { .. } => true,
