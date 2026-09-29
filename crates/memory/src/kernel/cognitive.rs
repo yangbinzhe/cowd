@@ -1650,8 +1650,8 @@ impl CognitiveContextManager {
 
         // Load knowledge graph from persistent store.
         let kg = {
-            let entities = orchestrator.store().load_entities().await?;
-            let triples = orchestrator.store().load_triples().await?;
+            let entities = orchestrator.store().load_entities(crate::store::KG_DEFAULT_SCOPE).await?;
+            let triples = orchestrator.store().load_triples(crate::store::KG_DEFAULT_SCOPE).await?;
             let mut graph = KnowledgeGraph::new();
             for e in entities {
                 graph.add_entity(e);

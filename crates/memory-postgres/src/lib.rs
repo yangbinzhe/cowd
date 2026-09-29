@@ -202,6 +202,23 @@ const MEMORY_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_symbol_refs_logical
             ON memory_symbol_references(symbol_id, memory_id, COALESCE(turn_index, -1), COALESCE(reference_type, ''))",
     ],
+}, PostgresMigrationSpec {
+    id: "memory.0007.knowledge-graph-scope",
+    domain: MEMORY_DOMAIN,
+    version: 7,
+    description: "scope the knowledge graph so a snapshot replace cannot cross scopes",
+    statements: &[
+        // Existing rows predate scoping; the only graph they can belong to is
+        // the global one, which is exactly MemoryScope::Global.scope_key().
+        "ALTER TABLE memory_entities ADD COLUMN IF NOT EXISTS scope_key TEXT NOT NULL DEFAULT 'global'",
+        "ALTER TABLE memory_triples ADD COLUMN IF NOT EXISTS scope_key TEXT NOT NULL DEFAULT 'global'",
+        "CREATE INDEX IF NOT EXISTS idx_memory_entities_scope ON memory_entities(scope_key)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_triples_scope ON memory_triples(scope_key)",
+        // Identity is now per-scope, so a snapshot replace only ever deletes
+        // rows of its own scope.
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_entities_scope_id ON memory_entities(scope_key, id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_triples_scope_id ON memory_triples(scope_key, id)",
+    ],
 }];
 
 const KNOWLEDGE_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
@@ -558,14 +575,15 @@ impl PostgresMemoryStore {
 
     fn replace_json_rows<T: Serialize>(
         &self,
+        scope_key: &str,
         table: &str,
         values: &[T],
         id: impl Fn(&serde_json::Value) -> Option<String>,
     ) -> MemoryResult<()> {
         let (delete_sql, insert_sql) = match table {
             "memory_entities" => (
-                "DELETE FROM memory_entities",
-                "INSERT INTO memory_entities(id,payload) VALUES($1,$2)",
+                "DELETE FROM memory_entities WHERE scope_key=$1",
+                "INSERT INTO memory_entities(scope_key,id,payload) VALUES($1,$2,$3)",
             ),
             _ => {
                 return Err(MemoryError::Store(format!(
@@ -573,6 +591,7 @@ impl PostgresMemoryStore {
                 )))
             }
         };
+        let scope_key = scope_key.to_string();
         let mut connection = self
             .executor
             .checkout_critical()
@@ -585,36 +604,37 @@ impl PostgresMemoryStore {
             )
             .map_err(postgres_memory_error)?;
         transaction
-            .execute(delete_sql, &[])
+            .execute(delete_sql, &[&scope_key])
             .map_err(postgres_memory_error)?;
         for value in values {
             let payload = serde_json::to_value(value).map_err(json_memory_error)?;
             let id = id(&payload)
                 .ok_or_else(|| MemoryError::Store("durable JSON row has no id".to_string()))?;
             transaction
-                .execute(insert_sql, &[&id, &payload])
+                .execute(insert_sql, &[&scope_key, &id, &payload])
                 .map_err(postgres_memory_error)?;
         }
         transaction.commit().map_err(postgres_memory_error)?;
         Ok(())
     }
 
-    fn load_json_rows<T: DeserializeOwned>(&self, table: &str) -> MemoryResult<Vec<T>> {
+    fn load_json_rows<T: DeserializeOwned>(&self, scope_key: &str, table: &str) -> MemoryResult<Vec<T>> {
         let sql = match table {
-            "memory_entities" => "SELECT payload FROM memory_entities ORDER BY id",
-            "memory_triples" => "SELECT payload FROM memory_triples ORDER BY id",
+            "memory_entities" => "SELECT payload FROM memory_entities WHERE scope_key=$1 ORDER BY id",
+            "memory_triples" => "SELECT payload FROM memory_triples WHERE scope_key=$1 ORDER BY id",
             _ => {
                 return Err(MemoryError::Store(format!(
                     "unsupported memory JSON table `{table}`"
                 )))
             }
         };
+        let scope_key = scope_key.to_string();
         let mut connection = self
             .executor
             .checkout_online_read()
             .map_err(storage_memory_error)?;
         connection
-            .query(sql, &[])
+            .query(sql, &[&scope_key])
             .map_err(postgres_memory_error)?
             .iter()
             .map(|row| {
@@ -624,7 +644,8 @@ impl PostgresMemoryStore {
             .collect()
     }
 
-    fn replace_triples(&self, triples: &[Triple]) -> MemoryResult<()> {
+    fn replace_triples(&self, scope_key: &str, triples: &[Triple]) -> MemoryResult<()> {
+        let scope_key = scope_key.to_string();
         let mut connection = self
             .executor
             .checkout_critical()
@@ -637,14 +658,14 @@ impl PostgresMemoryStore {
             )
             .map_err(postgres_memory_error)?;
         transaction
-            .execute("DELETE FROM memory_triples", &[])
+            .execute("DELETE FROM memory_triples WHERE scope_key=$1", &[&scope_key])
             .map_err(postgres_memory_error)?;
         for triple in triples {
             let payload = serde_json::to_value(triple).map_err(json_memory_error)?;
             transaction
                 .execute(
-                    "INSERT INTO memory_triples(id,subject_key,object_key,payload) VALUES($1,$2,$3,$4)",
-                    &[&triple.id, &triple.subject_id, &triple.object_id, &payload],
+                    "INSERT INTO memory_triples(scope_key,id,subject_key,object_key,payload) VALUES($1,$2,$3,$4,$5)",
+                    &[&scope_key, &triple.id, &triple.subject_id, &triple.object_id, &payload],
                 )
                 .map_err(postgres_memory_error)?;
         }
@@ -662,6 +683,7 @@ impl PostgresMemoryStore {
     /// (PLAN M-02 / W5 Step2).
     fn replace_knowledge_graph(
         &self,
+        scope_key: &str,
         entities: &[Entity],
         triples: &[Triple],
     ) -> MemoryResult<()> {
@@ -681,8 +703,9 @@ impl PostgresMemoryStore {
                 &[],
             )
             .map_err(postgres_memory_error)?;
+        let scope = scope_key.to_string();
         transaction
-            .execute("DELETE FROM memory_entities", &[])
+            .execute("DELETE FROM memory_entities WHERE scope_key=$1", &[&scope])
             .map_err(postgres_memory_error)?;
         for entity in entities {
             let payload = serde_json::to_value(entity).map_err(json_memory_error)?;
@@ -692,20 +715,20 @@ impl PostgresMemoryStore {
                 .ok_or_else(|| MemoryError::Store("durable entity has no id".to_string()))?;
             transaction
                 .execute(
-                    "INSERT INTO memory_entities(id,payload) VALUES($1,$2)",
-                    &[&id, &payload],
+                    "INSERT INTO memory_entities(scope_key,id,payload) VALUES($1,$2,$3)",
+                    &[&scope, &id, &payload],
                 )
                 .map_err(postgres_memory_error)?;
         }
         transaction
-            .execute("DELETE FROM memory_triples", &[])
+            .execute("DELETE FROM memory_triples WHERE scope_key=$1", &[&scope])
             .map_err(postgres_memory_error)?;
         for triple in triples {
             let payload = serde_json::to_value(triple).map_err(json_memory_error)?;
             transaction
                 .execute(
-                    "INSERT INTO memory_triples(id,subject_key,object_key,payload) VALUES($1,$2,$3,$4)",
-                    &[&triple.id, &triple.subject_id, &triple.object_id, &payload],
+                    "INSERT INTO memory_triples(scope_key,id,subject_key,object_key,payload) VALUES($1,$2,$3,$4,$5)",
+                    &[&scope, &triple.id, &triple.subject_id, &triple.object_id, &payload],
                 )
                 .map_err(postgres_memory_error)?;
         }
@@ -1168,11 +1191,12 @@ impl MemoryStore for PostgresMemoryStore {
         })
         .await
     }
-    async fn save_entities(&self, entities: &[Entity]) -> MemoryResult<()> {
+    async fn save_entities(&self, scope_key: &str, entities: &[Entity]) -> MemoryResult<()> {
         let store = self.clone();
+        let scope_key = scope_key.to_string();
         let entities = entities.to_vec();
         run_memory_blocking(move || {
-            store.replace_json_rows("memory_entities", &entities, |value| {
+            store.replace_json_rows(&scope_key, "memory_entities", &entities, |value| {
                 value
                     .get("id")
                     .and_then(serde_json::Value::as_str)
@@ -1181,28 +1205,34 @@ impl MemoryStore for PostgresMemoryStore {
         })
         .await
     }
-    async fn load_entities(&self) -> MemoryResult<Vec<Entity>> {
+    async fn load_entities(&self, scope_key: &str) -> MemoryResult<Vec<Entity>> {
         let store = self.clone();
-        run_memory_blocking(move || store.load_json_rows("memory_entities")).await
+        let scope_key = scope_key.to_string();
+        run_memory_blocking(move || store.load_json_rows(&scope_key, "memory_entities")).await
     }
-    async fn save_triples(&self, triples: &[Triple]) -> MemoryResult<()> {
+    async fn save_triples(&self, scope_key: &str, triples: &[Triple]) -> MemoryResult<()> {
         let store = self.clone();
+        let scope_key = scope_key.to_string();
         let triples = triples.to_vec();
-        run_memory_blocking(move || store.replace_triples(&triples)).await
+        run_memory_blocking(move || store.replace_triples(&scope_key, &triples)).await
     }
     async fn save_knowledge_graph(
         &self,
+        scope_key: &str,
         entities: &[Entity],
         triples: &[Triple],
     ) -> MemoryResult<()> {
         let store = self.clone();
+        let scope_key = scope_key.to_string();
         let entities = entities.to_vec();
         let triples = triples.to_vec();
-        run_memory_blocking(move || store.replace_knowledge_graph(&entities, &triples)).await
+        run_memory_blocking(move || store.replace_knowledge_graph(&scope_key, &entities, &triples))
+            .await
     }
-    async fn load_triples(&self) -> MemoryResult<Vec<Triple>> {
+    async fn load_triples(&self, scope_key: &str) -> MemoryResult<Vec<Triple>> {
         let store = self.clone();
-        run_memory_blocking(move || store.load_json_rows("memory_triples")).await
+        let scope_key = scope_key.to_string();
+        run_memory_blocking(move || store.load_json_rows(&scope_key, "memory_triples")).await
     }
     async fn save_verbatim(
         &self,

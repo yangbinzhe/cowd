@@ -237,7 +237,7 @@ impl CognitiveContextManager {
                 if let Err(e) = self
                     .orchestrator
                     .store()
-                    .save_knowledge_graph(&entities, &triples)
+                    .save_knowledge_graph(crate::store::KG_DEFAULT_SCOPE, &entities, &triples)
                     .await
                 {
                     tracing::warn!("failed to persist knowledge graph: {e}");
@@ -397,12 +397,12 @@ impl CognitiveContextManager {
 
     /// List persisted knowledge-graph entities.
     pub async fn list_entities(&self) -> Result<Vec<crate::entity::Entity>> {
-        self.orchestrator.store().load_entities().await
+        self.orchestrator.store().load_entities(crate::store::KG_DEFAULT_SCOPE).await
     }
 
     /// List persisted knowledge-graph triples.
     pub async fn list_triples(&self) -> Result<Vec<crate::entity::Triple>> {
-        self.orchestrator.store().load_triples().await
+        self.orchestrator.store().load_triples(crate::store::KG_DEFAULT_SCOPE).await
     }
 
     /// Link a code symbol to a memory entry for impact analysis and symbol-

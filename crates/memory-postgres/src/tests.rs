@@ -441,7 +441,7 @@ async fn real_postgres_empty_knowledge_graph_snapshot_is_rejected() {
     let fixture = PostgresTestScope::new();
     let store = PostgresMemoryStore::new(fixture.reconnect()).expect("owned memory namespace");
     let error = store
-        .save_knowledge_graph(&[], &[])
+        .save_knowledge_graph(memory::store::KG_DEFAULT_SCOPE, &[], &[])
         .await
         .expect_err("an empty snapshot must be refused");
     assert!(

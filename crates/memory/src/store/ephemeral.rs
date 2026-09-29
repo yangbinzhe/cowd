@@ -531,24 +531,24 @@ impl MemoryStore for EphemeralMemoryStore {
             .collect())
     }
 
-    async fn save_entities(&self, values: &[Entity]) -> Result<()> {
+    async fn save_entities(&self, _scope_key: &str, values: &[Entity]) -> Result<()> {
         let mut s = self.write()?;
         for v in values {
             s.entities.insert(v.id.clone(), v.clone());
         }
         Ok(())
     }
-    async fn load_entities(&self) -> Result<Vec<Entity>> {
+    async fn load_entities(&self, _scope_key: &str) -> Result<Vec<Entity>> {
         Ok(self.read()?.entities.values().cloned().collect())
     }
-    async fn save_triples(&self, values: &[Triple]) -> Result<()> {
+    async fn save_triples(&self, _scope_key: &str, values: &[Triple]) -> Result<()> {
         let mut s = self.write()?;
         for v in values {
             s.triples.insert(v.id.clone(), v.clone());
         }
         Ok(())
     }
-    async fn load_triples(&self) -> Result<Vec<Triple>> {
+    async fn load_triples(&self, _scope_key: &str) -> Result<Vec<Triple>> {
         Ok(self.read()?.triples.values().cloned().collect())
     }
     async fn save_verbatim(

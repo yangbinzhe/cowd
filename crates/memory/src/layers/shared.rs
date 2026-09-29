@@ -483,19 +483,19 @@ impl crate::store::MemoryStore for NoopStore {
         Ok(Vec::new())
     }
 
-    async fn save_entities(&self, _entities: &[Entity]) -> crate::store::Result<()> {
+    async fn save_entities(&self, _scope_key: &str, _entities: &[Entity]) -> crate::store::Result<()> {
         Ok(())
     }
 
-    async fn load_entities(&self) -> crate::store::Result<Vec<Entity>> {
+    async fn load_entities(&self, _scope_key: &str) -> crate::store::Result<Vec<Entity>> {
         Ok(Vec::new())
     }
 
-    async fn save_triples(&self, _triples: &[Triple]) -> crate::store::Result<()> {
+    async fn save_triples(&self, _scope_key: &str, _triples: &[Triple]) -> crate::store::Result<()> {
         Ok(())
     }
 
-    async fn load_triples(&self) -> crate::store::Result<Vec<Triple>> {
+    async fn load_triples(&self, _scope_key: &str) -> crate::store::Result<Vec<Triple>> {
         Ok(Vec::new())
     }
 

@@ -6,6 +6,11 @@
 
 use async_trait::async_trait;
 
+/// Scope of the knowledge graph when the caller has no narrower one. It matches
+/// `MemoryScope::Global.scope_key()`, so pre-scope rows and scope-less callers
+/// keep the exact previous behaviour (PLAN W5 Step3).
+pub const KG_DEFAULT_SCOPE: &str = "global";
+
 use crate::{
     code_indexer::{CodeSymbol, SymbolEdge},
     entity::{Entity, Triple},
@@ -281,26 +286,32 @@ pub trait MemoryStore: Send + Sync {
     // Knowledge-graph persistence
     // -----------------------------------------------------------------------
 
-    /// Save all entities to persistent storage.
-    async fn save_entities(&self, entities: &[Entity]) -> Result<()>;
+    /// Save all entities of one scope. A scope's snapshot replace only affects
+    /// rows of that scope (PLAN W5 Step3).
+    async fn save_entities(&self, scope_key: &str, entities: &[Entity]) -> Result<()>;
 
-    /// Load all entities from persistent storage.
-    async fn load_entities(&self) -> Result<Vec<Entity>>;
+    /// Load all entities of one scope.
+    async fn load_entities(&self, scope_key: &str) -> Result<Vec<Entity>>;
 
-    /// Save all triples to persistent storage.
-    async fn save_triples(&self, triples: &[Triple]) -> Result<()>;
+    /// Save all triples of one scope.
+    async fn save_triples(&self, scope_key: &str, triples: &[Triple]) -> Result<()>;
 
-    /// Persist the whole knowledge graph (entities + triples) as one logical
-    /// snapshot. The default performs two independent writes; a backend that
-    /// shares a database should override this so the pair is atomic and
-    /// serialized (see `PostgresMemoryStore::save_knowledge_graph`).
-    async fn save_knowledge_graph(&self, entities: &[Entity], triples: &[Triple]) -> Result<()> {
-        self.save_entities(entities).await?;
-        self.save_triples(triples).await
+    /// Persist the whole knowledge graph of one scope (entities + triples) as
+    /// one logical snapshot. The default performs two independent writes; a
+    /// backend that shares a database should override this so the pair is atomic
+    /// and serialized (see `PostgresMemoryStore::save_knowledge_graph`).
+    async fn save_knowledge_graph(
+        &self,
+        scope_key: &str,
+        entities: &[Entity],
+        triples: &[Triple],
+    ) -> Result<()> {
+        self.save_entities(scope_key, entities).await?;
+        self.save_triples(scope_key, triples).await
     }
 
-    /// Load all triples from persistent storage.
-    async fn load_triples(&self) -> Result<Vec<Triple>>;
+    /// Load all triples of one scope.
+    async fn load_triples(&self, scope_key: &str) -> Result<Vec<Triple>>;
 
     // -----------------------------------------------------------------------
     // Verbatim sink (zero-loss raw storage)
