@@ -579,6 +579,12 @@ impl PostgresMemoryStore {
             .map_err(storage_memory_error)?;
         let mut transaction = connection.transaction().map_err(postgres_memory_error)?;
         transaction
+            .execute(
+                "SELECT pg_advisory_xact_lock(hashtext('cowd-memory:knowledge-graph'))",
+                &[],
+            )
+            .map_err(postgres_memory_error)?;
+        transaction
             .execute(delete_sql, &[])
             .map_err(postgres_memory_error)?;
         for value in values {
@@ -624,6 +630,73 @@ impl PostgresMemoryStore {
             .checkout_critical()
             .map_err(storage_memory_error)?;
         let mut transaction = connection.transaction().map_err(postgres_memory_error)?;
+        transaction
+            .execute(
+                "SELECT pg_advisory_xact_lock(hashtext('cowd-memory:knowledge-graph'))",
+                &[],
+            )
+            .map_err(postgres_memory_error)?;
+        transaction
+            .execute("DELETE FROM memory_triples", &[])
+            .map_err(postgres_memory_error)?;
+        for triple in triples {
+            let payload = serde_json::to_value(triple).map_err(json_memory_error)?;
+            transaction
+                .execute(
+                    "INSERT INTO memory_triples(id,subject_key,object_key,payload) VALUES($1,$2,$3,$4)",
+                    &[&triple.id, &triple.subject_id, &triple.object_id, &payload],
+                )
+                .map_err(postgres_memory_error)?;
+        }
+        transaction.commit().map_err(postgres_memory_error)?;
+        Ok(())
+    }
+
+    /// Persist entities and triples as one atomic, serialized snapshot.
+    ///
+    /// `save_entities` + `save_triples` are two independent transactions; under
+    /// a multi-connection pool two turn-end writers could interleave and one
+    /// could wipe the other's rows. Take the knowledge-graph advisory lock and
+    /// perform both replacements in a single transaction, and refuse an empty
+    /// snapshot so a load failure cannot silently clear durable state
+    /// (PLAN M-02 / W5 Step2).
+    fn replace_knowledge_graph(
+        &self,
+        entities: &[Entity],
+        triples: &[Triple],
+    ) -> MemoryResult<()> {
+        if entities.is_empty() && triples.is_empty() {
+            return Err(MemoryError::Store(
+                "refusing to replace the knowledge graph with an empty snapshot".to_string(),
+            ));
+        }
+        let mut connection = self
+            .executor
+            .checkout_critical()
+            .map_err(storage_memory_error)?;
+        let mut transaction = connection.transaction().map_err(postgres_memory_error)?;
+        transaction
+            .execute(
+                "SELECT pg_advisory_xact_lock(hashtext('cowd-memory:knowledge-graph'))",
+                &[],
+            )
+            .map_err(postgres_memory_error)?;
+        transaction
+            .execute("DELETE FROM memory_entities", &[])
+            .map_err(postgres_memory_error)?;
+        for entity in entities {
+            let payload = serde_json::to_value(entity).map_err(json_memory_error)?;
+            let id = payload
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| MemoryError::Store("durable entity has no id".to_string()))?;
+            transaction
+                .execute(
+                    "INSERT INTO memory_entities(id,payload) VALUES($1,$2)",
+                    &[&id, &payload],
+                )
+                .map_err(postgres_memory_error)?;
+        }
         transaction
             .execute("DELETE FROM memory_triples", &[])
             .map_err(postgres_memory_error)?;
@@ -1116,6 +1189,16 @@ impl MemoryStore for PostgresMemoryStore {
         let store = self.clone();
         let triples = triples.to_vec();
         run_memory_blocking(move || store.replace_triples(&triples)).await
+    }
+    async fn save_knowledge_graph(
+        &self,
+        entities: &[Entity],
+        triples: &[Triple],
+    ) -> MemoryResult<()> {
+        let store = self.clone();
+        let entities = entities.to_vec();
+        let triples = triples.to_vec();
+        run_memory_blocking(move || store.replace_knowledge_graph(&entities, &triples)).await
     }
     async fn load_triples(&self) -> MemoryResult<Vec<Triple>> {
         let store = self.clone();

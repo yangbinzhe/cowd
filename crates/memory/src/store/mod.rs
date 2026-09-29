@@ -290,6 +290,15 @@ pub trait MemoryStore: Send + Sync {
     /// Save all triples to persistent storage.
     async fn save_triples(&self, triples: &[Triple]) -> Result<()>;
 
+    /// Persist the whole knowledge graph (entities + triples) as one logical
+    /// snapshot. The default performs two independent writes; a backend that
+    /// shares a database should override this so the pair is atomic and
+    /// serialized (see `PostgresMemoryStore::save_knowledge_graph`).
+    async fn save_knowledge_graph(&self, entities: &[Entity], triples: &[Triple]) -> Result<()> {
+        self.save_entities(entities).await?;
+        self.save_triples(triples).await
+    }
+
     /// Load all triples from persistent storage.
     async fn load_triples(&self) -> Result<Vec<Triple>>;
 

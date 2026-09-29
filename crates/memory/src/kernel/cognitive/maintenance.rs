@@ -231,11 +231,16 @@ impl CognitiveContextManager {
                 (entities, triples)
             };
             if !entities.is_empty() || !triples.is_empty() {
-                if let Err(e) = self.orchestrator.store().save_entities(&entities).await {
-                    tracing::warn!("failed to persist KG entities: {}", e);
-                }
-                if let Err(e) = self.orchestrator.store().save_triples(&triples).await {
-                    tracing::warn!("failed to persist KG triples: {}", e);
+                // Persist entities + triples as one atomic, serialized snapshot
+                // so concurrent turn-end writers cannot interleave and wipe one
+                // another (PLAN M-02 / W5 Step2).
+                if let Err(e) = self
+                    .orchestrator
+                    .store()
+                    .save_knowledge_graph(&entities, &triples)
+                    .await
+                {
+                    tracing::warn!("failed to persist knowledge graph: {e}");
                 }
             }
         }

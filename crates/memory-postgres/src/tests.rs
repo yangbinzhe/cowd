@@ -432,3 +432,20 @@ async fn real_postgres_symbol_memory_link_is_idempotent_with_null_turn_index() {
         "a NULL turn_index must still deduplicate symbol->memory links"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+async fn real_postgres_empty_knowledge_graph_snapshot_is_rejected() {
+    // Regression for PLAN M-02 / W5 Step2: a failed/empty KG load must never
+    // silently clear durable entities/triples.
+    let fixture = PostgresTestScope::new();
+    let store = PostgresMemoryStore::new(fixture.reconnect()).expect("owned memory namespace");
+    let error = store
+        .save_knowledge_graph(&[], &[])
+        .await
+        .expect_err("an empty snapshot must be refused");
+    assert!(
+        error.to_string().contains("empty snapshot"),
+        "unexpected error: {error}"
+    );
+}
