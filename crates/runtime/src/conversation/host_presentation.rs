@@ -4765,6 +4765,7 @@ pub(super) fn completed_result(
     ExecutionNodeResult {
         status: ExecutionNodeStatus::Completed,
         result_ref,
+        wait_class: None,
         summary: None,
         evidence_refs: Vec::new(),
         failure: None,

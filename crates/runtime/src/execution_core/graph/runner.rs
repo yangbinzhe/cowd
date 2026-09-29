@@ -1535,6 +1535,7 @@ impl ExecutionGraphRunner {
                         // caller discards this result because the node is no longer running.
                         status: ExecutionNodeStatus::Cancelled,
                         result_ref: None,
+                        wait_class: None,
                         summary: None,
                         evidence_refs: Vec::new(),
                         failure: None,
@@ -1991,6 +1992,7 @@ impl ExecutionGraphRunner {
                 Some(ExecutionNodeResult {
                     status: ExecutionNodeStatus::Blocked,
                     result_ref: None,
+                    wait_class: None,
                     summary: None,
                     evidence_refs: Vec::new(),
                     failure: Some(harness_contract::execution_graph::ExecutionFailure {
@@ -2040,6 +2042,7 @@ impl ExecutionGraphRunner {
         let result = ExecutionNodeResult {
             status: terminal_status,
             result_ref: None,
+            wait_class: None,
             summary: None,
             evidence_refs: Vec::new(),
             failure: Some(harness_contract::execution_graph::ExecutionFailure {
@@ -2526,6 +2529,7 @@ fn deadline_exceeded_outcome(node_id: &str, deadline_at_ms: u64) -> NodeExecutio
     NodeExecutionOutcome::new(ExecutionNodeResult {
         status: ExecutionNodeStatus::Cancelled,
         result_ref: Some(format!("execution-deadline:{node_id}:{deadline_at_ms}")),
+        wait_class: None,
         summary: Some("Execution branch stopped at its durable wall-clock deadline".to_string()),
         evidence_refs: Vec::new(),
         failure: Some(harness_contract::execution_graph::ExecutionFailure {
@@ -2695,6 +2699,7 @@ fn failed_result(error: &NodeExecutorError) -> ExecutionNodeResult {
             ExecutionNodeStatus::Failed
         },
         result_ref: None,
+        wait_class: None,
         summary: None,
         evidence_refs: Vec::new(),
         failure: Some(harness_contract::execution_graph::ExecutionFailure {
@@ -2869,6 +2874,7 @@ mod dependency_policy_tests {
         ExecutionNodeResult {
             status: ExecutionNodeStatus::Failed,
             result_ref: Some("agent-return:run".to_string()),
+            wait_class: None,
             summary: Some("partial".to_string()),
             evidence_refs: vec![
                 durable_evidence("runtime_change", "receipt-1"),
@@ -3018,6 +3024,7 @@ mod dependency_policy_tests {
         let result = ExecutionNodeResult {
             status: ExecutionNodeStatus::Cancelled,
             result_ref: Some("agent-return:cancel".to_string()),
+            wait_class: None,
             summary: Some("partial evidence".to_string()),
             evidence_refs: vec![durable_evidence("evidence", "partial-1")],
             failure: None,
@@ -3187,6 +3194,7 @@ mod dependency_policy_tests {
             harness_contract::execution_graph::ExecutionNodeResult {
                 status: ExecutionNodeStatus::Completed,
                 result_ref: Some("answer".to_string()),
+                wait_class: None,
                 summary: None,
                 evidence_refs: Vec::new(),
                 failure: None,

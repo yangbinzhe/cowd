@@ -364,6 +364,7 @@ impl NodeExecutor for VerifyNodeExecutor {
                     "not_satisfied"
                 }
             )),
+            wait_class: None,
             summary: failure
                 .as_ref()
                 .map(|failure| failure.message.clone())
@@ -557,6 +558,7 @@ mod tests {
                 Some(ExecutionNodeResult {
                     status: ExecutionNodeStatus::Completed,
                     result_ref: None,
+                    wait_class: None,
                     summary: Some("Verification fixture completed".to_string()),
                     evidence_refs: vec![evidence("proof")],
                     failure: None,
@@ -649,6 +651,7 @@ mod tests {
                 Some(ExecutionNodeResult {
                     status: ExecutionNodeStatus::Failed,
                     result_ref: None,
+                    wait_class: None,
                     summary: None,
                     evidence_refs: vec![evidence("failure-proof")],
                     failure: Some(ExecutionFailure {
@@ -718,6 +721,7 @@ mod tests {
         let mut result = ExecutionNodeResult {
             status: ExecutionNodeStatus::Completed,
             result_ref: Some("agent-return:reviewer".to_string()),
+            wait_class: None,
             summary: Some("reviewed".to_string()),
             evidence_refs: vec![shared.clone()],
             failure: None,
@@ -774,6 +778,7 @@ mod tests {
         let mut result = ExecutionNodeResult {
             status: ExecutionNodeStatus::Completed,
             result_ref: Some("agent-return:researcher".to_string()),
+            wait_class: None,
             summary: Some("source-backed artifact".to_string()),
             evidence_refs: vec![evidence("new-audit-artifact")],
             failure: None,
@@ -822,6 +827,7 @@ mod tests {
         let mut result = ExecutionNodeResult {
             status: ExecutionNodeStatus::Completed,
             result_ref: Some("agent-return:reducer".to_string()),
+            wait_class: None,
             summary: Some("synthesized only from the handoff".to_string()),
             evidence_refs: vec![handed_off.clone()],
             failure: None,

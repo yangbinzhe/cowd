@@ -249,6 +249,7 @@ mod tests {
         let mut outcome = NodeExecutionOutcome::new(ExecutionNodeResult {
             status: ExecutionNodeStatus::Completed,
             result_ref: Some("assistant_json:\"answer\"".to_string()),
+            wait_class: None,
             summary: Some("answer".to_string()),
             evidence_refs: Vec::new(),
             failure: None,

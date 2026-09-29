@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::context::{ContextBudgetLeaseRef, EvidenceAccessRef};
 use crate::outcome::{DeliveryEnvelope, TerminalPresentation};
+pub(crate) use super::external_wait::ExternalWaitClass;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -442,6 +443,12 @@ pub struct ExecutionUsage {
 pub struct ExecutionNodeResult {
     pub status: ExecutionNodeStatus,
     pub result_ref: Option<String>,
+    /// How the external-wait authority of this result is established. Only a
+    /// `WaitingExternal` result carries it: `Barrier` is structural (frozen
+    /// children + same-generation receipts), `Authoritative` is anchored on a
+    /// durable subject that a resolution must reproduce (PLAN W1 / C4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_class: Option<ExternalWaitClass>,
     /// Lossless semantic outcome for downstream collaborators. Raw model traces
     /// and complete tool payloads remain in evidence storage and are referenced
     /// through `evidence_refs`; the authored result contract itself is never

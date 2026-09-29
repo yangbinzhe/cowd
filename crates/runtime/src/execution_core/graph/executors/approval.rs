@@ -314,6 +314,7 @@ impl NodeExecutor for ApprovalNodeExecutor {
         Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
             status,
             result_ref: Some(approval_id),
+            wait_class: None,
             summary: failure
                 .as_ref()
                 .map(|failure| failure.message.clone())

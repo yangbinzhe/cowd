@@ -385,6 +385,7 @@ impl NodeExecutor for AgentTaskExecutor {
                     ""
                 }
             )),
+            wait_class: None,
             summary: (!returned.outcome.trim().is_empty())
                 .then(|| canonical_semantic_summary(&returned.outcome)),
             evidence_refs,

@@ -69,6 +69,7 @@ impl ScopedNodeBackend for GatewayConnectorServiceExecutor {
                     reason: error.to_string(),
                 }
             })?),
+            wait_class: None,
             summary: Some(format!(
                 "Cross-plane operation completed with status {status:?}"
             )),
@@ -239,6 +240,7 @@ fn node_result_from_dispatch(
                 reason: error.to_string(),
             }
         })?),
+        wait_class: None,
         summary: Some(format!(
             "Cross-plane connector completed with status {status:?}"
         )),

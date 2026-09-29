@@ -398,6 +398,7 @@ mod tests {
             Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
                 status: ExecutionNodeStatus::Completed,
                 result_ref: None,
+                wait_class: None,
                 summary: None,
                 evidence_refs: vec![],
                 failure: None,

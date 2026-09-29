@@ -610,6 +610,7 @@ impl NodeExecutor for EvidenceExecutor {
         Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
             status: ExecutionNodeStatus::Completed,
             result_ref: Some(format!("source-result:{}", ticket.node_id)),
+            wait_class: None,
             summary: Some("source completed".to_string()),
             evidence_refs,
             failure: None,
@@ -648,6 +649,7 @@ impl super::executors::SynthesizeBackend for TerminalBackend {
         Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
             status: ExecutionNodeStatus::Completed,
             result_ref: Some(format!("terminal:{}", ticket.graph_id)),
+            wait_class: None,
             summary: Some("terminal completed".to_string()),
             evidence_refs: Vec::new(),
             failure: None,
@@ -814,6 +816,7 @@ fn completed_result(id: &str) -> ExecutionNodeResult {
     ExecutionNodeResult {
         status: ExecutionNodeStatus::Completed,
         result_ref: Some(format!("result:{id}")),
+        wait_class: None,
         summary: Some(format!("result {id}")),
         evidence_refs: Vec::new(),
         failure: None,
@@ -1226,6 +1229,7 @@ async fn evidence_ready_reviewer_runs_on_failed_facts_and_never_rewrites_predece
             Some(ExecutionNodeResult {
                 status: ExecutionNodeStatus::Failed,
                 result_ref: Some("agent-return:run".to_string()),
+                wait_class: None,
                 summary: Some("implementer failed but evidence is durable".to_string()),
                 evidence_refs: vec![EvidenceAccessRef::durable(
                     EvidenceRef::observed("evidence", "proof-1"),

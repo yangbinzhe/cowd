@@ -97,6 +97,7 @@ use super::*;
                 harness_contract::execution_graph::ExecutionNodeResult {
                     status: harness_contract::execution_graph::ExecutionNodeStatus::Completed,
                     result_ref: Some(format!("cross-plane-sent:{}", ticket.node_id)),
+                    wait_class: None,
                     summary: Some("Cross-plane fixture completed".to_string()),
                     evidence_refs: Vec::new(),
                     failure: None,
@@ -149,6 +150,7 @@ use super::*;
                 harness_contract::execution_graph::ExecutionNodeResult {
                     status: harness_contract::execution_graph::ExecutionNodeStatus::Completed,
                     result_ref: Some(format!("tool-result:{}", ticket.node_id)),
+                    wait_class: None,
                     summary: Some("Tool fixture completed".to_string()),
                     evidence_refs: Vec::new(),
                     failure: None,

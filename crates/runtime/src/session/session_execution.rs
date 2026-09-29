@@ -415,6 +415,7 @@ impl NodeExecutor for SessionDispatchNodeExecutor {
                     ExecutionNodeStatus::Completed
                 },
                 result_ref: Some(routed.clone()),
+                wait_class: None,
                 summary: Some("Session input was routed to the target execution graph".to_string()),
                 failure: None,
                 usage: Default::default(),
@@ -1837,6 +1838,7 @@ mod tests {
             Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
                 status: ExecutionNodeStatus::Completed,
                 result_ref: Some(format!("durable-target-result:{}", ticket.graph_id)),
+                wait_class: None,
                 summary: Some("Durable target graph completed".to_string()),
                 evidence_refs: Vec::new(),
                 failure: None,

@@ -222,9 +222,12 @@ impl NodeExecutor for AgenticProgramWaitExecutor {
                 ),
             ),
         };
+        let wait_class = (status == ExecutionNodeStatus::WaitingExternal)
+            .then_some(harness_contract::execution_graph::ExternalWaitClass::Barrier);
         Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
             status,
             result_ref: Some(result_ref),
+            wait_class,
             summary: Some(summary),
             evidence_refs: Vec::new(),
             failure: None,

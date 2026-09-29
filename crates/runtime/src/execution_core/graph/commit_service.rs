@@ -1508,10 +1508,21 @@ impl ExecutionCommitService {
                     .node_results
                     .get(node_id)
                     .and_then(|result| result.result_ref.clone());
+                // Class A (barrier) is structurally authorised; anything else
+                // must have declared an authoritative wait class (PLAN W1 / C4).
+                let wait_class = next
+                    .node_results
+                    .get(node_id)
+                    .and_then(|result| result.wait_class);
                 if !harness_contract::execution_graph::WAITING_EXTERNAL_EXECUTOR_KINDS
                     .contains(&node_kind)
                     || correlation_id.trim().is_empty()
                     || parked.is_none()
+                    || wait_class.is_none_or(|class| {
+                        class != harness_contract::execution_graph::ExternalWaitClass::Barrier
+                            && class
+                                != harness_contract::execution_graph::ExternalWaitClass::Authoritative
+                    })
                 {
                     return Err(ExecutionCommitError::InvalidCommand(format!(
                         "node `{node_id}` is not a resolvable external wait"
@@ -1548,6 +1559,7 @@ impl ExecutionCommitService {
                     ExecutionNodeResult {
                         status: ExecutionNodeStatus::Completed,
                         result_ref: Some(result_ref.clone()),
+                        wait_class: None,
                         summary: None,
                         evidence_refs: Vec::new(),
                         failure: None,

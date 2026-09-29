@@ -1897,6 +1897,9 @@ mod completion_pump_tests {
                 return Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
                     status: ExecutionNodeStatus::WaitingExternal,
                     result_ref: Some("external:pending".to_string()),
+                    wait_class: Some(
+                        harness_contract::execution_graph::ExternalWaitClass::Barrier,
+                    ),
                     summary: None,
                     evidence_refs: Vec::new(),
                     failure: None,
@@ -1931,6 +1934,7 @@ mod completion_pump_tests {
             Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
                 status: ExecutionNodeStatus::Completed,
                 result_ref: Some(format!("result:{}", ticket.node_id)),
+                wait_class: None,
                 summary: None,
                 evidence_refs: Vec::new(),
                 failure: None,

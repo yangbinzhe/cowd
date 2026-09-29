@@ -1599,6 +1599,7 @@ impl super::super::graph::ScopedNodeBackend for ServiceScopedBackend {
             harness_contract::execution_graph::ExecutionNodeResult {
                 status: harness_contract::execution_graph::ExecutionNodeStatus::Completed,
                 result_ref: Some(format!("service-result:{}", ticket.node_id)),
+                wait_class: None,
                 summary: Some("service backend completed".to_string()),
                 evidence_refs: Vec::new(),
                 failure: None,

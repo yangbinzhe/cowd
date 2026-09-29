@@ -815,6 +815,7 @@ mod tests {
             ExecutionNodeResult {
                 status: ExecutionNodeStatus::Completed,
                 result_ref: Some("execution-result:summary".to_string()),
+                wait_class: None,
                 summary: Some("S".repeat(8_000)),
                 evidence_refs: Vec::new(),
                 failure: Some(ExecutionFailure {
@@ -890,7 +891,8 @@ mod tests {
                 ExecutionNodeResult {
                     status: ExecutionNodeStatus::Completed,
                     result_ref: Some(format!("artifact://agent-{index}")),
-                    summary: Some("S".repeat(1_000_000)),
+                    wait_class: None,
+                                        summary: Some("S".repeat(1_000_000)),
                     evidence_refs: Vec::new(),
                     failure: None,
                     usage: ExecutionUsage::default(),
@@ -1783,7 +1785,7 @@ mod tests {
                             result_kind: harness_contract::goal::GoalResultKind::Artifact,
                             effect_observation_refs: vec![],
                             result_ref: final_artifact.clone(),
-                            content_ref: "artifact://projection-fixture".into(),
+                                                        content_ref: "artifact://projection-fixture".into(),
                             sha256: "projection-fixture-hash".into(),
                             bytes: 1,
                             receipt_refs: vec!["fixture:read".into()],

@@ -383,6 +383,7 @@ impl NodeExecutor for MaterializeNodeExecutor {
         Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
             status: ExecutionNodeStatus::Completed,
             result_ref: Some(format!("materialization-receipt:{receipt_json}")),
+            wait_class: None,
             summary: Some(receipt_json),
             evidence_refs: evidence,
             failure: None,
@@ -406,6 +407,7 @@ fn blocked(
     NodeExecutionOutcome::new(ExecutionNodeResult {
         status: ExecutionNodeStatus::Blocked,
         result_ref: source_ref,
+        wait_class: None,
         summary: Some(format!(
             "materialization of `{}` to `{}` was not applied: {message}",
             request.artifact_kind, request.target_path
@@ -470,6 +472,7 @@ mod tests {
         ExecutionNodeResult {
             status: ExecutionNodeStatus::Completed,
             result_ref: Some("assistant_json:{\"report\":\"hello materializer\"}".to_string()),
+            wait_class: None,
             summary: Some("hello materializer\n".to_string()),
             evidence_refs: Vec::new(),
             failure: None,

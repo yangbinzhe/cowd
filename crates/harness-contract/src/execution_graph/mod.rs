@@ -67,6 +67,7 @@ mod tests {
             ExecutionNodeResult {
                 status: ExecutionNodeStatus::Completed,
                 result_ref: Some("result:inspect".to_string()),
+                wait_class: None,
                 summary: Some("inspection complete".to_string()),
                 evidence_refs: Vec::new(),
                 failure: None,

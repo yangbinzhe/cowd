@@ -296,6 +296,7 @@ impl ScopedNodeBackend for AgentToolBatchBackend {
         Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
             status: ExecutionNodeStatus::Completed,
             result_ref: Some(format!("agent-tool-outcome:{encoded}")),
+            wait_class: None,
             summary: None,
             evidence_refs: vec![],
             failure: None,
