@@ -846,6 +846,13 @@ pub enum AssistantEvent {
     },
     Usage(TokenUsage),
     MessageStop,
+    /// Provider terminal reason for the current message (e.g. `end_turn` vs
+    /// `length`). Forwarded so the runtime can tell a normal finish from a
+    /// max-token truncation (PLAN W2 Step1). It does not itself end the step;
+    /// `MessageStop` does.
+    MessageBoundary {
+        stop_reason: Option<String>,
+    },
     /// P0-2: Tool execution lifecycle events for real-time SSE visualization
     ToolStart {
         id: String,
@@ -881,6 +888,7 @@ fn assistant_event_is_semantic(event: &AssistantEvent) -> bool {
         AssistantEvent::ToolUse { .. }
         | AssistantEvent::Usage(_)
         | AssistantEvent::MessageStop
+        | AssistantEvent::MessageBoundary { .. }
         | AssistantEvent::ToolStart { .. }
         | AssistantEvent::ToolProgress { .. }
         | AssistantEvent::ToolComplete { .. } => true,
@@ -1431,6 +1439,7 @@ impl ModelStreamReducer {
                 self.complete_incomplete_items()?;
                 true
             }
+            AssistantEvent::MessageBoundary { .. } => false,
             AssistantEvent::ToolStart { .. }
             | AssistantEvent::ToolProgress { .. }
             | AssistantEvent::ToolComplete { .. } => false,

@@ -322,6 +322,7 @@ fn event_kind_counts(
             runtime::AssistantEvent::ToolUse { .. } => "tool_use",
             runtime::AssistantEvent::Usage(_) => "usage",
             runtime::AssistantEvent::MessageStop => "message_stop",
+            runtime::AssistantEvent::MessageBoundary { .. } => "message_boundary",
             runtime::AssistantEvent::ToolStart { .. } => "tool_start",
             runtime::AssistantEvent::ToolProgress { .. } => "tool_progress",
             runtime::AssistantEvent::ToolComplete { .. } => "tool_complete",

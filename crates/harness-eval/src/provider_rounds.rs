@@ -156,6 +156,9 @@ fn provider_event_json(event: &runtime::AssistantEvent) -> Value {
             })
         }
         runtime::AssistantEvent::MessageStop => json!({"kind": "message_stop"}),
+        runtime::AssistantEvent::MessageBoundary { stop_reason } => {
+            json!({"kind": "message_boundary", "stop_reason": stop_reason})
+        }
         runtime::AssistantEvent::ToolStart { id, name, preview } => {
             json!({"kind": "tool_start", "id": id, "name": name, "preview": preview})
         }

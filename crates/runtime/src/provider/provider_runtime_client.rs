@@ -1719,6 +1719,24 @@ async fn forward_provider_stream(
                     *attempt_usage = Some(usage);
                     *attempt_cache_dimensions_observed |= delta.cache_dimensions_observed;
                 }
+                // Forward the provider's terminal reason when present so the
+                // runtime can distinguish a normal finish from a max-token
+                // truncation (PLAN W2 Step1). Emitted only on `stop_reason`.
+                if let Some(stop_reason) = delta.delta.stop_reason.clone() {
+                    if !forward_event(
+                        sender,
+                        AssistantEvent::MessageBoundary {
+                            stop_reason: Some(stop_reason),
+                        },
+                        emit_output,
+                        &stream_callback,
+                        &mut emitted,
+                    )
+                    .await
+                    {
+                        return Ok(ForwardedProviderStream::ConsumerDropped);
+                    }
+                }
             }
             ApiStreamEvent::MessageStop(_) => {
                 if !flush_pending_text(
