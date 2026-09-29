@@ -399,3 +399,36 @@ fn real_postgres_knowledge_roundtrip_and_usage_persist_across_reopen() {
     assert_eq!(snapshot.usage.len(), 1);
     assert_eq!(snapshot.usage[0].signal_id, signal.signal_id);
 }
+
+#[tokio::test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+async fn real_postgres_symbol_memory_link_is_idempotent_with_null_turn_index() {
+    // Regression for PLAN M-02 / W5 Step1: a plain unique index treats NULL as
+    // distinct, so `ON CONFLICT DO NOTHING` silently no-ops and duplicate rows
+    // accumulate whenever turn_index is None (the HTTP/default path).
+    let fixture = PostgresTestScope::new();
+    let marker = uuid::Uuid::new_v4().simple().to_string();
+    let store = PostgresMemoryStore::new(fixture.reconnect()).expect("owned memory namespace");
+    let id = uuid::Uuid::new_v4();
+    store.insert(&memory_entry(id, &marker)).await.unwrap();
+    let symbol = format!("symbol-{marker}");
+    store
+        .link_symbol_to_memory(&symbol, &id, None, "test", 1)
+        .await
+        .unwrap();
+    store
+        .link_symbol_to_memory(&symbol, &id, None, "test", 2)
+        .await
+        .unwrap();
+    let linked = store
+        .list_symbol_memory_references()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|reference| reference.symbol_id == symbol && reference.memory_id == id)
+        .count();
+    assert_eq!(
+        linked, 1,
+        "a NULL turn_index must still deduplicate symbol->memory links"
+    );
+}

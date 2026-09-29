@@ -177,6 +177,31 @@ const MEMORY_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
         "CREATE TRIGGER memory_discovery_lifecycle_revision AFTER INSERT OR UPDATE OR DELETE ON memory_kv FOR EACH ROW EXECUTE FUNCTION memory_discovery_lifecycle_changed()",
         "CREATE INDEX IF NOT EXISTS idx_memory_discovery_scope_id ON memory_entries(scope_key,id)",
     ],
+}, PostgresMigrationSpec {
+    id: "memory.0006.knowledge-dedup",
+    domain: MEMORY_DOMAIN,
+    version: 6,
+    description: "deduplicate code edges / symbol references and enforce logical uniqueness",
+    statements: &[
+        // Remove historical duplicates, keeping the lowest surrogate key.
+        "DELETE FROM memory_code_edges a USING memory_code_edges b
+         WHERE a.edge_id > b.edge_id
+           AND a.source_id = b.source_id AND a.target_id = b.target_id
+           AND a.edge_type = b.edge_type AND a.file_path = b.file_path",
+        "DELETE FROM memory_symbol_references a USING memory_symbol_references b
+         WHERE a.reference_id > b.reference_id
+           AND a.symbol_id = b.symbol_id AND a.memory_id = b.memory_id
+           AND COALESCE(a.turn_index, -1) = COALESCE(b.turn_index, -1)
+           AND COALESCE(a.reference_type, '') = COALESCE(b.reference_type, '')",
+        // Logical uniqueness. The symbol-reference key is expression-based so a
+        // NULL turn_index/reference_type still collides: a plain unique index
+        // treats NULLs as distinct, which is exactly how `ON CONFLICT` silently
+        // no-ops and rows accumulate (PLAN M-02 / W5 Step1).
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_code_edges_logical
+            ON memory_code_edges(source_id, target_id, edge_type, file_path)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_symbol_refs_logical
+            ON memory_symbol_references(symbol_id, memory_id, COALESCE(turn_index, -1), COALESCE(reference_type, ''))",
+    ],
 }];
 
 const KNOWLEDGE_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
@@ -1164,7 +1189,7 @@ impl MemoryStore for PostgresMemoryStore {
         let edge = edge.clone();
         run_memory_blocking(move || {
             let mut connection = store.executor.checkout_critical().map_err(storage_memory_error)?;
-            connection.execute("INSERT INTO memory_code_edges(source_id,target_id,edge_type,file_path) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING", &[&edge.source_id,&edge.target_id,&edge.edge_type.as_str(),&edge.file_path]).map_err(postgres_memory_error)?;
+            connection.execute("INSERT INTO memory_code_edges(source_id,target_id,edge_type,file_path) VALUES($1,$2,$3,$4) ON CONFLICT (source_id,target_id,edge_type,file_path) DO NOTHING", &[&edge.source_id,&edge.target_id,&edge.edge_type.as_str(),&edge.file_path]).map_err(postgres_memory_error)?;
             Ok(())
         }).await
     }
@@ -1209,7 +1234,7 @@ impl MemoryStore for PostgresMemoryStore {
         let reference_type = reference_type.to_string();
         run_memory_blocking(move || {
             let mut connection = store.executor.checkout_critical().map_err(storage_memory_error)?;
-            connection.execute("INSERT INTO memory_symbol_references(symbol_id,memory_id,turn_index,reference_type,timestamp) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING", &[&symbol_id,&memory_id,&turn_index,&reference_type,&timestamp]).map_err(postgres_memory_error)?;
+            connection.execute("INSERT INTO memory_symbol_references(symbol_id,memory_id,turn_index,reference_type,timestamp) VALUES($1,$2,$3,$4,$5) ON CONFLICT (symbol_id, memory_id, COALESCE(turn_index, -1), COALESCE(reference_type, '')) DO NOTHING", &[&symbol_id,&memory_id,&turn_index,&reference_type,&timestamp]).map_err(postgres_memory_error)?;
             Ok(())
         }).await
     }
