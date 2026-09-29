@@ -1646,6 +1646,13 @@ async fn consume_provider_stream_with_activity(
             .checked_add(policy.idle.saturating_add(policy.heartbeat_grace))
             .unwrap_or_else(Instant::now)
     });
+    // Raw content that never reaches a step boundary (tool call / terminal) is
+    // the one pattern a peer can use to stream forever: refresh the idle window
+    // with non-empty deltas but make no syntactically meaningful progress. Bound
+    // it per attempt (generously above any legitimate single-step output) so such
+    // a stream fails instead of running without bound (PLAN W2 Step2 / N1).
+    const MAX_UNBOUNDED_CONTENT_BYTES: u64 = 8 * 1024 * 1024;
+    let mut unbounded_content_bytes: u64 = 0;
     loop {
         let next = if let Some(policy) = timeout_policy {
             loop {
@@ -1724,6 +1731,29 @@ async fn consume_provider_stream_with_activity(
         };
         match event {
             Ok(event) => {
+                // Accumulate raw content until a step boundary resets it. A peer
+                // cannot keep a step alive with content alone (PLAN W2 Step2).
+                match &event {
+                    AssistantEvent::TextDelta(text)
+                    | AssistantEvent::ReasoningSummaryDelta(text)
+                    | AssistantEvent::PrivateReasoningDelta(text) => {
+                        unbounded_content_bytes =
+                            unbounded_content_bytes.saturating_add(text.len() as u64);
+                    }
+                    AssistantEvent::ToolUse { .. } | AssistantEvent::MessageStop => {
+                        unbounded_content_bytes = 0;
+                    }
+                    _ => {}
+                }
+                if unbounded_content_bytes > MAX_UNBOUNDED_CONTENT_BYTES {
+                    resource_result_class =
+                        crate::execution_core::graph::ResourceResultClass::Failed;
+                    failure = Some(RuntimeError::new(format!(
+                        "provider stream exceeded {} MiB of content without a step boundary",
+                        MAX_UNBOUNDED_CONTENT_BYTES / (1024 * 1024)
+                    )));
+                    break;
+                }
                 // Only semantic progress refreshes the idle deadline. Empty
                 // lifecycle frames (content_block_stop / message_start / item
                 // boundaries) must not keep a stalled stream alive (PLAN C6-1).

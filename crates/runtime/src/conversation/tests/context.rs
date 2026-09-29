@@ -3406,3 +3406,30 @@
         assert_eq!(omitted.len(), 1);
         assert!(omitted[0].reason.contains("cross-Session"));
     }
+
+#[tokio::test]
+async fn consume_provider_stream_fails_unbounded_content_without_a_step_boundary() {
+    // A peer can stream non-empty deltas forever without ever producing a tool
+    // call or a terminal; the per-attempt content bound must fail the stream
+    // instead of letting it run without bound (PLAN W2 Step2).
+    let chunk = "x".repeat(1024);
+    let events: Vec<Result<AssistantEvent, RuntimeError>> = (0..(9 * 1024))
+        .map(|_| Ok(AssistantEvent::TextDelta(chunk.clone())))
+        .collect();
+    let stream = Box::pin(futures::stream::iter(events));
+    let result = consume_provider_stream(
+        stream,
+        CancellationToken::new(),
+        None,
+        ModelStreamReducer::new(None, None, "session-unbounded".to_string()),
+        None,
+    )
+    .await;
+    let failure = result
+        .failure
+        .expect("unbounded content must fail the stream");
+    assert!(
+        failure.to_string().contains("without a step boundary"),
+        "unexpected failure: {failure}"
+    );
+}
