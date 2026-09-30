@@ -318,6 +318,16 @@ pub struct ProviderRuntimeClient {
     execution_supervisor: Option<std::sync::Weak<crate::RuntimeExecutionSupervisor>>,
     provider_wire_evidence_writer: Option<Arc<dyn ProviderWireEvidenceWriter>>,
     prompt_history: Arc<std::sync::Mutex<ProviderPromptHistory>>,
+    /// PLAN D1b: how long a provider stream may go without semantic progress
+    /// before a probe is warranted, and how many probes are allowed. The wall
+    /// clock is deliberately absent: a long healthy generation is never
+    /// interrupted.
+    liveness_contract: crate::liveness::LivenessContract,
+    /// Optional probe notification so the turn owner can record the reaction
+    /// (retry the same nonce / fail over / escalate).
+    liveness_probe_sink: Option<
+        Arc<dyn Fn(crate::liveness::LivenessVerdict) + Send + Sync + 'static>,
+    >,
 }
 
 #[derive(Clone)]
@@ -496,6 +506,8 @@ impl ProviderRuntimeClient {
             execution_supervisor: None,
             provider_wire_evidence_writer: None,
             prompt_history: Arc::new(std::sync::Mutex::new(ProviderPromptHistory::default())),
+            liveness_contract: crate::liveness::LivenessContract::default(),
+            liveness_probe_sink: None,
         })
     }
 
@@ -913,8 +925,31 @@ impl ProviderRuntimeClient {
     ) -> Pin<
         Box<dyn futures::stream::Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>,
     > {
-        self.stream_with_activity_and_provider_snapshot(request, provider_snapshot)
-            .events
+        let contract = self.liveness_contract.clone();
+        let probe_sink = self.liveness_probe_sink.clone();
+        let events = self
+            .stream_with_activity_and_provider_snapshot(request, provider_snapshot)
+            .events;
+        // PLAN D1b: guard the provider stream so a request that connects and
+        // then goes silent is reported as a typed failure instead of hanging
+        // until the evaluator's wall clock. Detection lives here; the reaction
+        // (retry the same nonce / fail over / escalate) stays with the turn
+        // owner, which is why this only records the probe.
+        Box::pin(crate::liveness::guard_liveness(
+            events,
+            contract,
+            move |verdict| {
+                if let Some(sink) = probe_sink.as_ref() {
+                    sink(verdict);
+                }
+            },
+            |idle, probes| {
+                RuntimeError::new(format!(
+                    "{} after {idle:?} ({probes} probes); the provider accepted the connection but produced no semantic progress",
+                    crate::liveness::PROVIDER_SILENT_PREFIX
+                ))
+            },
+        ))
     }
 
     fn stream_with_activity_and_provider_snapshot(

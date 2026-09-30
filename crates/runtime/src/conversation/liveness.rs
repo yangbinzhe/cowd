@@ -374,18 +374,18 @@ pub fn guard_liveness<S, T, E, F, G>(
     make_silent_error: G,
 ) -> impl futures::Stream<Item = Result<T, E>>
 where
-    S: futures::Stream<Item = Result<T, E>> + Send + 'static,
-    T: Send + 'static,
-    E: Send + 'static,
-    F: FnMut(LivenessVerdict) + Send + 'static,
-    G: FnOnce(Duration, u32) -> E + Send + 'static,
+    // No `'static` bound: the provider event stream borrows its client, and a
+    // borrowed stream must stay guardable rather than forced to be owned.
+    S: futures::Stream<Item = Result<T, E>>,
+    F: FnMut(LivenessVerdict),
+    G: FnOnce(Duration, u32) -> E,
 {
     let tracker = LivenessTracker::new(contract);
     // (stream, tracker, pending idle) — the probe callback and the one-shot
     // silent-error factory are moved into the fold state so the closure stays
     // a plain `FnMut` that never moves them out of its captured environment.
     let state = (
-        Box::pin(stream) as std::pin::Pin<Box<dyn futures::Stream<Item = Result<T, E>> + Send>>,
+        Box::pin(stream),
         tracker,
         None::<Duration>,
         Some(on_probe),
