@@ -470,7 +470,25 @@ fn run_read_file(lease: &ToolHostLease, input: ReadFileInput) -> Result<String, 
 }
 
 #[allow(clippy::needless_pass_by_value)]
+/// Maximum items one flat batch tool call may enqueue in a single request.
+///
+/// Matches the orchestration engine's own per-step item limit, so the two batch
+/// surfaces behave the same, and stops one call from enqueuing unbounded work
+/// while only `max_concurrency` of it can run at a time.
+const MAX_BATCH_ITEMS: usize = 200;
+
+fn require_batch_bound(tool: &str, items: usize) -> Result<(), String> {
+    if items > MAX_BATCH_ITEMS {
+        return Err(format!(
+            "{tool} accepts at most {MAX_BATCH_ITEMS} items per call; this call has {items}. \
+             Split it into several calls, or use tool_orchestrate whose map step fans out the same way."
+        ));
+    }
+    Ok(())
+}
+
 fn run_read_many(lease: &ToolHostLease, input: ReadManyInput) -> Result<String, String> {
+    require_batch_bound("read_many", input.files.len())?;
     let results = run_ordered_batch(input.files, input.max_concurrency, |item| {
         let output = run_read_file(lease, item)?;
         serde_json::from_str(&output).or(Ok(Value::String(output)))
@@ -621,6 +639,7 @@ fn run_glob_search(lease: &ToolHostLease, input: GlobSearchInputValue) -> Result
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_glob_many(lease: &ToolHostLease, input: GlobManyInput) -> Result<String, String> {
+    require_batch_bound("glob_many", input.patterns.len())?;
     let results = run_ordered_batch(input.patterns, input.max_concurrency, |item| {
         let output = run_glob_search(lease, item)?;
         serde_json::from_str(&output).or(Ok(Value::String(output)))
@@ -635,6 +654,7 @@ fn run_grep_search(lease: &ToolHostLease, input: GrepSearchInput) -> Result<Stri
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_grep_many(lease: &ToolHostLease, input: GrepManyInput) -> Result<String, String> {
+    require_batch_bound("grep_many", input.searches.len())?;
     let results = run_ordered_batch(input.searches, input.max_concurrency, |item| {
         let output = run_grep_search(lease, item)?;
         serde_json::from_str(&output).or(Ok(Value::String(output)))
@@ -742,6 +762,7 @@ fn run_tool_batch_readonly(
     lease: &ToolHostLease,
     input: ToolBatchReadonlyInput,
 ) -> Result<String, String> {
+    require_batch_bound("tool_batch_readonly", input.calls.len())?;
     for call in &input.calls {
         if !is_allowed_readonly_batch_tool(&call.name) {
             return Err(format!(

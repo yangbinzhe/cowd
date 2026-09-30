@@ -2121,3 +2121,23 @@ fn tool_orchestrate_supports_filter_when_and_repeat() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+/// The flat batch tools declare and enforce the same per-call item bound as the
+/// orchestration engine's per-step limit, so one call cannot enqueue unbounded
+/// work while only `max_concurrency` of it can run at a time.
+#[test]
+fn flat_batch_tools_refuse_more_items_than_the_bound() {
+    let files = (0..201)
+        .map(|index| json!({ "path": format!("f{index}.txt") }))
+        .collect::<Vec<_>>();
+    let error = execute_tool("read_many", &json!({ "files": files }))
+        .expect_err("a read_many over the item bound must be refused");
+    assert!(error.contains("at most 200"), "{error}");
+
+    let calls = (0..201)
+        .map(|index| json!({ "name": "read_file", "input": { "path": format!("f{index}.txt") } }))
+        .collect::<Vec<_>>();
+    let error = execute_tool("tool_batch_readonly", &json!({ "calls": calls }))
+        .expect_err("a tool_batch_readonly over the item bound must be refused");
+    assert!(error.contains("at most 200"), "{error}");
+}

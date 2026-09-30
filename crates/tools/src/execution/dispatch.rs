@@ -85,27 +85,6 @@ pub(crate) fn execute_with_lease(
                 opts.map(|o| format!("\nOptions: {o}")).unwrap_or_default()
             ))
         }
-        "ast_search" => {
-            let parsed = serde_json::from_value::<AstGrepSearchInput>(input.clone()).unwrap_or(
-                AstGrepSearchInput {
-                    pattern: input
-                        .get("pattern")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    language: input
-                        .get("language")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("rust")
-                        .to_string(),
-                    path: None,
-                    case_sensitive: false,
-                    max_files: 200,
-                    max_matches: 50,
-                },
-            );
-            run_ast_grep_search(lease, parsed)
-        }
         "tool_search" => {
             from_value::<ToolSearchInput>(input).and_then(|parsed| run_tool_search(lease, parsed))
         }

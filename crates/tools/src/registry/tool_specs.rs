@@ -17,11 +17,13 @@ pub struct ToolSpec {
 #[must_use]
 pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
     let resolver_id = match normalize_tool_name(name).as_str() {
-        "bash" | "powershell" | "power_shell" | "repl" => "builtin.command",
-        // `execute_code` always enters the kernel-hardened workspace sandbox
-        // with a bounded timeout/output budget.  It must not inherit the
-        // arbitrary host-shell descriptor used by `bash`.
-        "execute_code" => "builtin.sandboxed_command",
+        "bash" | "powershell" | "power_shell" => "builtin.command",
+        // `execute_code` and `repl` always enter the kernel-hardened workspace
+        // sandbox with a bounded timeout/output budget. They must not inherit
+        // the arbitrary host-shell descriptor used by `bash`, and their
+        // registered read-only/no-network effect must stay truthful at
+        // execution time.
+        "execute_code" | "repl" => "builtin.sandboxed_command",
         // Effect is the strictest effect among the orchestrated sub-calls; the
         // host computes the escalation and this resolver shapes the descriptor.
         "tool_orchestrate" => "builtin.orchestrate",
@@ -32,7 +34,6 @@ pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
         | "grep_search"
         | "grep_many"
         | "ast_grep_search"
-        | "ast_search"
         | "workspace_snapshot"
         | "tool_batch_readonly"
         | "tool_cache_stats"
@@ -235,6 +236,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "properties": {
                     "files": {
                         "type": "array",
+                        "maxItems": 200,
                         "items": {
                             "type": "object",
                             "properties": {
@@ -470,6 +472,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "properties": {
                     "patterns": {
                         "type": "array",
+                        "maxItems": 200,
                         "items": {
                             "type": "object",
                             "properties": {
@@ -545,6 +548,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "properties": {
                     "searches": {
                         "type": "array",
+                        "maxItems": 200,
                         "items": {
                             "type": "object",
                             "properties": {
@@ -605,6 +609,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "properties": {
                     "calls": {
                         "type": "array",
+                        "maxItems": 200,
                         "items": {
                             "type": "object",
                             "properties": {
@@ -624,7 +629,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "tool_orchestrate",
-            description: "Run a bounded PROGRAM of many tool calls in ONE provider round: one instruction reaches its result without a round trip per step. This is the shortest path whenever the work is more than a single step - locate, read, aggregate and report in one call instead of one call per round. Bounds: <=50 steps, <=400 sub-calls in total, map over <=200 items, repeat <=25 rounds. Sub-calls run in declaration order and share values through `$<step_id>` references inside input objects; write a literal $ as $$. Step shapes, exactly as the input schema accepts them: {op:call,id,tool,input} one sub-call. {op:batch,id,calls:[{tool,input,as?}]} parallel fan-out (the same engine as read_many/grep_many). {op:map,id,over:$list,tool,input,field?} runs `tool` once per item of a prior list/collect result; `field` extracts that field from each item before it is passed as the item. {op:filter,id,over:$list,field,contains?,equals?} keeps the items whose `field` contains or equals a value. {op:collect,id,over:$list,agg,field?,separator?} aggregates a list, where agg is count|first|last|join|sum (join takes `separator`, default a single space). {op:compute,id,language,code,input?} runs code in the kernel-hardened read-only network-off sandbox over the data the program already holds and returns only stdout/stderr - use it to count, aggregate or compare across many files instead of moving their bodies into context. {op:when,id,if:{ref:$id,present?,equals?,contains?,non_empty?},tool,input?} runs one sub-call only when the condition holds. {op:repeat,id,max,while:{ref:$id,...},tool,input?} re-runs one sub-call while the condition holds, at most max times. Vocabulary: any catalog tool may be dispatched - read_file/read_many/glob_search/glob_many/grep_search/grep_many/ast_grep_search/workspace_snapshot to locate and read; execute_code/shell to reduce; write_file/edit_file/apply_patch_transaction to mutate, which needs write authorization; todo_write/checkpoint_*/skill_*/lsp/web_search/web_fetch/mcp to govern and integrate. tool_orchestrate itself may never be nested. Boundaries: every sub-call is authorized independently against the session tool allow-list, so an unauthorized tool fails closed naming that tool - the program never grants extra permission, and a write-requiring program is refused in a read-only session. Output is one JSON object: the `return` expression's value plus a per-step trace (op, tool, status, durationMs, error). Use `return` to select only the digest you need, because the whole result is subject to the tool-result budget.",
+            description: "Run a bounded PROGRAM of many tool calls in ONE provider round: one instruction reaches its result without a round trip per step. This is the shortest path whenever the work is more than a single step - locate, read, aggregate and report in one call instead of one call per round. Bounds: <=50 steps, <=400 sub-calls in total, map over <=200 items, repeat <=25 rounds. Sub-calls run in declaration order and share values through `$<step_id>` references inside input objects; write a literal $ as $$. Step shapes, exactly as the input schema accepts them: {op:call,id,tool,input} one sub-call. {op:batch,id,calls:[{tool,input,as?}]} parallel fan-out (the same engine as read_many/grep_many). {op:map,id,over:$list,tool,input,field?} runs `tool` once per item of a prior list/collect result; `field` extracts that field from each sub-call's RESULT before it is collected (it does not pre-select from the input item). {op:filter,id,over:$list,field,contains?,equals?} keeps the items whose `field` contains or equals a value. {op:collect,id,over:$list,agg,field?,separator?} aggregates a list, where agg is count|first|last|join|sum (join takes `separator`, default a single space). {op:compute,id,language,code,input?} runs code in the kernel-hardened read-only network-off sandbox over the data the program already holds and returns only stdout/stderr - use it to count, aggregate or compare across many files instead of moving their bodies into context. {op:when,id,if:{ref:$id,present?,equals?,contains?,non_empty?},tool,input?} runs one sub-call only when the condition holds. {op:repeat,id,max,while:{ref:$id,...},tool,input?} re-runs one sub-call while the condition holds, at most max times. Vocabulary: any catalog tool may be dispatched - read_file/read_many/glob_search/glob_many/grep_search/grep_many/ast_grep_search/workspace_snapshot to locate and read; execute_code/repl to reduce; write_file/edit_file/apply_patch_transaction to mutate, which needs write authorization; todo_write/checkpoint_*/skill_*/lsp/web_search/web_fetch/mcp to govern and integrate. Agentic/collaboration actions (team_create, agent_invite, task_publish, task_claim, task_submit, task_review, message_publish, artifact_commit, state_inspect, objective_*, ...) are NOT dispatchable here - they are their own provider tools and must be called directly. tool_orchestrate itself may never be nested. Boundaries: every sub-call is authorized independently against the session tool allow-list, so an unauthorized tool fails closed naming that tool - the program never grants extra permission, and a write-requiring program is refused in a read-only session. Output is one JSON object: the `return` expression's value plus a per-step trace (op, tool, status, durationMs, error). Use `return` to select only the digest you need, because the whole result is subject to the tool-result budget.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1042,7 +1047,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "repl",
-            description: "Run code in an interactive-style subprocess with your own timeout. This is the stateful, full-access sibling of execute_code: it can write files and touch the network, so it needs full-access authorization. Boundary: prefer execute_code for pure reduction - it is read-only, network-off and deterministic.",
+            description: "Run one code block through the SAME kernel-hardened, read-only, network-off sandbox as execute_code, with a caller-supplied timeout and a REPL-shaped result (stdout, stderr, exit_code). It is not an interactive session and it is not full-access: the workspace is mounted read-only, the network is off, and nothing persists between calls. Boundary: it cannot write files or reach the network - route mutations through write_file/edit_file/apply_patch_transaction and network through web_fetch/mcp; prefer execute_code for pure reduction, or bash when you genuinely need an unsandboxed host command.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1053,7 +1058,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["code", "language"],
                 "additionalProperties": false
             }),
-            required_permission: PermissionMode::DangerFullAccess,
+            required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
             name: "power_shell",
@@ -1222,7 +1227,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "execute_code",
-            description: "Deterministic reduction OUTSIDE the model. Runs python/javascript/bash/ruby/lua in a kernel-hardened, read-only, network-off sandbox and returns ONLY stdout/stderr (30s cap, nothing persisted). This is the tool for work that would otherwise mean pulling many files or many lines into context: count, aggregate, filter, compare, compute. Boundary: it cannot read the workspace itself - feed it data from read_file/read_many/grep_search, or dispatch it as tool_orchestrate's compute step where the program already holds the data.",
+            description: "Deterministic reduction OUTSIDE the model. Runs python/javascript/bash/ruby/lua in a kernel-hardened, read-only, network-off sandbox and returns ONLY stdout/stderr (30s cap, nothing persisted). This is the tool for work that would otherwise mean pulling many files or many lines into context: count, aggregate, filter, compare, compute. The workspace is mounted read-only with the working directory inside it, so the code CAN read authorised workspace files; it cannot write and cannot reach the network. Boundary: it cannot write files or touch the network - feed it data from read_file/read_many/grep_search, or dispatch it as tool_orchestrate's compute step where the program already holds the data.",
             input_schema: json!({
                 "type": "object",
                 "properties": {

@@ -561,7 +561,10 @@ fn collect(
             field,
         )),
         CollectAgg::Join => {
-            let separator = separator.unwrap_or("\n");
+            // The published contract (`tool_orchestrate` documentation) says the
+            // default separator is a single space; the code must not silently do
+            // otherwise.
+            let separator = separator.unwrap_or(" ");
             let parts = items
                 .iter()
                 .map(|item| {
@@ -727,6 +730,12 @@ mod tests {
         assert_eq!(
             collect(&items, CollectAgg::Join, Some("name"), Some(",")).unwrap(),
             json!("a,b")
+        );
+        // The published contract says the default separator is a single space;
+        // this pins it so the code cannot drift from the documentation again.
+        assert_eq!(
+            collect(&items, CollectAgg::Join, Some("name"), None).unwrap(),
+            json!("a b")
         );
         assert_eq!(
             collect(&items, CollectAgg::Sum, Some("n"), None).unwrap(),
