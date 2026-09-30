@@ -54,8 +54,6 @@ mod lark_cli_tool;
 mod logging;
 #[path = "infrastructure/matrix_store.rs"]
 mod matrix_store;
-#[path = "runtime/mcp_serve.rs"]
-mod mcp_serve;
 #[path = "static/plugin_static.rs"]
 mod plugin_static;
 #[path = "runtime/runtime_bootstrap.rs"]

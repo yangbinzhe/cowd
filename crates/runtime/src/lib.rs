@@ -94,8 +94,6 @@ mod mcp;
 mod mcp_client;
 #[path = "infrastructure/mcp_lifecycle_hardened.rs"]
 pub mod mcp_lifecycle_hardened;
-#[path = "infrastructure/mcp_server.rs"]
-pub mod mcp_server;
 #[path = "infrastructure/mcp_stdio.rs"]
 mod mcp_stdio;
 #[path = "infrastructure/mcp_tool_bridge.rs"]
@@ -569,7 +567,6 @@ pub use mcp_lifecycle_hardened::{
     McpDegradedReport, McpErrorSurface, McpFailedServer, McpLifecyclePhase, McpLifecycleState,
     McpLifecycleValidator, McpPhaseResult,
 };
-pub use mcp_server::{McpServer, McpServerSpec, ToolCallHandler, MCP_SERVER_PROTOCOL_VERSION};
 pub use mcp_stdio::{
     spawn_mcp_stdio_process, JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
     ManagedMcpTool, McpDiscoveryFailure, McpInitializeClientInfo, McpInitializeParams,
