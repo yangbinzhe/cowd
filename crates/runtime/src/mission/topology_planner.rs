@@ -215,87 +215,38 @@ pub fn plan_topology(
 /// has not, and must not be read as one.
 #[must_use]
 pub fn parse_topology_intent(objective: &str) -> TopologyIntent {
-    let lower = objective.to_lowercase();
-    let mentions_team = lower.contains("团队")
-        || lower.contains("team")
-        || lower.contains("多智能体")
-        || lower.contains("multi-agent")
-        || lower.contains("multiagent");
-    let mentions_single = lower.contains("单智能体")
-        || lower.contains("单个 agent")
-        || lower.contains("single agent")
-        || lower.contains("单独完成")
-        || lower.contains("不要启动团队")
-        || lower.contains("不用团队");
-
-    // An explicit single-agent request wins even when teams are also mentioned,
-    // because the only reason to mention both is to rule teams out
-    // ("请单独完成，不要启动团队").
-    if mentions_single {
+    // Deliberately a DELEGATION, not a parser. `strategy` already owns this
+    // question and has done since before this module existed:
+    //
+    // * `TaskUnderstanding::forbids_team` is produced by
+    //   `explicitly_forbids_collaboration`, whose whole purpose is the case this
+    //   module's first draft missed - "a request may mention teams solely to
+    //   prohibit them";
+    // * `required_team_count` is documented as "the orchestration authority":
+    //   the explicit number of Team entities the user requested. It is non-zero
+    //   exactly when the user gave an explicit Team constraint, and the framework
+    //   deliberately freezes that same number as the exact count (see
+    //   `singular_explicit_team_freezes_one_exact_team`), so an uncounted
+    //   "start a team" is a count of one rather than an unknown.
+    //
+    // A second parser here would be a second source of truth, and the two would
+    // eventually disagree - which is precisely what happened when this module was
+    // first written.
+    let understanding = harness_contract::strategy::understand(
+        &harness_contract::strategy::StrategyInput::from_prompt(objective),
+    );
+    if understanding.forbids_team {
         return TopologyIntent::UserSingleAgent;
     }
-    if !mentions_team {
-        return TopologyIntent::Autonomous;
+    if understanding.required_team_count > 0 {
+        return TopologyIntent::UserSpecified {
+            teams: Some(usize::from(understanding.required_team_count)),
+            // The framework does not parse a per-Team Agent count, and inventing
+            // one here would be a second, weaker authority for the same fact.
+            agents: None,
+        };
     }
-
-    // An explicit count is honoured exactly; a bare mention of teams with no
-    // count leaves the runtime to size it.
-    let teams = extract_count(objective, &["个团队", "个team", "个 team", "teams", "团队", "team"]);
-    let agents = extract_count(objective, &["个agent", "个 agent", "个智能体", "agents", "每个团队", "每队"]);
-    TopologyIntent::UserSpecified { teams, agents }
-}
-
-/// Chinese and English numerals, plus digits, in a small bounded window.
-fn extract_count(text: &str, markers: &[&str]) -> Option<usize> {
-    let lower = text.to_lowercase();
-    for marker in markers {
-        let mut from = 0_usize;
-        while let Some(found) = lower[from..].find(marker) {
-            let start = from + found;
-            // Look at the few characters before the marker for a number.
-            let window = &lower[start.saturating_sub(6)..start];
-            if let Some(value) = last_number_in(window) {
-                return Some(value);
-            }
-            from = start + marker.len();
-        }
-    }
-    None
-}
-
-fn last_number_in(window: &str) -> Option<usize> {
-    let mut best: Option<usize> = None;
-    let mut digits = String::new();
-    for ch in window.chars() {
-        if ch.is_ascii_digit() {
-            digits.push(ch);
-        } else if let Some(value) = chinese_digit(ch) {
-            best = Some(best.unwrap_or(0) * 10 + value);
-        } else if !digits.is_empty() {
-            best = digits.parse().ok();
-            digits.clear();
-        }
-    }
-    if !digits.is_empty() {
-        best = digits.parse().ok();
-    }
-    best.filter(|value| *value > 0)
-}
-
-fn chinese_digit(ch: char) -> Option<usize> {
-    match ch {
-        '一' => Some(1),
-        '两' => Some(2),
-        '二' => Some(2),
-        '三' => Some(3),
-        '四' => Some(4),
-        '五' => Some(5),
-        '六' => Some(6),
-        '七' => Some(7),
-        '八' => Some(8),
-        '九' => Some(9),
-        _ => None,
-    }
+    TopologyIntent::Autonomous
 }
 
 #[cfg(test)]
@@ -430,18 +381,44 @@ mod tests {
     }
 
     #[test]
-    fn explicit_counts_are_parsed_in_both_languages() {
+    /// The counts come from the framework authority, not from a parser here.
+    ///
+    /// `agents` is always `None`: `strategy` does not parse a per-Team Agent
+    /// count, and a second weaker authority for the same fact is what this module
+    /// was rewritten to remove.
+    fn explicit_counts_delegate_to_the_framework_authority() {
+        for (prompt, teams) in [
+            ("请用 3 个团队", 3usize),
+            ("请用三个团队", 3),
+            ("use 4 teams for this", 4),
+        ] {
+            assert_eq!(
+                parse_topology_intent(prompt),
+                TopologyIntent::UserSpecified {
+                    teams: Some(teams),
+                    agents: None
+                },
+                "`{prompt}` must delegate to strategy::required_team_count"
+            );
+        }
+        // The framework's deliberate reading: an uncounted "start a team" is a
+        // count of one, not an unknown. Delegating keeps that behaviour instead
+        // of inventing a different one.
         assert_eq!(
-            parse_topology_intent("请用 3 个团队"),
-            TopologyIntent::UserSpecified { teams: Some(3), agents: None }
+            parse_topology_intent("请启动协作团队审查架构"),
+            TopologyIntent::UserSpecified {
+                teams: Some(1),
+                agents: None
+            }
+        );
+        // Prohibiting Teams is read from the framework's own negation detection.
+        assert_eq!(
+            parse_topology_intent("请单独完成，不要启动团队"),
+            TopologyIntent::UserSingleAgent
         );
         assert_eq!(
-            parse_topology_intent("请用三个团队，每队 2 个 agent"),
-            TopologyIntent::UserSpecified { teams: Some(3), agents: Some(2) }
-        );
-        assert_eq!(
-            parse_topology_intent("use 4 teams for this"),
-            TopologyIntent::UserSpecified { teams: Some(4), agents: None }
+            parse_topology_intent("把这个模块读一下"),
+            TopologyIntent::Autonomous
         );
     }
 }
