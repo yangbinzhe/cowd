@@ -3701,7 +3701,7 @@ impl crate::ProviderWireEvidenceWriter for SessionProviderWireEvidenceWriter {
             crate::RuntimeSessionEventKind::ProviderRequestPacked,
             serde_json::json!({
                 "type": "ProviderRequestPacked",
-                "schema_version": 4,
+                "schema_version": 5,
                 "execution_id": context.execution_id,
                 "turn_id": context.turn_id,
                 "request_sequence": context.request_sequence,
@@ -3716,6 +3716,10 @@ impl crate::ProviderWireEvidenceWriter for SessionProviderWireEvidenceWriter {
                 "structural_reuse_ratio_bp": evidence.prefix_observation.structural_reuse_ratio_bp,
                 "exact_prefix_extension": evidence.prefix_observation.exact_extension,
                 "prefix_invalidation_reason": evidence.prefix_observation.invalidation_reason,
+                // PLAN A1: which segment moved, and the per-segment byte
+                // composition of the model-visible prompt. Observability only.
+                "prefix_divergence_segment": evidence.prefix_observation.divergence_segment,
+                "prompt_composition": evidence.prefix_observation.composition,
                 "cache_cold_leader": evidence.prefix_observation.cold_leader,
                 "cache_common_prefix_leader": evidence.prefix_observation.common_prefix_leader,
                 "cache_warmup_bypassed_low_reuse": evidence.prefix_observation.warmup_bypassed_low_reuse,

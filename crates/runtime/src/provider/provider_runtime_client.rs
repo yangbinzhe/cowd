@@ -1098,6 +1098,7 @@ impl ProviderRuntimeClient {
             Ok(handle) => Some(
                 handle.spawn(forward_provider_attempt(
                     entry,
+                    Some(request.prompt.composition()),
                     messages,
                     system,
                     cache_cohort_system,
@@ -1206,6 +1207,7 @@ fn compile_provider_input_messages(
 #[allow(clippy::too_many_arguments)]
 async fn forward_provider_attempt(
     entry: ProviderEntry,
+    prompt_composition: Option<crate::PromptComposition>,
     messages: Vec<InputMessage>,
     system: Option<String>,
     cache_cohort_system: Option<String>,
@@ -1292,6 +1294,7 @@ async fn forward_provider_attempt(
         stable_head_len,
     );
     prefix_observation.cold_leader = warmup.is_first_request_leader();
+    prefix_observation.composition = prompt_composition;
     prefix_observation.common_prefix_leader = warmup.is_common_prefix_leader();
     prefix_observation.warmup_bypassed_low_reuse = warmup.bypassed_low_reuse;
     prefix_observation.waited_for_warmup = warmup.waited;

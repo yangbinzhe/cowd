@@ -619,7 +619,14 @@ async fn exact_provider_wire_evidence_is_artifact_backed_and_durably_pinned() {
         .iter()
         .find(|event| event.kind == "context.provider_request_packed")
         .expect("provider request evidence event");
-    assert_eq!(packed.payload["schema_version"], 4);
+    assert_eq!(packed.payload["schema_version"], 5);
+    // PLAN A1: the per-segment composition and the divergence segment ride along
+    // with the aggregate byte counts, so a cache divergence is attributable to a
+    // segment from the evidence alone.
+    assert!(
+        packed.payload.get("prompt_composition").is_some(),
+        "the packed request evidence must carry the prompt composition"
+    );
     assert_eq!(packed.payload["execution_id"], "execution-evidence");
     assert_eq!(packed.payload["turn_id"], "turn-evidence");
     assert!(packed.payload.get("body").is_none());

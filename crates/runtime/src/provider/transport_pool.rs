@@ -47,6 +47,11 @@ pub struct ProviderWirePrefixObservation {
     // `String` rather than `&'static str` because this struct derives
     // Serialize/Deserialize and is persisted as wire evidence.
     pub divergence_segment: Option<String>,
+    /// PLAN A1: the per-segment byte composition of this request's model-visible
+    /// prompt. Observability only - it is never sent to the provider and never
+    /// feeds a cache key, so a segment breakdown can be exported per turn without
+    /// changing a single request byte.
+    pub composition: Option<crate::PromptComposition>,
     pub cold_leader: bool,
     /// This request serialized one DeepSeek common-prefix discovery after the
     /// first request had persisted. It is not another cold identity leader.
@@ -536,6 +541,7 @@ impl ProviderTransportPool {
             exact_extension,
             invalidation_reason,
             divergence_segment: divergence_segment.map(str::to_owned),
+            composition: None,
             cold_leader: false,
             common_prefix_leader: false,
             warmup_bypassed_low_reuse: false,

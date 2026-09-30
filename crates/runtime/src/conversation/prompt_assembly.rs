@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::context_runtime::{ContextAuthority, ContextItem, ContextRole, ContextSourceKind};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 /// PLAN A1: per-region byte composition of the prompt side of a request.
 ///
 /// Deliberately byte counts and not token estimates: the point is to make the
