@@ -106,6 +106,8 @@ pub mod mission_command_router;
 pub mod mission_control;
 #[path = "mission/mission_evidence.rs"]
 pub mod mission_evidence;
+#[path = "mission/topology_planner.rs"]
+pub mod topology_planner;
 #[path = "mission/organizer.rs"]
 pub mod mission_organizer;
 #[path = "mission/mission_runtime.rs"]
