@@ -574,8 +574,6 @@ pub mod path_policy;
 pub mod pdf_extract;
 #[path = "policy/permissions.rs"]
 pub mod permissions;
-#[path = "execution/prepared.rs"]
-pub(crate) mod prepared;
 #[path = "execution/sandbox_exec.rs"]
 pub mod sandbox_exec;
 #[path = "search/mod.rs"]

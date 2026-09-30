@@ -211,7 +211,7 @@ fn merge_calls(
 fn avoid_patterns_for(mode: EvidenceAcquisitionMode, prompt: &str) -> Vec<String> {
     let mut patterns = vec![
         "Do not repeatedly read overlapping ranges of the same small file.".to_string(),
-        "Do not use execute_code to slice a text file when read_many or grep_many can gather the evidence.".to_string(),
+        "Do not use execute_code to slice a text file when read_file or grep_search can gather the evidence.".to_string(),
         "Do not keep collecting evidence after the available evidence is enough for a staged answer.".to_string(),
     ];
     if is_readme_or_doc_review(prompt) || mode == EvidenceAcquisitionMode::SmallEvidence {

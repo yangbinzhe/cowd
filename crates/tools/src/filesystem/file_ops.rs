@@ -23,7 +23,7 @@ const MAX_SEARCH_RESULTS: usize = 100;
 /// Default line window used when callers omit an explicit read limit.
 const DEFAULT_READ_LINE_LIMIT: usize = 1_000;
 
-const TRUNCATED_READ_GUIDANCE: &str = "This is a bounded window, not the whole file. Prefer a few larger reads over many small slices: to continue exactly where this window ended, call read_file again with offset=nextOffset. Use grep_search (or grep_many) to locate specific content in very large files instead of scanning consecutive offsets. If the task explicitly requires whole-file or EOF coverage, call read_file again with complete=true; complete mode is still protected by the file-size safety ceiling.";
+const TRUNCATED_READ_GUIDANCE: &str = "This is a bounded window, not the whole file. Prefer a few larger reads over many small slices: to continue exactly where this window ended, call read_file again with offset=nextOffset. Use grep_search (its `searches` array batches several patterns) to locate specific content in very large files instead of scanning consecutive offsets. If the task explicitly requires whole-file or EOF coverage, call read_file again with complete=true; complete mode is still protected by the file-size safety ceiling.";
 
 /// Maximum file size that can be written (10 MB).
 const MAX_WRITE_SIZE: usize = 10 * 1024 * 1024;

@@ -421,7 +421,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             family: ToolFamily::Orchestrate,
             tier: ToolTier::Direct,
             permission_key: "batch",
-            description: "Run a bounded PROGRAM of many tool calls in ONE provider round: one instruction reaches its result without a round trip per step. This is the shortest path whenever the work is more than a single step - locate, read, aggregate and report in one call instead of one call per round. Bounds: <=50 steps, <=400 sub-calls in total, map over <=200 items, repeat <=25 rounds. Sub-calls run in declaration order and share values through `$<step_id>` references inside input objects; write a literal $ as $$. Step shapes, exactly as the input schema accepts them: {op:call,id,tool,input} one sub-call. {op:batch,id,calls:[{tool,input,as?}]} parallel fan-out (the same engine as read_many). {op:map,id,over:$list,tool,input,field?} runs `tool` once per item of a prior list/collect result; `field` extracts that field from each sub-call's RESULT before it is collected (it does not pre-select from the input item). {op:filter,id,over:$list,field,contains?,equals?} keeps the items whose `field` contains or equals a value. {op:collect,id,over:$list,agg,field?,separator?} aggregates a list, where agg is count|first|last|join|sum (join takes `separator`, default a single space). {op:compute,id,language,code,input?} runs code in the kernel-hardened read-only network-off sandbox over the data the program already holds and returns only stdout/stderr - use it to count, aggregate or compare across many files instead of moving their bodies into context. {op:when,id,if:{ref:$id,present?,equals?,contains?,non_empty?},tool,input?} runs one sub-call only when the condition holds. {op:repeat,id,max,while:{ref:$id,...},tool,input?} re-runs one sub-call while the condition holds, at most max times. Vocabulary: any catalog tool may be dispatched - read_file/glob_search/grep_search/workspace_snapshot to locate and read (batch a known file set with a `batch` step of read_file calls, or `map` over a list); execute_code to reduce; write_file/edit_file/apply_patch_transaction to mutate, which needs write authorization; todo_write/checkpoint_*/skill_*/lsp/web_search/web_fetch/mcp to govern and integrate. Agentic/collaboration actions (team_create, agent_invite, task_publish, task_claim, task_submit, task_review, message_publish, artifact_commit, state_inspect, objective_*, ...) are NOT dispatchable here - they are their own provider tools and must be called directly. tool_orchestrate itself may never be nested. Boundaries: every sub-call is authorized independently against the session tool allow-list, so an unauthorized tool fails closed naming that tool - the program never grants extra permission, and a write-requiring program is refused in a read-only session. Output is one JSON object: the `return` expression's value plus a per-step trace (op, tool, status, durationMs, error). Use `return` to select only the digest you need, because the whole result is subject to the tool-result budget.",
+            description: "Run a bounded PROGRAM of many tool calls in ONE provider round: one instruction reaches its result without a round trip per step. This is the shortest path whenever the work is more than a single step - locate, read, aggregate and report in one call instead of one call per round. Bounds: <=50 steps, <=400 sub-calls in total, map over <=200 items, repeat <=25 rounds. Sub-calls run in declaration order and share values through `$<step_id>` references inside input objects; write a literal $ as $$. Step shapes, exactly as the input schema accepts them: {op:call,id,tool,input} one sub-call. {op:batch,id,calls:[{tool,input,as?}]} parallel fan-out (one parallel fan-out). {op:map,id,over:$list,tool,input,field?} runs `tool` once per item of a prior list/collect result; `field` extracts that field from each sub-call's RESULT before it is collected (it does not pre-select from the input item). {op:filter,id,over:$list,field,contains?,equals?} keeps the items whose `field` contains or equals a value. {op:collect,id,over:$list,agg,field?,separator?} aggregates a list, where agg is count|first|last|join|sum (join takes `separator`, default a single space). {op:compute,id,language,code,input?} runs code in the kernel-hardened read-only network-off sandbox over the data the program already holds and returns only stdout/stderr - use it to count, aggregate or compare across many files instead of moving their bodies into context. {op:when,id,if:{ref:$id,present?,equals?,contains?,non_empty?},tool,input?} runs one sub-call only when the condition holds. {op:repeat,id,max,while:{ref:$id,...},tool,input?} re-runs one sub-call while the condition holds, at most max times. Vocabulary: any catalog tool may be dispatched - read_file/glob_search/grep_search/workspace_snapshot to locate and read (batch a known file set with a `batch` step of read_file calls, or `map` over a list); execute_code to reduce; edit to mutate (action=write|replace|patch; action=preview stays read-only), which needs write authorization; todo_write/checkpoint_*/skill_*/lsp/web_search/web_fetch/mcp to govern and integrate. Agentic/collaboration actions (team_create, agent_invite, task_publish, task_claim, task_submit, task_review, message_publish, artifact_commit, state_inspect, objective_*, ...) are NOT dispatchable here - they are their own provider tools and must be called directly. tool_orchestrate itself may never be nested. Boundaries: every sub-call is authorized independently against the session tool allow-list, so an unauthorized tool fails closed naming that tool - the program never grants extra permission, and a write-requiring program is refused in a read-only session. Output is one JSON object: the `return` expression's value plus a per-step trace (op, tool, status, durationMs, error). Use `return` to select only the digest you need, because the whole result is subject to the tool-result budget.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -896,7 +896,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             family: ToolFamily::Reduce,
             tier: ToolTier::Direct,
             permission_key: "code",
-            description: "Deterministic reduction OUTSIDE the model. Runs python/javascript/bash/ruby/lua in a kernel-hardened, read-only, network-off sandbox and returns ONLY stdout/stderr (30s cap, nothing persisted). This is the tool for work that would otherwise mean pulling many files or many lines into context: count, aggregate, filter, compare, compute. The workspace is mounted read-only with the working directory inside it, so the code CAN read authorised workspace files; it cannot write and cannot reach the network. Boundary: it cannot write files or touch the network - feed it data from read_file/read_many/grep_search, or dispatch it as tool_orchestrate's compute step where the program already holds the data.",
+            description: "Deterministic reduction OUTSIDE the model. Runs python/javascript/bash/ruby/lua in a kernel-hardened, read-only, network-off sandbox and returns ONLY stdout/stderr (30s cap, nothing persisted). This is the tool for work that would otherwise mean pulling many files or many lines into context: count, aggregate, filter, compare, compute. The workspace is mounted read-only with the working directory inside it, so the code CAN read authorised workspace files; it cannot write and cannot reach the network. Boundary: it cannot write files or touch the network - feed it data from read_file/grep_search, or dispatch it as tool_orchestrate's compute step where the program already holds the data.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1483,6 +1483,33 @@ mod family_taxonomy_tests {
             !ids.contains(&"testing_permission"),
             "operator-tier tools never enter the model surface"
         );
+    }
+
+    /// The names this framework merged away must never reappear in the catalog.
+    /// Merging removed a duplicate; a regression that re-adds one would silently
+    /// undo the convergence, so it is pinned here.
+    #[test]
+    fn retired_tool_names_do_not_reappear_in_the_catalog() {
+        const RETIRED: &[&str] = &[
+            "read_many", "glob_many", "grep_many", "ast_grep_search", "tool_batch_readonly",
+            "write_file", "edit_file", "apply_patch_transaction", "mutation_preview",
+            "edit_many_preview", "patch_plan", "notebook_edit", "repl", "power_shell",
+            "send_user_message", "question", "ask_user_question",
+            "checkpoint_create", "checkpoint_list", "checkpoint_diff", "checkpoint_restore",
+            "skill_install_plan", "skill_install_commit", "skill_status", "skill_rollback",
+            "skill_deactivate", "list_mcp_resources", "read_mcp_resource", "mcp_auth",
+            "enter_plan_mode", "exit_plan_mode", "background_task_status", "background_task_kill",
+        ];
+        let names = mvp_tool_specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<BTreeSet<_>>();
+        for retired in RETIRED {
+            assert!(
+                !names.contains(retired),
+                "`{retired}` was merged away and must not reappear in the catalog"
+            );
+        }
     }
 
     fn family_name(family: ToolFamily) -> &'static str {

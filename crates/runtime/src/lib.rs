@@ -445,24 +445,21 @@ pub use evidence_planner::{
     evidence_plan_prompt, plan_evidence, EvidenceAcquisitionMode, EvidencePlan,
 };
 pub use execution_core::{
-    build_runtime_execution_decision, execution_pattern_catalog_response, rewoo_plan_for_intent,
+    build_runtime_execution_decision, execution_pattern_catalog_response,
     runtime_execution_guidance_prompt, runtime_execution_guidance_prompt_with_tool_exposure,
-    runtime_orchestration_action_guidance, runtime_orchestration_actions, tool_intents_from_rewoo,
+    runtime_orchestration_action_guidance, runtime_orchestration_actions,
     CalibrationOutcomeImportReceipt, CrossPlaneRuntimeError, CrossPlaneRuntimeService,
-    DeliberationMode, DeliberationPlan, ExecutionCommitService, ExecutionCompileRequest,
+    ExecutionCommitService, ExecutionCompileRequest,
     ExecutionGraphCompiler, ExecutionGraphHost, ExecutionGraphHostReceipt,
     ExecutionGraphStateStore, ExecutionPatternCatalog, ExecutionStartupRecoveryError,
     ExecutionStartupRecoveryRecord, ExecutionStartupRecoveryReport, LegacyOutcomeImportReceipt,
-    OutcomeRecordReceipt, ReflexionRecord, ReflexionTrigger, RewooEvidencePlan,
-    RewooEvidenceResult, RewooEvidenceStep, RewooObservation, RewooSolverContract,
-    RuntimeCompileTarget, RuntimeEventReader, RuntimeEvidenceSummary, RuntimeExecutionDecision,
+    OutcomeRecordReceipt, RuntimeCompileTarget, RuntimeEventReader, RuntimeEvidenceSummary, RuntimeExecutionDecision,
     RuntimeExecutionHealth, RuntimeExecutionOwnerReport, RuntimeExecutionPatternCandidate,
     RuntimeExecutionPatternSpec, RuntimeExecutionReportSpec, RuntimeExecutionShutdownReport,
     RuntimeExecutionSupervisor, RuntimeServices, RuntimeServicesBuilder, RuntimeServicesError,
     RuntimeWorkAdmissionReceipt, SessionTerminalDeliveryPort, StrategyDecisionEngine,
-    StrategyLease, StrategyResourceHealth, ToolIntentDependency, ToolIntentDependencyKind,
-    ToolIntentGraph, ToolIntentNode, TurnStrategyActualOutcome, TurnStrategyDecisionState,
-    TurnStrategyDecisionStatus,
+    StrategyLease, StrategyResourceHealth, TurnStrategyActualOutcome,
+    TurnStrategyDecisionState, TurnStrategyDecisionStatus,
 };
 pub use git_context::{GitCommitEntry, GitContext};
 pub use harness_contract::agent::AgentLifecycleEvent;

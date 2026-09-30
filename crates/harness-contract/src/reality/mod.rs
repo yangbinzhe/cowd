@@ -308,38 +308,6 @@ impl RecallSelectionReason {
     }
 }
 
-/// Gateway-facing capability probe that makes partial wiring visible instead
-/// of silently presenting a feature as ready.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RealityCapabilityProbe {
-    pub id: String,
-    pub status: RealityCapabilityStatus,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-    #[serde(default)]
-    pub evidence: Vec<EvidenceRef>,
-}
-
-impl RealityCapabilityProbe {
-    pub fn new(id: impl Into<String>, status: RealityCapabilityStatus) -> Self {
-        Self {
-            id: id.into(),
-            status,
-            reason: None,
-            evidence: Vec::new(),
-        }
-    }
-
-    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
-        self.reason = Some(reason.into());
-        self
-    }
-
-    pub fn with_evidence(mut self, evidence: EvidenceRef) -> Self {
-        self.evidence.push(evidence);
-        self
-    }
-}
 
 #[cfg(test)]
 mod tests {

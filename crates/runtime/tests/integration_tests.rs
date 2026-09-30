@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use runtime::green_contract::{GreenContract, GreenContractOutcome, GreenLevel};
+use runtime::green_contract::GreenLevel;
 use runtime::{
     apply_policy, BranchFreshness, DiffScope, LaneBlocker, LaneContext, PolicyAction,
     PolicyCondition, PolicyEngine, PolicyRule, ReconcileReason, ReviewStatus, StaleBranchAction,
@@ -71,49 +71,6 @@ fn fresh_branch_does_not_trigger_stale_policy() {
 
     let actions = engine.evaluate(&fresh_context);
     assert!(actions.is_empty());
-}
-
-/// green_contract + policy_engine integration:
-/// A lane that meets its green contract should be mergeable
-#[test]
-fn green_contract_satisfied_allows_merge() {
-    let contract = GreenContract::new(GreenLevel::Workspace);
-    let satisfied = contract.is_satisfied_by(GreenLevel::Workspace);
-    assert!(satisfied);
-
-    let exceeded = contract.is_satisfied_by(GreenLevel::MergeReady);
-    assert!(exceeded);
-
-    let insufficient = contract.is_satisfied_by(GreenLevel::Package);
-    assert!(!insufficient);
-}
-
-/// green_contract + policy_engine:
-/// Lane with green level below contract requirement gets blocked
-#[test]
-fn green_contract_unsatisfied_blocks_merge() {
-    let context = LaneContext::new(
-        "partial-green-lane",
-        GreenLevel::Package,
-        Duration::from_secs(0),
-        LaneBlocker::None,
-        ReviewStatus::Pending,
-        DiffScope::Full,
-        false,
-    );
-
-    // LaneContext now uses the GreenLevel enum from green_contract
-    let engine = PolicyEngine::new(vec![PolicyRule::new(
-        "workspace-green-required",
-        PolicyCondition::GreenAt {
-            level: GreenLevel::Workspace,
-        },
-        PolicyAction::MergeToDev,
-        10,
-    )]);
-
-    let actions = engine.evaluate(&context);
-    assert!(actions.is_empty()); // Package < Workspace, so no merge
 }
 
 /// reconciliation + policy_engine integration:

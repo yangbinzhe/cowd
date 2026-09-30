@@ -961,7 +961,7 @@ impl LiveScenarioRunner {
             },
             LiveScenarioSpec {
                 id: "live_single_architecture_baseline",
-                prompt: "请单独完成一次复杂架构审查，不要启动团队。【取证要求】结论必须建立在本次真实读取到的源码内容上：至少 3 个来自不同 crate 的源码文件要被真正读到内容（列举路径不算）。如何读最有效由你自己决定——可以一次 tool_orchestrate 批量读，也可以逐个读；读不到就保留 unresolved，不要凭先验知识下结论。基于你实际读到的源码内容，分别分析 runtime、memory、gateway 的职责边界、各自的 canonical state 或事件真相、一个潜在风险，并在结论里引用你实际读过的文件路径。只陈述本次实际读取到源码所能验证的结论；不要加入“无法确认/无法判断/未确认/需要进一步检查”之类的保留项。选择最短路径。能用一次 `tool_orchestrate` 编排完成的，就不要拆成多个回合逐个调用：一个编排最多 400 次子调用、50 个步骤，其中 `map` 可对列表逐项并行处理，`filter`/`collect` 做筛选与聚合(count/first/last/join/sum)，`when`/`repeat` 表达条件与循环，`compute` 在只读沙箱内对编排已取到的数据做确定性地计算与统计。因此：跨文件的统计、过滤、分支与交叉校验，请放进编排的 `compute` 步骤在模型外完成，只把摘要带回上下文，而不要把大量原文逐段搬进上下文；需要多轮才能收敛的长确定性任务，也可以用 `repeat` 在一个编排内描述完整流程。如果你判断某个目标用单个工具更直接，那也尽管直接用——编排是手段，最短路径才是目的。只读结果被截断时，用 `read` 按工具返回的 `tool://` 证据引用取回正文。可用工具：read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot、tool_orchestrate、execute_code、ast_grep_search、read、context_left。不要调用 bash 或任何写工具。",
+                prompt: "请单独完成一次复杂架构审查，不要启动团队。【取证要求】结论必须建立在本次真实读取到的源码内容上：至少 3 个来自不同 crate 的源码文件要被真正读到内容（列举路径不算）。如何读最有效由你自己决定——可以一次 tool_orchestrate 批量读，也可以逐个读；读不到就保留 unresolved，不要凭先验知识下结论。基于你实际读到的源码内容，分别分析 runtime、memory、gateway 的职责边界、各自的 canonical state 或事件真相、一个潜在风险，并在结论里引用你实际读过的文件路径。只陈述本次实际读取到源码所能验证的结论；不要加入“无法确认/无法判断/未确认/需要进一步检查”之类的保留项。选择最短路径。能用一次 `tool_orchestrate` 编排完成的，就不要拆成多个回合逐个调用：一个编排最多 400 次子调用、50 个步骤，其中 `map` 可对列表逐项并行处理，`filter`/`collect` 做筛选与聚合(count/first/last/join/sum)，`when`/`repeat` 表达条件与循环，`compute` 在只读沙箱内对编排已取到的数据做确定性地计算与统计。因此：跨文件的统计、过滤、分支与交叉校验，请放进编排的 `compute` 步骤在模型外完成，只把摘要带回上下文，而不要把大量原文逐段搬进上下文；需要多轮才能收敛的长确定性任务，也可以用 `repeat` 在一个编排内描述完整流程。如果你判断某个目标用单个工具更直接，那也尽管直接用——编排是手段，最短路径才是目的。只读结果被截断时，用 `read_ref` 按工具返回的 `tool://` 证据引用取回正文。可用工具：read_file、glob_search、grep_search、workspace_snapshot、tool_orchestrate、execute_code、read_ref。不要调用 bash 或任何写工具。",
                 acceptance: LiveAcceptance::ArchitectureQuality {
                     minimum_teams: 0,
                     minimum_claimed_cross_team_edges: 0,
@@ -971,7 +971,7 @@ impl LiveScenarioRunner {
             },
             LiveScenarioSpec {
                 id: IMPLICIT_COLLABORATION_SCENARIO_ID,
-                prompt: "请对三个独立责任域分别取得只读工具证据并交叉核验，最后统一综合结论。责任域一核查策略选择与执行义务，责任域二核查状态持久化与恢复，责任域三核查最终验收与投影。必须列出至少三个本次实际读取的完整 `crates/.../*.rs` 源码路径，只陈述工具证据能够验证的事实；选择最短路径。能用一次 `tool_orchestrate` 编排完成的，就不要拆成多个回合逐个调用：一个编排最多 400 次子调用、50 个步骤，其中 `map` 可对列表逐项并行处理，`filter`/`collect` 做筛选与聚合(count/first/last/join/sum)，`when`/`repeat` 表达条件与循环，`compute` 在只读沙箱内对编排已取到的数据做确定性地计算与统计。因此：跨文件的统计、过滤、分支与交叉校验，请放进编排的 `compute` 步骤在模型外完成，只把摘要带回上下文，而不要把大量原文逐段搬进上下文；需要多轮才能收敛的长确定性任务，也可以用 `repeat` 在一个编排内描述完整流程。如果你判断某个目标用单个工具更直接，那也尽管直接用——编排是手段，最短路径才是目的。只读结果被截断时，用 `read` 按工具返回的 `tool://` 证据引用取回正文。可用工具：read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot、tool_orchestrate、execute_code、ast_grep_search、read、context_left。不要调用 bash 或任何写工具。",
+                prompt: "请对三个独立责任域分别取得只读工具证据并交叉核验，最后统一综合结论。责任域一核查策略选择与执行义务，责任域二核查状态持久化与恢复，责任域三核查最终验收与投影。必须列出至少三个本次实际读取的完整 `crates/.../*.rs` 源码路径，只陈述工具证据能够验证的事实；选择最短路径。能用一次 `tool_orchestrate` 编排完成的，就不要拆成多个回合逐个调用：一个编排最多 400 次子调用、50 个步骤，其中 `map` 可对列表逐项并行处理，`filter`/`collect` 做筛选与聚合(count/first/last/join/sum)，`when`/`repeat` 表达条件与循环，`compute` 在只读沙箱内对编排已取到的数据做确定性地计算与统计。因此：跨文件的统计、过滤、分支与交叉校验，请放进编排的 `compute` 步骤在模型外完成，只把摘要带回上下文，而不要把大量原文逐段搬进上下文；需要多轮才能收敛的长确定性任务，也可以用 `repeat` 在一个编排内描述完整流程。如果你判断某个目标用单个工具更直接，那也尽管直接用——编排是手段，最短路径才是目的。只读结果被截断时，用 `read_ref` 按工具返回的 `tool://` 证据引用取回正文。可用工具：read_file、glob_search、grep_search、workspace_snapshot、tool_orchestrate、execute_code、read_ref。不要调用 bash 或任何写工具。",
                 acceptance: LiveAcceptance::ArchitectureQuality {
                     minimum_teams: 3,
                     minimum_claimed_cross_team_edges: 0,
@@ -4564,10 +4564,6 @@ fn has_successful_runtime_tool_completion(
                         .is_some_and(|value| !value.trim().is_empty())
                 })
         })
-}
-
-fn summarize_json(value: &Value) -> String {
-    summarize(&value.to_string(), 500)
 }
 
 fn summarize(value: &str, max_chars: usize) -> String {

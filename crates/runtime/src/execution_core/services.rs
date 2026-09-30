@@ -37,7 +37,6 @@ use super::graph::{
     ResourceResultClass, ScopeLockError, ScopeLockManager, WorktreeLeaseError,
     WorktreeLeaseManager,
 };
-use super::protocols::ProtocolResultReducer;
 use crate::agent::binding::request_for_intent;
 use crate::agent::definition::ExplicitTomlAgentImport;
 use crate::managed_agent::ManagedAgentRestartDisposition;
@@ -1139,10 +1138,6 @@ impl RuntimeServices {
             workspace_root.clone(),
         ));
         let synthesize_executor = Arc::new(SynthesizeNodeExecutor::new());
-        synthesize_executor.install_resolver(Arc::new(ProtocolResultReducer::new(
-            graph_state_store.clone(),
-            Arc::clone(&agent_runtime),
-        )));
         let session_dispatch_executor =
             Arc::new(crate::session_execution::SessionDispatchNodeExecutor::new());
         let session_execution_policy_controls = Arc::new(RwLock::new(BTreeMap::<

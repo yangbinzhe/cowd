@@ -323,12 +323,6 @@ pub struct ProviderRuntimeClient {
     /// clock is deliberately absent: a long healthy generation is never
     /// interrupted.
     liveness_contract: crate::liveness::LivenessContract,
-    /// Notified when the stream goes semantically inactive, so the turn owner
-    /// can HELP (refocus / summarize / request commit / ask) rather than
-    /// terminate. PLAN D1: no stream is ever cut off by this module.
-    liveness_stall_sink: Option<
-        Arc<dyn Fn(crate::liveness::LivenessVerdict) + Send + Sync + 'static>,
-    >,
     /// PLAN D1b: verdicts observed by the stream guard, drained by the turn owner
     /// so each stall becomes a non-forcing push-forward nudge. Kept on the client
     /// so nothing new has to be threaded through Runtime construction.
@@ -512,7 +506,6 @@ impl ProviderRuntimeClient {
             provider_wire_evidence_writer: None,
             prompt_history: Arc::new(std::sync::Mutex::new(ProviderPromptHistory::default())),
             liveness_contract: crate::liveness::LivenessContract::default(),
-            liveness_stall_sink: None,
             liveness_stalls: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
     }
@@ -939,7 +932,6 @@ impl ProviderRuntimeClient {
         Box<dyn futures::stream::Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>,
     > {
         let contract = self.liveness_contract.clone();
-        let stall_sink = self.liveness_stall_sink.clone();
         let recorded_stalls = Arc::clone(&self.liveness_stalls);
         let events = self
             .stream_with_activity_and_provider_snapshot(request, provider_snapshot)
@@ -957,10 +949,7 @@ impl ProviderRuntimeClient {
         // immediate out-of-band reaction.
         Box::pin(crate::liveness::guard_liveness(events, contract, move |verdict| {
             if let Ok(mut recorded) = recorded_stalls.lock() {
-                recorded.push(verdict.clone());
-            }
-            if let Some(sink) = stall_sink.as_ref() {
-                sink(verdict);
+                recorded.push(verdict);
             }
         }))
     }

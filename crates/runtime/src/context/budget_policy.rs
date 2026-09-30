@@ -342,7 +342,7 @@ mod tests {
     #[test]
     fn a_huge_batch_is_still_bounded_so_one_call_cannot_own_the_turn() {
         // Batch tools concatenate N bodies into a single receipt, so the
-        // per-call ceiling is what stops `read_many` of a whole crate from
+        // per-call ceiling is what stops a batch of reads over a whole crate from
         // consuming the entire turn lease in one call.
         let plan = RuntimeBudgetPlan::derive(RuntimeBudgetInputs::new(1_000_000, 128_000));
         let lease = plan.tool_result_budget;

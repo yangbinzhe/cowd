@@ -26,8 +26,10 @@ pub enum ExecutionMode {
     SingleAgent,
     /// One root delegating bounded work without a Team contract.
     DelegatedSubagent,
-    /// A preset role protocol (debate / review-fix / incident / JPS).
-    PresetProtocol,
+    /// The objective asks for deliberation (debate / trade-offs / adversarial
+    /// review). The runtime prescribes NO topology here: the model owns the
+    /// decomposition, and any Team/Agent structure it chooses is its own.
+    Deliberation,
     /// Agent-first multi-Team collaboration.
     MultiTeamCollaboration,
     /// Collaboration plus independent sub-agent work outside any Team.
@@ -59,7 +61,7 @@ pub fn derive_execution_mode(
         );
     match pattern {
         ExecutionPattern::Collaborate => ExecutionMode::MultiTeamCollaboration,
-        ExecutionPattern::Deliberate => ExecutionMode::PresetProtocol,
+        ExecutionPattern::Deliberate => ExecutionMode::Deliberation,
         ExecutionPattern::Supervise => ExecutionMode::DelegatedSubagent,
         ExecutionPattern::Execute | ExecutionPattern::Explore => {
             if wants_delegation {
@@ -814,7 +816,7 @@ mod tests {
             责任域一核查策略选择与执行义务，责任域二核查状态持久化与恢复，责任域三核查最终验收与投影。\
             必须列出至少三个本次实际读取的完整 `crates/.../*.rs` 源码路径，只陈述工具证据能够验证的事实；\
             不要自行指定 Team、Agent、角色、模板或编排拓扑。\
-            只能使用 read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot 这些只读工具，不要调用 bash 或任何写工具。";
+            只能使用 read_file、glob_search、grep_search、workspace_snapshot 这些只读工具（批量读用 tool_orchestrate 的 batch/map 步），不要调用 bash 或任何写工具。";
         let decision = build_runtime_execution_decision(prompt, None);
         assert_eq!(decision.strategy.understanding.required_team_count, 0);
         assert_eq!(decision.strategy.understanding.independent_workstreams, 3);
@@ -1049,7 +1051,7 @@ mod tests {
             derive_execution_mode(TaskComplexity::Moderate, ExecutionPattern::Execute, 0, 1),
             ExecutionMode::SingleAgent
         );
-        // Deliberate maps to a preset role protocol.
+        // Deliberate asks for deliberation; the runtime prescribes no topology.
         assert_eq!(
             derive_execution_mode(
                 TaskComplexity::Moderate,
@@ -1057,7 +1059,7 @@ mod tests {
                 0,
                 0
             ),
-            ExecutionMode::PresetProtocol
+            ExecutionMode::Deliberation
         );
     }
 

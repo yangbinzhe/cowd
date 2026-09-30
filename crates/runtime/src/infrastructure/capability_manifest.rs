@@ -105,7 +105,7 @@ impl RuntimeCapabilityManifest {
                     summary: "Keep long content in normal model output or durable artifacts and pass compact references through actions."
                         .to_string(),
                     recommended_tools: vec![
-                        "read".to_string(),
+                        "read_ref".to_string(),
                         "context_retrieve".to_string(),
                         "evidence_retrieve".to_string(),
                         "artifact_commit".to_string(),

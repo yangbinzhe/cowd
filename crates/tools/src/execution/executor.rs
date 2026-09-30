@@ -25,10 +25,6 @@ use crate::mutation_plan::{
     apply_mutations, preview_mutations, MutationApplyInput, MutationPreviewInput,
 };
 use crate::path_policy::WorkspacePathPolicy;
-use crate::prepared::{
-    prepare_readonly_invocations, PreparedReadonlyLeaf, PreparedReadonlyLeafInvocation,
-    PreparedToolCall, ToolExecutionContext,
-};
 use crate::search::{execute_web_search, WebSearchInput};
 use crate::stale_branch::{check_freshness, BranchFreshness};
 use crate::ToolHostLease;
@@ -487,15 +483,6 @@ fn require_batch_bound(tool: &str, items: usize) -> Result<(), String> {
     Ok(())
 }
 
-fn run_read_many(lease: &ToolHostLease, input: ReadManyInput) -> Result<String, String> {
-    require_batch_bound("tool_orchestrate", input.files.len())?;
-    let results = run_ordered_batch(input.files, input.max_concurrency, |item| {
-        let output = run_read_file(lease, item)?;
-        serde_json::from_str(&output).or(Ok(Value::String(output)))
-    });
-    to_pretty_json(batch_output("tool_orchestrate", results))
-}
-
 #[allow(clippy::needless_pass_by_value)]
 fn run_write_file(lease: &ToolHostLease, input: WriteFileInput) -> Result<String, String> {
     let scope = file_cache_scope(
@@ -638,16 +625,6 @@ fn run_glob_search(lease: &ToolHostLease, input: GlobSearchInputValue) -> Result
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_glob_many(lease: &ToolHostLease, input: GlobManyInput) -> Result<String, String> {
-    require_batch_bound("tool_orchestrate", input.patterns.len())?;
-    let results = run_ordered_batch(input.patterns, input.max_concurrency, |item| {
-        let output = run_glob_search(lease, item)?;
-        serde_json::from_str(&output).or(Ok(Value::String(output)))
-    });
-    to_pretty_json(batch_output("tool_orchestrate", results))
-}
-
-#[allow(clippy::needless_pass_by_value)]
 fn run_grep_search(lease: &ToolHostLease, input: GrepSearchInput) -> Result<String, String> {
     to_pretty_json(grep_search(lease.path_policy(), &input).map_err(io_to_string)?)
 }
@@ -757,106 +734,6 @@ pub(super) fn full_content_hash(resolved: &Path) -> String {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
-fn run_tool_batch_readonly(
-    lease: &ToolHostLease,
-    input: ToolBatchReadonlyInput,
-) -> Result<String, String> {
-    require_batch_bound("tool_orchestrate", input.calls.len())?;
-    for call in &input.calls {
-        if !is_allowed_readonly_batch_tool(&call.name) {
-            return Err(format!(
-                "tool_batch_readonly only accepts approved read-only tools; `{}` is not allowed",
-                call.name
-            ));
-        }
-    }
-
-    let prepared_calls = input
-        .calls
-        .iter()
-        .map(|call| PreparedToolCall {
-            name: call.name.clone(),
-            input: call.input.clone(),
-        })
-        .collect::<Vec<_>>();
-    let context =
-        ToolExecutionContext::for_workspace(lease.workspace_root(), "tool_orchestrate");
-    if calls_support_prepared_readonly(&input.calls) {
-        let prepared = prepare_readonly_invocations(&context, &prepared_calls)
-            .map_err(|error| error.message)?;
-        let results = run_ordered_batch(prepared, input.max_concurrency, |prepared| {
-            execute_prepared_readonly_leaf(lease, prepared)
-        });
-        return to_pretty_json(batch_output_with_mode(
-            "tool_orchestrate",
-            "prepared_readonly",
-            results,
-        ));
-    }
-
-    let results = run_ordered_batch(input.calls, input.max_concurrency, |call| {
-        let output = execute_with_lease(lease, &call.name, &call.input)?;
-        Ok(serde_json::from_str(&output).unwrap_or(Value::String(output)))
-    });
-    to_pretty_json(batch_output_with_mode(
-        "tool_orchestrate",
-        "compat_recursive",
-        results,
-    ))
-}
-
-fn calls_support_prepared_readonly(calls: &[ToolBatchReadonlyCallInput]) -> bool {
-    calls
-        .iter()
-        .all(|call| is_prepared_readonly_tool(&call.name))
-}
-
-fn execute_prepared_readonly_leaf(
-    lease: &ToolHostLease,
-    prepared: PreparedReadonlyLeafInvocation,
-) -> Result<Value, String> {
-    let output = match prepared.leaf {
-        PreparedReadonlyLeaf::ReadFile(input) => {
-            from_value::<ReadFileInput>(&input).and_then(|parsed| run_read_file(lease, parsed))?
-        }
-        PreparedReadonlyLeaf::GlobSearch(input) => from_value::<GlobSearchInputValue>(&input)
-            .and_then(|parsed| run_glob_search(lease, parsed))?,
-        PreparedReadonlyLeaf::GrepSearch(input) => from_value::<GrepSearchInput>(&input)
-            .and_then(|parsed| run_grep_search(lease, parsed))?,
-        PreparedReadonlyLeaf::WorkspaceSnapshot(input) => {
-            from_value::<WorkspaceSnapshotInput>(&input)
-                .and_then(|parsed| run_workspace_snapshot(lease, parsed))?
-        }
-        PreparedReadonlyLeaf::ToolCacheStats => to_pretty_json(lease.cache().stats())?,
-    };
-    Ok(serde_json::from_str(&output).unwrap_or(Value::String(output)))
-}
-
-fn is_prepared_readonly_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "read_file" | "glob_search" | "grep_search" | "workspace_snapshot" | "tool_cache_stats"
-    )
-}
-
-pub(crate) fn is_allowed_readonly_batch_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "read_file"
-            | "tool_orchestrate"
-            | "glob_search"
-            | "tool_orchestrate"
-            | "grep_search"
-            | "workspace_snapshot"
-            | "tool_cache_stats"
-            // NOTE: `mutation_preview` used to be allowed here. `edit` is a
-            // WRITE tool (only its `action=preview` shape is read-only), and this
-            // allow-list is name-based, so `edit` must NOT appear - a read-only
-            // batch that could write is an authorization hole.
-    )
-}
-
 /// Tools `tool_orchestrate` may dispatch.
 ///
 /// PLAN E2: the vocabulary is the canonical built-in catalog, not a hand-copied
@@ -909,14 +786,6 @@ pub(crate) struct BatchToolItemOutput {
 
 fn batch_output(kind: &str, results: Vec<BatchToolItemOutput>) -> BatchToolOutput {
     batch_output_internal(kind, None, results)
-}
-
-fn batch_output_with_mode(
-    kind: &str,
-    execution_mode: &str,
-    results: Vec<BatchToolItemOutput>,
-) -> BatchToolOutput {
-    batch_output_internal(kind, Some(execution_mode.to_string()), results)
 }
 
 fn batch_output_internal(
@@ -1265,10 +1134,6 @@ fn run_structured_output(input: StructuredOutputInput) -> Result<String, String>
     to_pretty_json(execute_structured_output(input)?)
 }
 
-fn run_repl(lease: &ToolHostLease, input: ReplInput) -> Result<String, String> {
-    to_pretty_json(execute_repl(lease.workspace_root(), input)?)
-}
-
 fn run_powershell(lease: &ToolHostLease, input: PowerShellInput) -> Result<String, String> {
     to_pretty_json(
         execute_powershell(lease.workspace_root(), input).map_err(|error| error.to_string())?,
@@ -1291,12 +1156,6 @@ struct ReadFileInput {
     limit: Option<usize>,
     #[serde(default)]
     complete: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReadManyInput {
-    files: Vec<ReadFileInput>,
-    max_concurrency: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1324,27 +1183,9 @@ struct GlobSearchInputValue {
 }
 
 #[derive(Debug, Deserialize)]
-struct GlobManyInput {
-    patterns: Vec<GlobSearchInputValue>,
-    max_concurrency: Option<usize>,
-}
-
-#[derive(Debug, Deserialize)]
 struct GrepManyInput {
     searches: Vec<GrepSearchInput>,
     max_concurrency: Option<usize>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ToolBatchReadonlyInput {
-    calls: Vec<ToolBatchReadonlyCallInput>,
-    max_concurrency: Option<usize>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ToolBatchReadonlyCallInput {
-    name: String,
-    input: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1464,13 +1305,6 @@ enum ConfigValue {
 #[derive(Debug, Deserialize)]
 #[serde(transparent)]
 struct StructuredOutputInput(BTreeMap<String, Value>);
-
-#[derive(Debug, Deserialize)]
-struct ReplInput {
-    code: String,
-    language: String,
-    timeout_ms: Option<u64>,
-}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1677,17 +1511,6 @@ pub(crate) struct SearchableToolSpec {
 struct StructuredOutputResult {
     data: String,
     structured_output: BTreeMap<String, Value>,
-}
-
-#[derive(Debug, Serialize)]
-struct ReplOutput {
-    language: String,
-    stdout: String,
-    stderr: String,
-    #[serde(rename = "exitCode")]
-    exit_code: i32,
-    #[serde(rename = "durationMs")]
-    duration_ms: u128,
 }
 
 fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
@@ -2548,47 +2371,6 @@ fn execute_structured_output(
     Ok(StructuredOutputResult {
         data: String::from("Structured output provided successfully"),
         structured_output: input.0,
-    })
-}
-
-fn execute_repl(workspace_root: &Path, input: ReplInput) -> Result<ReplOutput, String> {
-    if input.code.trim().is_empty() {
-        return Err(String::from("code must not be empty"));
-    }
-    let language = input.language.trim().to_ascii_lowercase();
-    if !matches!(
-        language.as_str(),
-        "python" | "py" | "javascript" | "js" | "node" | "bash" | "sh" | "shell"
-    ) {
-        return Err(format!("unsupported REPL language: {}", input.language));
-    }
-    let started = Instant::now();
-    let output = crate::sandbox_exec::execute_code_in_workspace(
-        &input.language,
-        &input.code,
-        input.timeout_ms,
-        workspace_root,
-    );
-    if output.exit_code == 124 {
-        return Err(format!(
-            "REPL execution exceeded timeout of {} ms",
-            input.timeout_ms.unwrap_or_default()
-        ));
-    }
-    if output.exit_code != 0 {
-        return Err(format!(
-            "REPL execution failed with exit code {}: {}",
-            output.exit_code,
-            output.stderr.trim()
-        ));
-    }
-
-    Ok(ReplOutput {
-        language: input.language,
-        stdout: output.stdout,
-        stderr: output.stderr,
-        exit_code: output.exit_code,
-        duration_ms: started.elapsed().as_millis(),
     })
 }
 
