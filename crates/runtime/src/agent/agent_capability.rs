@@ -204,7 +204,7 @@ fn capability_mapping(capability: &str) -> CapabilityMapping {
             required_mode: PermissionMode::WorkspaceWrite,
         },
         "rollback" => CapabilityMapping {
-            tools: &["bash", "checkpoint_restore", "read_file", "grep_search"],
+            tools: &["bash", "checkpoint", "read_file", "grep_search"],
             required_mode: PermissionMode::DangerFullAccess,
         },
         "tool_call" => CapabilityMapping {
@@ -302,7 +302,7 @@ fn required_host_tool_alternatives(capability: &str) -> &'static [&'static str] 
         "network" | "web" => &["web_search", "web_fetch", "mcp_tool"],
         "write" => &["write_file", "edit_file"],
         "test" => &["bash", "execute_code"],
-        "rollback" => &["bash", "checkpoint_restore"],
+        "rollback" => &["bash", "checkpoint"],
         "connector_action" => &["mcp_tool"],
         _ => &[],
     }
@@ -312,7 +312,7 @@ pub(crate) fn agent_tool_permission(tool: &str) -> PermissionMode {
     match tool {
         "write_file" | "edit_file" | "artifact_materialize" => PermissionMode::WorkspaceWrite,
         "execute_code" => PermissionMode::ReadOnly,
-        "bash" | "checkpoint_restore" | "mcp_tool" => PermissionMode::DangerFullAccess,
+        "bash" | "checkpoint" | "mcp_tool" => PermissionMode::DangerFullAccess,
         _ => PermissionMode::ReadOnly,
     }
 }

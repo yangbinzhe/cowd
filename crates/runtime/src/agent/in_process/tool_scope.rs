@@ -125,7 +125,7 @@ impl ScopedRuntimeToolExecutor {
         let input = self.internal_checkpoint_input(input)?;
         if self
             .host
-            .delegated_tool_effect_descriptor("checkpoint_create", &input)
+            .delegated_tool_effect_descriptor("checkpoint", &input)
             .is_none()
         {
             return Err(ToolError::new(
@@ -141,7 +141,7 @@ impl ScopedRuntimeToolExecutor {
                 .clone()
                 .unwrap_or_else(|| format!("agent-checkpoint:{}", uuid::Uuid::new_v4())),
             tool_use_id: format!("agent-checkpoint:{}", uuid::Uuid::new_v4()),
-            tool_name: "checkpoint_create".to_string(),
+            tool_name: "checkpoint".to_string(),
             input: serde_json::to_string(&input).map_err(|error| {
                 ToolError::new(format!("serialize Runtime checkpoint input: {error}"))
             })?,

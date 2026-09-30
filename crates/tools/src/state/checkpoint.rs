@@ -109,7 +109,7 @@ pub fn checkpoint_list_in(root: impl AsRef<Path>) -> io::Result<CheckpointListOu
     }
     checkpoints.sort_by(|left, right| right.id.cmp(&left.id));
     Ok(CheckpointListOutput {
-        kind: "checkpoint_list".to_string(),
+        kind: "checkpoint".to_string(),
         checkpoints,
     })
 }
@@ -155,7 +155,7 @@ pub fn checkpoint_diff_in(
     added.sort();
     deleted.sort();
     Ok(CheckpointDiffOutput {
-        kind: "checkpoint_diff".to_string(),
+        kind: "checkpoint".to_string(),
         id: input.id,
         changed_files: changed,
         added_files: added,

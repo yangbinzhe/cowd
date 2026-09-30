@@ -1314,7 +1314,7 @@ fn auto_checkpoint_can_guard_mutations_when_enabled() {
         &json!({ "path": "src/lib.rs", "content": "omega\n" }),
     )
     .expect("write should create checkpoint first");
-    let checkpoints = execute_tool("checkpoint_list", &json!({})).expect("list checkpoints");
+    let checkpoints = execute_tool("checkpoint", &json!({"action": "list"})).expect("list checkpoints");
     let value: serde_json::Value = serde_json::from_str(&checkpoints).expect("json");
     let labels = value["checkpoints"]
         .as_array()
@@ -1444,8 +1444,8 @@ fn checkpoint_tools_create_diff_and_restore_workspace_files() {
 
     let created = execute_in_workspace(
         &root,
-        "checkpoint_create",
-        &json!({ "label": "before edit" }),
+        "checkpoint",
+        &json!({"action": "create", "label": "before edit"}),
     )
     .expect("checkpoint create should succeed");
     let created_value: serde_json::Value = serde_json::from_str(&created).expect("json");
@@ -1462,10 +1462,10 @@ fn checkpoint_tools_create_diff_and_restore_workspace_files() {
     fs::write(&file, "omega\n").expect("mutate file");
     fs::write(root.join("src/new.rs"), "new\n").expect("add file");
     fs::remove_file(&file).expect("delete file");
-    let diff = execute_in_workspace(&root, "checkpoint_diff", &json!({ "id": checkpoint_id }))
+    let diff = execute_in_workspace(&root, "checkpoint", &json!({"action": "diff", "id": checkpoint_id}))
         .expect("checkpoint diff should succeed");
     let diff_value: serde_json::Value = serde_json::from_str(&diff).expect("json");
-    assert_eq!(diff_value["type"], "checkpoint_diff");
+    assert_eq!(diff_value["type"], "checkpoint");
     assert!(diff_value["deletedFiles"]
         .as_array()
         .expect("deleted files")
@@ -1478,15 +1478,15 @@ fn checkpoint_tools_create_diff_and_restore_workspace_files() {
         .any(|file| file.as_str() == Some("src/new.rs")));
 
     let checkpoint_id = created_value["id"].as_str().expect("checkpoint id");
-    execute_in_workspace(&root, "checkpoint_restore", &json!({ "id": checkpoint_id }))
+    execute_in_workspace(&root, "checkpoint", &json!({"action": "restore", "id": checkpoint_id}))
         .expect("checkpoint restore should succeed");
     assert_eq!(fs::read_to_string(&file).expect("read restored"), "alpha\n");
     assert!(!root.join("src/new.rs").exists());
 
     let listed =
-        execute_in_workspace(&root, "checkpoint_list", &json!({})).expect("checkpoint list");
+        execute_in_workspace(&root, "checkpoint", &json!({"action": "list"})).expect("checkpoint list");
     let listed_value: serde_json::Value = serde_json::from_str(&listed).expect("json");
-    assert_eq!(listed_value["type"], "checkpoint_list");
+    assert_eq!(listed_value["type"], "checkpoint");
     assert!(!listed_value["checkpoints"]
         .as_array()
         .expect("checkpoints")

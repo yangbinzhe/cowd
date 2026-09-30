@@ -80,6 +80,7 @@ pub struct ToolSpec {
 pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
     let resolver_id = match normalize_tool_name(name).as_str() {
         "bash" | "powershell" => "builtin.command",
+        "checkpoint" => "runtime.action_checkpoint",
         "background" => "runtime.action_background",
         // `execute_code` and `repl` always enter the kernel-hardened workspace
         // sandbox with a bounded timeout/output budget. They must not inherit
@@ -114,8 +115,6 @@ pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
         "write_file"
         | "edit_file"
         | "apply_patch_transaction"
-        | "checkpoint_create"
-        | "checkpoint_restore"
         | "notebook_edit"
         | "todo_write"
         | "config"
@@ -486,66 +485,20 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::WorkspaceWrite,
         },
         ToolSpec {
-            name: "checkpoint_create",
+            name: "checkpoint",
             family: ToolFamily::Mutate,
             tier: ToolTier::Orchestration,
             permission_key: "checkpoint",
-            description: "Create a lightweight workspace checkpoint before risky edits. Boundary: it snapshots the workspace, not the session state, so restore it only to undo workspace content.",
+            description: "Manage local workspace checkpoints through ONE entry point. action=create (label?, paths?): snapshot the workspace before risky edits. action=list: list local checkpoints with ids and scope. action=diff (id): compare the workspace against a checkpoint. action=restore (id): overwrite files from a checkpoint - diff first. Boundary: checkpoints cover workspace content only, never session state, and are local to this session and host.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "action": { "type": "string", "enum": ["create", "list", "diff", "restore"] },
+                    "id": { "type": "string", "description": "Checkpoint id for diff/restore." },
                     "label": { "type": "string" },
-                    "paths": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Optional workspace-relative paths for a bounded checkpoint."
-                    }
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Optional workspace-relative paths for a bounded checkpoint." }
                 },
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::WorkspaceWrite,
-        },
-        ToolSpec {
-            name: "checkpoint_list",
-            family: ToolFamily::Session,
-            tier: ToolTier::Orchestration,
-            permission_key: "checkpoint",
-            description: "List local workspace checkpoints with their ids and scope. Boundary: local checkpoints only - it never sees checkpoints held by another session or host.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "checkpoint_diff",
-            family: ToolFamily::Session,
-            tier: ToolTier::Orchestration,
-            permission_key: "checkpoint",
-            description: "Compare the current workspace against a checkpoint, reporting changed files and hashes. Boundary: it reports differences, never the changed content itself.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" }
-                },
-                "required": ["id"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "checkpoint_restore",
-            family: ToolFamily::Mutate,
-            tier: ToolTier::Orchestration,
-            permission_key: "checkpoint",
-            description: "Restore files from a local workspace checkpoint. Boundary: it overwrites current content - diff first.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" }
-                },
-                "required": ["id"],
+                "required": ["action"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::WorkspaceWrite,
@@ -1688,7 +1641,7 @@ mod family_taxonomy_tests {
     #[test]
     fn every_tool_declares_a_family_tier_and_permission_key() {
         let specs = mvp_tool_specs();
-        assert_eq!(specs.len(), 42, "the catalog size is the contract");
+        assert_eq!(specs.len(), 39, "the catalog size is the contract");
         for spec in &specs {
             assert!(
                 !spec.permission_key.is_empty(),
@@ -1740,9 +1693,7 @@ mod family_taxonomy_tests {
     #[test]
     fn canonical_tools_do_not_share_a_permission_slot_beyond_the_legacy_ledger() {
         const LEGACY: &[(&str, &str, &str, usize)] = &[
-            ("Mutate", "checkpoint", "Orchestration", 2),
             ("Mutate", "edit", "Orchestration", 5),
-            ("Session", "checkpoint", "Orchestration", 2),
         ];
         let mut slots: BTreeMap<(&str, &str, &str), usize> = BTreeMap::new();
         for spec in mvp_tool_specs() {

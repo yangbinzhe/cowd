@@ -48,13 +48,18 @@ pub(crate) fn execute_with_lease(
         }
         "apply_patch_transaction" => from_value::<MutationApplyInput>(input)
             .and_then(|parsed| run_apply_patch_transaction(lease, parsed)),
-        "checkpoint_create" => from_value::<CheckpointCreateInput>(input)
-            .and_then(|parsed| run_checkpoint_create(lease, parsed)),
-        "checkpoint_list" => run_checkpoint_list(lease),
-        "checkpoint_diff" => from_value::<CheckpointDiffInput>(input)
-            .and_then(|parsed| run_checkpoint_diff(lease, parsed)),
-        "checkpoint_restore" => from_value::<CheckpointRestoreInput>(input)
-            .and_then(|parsed| run_checkpoint_restore(lease, parsed)),
+        "checkpoint" => match input.get("action").and_then(|value| value.as_str()) {
+            Some("create") => from_value::<CheckpointCreateInput>(input)
+                .and_then(|parsed| run_checkpoint_create(lease, parsed)),
+            Some("list") => run_checkpoint_list(lease),
+            Some("diff") => from_value::<CheckpointDiffInput>(input)
+                .and_then(|parsed| run_checkpoint_diff(lease, parsed)),
+            Some("restore") => from_value::<CheckpointRestoreInput>(input)
+                .and_then(|parsed| run_checkpoint_restore(lease, parsed)),
+            other => Err(format!(
+                "checkpoint action must be create|list|diff|restore, got {other:?}"
+            )),
+        },
         "glob_search" => from_value::<GlobSearchInputValue>(input)
             .and_then(|parsed| run_glob_search(lease, parsed)),
         "glob_many" => {

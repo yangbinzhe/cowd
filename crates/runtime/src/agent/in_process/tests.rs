@@ -1055,7 +1055,7 @@ fn test_tool_descriptor_for_input(
             ToolPermissionMode::ReadOnly,
             PermissionResource::Tool,
         ),
-        "checkpoint_create" | "write_file" | "artifact_materialize" => (
+        "checkpoint" | "write_file" | "artifact_materialize" => (
             ToolEffectKind::Write,
             PermissionOperation::Write,
             ToolPermissionMode::WorkspaceWrite,
@@ -1148,7 +1148,7 @@ async fn runtime_artifact_materialization_uses_registered_write_classification()
     );
     assert!(executor.owns_durable_tool_effect("artifact_materialize"));
     assert!(executor.owns_tool_resource_admission("artifact_materialize"));
-    assert!(!executor.owns_tool_resource_admission("checkpoint_create"));
+    assert!(!executor.owns_tool_resource_admission("checkpoint"));
     // With a production dispatcher, an absent parent fails admission. The
     // compatibility Echo host must no longer return a successful direct call.
     assert!(executor
@@ -1938,12 +1938,12 @@ async fn scoped_executor_advertises_only_packet_authorized_tools() {
         discovery.activation_candidates,
         vec!["grep_search", "read_file"]
     );
-    assert!(executor.has_tool("checkpoint_create"));
+    assert!(executor.has_tool("checkpoint"));
     assert!(!executor
         .available_tool_names()
-        .contains(&"checkpoint_create".to_string()));
+        .contains(&"checkpoint".to_string()));
     assert!(executor
-        .execute_output("checkpoint_create", r#"{"label":"model"}"#)
+        .execute_output("checkpoint", r#"{"label":"model"}"#)
         .await
         .is_err());
 }
@@ -1982,7 +1982,7 @@ async fn scoped_executor_routes_hidden_checkpoint_for_runtime_guard_only() {
         provider_model_obligations: Vec::new(),
     };
     let descriptor = executor
-        .registered_tool_effect("checkpoint_create", &serde_json::json!({"label": "guard"}))
+        .registered_tool_effect("checkpoint", &serde_json::json!({"label": "guard"}))
         .expect("Runtime guard must see the hidden checkpoint descriptor");
     let effective = crate::AuthorizationNegotiator::compile_effective_descriptor(
         &descriptor,
@@ -2005,7 +2005,7 @@ async fn scoped_executor_routes_hidden_checkpoint_for_runtime_guard_only() {
 
     assert_eq!(
         executor
-            .execute_authorized_output(&authorization, "checkpoint_create", r#"{"label":"guard"}"#,)
+            .execute_authorized_output(&authorization, "checkpoint", r#"{"label":"guard"}"#,)
             .await
             .expect("hidden checkpoint should reach the pinned Runtime host"),
         harness_contract::context::ToolOutputDraft::bounded_inline("authorized:checkpoint_create")

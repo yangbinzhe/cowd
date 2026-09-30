@@ -220,7 +220,7 @@ impl SystemService {
             ));
         }
         match tool_name {
-            "checkpoint_create" => {
+            "checkpoint" => {
                 let input = serde_json::from_value::<CheckpointCreateInput>(input)
                     .map_err(|error| error.to_string())?;
                 serde_json::to_string_pretty(
@@ -229,11 +229,11 @@ impl SystemService {
                 )
                 .map_err(|error| error.to_string())
             }
-            "checkpoint_list" => serde_json::to_string_pretty(
+            "checkpoint" => serde_json::to_string_pretty(
                 &checkpoint_list_in(workspace_root).map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string()),
-            "checkpoint_diff" => {
+            "checkpoint" => {
                 let input = serde_json::from_value::<CheckpointDiffInput>(input)
                     .map_err(|error| error.to_string())?;
                 serde_json::to_string_pretty(
@@ -242,7 +242,7 @@ impl SystemService {
                 )
                 .map_err(|error| error.to_string())
             }
-            "checkpoint_restore" => {
+            "checkpoint" => {
                 let input = serde_json::from_value::<CheckpointRestoreInput>(input)
                     .map_err(|error| error.to_string())?;
                 let output = serde_json::to_string_pretty(
@@ -450,7 +450,7 @@ fn changed_refs_for_tool(tool_name: &str, data: &serde_json::Value) -> Vec<Strin
             .filter_map(|item| item.get("path").and_then(serde_json::Value::as_str))
             .map(|path| format!("file:{path}"))
             .collect(),
-        "checkpoint_create" | "checkpoint_restore" => data
+        "checkpoint" | "checkpoint" => data
             .get("id")
             .and_then(serde_json::Value::as_str)
             .map(|id| vec![format!("checkpoint:{id}")])
@@ -461,7 +461,7 @@ fn changed_refs_for_tool(tool_name: &str, data: &serde_json::Value) -> Vec<Strin
 
 fn warnings_for_tool(tool_name: &str, data: &serde_json::Value) -> Vec<String> {
     let mut warnings = Vec::new();
-    if tool_name == "checkpoint_restore" {
+    if tool_name == "checkpoint" {
         warnings.push("restore replaces workspace files from a checkpoint".to_string());
     }
     if data
@@ -489,8 +489,8 @@ fn next_actions_for_tool(tool_name: &str, data: &serde_json::Value) -> Vec<Strin
                 vec!["Resolve conflicts before applying".to_string()]
             }
         }
-        "checkpoint_create" => vec!["Use checkpoint diff before restore".to_string()],
-        "checkpoint_restore" => vec!["Refresh workspace and inspect diff".to_string()],
+        "checkpoint" => vec!["Use checkpoint diff before restore".to_string()],
+        "checkpoint" => vec!["Refresh workspace and inspect diff".to_string()],
         _ => Vec::new(),
     }
 }

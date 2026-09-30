@@ -286,7 +286,7 @@ impl ProcessJsonlToolSession {
         input: &str,
     ) -> Result<String, String> {
         self.validate_current_policy()?;
-        if tool_name == "checkpoint_create" {
+        if tool_name == "checkpoint" {
             return Err("checkpoint_create is Runtime-internal".into());
         }
         if tool_name == "tool_search" {

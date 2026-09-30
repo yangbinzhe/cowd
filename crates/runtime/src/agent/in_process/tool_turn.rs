@@ -528,7 +528,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
                     ToolError::new(format!("serialize agent tool discovery: {error}"))
                 });
         }
-        if tool_name == "checkpoint_create" {
+        if tool_name == "checkpoint" {
             return Err(ToolError::new(
                 "checkpoint_create is a Runtime-internal mutation guard and cannot be invoked by the delegated model",
             ));
@@ -594,7 +594,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
         tool_name: &str,
         input: &serde_json::Value,
     ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
-        if tool_name == "checkpoint_create" {
+        if tool_name == "checkpoint" {
             return self
                 .internal_checkpoint_input(input.clone())
                 .ok()
@@ -648,7 +648,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
                 "agent tool authorization does not match the allowed tool request",
             ));
         }
-        if tool_name == "checkpoint_create" {
+        if tool_name == "checkpoint" {
             return self
                 .execute_internal_checkpoint(input, authorization.clone())
                 .await
@@ -736,7 +736,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
 
     fn owns_tool_resource_admission(&self, tool_name: &str) -> bool {
         self.tool_batch.is_some()
-            && tool_name != "checkpoint_create"
+            && tool_name != "checkpoint"
             && self.owns_durable_tool_effect(tool_name)
     }
 
@@ -757,7 +757,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
         tool_name: &str,
         input: &str,
     ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
-        if tool_name == "checkpoint_create"
+        if tool_name == "checkpoint"
             || matches!(
                 tool_name,
                 "evidence_retrieve"
@@ -799,7 +799,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
     fn has_tool(&self, tool_name: &str) -> bool {
         tool_name == "tool_search"
             || self.allowed_tools.contains(tool_name)
-            || (tool_name == "checkpoint_create"
+            || (tool_name == "checkpoint"
                 && self
                     .host
                     .delegated_tool_effect_descriptor(tool_name, &serde_json::json!({}))

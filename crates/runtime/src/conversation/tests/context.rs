@@ -248,7 +248,7 @@
             Session::new(),
             MockApi,
             StaticToolExecutor::new()
-                .register("checkpoint_create", move |_| {
+                .register("checkpoint", move |_| {
                     checkpoint_counter.fetch_add(1, Ordering::SeqCst);
                     Ok(r#"{"id":"checkpoint-test"}"#.to_string())
                 })

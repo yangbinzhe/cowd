@@ -373,7 +373,7 @@ async fn tool_checkpoints_handler(
         .execute_tool_receipt(
             &tool_host,
             &state.workspace_root,
-            "checkpoint_list",
+            "checkpoint",
             serde_json::json!({}),
             "read_only",
             "low",
@@ -393,7 +393,7 @@ async fn tool_checkpoint_create_handler(
         .execute_tool_receipt(
             &tool_host,
             &state.workspace_root,
-            "checkpoint_create",
+            "checkpoint",
             serde_json::json!({ "label": body.label }),
             "checkpoint",
             "medium",
@@ -413,7 +413,7 @@ async fn tool_checkpoint_diff_handler(
         .execute_tool_receipt(
             &tool_host,
             &state.workspace_root,
-            "checkpoint_diff",
+            "checkpoint",
             serde_json::json!({ "id": id }),
             "read_only",
             "low",
@@ -433,7 +433,7 @@ async fn tool_checkpoint_restore_handler(
         .execute_tool_receipt(
             &tool_host,
             &state.workspace_root,
-            "checkpoint_restore",
+            "checkpoint",
             serde_json::json!({ "id": id }),
             "restore",
             "high",
@@ -477,8 +477,8 @@ fn is_webui_generic_tool_allowed(tool_name: &str) -> bool {
             | "mutation_preview"
             | "edit_many_preview"
             | "patch_plan"
-            | "checkpoint_list"
-            | "checkpoint_diff"
+            | "checkpoint"
+            | "checkpoint"
             | "tool_batch_readonly"
             | "tool_cache_stats"
     )

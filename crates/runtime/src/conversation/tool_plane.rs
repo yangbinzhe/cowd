@@ -426,7 +426,7 @@ where
         if !validation.requires_checkpoint {
             return;
         }
-        if !self.tool_executor.has_tool("checkpoint_create") {
+        if !self.tool_executor.has_tool("checkpoint") {
             validation.allowed = false;
             validation
                 .findings
@@ -453,7 +453,7 @@ where
             }
         };
         let Some(descriptor) =
-            executor.registered_tool_effect("checkpoint_create", &checkpoint_value)
+            executor.registered_tool_effect("checkpoint", &checkpoint_value)
         else {
             validation.allowed = false;
             validation
@@ -514,7 +514,7 @@ where
                     executor
                         .execute_authorized_output(
                             &authorization.authorization,
-                            "checkpoint_create",
+                            "checkpoint",
                             &checkpoint_input,
                         )
                         .await

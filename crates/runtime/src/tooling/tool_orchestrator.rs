@@ -89,8 +89,8 @@ impl ToolSafetyCategory {
             | "mutation_preview"
             | "edit_many_preview"
             | "patch_plan"
-            | "checkpoint_list"
-            | "checkpoint_diff"
+            | "checkpoint"
+            | "checkpoint"
             | "git_status"
             | "git_log"
             | "git_diff"
@@ -124,8 +124,8 @@ impl ToolSafetyCategory {
             | "session_create"
             | "todo_write"
             | "apply_patch_transaction"
-            | "checkpoint_create"
-            | "checkpoint_restore" => Self::WriteLocal,
+            | "checkpoint"
+            | "checkpoint" => Self::WriteLocal,
 
             "web_search" | "web_fetch" | "http_request" => Self::Network,
 
@@ -205,7 +205,7 @@ fn cache_policy_for_tool(
         "write_file" | "edit_file" | "apply_patch_transaction" => {
             ToolCachePolicy::ScopeInvalidatingWrite
         }
-        "checkpoint_restore" => ToolCachePolicy::GlobalInvalidatingWrite,
+        "checkpoint" => ToolCachePolicy::GlobalInvalidatingWrite,
         _ if safety_category == ToolSafetyCategory::ReadOnly => ToolCachePolicy::Uncached,
         _ => ToolCachePolicy::Uncached,
     }

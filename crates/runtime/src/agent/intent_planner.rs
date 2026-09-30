@@ -130,7 +130,7 @@ fn mutation_kind(tool_name: &str) -> MutationKind {
     MutationKind {
         needs_dependency: matches!(
             tool_name,
-            "write_file" | "edit_file" | "apply_patch_transaction" | "checkpoint_restore"
+            "write_file" | "edit_file" | "apply_patch_transaction" | "checkpoint"
         ),
     }
 }

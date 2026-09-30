@@ -255,7 +255,7 @@ async fn tool_checkpoint_api_returns_receipts() {
     let body = to_bytes(create.into_body(), usize::MAX).await.unwrap();
     let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let checkpoint_id = created["data"]["id"].as_str().unwrap().to_string();
-    assert_eq!(created["tool_name"], "checkpoint_create");
+    assert_eq!(created["tool_name"], "checkpoint");
     assert_eq!(
         created["changed_refs"][0],
         format!("checkpoint:{checkpoint_id}")
