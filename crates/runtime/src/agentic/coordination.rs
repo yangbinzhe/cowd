@@ -319,7 +319,7 @@ pub(crate) mod tests {
             session_id: "coord-session".into(),
             turn_id: "coord-turn".into(),
             root_execution_id: None,
-            required_team_count: 1,
+            required_team_count: 0,
             objective_summary: "coordinate evidence".into(),
             model_lease: "test".into(),
             permission_ceiling: Some(permission_ceiling),
