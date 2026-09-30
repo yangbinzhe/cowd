@@ -42,7 +42,7 @@ fn brief_returns_sent_message_and_attachment_metadata() {
 
     let result = execute_in_workspace(
         root,
-        "send_user_message",
+        "ask",
         &json!({
             "message": "hello user",
             "attachments": [attachment.display().to_string()],
@@ -490,12 +490,12 @@ fn orchestrate_can_dispatch_the_whole_builtin_catalog_but_never_itself() {
         .map(|spec| spec.name.to_string())
         .collect();
 
-    assert_eq!(catalog.len(), 56, "the catalog size is the contract");
+    assert_eq!(catalog.len(), 54, "the catalog size is the contract");
     let catalog: Vec<String> = catalog
         .into_iter()
         .filter(|name| name != "tool_orchestrate")
         .collect();
-    assert_eq!(catalog.len(), 55, "the catalog minus the orchestrator itself");
+    assert_eq!(catalog.len(), 53, "the catalog minus the orchestrator itself");
     for name in &catalog {
         assert!(dispatchable(name), "`{name}` is in the catalog, so it must be composable");
     }

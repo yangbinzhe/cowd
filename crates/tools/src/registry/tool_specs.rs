@@ -104,8 +104,7 @@ pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
         | "patch_plan"
         | "checkpoint_list"
         | "checkpoint_diff"
-        | "question"
-        | "ask_user_question"
+        | "ask"
         | "tool_search"
         | "background_task_status"
         | "structured_output"
@@ -125,7 +124,7 @@ pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
         | "config"
         | "enter_plan_mode"
         | "exit_plan_mode" => "builtin.workspace_write",
-        "web_fetch" | "web_search" | "remote_trigger" | "send_user_message"
+        "web_fetch" | "web_search" | "remote_trigger"
         | "skill_install_plan" => "builtin.network",
         "request_plugin_install"
         | "skill_install_commit"
@@ -978,18 +977,20 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::WorkspaceWrite,
         },
         ToolSpec {
-            name: "question",
+            name: "ask",
             family: ToolFamily::Ask,
-            tier: ToolTier::Orchestration,
+            tier: ToolTier::Direct,
             permission_key: "ask",
-            description: "Ask the user a clarifying question with optional choices and wait. Alias for ask_user_question (same question/options input), kept for existing callers. Boundary: it blocks the turn until a reply - use send_user_message when you do not need an answer.",
+            description: "Talk to the user through ONE entry point. With `question` (+ optional `options`) it asks and BLOCKS the turn until they answer - use it only when you cannot proceed without a reply. With `message` (+ optional `attachments`, `status`) it sends an update or decision and does NOT wait. Boundary: `question` and `message` are mutually exclusive; never use a blocking question for progress that needs no answer.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "question": { "type": "string", "description": "The question to ask" },
-                    "options": { "type": "array", "items": { "type": "string" } }
+                    "question": { "type": "string", "description": "Ask and block until answered. Mutually exclusive with message." },
+                    "options": { "type": "array", "items": { "type": "string" }, "description": "Choices for question." },
+                    "message": { "type": "string", "description": "Send without waiting. Mutually exclusive with question." },
+                    "attachments": { "type": "array", "items": { "type": "string" } },
+                    "status": { "type": "string", "enum": ["normal", "proactive"] }
                 },
-                "required": ["question"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,
@@ -1179,30 +1180,6 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
-            name: "send_user_message",
-            family: ToolFamily::Ask,
-            tier: ToolTier::Orchestration,
-            permission_key: "ask",
-            description: "Send a message to the user without waiting for a reply. Use it for progress and decisions; use ask_user_question when you need an answer.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "message": { "type": "string" },
-                    "attachments": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    },
-                    "status": {
-                        "type": "string",
-                        "enum": ["normal", "proactive"]
-                    }
-                },
-                "required": ["message", "status"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
             name: "config",
             family: ToolFamily::Govern,
             tier: ToolTier::Operator,
@@ -1300,26 +1277,6 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::DangerFullAccess,
-        },
-        ToolSpec {
-            name: "ask_user_question",
-            family: ToolFamily::Ask,
-            tier: ToolTier::Direct,
-            permission_key: "ask",
-            description: "Ask the user a question with optional choices and block until they answer. Boundary: it stops the turn - use send_user_message when a reply is not required.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "question": { "type": "string" },
-                    "options": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    }
-                },
-                "required": ["question"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
             name: "lsp",
@@ -1682,11 +1639,7 @@ fn every_tool_documentation_states_power_and_boundary_without_false_claims() {
             .unwrap_or_else(|| panic!("{name} spec is missing"))
     };
     // Documented aliases: they intentionally defer to their canonical tool.
-    const ALIASES: &[&str] = &[
-        "edit_many_preview",
-        "patch_plan",
-        "question",
-    ];
+    const ALIASES: &[&str] = &["edit_many_preview", "patch_plan"];
 
     for spec in &specs {
         if ALIASES.contains(&spec.name) {
@@ -1954,7 +1907,7 @@ mod family_taxonomy_tests {
 
     /// Documented aliases defer to a canonical tool, so they never occupy a
     /// permission slot of their own.
-    const ALIASES: &[&str] = &["edit_many_preview", "patch_plan", "question"];
+    const ALIASES: &[&str] = &["edit_many_preview", "patch_plan"];
 
     /// The taxonomy the flat catalog lacked: every tool declares exactly one
     /// capability family and exposure tier and a non-empty permission key, and
@@ -1962,7 +1915,7 @@ mod family_taxonomy_tests {
     #[test]
     fn every_tool_declares_a_family_tier_and_permission_key() {
         let specs = mvp_tool_specs();
-        assert_eq!(specs.len(), 56, "the catalog size is the contract");
+        assert_eq!(specs.len(), 54, "the catalog size is the contract");
         for spec in &specs {
             assert!(
                 !spec.permission_key.is_empty(),

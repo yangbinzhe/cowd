@@ -72,19 +72,6 @@ pub(crate) fn execute_with_lease(
         "todo_write" => {
             from_value::<TodoWriteInput>(input).and_then(|parsed| run_todo_write(lease, parsed))
         }
-        "question" => {
-            let q = input.get("question").and_then(|v| v.as_str()).unwrap_or("");
-            let opts = input.get("options").and_then(|v| v.as_array()).map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            });
-            Ok(format!(
-                "[QUESTION] {q}{}",
-                opts.map(|o| format!("\nOptions: {o}")).unwrap_or_default()
-            ))
-        }
         "tool_search" => {
             from_value::<ToolSearchInput>(input).and_then(|parsed| run_tool_search(lease, parsed))
         }
@@ -103,9 +90,6 @@ pub(crate) fn execute_with_lease(
         "notebook_edit" => from_value::<NotebookEditInput>(input)
             .and_then(|parsed| run_notebook_edit(lease, parsed)),
         "sleep" => from_value::<SleepInput>(input).and_then(run_sleep),
-        "send_user_message" => {
-            from_value::<BriefInput>(input).and_then(|parsed| run_brief(lease, parsed))
-        }
         "config" => from_value::<ConfigInput>(input).and_then(|parsed| run_config(lease, parsed)),
         "enter_plan_mode" => from_value::<EnterPlanModeInput>(input)
             .and_then(|parsed| run_enter_plan_mode(lease, parsed)),
@@ -119,8 +103,12 @@ pub(crate) fn execute_with_lease(
             let ps_input: PowerShellInput = from_value(input)?;
             run_powershell(lease, ps_input)
         }
-        "ask_user_question" => {
-            from_value::<AskUserQuestionInput>(input).and_then(run_ask_user_question)
+        "ask" => {
+            if input.get("message").is_some() {
+                from_value::<BriefInput>(input).and_then(|parsed| run_brief(lease, parsed))
+            } else {
+                from_value::<AskUserQuestionInput>(input).and_then(run_ask_user_question)
+            }
         }
         "lsp" => from_value::<LspInput>(input).and_then(|parsed| run_lsp(lease, parsed)),
         "list_mcp_resources" => from_value::<McpResourceInput>(input)

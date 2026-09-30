@@ -105,8 +105,7 @@ impl ToolSafetyCategory {
             | "session_get"
             | "skill_list"
             | "skill_view"
-            | "question"
-            | "ask_user_question"
+            | "ask"
             | "tool_search"
             | "runtime_capabilities"
             | "list_mcp_resources"
@@ -226,7 +225,7 @@ fn normalize_tool_name_for_safety(name: &str) -> String {
         "webfetch" => "web_fetch".to_string(),
         "websearch" => "web_search".to_string(),
         "todowrite" => "todo_write".to_string(),
-        "askuserquestion" => "ask_user_question".to_string(),
+        "askuserquestion" => "ask".to_string(),
         "toolsearch" => "tool_search".to_string(),
         "runtimecapabilities" => "runtime_capabilities".to_string(),
         "contextretrieve" => "context_retrieve".to_string(),

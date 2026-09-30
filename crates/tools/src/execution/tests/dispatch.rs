@@ -167,7 +167,7 @@ fn exposes_mvp_tools() {
     assert!(names.contains(&"tool_search"));
     assert!(names.contains(&"notebook_edit"));
     assert!(names.contains(&"sleep"));
-    assert!(names.contains(&"send_user_message"));
+    assert!(names.contains(&"ask"));
     assert!(names.contains(&"config"));
     assert!(names.contains(&"enter_plan_mode"));
     assert!(names.contains(&"exit_plan_mode"));
