@@ -107,6 +107,78 @@ impl FacetVerdict {
     }
 }
 
+/// PLAN L1: the paths that got a durable successful READ receipt.
+///
+/// Single implementation, used by both the runner and these tests. Reading via a
+/// batch counts as reading, and every path in the batch is unwrapped; a failed
+/// or errored read is not evidence.
+pub fn collect_read_paths(timeline: &serde_json::Value, projections: &[serde_json::Value]) -> Vec<String> {
+    let accepts_tool = |name: &str| matches!(name, "read_file" | "read_many");
+    let paths_from_input = |input: &serde_json::Value| -> Vec<String> {
+        if let Some(path) = input.get("path").and_then(serde_json::Value::as_str) {
+            return vec![path.to_string()];
+        }
+        input
+            .get("files")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|file| file.get("path").and_then(serde_json::Value::as_str))
+            .map(ToString::to_string)
+            .collect()
+    };
+    let mut out = timeline
+        .get("events")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|event| {
+            event.get("kind").and_then(serde_json::Value::as_str) == Some("tool.invocation.completed")
+                && event.pointer("/payload/status").and_then(serde_json::Value::as_str) == Some("completed")
+                && event.pointer("/payload/is_error").and_then(serde_json::Value::as_bool) == Some(false)
+                && event
+                    .pointer("/payload/tool_name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(accepts_tool)
+        })
+        .filter_map(|event| {
+            event
+                .pointer("/payload/input_preview")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|input| serde_json::from_str::<serde_json::Value>(input).ok())
+                .map(|input| paths_from_input(&input))
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    // Projection activities carry the resolved path, which is what a required
+    // path is compared against.
+    for projection in projections {
+        for activity in projection
+            .get("activities")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let kind = activity.get("kind").and_then(serde_json::Value::as_str).unwrap_or("");
+            if !matches!(kind, "tool" | "tool_batch" | "read")
+                || activity.get("status").and_then(serde_json::Value::as_str) != Some("completed")
+            {
+                continue;
+            }
+            if let Some(path) = activity
+                .get("detail")
+                .and_then(|detail| detail.get("path"))
+                .and_then(serde_json::Value::as_str)
+            {
+                out.push(path.to_string());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Gate one facet's outcome.
 ///
 /// Pure: the same outcome and acceptance always produce the same verdict, which
@@ -282,5 +354,64 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+/// PLAN L1 integration: the gate's evidence comes from the timeline, and a
+/// batched read must count as a read. These use the shape the runner produces
+/// for `tool.invocation.completed`.
+#[cfg(test)]
+mod timeline_tests {
+    use serde_json::json;
+
+    // The extraction itself lives in `facet_gate::collect_read_paths` and the
+    // runner calls it, so the gate is tested against the same code it uses.
+    use super::collect_read_paths as read_paths;
+
+    fn event(tool: &str, preview: &str, is_error: bool) -> serde_json::Value {
+        json!({
+            "kind": "tool.invocation.completed",
+            "status": "completed",
+            "payload": {
+                "status": "completed",
+                "is_error": is_error,
+                "tool_name": tool,
+                "input_preview": preview,
+            }
+        })
+    }
+
+    #[test]
+    fn a_batched_read_counts_as_a_read_of_every_file() {
+        let preview = json!({"files": [{"path": "a.rs"}, {"path": "b.rs"}]}).to_string();
+        let timeline = json!({"events": [event("read_many", &preview, false)]});
+        let paths = read_paths(&timeline, &[]);
+        assert!(paths.contains(&"a.rs".to_string()), "{paths:?}");
+        assert!(paths.contains(&"b.rs".to_string()), "{paths:?}");
+    }
+
+    #[test]
+    fn single_reads_are_collected_and_sorted() {
+        let timeline = json!({"events": [
+            event("read_file", &json!({"path": "c.rs"}).to_string(), false),
+            event("read_file", &json!({"path": "a.rs"}).to_string(), false),
+            event("read_file", &json!({"path": "b.rs"}).to_string(), false),
+        ]});
+        assert_eq!(
+            read_paths(&timeline, &[]),
+            vec!["a.rs".to_string(), "b.rs".to_string(), "c.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_failed_read_is_not_evidence() {
+        let timeline = json!({"events": [event("read_file", &json!({"path": "a.rs"}).to_string(), true)]});
+        assert!(read_paths(&timeline, &[]).is_empty(), "an errored read is not evidence");
+    }
+
+    #[test]
+    fn a_write_tool_is_not_a_read() {
+        let timeline = json!({"events": [event("write_file", &json!({"path": "a.rs"}).to_string(), false)]});
+        assert!(read_paths(&timeline, &[]).is_empty(), "only reads count");
     }
 }

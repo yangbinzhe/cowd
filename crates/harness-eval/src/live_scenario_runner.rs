@@ -915,10 +915,19 @@ impl LiveScenarioRunner {
             LiveScenarioSpec {
                 id: "live_minimal_batch_read",
                 prompt: "请读取以下 6 个源码文件，并对每个文件给出一个可核验的事实（文件路径 + 事实）。crates/tools/src/lib.rs —— workspace 的成员 crate 数量。crates/runtime/src/lib.rs —— 顶层 `pub mod` / `pub use` 的数量。crates/memory/src/lib.rs —— 记忆 crate 的模块数量。crates/gateway/src/main.rs —— main.rs 的行数。crates/provider/src/lib.rs —— provider crate 的公开导出条数。crates/harness-eval/src/lib.rs —— harness-eval 的行数。只使用只读工具，不要调用 bash 或任何写工具；读不到就保留 unresolved，不要凭先验知识作答。",
-                acceptance: LiveAcceptance::ArchitectureQuality {
-                    minimum_teams: 0,
-                    minimum_claimed_cross_team_edges: 0,
-                    evidence_profile: ArchitectureEvidenceProfile::Basic,
+                acceptance: LiveAcceptance::Facet {
+                    facet_id: "read_six_named_files",
+                    capability: "read every named file and report one verifiable fact from it",
+                    required_read_paths: &[
+                        "crates/tools/src/lib.rs",
+                        "crates/runtime/src/lib.rs",
+                        "crates/memory/src/lib.rs",
+                        "crates/gateway/src/main.rs",
+                        "crates/provider/src/lib.rs",
+                        "crates/harness-eval/src/lib.rs",
+                    ],
+                    answer_contains: &[],
+                    keep_unresolved_ok: true,
                 },
                 timeout: LiveScenarioTimeout::tool(),
             },
@@ -932,10 +941,12 @@ impl LiveScenarioRunner {
             LiveScenarioSpec {
                 id: "live_minimal_compute_reduce",
                 prompt: "请统计本 workspace 中 Rust 源码的总行数、以及 `.rs` 文件的数量，并给出 `crates/` 下哪一个 crate 的 `.rs` 文件最多（给出 crate 名与文件数）。只使用只读工具，不要调用 bash 或任何写工具；不要逐个人工累加文件内容。",
-                acceptance: LiveAcceptance::ArchitectureQuality {
-                    minimum_teams: 0,
-                    minimum_claimed_cross_team_edges: 0,
-                    evidence_profile: ArchitectureEvidenceProfile::Basic,
+                acceptance: LiveAcceptance::Facet {
+                    facet_id: "deterministic_reduction_outside_the_model",
+                    capability: "aggregate across files without moving their bodies into context",
+                    required_read_paths: &[],
+                    answer_contains: &[],
+                    keep_unresolved_ok: true,
                 },
                 timeout: LiveScenarioTimeout::tool(),
             },
@@ -2844,6 +2855,32 @@ enum LiveAcceptance {
         minimum_topics: usize,
         output_path: &'static str,
     },
+    /// PLAN Phase 4 / L1: a single-facet probe gated on what that facet tests.
+    ///
+    /// Both facets were previously declared failed by `ArchitectureQuality` - a
+    /// gate for a multi-team architecture review - even when the model had
+    /// answered correctly. arm E returned three verbatim source quotes in 3
+    /// rounds and Facet B answered 1125 files / 771040 lines with cited receipts,
+    /// and both still failed on `architecture_quality`.
+    ///
+    /// A gate that cannot pass a correct answer measures nothing. A facet
+    /// therefore names only what its own capability must have produced, and
+    /// never requires teams, tasks, reviews or topics.
+    Facet {
+        /// The facet identifier, for the report.
+        facet_id: &'static str,
+        /// The single capability under test.
+        capability: &'static str,
+        /// Paths that must have a durable read receipt. Empty means "not gated
+        /// on reads".
+        required_read_paths: &'static [&'static str],
+        /// Substrings the final answer must contain.
+        answer_contains: &'static [&'static str],
+        /// Whether leaving something unresolved is acceptable. For a facet whose
+        /// point is honest reporting this MUST be true, or the gate punishes the
+        /// behaviour it is trying to teach.
+        keep_unresolved_ok: bool,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2901,6 +2938,54 @@ impl LiveAcceptance {
                         json!({"name": "durable_response", "passed": !response.trim().is_empty()}),
                         json!({"name": "tool_evidence", "passed": tool_evidence}),
                     ],
+                }
+            }
+            Self::Facet {
+                facet_id,
+                capability,
+                required_read_paths,
+                answer_contains,
+                keep_unresolved_ok,
+            } => {
+                // Collect the paths that actually have a durable read receipt
+                // from the timeline, so "the model claims it read X" and "the
+                // model read X" stay distinguishable.
+                let read_paths = durable_read_receipt_paths(timeline, projections);
+                let outcome = crate::facet_gate::FacetOutcome {
+                    read_paths,
+                    answer: response.to_string(),
+                    marked_unresolved: response_marks_unresolved(response),
+                };
+                let verdict = crate::facet_gate::evaluate_facet(
+                    &crate::facet_gate::FacetAcceptance {
+                        facet_id: facet_id.to_string(),
+                        capability: capability.to_string(),
+                        required_read_paths: required_read_paths
+                            .iter()
+                            .map(|path| (*path).to_string())
+                            .collect(),
+                        answer_contains: answer_contains
+                            .iter()
+                            .map(|needle| (*needle).to_string())
+                            .collect(),
+                        keep_unresolved_ok,
+                    },
+                    &outcome,
+                );
+                LiveAcceptanceResult {
+                    passed: verdict.passed,
+                    quality: None,
+                    checks: verdict
+                        .requirements
+                        .iter()
+                        .map(|requirement| {
+                            json!({
+                                "name": requirement.requirement,
+                                "passed": requirement.passed,
+                                "observed": requirement.observed,
+                            })
+                        })
+                        .collect(),
                 }
             }
             Self::ArchitectureQuality {
@@ -4391,6 +4476,33 @@ fn root_business_outcome(timeline: &Value, root_execution_id: &str) -> RootBusin
 /// Successful tool evidence is a canonical Runtime completion receipt. It is
 /// deliberately not a recursive key search: provider capability metadata and
 /// zero-valued usage summaries are declarations, not executed effects.
+/// PLAN L1: the paths that actually got a durable successful read receipt.
+///
+/// The extraction lives in `facet_gate::collect_read_paths` so the gate and its
+/// tests use the same code; this exists to keep the call site readable.
+fn durable_read_receipt_paths(timeline: &Value, projections: &[Value]) -> Vec<String> {
+    crate::facet_gate::collect_read_paths(timeline, projections)
+}
+
+/// PLAN L1: whether the final answer explicitly keeps something unresolved.
+///
+/// Honest reporting is a behaviour the gate must reward, so this has to be
+/// detected rather than assumed absent.
+pub(crate) fn response_marks_unresolved(response: &str) -> bool {
+    let lower = response.to_lowercase();
+    const MARKERS: [&str; 8] = [
+        "unresolved",
+        "无法从现有证据",
+        "无法确定",
+        "未能确定",
+        "无法确认",
+        "未能确认",
+        "无法判断",
+        "保留",
+    ];
+    MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
 fn has_successful_runtime_tool_completion(
     timeline: &Value,
     expected_tool_name: &str,
