@@ -4594,3 +4594,41 @@ fn env_duration_millis(key: &str, default: Duration) -> Duration {
 #[cfg(test)]
 #[path = "live_scenario_runner/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod scenario_tool_advertisement_tests {
+    use std::collections::BTreeSet;
+
+    /// The scenario prompts used to hand-write their tool allow-list, and that
+    /// list had drifted to advertise names the runtime had already removed
+    /// (`read_many`, `glob_many`, ...) - the same class of hand-written list that
+    /// caused the V1 regression, and one that could mask a real "tool not
+    /// reachable" failure. This pins every advertised name to the live catalog.
+    #[test]
+    fn scenario_prompts_only_advertise_tools_the_runtime_exposes() {
+        let catalog = tools::mvp_tool_specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<BTreeSet<_>>();
+        // Runtime-owned read-only tools that live outside the built-in catalog.
+        let runtime_readonly = ["read_ref", "context_retrieve", "evidence_retrieve"];
+        let source = include_str!("live_scenario_runner.rs");
+        // Escaped so this test's own source does not contain the literal it scans for.
+        let anchor = "\u{53ef}\u{7528}\u{5de5}\u{5177}\u{ff1a}";
+        let mut checked = 0_usize;
+        for line in source.lines() {
+            let Some(rest) = line.split(anchor).nth(1) else {
+                continue;
+            };
+            let list = rest.split('。').next().unwrap_or("");
+            for name in list.split('、').map(str::trim).filter(|name| !name.is_empty()) {
+                assert!(
+                    catalog.contains(name) || runtime_readonly.contains(&name),
+                    "a scenario prompt advertises `{name}`, which the runtime does not expose"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 7, "expected to validate the scenario tool lists, checked {checked}");
+    }
+}
