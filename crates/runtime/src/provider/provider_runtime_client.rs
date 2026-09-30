@@ -323,9 +323,10 @@ pub struct ProviderRuntimeClient {
     /// clock is deliberately absent: a long healthy generation is never
     /// interrupted.
     liveness_contract: crate::liveness::LivenessContract,
-    /// Optional probe notification so the turn owner can record the reaction
-    /// (retry the same nonce / fail over / escalate).
-    liveness_probe_sink: Option<
+    /// Notified when the stream goes semantically inactive, so the turn owner
+    /// can HELP (refocus / summarize / request commit / ask) rather than
+    /// terminate. PLAN D1: no stream is ever cut off by this module.
+    liveness_stall_sink: Option<
         Arc<dyn Fn(crate::liveness::LivenessVerdict) + Send + Sync + 'static>,
     >,
 }
@@ -507,7 +508,7 @@ impl ProviderRuntimeClient {
             provider_wire_evidence_writer: None,
             prompt_history: Arc::new(std::sync::Mutex::new(ProviderPromptHistory::default())),
             liveness_contract: crate::liveness::LivenessContract::default(),
-            liveness_probe_sink: None,
+            liveness_stall_sink: None,
         })
     }
 
@@ -926,30 +927,21 @@ impl ProviderRuntimeClient {
         Box<dyn futures::stream::Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>,
     > {
         let contract = self.liveness_contract.clone();
-        let probe_sink = self.liveness_probe_sink.clone();
+        let stall_sink = self.liveness_stall_sink.clone();
         let events = self
             .stream_with_activity_and_provider_snapshot(request, provider_snapshot)
             .events;
-        // PLAN D1b: guard the provider stream so a request that connects and
-        // then goes silent is reported as a typed failure instead of hanging
-        // until the evaluator's wall clock. Detection lives here; the reaction
-        // (retry the same nonce / fail over / escalate) stays with the turn
-        // owner, which is why this only records the probe.
-        Box::pin(crate::liveness::guard_liveness(
-            events,
-            contract,
-            move |verdict| {
-                if let Some(sink) = probe_sink.as_ref() {
-                    sink(verdict);
-                }
-            },
-            |idle, probes| {
-                RuntimeError::new(format!(
-                    "{} after {idle:?} ({probes} probes); the provider accepted the connection but produced no semantic progress",
-                    crate::liveness::PROVIDER_SILENT_PREFIX
-                ))
-            },
-        ))
+        // PLAN D1b (corrected): a stream that goes semantically inactive is
+        // REPORTED to the turn owner with the idle time and the ladder step so
+        // it can HELP the model (refocus / summarize / request commit / ask).
+        // The stream is never cut off and no typed failure is synthesised: the
+        // earlier version terminated the turn on a symptom that turned out to be
+        // a measurement artefact, which killed work the model was still doing.
+        Box::pin(crate::liveness::guard_liveness(events, contract, move |verdict| {
+            if let Some(sink) = stall_sink.as_ref() {
+                sink(verdict);
+            }
+        }))
     }
 
     fn stream_with_activity_and_provider_snapshot(
