@@ -142,7 +142,6 @@ pub(crate) mod pg_test_support {
     /// The pool still grows on demand up to `config.max_connections`, which is
     /// what keeps a concurrent test from starving while an idle one costs
     /// almost nothing.
-    const TEST_POOL_WARM_CONNECTIONS: u32 = 10;
 
     fn postgres_executor() -> PostgresExecutor {
         static EXECUTOR: OnceLock<Result<PostgresExecutor, String>> = OnceLock::new();
@@ -168,7 +167,12 @@ pub(crate) mod pg_test_support {
                 // Warm a small floor and let the pool grow to the ceiling only
                 // when cases actually ask for connections.
                 config.max_connections = 64;
-                config.min_idle_connections = Some(TEST_POOL_WARM_CONNECTIONS);
+                // Hold NO idle connections. Nine PG-backed test binaries share one server and
+                // libtest runs them concurrently, so a warm floor is multiplied by the
+                // binary count and most of those connections sit idle: that is what
+                // turns a shared fixture into an admission failure. Connections are
+                // created when a case actually checks one out.
+                config.min_idle_connections = Some(0);
                 PostgresExecutor::connect(config, &resolver).map_err(|error| error.to_string())
             })
             .clone()

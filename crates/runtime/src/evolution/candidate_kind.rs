@@ -35,20 +35,19 @@ pub enum EvolutionPromotionRoute {
 }
 
 impl EvolutionCandidateKind {
-    pub const ALL: [Self; 13] = [
+    /// The kinds the runtime can actually promote - i.e. the ones a caller may
+    /// ADVERTISE. A kind is only listed here when `promotion_route` returns a
+    /// governed route, so "advertised" and "executable" stay the same set.
+    ///
+    /// The enum still carries the other ten kinds, because durable records refer
+    /// to them and dropping the variants would make history unreadable. They are
+    /// deliberately absent from `ALL` so nothing iterates over them as if they
+    /// were live: `promotion_route` returns `PromotionAdapterUnavailable` for
+    /// each of them, which is the honest statement of the gap.
+    pub const ALL: [Self; 3] = [
         Self::AgentDefinition,
-        Self::RuntimePolicy,
-        Self::ContextPolicy,
-        Self::MemoryGovernance,
-        Self::RealityGovernance,
-        Self::ToolContract,
         Self::SkillPackage,
-        Self::SessionPolicy,
-        Self::ProviderProfile,
-        Self::EvalScenario,
-        Self::SurfaceProjection,
-        Self::CodePatch,
-        Self::ArchitecturePlan,
+        Self::MemoryGovernance,
     ];
 
     #[must_use]
@@ -203,8 +202,11 @@ mod tests {
             match kind.promotion_route() {
                 EvolutionPromotionRoute::AgentDefinitionGovernance
                 | EvolutionPromotionRoute::SkillRevisionGovernance
-                | EvolutionPromotionRoute::KnowledgeCandidateOnly
-                | EvolutionPromotionRoute::PromotionAdapterUnavailable => {}
+                | EvolutionPromotionRoute::KnowledgeCandidateOnly => {}
+                EvolutionPromotionRoute::PromotionAdapterUnavailable => panic!(
+                    "`{}` is advertised in ALL but has no promotion route",
+                    kind.as_str()
+                ),
             }
         }
         assert_eq!(
@@ -215,5 +217,52 @@ mod tests {
             EvolutionCandidateKind::CodePatch.promotion_route(),
             EvolutionPromotionRoute::PromotionAdapterUnavailable
         );
+    }
+
+    /// "Advertised" and "executable" must stay the same set. This is the whole
+    /// point of trimming `ALL`: a kind with no executor may not be iterated as if
+    /// it were a live capability, which is what the thirteen-entry list did.
+    #[test]
+    fn advertised_equals_executable() {
+        let advertised = EvolutionCandidateKind::ALL
+            .iter()
+            .map(|kind| kind.as_str())
+            .collect::<Vec<_>>();
+        let executable = [
+            EvolutionCandidateKind::AgentDefinition,
+            EvolutionCandidateKind::SkillPackage,
+            EvolutionCandidateKind::MemoryGovernance,
+        ]
+        .iter()
+        .map(|kind| kind.as_str())
+        .collect::<Vec<_>>();
+        assert_eq!(advertised, executable);
+
+        // The ten unavailable kinds stay in the enum (history refers to them) but
+        // are absent from ALL.
+        for kind in [
+            EvolutionCandidateKind::RuntimePolicy,
+            EvolutionCandidateKind::ContextPolicy,
+            EvolutionCandidateKind::RealityGovernance,
+            EvolutionCandidateKind::ToolContract,
+            EvolutionCandidateKind::SessionPolicy,
+            EvolutionCandidateKind::ProviderProfile,
+            EvolutionCandidateKind::EvalScenario,
+            EvolutionCandidateKind::SurfaceProjection,
+            EvolutionCandidateKind::CodePatch,
+            EvolutionCandidateKind::ArchitecturePlan,
+        ] {
+            assert_eq!(
+                kind.promotion_route(),
+                EvolutionPromotionRoute::PromotionAdapterUnavailable,
+                "`{}` must stay honest about having no executor",
+                kind.as_str()
+            );
+            assert!(
+                !EvolutionCandidateKind::ALL.contains(&kind),
+                "`{}` has no executor and must not be advertised",
+                kind.as_str()
+            );
+        }
     }
 }
