@@ -268,6 +268,13 @@ impl ToolCatalog {
         let runtime = self
             .runtime_tools
             .iter()
+            // PLAN B-4: externally discovered MCP tools (`mcp__server__tool`) are
+            // NOT part of the provider tool array. Activating one used to rewrite
+            // the tools array and invalidate the prompt cache from the tools
+            // onward, and it is the one confirmed real prefix-split source. They
+            // stay resolvable by name for `mcp(action=call)` and by orchestration,
+            // which is the only route the model needs.
+            .filter(|tool| !tool.name.starts_with("mcp__"))
             .filter(|tool| allowed_tools.is_none_or(|allowed| allowed.contains(tool.name.as_str())))
             .map(|tool| ToolDefinition {
                 name: tool.name.clone(),
@@ -689,6 +696,49 @@ mod tests {
             catalog.required_permission("mcp__alpha__echo"),
             Some(KernelToolPermissionMode::ReadOnly)
         );
+    }
+
+    /// PLAN B-4: externally discovered MCP tools are reachable through
+    /// `mcp(action=call)` (and orchestration), but they must NOT enter the
+    /// provider tool array - activating one used to rewrite that array and
+    /// invalidate the whole prompt cache from the tools onward.
+    #[test]
+    fn externally_discovered_mcp_tools_stay_out_of_the_provider_definitions() {
+        let definition = |name: &str| RuntimeToolDefinition {
+            name: name.to_string(),
+            description: None,
+            input_schema: serde_json::json!({ "type": "object" }),
+            required_permission: PermissionMode::ReadOnly,
+            effect_resolver: ToolEffectResolverSpec {
+                resolver_id: "runtime.readonly".to_string(),
+                resolver_version: 1,
+            },
+        };
+        let catalog = ToolCatalog::builtin()
+            .with_runtime_tools(vec![definition("team_create")])
+            .expect("core runtime tool")
+            .extend_runtime_tools(vec![definition("mcp__alpha__echo")])
+            .expect("MCP runtime tool");
+
+        let names = catalog
+            .definitions(None)
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            names.contains("team_create"),
+            "core runtime tools stay in the provider array"
+        );
+        assert!(
+            !names.contains("mcp__alpha__echo"),
+            "an MCP tool must not enter the provider tool array"
+        );
+        // It stays resolvable, so `mcp(action=call)` and orchestration reach it.
+        assert_eq!(
+            catalog.canonical_name("mcp__alpha__echo").as_deref(),
+            Some("mcp__alpha__echo")
+        );
+        assert!(catalog.required_permission("mcp__alpha__echo").is_some());
     }
 
     #[derive(Debug)]
