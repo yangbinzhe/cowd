@@ -33,6 +33,60 @@ const DELEGATED_PROVIDER_ADMISSION_TIMEOUT_MS: u64 = 300_000;
 // hard "cannot fit" failure through the existing semantic-checkpoint pipeline.
 const PROACTIVE_COMPACTION_PERCENT: usize = 90;
 
+/// PLAN D1b: turn the liveness verdicts the stream guard recorded into at most one
+/// non-forcing push-forward nudge for the next request.
+///
+/// The ladder is cumulative, so the highest rung already says what to do; taking
+/// only that one keeps a perpetually-stalling turn from flooding its own context
+/// with its own nudges. The result never disables tools and never asks the
+/// runtime to end the turn - only the model declares a task finished or
+/// impossible (PLAN D1).
+fn liveness_stall_context_item(
+    stalls: Vec<crate::liveness::LivenessVerdict>,
+) -> Option<ContextItem> {
+    use crate::liveness::{LivenessAction, LivenessVerdict};
+    let (idle, step, action) = stalls
+        .into_iter()
+        .filter_map(|verdict| match verdict {
+            LivenessVerdict::Stalled { idle, step, action } => Some((idle, step, action)),
+            LivenessVerdict::Progressing => None,
+        })
+        .max_by_key(|(_, step, _)| *step)?;
+    let guidance = match action {
+        LivenessAction::Refocus => format!(
+            "Runtime liveness: no semantic progress for {}s. State concretely what is still \
+             missing and take the next concrete step; do not restate what you already know.",
+            idle.as_secs()
+        ),
+        LivenessAction::Summarize => format!(
+            "Runtime liveness: no semantic progress for {}s. Summarize what is already known so \
+             the next step is cheap, then continue from that summary.",
+            idle.as_secs()
+        ),
+        LivenessAction::RequestCommit => format!(
+            "Runtime liveness: no semantic progress for {}s. If the evidence already suffices, \
+             commit the final answer now from the receipts you hold. If it does not, say what is \
+             still missing and continue.",
+            idle.as_secs()
+        ),
+        LivenessAction::Ask => format!(
+            "Runtime liveness: no semantic progress for {}s. Say whether you can continue, and if \
+             the task is finished or impossible say so plainly. Only you decide - the runtime does \
+             not end the turn for you.",
+            idle.as_secs()
+        ),
+    };
+    let mut item = ContextItem::new(
+        format!("runtime-liveness-{step}"),
+        ContextSourceKind::Task,
+        ContextRole::Instruction,
+        guidance,
+    );
+    item.authority = ContextAuthority::System;
+    item.visibility = ContextVisibility::Private;
+    Some(item)
+}
+
 /// Make Runtime's checked receipts legible to the terminal narrator even when
 /// the provider transport represents them only as native tool messages.
 ///
@@ -962,6 +1016,14 @@ where
             return Err(RuntimeError::new(
                 "turn cancelled before provider execution",
             ));
+        }
+        // PLAN D1b: verdicts the stream guard recorded while the previous provider
+        // stream was polled. Each becomes a NON-FORCING push-forward nudge on this
+        // request - refocus, summarize, request commit, or ask. The runtime never
+        // disables tools and never ends the turn here: only the model declares a
+        // task finished or impossible (PLAN D1).
+        if let Some(item) = liveness_stall_context_item(self.api_client.take_liveness_stalls()) {
+            self.push_next_model_context_item(item);
         }
         let started_at = Instant::now();
         if first_step {
@@ -1961,6 +2023,75 @@ mod provider_admission_tests {
             ExecutionServiceClass::Maintenance,
         ] {
             assert_eq!(provider_admission_timeout_ms(class), 300_000);
+        }
+    }
+}
+
+#[cfg(test)]
+mod liveness_stall_context_tests {
+    use super::*;
+    use crate::liveness::{LivenessAction, LivenessVerdict};
+
+    fn stalled(step: u32, action: LivenessAction) -> LivenessVerdict {
+        LivenessVerdict::Stalled {
+            idle: std::time::Duration::from_secs(120 + u64::from(step)),
+            step,
+            action,
+        }
+    }
+
+    /// Nothing stalled, nothing injected.
+    #[test]
+    fn progress_alone_injects_nothing() {
+        assert!(liveness_stall_context_item(Vec::new()).is_none());
+        assert!(
+            liveness_stall_context_item(vec![LivenessVerdict::Progressing]).is_none(),
+            "a progressing stream must never add a nudge"
+        );
+    }
+
+    /// The guard reports each rung of the ladder; the runtime injects ONE nudge,
+    /// for the highest rung, because the ladder is cumulative and repeating the
+    /// lower rungs would flood the context with the runtime's own voice.
+    #[test]
+    fn the_highest_rung_is_the_one_injected() {
+        let item = liveness_stall_context_item(vec![
+            stalled(1, LivenessAction::Refocus),
+            stalled(3, LivenessAction::RequestCommit),
+            stalled(2, LivenessAction::Summarize),
+        ])
+        .expect("a stall must produce a nudge");
+        assert_eq!(item.id, "runtime-liveness-3");
+        assert!(
+            item.content.contains("commit the final answer"),
+            "the highest rung's guidance must be the one carried: {}",
+            item.content
+        );
+    }
+
+    /// Each rung says what to DO, and none of them disables tools or ends the
+    /// turn - the model owns the verdict that a task is finished or impossible.
+    #[test]
+    fn every_rung_is_constructive_and_none_forces_an_end() {
+        for (action, needle) in [
+            (LivenessAction::Refocus, "State concretely what is still"),
+            (LivenessAction::Summarize, "Summarize what is already known"),
+            (LivenessAction::RequestCommit, "commit the final answer"),
+            (LivenessAction::Ask, "Only you decide"),
+        ] {
+            let item = liveness_stall_context_item(vec![stalled(1, action)])
+                .expect("a stall must produce a nudge");
+            assert!(
+                item.content.contains(needle),
+                "{action:?} must say what to do, got: {}",
+                item.content
+            );
+            assert!(
+                !item.content.contains("tools are disabled")
+                    && !item.content.contains("the turn ends"),
+                "{action:?} must not force an end: {}",
+                item.content
+            );
         }
     }
 }

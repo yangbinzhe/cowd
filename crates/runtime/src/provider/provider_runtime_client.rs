@@ -329,6 +329,10 @@ pub struct ProviderRuntimeClient {
     liveness_stall_sink: Option<
         Arc<dyn Fn(crate::liveness::LivenessVerdict) + Send + Sync + 'static>,
     >,
+    /// PLAN D1b: verdicts observed by the stream guard, drained by the turn owner
+    /// so each stall becomes a non-forcing push-forward nudge. Kept on the client
+    /// so nothing new has to be threaded through Runtime construction.
+    liveness_stalls: Arc<std::sync::Mutex<Vec<crate::liveness::LivenessVerdict>>>,
 }
 
 #[derive(Clone)]
@@ -509,6 +513,7 @@ impl ProviderRuntimeClient {
             prompt_history: Arc::new(std::sync::Mutex::new(ProviderPromptHistory::default())),
             liveness_contract: crate::liveness::LivenessContract::default(),
             liveness_stall_sink: None,
+            liveness_stalls: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
     }
 
@@ -916,6 +921,13 @@ impl ApiClient for ProviderRuntimeClient {
     ) {
         self.provider_wire_evidence_writer = writer;
     }
+
+    fn take_liveness_stalls(&mut self) -> Vec<crate::liveness::LivenessVerdict> {
+        self.liveness_stalls
+            .lock()
+            .map(|mut recorded| std::mem::take(&mut *recorded))
+            .unwrap_or_default()
+    }
 }
 
 impl ProviderRuntimeClient {
@@ -928,16 +940,25 @@ impl ProviderRuntimeClient {
     > {
         let contract = self.liveness_contract.clone();
         let stall_sink = self.liveness_stall_sink.clone();
+        let recorded_stalls = Arc::clone(&self.liveness_stalls);
         let events = self
             .stream_with_activity_and_provider_snapshot(request, provider_snapshot)
             .events;
         // PLAN D1b (corrected): a stream that goes semantically inactive is
-        // REPORTED to the turn owner with the idle time and the ladder step so
-        // it can HELP the model (refocus / summarize / request commit / ask).
-        // The stream is never cut off and no typed failure is synthesised: the
-        // earlier version terminated the turn on a symptom that turned out to be
-        // a measurement artefact, which killed work the model was still doing.
+        // REPORTED with the idle time and the ladder step so the turn owner can
+        // HELP the model (refocus / summarize / request commit / ask). The stream
+        // is never cut off and no typed failure is synthesised: the earlier
+        // version terminated the turn on a symptom that turned out to be a
+        // measurement artefact, which killed work the model was still doing.
+        //
+        // The verdict is recorded on the client so the turn owner can drain it
+        // without a new value being threaded through Runtime construction; the
+        // optional `liveness_stall_sink` remains for callers that want an
+        // immediate out-of-band reaction.
         Box::pin(crate::liveness::guard_liveness(events, contract, move |verdict| {
+            if let Ok(mut recorded) = recorded_stalls.lock() {
+                recorded.push(verdict.clone());
+            }
             if let Some(sink) = stall_sink.as_ref() {
                 sink(verdict);
             }

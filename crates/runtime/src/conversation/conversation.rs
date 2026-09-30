@@ -2471,6 +2471,14 @@ pub trait ApiClient {
         (0, 0)
     }
 
+    /// PLAN D1b: liveness push-forward verdicts observed while the last provider
+    /// stream was polled. The turn owner drains these and turns each into a
+    /// non-forcing nudge on a later request. The default is empty because
+    /// lightweight test clients have no stream guard.
+    fn take_liveness_stalls(&mut self) -> Vec<crate::liveness::LivenessVerdict> {
+        Vec::new()
+    }
+
     /// Convenience: collect all events synchronously (backward compat).
     fn stream_collect(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         // Provider streams create their producer task when `stream` is called.
