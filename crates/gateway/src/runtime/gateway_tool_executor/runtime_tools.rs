@@ -237,12 +237,92 @@ impl GatewayToolExecutor {
         .await
     }
 
+    /// Apply several Agent actions in one provider round.
+    ///
+    /// Each entry is re-dispatched through `execute_runtime_tool_with_binding`,
+    /// so validation, authorization, the durable commit and the physical
+    /// follow-up dispatch are exactly the path a direct call takes: the batch
+    /// can never grant a permission a direct call would be denied.
+    async fn execute_agent_action_batch(
+        &self,
+        mut value: serde_json::Value,
+        binding: RuntimeToolExecutionBinding<'_>,
+    ) -> Result<String, ToolError> {
+        const MAX_ACTIONS: usize = 25;
+        let actions = value
+            .as_object_mut()
+            .and_then(|object| object.remove("actions"))
+            .and_then(|actions| actions.as_array().cloned())
+            .filter(|actions| !actions.is_empty())
+            .ok_or_else(|| {
+                ToolError::new("agent_action_batch requires a non-empty `actions` array")
+            })?;
+        if actions.len() > MAX_ACTIONS {
+            return Err(ToolError::new(format!(
+                "agent_action_batch accepts at most {MAX_ACTIONS} actions per call; this call has {}",
+                actions.len()
+            )));
+        }
+        let parent_action_id = binding
+            .action_id
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                ToolError::new("agent_action_batch requires a durable Runtime invocation id")
+            })?
+            .to_string();
+        let mut results = Vec::with_capacity(actions.len());
+        for (index, entry) in actions.iter().enumerate() {
+            let inner_tool = entry
+                .get("tool")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    ToolError::new(format!("agent_action_batch action[{index}] needs a `tool`"))
+                })?;
+            if !is_agent_action_tool(inner_tool) {
+                return Err(ToolError::new(format!(
+                    "agent_action_batch dispatches Agent actions only; `{inner_tool}` is not one"
+                )));
+            }
+            let inner_input = entry
+                .get("input")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            // Each action gets its own durable identity derived from this call,
+            // so retrying the whole batch is idempotent per action.
+            let action_id = format!("{parent_action_id}:{index}");
+            let inner_binding = RuntimeToolExecutionBinding {
+                action_id: Some(action_id.as_str()),
+                ..binding
+            };
+            let receipt = Box::pin(self.execute_runtime_tool_with_binding(
+                inner_tool,
+                inner_input,
+                inner_binding,
+            ))
+            .await?;
+            results.push(serde_json::json!({
+                "tool": inner_tool,
+                "receipt": serde_json::from_str::<serde_json::Value>(&receipt)
+                    .unwrap_or(serde_json::Value::String(receipt)),
+            }));
+        }
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "type": "agent_action_batch",
+            "count": results.len(),
+            "results": results,
+        }))
+        .unwrap_or_default())
+    }
+
     async fn execute_runtime_tool_with_binding(
         &self,
         tool_name: &str,
         mut value: serde_json::Value,
         binding: RuntimeToolExecutionBinding<'_>,
     ) -> Result<String, ToolError> {
+        if tool_name == "agent_action_batch" {
+            return self.execute_agent_action_batch(value, binding).await;
+        }
         if matches!(tool_name, "artifact_publish" | "artifact_materialize") {
             return self
                 .execute_content_publication(tool_name, value, binding)

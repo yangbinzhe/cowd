@@ -1176,3 +1176,98 @@
         assert_eq!(base64::engine::general_purpose::STANDARD.decode(encoded).unwrap(),bytes);
         assert!(executor.execute_runtime_tool_with_binding("evidence_retrieve",serde_json::json!({"evidence_ref":binary.selector,"query":"needle"}),binding).await.is_err());
     }
+
+    /// PLAN M2: several Agent actions in ONE provider round, each on exactly the
+    /// same validation/authorization/commit path a direct call takes.
+    #[tokio::test]
+    async fn agent_action_batch_applies_every_action_through_the_same_path() {
+        let services = runtime::RuntimeServices::in_memory().expect("runtime services");
+        let mut graph =
+            harness_contract::execution_graph::ExecutionGraph::new("root batch bootstrap");
+        graph.id = "graph-root-batch".to_string();
+        graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id: "session-root-batch".to_string(),
+            turn_id: "turn-root-batch".to_string(),
+            root_task_id: "task-root-batch".to_string(),
+            task_id: "task-root-batch".to_string(),
+            generation: 1,
+        });
+        let mut node = harness_contract::execution_graph::ExecutionNodeSpec::new(
+            harness_contract::execution_graph::ExecutionNodeKind::InlineModel,
+            "inline_model",
+            "payload:root-model",
+        );
+        node.id = "graph-root-batch:model".to_string();
+        node.idempotency_key = "root-model".to_string();
+        graph.nodes.push(node.clone());
+        services
+            .commit_service()
+            .register_graph(graph)
+            .expect("register root graph");
+
+        let mut decision = runtime::build_runtime_execution_decision("建立两个团队", None);
+        decision.execution_graph_ref = Some("graph-root-batch".to_string());
+        decision.session_ref = Some("session-root-batch".to_string());
+        decision.turn_ref = Some("turn-root-batch".to_string());
+        let parent = harness_contract::execution_graph::ExecutionParentBinding {
+            execution_id: "graph-root-batch".to_string(),
+            node_id: node.id,
+        };
+        let registry = GatewayToolRegistry::builtin()
+            .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
+            .expect("Agent action tools");
+        let executor = GatewayToolExecutor::new(None, false, registry);
+        executor
+            .bind_runtime_services(Arc::clone(&services))
+            .expect("bind runtime services");
+        let binding = RuntimeToolExecutionBinding {
+            action_id: Some("bound-root-batch"),
+            session_id: Some("session-root-batch"),
+            authorized_scopes: &[],
+            memory_context: None,
+            reality_context: None,
+            model_lease: Some("deepseek-v4-flash"),
+            parent_execution: Some(&parent),
+            execution_decision: Some(&decision),
+            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+        };
+        let receipt = executor
+            .execute_runtime_tool_with_binding(
+                "agent_action_batch",
+                serde_json::json!({
+                    "actions": [
+                        {"tool": "team_create", "input": {"name": "Alpha", "mission": "first lane"}},
+                        {"tool": "team_create", "input": {"name": "Beta", "mission": "second lane"}}
+                    ]
+                }),
+                binding,
+            )
+            .await
+            .expect("the batch must apply");
+        let value: serde_json::Value = serde_json::from_str(&receipt).expect("batch receipt json");
+        assert_eq!(value["type"], "agent_action_batch");
+        assert_eq!(value["count"], 2);
+
+        let program = services
+            .agent_action_service()
+            .project(&harness_contract::agent_action::program_id_for_objective(
+                &harness_contract::agent_action::root_objective_id(
+                    "session-root-batch",
+                    "turn-root-batch",
+                ),
+            ))
+            .expect("durable Program");
+        assert_eq!(program.teams.len(), 2, "both actions must have committed");
+
+        // The batch dispatches Agent actions only; anything else is refused
+        // rather than silently routed to a different executor.
+        let error = executor
+            .execute_runtime_tool_with_binding(
+                "agent_action_batch",
+                serde_json::json!({"actions": [{"tool": "bash", "input": {"command": "echo hi"}}]}),
+                binding,
+            )
+            .await
+            .expect_err("bash must not be dispatchable through the batch");
+        assert!(error.to_string().contains("Agent actions only"), "{error}");
+    }

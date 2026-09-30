@@ -414,6 +414,35 @@ pub(crate) fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition
         required_permission: ToolPermissionMode::ReadOnly,
         effect_resolver: runtime_effect_resolver("runtime.private_note"),
     });
+    definitions.push(RuntimeToolDefinition {
+        name: "agent_action_batch".to_string(),
+        description: Some(
+            "Apply several Agent actions in ONE provider round. Each entry is {tool, input}, where tool is any Agent action (team_create, agent_invite, task_publish, task_claim, task_release, task_supersede, task_withdraw, task_submit, task_review, message_publish, artifact_commit, objective_update, objective_review, objective_complete_request, membership_update, team_update). Every entry is validated, authorized, committed and physically dispatched EXACTLY as if it had been its own call - the batch grants no extra permission, and each action gets its own durable identity derived from this call. Use it to publish several independent Tasks, or to advance a multi-step program, without one round per action. state_inspect is accepted but never waits here; inspect separately when you need results. Bounds: at most 25 actions per call, applied in order. Boundary: it dispatches Agent actions only, never workspace/shell/network tools; a rejected action fails the whole batch with its own reason."
+                .to_string(),
+        ),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "actions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 25,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "tool": { "type": "string" },
+                            "input": { "type": "object" }
+                        },
+                        "required": ["tool"]
+                    }
+                }
+            },
+            "required": ["actions"],
+            "additionalProperties": false
+        }),
+        required_permission: ToolPermissionMode::ReadOnly,
+        effect_resolver: runtime_effect_resolver("runtime.agent_action"),
+    });
     definitions.extend(agent_action_tool_definitions());
     definitions
 }
@@ -736,12 +765,22 @@ mod tests {
             assert_eq!(action.input_schema["additionalProperties"], false);
             assert!(action.input_schema["properties"]["expected_revision"].is_null());
         }
+        // `agent_action_batch` shares the resolver because its effect IS an Agent
+        // action, but it is not itself one of the 17 actions.
         assert_eq!(
             tools
                 .iter()
-                .filter(|tool| tool.effect_resolver.resolver_id == "runtime.agent_action")
+                .filter(|tool| {
+                    tool.effect_resolver.resolver_id == "runtime.agent_action"
+                        && tool.name != "agent_action_batch"
+                })
                 .count(),
             harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.len()
+        );
+        assert!(
+            tools.iter().any(|tool| tool.name == "agent_action_batch"
+                && tool.effect_resolver.resolver_id == "runtime.agent_action"),
+            "the batch tool must share the Agent-action effect resolver"
         );
 
         let evidence_tool = tools

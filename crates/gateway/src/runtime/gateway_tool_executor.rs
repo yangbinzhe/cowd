@@ -171,7 +171,8 @@ fn is_gateway_runtime_control_tool(tool_name: &str) -> bool {
     is_agent_action_tool(tool_name)
         || matches!(
             tool_name,
-            "runtime_config_view"
+            "agent_action_batch"
+                | "runtime_config_view"
                 | "runtime_resource_capabilities"
                 | "runtime_capabilities"
                 | "mcp_tool"

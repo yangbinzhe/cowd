@@ -2048,6 +2048,11 @@ fn bootstrap_tool_ids(
         // cause of the 26-round / 767k-token failure. It must be visible on
         // the first request of every turn.
         "tool_orchestrate",
+        // PLAN M2: several Agent actions can be applied in ONE provider round
+        // through `agent_action_batch`, so a multi-Team/multi-Task program does
+        // not cost one round per action. Each action re-enters the SAME
+        // validation/authorization/commit path as a direct call.
+        "agent_action_batch",
         // PLAN E5 (prerequisite): `execute_code` is the ONLY read-only-tier
         // reduction primitive. Without it a ReadOnly session has no way to
         // gather, aggregate or branch across many files, and the model is
