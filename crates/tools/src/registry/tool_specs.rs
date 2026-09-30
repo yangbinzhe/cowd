@@ -127,9 +127,7 @@ pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
         "request_plugin_install" => "builtin.external_unknown",
         "skill" => "runtime.action_skill",
         "sleep" => "builtin.process",
-        "list_mcp_resources" | "read_mcp_resource" | "mcp_auth" | "mcp" => {
-            "builtin.external_unknown"
-        }
+        "mcp" => "runtime.action_mcp",
         _ => "builtin.unknown",
     };
     ToolEffectResolverSpec {
@@ -1207,54 +1205,6 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
-            name: "list_mcp_resources",
-            family: ToolFamily::Mcp,
-            tier: ToolTier::Orchestration,
-            permission_key: "mcp",
-            description: "List the resources published by connected MCP servers. Boundary: it lists resources, not tools - use mcp to call a tool, and a server must be configured and reachable to appear.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "server": { "type": "string" }
-                },
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "read_mcp_resource",
-            family: ToolFamily::Mcp,
-            tier: ToolTier::Orchestration,
-            permission_key: "mcp",
-            description: "Read one MCP resource by server and uri. Boundary: the server must be configured and reachable, and the uri must be one that server actually published - prefer list_mcp_resources first.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "server": { "type": "string" },
-                    "uri": { "type": "string" }
-                },
-                "required": ["uri"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "mcp_auth",
-            family: ToolFamily::Mcp,
-            tier: ToolTier::Operator,
-            permission_key: "mcp",
-            description: "Authenticate with an MCP server that requires OAuth or credentials. Operator action, not a task step: use it only when a server reports an auth failure and the credential can be obtained without human input. Boundary: it never stores or prints a secret.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "server": { "type": "string" }
-                },
-                "required": ["server"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        ToolSpec {
             name: "remote_trigger",
             family: ToolFamily::Web,
             tier: ToolTier::Operator,
@@ -1279,15 +1229,17 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             family: ToolFamily::Mcp,
             tier: ToolTier::Orchestration,
             permission_key: "mcp",
-            description: "Execute a tool exposed by a connected external MCP server, or list/read its resources. This is the only bridge to non-local capability: it is heavier than a local primitive and needs the server configured, so prefer local tools for anything the catalog already covers. Boundary: the server must be reachable and authenticated, and arguments pass through to it unvalidated.",
+            description: "The ONE bridge to externally connected MCP servers. action=call (server, tool, arguments?): execute a tool the server exposes. action=list (server?): list the resources the server publishes. action=read (server?, uri): read one published resource. action=auth (server): authenticate when a server reports an auth failure and the credential needs no human input. Prefer local tools for anything the catalog already covers; the server must be configured and reachable, and arguments pass through unvalidated. Boundary: list/read are read-only; call and auth need full access, and auth never stores or prints a secret.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "action": { "type": "string", "enum": ["call", "list", "read", "auth"] },
                     "server": { "type": "string" },
                     "tool": { "type": "string" },
-                    "arguments": { "type": "object" }
+                    "arguments": { "type": "object" },
+                    "uri": { "type": "string" }
                 },
-                "required": ["server", "tool"],
+                "required": ["action"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::DangerFullAccess,
@@ -1817,7 +1769,7 @@ mod family_taxonomy_tests {
     #[test]
     fn every_tool_declares_a_family_tier_and_permission_key() {
         let specs = mvp_tool_specs();
-        assert_eq!(specs.len(), 48, "the catalog size is the contract");
+        assert_eq!(specs.len(), 45, "the catalog size is the contract");
         for spec in &specs {
             assert!(
                 !spec.permission_key.is_empty(),
@@ -1870,7 +1822,6 @@ mod family_taxonomy_tests {
     fn canonical_tools_do_not_share_a_permission_slot_beyond_the_legacy_ledger() {
         const LEGACY: &[(&str, &str, &str, usize)] = &[
             ("Locate", "grep", "Orchestration", 2),
-            ("Mcp", "mcp", "Orchestration", 3),
             ("Mutate", "checkpoint", "Orchestration", 2),
             ("Mutate", "edit", "Orchestration", 5),
             ("Reduce", "shell", "EscapeHatch", 2),

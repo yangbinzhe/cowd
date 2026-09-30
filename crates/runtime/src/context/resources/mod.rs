@@ -211,8 +211,7 @@ impl ResourceCapabilitySnapshot {
             skills: Vec::new(),
             plugins: Vec::new(),
             mcp_resources: vec![
-                "list_mcp_resources".to_string(),
-                "read_mcp_resource".to_string(),
+                "mcp".to_string(),
             ],
             local_commands: Vec::new(),
             provider_native: vec!["image_input_when_supported".to_string()],

@@ -638,7 +638,6 @@ mod tests {
             ("tool-search", "tool_search"),
             ("GLOB-SEARCH", "glob_search"),
             ("power_shell", "power_shell"),
-            ("mcp_auth", "mcp_auth"),
         ] {
             assert_eq!(
                 catalog.canonical_name(requested).as_deref(),

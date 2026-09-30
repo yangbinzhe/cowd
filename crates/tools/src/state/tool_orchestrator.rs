@@ -438,7 +438,7 @@ fn resolve_effect_properties(
         ),
         "runtime.action_mcp" => action_effect(
             input,
-            &["list", "read", "call"],
+            &["list", "read"],
             ToolPermissionMode::DangerFullAccess,
             ToolEffectKind::Network,
         ),

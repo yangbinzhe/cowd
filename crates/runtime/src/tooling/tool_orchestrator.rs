@@ -108,8 +108,7 @@ impl ToolSafetyCategory {
             | "ask"
             | "tool_search"
             | "runtime_capabilities"
-            | "list_mcp_resources"
-            | "read_mcp_resource" => Self::ReadOnly,
+            | "mcp" => Self::ReadOnly,
 
             "add" | "calculator" => Self::ReadOnly,
 
@@ -130,7 +129,7 @@ impl ToolSafetyCategory {
 
             "web_search" | "web_fetch" | "http_request" => Self::Network,
 
-            "bash" | "powershell" | "repl" | "mcp" | "mcp_auth" | "remote_trigger" | "agent"
+            "bash" | "powershell" | "repl" | "mcp" | "remote_trigger" | "agent"
             | "task_create" | "run_task_packet" | "task_stop" | "task_update" | "worker_create"
             | "worker_send_prompt" | "worker_restart" | "worker_terminate" | "team_create"
             | "team_delete" | "cron_create" | "cron_delete" | "config" | "notebook_edit"

@@ -137,15 +137,22 @@ pub(crate) fn execute_with_lease(
             }
         }
         "lsp" => from_value::<LspInput>(input).and_then(|parsed| run_lsp(lease, parsed)),
-        "list_mcp_resources" => from_value::<McpResourceInput>(input)
-            .and_then(|parsed| run_list_mcp_resources(lease, parsed)),
-        "read_mcp_resource" => from_value::<McpResourceInput>(input)
-            .and_then(|parsed| run_read_mcp_resource(lease, parsed)),
-        "mcp_auth" => {
-            from_value::<McpAuthInput>(input).and_then(|parsed| run_mcp_auth(lease, parsed))
-        }
         "remote_trigger" => from_value::<RemoteTriggerInput>(input).and_then(run_remote_trigger),
-        "mcp" => from_value::<McpToolInput>(input).and_then(|parsed| run_mcp_tool(lease, parsed)),
+        "mcp" => match input.get("action").and_then(|value| value.as_str()) {
+            Some("call") => {
+                from_value::<McpToolInput>(input).and_then(|parsed| run_mcp_tool(lease, parsed))
+            }
+            Some("list") => from_value::<McpResourceInput>(input)
+                .and_then(|parsed| run_list_mcp_resources(lease, parsed)),
+            Some("read") => from_value::<McpResourceInput>(input)
+                .and_then(|parsed| run_read_mcp_resource(lease, parsed)),
+            Some("auth") => {
+                from_value::<McpAuthInput>(input).and_then(|parsed| run_mcp_auth(lease, parsed))
+            }
+            other => Err(format!(
+                "mcp action must be call|list|read|auth, got {other:?}"
+            )),
+        },
         "testing_permission" => {
             from_value::<TestingPermissionInput>(input).and_then(run_testing_permission)
         }
