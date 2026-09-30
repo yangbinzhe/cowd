@@ -2012,7 +2012,7 @@ fn first_request_exposes_orchestrate_reduce_and_canonical_read() {
         // read-only reduction: gather/aggregate/branch without line-by-line reads
         "execute_code",
         // canonical fact reader: makes `tool://` evidence refs retrievable
-        "read",
+        "read_ref",
         // baseline evidence tools
         "read_file",
         "grep_search",
@@ -2038,7 +2038,7 @@ fn bootstrap_tool_ids(
         .collect::<Vec<_>>();
     // Runtime-owned tools that are not in the built-in catalog.
     bootstrap.extend(
-        ["runtime_capabilities", "context_retrieve", "read"]
+        ["runtime_capabilities", "context_retrieve", "read_ref"]
             .into_iter()
             .map(str::to_owned),
     );

@@ -181,7 +181,7 @@ fn is_gateway_runtime_control_tool(tool_name: &str) -> bool {
                 | "lark_cli_read"
                 | "lark_cli_write"
                 | "evidence_retrieve"
-                | "read"
+                | "read_ref"
                 | "artifact_publish"
                 | "artifact_materialize"
                 | "get_context_remaining"

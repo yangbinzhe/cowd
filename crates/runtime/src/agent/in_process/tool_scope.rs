@@ -418,7 +418,7 @@ impl ScopedRuntimeToolExecutor {
             let mode = if descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Write {
                 "write"
             } else {
-                "read"
+                "read_ref"
             };
             requested
                 .paths

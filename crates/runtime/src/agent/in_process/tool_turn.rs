@@ -465,7 +465,7 @@ pub(super) fn agent_autonomy_checkpoint(
                 // submitted body, not in metadata. Read each artifact body
                 // first, then decide; the read tools are in this contract.
                 "required_protocol": [
-                    "read every submitted artifact body with `read` on the artifact:// reference or `evidence_retrieve` before judging; metadata alone is not evidence",
+                    "read every submitted artifact body with `read_ref` on the artifact:// reference or `evidence_retrieve` before judging; metadata alone is not evidence",
                     "then issue exactly one independent task_review verdict"
                 ],
                 "tool": "task_review",

@@ -66,7 +66,7 @@ impl ToolSafetyCategory {
     pub fn from_tool_name(name: &str) -> Self {
         let normalized = normalize_tool_name_for_safety(name);
         match normalized.as_str() {
-            "read"
+            "read_ref"
             | "read_file"
             | "read_many"
             | "cat"

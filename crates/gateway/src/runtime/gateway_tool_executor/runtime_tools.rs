@@ -725,7 +725,7 @@ impl GatewayToolExecutor {
     /// read instead of stitching several tools together.
     async fn read_graph_node(&self, graph_id: &str, node_id: &str) -> Result<String, ToolError> {
         let services = self.runtime_services.get().cloned().ok_or_else(|| {
-            ToolError::new("`read` node:// requires the workspace RuntimeServices")
+            ToolError::new("`read_ref` node:// requires the workspace RuntimeServices")
         })?;
         let graph = services
             .graph_state_store()

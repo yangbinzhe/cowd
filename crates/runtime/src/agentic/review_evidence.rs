@@ -593,10 +593,10 @@ impl RuntimeServices {
                     {
                         continue;
                     }
-                    // `read` is the unified facade; a tool:// or artifact:// read
+                    // `read_ref` is the unified facade; a tool:// or artifact:// read
                     // through it resolves the same durable receipt as
                     // `evidence_retrieve`, so it must count as a physical read.
-                    // Non-evidence `read` calls simply have no full_output_ref
+                    // Non-evidence `read_ref` calls simply have no full_output_ref
                     // and are skipped below.
                     if !matches!(
                         event.payload["tool_name"].as_str(),
