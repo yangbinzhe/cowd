@@ -1029,10 +1029,10 @@ mod tests {
             .validate_input("bash", &json!({"command": "pwd"}))
             .expect("valid command input");
         lease
-            .validate_input("enter_plan_mode", &json!({}))
+            .validate_input("plan_mode", &json!({"action": "enter"}))
             .expect("legitimate no-argument tools remain valid");
         lease
-            .validate_input("enter_plan_mode", &json!({"invented": true}))
+            .validate_input("plan_mode", &json!({"action": "enter", "invented": true}))
             .expect_err("no-argument tools still reject invented fields");
     }
 

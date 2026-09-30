@@ -169,8 +169,7 @@ fn exposes_mvp_tools() {
     assert!(names.contains(&"sleep"));
     assert!(names.contains(&"ask"));
     assert!(names.contains(&"config"));
-    assert!(names.contains(&"enter_plan_mode"));
-    assert!(names.contains(&"exit_plan_mode"));
+    assert!(names.contains(&"plan_mode"));
     assert!(names.contains(&"structured_output"));
     assert!(names.contains(&"repl"));
     assert!(names.contains(&"power_shell"));

@@ -91,10 +91,17 @@ pub(crate) fn execute_with_lease(
             .and_then(|parsed| run_notebook_edit(lease, parsed)),
         "sleep" => from_value::<SleepInput>(input).and_then(run_sleep),
         "config" => from_value::<ConfigInput>(input).and_then(|parsed| run_config(lease, parsed)),
-        "enter_plan_mode" => from_value::<EnterPlanModeInput>(input)
-            .and_then(|parsed| run_enter_plan_mode(lease, parsed)),
-        "exit_plan_mode" => from_value::<ExitPlanModeInput>(input)
-            .and_then(|parsed| run_exit_plan_mode(lease, parsed)),
+        "plan_mode" => match input.get("action").and_then(|value| value.as_str()) {
+            Some("enter") => {
+                from_value::<EnterPlanModeInput>(input).and_then(|parsed| run_enter_plan_mode(lease, parsed))
+            }
+            Some("exit") => {
+                from_value::<ExitPlanModeInput>(input).and_then(|parsed| run_exit_plan_mode(lease, parsed))
+            }
+            other => Err(format!(
+                "plan_mode action must be `enter` or `exit`, got {other:?}"
+            )),
+        },
         "structured_output" => {
             from_value::<StructuredOutputInput>(input).and_then(run_structured_output)
         }

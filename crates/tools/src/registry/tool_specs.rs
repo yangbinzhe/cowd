@@ -122,8 +122,7 @@ pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
         | "todo_write"
         | "background_task_kill"
         | "config"
-        | "enter_plan_mode"
-        | "exit_plan_mode" => "builtin.workspace_write",
+        | "plan_mode" => "builtin.workspace_write",
         "web_fetch" | "web_search" | "remote_trigger"
         | "skill_install_plan" => "builtin.network",
         "request_plugin_install"
@@ -859,7 +858,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             name: "tool_cache_stats",
             family: ToolFamily::Session,
             tier: ToolTier::Orchestration,
-            permission_key: "none",
+            permission_key: "diagnostics",
             description: "Report in-process read-only cache hit, miss, invalidation and entry counts. Use it to diagnose whether reads are being served from cache.",
             input_schema: json!({
                 "type": "object",
@@ -999,7 +998,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             name: "current_time",
             family: ToolFamily::Session,
             tier: ToolTier::Orchestration,
-            permission_key: "none",
+            permission_key: "time",
             description: "Return the current UTC time and local timezone as a bounded RFC3339 timestamp. Boundary: it is the Runtime clock, not a workspace fact - prefer the evidence in a tool result when both exist.",
             input_schema: json!({
                 "type": "object",
@@ -1031,7 +1030,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             name: "request_plugin_install",
             family: ToolFamily::Govern,
             tier: ToolTier::Operator,
-            permission_key: "none",
+            permission_key: "plugin",
             description: "Refuses by design: plugin installation is an operator control-plane operation, never a model action. Present so a request fails closed with a clear reason instead of being silently ignored.",
             input_schema: json!({
                 "type": "object",
@@ -1199,27 +1198,17 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::WorkspaceWrite,
         },
         ToolSpec {
-            name: "enter_plan_mode",
+            name: "plan_mode",
             family: ToolFamily::Plan,
             tier: ToolTier::Orchestration,
-            permission_key: "config",
-            description: "Enable a worktree-local planning-mode override, remembering the previous local setting so exit_plan_mode can restore it. Boundary: it only affects this worktree, not other sessions or hosts.",
+            permission_key: "plan_mode",
+            description: "Toggle the worktree-local planning-mode override. action=enter enables it and remembers the previous local setting; action=exit restores or clears it. Boundary: it only affects this worktree, and exit requires a matching enter in this worktree - with none it fails closed rather than guessing the previous state.",
             input_schema: json!({
                 "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::WorkspaceWrite,
-        },
-        ToolSpec {
-            name: "exit_plan_mode",
-            family: ToolFamily::Plan,
-            tier: ToolTier::Orchestration,
-            permission_key: "config",
-            description: "Restore or clear the planning-mode override created by enter_plan_mode. Boundary: it requires a matching enter_plan_mode in this worktree; with none it fails closed rather than guessing the previous state.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {},
+                "properties": {
+                    "action": { "type": "string", "enum": ["enter", "exit"] }
+                },
+                "required": ["action"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::WorkspaceWrite,
@@ -1388,7 +1377,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             name: "testing_permission",
             family: ToolFamily::Govern,
             tier: ToolTier::Operator,
-            permission_key: "none",
+            permission_key: "testing",
             description: "Test-only probe for permission enforcement. It has no production purpose and refuses outside a test.",
             input_schema: json!({
                 "type": "object",
@@ -1915,7 +1904,7 @@ mod family_taxonomy_tests {
     #[test]
     fn every_tool_declares_a_family_tier_and_permission_key() {
         let specs = mvp_tool_specs();
-        assert_eq!(specs.len(), 54, "the catalog size is the contract");
+        assert_eq!(specs.len(), 53, "the catalog size is the contract");
         for spec in &specs {
             assert!(
                 !spec.permission_key.is_empty(),
@@ -1967,18 +1956,15 @@ mod family_taxonomy_tests {
     #[test]
     fn canonical_tools_do_not_share_a_permission_slot_beyond_the_legacy_ledger() {
         const LEGACY: &[(&str, &str, &str, usize)] = &[
-            ("Govern", "none", "Operator", 2),
             ("Govern", "skill", "Operator", 3),
             ("Govern", "skill", "Orchestration", 2),
             ("Locate", "grep", "Orchestration", 2),
             ("Mcp", "mcp", "Orchestration", 3),
             ("Mutate", "checkpoint", "Orchestration", 2),
             ("Mutate", "edit", "Orchestration", 5),
-            ("Plan", "config", "Orchestration", 2),
             ("Reduce", "shell", "EscapeHatch", 2),
             ("Session", "background", "Orchestration", 2),
             ("Session", "checkpoint", "Orchestration", 2),
-            ("Session", "none", "Orchestration", 2),
         ];
         let mut slots: BTreeMap<(&str, &str, &str), usize> = BTreeMap::new();
         for spec in mvp_tool_specs() {

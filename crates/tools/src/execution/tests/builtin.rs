@@ -153,7 +153,7 @@ fn enter_and_exit_plan_mode_round_trip_existing_local_override() {
     std::env::remove_var("COWD_CONFIG_HOME");
     std::env::set_current_dir(&cwd).expect("set cwd");
 
-    let enter = execute_tool("enter_plan_mode", &json!({})).expect("enter plan mode");
+    let enter = execute_tool("plan_mode", &json!({"action": "enter"})).expect("enter plan mode");
     let enter_output: serde_json::Value = serde_json::from_str(&enter).expect("json");
     assert_eq!(enter_output["changed"], true);
     assert_eq!(enter_output["managed"], true);
@@ -169,7 +169,7 @@ fn enter_and_exit_plan_mode_round_trip_existing_local_override() {
     assert!(state.contains(r#""hadLocalOverride": true"#));
     assert!(state.contains(r#""previousLocalMode": "workspace-write""#));
 
-    let exit = execute_tool("exit_plan_mode", &json!({})).expect("exit plan mode");
+    let exit = execute_tool("plan_mode", &json!({"action": "exit"})).expect("exit plan mode");
     let exit_output: serde_json::Value = serde_json::from_str(&exit).expect("json");
     assert_eq!(exit_output["changed"], true);
     assert_eq!(exit_output["managed"], false);
@@ -221,12 +221,12 @@ fn exit_plan_mode_clears_override_when_enter_created_it_from_empty_local_state()
     std::env::remove_var("COWD_CONFIG_HOME");
     std::env::set_current_dir(&cwd).expect("set cwd");
 
-    let enter = execute_tool("enter_plan_mode", &json!({})).expect("enter plan mode");
+    let enter = execute_tool("plan_mode", &json!({"action": "enter"})).expect("enter plan mode");
     let enter_output: serde_json::Value = serde_json::from_str(&enter).expect("json");
     assert_eq!(enter_output["previousLocalMode"], serde_json::Value::Null);
     assert_eq!(enter_output["currentLocalMode"], "read-only");
 
-    let exit = execute_tool("exit_plan_mode", &json!({})).expect("exit plan mode");
+    let exit = execute_tool("plan_mode", &json!({"action": "exit"})).expect("exit plan mode");
     let exit_output: serde_json::Value = serde_json::from_str(&exit).expect("json");
     assert_eq!(exit_output["changed"], true);
     assert_eq!(exit_output["currentLocalMode"], serde_json::Value::Null);
@@ -490,12 +490,12 @@ fn orchestrate_can_dispatch_the_whole_builtin_catalog_but_never_itself() {
         .map(|spec| spec.name.to_string())
         .collect();
 
-    assert_eq!(catalog.len(), 54, "the catalog size is the contract");
+    assert_eq!(catalog.len(), 53, "the catalog size is the contract");
     let catalog: Vec<String> = catalog
         .into_iter()
         .filter(|name| name != "tool_orchestrate")
         .collect();
-    assert_eq!(catalog.len(), 53, "the catalog minus the orchestrator itself");
+    assert_eq!(catalog.len(), 52, "the catalog minus the orchestrator itself");
     for name in &catalog {
         assert!(dispatchable(name), "`{name}` is in the catalog, so it must be composable");
     }
