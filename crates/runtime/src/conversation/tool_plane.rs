@@ -2,6 +2,10 @@
 
 use super::*;
 
+/// PLAN B-5: minimum tool-result grant for a read, so a spent budget cannot
+/// reduce a read to an unusable shell.
+const READ_TOOL_RESULT_FLOOR_TOKENS: u64 = 8_192;
+
 impl<C, T> ConversationRuntime<C, T>
 where
     C: ApiClient,
@@ -1312,10 +1316,23 @@ where
             .saturating_add(96)
             .min(per_tool_limit)
             .max(1);
+        // PLAN B-5: a read must never be starved into a shell by a spent
+        // tool-result budget. For the read family the budget is a soft cap, so an
+        // exhausted ledger still grants this floor.
+        let read_tool = matches!(
+            tool_name,
+            "read_file" | "read_ref" | "grep_search" | "glob_search" | "workspace_snapshot"
+        );
         let granted = self
             .turn_context_ledger
             .lock()
-            .map(|mut ledger| ledger.reserve_tool_result(requested))
+            .map(|mut ledger| {
+                if read_tool {
+                    ledger.reserve_tool_result_with_floor(requested, READ_TOOL_RESULT_FLOOR_TOKENS)
+                } else {
+                    ledger.reserve_tool_result(requested)
+                }
+            })
             .unwrap_or(requested);
         let mut receipt = crate::context_evidence::build_tool_receipt(
             tool_name,

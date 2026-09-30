@@ -257,6 +257,20 @@ impl ContextLedger {
         granted
     }
 
+    /// PLAN B-5: for a tool whose result the model MUST be able to read, the
+    /// tool-result budget is a SOFT cap: an exhausted budget may be exceeded by
+    /// at most `floor` rather than starving the call into an unusable shell.
+    /// The 588-character `read_file` shells were exactly that starvation. The
+    /// grant is still bounded by what the call itself needs (`requested`).
+    #[must_use]
+    pub fn reserve_tool_result_with_floor(&mut self, requested: u64, floor: u64) -> u64 {
+        let granted = requested
+            .min(self.remaining_tool_result_tokens().max(floor))
+            .max(1);
+        self.tool_result_consumed = self.tool_result_consumed.saturating_add(granted);
+        granted
+    }
+
     #[must_use]
     pub fn remaining_tool_result_tokens(&self) -> u64 {
         self.tool_result_limit
@@ -385,5 +399,25 @@ mod tests {
             BTreeMap::new(),
         );
         assert!(!budget.executable);
+    }
+}
+
+#[cfg(test)]
+mod floor_tests {
+    use super::*;
+
+    /// PLAN B-5: an exhausted tool-result budget must not starve a read into a
+    /// shell. The budget is a soft cap for the read family.
+    #[test]
+    fn an_exhausted_budget_still_grants_a_read_its_floor() {
+        let mut ledger = ContextLedger::new(100_000, 1_000);
+        // Spend the whole tool-result budget.
+        assert_eq!(ledger.reserve_tool_result(1_000), 1_000);
+        assert_eq!(ledger.remaining_tool_result_tokens(), 0);
+        // A plain result is still starved...
+        assert_eq!(ledger.reserve_tool_result(5_000), 0);
+        // ...but a read keeps a usable floor, bounded by what it needs.
+        assert_eq!(ledger.reserve_tool_result_with_floor(5_000, 8_192), 5_000);
+        assert_eq!(ledger.reserve_tool_result_with_floor(20_000, 8_192), 8_192);
     }
 }
