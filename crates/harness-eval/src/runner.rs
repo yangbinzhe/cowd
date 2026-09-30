@@ -905,7 +905,7 @@ fn run_full_real_tool_scenarios() -> FullRealToolEval {
             tool_calls: tool_details.len(),
             runtime_evidence: vec![
                 "workspace_snapshot captured runtime/eval code roots".to_string(),
-                "grep_many scanned orchestration and tool event markers".to_string(),
+                "grep_search(searches) scanned orchestration and tool event markers".to_string(),
             ],
             matrix_evidence: vec!["KnowledgeFabric/matrix related code markers scanned".to_string()],
             memory_evidence: vec![
