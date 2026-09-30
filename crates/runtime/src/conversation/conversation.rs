@@ -2028,55 +2028,33 @@ fn first_request_exposes_orchestrate_reduce_and_canonical_read() {
 fn bootstrap_tool_ids(
     _maximum_permission: harness_contract::tool::ToolPermissionMode,
 ) -> Vec<String> {
-    let mut bootstrap = vec![
-        // Discovery / governance surface.
-        "tool_search",
-        "runtime_capabilities",
-        "context_retrieve",
-        // Managed Team roles must acquire their first bounded source receipt
-        // before a required escalation.  These core read-only evidence tools
-        // therefore cannot be deferred: an exposure miss terminates the
-        // provider step before the role reaches its Runtime-owned checkpoint.
-        "glob_search",
-        "grep_search",
-        "read_file",
-        "workspace_snapshot",
-        // PLAN E1: `tool_orchestrate` is the one primitive that lets a single
-        // instruction drive a bounded program (up to 400 tool calls in one
-        // turn, with map/filter/repeat/when/compute). It was deferred, so the
-        // model never saw it and fell back to one call per round - the direct
-        // cause of the 26-round / 767k-token failure. It must be visible on
-        // the first request of every turn.
-        "tool_orchestrate",
-        // PLAN M2: several Agent actions can be applied in ONE provider round
-        // through `agent_action_batch`, so a multi-Team/multi-Task program does
-        // not cost one round per action. Each action re-enters the SAME
-        // validation/authorization/commit path as a direct call.
-        "agent_action_batch",
-        // PLAN E5 (prerequisite): `execute_code` is the ONLY read-only-tier
-        // reduction primitive. Without it a ReadOnly session has no way to
-        // gather, aggregate or branch across many files, and the model is
-        // forced into line-by-line reading. Kernel-hardened, network-off.
-        "execute_code",
-        // PLAN E3 (recovery path): the omission marker tells the model to
-        // retrieve the full body by evidence ref. `read` resolves canonical
-        // Runtime references (tool://, artifact://, memory://, task://, ...);
-        // without it that instruction is a dead end and the model concludes
-        // the evidence is unreachable.
-        "read",
-    ];
-    // The stable Agent action prefix is always available. These actions write
-    // only Runtime collaboration facts; concrete workspace/external effects
-    // keep their independent permission gates.
+    // PLAN E1/D4: the built-in working set is DERIVED from each tool's declared
+    // exposure tier, not hand-listed. A hand-written list had already drifted -
+    // it named Runtime-owned tools as if they were built-ins, and it had to be
+    // edited by hand every time a tool's exposure changed.
+    let mut bootstrap = tools::bootstrap_builtin_tool_ids()
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    // Runtime-owned tools that are not in the built-in catalog.
+    bootstrap.extend(
+        ["runtime_capabilities", "context_retrieve", "read"]
+            .into_iter()
+            .map(str::to_owned),
+    );
+    // The semantic collaboration actions are always available. They write only
+    // Runtime collaboration facts; concrete workspace/external effects keep
+    // their independent permission gates. `agent_action_batch` applies several
+    // of them in ONE provider round through the same per-action path.
     bootstrap.extend(
         harness_contract::agent_action::AGENT_ACTION_TOOL_IDS
             .iter()
-            .map(|tool| *tool),
+            .map(|tool| (*tool).to_owned()),
     );
+    bootstrap.push("agent_action_batch".to_owned());
+    bootstrap.sort_unstable();
+    bootstrap.dedup();
     bootstrap
-        .into_iter()
-        .map(str::to_owned)
-        .collect()
 }
 
 fn tool_exposure_for_catalog(

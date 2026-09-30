@@ -28,7 +28,10 @@ pub(crate) fn test_process_environment_lock() -> &'static std::sync::Mutex<()> {
 }
 
 // Re-exports from split modules
-pub use tool_specs::{builtin_effect_resolver_spec, mvp_tool_specs, ToolSpec};
+pub use tool_specs::{
+    bootstrap_builtin_tool_ids, builtin_effect_resolver_spec, mvp_tool_specs, ToolFamily, ToolSpec,
+    ToolTier,
+};
 pub(crate) use tool_specs::{normalize_tool_name, permission_mode_from_plugin};
 
 #[derive(Debug, Clone, PartialEq, Eq)]

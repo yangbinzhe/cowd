@@ -177,6 +177,26 @@ pub(crate) fn permission_mode_from_plugin(value: &str) -> Result<PermissionMode,
 
 #[must_use]
 #[allow(clippy::too_many_lines)]
+/// The built-in tools the model is meant to call DIRECTLY.
+///
+/// Derived from the exposure tier rather than hand-listed: `Direct` is the turn
+/// working set and `EscapeHatch` is `tool_search` (the discovery mechanism, which
+/// must stay reachable or deferred tools can never be activated). `Operator` is
+/// deliberately excluded - those tools are registered to fail closed and are not
+/// part of the model's decision surface - and `Orchestration` is reachable
+/// through the orchestration vocabulary / activation instead of the first
+/// request.
+#[must_use]
+pub fn bootstrap_builtin_tool_ids() -> Vec<&'static str> {
+    let mut ids = mvp_tool_specs()
+        .into_iter()
+        .filter(|spec| matches!(spec.tier, ToolTier::Direct | ToolTier::EscapeHatch))
+        .map(|spec| spec.name)
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids
+}
+
 pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
@@ -2031,6 +2051,32 @@ mod family_taxonomy_tests {
             actual, expected,
             "a permission slot may only hold the legacy collisions already recorded: \
              merging removes entries, nothing may add one"
+        );
+    }
+
+    /// The first-request working set is derived from the tiers, not hand-listed.
+    /// Direct and EscapeHatch are exposed; Orchestration and Operator are not.
+    #[test]
+    fn the_bootstrap_set_is_derived_from_the_tiers() {
+        let ids = bootstrap_builtin_tool_ids();
+        for spec in mvp_tool_specs() {
+            let exposed = ids.contains(&spec.name);
+            match spec.tier {
+                ToolTier::Direct | ToolTier::EscapeHatch => {
+                    assert!(exposed, "`{}` is Direct/EscapeHatch and must be bootstrap", spec.name)
+                }
+                ToolTier::Orchestration | ToolTier::Operator => assert!(
+                    !exposed,
+                    "`{}` is {} and must not be bootstrap",
+                    spec.name,
+                    tier_name(spec.tier)
+                ),
+            }
+        }
+        assert!(ids.contains(&"tool_search"), "discovery must stay reachable");
+        assert!(
+            !ids.contains(&"testing_permission"),
+            "operator-tier tools never enter the model surface"
         );
     }
 
