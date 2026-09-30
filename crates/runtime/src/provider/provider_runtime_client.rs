@@ -1244,7 +1244,7 @@ async fn forward_provider_attempt(
         .map_or(entry.request_context.request_id.as_str(), |context| {
             context.session_id.as_str()
         });
-    let (cache_identity_sha256, canonical_prompt) = provider_cache_material(
+    let (cache_identity_sha256, canonical_prompt, stable_head_len) = provider_cache_material(
         &entry.request_context,
         &wire_request,
         security_domain,
@@ -1260,10 +1260,15 @@ async fn forward_provider_attempt(
             cache_behavior.requires_common_prefix_discovery,
         )
         .await;
+    // PLAN A2: the stable leading cohort is the first wire item for
+    // OpenAI-compatible transports (the system message) or the separately carried
+    // system bytes. Its length in the canonical prompt is the boundary between
+    // "must hold still" and "expected to grow".
     let mut prefix_observation = transport_pool.observe_prompt_prefix(
         cache_identity_sha256,
         entry.request_context.request_id.clone(),
         canonical_prompt,
+        stable_head_len,
     );
     prefix_observation.cold_leader = warmup.is_first_request_leader();
     prefix_observation.common_prefix_leader = warmup.is_common_prefix_leader();
@@ -1398,7 +1403,7 @@ fn provider_cache_material(
     security_domain: &str,
     cache_cohort_system: Option<&str>,
     _cache_cohort_user_prefix: &[String],
-) -> (String, Vec<u8>) {
+) -> (String, Vec<u8>, usize) {
     let mut properties = wire.body.clone();
     let prompt_value = properties
         .as_object_mut()
@@ -1420,6 +1425,7 @@ fn provider_cache_material(
         })
         .unwrap_or(serde_json::Value::Null);
     let mut canonical_prompt = Vec::new();
+    let mut stable_head_len = 0_usize;
     let wire_stable_cohort_bytes = if let Some(items) = prompt_value.as_array() {
         let first = items
             .first()
@@ -1431,6 +1437,9 @@ fn provider_cache_material(
             canonical_prompt.push(b':');
             canonical_prompt.extend_from_slice(&encoded);
             canonical_prompt.push(b'\n');
+            if stable_head_len == 0 {
+                stable_head_len = canonical_prompt.len();
+            }
         }
         first
     } else {
@@ -1470,7 +1479,11 @@ fn provider_cache_material(
     });
     let identity_bytes = serde_json::to_vec(&identity).unwrap_or_default();
     let cache_identity_sha256 = format!("sha256:{:x}", Sha256::digest(identity_bytes));
-    (cache_identity_sha256, canonical_prompt)
+    // PLAN A2: hand back how many bytes of the canonical prompt are the stable
+    // leading cohort, so the prefix observer can attribute a divergence to
+    // "the stable head moved" versus "the history grew" instead of only
+    // reporting a ratio.
+    (cache_identity_sha256, canonical_prompt, stable_head_len)
 }
 
 fn provider_account_fenced_message(provider_account: &str) -> String {
@@ -2275,21 +2288,21 @@ mod tests {
             body_sha256: "body".to_string(),
             tool_schema_sha256: None,
         };
-        let (agent_a, agent_a_canonical) = provider_cache_material(
+        let (agent_a, agent_a_canonical, _) = provider_cache_material(
             &context,
             &wire("shared-program", "agent-a"),
             "session-a",
             None,
             &[],
         );
-        let (agent_b, _) = provider_cache_material(
+        let (agent_b, _, _) = provider_cache_material(
             &context,
             &wire("shared-program", "agent-b"),
             "session-a",
             None,
             &[],
         );
-        let (other_program, _) = provider_cache_material(
+        let (other_program, _, _) = provider_cache_material(
             &context,
             &wire("other-program", "agent-b"),
             "session-a",
@@ -2299,7 +2312,7 @@ mod tests {
         assert_eq!(agent_a, agent_b);
         assert_ne!(agent_a, other_program);
         for _ in 0..1_000 {
-            let (identity, canonical) = provider_cache_material(
+            let (identity, canonical, _) = provider_cache_material(
                 &context,
                 &wire("shared-program", "agent-a"),
                 "session-a",
@@ -2348,14 +2361,14 @@ mod tests {
             body_sha256: "body".to_string(),
             tool_schema_sha256: None,
         };
-        let (agent_a, _) = provider_cache_material(
+        let (agent_a, _, _) = provider_cache_material(
             &context,
             &wire("shared-program\nagent-a"),
             "session-a",
             Some("shared-program"),
             &["shared-package".to_string()],
         );
-        let (agent_b, _) = provider_cache_material(
+        let (agent_b, _, _) = provider_cache_material(
             &context,
             &wire("shared-program\nagent-b"),
             "session-a",
@@ -2363,7 +2376,7 @@ mod tests {
             &["shared-package".to_string()],
         );
         assert_eq!(agent_a, agent_b);
-        let (other_package, _) = provider_cache_material(
+        let (other_package, _, _) = provider_cache_material(
             &context,
             &wire("shared-program\nagent-b"),
             "session-a",
@@ -2417,14 +2430,14 @@ mod tests {
             body_sha256: format!("body-{tool}"),
             tool_schema_sha256: Some(format!("schema-{tool}")),
         };
-        let (reader, _) = provider_cache_material(
+        let (reader, _, _) = provider_cache_material(
             &context,
             &wire("read_file"),
             "session-a",
             Some("shared-program"),
             &[],
         );
-        let (researcher, _) = provider_cache_material(
+        let (researcher, _, _) = provider_cache_material(
             &context,
             &wire("web_search"),
             "session-a",

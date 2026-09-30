@@ -39,6 +39,14 @@ pub struct ProviderWirePrefixObservation {
     pub structural_reuse_ratio_bp: u32,
     pub exact_extension: bool,
     pub invalidation_reason: Option<String>,
+    /// PLAN A2: WHICH segment moved when the prefix diverged. The canonical
+    /// prompt carries only the messages, so this is either the stable leading
+    /// cohort (expensive: everything after it is re-sent) or the append-only
+    /// history (expected). A changed tool schema never shows up here - it
+    /// changes the cache identity and is reported as `cold_identity`.
+    // `String` rather than `&'static str` because this struct derives
+    // Serialize/Deserialize and is persisted as wire evidence.
+    pub divergence_segment: Option<String>,
     pub cold_leader: bool,
     /// This request serialized one DeepSeek common-prefix discovery after the
     /// first request had persisted. It is not another cold identity leader.
@@ -437,11 +445,13 @@ impl ProviderTransportPool {
     /// Compare one exact canonical model-visible prompt against recent
     /// requests in the same cache-sensitive identity. This is structural
     /// evidence only; Provider usage remains the billing truth.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn observe_prompt_prefix(
         &self,
         cache_identity_sha256: String,
         request_id: String,
         prompt: Vec<u8>,
+        stable_head_bytes: usize,
     ) -> ProviderWirePrefixObservation {
         let mut histories = self
             .prompt_prefixes
@@ -467,6 +477,7 @@ impl ProviderTransportPool {
                 (candidate, lcp)
             })
             .max_by_key(|(_, lcp)| *lcp);
+        let best_bytes = best.map(|(candidate, _)| candidate.bytes.clone()).unwrap_or_default();
         let predecessor_request_id = best.map(|(candidate, _)| candidate.request_id.clone());
         let reusable_prefix_bytes = best.map_or(0, |(_, lcp)| lcp);
         let exact_extension = best.is_some_and(|(candidate, lcp)| lcp == candidate.bytes.len());
@@ -485,6 +496,21 @@ impl ProviderTransportPool {
             Some("no_common_model_visible_prefix".to_string())
         } else {
             Some("model_visible_prefix_diverged".to_string())
+        };
+        // PLAN A2: name the segment that moved, so a falling reuse ratio has a
+        // cause instead of only a magnitude.
+        let divergence_segment = if best.is_none() || exact_extension {
+            None
+        } else {
+            let attribution = crate::provider_prefix_attribution::attribute_divergence(
+                &best_bytes,
+                &prompt,
+                &crate::provider_prefix_attribution::canonical_prompt_layout(
+                    stable_head_bytes.min(prompt.len()),
+                    prompt.len(),
+                ),
+            );
+            attribution.segment.map(|segment| segment.as_str())
         };
         if best.is_some() && low_structural_reuse(structural_reuse_ratio_bp) {
             tracing::debug!(
@@ -509,6 +535,7 @@ impl ProviderTransportPool {
             structural_reuse_ratio_bp,
             exact_extension,
             invalidation_reason,
+            divergence_segment: divergence_segment.map(str::to_owned),
             cold_leader: false,
             common_prefix_leader: false,
             warmup_bypassed_low_reuse: false,
@@ -664,6 +691,107 @@ impl Drop for TransportRequestGuard<'_> {
     }
 }
 
+/// PLAN A2, wired: the transport's prefix observer names the segment that moved.
+///
+/// The real canonical prompt is the messages array encoded as `<len>:<json>\n`,
+/// so this exercises exactly that shape against the real `observe_prompt_prefix`.
+#[cfg(test)]
+fn encode_messages(items: &[&str]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for item in items {
+        out.extend_from_slice(item.len().to_string().as_bytes());
+        out.push(b':');
+        out.extend_from_slice(item.as_bytes());
+        out.push(b'\n');
+    }
+    out
+}
+
+#[cfg(test)]
+mod prefix_wiring_tests {
+    use super::{encode_messages, ProviderTransportPool};
+
+    /// A history that only GROWS is a pure append: reuse is total and there is no
+    /// divergence to attribute. That is the healthy case.
+    #[test]
+    fn a_growing_history_is_a_pure_append_not_a_divergence() {
+        let pool = ProviderTransportPool::new(4);
+        let stable = 13_usize; // "10:system_msg\n"
+        let first = encode_messages(&["system_msg", "history_msg"]);
+        pool.observe_prompt_prefix("sha256:id".to_string(), "r1".to_string(), first.clone(), stable);
+
+        let second = encode_messages(&["system_msg", "history_msg", "history_msg2"]);
+        let observation =
+            pool.observe_prompt_prefix("sha256:id".to_string(), "r2".to_string(), second, stable);
+
+        assert!(observation.exact_extension, "the first prompt is a prefix of the second");
+        assert_eq!(
+            observation.divergence_segment, None,
+            "a pure append is not a divergence"
+        );
+        assert_eq!(observation.reusable_prefix_bytes as usize, first.len());
+    }
+
+    /// A REWRITTEN history is attributed to the message segment: expected, and
+    /// still much cheaper than a moving stable head.
+    #[test]
+    fn a_rewritten_history_is_attributed_to_the_message_segment() {
+        let pool = ProviderTransportPool::new(4);
+        let first = encode_messages(&["system_msg", "history_msg"]);
+        pool.observe_prompt_prefix("sha256:id".to_string(), "r1".to_string(), first, 13);
+
+        let second = encode_messages(&["system_msg", "history_msgX"]);
+        let observation =
+            pool.observe_prompt_prefix("sha256:id".to_string(), "r2".to_string(), second, 13);
+
+        assert_eq!(observation.divergence_segment.as_deref(), Some("messages"));
+        assert!(!observation.exact_extension);
+    }
+
+    #[test]
+    fn a_moving_stable_head_is_attributed_to_the_system_segment() {
+        let pool = ProviderTransportPool::new(4);
+        let first = encode_messages(&["system_msgA", "history_msg"]);
+        pool.observe_prompt_prefix("sha256:id".to_string(), "r1".to_string(), first, 14);
+
+        let second = encode_messages(&["system_msgB", "history_msg"]);
+        let observation =
+            pool.observe_prompt_prefix("sha256:id".to_string(), "r2".to_string(), second, 14);
+
+        assert_eq!(
+            observation.divergence_segment.as_deref(),
+            Some("system"),
+            "a moving stable head is the expensive case and must be named"
+        );
+    }
+
+    #[test]
+    fn a_cold_identity_has_no_divergence_to_attribute() {
+        let pool = ProviderTransportPool::new(4);
+        let observation = pool.observe_prompt_prefix(
+            "sha256:brand-new".to_string(),
+            "r1".to_string(),
+            encode_messages(&["system_msg"]),
+            13,
+        );
+        assert_eq!(observation.divergence_segment, None);
+        assert_eq!(observation.invalidation_reason.as_deref(), Some("cold_identity"));
+    }
+
+    #[test]
+    fn a_pure_append_has_no_divergence() {
+        let pool = ProviderTransportPool::new(4);
+        let first = encode_messages(&["system_msg", "history_msg"]);
+        pool.observe_prompt_prefix("sha256:id".to_string(), "r1".to_string(), first.clone(), 13);
+
+        let mut second = first.clone();
+        second.extend_from_slice(b"13:history_msg2\n");
+        let observation =
+            pool.observe_prompt_prefix("sha256:id".to_string(), "r2".to_string(), second, 13);
+        assert_eq!(observation.divergence_segment, None);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ProviderTransportPool;
@@ -751,6 +879,7 @@ mod tests {
             "identity-a".to_string(),
             "request-1".to_string(),
             b"stable-history".to_vec(),
+            0,
         );
         assert_eq!(cold.invalidation_reason.as_deref(), Some("cold_identity"));
         assert_eq!(cold.structural_reuse_ratio_bp, 0);
@@ -759,6 +888,7 @@ mod tests {
             "identity-a".to_string(),
             "request-2".to_string(),
             b"stable-history-new-delta".to_vec(),
+            0,
         );
         assert_eq!(warm.predecessor_request_id.as_deref(), Some("request-1"));
         assert_eq!(warm.reusable_prefix_bytes, 14);
@@ -773,11 +903,13 @@ mod tests {
             "identity-a".to_string(),
             "request-1".to_string(),
             b"same-prefix".to_vec(),
+            0,
         );
         let other = pool.observe_prompt_prefix(
             "identity-b".to_string(),
             "request-2".to_string(),
             b"same-prefix-more".to_vec(),
+            0,
         );
         assert_eq!(other.invalidation_reason.as_deref(), Some("cold_identity"));
         assert!(other.predecessor_request_id.is_none());

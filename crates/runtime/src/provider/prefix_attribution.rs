@@ -161,6 +161,31 @@ impl DivergenceAttribution {
     }
 }
 
+/// The layout of the canonical prompt the transport actually compares.
+///
+/// Code fact (`provider_cache_material`): the canonical prompt is the **messages
+/// array** encoded as `<len>:<json>\n` per item. The tool schema array and a
+/// provider's separate `system` field are NOT in it - they are folded into the
+/// cache identity instead, so a tool change produces a *cold identity* rather
+/// than a mid-prompt divergence. That leaves exactly two segments to attribute:
+///
+/// * `System` - the stable leading cohort. It is the first wire item for
+///   OpenAI-compatible transports, or the separately-carried system bytes. If
+///   this moves, every request after it is re-sent.
+/// * `Messages` - the append-only history. It is supposed to grow; only its head
+///   has to hold still.
+pub fn canonical_prompt_layout(stable_head_bytes: usize, total_bytes: usize) -> PromptLayout {
+    let boundary = stable_head_bytes.min(total_bytes);
+    PromptLayout {
+        spans: [
+            (PromptSegment::System, SegmentSpan::new(0, boundary)),
+            (PromptSegment::Messages, SegmentSpan::new(boundary, total_bytes)),
+        ]
+        .into_iter()
+        .collect(),
+    }
+}
+
 /// The segment layout of one serialized request.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PromptLayout {
@@ -217,15 +242,20 @@ pub fn attribute_divergence(
     // A cold identity has no predecessor, so there is nothing to attribute.
     let mut segment = None;
     let mut only_messages_grew = true;
-    if previous.is_empty() {
+    let pure_append = previous.is_empty() || reusable_bytes == previous.len();
+    if previous.is_empty() || reusable_bytes == previous.len() {
         return DivergenceAttribution {
             segment: None,
+            // For a cold identity there is no predecessor at all; for a pure
+            // append nothing differs, so both report offset 0 with zero
+            // attributed bytes.
             first_diff_offset: 0,
-            reusable_bytes: 0,
+            reusable_bytes,
             prompt_bytes: current.len(),
             only_messages_grew: true,
         };
     }
+    let _ = pure_append;
     // The first differing segment is the one that CONTAINS the first difference.
     for candidate in PromptSegment::ALL {
         let Some(span) = current_layout.span(candidate) else {
@@ -288,11 +318,11 @@ mod tests {
             .with_segment(PromptSegment::Memory, SegmentSpan::new(8, 11))
             .with_segment(PromptSegment::Messages, SegmentSpan::new(11, 21));
         let attribution = attribute_divergence(previous, current, &layout);
-        assert_eq!(attribution.segment, Some(PromptSegment::Messages));
-        assert!(
-            attribution.only_messages_grew,
-            "a growing history is expected, not a defect"
-        );
+        // A purely appended history is not a divergence at all. Only a REWRITTEN
+        // one is, and then it is attributed to Messages, the one segment allowed
+        // to change.
+        assert_eq!(attribution.segment, None);
+        assert!(attribution.only_messages_grew);
     }
 
     /// A changed tool schema breaks breakpoint 2 and every message after it.
@@ -363,5 +393,56 @@ mod tests {
             !PromptSegment::Messages.must_be_stable(),
             "history is append-only; only its head must hold still"
         );
+    }
+}
+
+#[cfg(test)]
+mod canonical_tests {
+    use super::*;
+
+    /// The real shape: a stable head plus a growing history. Reuse is high and no
+    /// stable segment is blamed - which is what a healthy turn looks like.
+    #[test]
+    fn a_growing_history_behind_a_stable_head_is_not_divergence() {
+        let mut previous = String::new();
+        previous.push_str("11:system_msg\n");
+        previous.push_str("12:history_msg\n");
+        let mut current = previous.clone();
+        current.push_str("13:history_msg2\n");
+        let layout = canonical_prompt_layout(previous.len(), current.len());
+        let attribution = attribute_divergence(previous.as_bytes(), current.as_bytes(), &layout);
+        // A pure append is not a divergence at all: reuse is total and nothing
+        // needs fixing, which is the healthy case.
+        assert_eq!(attribution.segment, None);
+        assert!(attribution.only_messages_grew);
+        // Reuse is measured against the CURRENT prompt, which now includes the
+        // appended message, so it is high but not total - and crucially there is
+        // no segment to fix.
+        assert!(attribution.reuse_bp() > 6_000, "{}", attribution.reuse_bp());
+    }
+
+    /// A moving stable head is the expensive failure: it invalidates everything
+    /// after it, so it must be named.
+    #[test]
+    fn a_moving_stable_head_is_attributed_to_the_system_segment() {
+        let previous = "12:system_msgA\n12:history_msg\n";
+        let current = "12:system_msgB\n12:history_msg\n";
+        let layout = canonical_prompt_layout(14, current.len());
+        let attribution = attribute_divergence(previous.as_bytes(), current.as_bytes(), &layout);
+        assert_eq!(attribution.segment, Some(PromptSegment::System));
+        assert!(!attribution.only_messages_grew);
+    }
+
+    /// A changed tool schema does NOT reach the canonical prompt, so it can never
+    /// be blamed here: it is a cold identity (a different cache key), which is
+    /// the existing `cold_identity` invalidation reason.
+    #[test]
+    fn a_tool_schema_change_cannot_appear_as_a_prompt_divergence() {
+        let previous = "12:system_msg\n12:history_msg\n";
+        let current = "12:system_msg\n12:history_msg\n";
+        let layout = canonical_prompt_layout(14, current.len());
+        let attribution = attribute_divergence(previous.as_bytes(), current.as_bytes(), &layout);
+        assert_ne!(attribution.segment, Some(PromptSegment::Tools));
+        assert_eq!(attribution.segment, None);
     }
 }
