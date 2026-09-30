@@ -3208,7 +3208,15 @@ fn runtime_bootstrap_state_discovers_mcp_tools_and_surfaces_pending_servers() {
         .expect("tool search should execute");
     let search_json: serde_json::Value =
         serde_json::from_str(&search_output).expect("search output should be json");
-    assert_eq!(search_json["matches"][0], "mcp__alpha__echo");
+    // PLAN B-4: an MCP tool is reached through the `mcp` wrapper, not through
+    // provider tool activation (which rewrites the tools array), so it must not
+    // be a search match. The server-health surface is unaffected.
+    assert!(
+        search_json["matches"]
+            .as_array()
+            .is_none_or(|matches| matches.iter().all(|m| m != "mcp__alpha__echo")),
+        "an MCP tool must not be a search match: {search_json}"
+    );
     assert_eq!(search_json["pending_mcp_servers"][0], "broken");
     assert_eq!(
         search_json["mcp_degraded"]["failed_servers"][0]["server_name"],
