@@ -527,3 +527,334 @@ mod guard_tests {
         assert!(collected.iter().all(Result::is_ok));
     }
 }
+
+/// PLAN D2a: the terminal obligation for one turn.
+///
+/// # Why this exists
+///
+/// The second failure mode observed on real runs is a turn that keeps working
+/// and never finishes: EXP-003 Facet A showed 367 progress observations, 27.9MB
+/// of activity and 954 projected activities, yet **no durable terminal message
+/// was ever committed**, and the run again ended at the evaluator's wall clock.
+///
+/// A model that has all the evidence it needs has no intrinsic pressure to stop
+/// generating. The obligation supplies that pressure explicitly, in the
+/// runtime, instead of relying on the model's discretion or on a timeout.
+///
+/// # Semantics
+///
+/// The obligation is armed only by a **causal event** - the objective's evidence
+/// requirement being satisfied. It is measured from that event, never from the
+/// start of the turn, so a long-running turn is never penalised for taking a
+/// long time (PLAN I1: an authoritative TTL may exist, but only a causal event
+/// reaches a terminal state).
+
+/// What the objective requires before a terminal answer is owed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SatisfactionRule {
+    /// At least `required` committed tool receipts.
+    Receipts {
+        /// How many receipts the objective needs.
+        required: usize,
+    },
+    /// The model emitted an explicit terminal marker.
+    TerminalMarker,
+}
+
+/// The observable facts a turn has produced so far.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnProgress {
+    /// Committed tool receipts (success or failure - both are facts).
+    pub committed_receipts: usize,
+    /// A terminal marker appeared in the model output.
+    pub saw_terminal_marker: bool,
+    /// A durable terminal message has been committed.
+    pub committed_terminal: bool,
+}
+
+impl TurnProgress {
+    #[must_use]
+    pub const fn satisfied(&self, rule: &SatisfactionRule) -> bool {
+        match rule {
+            SatisfactionRule::Receipts { required } => self.committed_receipts >= *required,
+            SatisfactionRule::TerminalMarker => self.saw_terminal_marker,
+        }
+    }
+}
+
+/// How long after satisfaction the runtime waits, and how it nags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalObligation {
+    /// When a terminal answer becomes owed.
+    pub satisfaction: SatisfactionRule,
+    /// How long after satisfaction to wait before probing.
+    pub commit_window: Duration,
+    /// How many commit probes may be issued.
+    pub probe_budget: u32,
+}
+
+impl Default for TerminalObligation {
+    fn default() -> Self {
+        Self {
+            // Three receipts: enough to cover a locate -> read -> verify chain.
+            satisfaction: SatisfactionRule::Receipts { required: 3 },
+            commit_window: Duration::from_secs(90),
+            probe_budget: 1,
+        }
+    }
+}
+
+/// What the terminal obligation says right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalVerdict {
+    /// The obligation is not armed yet; nothing is owed.
+    NotSatisfied,
+    /// A durable terminal message has been committed. Done.
+    Committed,
+    /// Armed, but still inside the commit window. Do not nag.
+    WithinWindow {
+        /// Time since the objective became satisfied.
+        since_satisfied: Duration,
+    },
+    /// Armed, window elapsed, probes remain: ask the model to commit.
+    Probe {
+        since_satisfied: Duration,
+        /// The probe number being requested (1-based).
+        probe: u32,
+    },
+    /// Armed, probes exhausted, still no terminal message.
+    NonCommitting {
+        since_satisfied: Duration,
+        probes: u32,
+    },
+}
+
+/// Tracks the terminal obligation for one turn.
+#[derive(Debug, Clone)]
+pub struct TerminalTracker {
+    obligation: TerminalObligation,
+    probes_issued: u32,
+    armed: bool,
+}
+
+impl TerminalTracker {
+    #[must_use]
+    pub const fn new(obligation: TerminalObligation) -> Self {
+        Self {
+            obligation,
+            probes_issued: 0,
+            armed: false,
+        }
+    }
+
+    /// Evaluate the obligation against the turn's progress.
+    ///
+    /// `since_satisfied` is `None` while the objective is not yet satisfied, and
+    /// is the elapsed time since the causal arming event afterwards. Supplied by
+    /// the caller so this stays a pure function of (obligation, progress,
+    /// since_satisfied, probes).
+    #[must_use]
+    pub fn evaluate(&self, progress: &TurnProgress, since_satisfied: Option<Duration>) -> TerminalVerdict {
+        if progress.committed_terminal {
+            return TerminalVerdict::Committed;
+        }
+        if !self.armed && !progress.satisfied(&self.obligation.satisfaction) {
+            return TerminalVerdict::NotSatisfied;
+        }
+        if !self.armed {
+            // Armed by this evaluation but never observed as satisfied before:
+            // the window starts now.
+            return TerminalVerdict::WithinWindow {
+                since_satisfied: Duration::ZERO,
+            };
+        }
+        let since = since_satisfied.unwrap_or(Duration::ZERO);
+        if since < self.obligation.commit_window {
+            return TerminalVerdict::WithinWindow { since_satisfied: since };
+        }
+        if self.probes_issued >= self.obligation.probe_budget {
+            return TerminalVerdict::NonCommitting {
+                since_satisfied: since,
+                probes: self.probes_issued,
+            };
+        }
+        TerminalVerdict::Probe {
+            since_satisfied: since,
+            probe: self.probes_issued + 1,
+        }
+    }
+
+    /// Arm the obligation. Called when the caller first observes satisfaction.
+    pub fn arm(&mut self) {
+        self.armed = true;
+    }
+
+    /// Whether the obligation is armed.
+    #[must_use]
+    pub const fn is_armed(&self) -> bool {
+        self.armed
+    }
+
+    /// Consume one commit probe.
+    pub fn issue_probe(&mut self) -> bool {
+        if self.probes_issued >= self.obligation.probe_budget {
+            return false;
+        }
+        self.probes_issued = self.probes_issued.saturating_add(1);
+        true
+    }
+
+    /// Probes issued so far.
+    #[must_use]
+    pub const fn probes_issued(&self) -> u32 {
+        self.probes_issued
+    }
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::*;
+
+    fn obligation(required: usize, window_secs: u64, budget: u32) -> TerminalObligation {
+        TerminalObligation {
+            satisfaction: SatisfactionRule::Receipts { required },
+            commit_window: Duration::from_secs(window_secs),
+            probe_budget: budget,
+        }
+    }
+
+    #[test]
+    fn nothing_is_owed_before_the_objective_is_satisfied() {
+        let tracker = TerminalTracker::new(obligation(3, 90, 1));
+        let progress = TurnProgress {
+            committed_receipts: 2,
+            saw_terminal_marker: false,
+            committed_terminal: false,
+        };
+        assert_eq!(
+            tracker.evaluate(&progress, None),
+            TerminalVerdict::NotSatisfied
+        );
+    }
+
+    /// The I1 guard: a turn that has not yet satisfied its objective is never
+    /// nagged, however long it has been running. Elapsed time is not an input.
+    #[test]
+    fn a_long_unsatisfied_turn_is_never_nagged() {
+        let tracker = TerminalTracker::new(obligation(3, 90, 1));
+        let progress = TurnProgress {
+            committed_receipts: 0,
+            saw_terminal_marker: false,
+            committed_terminal: false,
+        };
+        // A full day of work with no receipts yet: still not owed anything.
+        assert_eq!(
+            tracker.evaluate(&progress, Some(Duration::from_secs(86_400))),
+            TerminalVerdict::NotSatisfied
+        );
+    }
+
+    #[test]
+    fn a_committed_terminal_message_ends_the_obligation() {
+        let tracker = TerminalTracker::new(obligation(3, 90, 1));
+        let progress = TurnProgress {
+            committed_receipts: 9,
+            saw_terminal_marker: false,
+            committed_terminal: true,
+        };
+        assert_eq!(tracker.evaluate(&progress, None), TerminalVerdict::Committed);
+    }
+
+    #[test]
+    fn satisfaction_starts_the_window_and_a_probe_follows_it() {
+        let mut tracker = TerminalTracker::new(obligation(3, 90, 1));
+        let satisfied = TurnProgress {
+            committed_receipts: 3,
+            saw_terminal_marker: false,
+            committed_terminal: false,
+        };
+        // First observation of satisfaction arms the obligation.
+        assert_eq!(
+            tracker.evaluate(&satisfied, None),
+            TerminalVerdict::WithinWindow {
+                since_satisfied: Duration::ZERO
+            }
+        );
+        tracker.arm();
+
+        // Inside the window: never nag, however the model spends it.
+        assert_eq!(
+            tracker.evaluate(&satisfied, Some(Duration::from_secs(89))),
+            TerminalVerdict::WithinWindow {
+                since_satisfied: Duration::from_secs(89)
+            }
+        );
+
+        // Past the window with no terminal message: one probe.
+        assert_eq!(
+            tracker.evaluate(&satisfied, Some(Duration::from_secs(90))),
+            TerminalVerdict::Probe {
+                since_satisfied: Duration::from_secs(90),
+                probe: 1
+            }
+        );
+        assert!(tracker.issue_probe());
+
+        // Probes exhausted -> typed failure, the only path to NonCommitting.
+        assert_eq!(
+            tracker.evaluate(&satisfied, Some(Duration::from_secs(180))),
+            TerminalVerdict::NonCommitting {
+                since_satisfied: Duration::from_secs(180),
+                probes: 1
+            }
+        );
+        assert!(!tracker.issue_probe(), "the probe budget is hard");
+    }
+
+    #[test]
+    fn a_terminal_marker_also_arms_the_obligation() {
+        let tracker = TerminalTracker::new(TerminalObligation {
+            satisfaction: SatisfactionRule::TerminalMarker,
+            commit_window: Duration::from_secs(10),
+            probe_budget: 1,
+        });
+        let progress = TurnProgress {
+            committed_receipts: 0,
+            saw_terminal_marker: true,
+            committed_terminal: false,
+        };
+        assert_eq!(
+            tracker.evaluate(&progress, None),
+            TerminalVerdict::WithinWindow {
+                since_satisfied: Duration::ZERO
+            }
+        );
+    }
+
+    /// The happy path this obligation must not disturb: a turn that commits its
+    /// terminal answer as soon as it is owed is never probed.
+    #[test]
+    fn a_turn_that_commits_promptly_is_never_probed() {
+        let mut tracker = TerminalTracker::new(obligation(3, 90, 1));
+        let mut progress = TurnProgress::default();
+        for receipts in 1..=5_u64 {
+            progress.committed_receipts += 1;
+            let _ = receipts;
+            tracker.arm();
+            // A terminal message arrives with each satisfied round.
+            progress.committed_terminal = progress.committed_receipts >= 3;
+            assert_eq!(
+                tracker.evaluate(&progress, Some(Duration::from_secs(1))),
+                if progress.committed_terminal {
+                    TerminalVerdict::Committed
+                } else {
+                    TerminalVerdict::WithinWindow {
+                        since_satisfied: Duration::from_secs(1)
+                    }
+                },
+                "a prompt commit must never be probed"
+            );
+        }
+        assert_eq!(tracker.probes_issued(), 0);
+    }
+}
