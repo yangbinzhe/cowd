@@ -138,7 +138,7 @@ pub(crate) async fn execute_bound_agent_tool(
             }) {
                 outcome.observed_evidence.push(observed);
             }
-        } else if tool_name == "read_many" {
+        } else if tool_name == "tool_orchestrate" {
             outcome.observed_evidence.extend(
                 parsed
                     .as_ref()

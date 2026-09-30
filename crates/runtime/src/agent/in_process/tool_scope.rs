@@ -7,7 +7,7 @@ impl ScopedRuntimeToolExecutor {
         input: &str,
     ) -> Vec<String> {
         if self.provider_model_obligations.is_empty()
-            || !matches!(tool_name, "read_file" | "read_many")
+            || !matches!(tool_name, "read_file" | "tool_orchestrate")
         {
             return Vec::new();
         }

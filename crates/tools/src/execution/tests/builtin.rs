@@ -279,56 +279,6 @@ fn given_empty_payload_when_structured_output_then_rejects_with_error() {
 }
 
 #[test]
-fn repl_executes_python_code() {
-    let _guard = env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let result = execute_tool(
-        "repl",
-        &json!({"language": "python", "code": "print(1 + 1)", "timeout_ms": 5_000}),
-    )
-    .expect("REPL should succeed");
-    let output: serde_json::Value = serde_json::from_str(&result).expect("json");
-    assert_eq!(output["language"], "python");
-    assert_eq!(output["exitCode"], 0);
-    assert!(output["stdout"].as_str().expect("stdout").contains('2'));
-}
-
-#[test]
-fn given_empty_code_when_repl_then_rejects_with_error() {
-    let result = execute_tool("repl", &json!({"language": "python", "code": "   "}));
-
-    let error = result.expect_err("empty REPL code should fail");
-    assert!(error.contains("code must not be empty"));
-}
-
-#[test]
-fn given_unsupported_language_when_repl_then_rejects_with_error() {
-    let result = execute_tool("repl", &json!({"language": "ruby", "code": "puts 1"}));
-
-    let error = result.expect_err("unsupported REPL language should fail");
-    assert!(error.contains("unsupported REPL language: ruby"));
-}
-
-#[test]
-fn given_timeout_ms_when_repl_blocks_then_returns_timeout_error() {
-    let _guard = crate::test_process_environment_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let result = execute_tool(
-        "repl",
-        &json!({
-            "language": "python",
-            "code": "import time\ntime.sleep(1)",
-            "timeout_ms": 10
-        }),
-    );
-
-    let error = result.expect_err("timed out REPL execution should fail");
-    assert!(error.contains("REPL execution exceeded timeout of 10 ms"));
-}
-
-#[test]
 fn powershell_runs_via_stub_shell() {
     let _guard = env_lock()
         .lock()
@@ -490,12 +440,12 @@ fn orchestrate_can_dispatch_the_whole_builtin_catalog_but_never_itself() {
         .map(|spec| spec.name.to_string())
         .collect();
 
-    assert_eq!(catalog.len(), 33, "the catalog size is the contract");
+    assert_eq!(catalog.len(), 29, "the catalog size is the contract");
     let catalog: Vec<String> = catalog
         .into_iter()
         .filter(|name| name != "tool_orchestrate")
         .collect();
-    assert_eq!(catalog.len(), 32, "the catalog minus the orchestrator itself");
+    assert_eq!(catalog.len(), 28, "the catalog minus the orchestrator itself");
     for name in &catalog {
         assert!(dispatchable(name), "`{name}` is in the catalog, so it must be composable");
     }

@@ -488,12 +488,12 @@ fn require_batch_bound(tool: &str, items: usize) -> Result<(), String> {
 }
 
 fn run_read_many(lease: &ToolHostLease, input: ReadManyInput) -> Result<String, String> {
-    require_batch_bound("read_many", input.files.len())?;
+    require_batch_bound("tool_orchestrate", input.files.len())?;
     let results = run_ordered_batch(input.files, input.max_concurrency, |item| {
         let output = run_read_file(lease, item)?;
         serde_json::from_str(&output).or(Ok(Value::String(output)))
     });
-    to_pretty_json(batch_output("read_many", results))
+    to_pretty_json(batch_output("tool_orchestrate", results))
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -639,12 +639,12 @@ fn run_glob_search(lease: &ToolHostLease, input: GlobSearchInputValue) -> Result
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_glob_many(lease: &ToolHostLease, input: GlobManyInput) -> Result<String, String> {
-    require_batch_bound("glob_many", input.patterns.len())?;
+    require_batch_bound("tool_orchestrate", input.patterns.len())?;
     let results = run_ordered_batch(input.patterns, input.max_concurrency, |item| {
         let output = run_glob_search(lease, item)?;
         serde_json::from_str(&output).or(Ok(Value::String(output)))
     });
-    to_pretty_json(batch_output("glob_many", results))
+    to_pretty_json(batch_output("tool_orchestrate", results))
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -762,7 +762,7 @@ fn run_tool_batch_readonly(
     lease: &ToolHostLease,
     input: ToolBatchReadonlyInput,
 ) -> Result<String, String> {
-    require_batch_bound("tool_batch_readonly", input.calls.len())?;
+    require_batch_bound("tool_orchestrate", input.calls.len())?;
     for call in &input.calls {
         if !is_allowed_readonly_batch_tool(&call.name) {
             return Err(format!(
@@ -781,7 +781,7 @@ fn run_tool_batch_readonly(
         })
         .collect::<Vec<_>>();
     let context =
-        ToolExecutionContext::for_workspace(lease.workspace_root(), "tool_batch_readonly");
+        ToolExecutionContext::for_workspace(lease.workspace_root(), "tool_orchestrate");
     if calls_support_prepared_readonly(&input.calls) {
         let prepared = prepare_readonly_invocations(&context, &prepared_calls)
             .map_err(|error| error.message)?;
@@ -789,7 +789,7 @@ fn run_tool_batch_readonly(
             execute_prepared_readonly_leaf(lease, prepared)
         });
         return to_pretty_json(batch_output_with_mode(
-            "tool_batch_readonly",
+            "tool_orchestrate",
             "prepared_readonly",
             results,
         ));
@@ -800,7 +800,7 @@ fn run_tool_batch_readonly(
         Ok(serde_json::from_str(&output).unwrap_or(Value::String(output)))
     });
     to_pretty_json(batch_output_with_mode(
-        "tool_batch_readonly",
+        "tool_orchestrate",
         "compat_recursive",
         results,
     ))
@@ -844,9 +844,9 @@ pub(crate) fn is_allowed_readonly_batch_tool(name: &str) -> bool {
     matches!(
         name,
         "read_file"
-            | "read_many"
+            | "tool_orchestrate"
             | "glob_search"
-            | "glob_many"
+            | "tool_orchestrate"
             | "grep_search"
             | "workspace_snapshot"
             | "tool_cache_stats"

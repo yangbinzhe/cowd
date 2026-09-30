@@ -49,7 +49,7 @@ pub struct ToolExposurePlanner;
 /// 这些工具是几乎所有编程任务的基础操作，延迟激活会浪费模型轮次。
 const HOT_TOOLS: &[&str] = &[
     "read_file",
-    "read_many",
+    "tool_orchestrate",
     "edit",
     "edit",
     "bash",

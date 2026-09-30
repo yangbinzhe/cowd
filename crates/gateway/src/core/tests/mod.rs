@@ -2104,12 +2104,12 @@ fn workspace_context_item_summarizes_runtime_workspace() {
 fn runtime_capability_context_item_reflects_filtered_tools() {
     let tools = vec![
         runtime::ProviderToolDefinition {
-            name: "read_many".to_string(),
+            name: "tool_orchestrate".to_string(),
             description: Some("read many".to_string()),
             input_schema: serde_json::json!({ "type": "object" }),
         },
         runtime::ProviderToolDefinition {
-            name: "tool_batch_readonly".to_string(),
+            name: "tool_orchestrate".to_string(),
             description: Some("batch".to_string()),
             input_schema: serde_json::json!({ "type": "object" }),
         },
@@ -2126,8 +2126,8 @@ fn runtime_capability_context_item_reflects_filtered_tools() {
     assert_eq!(item.role, runtime::ContextRole::Orientation);
     assert!(item.content.contains("runtime_capabilities=registered"));
     assert!(!item.content.contains(concat!("runtime_", "orchestrate")));
-    assert!(item.content.contains("read_many"));
-    assert!(item.content.contains("tool_batch_readonly"));
+    assert!(item.content.contains("tool_orchestrate"));
+    assert!(item.content.contains("tool_orchestrate"));
 }
 
 #[test]

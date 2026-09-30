@@ -4082,7 +4082,7 @@ fn collect_checked_source_receipts(value: &Value, receipts: &mut BTreeSet<String
                 .is_some_and(|tool| {
                     matches!(
                         tool,
-                        "read_file" | "read_many" | "grep_search" | "grep_search"
+                        "read_file" | "tool_orchestrate" | "grep_search" | "grep_search"
                     )
                 });
             let succeeded = values.get("is_error").and_then(Value::as_bool) == Some(false);
@@ -4512,7 +4512,7 @@ fn has_successful_runtime_tool_completion(
     // pass an absolute path. Accept equivalent tools and path forms so the
     // acceptance checks the *action*, not a presentation choice.
     let accepts_tool = |name: &str| match expected_tool_name {
-        "read_file" => matches!(name, "read_file" | "read_many"),
+        "read_file" => matches!(name, "read_file" | "tool_orchestrate"),
         other => name == other,
     };
     let target = expected_target_path.trim_start_matches("./");

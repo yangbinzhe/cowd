@@ -306,7 +306,7 @@ async fn tool_batch_readonly_handler(
         .execute_tool_receipt(
             &tool_host,
             &state.workspace_root,
-            "tool_batch_readonly",
+            "tool_orchestrate",
             serde_json::json!({
                 "calls": body.calls,
                 "max_concurrency": body.max_concurrency,
@@ -478,7 +478,7 @@ fn is_webui_generic_tool_allowed(tool_name: &str) -> bool {
             // NOTE: `edit` (a WRITE tool) is deliberately excluded - this is the
             // read-only generic-tool surface. `mutation_preview` used to be here.
             | "checkpoint"
-            | "tool_batch_readonly"
+            | "tool_orchestrate"
             | "tool_cache_stats"
     )
 }

@@ -62,7 +62,7 @@ pub fn plan_context_fanout_for_intent(
                 json!({"include_git": true, "include_files": false}),
             ),
             call(
-                "tool_batch_readonly",
+                "tool_orchestrate",
                 json!({"calls": [
                     {"name": "glob_search", "input": {"pattern": "scripts/validate.sh"}},
                     {"name": "glob_search", "input": {"pattern": "**/Cargo.toml"}},
@@ -76,7 +76,7 @@ pub fn plan_context_fanout_for_intent(
                 json!({"include_git": true, "include_files": true, "roots": ["crates", "webui"], "max_files": 500}),
             ),
             call(
-                "glob_many",
+                "tool_orchestrate",
                 json!({"patterns": [
                     {"pattern": "**/*.tsx"},
                     {"pattern": "**/*.ts"},
@@ -86,7 +86,7 @@ pub fn plan_context_fanout_for_intent(
             ),
         ],
         TaskIntent::Docs => vec![call(
-            "glob_many",
+            "tool_orchestrate",
             json!({"patterns": [
                 {"pattern": "docs/**/*.md"},
                 {"pattern": "../plan/**/*.md"},
@@ -140,6 +140,6 @@ mod tests {
         assert!(plan
             .calls
             .iter()
-            .any(|call| call.name == "tool_batch_readonly"));
+            .any(|call| call.name == "tool_orchestrate"));
     }
 }

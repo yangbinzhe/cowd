@@ -23,7 +23,7 @@ fn gateway_observed_evidence(
         "read_file" => complete_read_evidence(resolver, "read_file", &output, sequence)
             .into_iter()
             .collect(),
-        "read_many" => batch_success_outputs(&output)
+        "tool_orchestrate" => batch_success_outputs(&output)
             .filter_map(|child| complete_read_evidence(resolver, "read_file", child, sequence))
             .collect(),
         "artifact_materialize" => materialized_artifact_evidence(resolver, &output, sequence)
@@ -80,7 +80,7 @@ fn gateway_observed_evidence(
         )
         .into_iter()
         .collect(),
-        "glob_many" => batch_success_outputs(&output)
+        "tool_orchestrate" => batch_success_outputs(&output)
             .filter_map(|child| {
                 discovery_evidence(
                     resolver,

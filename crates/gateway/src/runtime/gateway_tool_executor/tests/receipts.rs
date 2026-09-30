@@ -147,7 +147,7 @@
         let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
             &runtime::tool_dispatch::ToolRequest {
                 tool_use_id: "read-many".to_string(),
-                tool_name: "read_many".to_string(),
+                tool_name: "tool_orchestrate".to_string(),
                 input: "{}".to_string(),
                 depends_on: Vec::new(),
             },

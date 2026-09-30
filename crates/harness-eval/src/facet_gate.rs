@@ -113,7 +113,7 @@ impl FacetVerdict {
 /// batch counts as reading, and every path in the batch is unwrapped; a failed
 /// or errored read is not evidence.
 pub fn collect_read_paths(timeline: &serde_json::Value, projections: &[serde_json::Value]) -> Vec<String> {
-    let accepts_tool = |name: &str| matches!(name, "read_file" | "read_many");
+    let accepts_tool = |name: &str| matches!(name, "read_file" | "tool_orchestrate");
     let paths_from_input = |input: &serde_json::Value| -> Vec<String> {
         if let Some(path) = input.get("path").and_then(serde_json::Value::as_str) {
             return vec![path.to_string()];
@@ -384,7 +384,7 @@ mod timeline_tests {
     #[test]
     fn a_batched_read_counts_as_a_read_of_every_file() {
         let preview = json!({"files": [{"path": "a.rs"}, {"path": "b.rs"}]}).to_string();
-        let timeline = json!({"events": [event("read_many", &preview, false)]});
+        let timeline = json!({"events": [event("tool_orchestrate", &preview, false)]});
         let paths = read_paths(&timeline, &[]);
         assert!(paths.contains(&"a.rs".to_string()), "{paths:?}");
         assert!(paths.contains(&"b.rs".to_string()), "{paths:?}");

@@ -155,7 +155,7 @@ fn capability_mapping(capability: &str) -> CapabilityMapping {
         "read" => CapabilityMapping {
             tools: &[
                 "read_file",
-                "read_many",
+                "tool_orchestrate",
                 "workspace_snapshot",
                 "tool_orchestrate",
                 "context_retrieve",
@@ -167,7 +167,7 @@ fn capability_mapping(capability: &str) -> CapabilityMapping {
                 "grep_search",
                 "grep_search",
                 "glob_search",
-                "glob_many",
+                "tool_orchestrate",
                 "grep_search",
                 "lsp",
                 "tool_search",
@@ -343,12 +343,12 @@ mod tests {
 
         assert_eq!(resolved.permission_mode, PermissionMode::ReadOnly);
         assert!(resolved.allowed_tools.contains("read_file"));
-        assert!(resolved.allowed_tools.contains("read_many"));
+        assert!(resolved.allowed_tools.contains("tool_orchestrate"));
         assert!(resolved.allowed_tools.contains("workspace_snapshot"));
         assert!(resolved.allowed_tools.contains("grep_search"));
         assert!(resolved.allowed_tools.contains("grep_search"));
         assert!(resolved.allowed_tools.contains("glob_search"));
-        assert!(resolved.allowed_tools.contains("glob_many"));
+        assert!(resolved.allowed_tools.contains("tool_orchestrate"));
         assert!(resolved.allowed_tools.contains("grep_search"));
         assert!(resolved.allowed_tools.contains("lsp"));
         assert!(resolved.allowed_tools.contains("tool_search"));

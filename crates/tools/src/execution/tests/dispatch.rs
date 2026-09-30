@@ -171,7 +171,7 @@ fn exposes_mvp_tools() {
     assert!(names.contains(&"config"));
     assert!(names.contains(&"plan_mode"));
     assert!(names.contains(&"structured_output"));
-    assert!(names.contains(&"repl"));
+    assert!(names.contains(&"execute_code"));
     for removed in [
         "Agent",
         "TaskCreate",
@@ -1253,50 +1253,6 @@ fn glob_and_grep_tools_cover_success_and_errors() {
 }
 
 #[test]
-fn read_many_preserves_order_and_reports_partial_failures() {
-    let _guard = env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let root = temp_path("read-many-suite");
-    fs::create_dir_all(root.join("nested")).expect("create root");
-    let original_dir = std::env::current_dir().expect("cwd");
-    std::env::set_current_dir(&root).expect("set cwd");
-
-    fs::write(root.join("nested/a.txt"), "alpha\nbeta\n").expect("write a");
-    fs::write(root.join("nested/b.txt"), "gamma\n").expect("write b");
-
-    let output = execute_tool(
-        "read_many",
-        &json!({
-            "files": [
-                { "path": "nested/a.txt", "offset": 1, "limit": 1 },
-                { "path": "missing.txt" },
-                { "path": "nested/b.txt" }
-            ],
-            "max_concurrency": 2
-        }),
-    )
-    .expect("read_many should return structured batch output");
-    let value: serde_json::Value = serde_json::from_str(&output).expect("json");
-
-    assert_eq!(value["type"], "read_many");
-    assert_eq!(value["count"], 3);
-    assert_eq!(value["successCount"], 2);
-    assert_eq!(value["errorCount"], 1);
-    assert_eq!(value["partialSuccess"], true);
-    assert_eq!(value["results"][0]["index"], 0);
-    assert_eq!(value["results"][0]["status"], "success");
-    assert_eq!(value["results"][0]["output"]["file"]["content"], "beta");
-    assert_eq!(value["results"][1]["index"], 1);
-    assert_eq!(value["results"][1]["status"], "error");
-    assert_eq!(value["results"][2]["index"], 2);
-    assert_eq!(value["results"][2]["output"]["file"]["content"], "gamma");
-
-    std::env::set_current_dir(&original_dir).expect("restore cwd");
-    let _ = fs::remove_dir_all(root);
-}
-
-#[test]
 fn auto_checkpoint_can_guard_mutations_when_enabled() {
     let _guard = env_lock()
         .lock()
@@ -1498,65 +1454,6 @@ fn checkpoint_tools_create_diff_and_restore_workspace_files() {
 }
 
 #[test]
-fn glob_many_and_grep_many_preserve_order() {
-    let _guard = env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let root = temp_path("search-many-suite");
-    fs::create_dir_all(root.join("nested")).expect("create root");
-    let original_dir = std::env::current_dir().expect("cwd");
-    std::env::set_current_dir(&root).expect("set cwd");
-
-    fs::write(root.join("nested/lib.rs"), "let alpha = 1;\n").expect("write rs");
-    fs::write(root.join("nested/notes.md"), "alpha\nbeta\n").expect("write md");
-
-    let globbed = execute_tool(
-        "glob_many",
-        &json!({
-            "patterns": [
-                { "pattern": "nested/*.rs" },
-                { "pattern": "[" },
-                { "pattern": "nested/*.md" }
-            ],
-            "max_concurrency": 2
-        }),
-    )
-    .expect("glob_many should return structured batch output");
-    let globbed_value: serde_json::Value = serde_json::from_str(&globbed).expect("json");
-    assert_eq!(globbed_value["successCount"], 2);
-    assert_eq!(globbed_value["errorCount"], 1);
-    assert_eq!(globbed_value["results"][0]["index"], 0);
-    assert_eq!(globbed_value["results"][1]["status"], "error");
-    assert_eq!(globbed_value["results"][2]["index"], 2);
-
-    let grepped = execute_tool(
-        "grep_search",
-        &json!({
-            "searches": [
-                { "pattern": "alpha", "path": "nested", "glob": "*.rs" },
-                { "pattern": "(alpha", "path": "nested" },
-                { "pattern": "beta", "path": "nested", "output_mode": "content" }
-            ],
-            "max_concurrency": 2
-        }),
-    )
-    .expect("grep_many should return structured batch output");
-    let grepped_value: serde_json::Value = serde_json::from_str(&grepped).expect("json");
-    assert_eq!(grepped_value["successCount"], 2);
-    assert_eq!(grepped_value["errorCount"], 1);
-    assert_eq!(grepped_value["results"][0]["index"], 0);
-    assert_eq!(grepped_value["results"][1]["status"], "error");
-    assert_eq!(grepped_value["results"][2]["index"], 2);
-    assert!(grepped_value["results"][2]["output"]["content"]
-        .as_str()
-        .expect("content")
-        .contains("beta"));
-
-    std::env::set_current_dir(&original_dir).expect("restore cwd");
-    let _ = fs::remove_dir_all(root);
-}
-
-#[test]
 fn workspace_snapshot_reports_compact_read_only_state() {
     let _guard = env_lock()
         .lock()
@@ -1593,46 +1490,6 @@ fn workspace_snapshot_reports_compact_read_only_state() {
 }
 
 #[test]
-fn tool_batch_readonly_runs_allowed_calls_in_order() {
-    let _guard = env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let root = temp_path("tool-batch-readonly-suite");
-    fs::create_dir_all(root.join("src")).expect("create root");
-    fs::write(root.join("src/lib.rs"), "pub fn alpha() {}\n").expect("write rs");
-    let original_dir = std::env::current_dir().expect("cwd");
-    std::env::set_current_dir(&root).expect("set cwd");
-
-    let output = execute_tool(
-        "tool_batch_readonly",
-        &json!({
-            "calls": [
-                { "name": "read_file", "input": { "path": "src/lib.rs" } },
-                { "name": "grep_search", "input": { "pattern": "alpha", "path": "src" } },
-                { "name": "glob_search", "input": { "pattern": "src/*.rs" } }
-            ],
-            "max_concurrency": 3
-        }),
-    )
-    .expect("tool_batch_readonly should succeed");
-    let value: serde_json::Value = serde_json::from_str(&output).expect("json");
-    assert_eq!(value["type"], "tool_batch_readonly");
-    assert_eq!(value["executionMode"], "prepared_readonly");
-    assert_eq!(value["successCount"], 3);
-    assert_eq!(value["errorCount"], 0);
-    assert_eq!(value["results"][0]["index"], 0);
-    assert_eq!(
-        value["results"][0]["output"]["file"]["content"],
-        "pub fn alpha() {}"
-    );
-    assert_eq!(value["results"][1]["index"], 1);
-    assert_eq!(value["results"][2]["index"], 2);
-
-    std::env::set_current_dir(&original_dir).expect("restore cwd");
-    let _ = fs::remove_dir_all(root);
-}
-
-#[test]
 fn tool_hosts_execute_concurrently_without_process_cwd_switching() {
     let _guard = env_lock()
         .lock()
@@ -1656,10 +1513,9 @@ fn tool_hosts_execute_concurrently_without_process_cwd_switching() {
         thread::spawn(move || {
             execute_in_workspace(
                 &root,
-                "tool_batch_readonly",
+                "tool_orchestrate",
                 &json!({
-                    "calls": [{"name": "read_file", "input": {"path": "identity.txt"}}],
-                    "max_concurrency": 2
+                    "steps": [{"id": "r", "op": "call", "tool": "read_file", "input": {"path": "identity.txt"}}]
                 }),
             )
         })
@@ -1682,61 +1538,6 @@ fn tool_hosts_execute_concurrently_without_process_cwd_switching() {
 
     fs::remove_dir_all(root_a).expect("cleanup workspace a");
     fs::remove_dir_all(root_b).expect("cleanup workspace b");
-}
-
-#[test]
-fn tool_batch_readonly_falls_back_for_readonly_aggregate_tools() {
-    let _guard = env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let root = temp_path("tool-batch-readonly-compat-suite");
-    fs::create_dir_all(root.join("src")).expect("create root");
-    fs::write(root.join("src/a.rs"), "alpha\n").expect("write a");
-    fs::write(root.join("src/b.rs"), "beta\n").expect("write b");
-    let original_dir = std::env::current_dir().expect("cwd");
-    std::env::set_current_dir(&root).expect("set cwd");
-
-    let output = execute_tool(
-        "tool_batch_readonly",
-        &json!({
-            "calls": [
-                {
-                    "name": "read_many",
-                    "input": {
-                        "files": [
-                            { "path": "src/a.rs" },
-                            { "path": "src/b.rs" }
-                        ],
-                        "max_concurrency": 2
-                    }
-                }
-            ]
-        }),
-    )
-    .expect("tool_batch_readonly should keep aggregate compatibility");
-    let value: serde_json::Value = serde_json::from_str(&output).expect("json");
-    assert_eq!(value["executionMode"], "compat_recursive");
-    assert_eq!(value["successCount"], 1);
-    assert_eq!(value["results"][0]["output"]["type"], "read_many");
-
-    std::env::set_current_dir(&original_dir).expect("restore cwd");
-    let _ = fs::remove_dir_all(root);
-}
-
-#[test]
-fn tool_batch_readonly_rejects_non_readonly_tools_before_execution() {
-    let output = execute_tool(
-            "tool_batch_readonly",
-            &json!({
-                "calls": [
-                    { "name": "read_file", "input": { "path": "Cargo.toml" } },
-                    { "name": "edit", "input": { "action": "write", "path": "should-not-exist.txt", "content": "no" } }
-                ]
-            }),
-        )
-        .expect_err("write_file must be rejected");
-    assert!(output.contains("edit"));
-    assert!(output.contains("not allowed"));
 }
 
 #[test]
@@ -2121,22 +1922,3 @@ fn tool_orchestrate_supports_filter_when_and_repeat() {
     let _ = fs::remove_dir_all(&root);
 }
 
-/// The flat batch tools declare and enforce the same per-call item bound as the
-/// orchestration engine's per-step limit, so one call cannot enqueue unbounded
-/// work while only `max_concurrency` of it can run at a time.
-#[test]
-fn flat_batch_tools_refuse_more_items_than_the_bound() {
-    let files = (0..201)
-        .map(|index| json!({ "path": format!("f{index}.txt") }))
-        .collect::<Vec<_>>();
-    let error = execute_tool("read_many", &json!({ "files": files }))
-        .expect_err("a read_many over the item bound must be refused");
-    assert!(error.contains("at most 200"), "{error}");
-
-    let calls = (0..201)
-        .map(|index| json!({ "name": "read_file", "input": { "path": format!("f{index}.txt") } }))
-        .collect::<Vec<_>>();
-    let error = execute_tool("tool_batch_readonly", &json!({ "calls": calls }))
-        .expect_err("a tool_batch_readonly over the item bound must be refused");
-    assert!(error.contains("at most 200"), "{error}");
-}

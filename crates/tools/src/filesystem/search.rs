@@ -886,8 +886,8 @@ mod tests {
             .unwrap();
         lease
             .validate_input(
-                "glob_many",
-                &serde_json::json!({"patterns":[first["next_request"].clone()]}),
+                "tool_orchestrate",
+                &serde_json::json!({"steps":[{"id":"g","op":"call","tool":"glob_search","input":first["next_request"].clone()}]}),
             )
             .unwrap();
         fixture.write(".gitignore", "*.rs\n");

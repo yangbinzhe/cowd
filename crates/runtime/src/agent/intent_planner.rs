@@ -60,14 +60,14 @@ fn intent_from_domain(domain: TaskDomain) -> TaskIntent {
 
 fn recommended_tools_for(intent: TaskIntent) -> Vec<String> {
     let tools = match intent {
-        TaskIntent::Review => vec!["workspace_snapshot", "grep_search", "read_many"],
-        TaskIntent::Bugfix => vec!["grep_search", "read_many", "tool_batch_readonly"],
-        TaskIntent::Frontend => vec!["workspace_snapshot", "glob_many", "read_many"],
-        TaskIntent::Backend => vec!["workspace_snapshot", "grep_search", "read_many"],
-        TaskIntent::Docs => vec!["glob_many", "read_many"],
-        TaskIntent::Release => vec!["workspace_snapshot", "tool_batch_readonly"],
+        TaskIntent::Review => vec!["workspace_snapshot", "grep_search", "tool_orchestrate"],
+        TaskIntent::Bugfix => vec!["grep_search", "tool_orchestrate", "tool_orchestrate"],
+        TaskIntent::Frontend => vec!["workspace_snapshot", "tool_orchestrate", "tool_orchestrate"],
+        TaskIntent::Backend => vec!["workspace_snapshot", "grep_search", "tool_orchestrate"],
+        TaskIntent::Docs => vec!["tool_orchestrate", "tool_orchestrate"],
+        TaskIntent::Release => vec!["workspace_snapshot", "tool_orchestrate"],
         TaskIntent::Test => vec!["workspace_snapshot", "grep_search"],
-        TaskIntent::Explore => vec!["workspace_snapshot", "grep_search", "read_many"],
+        TaskIntent::Explore => vec!["workspace_snapshot", "grep_search", "tool_orchestrate"],
     };
     tools.into_iter().map(str::to_string).collect()
 }

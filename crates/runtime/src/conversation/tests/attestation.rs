@@ -670,7 +670,7 @@
             },
             ModelToolCall {
                 id: "mistyped-read".to_string(),
-                name: "read_many".to_string(),
+                name: "tool_orchestrate".to_string(),
                 input: serde_json::json!({
                     "files": [
                         "crates/runtime/src/policy/mod.rs",

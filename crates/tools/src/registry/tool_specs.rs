@@ -88,17 +88,14 @@ pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
         // the arbitrary host-shell descriptor used by `bash`, and their
         // registered read-only/no-network effect must stay truthful at
         // execution time.
-        "execute_code" | "repl" => "builtin.sandboxed_command",
+        "execute_code" => "builtin.sandboxed_command",
         // Effect is the strictest effect among the orchestrated sub-calls; the
         // host computes the escalation and this resolver shapes the descriptor.
         "tool_orchestrate" => "builtin.orchestrate",
         "read_file"
-        | "read_many"
         | "glob_search"
-        | "glob_many"
         | "grep_search"
         | "workspace_snapshot"
-        | "tool_batch_readonly"
         | "tool_cache_stats"
         | "checkpoint_list"
         | "checkpoint_diff"
@@ -292,37 +289,6 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
-            name: "read_many",
-            family: ToolFamily::Read,
-            tier: ToolTier::Orchestration,
-            permission_key: "read",
-            description: "Read many workspace text files in ONE ordered batch. Items accept exactly the path/offset/limit/complete fields of read_file and run in parallel (bounded by max_concurrency, default the runtime ceiling) with per-item durationMs. Use it when you already know the paths. Boundary: each item is still a bounded window - a whole body only arrives with complete=true under the file-size ceiling, and the batch output is subject to the per-tool result budget, so prefer tool_orchestrate when the paths are not yet known or you must filter/aggregate between reads.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "files": {
-                        "type": "array",
-                        "maxItems": 200,
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "path": { "type": "string" },
-                                "offset": { "type": "integer", "minimum": 0 },
-                                "limit": { "type": "integer", "minimum": 1 },
-                                "complete": { "type": "boolean", "default": false }
-                            },
-                            "required": ["path"],
-                            "additionalProperties": false
-                        }
-                    },
-                    "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 42 }
-                },
-                "required": ["files"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
             name: "checkpoint",
             family: ToolFamily::Mutate,
             tier: ToolTier::Orchestration,
@@ -390,38 +356,6 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
-            name: "glob_many",
-            family: ToolFamily::Locate,
-            tier: ToolTier::Orchestration,
-            permission_key: "glob",
-            description: "Run several independent filename searches in ONE ordered batch, each continuing through its own continuationCursor. Boundary: each scan is bounded by depth, entries, duration and file size - inspect scanComplete/omissions and refine an omitted subtree as a new search; prefer tool_orchestrate when patterns must come from an earlier step.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "patterns": {
-                        "type": "array",
-                        "maxItems": 200,
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "pattern": { "type": "string" },
-                    "include_ignored": { "type": "boolean", "description": "Include hidden and project-ignored paths; workspace protection still applies." },
-                    "ignore_patterns": { "type": "array", "items": { "type": "string" }, "description": "Additional exclusion globs relative to the search root." },
-                                "path": { "type": "string" },
-                                "cursor": { "type": "string", "description": "Opaque query-bound cursor; prefer copying next_request unchanged." }
-                            },
-                            "required": ["pattern"],
-                            "additionalProperties": false
-                        }
-                    },
-                    "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 42 }
-                },
-                "required": ["patterns"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
             name: "grep_search",
             family: ToolFamily::Locate,
             tier: ToolTier::Direct,
@@ -483,40 +417,11 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
-            name: "tool_batch_readonly",
-            family: ToolFamily::Orchestrate,
-            tier: ToolTier::Direct,
-            permission_key: "read",
-            description: "Execute several approved read-only tool calls in ONE ordered batch, in parallel, with per-item status and durationMs. Boundary: read-only tools only - writes are refused - and it is the flat form of tool_orchestrate, so prefer tool_orchestrate when you need map/filter/compute between calls.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "calls": {
-                        "type": "array",
-                        "maxItems": 200,
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "name": { "type": "string" },
-                                "input": { "type": "object" }
-                            },
-                            "required": ["name", "input"],
-                            "additionalProperties": false
-                        }
-                    },
-                    "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 42 }
-                },
-                "required": ["calls"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
             name: "tool_orchestrate",
             family: ToolFamily::Orchestrate,
             tier: ToolTier::Direct,
             permission_key: "batch",
-            description: "Run a bounded PROGRAM of many tool calls in ONE provider round: one instruction reaches its result without a round trip per step. This is the shortest path whenever the work is more than a single step - locate, read, aggregate and report in one call instead of one call per round. Bounds: <=50 steps, <=400 sub-calls in total, map over <=200 items, repeat <=25 rounds. Sub-calls run in declaration order and share values through `$<step_id>` references inside input objects; write a literal $ as $$. Step shapes, exactly as the input schema accepts them: {op:call,id,tool,input} one sub-call. {op:batch,id,calls:[{tool,input,as?}]} parallel fan-out (the same engine as read_many). {op:map,id,over:$list,tool,input,field?} runs `tool` once per item of a prior list/collect result; `field` extracts that field from each sub-call's RESULT before it is collected (it does not pre-select from the input item). {op:filter,id,over:$list,field,contains?,equals?} keeps the items whose `field` contains or equals a value. {op:collect,id,over:$list,agg,field?,separator?} aggregates a list, where agg is count|first|last|join|sum (join takes `separator`, default a single space). {op:compute,id,language,code,input?} runs code in the kernel-hardened read-only network-off sandbox over the data the program already holds and returns only stdout/stderr - use it to count, aggregate or compare across many files instead of moving their bodies into context. {op:when,id,if:{ref:$id,present?,equals?,contains?,non_empty?},tool,input?} runs one sub-call only when the condition holds. {op:repeat,id,max,while:{ref:$id,...},tool,input?} re-runs one sub-call while the condition holds, at most max times. Vocabulary: any catalog tool may be dispatched - read_file/read_many/glob_search/glob_many/grep_search/workspace_snapshot to locate and read; execute_code/repl to reduce; write_file/edit_file/apply_patch_transaction to mutate, which needs write authorization; todo_write/checkpoint_*/skill_*/lsp/web_search/web_fetch/mcp to govern and integrate. Agentic/collaboration actions (team_create, agent_invite, task_publish, task_claim, task_submit, task_review, message_publish, artifact_commit, state_inspect, objective_*, ...) are NOT dispatchable here - they are their own provider tools and must be called directly. tool_orchestrate itself may never be nested. Boundaries: every sub-call is authorized independently against the session tool allow-list, so an unauthorized tool fails closed naming that tool - the program never grants extra permission, and a write-requiring program is refused in a read-only session. Output is one JSON object: the `return` expression's value plus a per-step trace (op, tool, status, durationMs, error). Use `return` to select only the digest you need, because the whole result is subject to the tool-result budget.",
+            description: "Run a bounded PROGRAM of many tool calls in ONE provider round: one instruction reaches its result without a round trip per step. This is the shortest path whenever the work is more than a single step - locate, read, aggregate and report in one call instead of one call per round. Bounds: <=50 steps, <=400 sub-calls in total, map over <=200 items, repeat <=25 rounds. Sub-calls run in declaration order and share values through `$<step_id>` references inside input objects; write a literal $ as $$. Step shapes, exactly as the input schema accepts them: {op:call,id,tool,input} one sub-call. {op:batch,id,calls:[{tool,input,as?}]} parallel fan-out (the same engine as read_many). {op:map,id,over:$list,tool,input,field?} runs `tool` once per item of a prior list/collect result; `field` extracts that field from each sub-call's RESULT before it is collected (it does not pre-select from the input item). {op:filter,id,over:$list,field,contains?,equals?} keeps the items whose `field` contains or equals a value. {op:collect,id,over:$list,agg,field?,separator?} aggregates a list, where agg is count|first|last|join|sum (join takes `separator`, default a single space). {op:compute,id,language,code,input?} runs code in the kernel-hardened read-only network-off sandbox over the data the program already holds and returns only stdout/stderr - use it to count, aggregate or compare across many files instead of moving their bodies into context. {op:when,id,if:{ref:$id,present?,equals?,contains?,non_empty?},tool,input?} runs one sub-call only when the condition holds. {op:repeat,id,max,while:{ref:$id,...},tool,input?} re-runs one sub-call while the condition holds, at most max times. Vocabulary: any catalog tool may be dispatched - read_file/glob_search/grep_search/workspace_snapshot to locate and read (batch a known file set with a `batch` step of read_file calls, or `map` over a list); execute_code to reduce; write_file/edit_file/apply_patch_transaction to mutate, which needs write authorization; todo_write/checkpoint_*/skill_*/lsp/web_search/web_fetch/mcp to govern and integrate. Agentic/collaboration actions (team_create, agent_invite, task_publish, task_claim, task_submit, task_review, message_publish, artifact_commit, state_inspect, objective_*, ...) are NOT dispatchable here - they are their own provider tools and must be called directly. tool_orchestrate itself may never be nested. Boundaries: every sub-call is authorized independently against the session tool allow-list, so an unauthorized tool fails closed naming that tool - the program never grants extra permission, and a write-requiring program is refused in a read-only session. Output is one JSON object: the `return` expression's value plus a per-step trace (op, tool, status, durationMs, error). Use `return` to select only the digest you need, because the whole result is subject to the tool-result budget.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -861,24 +766,6 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
-            name: "repl",
-            family: ToolFamily::Reduce,
-            tier: ToolTier::Orchestration,
-            permission_key: "code",
-            description: "Run one code block through the SAME kernel-hardened, read-only, network-off sandbox as execute_code, with a caller-supplied timeout and a REPL-shaped result (stdout, stderr, exit_code). It is not an interactive session and it is not full-access: the workspace is mounted read-only, the network is off, and nothing persists between calls. Boundary: it cannot write files or reach the network - route mutations through write_file/edit_file/apply_patch_transaction and network through web_fetch/mcp; prefer execute_code for pure reduction, or bash when you genuinely need an unsandboxed host command.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "code": { "type": "string" },
-                    "language": { "type": "string" },
-                    "timeout_ms": { "type": "integer", "minimum": 1 }
-                },
-                "required": ["code", "language"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
             name: "skill",
             family: ToolFamily::Govern,
             tier: ToolTier::Orchestration,
@@ -1021,6 +908,11 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "code": {
                         "type": "string",
                         "description": "Code to execute. Use console.log/print to output results. Only stdout enters context."
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional wall-clock timeout in milliseconds; defaults to the sandbox budget."
                     }
                 },
                 "required": ["language", "code"],
@@ -1487,7 +1379,7 @@ mod family_taxonomy_tests {
     #[test]
     fn every_tool_declares_a_family_tier_and_permission_key() {
         let specs = mvp_tool_specs();
-        assert_eq!(specs.len(), 33, "the catalog size is the contract");
+        assert_eq!(specs.len(), 29, "the catalog size is the contract");
         for spec in &specs {
             assert!(
                 !spec.permission_key.is_empty(),

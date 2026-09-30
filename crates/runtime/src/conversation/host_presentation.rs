@@ -3230,14 +3230,14 @@ pub(super) fn tool_call_coverage_keys(call: &ModelToolCall) -> Vec<String> {
         name.as_str(),
         "workspace_snapshot"
             | "glob_search"
-            | "glob_many"
+            | "tool_orchestrate"
             | "grep_search"
             | "grep_search"
             | "lsp"
             | "toolsearch"
             | "tool_search"
             | "runtime_capabilities"
-            | "tool_batch_readonly"
+            | "tool_orchestrate"
     );
     if is_discovery {
         let zones = if paths.is_empty() {
@@ -3404,7 +3404,7 @@ pub(super) fn graph_metadata_effect(
     // governed compiler.
     let normalized = tool_name.trim().replace('-', "_").to_ascii_lowercase();
     let effect_kind = match normalized.as_str() {
-        "read_file" | "read_many" | "grep_search" | "grep_search" | "glob_search" | "glob_many"
+        "read_file" | "tool_orchestrate" | "grep_search" | "grep_search" | "glob_search" | "tool_orchestrate"
         | "workspace_snapshot" => ToolEffectKind::Read,
         "edit" | "edit" | "edit" | "edit" => {
             ToolEffectKind::Write

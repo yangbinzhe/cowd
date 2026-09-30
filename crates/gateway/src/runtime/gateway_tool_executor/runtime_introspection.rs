@@ -103,11 +103,11 @@ impl GatewayToolExecutor {
     ) -> Result<String, ToolError> {
         let kind = input.resource_kind.trim().to_ascii_lowercase();
         let desired_tools = match kind.as_str() {
-            "image" => ["vision_analyze", "read_file", "read_many"].as_slice(),
+            "image" => ["vision_analyze", "read_file", "tool_orchestrate"].as_slice(),
             "audio" | "video" => ["bash", "execute_code", "read_file"].as_slice(),
-            "pdf" | "document" | "archive" => ["bash", "read_file", "read_many"].as_slice(),
-            "csv" => ["execute_code", "read_file", "read_many"].as_slice(),
-            "text" | "markdown" | "code" => ["read_file", "read_many", "grep_search"].as_slice(),
+            "pdf" | "document" | "archive" => ["bash", "read_file", "tool_orchestrate"].as_slice(),
+            "csv" => ["execute_code", "read_file", "tool_orchestrate"].as_slice(),
+            "text" | "markdown" | "code" => ["read_file", "tool_orchestrate", "grep_search"].as_slice(),
             _ => ["read_file", "bash", "execute_code"].as_slice(),
         };
         let available = self.available_tool_names();

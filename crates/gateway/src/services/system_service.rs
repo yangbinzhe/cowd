@@ -149,7 +149,7 @@ impl SystemService {
             "recommended_tools": plan.recommended_tools,
             "selected_tools": selected_tools,
             "reason": plan.reason,
-            "batch_ready": plan.recommended_tools.iter().any(|tool| tool == "tool_batch_readonly"),
+            "batch_ready": plan.recommended_tools.iter().any(|tool| tool == "tool_orchestrate"),
         })
     }
 
@@ -161,7 +161,7 @@ impl SystemService {
             "intent": plan.intent,
             "calls": plan.calls,
             "reason": plan.reason,
-            "batch_ready": plan.calls.iter().any(|call| call.name == "tool_batch_readonly"),
+            "batch_ready": plan.calls.iter().any(|call| call.name == "tool_orchestrate"),
         })
     }
 
@@ -436,7 +436,7 @@ fn managed_tool_tags(tool_name: &str) -> Vec<&'static str> {
     if normalized.starts_with("checkpoint_") {
         tags.push("checkpoint");
     }
-    if normalized == "tool_batch_readonly" {
+    if normalized == "tool_orchestrate" {
         tags.push("batch");
     }
     if normalized == "tool_cache_stats" {

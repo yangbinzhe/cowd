@@ -2919,10 +2919,10 @@ pub(crate) fn runtime_capability_context_item(
     let has_tool = |name: &str| tool_names.contains(&name);
     let batch_tools = [
         "workspace_snapshot",
-        "read_many",
+        "tool_orchestrate",
         "grep_search",
-        "glob_many",
-        "tool_batch_readonly",
+        "tool_orchestrate",
+        "tool_orchestrate",
     ]
     .into_iter()
     .filter(|name| has_tool(name))

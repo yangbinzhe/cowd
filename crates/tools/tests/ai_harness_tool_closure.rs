@@ -95,7 +95,7 @@ fn live_tool_write_descriptor_requires_runtime_authorization() {
 }
 
 #[test]
-fn live_tool_batch_readonly_accepts_read_tools_and_rejects_write_tools() {
+fn orchestrate_escalates_to_its_writes_while_a_read_program_stays_readonly() {
     let root = std::env::temp_dir().join(format!("cowd-tool-batch-{}", std::process::id()));
     fs::create_dir_all(&root).expect("temp root");
     let fixture = root.join("batch.txt");
@@ -103,37 +103,40 @@ fn live_tool_batch_readonly_accepts_read_tools_and_rejects_write_tools() {
 
     let host = test_host("batch-test", &root);
     let lease = host.pin_snapshot();
-    let read_batch = json!({
-        "calls": [
-            {
-                "name": "read_file",
-                "input": {"path": fixture, "offset": 0, "limit": 2000}
-            }
-        ],
-        "max_concurrency": 2
+
+    // A read-only program still reads, and its effect stays ReadOnly.
+    let read_program = json!({
+        "steps": [{"id": "r", "op": "call", "tool": "read_file", "input": {"path": fixture, "offset": 0, "limit": 2000}}]
     });
     let output = lease
         .execute(
-            &authorize(&lease, "tool_batch_readonly", &read_batch),
-            "tool_batch_readonly",
-            &read_batch,
+            &authorize(&lease, "tool_orchestrate", &read_program),
+            "tool_orchestrate",
+            &read_program,
         )
-        .expect("readonly batch should accept read_file");
+        .expect("a read-only program must read");
     assert!(output.contains("batch evidence"));
+    assert_eq!(
+        lease
+            .describe_effect("tool_orchestrate", &read_program)
+            .required_permission,
+        ToolPermissionMode::ReadOnly
+    );
 
-    let write_batch = json!({
-        "calls": [{"name": "edit", "input": {"path": root.join("bad.txt"), "content": "no"}}]
+    // A write sub-call escalates the WHOLE program, so a read lease refuses it
+    // before any effect runs - the orchestration never grants an extra
+    // permission to its sub-calls.
+    let write_program = json!({
+        "steps": [{"id": "w", "op": "call", "tool": "edit", "input": {"action": "write", "path": root.join("bad.txt"), "content": "no"}}]
     });
-    let error = lease
-        .execute(
-            &authorize(&lease, "tool_batch_readonly", &write_batch),
-            "tool_batch_readonly",
-            &write_batch,
-        )
-        .expect_err("readonly batch should reject write_file before execution");
-    assert!(error
-        .to_string()
-        .contains("only accepts approved read-only tools"));
+    assert_eq!(
+        lease
+            .describe_effect("tool_orchestrate", &write_program)
+            .required_permission,
+        ToolPermissionMode::WorkspaceWrite,
+        "a write sub-call must escalate the whole program"
+    );
+    assert!(!root.join("bad.txt").exists());
 }
 
 #[test]

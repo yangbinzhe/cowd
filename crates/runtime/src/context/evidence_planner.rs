@@ -172,7 +172,7 @@ fn readme_review_calls() -> Vec<FanoutToolCall> {
             json!({"include_git": true, "include_files": true, "max_files": 300}),
         ),
         call(
-            "tool_batch_readonly",
+            "tool_orchestrate",
             json!({
                 "calls": [
                     {"name": "read_file", "input": {"path": "README.md"}},
@@ -310,7 +310,7 @@ mod tests {
         assert!(plan
             .recommended_calls
             .iter()
-            .any(|call| call.name == "tool_batch_readonly"));
+            .any(|call| call.name == "tool_orchestrate"));
         assert!(plan
             .avoid_patterns
             .iter()
@@ -337,7 +337,7 @@ mod tests {
         assert!(plan
             .recommended_calls
             .iter()
-            .any(|call| call.name == "tool_batch_readonly"));
+            .any(|call| call.name == "tool_orchestrate"));
         assert!(plan
             .recommended_calls
             .iter()
@@ -356,7 +356,7 @@ mod tests {
         assert!(plan
             .recommended_calls
             .iter()
-            .any(|call| call.name == "tool_batch_readonly"));
+            .any(|call| call.name == "tool_orchestrate"));
         assert!(plan
             .recommended_calls
             .iter()
@@ -370,7 +370,7 @@ mod tests {
         let prompt = evidence_plan_prompt(&plan);
 
         assert!(prompt.contains("Runtime evidence plan"));
-        assert!(prompt.contains("tool_batch_readonly"));
+        assert!(prompt.contains("tool_orchestrate"));
         assert!(prompt.contains("Avoid"));
     }
 }

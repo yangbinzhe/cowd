@@ -33,9 +33,6 @@ pub(crate) fn execute_with_lease(
         "read_file" => {
             from_value::<ReadFileInput>(input).and_then(|parsed| run_read_file(lease, parsed))
         }
-        "read_many" => {
-            from_value::<ReadManyInput>(input).and_then(|parsed| run_read_many(lease, parsed))
-        }
         "edit" => {
             let action = input.get("action").and_then(serde_json::Value::as_str);
             let mut rest = input.clone();
@@ -72,9 +69,6 @@ pub(crate) fn execute_with_lease(
         },
         "glob_search" => from_value::<GlobSearchInputValue>(input)
             .and_then(|parsed| run_glob_search(lease, parsed)),
-        "glob_many" => {
-            from_value::<GlobManyInput>(input).and_then(|parsed| run_glob_many(lease, parsed))
-        }
         "grep_search" => {
             if input.get("searches").is_some() {
                 from_value::<GrepManyInput>(input).and_then(|parsed| run_grep_many(lease, parsed))
@@ -88,8 +82,6 @@ pub(crate) fn execute_with_lease(
         }
         "workspace_snapshot" => from_value::<WorkspaceSnapshotInput>(input)
             .and_then(|parsed| run_workspace_snapshot(lease, parsed)),
-        "tool_batch_readonly" => from_value::<ToolBatchReadonlyInput>(input)
-            .and_then(|parsed| run_tool_batch_readonly(lease, parsed)),
         "tool_cache_stats" => to_pretty_json(lease.cache().stats()),
         "tool_orchestrate" => run_orchestrate(lease, input),
         "web_fetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
@@ -151,7 +143,6 @@ pub(crate) fn execute_with_lease(
         "structured_output" => {
             from_value::<StructuredOutputInput>(input).and_then(run_structured_output)
         }
-        "repl" => from_value::<ReplInput>(input).and_then(|parsed| run_repl(lease, parsed)),
         "ask" => {
             if input.get("message").is_some() {
                 from_value::<BriefInput>(input).and_then(|parsed| run_brief(lease, parsed))
@@ -187,7 +178,8 @@ pub(crate) fn execute_with_lease(
                 .and_then(|v| v.as_str())
                 .unwrap_or("python");
             let code = input.get("code").and_then(|v| v.as_str()).unwrap_or("");
-            let result = execute_code_in_workspace(lang, code, None, lease.workspace_root());
+            let timeout_ms = input.get("timeout_ms").and_then(serde_json::Value::as_u64);
+            let result = execute_code_in_workspace(lang, code, timeout_ms, lease.workspace_root());
             Ok(serde_json::to_string_pretty(&serde_json::json!({
                 "stdout": result.stdout,
                 "stderr": result.stderr,

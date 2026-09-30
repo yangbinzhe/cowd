@@ -213,7 +213,7 @@ fn truncate_head_tail(
     // A bare "retrieve by evidence ref" is not: there is no model-facing tool
     // that resolves a `tool://` URI, so the model concludes the evidence is
     // unreachable and repeats the same call. Name the concrete call instead.
-    let recovery = if matches!(tool_name, "read_file" | "read_many") {
+    let recovery = if matches!(tool_name, "read_file" | "tool_orchestrate") {
         "re-read the needed window with read_file(path, offset=nextOffset, limit=...) instead of re-reading the same range"
     } else {
         "narrow the query (concrete path/pattern, smaller head_limit) or read the persisted output by range instead of repeating this call"

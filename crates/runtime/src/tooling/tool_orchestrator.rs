@@ -68,7 +68,7 @@ impl ToolSafetyCategory {
         match normalized.as_str() {
             "read_ref"
             | "read_file"
-            | "read_many"
+            | "tool_orchestrate"
             | "cat"
             | "head"
             | "tail"
@@ -78,13 +78,13 @@ impl ToolSafetyCategory {
             | "rg"
             | "glob"
             | "glob_search"
-            | "glob_many"
+            | "tool_orchestrate"
             | "find"
             | "ls"
             | "list_directory"
             | "file_search"
             | "workspace_snapshot"
-            | "tool_batch_readonly"
+            | "tool_orchestrate"
             | "tool_cache_stats"
             | "git_status"
             | "git_log"
@@ -120,7 +120,7 @@ impl ToolSafetyCategory {
 
             "web_search" | "web_fetch" | "http_request" => Self::Network,
 
-            "bash" | "powershell" | "repl" | "mcp" | "remote_trigger" | "agent"
+            "bash" | "powershell" | "execute_code" | "mcp" | "remote_trigger" | "agent"
             | "task_create" | "run_task_packet" | "task_stop" | "task_update" | "worker_create"
             | "worker_send_prompt" | "worker_restart" | "worker_terminate" | "team_create"
             | "team_delete" | "cron_create" | "cron_delete" | "config"

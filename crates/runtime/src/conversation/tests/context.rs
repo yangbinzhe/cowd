@@ -796,7 +796,7 @@
             ]
             .into_iter()
             .collect(),
-            deferred: ["read_many".to_string(), "team_create".to_string()]
+            deferred: ["tool_orchestrate".to_string(), "team_create".to_string()]
                 .into_iter()
                 .collect(),
             reason: "bootstrap tools exposed".to_string(),
@@ -806,10 +806,10 @@
 
         let projected = runtime.project_runtime_capabilities_for_model(
             &serde_json::json!({
-                "available_tool_names": ["tool_search", "runtime_capabilities", "read_many", "team_create"],
+                "available_tool_names": ["tool_search", "runtime_capabilities", "tool_orchestrate", "team_create"],
                 "team_create": {"available": true, "blocked_reasons": []},
                 "action_plane": {"can_execute_now": true},
-                "strategy": {"model_callable_tools": ["tool_search", "runtime_capabilities", "read_many", "team_create"]}
+                "strategy": {"model_callable_tools": ["tool_search", "runtime_capabilities", "tool_orchestrate", "team_create"]}
             })
             .to_string(),
         );
@@ -851,7 +851,7 @@
             ]
             .into_iter()
             .collect(),
-            deferred: ["read_many".to_string()].into_iter().collect(),
+            deferred: ["tool_orchestrate".to_string()].into_iter().collect(),
             reason: "bootstrap tools exposed".to_string(),
             revision: 2,
             fallback_full: false,

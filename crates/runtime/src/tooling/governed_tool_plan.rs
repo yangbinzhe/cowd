@@ -1130,7 +1130,7 @@ fn analyze_request(
     .to_string();
     let output_budget_class = if request
         .tool_name
-        .eq_ignore_ascii_case("tool_batch_readonly")
+        .eq_ignore_ascii_case("tool_orchestrate")
     {
         "batch"
     } else if effect.effect_kind == ToolEffectKind::Read {
@@ -2219,7 +2219,7 @@ mod tests {
     fn read_only_batch_tools_get_batch_budget_class() {
         let plan = GovernedToolPlan::from_requests(&[ToolRequest {
             tool_use_id: "batch-1".to_string(),
-            tool_name: "tool_batch_readonly".to_string(),
+            tool_name: "tool_orchestrate".to_string(),
             input: r#"{"calls":[]}"#.to_string(),
             depends_on: Vec::new(),
         }]);
