@@ -16,6 +16,54 @@ use harness_contract::tool::{
 };
 use serde_json::Value;
 
+
+/// Effect for an action-aware merged tool: a query action stays ReadOnly, any
+/// other action takes the family's elevated permission.
+fn action_effect(
+    input: &Value,
+    readonly_actions: &[&str],
+    elevated_permission: ToolPermissionMode,
+    elevated_kind: ToolEffectKind,
+) -> EffectProperties {
+    let action = input
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if readonly_actions.contains(&action) {
+        EffectProperties {
+            effect_kind: ToolEffectKind::Read,
+            idempotency: ToolIdempotency::Idempotent,
+            scopes: vec![scope(
+                PermissionResource::Tool,
+                PermissionOperation::Read,
+                resource_target(input),
+            )],
+            required_permission: ToolPermissionMode::ReadOnly,
+            approval_class: ToolApprovalClass::None,
+            uses_network: false,
+            spawns_process: false,
+            mutates_packages: false,
+            mutates_system: false,
+        }
+    } else {
+        EffectProperties {
+            effect_kind: elevated_kind,
+            idempotency: ToolIdempotency::IdempotentWithKey,
+            scopes: vec![scope(
+                PermissionResource::Tool,
+                PermissionOperation::Write,
+                resource_target(input),
+            )],
+            required_permission: elevated_permission,
+            approval_class: ToolApprovalClass::Policy,
+            uses_network: matches!(elevated_kind, ToolEffectKind::Network),
+            spawns_process: matches!(elevated_kind, ToolEffectKind::Process),
+            mutates_packages: false,
+            mutates_system: false,
+        }
+    }
+}
+
 /// Derive the effective effect from the concrete tool input.
 #[must_use]
 pub fn resolve_registered_tool_effect(
@@ -33,8 +81,16 @@ pub fn resolve_registered_tool_effect(
     } else {
         resolve_effect_properties(resolver, tool_id, input)
     };
-    properties.required_permission =
-        stricter_permission(properties.required_permission, catalog_permission);
+    // A resolver whose id starts with `runtime.action_` is authoritative: it
+    // derives the permission from the concrete `action` in the input, so it is
+    // NOT maxed with the catalog. The catalog still carries the STRICTEST action
+    // as its static floor, which is what the orchestration escalation path (which
+    // cannot see sub-call input) uses - so a merged family can be safe for a
+    // direct `action=status` while an orchestrated sub-call stays conservative.
+    if !resolver.resolver_id.starts_with("runtime.action_") {
+        properties.required_permission =
+            stricter_permission(properties.required_permission, catalog_permission);
+    }
 
     let descriptor_hash = descriptor_hash(tool_id, input, &properties);
     let assessment = effect_assessment(&properties, input);
@@ -364,6 +420,40 @@ fn resolve_effect_properties(
             mutates_packages: false,
             mutates_system: false,
         },
+        // Action-aware merged families: the permission follows the `action`
+        // field, so one tool can be safely ReadOnly for its query actions and
+        // elevated for its mutating ones. The catalog still declares the
+        // STRICTEST action, which is what the orchestration escalation path uses.
+        "runtime.action_skill" => action_effect(
+            input,
+            &["install_plan", "status"],
+            ToolPermissionMode::DangerFullAccess,
+            ToolEffectKind::Unknown,
+        ),
+        "runtime.action_checkpoint" => action_effect(
+            input,
+            &["list", "diff"],
+            ToolPermissionMode::WorkspaceWrite,
+            ToolEffectKind::Write,
+        ),
+        "runtime.action_mcp" => action_effect(
+            input,
+            &["list", "read", "call"],
+            ToolPermissionMode::DangerFullAccess,
+            ToolEffectKind::Network,
+        ),
+        "runtime.action_edit" => action_effect(
+            input,
+            &["preview"],
+            ToolPermissionMode::WorkspaceWrite,
+            ToolEffectKind::Write,
+        ),
+        "runtime.action_background" => action_effect(
+            input,
+            &["status"],
+            ToolPermissionMode::WorkspaceWrite,
+            ToolEffectKind::Process,
+        ),
         _ => conservative_unknown(tool_id_target(tool_id, input)),
     }
 }

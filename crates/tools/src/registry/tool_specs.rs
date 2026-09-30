@@ -80,6 +80,7 @@ pub struct ToolSpec {
 pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
     let resolver_id = match normalize_tool_name(name).as_str() {
         "bash" | "powershell" | "power_shell" => "builtin.command",
+        "background" => "runtime.action_background",
         // `execute_code` and `repl` always enter the kernel-hardened workspace
         // sandbox with a bounded timeout/output budget. They must not inherit
         // the arbitrary host-shell descriptor used by `bash`, and their
@@ -106,7 +107,6 @@ pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
         | "checkpoint_diff"
         | "ask"
         | "tool_search"
-        | "background_task_status"
         | "structured_output"
         | "current_time"
         | "get_context_remaining"
@@ -120,7 +120,6 @@ pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
         | "checkpoint_restore"
         | "notebook_edit"
         | "todo_write"
-        | "background_task_kill"
         | "config"
         | "plan_mode" => "builtin.workspace_write",
         "web_fetch" | "web_search" | "remote_trigger"
@@ -214,7 +213,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 the needed range via read_file instead of re-running the command. A truncated \
                 result is partial evidence; verify it before concluding. For long-running work, set \
                 run_in_background=true to detach and return a job id; query it with \
-                background_task_status and cancel it with background_task_kill. Do not run \
+                background(action=status) and cancel it with background(action=kill). Do not run \
                 interactive commands.",
             input_schema: json!({
                 "type": "object",
@@ -231,7 +230,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "run_in_background": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Run detached and return a job id instead of waiting; query it with background_task_status and cancel it with background_task_kill."
+                        "description": "Run detached and return a job id instead of waiting; query it with background(action=status) and cancel it with background(action=kill)."
                     },
                     "env": {
                         "type": "object",
@@ -269,34 +268,19 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
-            name: "background_task_status",
+            name: "background",
             family: ToolFamily::Session,
             tier: ToolTier::Orchestration,
             permission_key: "background",
-            description: "Inspect a background job started with run_in_background: command, running/finished state, exit code, elapsed time, byte counts, persistedOutputPath and a head+tail preview. tail=N returns only the last N bytes. Boundary: it reports a job's state and a preview, never its full output - re-read the persisted range with read_file, and it requires that the job was started by run_in_background in this session.",
+            description: "Manage this session's background jobs through ONE entry point. action=status (jobId, tail?): running/finished state, exit code, elapsed time, byte counts, persistedOutputPath and a head+tail preview, where tail=N returns only the last N bytes. action=kill (jobId): cancel the job by killing its process group; terminal for that job. Boundary: it only reaches jobs started with run_in_background in this session, status never returns the full output - re-read the persisted range with read_file - and kill is terminal, so check status first if you still need the output.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "action": { "type": "string", "enum": ["status", "kill"] },
                     "jobId": { "type": "string" },
                     "tail": { "type": "integer", "minimum": 1, "maximum": 65536 }
                 },
-                "required": ["jobId"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "background_task_kill",
-            family: ToolFamily::Session,
-            tier: ToolTier::Orchestration,
-            permission_key: "background",
-            description: "Cancel a background job by killing its process group; the terminal state is recorded and surfaced next turn. Boundary: it is terminal for that job - use background_task_status first if you still need its output, and it only reaches jobs started in this session.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "jobId": { "type": "string" }
-                },
-                "required": ["jobId"],
+                "required": ["action", "jobId"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::WorkspaceWrite,
@@ -1904,7 +1888,7 @@ mod family_taxonomy_tests {
     #[test]
     fn every_tool_declares_a_family_tier_and_permission_key() {
         let specs = mvp_tool_specs();
-        assert_eq!(specs.len(), 53, "the catalog size is the contract");
+        assert_eq!(specs.len(), 52, "the catalog size is the contract");
         for spec in &specs {
             assert!(
                 !spec.permission_key.is_empty(),
@@ -1963,7 +1947,6 @@ mod family_taxonomy_tests {
             ("Mutate", "checkpoint", "Orchestration", 2),
             ("Mutate", "edit", "Orchestration", 5),
             ("Reduce", "shell", "EscapeHatch", 2),
-            ("Session", "background", "Orchestration", 2),
             ("Session", "checkpoint", "Orchestration", 2),
         ];
         let mut slots: BTreeMap<(&str, &str, &str), usize> = BTreeMap::new();

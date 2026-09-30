@@ -12,8 +12,13 @@ pub(crate) fn execute_with_lease(
             let bash_input: BashCommandInput = from_value(input)?;
             run_bash(lease, bash_input)
         }
-        "background_task_status" => run_background_task_status(lease, input),
-        "background_task_kill" => run_background_task_kill(lease, input),
+        "background" => match input.get("action").and_then(|value| value.as_str()) {
+            Some("status") => run_background_task_status(lease, input),
+            Some("kill") => run_background_task_kill(lease, input),
+            other => Err(format!(
+                "background action must be `status` or `kill`, got {other:?}"
+            )),
+        },
         "read_file" => {
             from_value::<ReadFileInput>(input).and_then(|parsed| run_read_file(lease, parsed))
         }
