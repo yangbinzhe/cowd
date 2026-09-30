@@ -198,67 +198,15 @@ fn parse_agent_action(
     tool_name: &str,
     value: serde_json::Value,
 ) -> Result<harness_contract::agent_action::AgentAction, serde_json::Error> {
-    use harness_contract::agent_action as action;
-
-    Ok(match tool_name {
-        action::STATE_INSPECT_TOOL_ID => {
-            action::AgentAction::StateInspect(serde_json::from_value(value)?)
-        }
-        action::TEAM_CREATE_TOOL_ID => {
-            action::AgentAction::TeamCreate(serde_json::from_value(value)?)
-        }
-        action::AGENT_INVITE_TOOL_ID => {
-            action::AgentAction::AgentInvite(serde_json::from_value(value)?)
-        }
-        action::TASK_PUBLISH_TOOL_ID => {
-            action::AgentAction::TaskPublish(serde_json::from_value(value)?)
-        }
-        action::TASK_CLAIM_TOOL_ID => {
-            action::AgentAction::TaskClaim(serde_json::from_value(value)?)
-        }
-        action::TASK_RELEASE_TOOL_ID => {
-            action::AgentAction::TaskRelease(serde_json::from_value(value)?)
-        }
-        action::TASK_SUPERSEDE_TOOL_ID => {
-            action::AgentAction::TaskSupersede(serde_json::from_value(value)?)
-        }
-        action::TASK_WITHDRAW_TOOL_ID => {
-            action::AgentAction::TaskWithdraw(serde_json::from_value(value)?)
-        }
-        action::TASK_SUBMIT_TOOL_ID => {
-            action::AgentAction::TaskSubmit(serde_json::from_value(value)?)
-        }
-        action::TASK_REVIEW_TOOL_ID => {
-            action::AgentAction::TaskReview(serde_json::from_value(value)?)
-        }
-        action::MESSAGE_PUBLISH_TOOL_ID => {
-            action::AgentAction::MessagePublish(serde_json::from_value(value)?)
-        }
-        action::ARTIFACT_COMMIT_TOOL_ID => {
-            action::AgentAction::ArtifactCommit(serde_json::from_value(value)?)
-        }
-        action::OBJECTIVE_COMPLETE_REQUEST_TOOL_ID => {
-            action::AgentAction::ObjectiveCompleteRequest(serde_json::from_value(value)?)
-        }
-        action::OBJECTIVE_UPDATE_TOOL_ID => {
-            action::AgentAction::ObjectiveUpdate(serde_json::from_value(value)?)
-        }
-        action::OBJECTIVE_REVIEW_TOOL_ID => {
-            action::AgentAction::ObjectiveReview(serde_json::from_value(value)?)
-        }
-        action::MEMBERSHIP_UPDATE_TOOL_ID => {
-            action::AgentAction::MembershipUpdate(serde_json::from_value(value)?)
-        }
-        action::TEAM_UPDATE_TOOL_ID => {
-            action::AgentAction::TeamUpdate(serde_json::from_value(value)?)
-        }
-        _ => {
-            return Err(serde_json::Error::io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("unknown Agent action tool `{tool_name}`"),
-            )))
-        }
-    })
+    // The enum OWNS the name<->variant mapping through
+    // `#[serde(tag = "kind", content = "input", rename_all = "snake_case")]`, and
+    // `kind()` returns the same `*_TOOL_ID` constants a hand-written table would
+    // match on. Keeping a 17-arm table here would be a second source of truth
+    // that can silently drift from the enum, so reuse serde instead.
+    serde_json::from_value(serde_json::json!({
+        "kind": tool_name,
+        "input": value,
+    }))
 }
 
 fn serialize_agent_action_receipt(
