@@ -126,6 +126,8 @@ mod policy_engine;
 mod prompt;
 #[path = "conversation/prompt_assembly.rs"]
 mod prompt_assembly;
+#[path = "conversation/liveness.rs"]
+pub mod liveness;
 #[path = "recovery/recovery.rs"]
 pub mod recovery;
 #[path = "recovery/recovery_recipes.rs"]

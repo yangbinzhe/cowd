@@ -237,14 +237,35 @@ command -v curl >/dev/null || { echo 'curl is required.' >&2; exit 2; }
 command -v ss >/dev/null || { echo 'ss is required.' >&2; exit 2; }
 command -v jq >/dev/null || { echo 'jq is required.' >&2; exit 2; }
 if [[ -n "$(git -C "$ROOT" status --porcelain=v1 --untracked-files=all)" ]]; then
-  echo 'real-model evaluation requires a clean candidate worktree; run deterministic checks on the current changes, then evaluate the immutable candidate once.' >&2
-  exit 2
+  if [[ "${COWD_EVAL_EXPERIMENTAL:-0}" != "1" ]]; then
+    echo 'real-model evaluation requires a clean candidate worktree; run deterministic checks on the current changes, then evaluate the immutable candidate once.' >&2
+    echo 'set COWD_EVAL_EXPERIMENTAL=1 to measure the working tree as-is (evidence is then marked experimental and is never reused).' >&2
+    exit 2
+  fi
+  # Experiment mode. Faithfully fingerprint what ACTUALLY ran - HEAD plus the
+  # dirty working tree and untracked files - instead of refusing, so the
+  # evidence stays honest: it cannot be mistaken for a certification of the
+  # committed source, and two different dirty states cannot collide on one key.
+  CANDIDATE_STATE="experimental-dirty"
+  TMP_INDEX="$(mktemp -u)"
+  GIT_INDEX_FILE="$TMP_INDEX" git -C "$ROOT" read-tree HEAD >/dev/null 2>&1
+  GIT_INDEX_FILE="$TMP_INDEX" git -C "$ROOT" add -A >/dev/null 2>&1
+  STATE_TREE="$(GIT_INDEX_FILE="$TMP_INDEX" git -C "$ROOT" write-tree 2>/dev/null || true)"
+  rm -f "$TMP_INDEX"
+  CANDIDATE_SHA="$(git -C "$ROOT" rev-parse HEAD)"
+  if [[ -n "$STATE_TREE" ]]; then
+    CANDIDATE_SOURCE_SHA256="$STATE_TREE"
+  else
+    CANDIDATE_SOURCE_SHA256="$(git -C "$ROOT" status --porcelain=v1 --untracked-files=all | sha256sum | awk '{print $1}')"
+  fi
+else
+  CANDIDATE_STATE="clean"
+  CANDIDATE_SHA="$(git -C "$ROOT" rev-parse HEAD)"
+  CANDIDATE_SOURCE_SHA256="$(git -C "$ROOT" archive --format=tar "$CANDIDATE_SHA" | sha256sum | awk '{print $1}')"
 fi
-CANDIDATE_SHA="$(git -C "$ROOT" rev-parse HEAD)"
-CANDIDATE_SOURCE_SHA256="$(git -C "$ROOT" archive --format=tar "$CANDIDATE_SHA" | sha256sum | awk '{print $1}')"
 ROUTE_FINGERPRINT="$(printf '%s\n' "$MODEL" "$PROVIDER_ID" "$PROVIDER_BASE_URL" "$PROVIDER_PROTOCOL" | sha256sum | awk '{print $1}')"
 SCENARIO_FINGERPRINT="$(printf '%s\n' "$SCENARIO_ID" "$MAX_PROVIDER_TOKENS" "${COWD_EVAL_AUTONOMOUS_AGENT_SCALE:-}" | sha256sum | awk '{print $1}')"
-EVIDENCE_KEY="$(printf '%s\n' "deep-real-v4" "$CANDIDATE_SHA" "$CANDIDATE_SOURCE_SHA256" "$ROUTE_FINGERPRINT" "$SCENARIO_FINGERPRINT" | sha256sum | awk '{print $1}')"
+EVIDENCE_KEY="$(printf '%s\n' "deep-real-v4" "$CANDIDATE_STATE" "$CANDIDATE_SHA" "$CANDIDATE_SOURCE_SHA256" "$ROUTE_FINGERPRINT" "$SCENARIO_FINGERPRINT" | sha256sum | awk '{print $1}')"
 if [[ "${COWD_EVAL_FORCE_RERUN:-0}" != "1" && -d "$EVIDENCE_ROOT/runs" ]]; then
   prior_evidence="$({
     find "$EVIDENCE_ROOT/runs" -type f -name report.json -exec jq -r --arg key "$EVIDENCE_KEY" '
