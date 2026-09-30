@@ -1066,4 +1066,24 @@ mod tests {
         replace.reason_ref = Some("artifact://scope-change-rationale".to_string());
         assert_eq!(AgentAction::ObjectiveUpdate(replace).validate(), Ok(()));
     }
+
+    /// PLAN B-7: `AGENT_ACTION_TOOL_IDS` is the list the gateway advertises, and
+    /// the enum owns the real name<->variant mapping through its serde tag. A
+    /// drift between the two would advertise an action the gateway cannot parse
+    /// (which is exactly what the deleted 17-arm table used to hide). Every
+    /// advertised id must be a variant the enum can parse.
+    #[test]
+    fn every_advertised_agent_action_id_is_a_known_variant() {
+        for id in AGENT_ACTION_TOOL_IDS {
+            if let Err(error) = serde_json::from_value::<AgentAction>(
+                serde_json::json!({"kind": id, "input": {}}),
+            ) {
+                let message = error.to_string();
+                assert!(
+                    !message.contains("unknown variant"),
+                    "`{id}` is advertised in AGENT_ACTION_TOOL_IDS but is not an AgentAction variant: {message}"
+                );
+            }
+        }
+    }
 }
