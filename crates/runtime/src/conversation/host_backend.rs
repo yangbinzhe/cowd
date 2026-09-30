@@ -382,6 +382,61 @@ where
                     }
                 }
             };
+            // PLAN D2b: the generic terminal obligation.
+            //
+            // The bounded-Focus mechanism forces a terminal presentation only
+            // when a Focus declared its acceptance scopes; a long open-ended
+            // turn that keeps producing receipts has no such trigger, which is
+            // the "progress without committing" failure the Facet A run showed
+            // (367 observations, 27.9MB, no terminal). This evaluates the
+            // obligation against a CAUSAL clock - armed when the turn first had
+            // enough committed receipts, never at turn start - and, once the
+            // commit window has elapsed, asks the model once to commit.
+            //
+            // It NEVER forces text-only and NEVER ends the turn: `NonCommitting`
+            // is deliberately inert. PLAN D1: the runtime helps a turn finish,
+            // it does not kill one the model has not declared complete.
+            {
+                use crate::liveness::{TerminalVerdict, TurnProgress};
+                let progress = TurnProgress {
+                    committed_receipts: state.tool_receipts_observed,
+                    saw_terminal_marker: false,
+                    committed_terminal: state.committed_terminal_answer.is_some(),
+                };
+                if !state.terminal_tracker.is_armed()
+                    && !progress.committed_terminal
+                    && progress.satisfied(&state.terminal_tracker.obligation().satisfaction)
+                {
+                    state.terminal_tracker.arm();
+                    state.terminal_satisfaction_since = Some(std::time::Instant::now());
+                }
+                if let TerminalVerdict::RequestCommit { since_satisfied, .. } =
+                    state.terminal_tracker.evaluate(
+                        &progress,
+                        state.terminal_satisfaction_since.map(|since| since.elapsed()),
+                    )
+                {
+                    if state.terminal_tracker.request_commit() {
+                        let mut item = ContextItem::new(
+                            "runtime-terminal-obligation",
+                            ContextSourceKind::Task,
+                            ContextRole::Instruction,
+                            format!(
+                                "Runtime terminal obligation: {} tool receipt(s) are committed and \
+                                 the turn has been within the commit window for {}s. If the \
+                                 objective is satisfied, commit the final answer now from the \
+                                 receipts already held. If it is not, say what is still missing \
+                                 and continue - the runtime does not end the turn for you.",
+                                progress.committed_receipts,
+                                since_satisfied.as_secs()
+                            ),
+                        );
+                        item.authority = ContextAuthority::System;
+                        item.visibility = ContextVisibility::Private;
+                        state.pending_next_model_context.push(item);
+                    }
+                }
+            }
             let pending_next_model_context = model_context_for_step(
                 std::mem::take(&mut state.pending_next_model_context),
                 &state.persistent_collaboration_context,

@@ -680,6 +680,15 @@ impl TerminalTracker {
         self.armed
     }
 
+    /// The obligation this tracker was built with.
+    ///
+    /// The caller owns the satisfaction clock, so it needs the rule to decide
+    /// when the causal arming event has occurred.
+    #[must_use]
+    pub const fn obligation(&self) -> &TerminalObligation {
+        &self.obligation
+    }
+
     /// Consume one commit request.
     pub fn request_commit(&mut self) -> bool {
         if self.requests_issued >= self.obligation.commit_budget {
@@ -735,6 +744,17 @@ mod terminal_tests {
         assert_eq!(
             tracker.evaluate(&progress, Some(Duration::from_secs(86_400))),
             TerminalVerdict::NotSatisfied
+        );
+    }
+
+    #[test]
+    fn the_arming_rule_is_the_same_rule_evaluate_uses() {
+        // The caller arms the tracker from `obligation().satisfaction`, so the
+        // rule it reads must be the one `evaluate` enforces.
+        let tracker = TerminalTracker::new(obligation(3, 90, 1));
+        assert_eq!(
+            tracker.obligation().satisfaction,
+            SatisfactionRule::Receipts { required: 3 }
         );
     }
 

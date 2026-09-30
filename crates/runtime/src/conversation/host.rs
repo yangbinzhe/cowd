@@ -769,6 +769,10 @@ where
             pending_terminal_artifact: None,
             pending_controlled_recovery_claim_fingerprints: Vec::new(),
             pending_disposition_inputs: Vec::new(),
+            terminal_tracker: crate::liveness::TerminalTracker::new(
+                crate::liveness::TerminalObligation::default(),
+            ),
+            terminal_satisfaction_since: None,
         }));
 
         let provider_profile_fingerprint = {
@@ -3270,6 +3274,16 @@ struct TurnGraphState {
     /// after the graph/terminal transaction has become durable.
     pending_controlled_recovery_claim_fingerprints: Vec<String>,
     pending_disposition_inputs: Vec<crate::session_input::SessionInputRecord>,
+    /// PLAN D2b: the turn's generic terminal obligation. The bounded-Focus
+    /// mechanism forces a terminal presentation only when a Focus declared its
+    /// acceptance scopes; a long open-ended turn that keeps producing receipts
+    /// has no such trigger, which is the "progress without committing" failure
+    /// the Facet A run showed (367 observations, no terminal).
+    terminal_tracker: crate::liveness::TerminalTracker,
+    /// Causal arming time: when the turn first had enough committed receipts.
+    /// Deliberately not the turn start, so a long turn is never penalised for
+    /// taking a long time (PLAN I1).
+    terminal_satisfaction_since: Option<std::time::Instant>,
 }
 
 pub(super) struct RootModelUsageDelta {
