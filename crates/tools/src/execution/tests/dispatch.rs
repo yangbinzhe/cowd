@@ -244,9 +244,15 @@ fn runtime_tools_extend_registry_definitions_permissions_and_search() {
         .expect("allow-list should be populated");
     assert!(allowed.contains("mcp__demo__echo"));
 
+    // PLAN B-4: an externally discovered MCP tool is NOT part of the provider
+    // tool array - activating one used to rewrite that array and invalidate the
+    // prompt cache from the tools onward. It stays allow-listable and resolvable
+    // so `mcp(action=call)` still reaches it.
     let definitions = registry.definitions(Some(&allowed));
-    assert_eq!(definitions.len(), 1);
-    assert_eq!(definitions[0].name, "mcp__demo__echo");
+    assert!(
+        definitions.is_empty(),
+        "an MCP tool must not enter the provider tool array: {definitions:?}"
+    );
 
     let permissions = registry
         .permission_specs(Some(&allowed))
@@ -267,8 +273,12 @@ fn runtime_tools_extend_registry_definitions_permissions_and_search() {
     );
     let search = host.pin_snapshot().search("demo echo", 5);
     let output = serde_json::to_value(search).expect("search output should serialize");
-    assert_eq!(output["activation_candidates"][0], "mcp__demo__echo");
-    assert_eq!(output["descriptors"][0]["source"], "runtime");
+    assert!(
+        output["activation_candidates"]
+            .as_array()
+            .is_none_or(|candidates| candidates.iter().all(|candidate| candidate != "mcp__demo__echo")),
+        "an MCP tool must not be advertised as an activation candidate: {output}"
+    );
     assert_eq!(output["catalog_revision"], 1);
 }
 

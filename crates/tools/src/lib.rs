@@ -476,10 +476,18 @@ impl ToolCatalog {
             name: spec.name.to_string(),
             description: spec.description.to_string(),
         });
-        let runtime = self.runtime_tools.iter().map(|tool| SearchableToolSpec {
-            name: tool.name.clone(),
-            description: tool.description.clone().unwrap_or_default(),
-        });
+        let runtime = self
+            .runtime_tools
+            .iter()
+            // PLAN B-4: an MCP tool is not part of the provider array, so it must
+            // not be offered as an activation candidate either - "activating" it
+            // is exactly the tool-array rewrite that broke the prompt cache. It is
+            // reached through `mcp(action=call)`.
+            .filter(|tool| !tool.name.starts_with("mcp__"))
+            .map(|tool| SearchableToolSpec {
+                name: tool.name.clone(),
+                description: tool.description.clone().unwrap_or_default(),
+            });
         let plugin = self.plugin_tools.iter().map(|tool| SearchableToolSpec {
             name: tool.definition().name.clone(),
             description: tool.definition().description.clone().unwrap_or_default(),
