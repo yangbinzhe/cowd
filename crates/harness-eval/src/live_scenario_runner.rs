@@ -1512,10 +1512,22 @@ impl LiveScenarioRunner {
             }
             if timeout.should_abort_for_absolute_wait(elapsed) {
                 observer.mark_stalled();
-                return Err(format!(
-                    "timed out after {}ms waiting for a durable assistant message; explicit absolute scenario safety wait={}ms, phase={}, last_active_phase={}, progress_observations={}, message_cursor={}, timeline_cursor={}",
+                // PLAN D3: the evaluator's absolute window is an observation
+                // limit, not a verdict on the work. The old message read as
+                // "the turn produced nothing", which was wrong for both observed
+                // cases (arm C was still at calling_model over revisions 1..27;
+                // Facet A had 367 progress observations) and it made every such
+                // failure undiagnosable. Emit the classified report instead, and
+                // keep the raw diagnostics for the reader.
+                let report = crate::observation_limit::observation_limit_report(
                     elapsed.as_millis(),
-                    timeout.absolute_wait.map_or(0, |wait| wait.as_millis()),
+                    timeout.absolute_wait.map(|wait| wait.as_millis()),
+                    u128::from(observer.since_last_progress_ms(elapsed.as_millis() as u64)),
+                    observer.progress_observations() as usize,
+                );
+                return Err(format!(
+                    "observation limit reached (not a verdict on the work): {}; diagnostics: waiting_for=durable_assistant_message phase={} last_active_phase={} progress_observations={} message_cursor={} timeline_cursor={}",
+                    report,
                     observer.phase(),
                     observer.last_active_phase(),
                     observer.progress_observations(),

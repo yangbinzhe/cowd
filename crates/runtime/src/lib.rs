@@ -260,6 +260,8 @@ pub mod provider_transcript;
 pub mod provider_transport_policy;
 #[path = "provider/transport_pool.rs"]
 pub mod provider_transport_pool;
+#[path = "provider/prefix_attribution.rs"]
+pub mod provider_prefix_attribution;
 #[path = "infrastructure/quality_gate.rs"]
 pub mod quality_gate;
 #[path = "context/reality_decision.rs"]

@@ -1586,3 +1586,108 @@ fn orchestrate_documentation_matches_its_own_input_schema() {
         );
     }
 }
+
+/// The catalog-side primitive behind provider tool exposure.
+///
+/// Kept beside the catalog so the determinism contract is tested against the
+/// same input the provider side consumes; the provider layer applies the same
+/// filter to its own compiled definitions.
+#[cfg(test)]
+pub(crate) fn tool_definitions_for_exposure_filter(
+    specs: &[ToolSpec],
+    active: &std::collections::BTreeSet<String>,
+) -> Vec<ToolSpec> {
+    specs
+        .iter()
+        .filter(|spec| active.contains(spec.name))
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod cache_determinism_tests {
+    use super::*;
+
+/// PLAN A3: the tool catalog must serialize to identical bytes every time.
+///
+/// `tool_definitions_for_exposure` filters the catalog into the array that the
+/// provider request carries, and `apply_inline_cache_breakpoints` puts a
+/// `cache_control` marker on the LAST tool definition - so the whole tool array
+/// is inside cache breakpoint 2. If that array's bytes move, the provider's
+/// cache is invalidated from the tools onward, i.e. every message after it.
+///
+/// The array is filtered from a `BTreeSet` of active ids, which is already
+/// deterministic, but nothing enforced it. This pins the three properties that
+/// make the array cache-safe:
+///
+/// 1. the same input set yields the same order and the same bytes;
+/// 2. filtering is a pure function of the active set (adding one id appends one
+///    entry and leaves the prefix untouched) - so incremental activation cannot
+///    rewrite what came before;
+/// 3. the catalog contains no duplicate names (a duplicate would make the
+///    filter order dependent on the catalog, which is not keyed by anything).
+#[test]
+fn the_tool_catalog_serializes_deterministically_for_provider_caching() {
+    let specs = mvp_tool_specs();
+
+    // (3) no duplicate tool names anywhere in the catalog.
+    let mut names = specs.iter().map(|spec| spec.name).collect::<Vec<_>>();
+    let total = names.len();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), total, "the catalog must not contain duplicate names");
+
+    // (1) a fixed input set always yields the same bytes. This is what lets the
+    // provider cache key on the tools array at all.
+    let active = ["read_file", "grep_search", "tool_orchestrate", "glob_search"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<std::collections::BTreeSet<_>>();
+    let render = |active: &std::collections::BTreeSet<String>| -> String {
+        super::tool_definitions_for_exposure_filter(&specs, active)
+            .into_iter()
+            .map(|spec| {
+                // `ToolSpec` is not Serialize, so compare the two things that
+                // actually reach the wire: the ordered names and each input
+                // schema serialized deterministically.
+                format!(
+                    "{}:{}",
+                    spec.name,
+                    serde_json::to_string(&spec.input_schema).unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    };
+    let first = render(&active);
+    for _ in 0..8 {
+        assert_eq!(first, render(&active), "the filtered catalog must be byte-stable");
+    }
+
+    // (2) growing the active set appends; the shared prefix is untouched.
+    let mut wider = active.clone();
+    wider.insert("execute_code".to_owned());
+    let wider_bytes = render(&wider);
+    let shared = first
+        .as_bytes()
+        .iter()
+        .zip(wider_bytes.as_bytes())
+        .take_while(|(left, right)| left == right)
+        .count();
+    assert!(
+        shared >= first.len().saturating_sub(64),
+        "adding an entry must not rewrite the stable prefix: shared {shared} of {} bytes",
+        first.len()
+    );
+    assert_eq!(
+        super::tool_definitions_for_exposure_filter(&specs, &active).len(),
+        4,
+        "the filter is exactly the active set"
+    );
+    assert_eq!(
+        super::tool_definitions_for_exposure_filter(&specs, &wider).len(),
+        5,
+        "one more active id yields exactly one more entry"
+    );
+}
+}

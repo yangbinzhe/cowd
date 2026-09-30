@@ -33,6 +33,7 @@ mod measurement;
 mod paired_performance;
 mod provider_cache_calibration;
 mod provider_rounds;
+mod observation_limit;
 mod real_provider_runner;
 mod report;
 mod report_store;
