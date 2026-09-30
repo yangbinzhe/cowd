@@ -135,6 +135,15 @@ pub(crate) mod pg_test_support {
     use session::UnifiedSessionStore;
     use storage::{PostgresConnectionConfig, PostgresExecutor, StaticSecretRefResolver};
 
+    /// Warm connections opened eagerly by a PG-backed test binary.
+    ///
+    /// Deliberately small: several test binaries share one fixture server, so
+    /// the cost of an idle connection is multiplied by the number of binaries.
+    /// The pool still grows on demand up to `config.max_connections`, which is
+    /// what keeps a concurrent test from starving while an idle one costs
+    /// almost nothing.
+    const TEST_POOL_WARM_CONNECTIONS: u32 = 10;
+
     fn postgres_executor() -> PostgresExecutor {
         static EXECUTOR: OnceLock<Result<PostgresExecutor, String>> = OnceLock::new();
         EXECUTOR
@@ -151,10 +160,15 @@ pub(crate) mod pg_test_support {
                 // cases concurrently. A tiny shared pool turns unrelated
                 // tests into artificial admission failures and masks the
                 // business invariants they exercise.
+                //
+                // The ceiling stays high enough that one test binary can use
+                // real parallelism (64), but the pool must not open all 64 up
+                // front: nine PG-backed test binaries share one server, so
+                // eager creation of every slot is what exhausted the fixture.
+                // Warm a small floor and let the pool grow to the ceiling only
+                // when cases actually ask for connections.
                 config.max_connections = 64;
-                // Acquire connections on demand; eager creation of all 64
-                // slots can exhaust a shared development PostgreSQL server.
-                config.min_idle_connections = Some(0);
+                config.min_idle_connections = Some(TEST_POOL_WARM_CONNECTIONS);
                 PostgresExecutor::connect(config, &resolver).map_err(|error| error.to_string())
             })
             .clone()
