@@ -2628,6 +2628,7 @@ mod tests {
                     turn_id: "lifetime-turn".into(),
                     root_execution_id: None,
                     required_team_count: 1,
+                    exact_team_count: None,
                     objective_summary: "preserve worker truth".into(),
                     model_lease: "fast".into(),
                     permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),

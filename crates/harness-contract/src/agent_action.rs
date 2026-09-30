@@ -488,6 +488,17 @@ pub struct AgentActorBinding {
     /// inherited by delegated actors and never accepted in model tool JSON.
     #[serde(default)]
     pub required_team_count: u8,
+    /// The operator's NAMED Team count, present only when they actually named one.
+    ///
+    /// `required_team_count` is a FLOOR and is non-zero for two different
+    /// situations: the user named a number, and the runtime inferred a structural
+    /// minimum from independent workstreams. Only the first is a topology the
+    /// operator specified, so only the first may become a binding CEILING - the
+    /// inferred case explicitly leaves the model free to choose a larger topology
+    /// (see `strategy_decision`). Carrying the `Option` is what keeps the two
+    /// apart; a bare count cannot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_team_count: Option<u8>,
     /// Trusted immutable preview of the user Objective. It is persisted when
     /// the Program opens so recovery and completion never validate activity
     /// counts without the business goal that gave them meaning.
@@ -929,6 +940,7 @@ mod tests {
                 turn_id: "turn-1".to_string(),
                 root_execution_id: None,
                 required_team_count: 1,
+                exact_team_count: None,
                 objective_summary: "test objective".to_string(),
                 model_lease: "test".to_string(),
                 permission_ceiling: Some(crate::policy::PermissionMode::ReadOnly),

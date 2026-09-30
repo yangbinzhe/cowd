@@ -220,6 +220,7 @@ mod tests {
             turn_id: turn.into(),
             root_execution_id: Some(root.into()),
             required_team_count: 1,
+            exact_team_count: None,
             objective_summary: "Deliver the original full report".into(),
             model_lease: "current-model".into(),
             permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),

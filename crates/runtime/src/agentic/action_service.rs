@@ -249,6 +249,7 @@ impl AgentActionService {
                     &envelope.actor.objective_id,
                 );
                 projection.required_team_count = envelope.actor.required_team_count;
+                projection.exact_team_count = envelope.actor.exact_team_count;
                 projection
                     .objective_summary
                     .clone_from(&envelope.actor.objective_summary);
@@ -634,6 +635,7 @@ impl AgentActionService {
                         "turn_id": envelope.actor.turn_id,
                         "root_execution_id": envelope.actor.root_execution_id,
                         "required_team_count": envelope.actor.required_team_count,
+                        "exact_team_count": envelope.actor.exact_team_count,
                         "objective_summary": envelope.actor.objective_summary,
                         "model_lease": envelope.actor.model_lease,
                         "permission_ceiling": envelope.actor.permission_ceiling,
@@ -821,6 +823,11 @@ impl AgentActionService {
             .and_then(serde_json::Value::as_u64)
             .and_then(|value| u8::try_from(value).ok())
             .unwrap_or_default();
+        projection.exact_team_count = opened
+            .payload
+            .get("exact_team_count")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u8::try_from(value).ok());
         projection.objective_summary = opened
             .payload
             .get("objective_summary")

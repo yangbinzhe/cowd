@@ -292,6 +292,12 @@ fn root_agent_action_actor(
         .execution_decision
         .and_then(|decision| decision.collaboration_obligation.as_ref())
         .map_or(0, |obligation| obligation.required_team_count());
+    // The ceiling needs the operator's NAMED count, which is `None` when the
+    // runtime inferred a structural minimum and the model may still choose more.
+    let exact_team_count = binding
+        .execution_decision
+        .and_then(|decision| decision.collaboration_obligation.as_ref())
+        .and_then(|obligation| obligation.exact_team_count);
     let mut resource_scopes = binding.authorized_scopes.to_vec();
     if let Some(decision) = binding.execution_decision {
         resource_scopes.extend(
@@ -315,6 +321,7 @@ fn root_agent_action_actor(
             .execution_decision
             .and_then(|decision| decision.execution_graph_ref.clone()),
         required_team_count,
+        exact_team_count,
         objective_summary: binding
             .execution_decision
             .map(|decision| decision.user_intent_preview.clone())

@@ -2449,6 +2449,7 @@ impl RuntimeServices {
             turn_id: projection.turn_id,
             root_execution_id: projection.root_execution_id,
             required_team_count: projection.required_team_count,
+            exact_team_count: None,
             objective_summary: projection.objective_summary,
             model_lease: projection.model_lease,
             permission_ceiling: Some(projection.permission_ceiling),

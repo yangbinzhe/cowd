@@ -41,30 +41,27 @@ pub(super) fn validate_transition(
     match &envelope.action {
         AgentAction::StateInspect(_) => None,
         AgentAction::TeamCreate(_) => {
-            // PLAN B2: when the operator specified a Team topology, that number
-            // is binding. `supervision.rs` already enforces it as a FLOOR for
-            // completion; nothing enforced the ceiling, so a program frozen at
-            // "3 Teams" could still open a fourth.
-            //
-            // `required_team_count` is the right authority and needs no new
-            // field: it is non-zero exactly when the user gave an explicit Team
-            // constraint (`CollaborationExecutionObligation` is only built for
-            // those, and `for_explicit_request` refuses a zero), and the framework
-            // deliberately freezes that same number as the exact count (see
-            // `singular_explicit_team_freezes_one_exact_team`). An autonomous
-            // objective carries zero, so the model keeps every bit of agency it
-            // had.
-            if projection.required_team_count > 0
-                && projection.teams.len() >= usize::from(projection.required_team_count)
+            // PLAN B2 (corrected): only a Team count the OPERATOR NAMED is a
+            // binding ceiling. `required_team_count` is a floor and is non-zero
+            // for two different situations - the user named a number, and the
+            // runtime inferred a structural minimum from independent workstreams.
+            // Capping the inferred case at its own minimum would overrule the
+            // model's topology choice, which `strategy_decision` explicitly leaves
+            // open ("the model still chooses ... any Team count above the
+            // minimum"). `exact_team_count` is `Some` only for the named case.
+            if let Some(ceiling) = projection
+                .exact_team_count
+                .filter(|_| projection.required_team_count > 0)
             {
-                return Some((
-                    "team_ceiling_reached",
-                    format!(
-                        "the user specified {} Team(s) and {} already exist",
-                        projection.required_team_count,
-                        projection.teams.len()
-                    ),
-                ));
+                if projection.teams.len() >= usize::from(ceiling) {
+                    return Some((
+                        "team_ceiling_reached",
+                        format!(
+                            "the user specified {ceiling} Team(s) and {} already exist",
+                            projection.teams.len()
+                        ),
+                    ));
+                }
             }
             if matches!(
                 envelope.actor.kind,

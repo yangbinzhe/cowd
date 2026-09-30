@@ -41,6 +41,9 @@ pub struct AgenticProgramProjection {
     pub turn_id: String,
     pub root_execution_id: Option<String>,
     pub required_team_count: u8,
+    /// The operator's NAMED Team count, `None` when the runtime only inferred a
+    /// structural minimum. Only a named count is a binding ceiling.
+    pub exact_team_count: Option<u8>,
     pub objective_summary: String,
     pub model_lease: String,
     pub permission_ceiling: harness_contract::policy::PermissionMode,
@@ -95,6 +98,7 @@ impl AgenticProgramProjection {
             turn_id: String::new(),
             root_execution_id: None,
             required_team_count: 0,
+            exact_team_count: None,
             objective_summary: String::new(),
             model_lease: "default".to_string(),
             permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,

@@ -31,6 +31,7 @@ fn append_messages(store: &RuntimeEventStore, program: &str, count: u64) {
                     turn_id: "fixed-turn".into(),
                     root_execution_id: None,
                     required_team_count: 0,
+                    exact_team_count: None,
                     objective_summary: "fixed source workload".into(),
                     model_lease: "fixture-only".into(),
                     permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),

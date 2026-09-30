@@ -2172,6 +2172,7 @@ mod tests {
             turn_id: "refinement-turn".into(),
             root_execution_id: Some("refinement-root".into()),
             required_team_count: 0,
+            exact_team_count: None,
             objective_summary: original.objective.clone(),
             model_lease: "test".into(),
             permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),

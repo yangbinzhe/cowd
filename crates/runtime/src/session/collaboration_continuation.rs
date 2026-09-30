@@ -563,6 +563,7 @@ mod tests {
                     turn_id: turn.to_string(),
                     root_execution_id: Some(root.to_string()),
                     required_team_count: 1,
+                    exact_team_count: None,
                     objective_summary: format!("verified work for {program_id}"),
                     model_lease: "test".to_string(),
                     permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),

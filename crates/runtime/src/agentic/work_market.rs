@@ -582,6 +582,7 @@ mod tests {
                 turn_id: "turn".to_string(),
                 root_execution_id: Some("root".to_string()),
                 required_team_count: 1,
+                exact_team_count: None,
                 objective_summary: "long-running task".to_string(),
                 model_lease: "model".to_string(),
                 permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),

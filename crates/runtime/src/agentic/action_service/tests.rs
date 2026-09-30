@@ -21,6 +21,7 @@ fn root(action_id: &str, action: AgentAction) -> AgentActionEnvelope {
             turn_id: "turn-1".to_string(),
             root_execution_id: Some("root-execution-1".to_string()),
             required_team_count: 0,
+            exact_team_count: None,
             objective_summary: "test objective".to_string(),
             model_lease: "test".to_string(),
             permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
@@ -51,6 +52,7 @@ fn managed(
             turn_id: "turn-1".to_string(),
             root_execution_id: Some("root-execution-1".to_string()),
             required_team_count: 0,
+            exact_team_count: None,
             objective_summary: "test objective".to_string(),
             model_lease: "test".to_string(),
             permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
@@ -2959,4 +2961,102 @@ fn new_run_membership_authorizes_incremental_work_and_leave_revokes_it() {
         .tasks
         .values()
         .all(|task| task.claimant.is_none()));
+}
+
+/// PLAN B2 (corrected): the operator's NAMED Team count is binding - a floor AND
+/// a ceiling. `supervision.rs` already enforced the floor; nothing enforced the
+/// ceiling, so a program frozen at "the user asked for 3 Teams" could open a 4th.
+fn root_with_team_budget(
+    action_id: &str,
+    required: u8,
+    exact: Option<u8>,
+    action: AgentAction,
+) -> AgentActionEnvelope {
+    let mut envelope = root(action_id, action);
+    envelope.actor.required_team_count = required;
+    envelope.actor.exact_team_count = exact;
+    envelope
+}
+
+fn team_create(action_id: &str, required: u8, exact: Option<u8>) -> AgentActionEnvelope {
+    root_with_team_budget(
+        action_id,
+        required,
+        exact,
+        AgentAction::TeamCreate(TeamCreateInput {
+            name: "Evidence".to_string(),
+            mission: "collect independent evidence".to_string(),
+            objective: None,
+        }),
+    )
+}
+
+fn seed_teams(projection: &mut crate::agentic::program::AgenticProgramProjection, count: usize) {
+    for index in 0..count {
+        let team_id = format!("team-{index}");
+        projection.teams.insert(
+            team_id.clone(),
+            crate::agentic::program::AgenticTeamProjection {
+                team_id,
+                name: "t".to_string(),
+                mission: "m".to_string(),
+                objective: None,
+                topic_ref: "topic".to_string(),
+                created_by: "root-1".to_string(),
+                member_ids: Vec::new(),
+                task_ids: Vec::new(),
+                lifecycle: crate::agentic::program::AgenticTeamLifecycle::Active,
+            },
+        );
+    }
+}
+
+#[test]
+fn the_operator_team_count_is_a_ceiling_only_when_it_was_named() {
+    let mut projection =
+        crate::agentic::program::AgenticProgramProjection::empty("program-1", "objective-1");
+    projection.required_team_count = 3;
+    projection.exact_team_count = Some(3);
+    seed_teams(&mut projection, 2);
+
+    assert!(
+        validate_transition(&projection, &team_create("t3", 3, Some(3)), 0, None).is_none(),
+        "the third Team is still within the operator's count"
+    );
+    seed_teams(&mut projection, 3);
+    let rejection = validate_transition(&projection, &team_create("t4", 3, Some(3)), 0, None)
+        .expect("a fourth Team must be refused when the user asked for three");
+    assert_eq!(rejection.0, "team_ceiling_reached");
+    assert!(
+        rejection.1.contains('3'),
+        "the refusal must name the operator's count: {}",
+        rejection.1
+    );
+}
+
+/// The correction that matters: `required_team_count` is ALSO non-zero when the
+/// runtime infers a structural minimum from independent workstreams, and the
+/// model is explicitly left free to choose a larger topology. Only a NAMED count
+/// (`exact_team_count: Some`) may be a ceiling.
+#[test]
+fn an_inferred_team_minimum_is_a_floor_and_not_a_ceiling() {
+    let mut projection =
+        crate::agentic::program::AgenticProgramProjection::empty("program-1", "objective-1");
+    projection.required_team_count = 3; // a real floor ...
+    projection.exact_team_count = None; // ... but nobody named a number
+    seed_teams(&mut projection, 5);
+
+    assert!(
+        validate_transition(&projection, &team_create("t6", 3, None), 0, None).is_none(),
+        "an inferred minimum must not cap the model's topology choice"
+    );
+
+    // A truly autonomous objective has neither floor nor ceiling.
+    let mut autonomous =
+        crate::agentic::program::AgenticProgramProjection::empty("program-1", "objective-1");
+    seed_teams(&mut autonomous, 9);
+    assert!(
+        validate_transition(&autonomous, &team_create("t10", 0, None), 0, None).is_none(),
+        "an autonomous objective must never be capped"
+    );
 }

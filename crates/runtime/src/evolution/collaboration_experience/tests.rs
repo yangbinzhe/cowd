@@ -299,6 +299,7 @@ fn model_can_read_advice_without_mutating_program_or_gaining_permissions() {
         turn_id: "new-turn".into(),
         root_execution_id: None,
         required_team_count: 0,
+        exact_team_count: None,
         objective_summary: "Plan useful work".into(),
         model_lease: "test".into(),
         permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),

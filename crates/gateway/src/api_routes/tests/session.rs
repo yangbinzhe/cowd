@@ -466,6 +466,7 @@ async fn agentic_program_route_returns_only_the_typed_root_program() {
                 turn_id: turn_id.to_string(),
                 root_execution_id: Some("agentic-program-route-root".to_string()),
                 required_team_count: 1,
+                exact_team_count: None,
                 objective_summary: "typed route projection".to_string(),
                 model_lease: "test-model".to_string(),
                 permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),

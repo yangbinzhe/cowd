@@ -192,6 +192,7 @@ mod tests {
             turn_id: "turn".into(),
             root_execution_id: Some("graph".into()),
             required_team_count: 3,
+            exact_team_count: None,
             objective_summary: "objective".into(),
             model_lease: "default".into(),
             permission_ceiling: None,

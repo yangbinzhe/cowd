@@ -1451,6 +1451,7 @@ mod tests {
                 turn_id: "turn-agentic-projection".to_string(),
                 root_execution_id: Some(execution_id.to_string()),
                 required_team_count: 2,
+                exact_team_count: None,
                 objective_summary: "Produce an evidence-backed manufacturing report".to_string(),
                 model_lease: "projection-test".to_string(),
                 permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),

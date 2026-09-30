@@ -647,6 +647,7 @@ mod tests {
             turn_id: format!("turn:{program_id}"),
             root_execution_id: Some(root_execution_id.to_string()),
             required_team_count: 1,
+            exact_team_count: None,
             objective_summary: "wait for autonomous Agent work".to_string(),
             model_lease: "test".to_string(),
             permission_ceiling: Some(PermissionMode::ReadOnly),

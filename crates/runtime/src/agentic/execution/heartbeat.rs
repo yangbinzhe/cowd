@@ -22,6 +22,7 @@ pub(super) fn agentic_claim_actor(
         turn_id: projection.turn_id.clone(),
         root_execution_id: projection.root_execution_id.clone(),
         required_team_count: projection.required_team_count,
+        exact_team_count: None,
         objective_summary: projection.objective_summary.clone(),
         model_lease: projection.model_lease.clone(),
         permission_ceiling: Some(projection.permission_ceiling),

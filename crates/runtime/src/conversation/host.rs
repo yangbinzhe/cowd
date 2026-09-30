@@ -1005,6 +1005,7 @@ where
                 program_id: harness_contract::agent_action::program_id_for_objective(&objective_id), objective_id,
                 session_id: session_id.clone(), turn_id: turn_ref.clone(), root_execution_id: Some(graph.id.clone()),
                 required_team_count: source.required_team_count, objective_summary: source.objective_summary.clone(),
+                exact_team_count: None,
                 model_lease: runtime.lock().await.current_model().unwrap_or("default").to_string(),
                 permission_ceiling: Some(policy.permission_mode),
                 resource_scopes: root_delegation_resource_scopes(evaluation_control.as_ref(), Some(&policy)),

@@ -528,6 +528,7 @@ mod tests {
             turn_id: "turn-completion".into(),
             root_execution_id: Some("root-completion".into()),
             required_team_count: 0,
+            exact_team_count: None,
             objective_summary: "Preserve original acceptance".into(),
             model_lease: "test".into(),
             permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),

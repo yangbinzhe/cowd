@@ -206,6 +206,7 @@ fn root(action_id: &str, action: AgentAction) -> AgentActionEnvelope {
             // No user topology constraint in this fixture; the ceiling must
             // therefore not restrict the teams these tests build.
             required_team_count: 0,
+            exact_team_count: None,
             objective_summary: "dispatch objective".to_string(),
             model_lease: "test".to_string(),
             permission_ceiling: Some(PermissionMode::ReadOnly),
@@ -282,6 +283,7 @@ async fn root_actor_inherits_the_immutable_graph_delegation_scope() {
         turn_id: turn_id.to_string(),
         root_execution_id: Some(graph_id.to_string()),
         required_team_count: 0,
+        exact_team_count: None,
         objective_summary: "autonomous scoped work".to_string(),
         model_lease: "model:test".to_string(),
         permission_ceiling: Some(PermissionMode::DangerFullAccess),
