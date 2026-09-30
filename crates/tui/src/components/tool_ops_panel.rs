@@ -644,7 +644,7 @@ mod tests {
     fn tool_ops_panel_extracts_expected_hashes_from_preview_receipt() {
         let mut panel = ToolOpsPanel::new();
         panel.record_receipt(serde_json::json!({
-            "tool_name": "mutation_preview",
+            "tool_name": "edit",
             "status": "ok",
             "data": {
                 "files": [

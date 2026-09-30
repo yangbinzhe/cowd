@@ -472,7 +472,7 @@ mod tests {
     #[test]
     fn low_risk_effect_policy_rejects_unbounded_external_unknown_or_independently_gated_writes() {
         let effect = ToolEffectDescriptor {
-            tool_id: "write_file".into(),
+            tool_id: "edit".into(),
             descriptor_hash: "registered-file-effect".into(),
             effect_kind: ToolEffectKind::Write,
             idempotency: ToolIdempotency::Idempotent,

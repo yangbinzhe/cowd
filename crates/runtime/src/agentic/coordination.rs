@@ -86,7 +86,7 @@ pub(crate) mod tests {
             let tool_input: serde_json::Value =
                 serde_json::from_str(&request.input).unwrap_or(serde_json::Value::Null);
             match request.tool_name.as_str() {
-                "write_file" => {
+                "edit" => {
                     let path = tool_input
                         .get("path")
                         .and_then(serde_json::Value::as_str)
@@ -167,7 +167,7 @@ pub(crate) mod tests {
         ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
             use harness_contract::{policy::*, tool::*};
             let (effect_kind, operation, permission) = match name {
-                "write_file" => (
+                "edit" => (
                     ToolEffectKind::Write,
                     PermissionOperation::Write,
                     ToolPermissionMode::WorkspaceWrite,

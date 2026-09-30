@@ -36,18 +36,28 @@ pub(crate) fn execute_with_lease(
         "read_many" => {
             from_value::<ReadManyInput>(input).and_then(|parsed| run_read_many(lease, parsed))
         }
-        "write_file" => {
-            from_value::<WriteFileInput>(input).and_then(|parsed| run_write_file(lease, parsed))
+        "edit" => {
+            let action = input.get("action").and_then(serde_json::Value::as_str);
+            let mut rest = input.clone();
+            if let Some(object) = rest.as_object_mut() {
+                object.remove("action");
+            }
+            match action {
+                Some("write") => from_value::<WriteFileInput>(&rest)
+                    .and_then(|parsed| run_write_file(lease, parsed)),
+                Some("replace") => from_value::<EditFileInput>(&rest)
+                    .and_then(|parsed| run_edit_file(lease, parsed)),
+                Some("preview") => from_value::<MutationPreviewInput>(&rest)
+                    .and_then(|parsed| run_mutation_preview(lease, parsed)),
+                Some("patch") => from_value::<MutationApplyInput>(&rest)
+                    .and_then(|parsed| run_apply_patch_transaction(lease, parsed)),
+                Some("notebook") => from_value::<NotebookEditInput>(&rest)
+                    .and_then(|parsed| run_notebook_edit(lease, parsed)),
+                other => Err(format!(
+                    "edit action must be write|replace|preview|patch|notebook, got {other:?}"
+                )),
+            }
         }
-        "edit_file" => {
-            from_value::<EditFileInput>(input).and_then(|parsed| run_edit_file(lease, parsed))
-        }
-        "mutation_preview" | "edit_many_preview" | "patch_plan" => {
-            from_value::<MutationPreviewInput>(input)
-                .and_then(|parsed| run_mutation_preview(lease, parsed))
-        }
-        "apply_patch_transaction" => from_value::<MutationApplyInput>(input)
-            .and_then(|parsed| run_apply_patch_transaction(lease, parsed)),
         "checkpoint" => match input.get("action").and_then(|value| value.as_str()) {
             Some("create") => from_value::<CheckpointCreateInput>(input)
                 .and_then(|parsed| run_checkpoint_create(lease, parsed)),
@@ -125,8 +135,6 @@ pub(crate) fn execute_with_lease(
                  Plugin installation is an operator control-plane operation performed through the Gateway."
             ))
         }
-        "notebook_edit" => from_value::<NotebookEditInput>(input)
-            .and_then(|parsed| run_notebook_edit(lease, parsed)),
         "sleep" => from_value::<SleepInput>(input).and_then(run_sleep),
         "config" => from_value::<ConfigInput>(input).and_then(|parsed| run_config(lease, parsed)),
         "plan_mode" => match input.get("action").and_then(|value| value.as_str()) {

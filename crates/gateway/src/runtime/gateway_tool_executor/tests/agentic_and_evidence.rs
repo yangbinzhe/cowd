@@ -873,8 +873,8 @@
         let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
             &runtime::tool_dispatch::ToolRequest {
                 tool_use_id: "typed-edit-receipt".to_string(),
-                tool_name: "edit_file".to_string(),
-                input: r#"{"path":"edit.txt"}"#.to_string(),
+                tool_name: "edit".to_string(),
+                input: r#"{"action":"replace","path":"edit.txt"}"#.to_string(),
                 depends_on: Vec::new(),
             },
         );
@@ -929,8 +929,8 @@
         let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
             &runtime::tool_dispatch::ToolRequest {
                 tool_use_id: "typed-write-receipt".to_string(),
-                tool_name: "write_file".to_string(),
-                input: "{}".to_string(),
+                tool_name: "edit".to_string(),
+                input: "{\"action\":\"write\"}".to_string(),
                 depends_on: Vec::new(),
             },
         );
@@ -989,8 +989,8 @@
         let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
             &runtime::tool_dispatch::ToolRequest {
                 tool_use_id: "compact-write-receipt".to_string(),
-                tool_name: "write_file".to_string(),
-                input: "{}".to_string(),
+                tool_name: "edit".to_string(),
+                input: "{\"action\":\"write\"}".to_string(),
                 depends_on: Vec::new(),
             },
         );

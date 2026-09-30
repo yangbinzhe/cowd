@@ -86,11 +86,6 @@ impl ToolSafetyCategory {
             | "workspace_snapshot"
             | "tool_batch_readonly"
             | "tool_cache_stats"
-            | "mutation_preview"
-            | "edit_many_preview"
-            | "patch_plan"
-            | "checkpoint"
-            | "checkpoint"
             | "git_status"
             | "git_log"
             | "git_diff"
@@ -113,18 +108,14 @@ impl ToolSafetyCategory {
             "add" | "calculator" => Self::ReadOnly,
 
             "write"
-            | "write_file"
-            | "artifact_materialize"
             | "edit"
-            | "edit_file"
+            | "artifact_materialize"
             | "create_file"
             | "delete_file"
             | "memory_create"
             | "memory_delete"
             | "session_create"
             | "todo_write"
-            | "apply_patch_transaction"
-            | "checkpoint"
             | "checkpoint" => Self::WriteLocal,
 
             "web_search" | "web_fetch" | "http_request" => Self::Network,
@@ -132,7 +123,7 @@ impl ToolSafetyCategory {
             "bash" | "powershell" | "repl" | "mcp" | "remote_trigger" | "agent"
             | "task_create" | "run_task_packet" | "task_stop" | "task_update" | "worker_create"
             | "worker_send_prompt" | "worker_restart" | "worker_terminate" | "team_create"
-            | "team_delete" | "cron_create" | "cron_delete" | "config" | "notebook_edit"
+            | "team_delete" | "cron_create" | "cron_delete" | "config"
             | "structured_output" | "execute_code" | "rm" | "kill" | "sudo" | "truncate"
             | "drop" => Self::Destructive,
 
@@ -202,9 +193,7 @@ fn cache_policy_for_tool(
             ToolCachePolicy::ScopedRead
         }
         "tool_cache_stats" => ToolCachePolicy::GlobalRead,
-        "write_file" | "edit_file" | "apply_patch_transaction" => {
-            ToolCachePolicy::ScopeInvalidatingWrite
-        }
+        "edit" => ToolCachePolicy::ScopeInvalidatingWrite,
         "checkpoint" => ToolCachePolicy::GlobalInvalidatingWrite,
         _ if safety_category == ToolSafetyCategory::ReadOnly => ToolCachePolicy::Uncached,
         _ => ToolCachePolicy::Uncached,
@@ -232,7 +221,7 @@ fn normalize_tool_name_for_safety(name: &str) -> String {
         "readmcpresource" => "read_mcp_resource".to_string(),
         "mcpauth" => "mcp_auth".to_string(),
         "remotetrigger" => "remote_trigger".to_string(),
-        "notebookedit" => "notebook_edit".to_string(),
+        "notebookedit" => "edit".to_string(),
         "structuredoutput" => "structured_output".to_string(),
         "execute_code" => "execute_code".to_string(),
         "taskcreate" => "task_create".to_string(),
@@ -300,7 +289,7 @@ mod tests {
             ToolSafetyCategory::ReadOnly
         );
         assert_eq!(
-            ToolSafetyCategory::from_tool_name("write_file"),
+            ToolSafetyCategory::from_tool_name("edit"),
             ToolSafetyCategory::WriteLocal
         );
         assert_eq!(
@@ -344,7 +333,7 @@ mod tests {
         assert_eq!(read.cache_policy, ToolCachePolicy::ScopedRead);
         assert!(read.prepared_readonly_supported);
 
-        let write = tool_execution_profile("write_file");
+        let write = tool_execution_profile("edit");
         assert_eq!(write.safety_category, ToolSafetyCategory::WriteLocal);
         assert_eq!(write.cache_policy, ToolCachePolicy::ScopeInvalidatingWrite);
     }

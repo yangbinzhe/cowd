@@ -98,7 +98,7 @@ mod tests {
 
     fn descriptor(permission: ToolPermissionMode) -> ToolEffectDescriptor {
         ToolEffectDescriptor {
-            tool_id: "write_file".to_string(),
+            tool_id: "edit".to_string(),
             descriptor_hash: "hash".to_string(),
             effect_kind: ToolEffectKind::Write,
             idempotency: ToolIdempotency::IdempotentWithKey,

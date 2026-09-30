@@ -993,7 +993,7 @@ fn parses_allowed_tools_flags_with_canonical_names_and_lists() {
     let args = vec![
         "--allowedTools".to_string(),
         "read_file,glob_search".to_string(),
-        "--allowed-tools=write_file".to_string(),
+        "--allowed-tools=edit".to_string(),
     ];
     assert_eq!(
         parse_args(&args).expect("args should parse"),
@@ -1001,7 +1001,7 @@ fn parses_allowed_tools_flags_with_canonical_names_and_lists() {
             model: DEFAULT_MODEL_ALIAS.to_string(),
             session_id: None,
             allowed_tools: Some(
-                ["glob_search", "read_file", "write_file"]
+                ["glob_search", "read_file", "edit"]
                     .into_iter()
                     .map(str::to_string)
                     .collect()

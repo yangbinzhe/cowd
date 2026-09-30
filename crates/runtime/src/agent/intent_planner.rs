@@ -107,9 +107,9 @@ pub fn infer_tool_dependencies(requests: &mut [ToolRequest]) -> usize {
         };
         for previous in (0..current).rev() {
             if path_related(tool_path(&requests[previous]).as_deref(), &current_path)
-                || requests[previous].tool_name == "mutation_preview"
-                || requests[previous].tool_name == "patch_plan"
-                || requests[previous].tool_name == "edit_many_preview"
+                || requests[previous].tool_name == "edit"
+                || requests[previous].tool_name == "edit"
+                || requests[previous].tool_name == "edit"
             {
                 requests[current]
                     .depends_on
@@ -130,7 +130,7 @@ fn mutation_kind(tool_name: &str) -> MutationKind {
     MutationKind {
         needs_dependency: matches!(
             tool_name,
-            "write_file" | "edit_file" | "apply_patch_transaction" | "checkpoint"
+            "edit" | "edit" | "edit" | "checkpoint"
         ),
     }
 }
@@ -209,7 +209,7 @@ mod tests {
             request("read-1", "read_file", r#"{"path":"src/lib.rs"}"#),
             request(
                 "write-1",
-                "write_file",
+                "edit",
                 r#"{"path":"src/lib.rs","content":"x"}"#,
             ),
         ];
@@ -223,12 +223,12 @@ mod tests {
         let mut requests = vec![
             request(
                 "plan-1",
-                "patch_plan",
+                "edit",
                 r#"{"edits":[{"path":"src/lib.rs","old_string":"a","new_string":"b"}]}"#,
             ),
             request(
                 "apply-1",
-                "apply_patch_transaction",
+                "edit",
                 r#"{"edits":[{"path":"src/lib.rs","old_string":"a","new_string":"b"}]}"#,
             ),
         ];

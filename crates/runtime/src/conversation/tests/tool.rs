@@ -82,7 +82,7 @@
 
         let write_call = ModelToolCall {
             id: "write".to_string(),
-            name: "write_file".to_string(),
+            name: "edit".to_string(),
             input: r#"{"path":"README.md","content":"changed"}"#.to_string(),
             depends_on: Vec::new(),
         };
@@ -401,7 +401,7 @@
         let receipts = vec![serde_json::json!({
             "sequence": 7,
             "tool_call_id": "write-html",
-            "tool": "write_file",
+            "tool": "edit",
             "evidence_ref": "tool://write-html-receipt",
             "paths": ["group-theory-ai-autonomous-evaluation.html"],
         })];
@@ -429,7 +429,7 @@
         );
         assert_eq!(
             receipt_closed["digest_receipt"]["receipts"][0]["tool"],
-            "write_file"
+            "edit"
         );
         assert_eq!(
             receipt_closed["unresolved"][0]["no_empty_state_inferred"],
@@ -478,7 +478,7 @@
                 ),
                 ConversationMessage::tool_result(
                     "write",
-                    "write_file",
+                    "edit",
                     "Tool `write_file` completed. Evidence: tool://write-ref. changed",
                     false,
                 ),
@@ -520,7 +520,7 @@
             &["fixtures/target.txt".into()],
             &[ConversationMessage::tool_result(
                 "write",
-                "write_file",
+                "edit",
                 "Tool `write_file` completed. Evidence: tool://write-ref. changed",
                 false,
             )],
@@ -1601,7 +1601,7 @@
                     }),
                     Ok(AssistantEvent::ToolUse {
                         id: "write-1".to_string(),
-                        name: "write_file".to_string(),
+                        name: "edit".to_string(),
                         input: r#"{"path":"src/lib.rs","content":"updated"}"#.to_string(),
                     }),
                     Ok(AssistantEvent::MessageStop),
@@ -1629,8 +1629,8 @@
                 );
                 assert!(
                     committed_results.iter().any(
-                        |(tool, output)| *tool == "write_file"
-                            && output.contains("write_file complete")
+                        |(tool, output)| *tool == "edit"
+                            && output.contains("edit complete")
                     ),
                     "the dependent model request must observe the committed write receipt: {committed_results:?}"
                 );
@@ -1697,8 +1697,8 @@
                             "health": "healthy"
                         },
                         {
-                            "canonical_id": "write_file",
-                            "display_name": "write_file",
+                            "canonical_id": "edit",
+                            "display_name": "edit",
                             "source": "test",
                             "schema_hash": "write-v1",
                             "required_permission": "workspace-write",
@@ -1706,7 +1706,7 @@
                             "health": "healthy"
                         }
                     ],
-                    "activation_candidates": ["read_file", "write_file"]
+                    "activation_candidates": ["read_file", "edit"]
                 })
                 .to_string()
             } else {
@@ -1723,7 +1723,7 @@
             vec![
                 "tool_search".to_string(),
                 "read_file".to_string(),
-                "write_file".to_string(),
+                "edit".to_string(),
             ]
         }
 
@@ -1758,7 +1758,7 @@
                     mutates_system: false,
                     assessment: harness_contract::policy::EffectAssessment::default(),
                 }),
-                "write_file" => Some(ToolEffectDescriptor {
+                "edit" => Some(ToolEffectDescriptor {
                     tool_id: name.to_string(),
                     descriptor_hash: "test-write-file-v1".to_string(),
                     effect_kind: ToolEffectKind::Write,
@@ -1796,7 +1796,7 @@
             name: &str,
             _input: &str,
         ) -> Option<crate::tool_orchestrator::ToolSafetyCategory> {
-            Some(if name == "write_file" {
+            Some(if name == "edit" {
                 crate::tool_orchestrator::ToolSafetyCategory::WriteLocal
             } else {
                 crate::tool_orchestrator::ToolSafetyCategory::ReadOnly
@@ -2701,10 +2701,10 @@
                 .unwrap();
         let required = vec!["write:reports/index.html".to_string()];
         let wrong = vec![resolver
-            .observe_tool_scope("write_file", "write:reports/report.html", Some("wrong"), 1)
+            .observe_tool_scope("edit", "write:reports/report.html", Some("wrong"), 1)
             .unwrap()];
         let exact = vec![resolver
-            .observe_tool_scope("write_file", "write:reports/index.html", Some("exact"), 1)
+            .observe_tool_scope("edit", "write:reports/index.html", Some("exact"), 1)
             .unwrap()];
         let objective = format!(
             "形成中文 HTML 报告并保存为 {}",

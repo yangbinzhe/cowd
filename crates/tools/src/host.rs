@@ -1127,13 +1127,13 @@ mod tests {
         let host = test_host("workspace", "/tmp/workspace");
         let lease = host.pin_snapshot();
         let descriptor = lease.describe_effect(
-            "write_file",
+            "edit",
             &json!({"path": "/tmp/tool-host-test", "content": "x"}),
         );
         let error = lease
             .execute(
                 &authorization(&descriptor, None),
-                "write_file",
+                "edit",
                 &json!({"path": "/tmp/tool-host-test", "content": "x"}),
             )
             .expect_err("write without idempotency key must fail");
@@ -1199,18 +1199,18 @@ mod tests {
             1,
             "authorization is checked before cache lookup"
         );
-        let write = json!({"path":"source.txt","content":"omega"});
+        let write = json!({"action":"write","path":"source.txt","content":"omega"});
         let write_auth = authorization(
-            &lease.describe_effect("write_file", &write),
+            &lease.describe_effect("edit", &write),
             Some("write-cache-test"),
         );
-        lease.execute(&write_auth, "write_file", &write).unwrap();
+        lease.execute(&write_auth, "edit", &write).unwrap();
         assert_eq!(host.cache_stats().invalidations, 1);
         assert!(lease
             .execute(&auth, "read_file", &input)
             .unwrap()
             .contains("omega"));
-        lease.execute(&write_auth, "write_file", &write).unwrap();
+        lease.execute(&write_auth, "edit", &write).unwrap();
         assert_eq!(
             host.cache_stats().invalidations,
             2,
@@ -1293,7 +1293,7 @@ mod tests {
         let writes = lease.describe_effect(
             "tool_orchestrate",
             &serde_json::json!({
-                "steps": [{"id": "w", "op": "call", "tool": "write_file", "input": {"path": "x", "content": "y"}}]
+                "steps": [{"id": "w", "op": "call", "tool": "edit", "input": {"path": "x", "content": "y"}}]
             }),
         );
         assert_eq!(writes.effect_kind, ToolEffectKind::Write);

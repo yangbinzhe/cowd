@@ -121,8 +121,8 @@ async fn tool_execute_rejects_write_tools_and_path_escape() {
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::json!({
-                        "name": "write_file",
-                        "input": { "path": "owned.txt", "content": "no" }
+                        "name": "edit",
+                        "input": { "action": "write", "path": "owned.txt", "content": "no" }
                     })
                     .to_string(),
                 ))
@@ -189,7 +189,7 @@ async fn tool_mutation_api_previews_and_applies_transaction() {
     assert_eq!(preview.status(), StatusCode::OK);
     let body = to_bytes(preview.into_body(), usize::MAX).await.unwrap();
     let preview_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(preview_json["data"]["type"], "mutation_preview");
+    assert_eq!(preview_json["data"]["type"], "edit");
     let expected_hash = preview_json["data"]["files"][0]["expectedHash"]
         .as_str()
         .unwrap();
@@ -321,7 +321,7 @@ async fn tool_batch_readonly_api_rejects_write_tools() {
                 .body(Body::from(
                     serde_json::json!({
                         "calls": [{
-                            "name": "write_file",
+                            "name": "edit",
                             "input": { "path": "a.txt", "content": "no" }
                         }]
                     })

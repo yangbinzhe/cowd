@@ -165,7 +165,7 @@ fn exposes_mvp_tools() {
     assert!(names.contains(&"web_search"));
     assert!(names.contains(&"todo_write"));
     assert!(names.contains(&"tool_search"));
-    assert!(names.contains(&"notebook_edit"));
+    assert!(names.contains(&"edit"));
     assert!(names.contains(&"sleep"));
     assert!(names.contains(&"ask"));
     assert!(names.contains(&"config"));
@@ -729,8 +729,8 @@ fn notebook_edit_replaces_inserts_and_deletes_cells() {
 
     let replaced = execute_in_workspace(
         root,
-        "notebook_edit",
-        &json!({
+        "edit",
+        &json!({ "action": "notebook",
             "notebook_path": path.display().to_string(),
             "cell_id": "cell-a",
             "new_source": "print(2)\n",
@@ -744,8 +744,8 @@ fn notebook_edit_replaces_inserts_and_deletes_cells() {
 
     let inserted = execute_in_workspace(
         root,
-        "notebook_edit",
-        &json!({
+        "edit",
+        &json!({ "action": "notebook",
             "notebook_path": path.display().to_string(),
             "cell_id": "cell-a",
             "new_source": "# heading\n",
@@ -758,8 +758,8 @@ fn notebook_edit_replaces_inserts_and_deletes_cells() {
     assert_eq!(inserted_output["cell_type"], "markdown");
     let appended = execute_in_workspace(
         root,
-        "notebook_edit",
-        &json!({
+        "edit",
+        &json!({ "action": "notebook",
             "notebook_path": path.display().to_string(),
             "new_source": "print(3)\n",
             "edit_mode": "insert"
@@ -771,8 +771,8 @@ fn notebook_edit_replaces_inserts_and_deletes_cells() {
 
     let deleted = execute_in_workspace(
         root,
-        "notebook_edit",
-        &json!({
+        "edit",
+        &json!({ "action": "notebook",
             "notebook_path": path.display().to_string(),
             "cell_id": "cell-a",
             "edit_mode": "delete"
@@ -802,8 +802,8 @@ fn notebook_edit_rejects_invalid_inputs() {
     fs::write(&text_path, "not a notebook").expect("write text file");
     let wrong_extension = execute_in_workspace(
         root,
-        "notebook_edit",
-        &json!({
+        "edit",
+        &json!({ "action": "notebook",
             "notebook_path": text_path.display().to_string(),
             "new_source": "print(1)\n"
         }),
@@ -821,8 +821,8 @@ fn notebook_edit_rejects_invalid_inputs() {
 
     let missing_source = execute_in_workspace(
         root,
-        "notebook_edit",
-        &json!({
+        "edit",
+        &json!({ "action": "notebook",
             "notebook_path": empty_notebook.display().to_string(),
             "edit_mode": "insert"
         }),
@@ -832,8 +832,8 @@ fn notebook_edit_rejects_invalid_inputs() {
 
     let missing_cell = execute_in_workspace(
         root,
-        "notebook_edit",
-        &json!({
+        "edit",
+        &json!({ "action": "notebook",
             "notebook_path": empty_notebook.display().to_string(),
             "edit_mode": "delete"
         }),
@@ -1077,8 +1077,8 @@ fn file_tools_cover_read_write_and_edit_behaviors() {
     std::env::set_current_dir(&root).expect("set cwd");
 
     let write_create = execute_tool(
-        "write_file",
-        &json!({ "path": "nested/demo.txt", "content": "alpha\nbeta\nalpha\n" }),
+        "edit",
+        &json!({ "action": "write", "path": "nested/demo.txt", "content": "alpha\nbeta\nalpha\n" }),
     )
     .expect("write create should succeed");
     let write_create_output: serde_json::Value = serde_json::from_str(&write_create).expect("json");
@@ -1086,8 +1086,8 @@ fn file_tools_cover_read_write_and_edit_behaviors() {
     assert!(root.join("nested/demo.txt").exists());
 
     let write_update = execute_tool(
-        "write_file",
-        &json!({ "path": "nested/demo.txt", "content": "alpha\nbeta\ngamma\n" }),
+        "edit",
+        &json!({ "action": "write", "path": "nested/demo.txt", "content": "alpha\nbeta\ngamma\n" }),
     )
     .expect("write update should succeed");
     let write_update_output: serde_json::Value = serde_json::from_str(&write_update).expect("json");
@@ -1130,8 +1130,8 @@ fn file_tools_cover_read_write_and_edit_behaviors() {
     assert!(!read_error.is_empty());
 
     let edit_once = execute_tool(
-        "edit_file",
-        &json!({ "path": "nested/demo.txt", "old_string": "alpha", "new_string": "omega" }),
+        "edit",
+        &json!({ "action": "replace", "path": "nested/demo.txt", "old_string": "alpha", "new_string": "omega" }),
     )
     .expect("single edit should succeed");
     let edit_once_output: serde_json::Value = serde_json::from_str(&edit_once).expect("json");
@@ -1142,13 +1142,13 @@ fn file_tools_cover_read_write_and_edit_behaviors() {
     );
 
     execute_tool(
-        "write_file",
-        &json!({ "path": "nested/demo.txt", "content": "alpha\nbeta\nalpha\n" }),
+        "edit",
+        &json!({ "action": "write", "path": "nested/demo.txt", "content": "alpha\nbeta\nalpha\n" }),
     )
     .expect("reset file");
     let edit_all = execute_tool(
-        "edit_file",
-        &json!({
+        "edit",
+        &json!({ "action": "replace",
             "path": "nested/demo.txt",
             "old_string": "alpha",
             "new_string": "omega",
@@ -1164,15 +1164,15 @@ fn file_tools_cover_read_write_and_edit_behaviors() {
     );
 
     let edit_same = execute_tool(
-        "edit_file",
-        &json!({ "path": "nested/demo.txt", "old_string": "omega", "new_string": "omega" }),
+        "edit",
+        &json!({ "action": "replace", "path": "nested/demo.txt", "old_string": "omega", "new_string": "omega" }),
     )
     .expect_err("identical old/new should fail");
     assert!(edit_same.contains("must differ"));
 
     let edit_missing = execute_tool(
-        "edit_file",
-        &json!({ "path": "nested/demo.txt", "old_string": "missing", "new_string": "omega" }),
+        "edit",
+        &json!({ "action": "replace", "path": "nested/demo.txt", "old_string": "missing", "new_string": "omega" }),
     )
     .expect_err("missing substring should fail");
     assert!(edit_missing.contains("old_string not found"));
@@ -1310,8 +1310,8 @@ fn auto_checkpoint_can_guard_mutations_when_enabled() {
     std::env::set_var("COWD_AUTO_CHECKPOINT", "1");
 
     execute_tool(
-        "write_file",
-        &json!({ "path": "src/lib.rs", "content": "omega\n" }),
+        "edit",
+        &json!({ "action": "write", "path": "src/lib.rs", "content": "omega\n" }),
     )
     .expect("write should create checkpoint first");
     let checkpoints = execute_tool("checkpoint", &json!({"action": "list"})).expect("list checkpoints");
@@ -1322,7 +1322,7 @@ fn auto_checkpoint_can_guard_mutations_when_enabled() {
         .iter()
         .filter_map(|checkpoint| checkpoint["label"].as_str())
         .collect::<Vec<_>>();
-    assert!(labels.contains(&"auto-before-write_file"));
+    assert!(labels.contains(&"auto-before-edit"));
 
     match original_auto_checkpoint {
         Some(value) => std::env::set_var("COWD_AUTO_CHECKPOINT", value),
@@ -1345,8 +1345,8 @@ fn mutation_preview_and_apply_patch_transaction_cover_conflict_and_success() {
     std::env::set_current_dir(&root).expect("set cwd");
 
     let preview = execute_tool(
-        "mutation_preview",
-        &json!({
+        "edit",
+        &json!({ "action": "preview",
             "edits": [
                 { "path": "src/lib.rs", "old_string": "alpha", "new_string": "omega" }
             ]
@@ -1354,7 +1354,7 @@ fn mutation_preview_and_apply_patch_transaction_cover_conflict_and_success() {
     )
     .expect("mutation preview should succeed");
     let preview_value: serde_json::Value = serde_json::from_str(&preview).expect("json");
-    assert_eq!(preview_value["type"], "mutation_preview");
+    assert_eq!(preview_value["type"], "edit");
     assert_eq!(preview_value["conflictCount"], 0);
     let expected_hash = preview_value["files"][0]["expectedHash"]
         .as_str()
@@ -1362,8 +1362,8 @@ fn mutation_preview_and_apply_patch_transaction_cover_conflict_and_success() {
         .to_string();
 
     let applied = execute_tool(
-        "apply_patch_transaction",
-        &json!({
+        "edit",
+        &json!({ "action": "patch",
             "edits": [
                 { "path": "src/lib.rs", "old_string": "alpha", "new_string": "omega" }
             ],
@@ -1382,8 +1382,8 @@ fn mutation_preview_and_apply_patch_transaction_cover_conflict_and_success() {
 
     fs::write(&file, "alpha\nalpha\n").expect("reset file");
     let conflict = execute_tool(
-        "patch_plan",
-        &json!({
+        "edit",
+        &json!({ "action": "preview",
             "edits": [
                 { "path": "src/lib.rs", "old_string": "alpha", "new_string": "omega" }
             ]
@@ -1410,8 +1410,8 @@ fn apply_patch_transaction_rejects_stale_expected_hash() {
     std::env::set_current_dir(&root).expect("set cwd");
 
     let err = execute_tool(
-        "apply_patch_transaction",
-        &json!({
+        "edit",
+        &json!({ "action": "patch",
             "edits": [
                 { "path": "src/lib.rs", "old_string": "alpha", "new_string": "omega" }
             ],
@@ -1730,12 +1730,12 @@ fn tool_batch_readonly_rejects_non_readonly_tools_before_execution() {
             &json!({
                 "calls": [
                     { "name": "read_file", "input": { "path": "Cargo.toml" } },
-                    { "name": "write_file", "input": { "path": "should-not-exist.txt", "content": "no" } }
+                    { "name": "edit", "input": { "action": "write", "path": "should-not-exist.txt", "content": "no" } }
                 ]
             }),
         )
         .expect_err("write_file must be rejected");
-    assert!(output.contains("write_file"));
+    assert!(output.contains("edit"));
     assert!(output.contains("not allowed"));
 }
 
@@ -1995,7 +1995,7 @@ fn tool_orchestrate_can_write_and_then_read_in_one_call() {
         "tool_orchestrate",
         &json!({
             "steps": [
-                {"id": "w", "op": "call", "tool": "write_file", "input": {"path": "made.txt", "content": "written by orchestrate\n"}},
+                {"id": "w", "op": "call", "tool": "edit", "input": {"action": "write", "path": "made.txt", "content": "written by orchestrate\n"}},
                 {"id": "r", "op": "call", "tool": "read_file", "input": {"path": "made.txt"}}
             ],
             "return": "$r"

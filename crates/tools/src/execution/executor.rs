@@ -504,7 +504,7 @@ fn run_write_file(lease: &ToolHostLease, input: WriteFileInput) -> Result<String
             .resolve(&input.path)
             .map_err(io_to_string)?,
     );
-    create_auto_checkpoint(lease, "write_file")?;
+    create_auto_checkpoint(lease, "edit")?;
     let output = to_pretty_json(
         write_file(lease.path_policy(), &input.path, &input.content).map_err(io_to_string)?,
     );
@@ -522,7 +522,7 @@ fn run_edit_file(lease: &ToolHostLease, input: EditFileInput) -> Result<String, 
             .resolve(&input.path)
             .map_err(io_to_string)?,
     );
-    create_auto_checkpoint(lease, "edit_file")?;
+    create_auto_checkpoint(lease, "edit")?;
     let output = to_pretty_json(
         edit_file(
             lease.path_policy(),
@@ -552,7 +552,7 @@ fn run_apply_patch_transaction(
     lease: &ToolHostLease,
     input: MutationApplyInput,
 ) -> Result<String, String> {
-    create_auto_checkpoint(lease, "apply_patch_transaction")?;
+    create_auto_checkpoint(lease, "edit")?;
     let applied = apply_mutations(lease.path_policy(), input).map_err(io_to_string)?;
     for file in &applied.applied {
         lease.cache().invalidate_scope(&file_cache_scope(
@@ -848,12 +848,12 @@ pub(crate) fn is_allowed_readonly_batch_tool(name: &str) -> bool {
             | "glob_search"
             | "glob_many"
             | "grep_search"
-            | "grep_search"
             | "workspace_snapshot"
             | "tool_cache_stats"
-            | "mutation_preview"
-            | "edit_many_preview"
-            | "patch_plan"
+            // NOTE: `mutation_preview` used to be allowed here. `edit` is a
+            // WRITE tool (only its `action=preview` shape is read-only), and this
+            // allow-list is name-based, so `edit` must NOT appear - a read-only
+            // batch that could write is an authorization hole.
     )
 }
 

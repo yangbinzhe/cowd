@@ -583,7 +583,7 @@ async fn episode_set_pair(real_skill: bool) {
         harness_contract::policy::PermissionMode::ReadOnly
     };
     let allowed_tools = if real_skill {
-        vec!["write_file".to_string(), "read_file".to_string()]
+        vec!["edit".to_string(), "read_file".to_string()]
     } else {
         vec![]
     };

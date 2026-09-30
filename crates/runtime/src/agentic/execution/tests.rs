@@ -882,7 +882,7 @@ async fn exercise_reviewed_goal_delivery(
         writer
             .execute_tool(
                 "delegated-write",
-                "write_file",
+                "edit",
                 r#"{"path":"review-effect.txt","content":"actual delegated write"}"#,
             )
             .await
@@ -897,7 +897,7 @@ async fn exercise_reviewed_goal_delivery(
                 calls
                     .iter()
                     .rev()
-                    .find(|call| call.tool_name == "write_file")
+                    .find(|call| call.tool_name == "edit")
                     .unwrap()
                     .clone(),
                 calls.len(),
@@ -939,7 +939,7 @@ async fn exercise_reviewed_goal_delivery(
         let error = stale
             .execute_tool(
                 "stale-generation-write",
-                "write_file",
+                "edit",
                 r#"{"path":"review-effect.txt","content":"stale generation"}"#,
             )
             .await
@@ -994,7 +994,7 @@ async fn exercise_reviewed_goal_delivery(
             .unwrap()
             .execute_tool(
                 "withdrawn-but-running",
-                "write_file",
+                "edit",
                 r#"{"path":"review-effect.txt","content":"withdrawn worker must not write"}"#,
             )
             .await
@@ -1111,7 +1111,7 @@ async fn exercise_reviewed_goal_delivery(
         let error = writer
             .execute_tool(
                 "late-after-submit",
-                "write_file",
+                "edit",
                 r#"{"path":"review-effect.txt","content":"must never be written"}"#,
             )
             .await
@@ -1288,7 +1288,7 @@ async fn exercise_reviewed_goal_delivery(
         let error = writer
             .execute_tool(
                 "late-after-cancel",
-                "write_file",
+                "edit",
                 r#"{"path":"review-effect.txt","content":"cancelled write must not execute"}"#,
             )
             .await
@@ -3719,7 +3719,7 @@ impl ReviewReadHost {
         assert!(matches!(path, "review-effect.txt" | "unrelated-review.txt"));
         let path = services.workspace_root().join(path);
         match name {
-            "write_file" => {
+            "edit" => {
                 std::fs::write(&path, input["content"].as_str().unwrap()).unwrap();
                 serde_json::json!({"written":true,"path":path}).to_string()
             }
@@ -3800,7 +3800,7 @@ impl crate::RuntimeExecutionHost for ReviewReadHost {
         use harness_contract::{policy::*, tool::*};
         let mut scope = PermissionScope::new(
             PermissionResource::File,
-            if name == "write_file" {
+            if name == "edit" {
                 PermissionOperation::Write
             } else {
                 PermissionOperation::Read
@@ -3810,14 +3810,14 @@ impl crate::RuntimeExecutionHost for ReviewReadHost {
         Some(ToolEffectDescriptor {
             tool_id: name.into(),
             descriptor_hash: format!("review-read:{name}"),
-            effect_kind: if name == "write_file" {
+            effect_kind: if name == "edit" {
                 ToolEffectKind::Write
             } else {
                 ToolEffectKind::Read
             },
             idempotency: ToolIdempotency::Idempotent,
             scopes: vec![scope],
-            required_permission: if name == "write_file" {
+            required_permission: if name == "edit" {
                 ToolPermissionMode::WorkspaceWrite
             } else {
                 ToolPermissionMode::ReadOnly
@@ -3827,7 +3827,7 @@ impl crate::RuntimeExecutionHost for ReviewReadHost {
             spawns_process: false,
             mutates_packages: false,
             mutates_system: false,
-            assessment: if name == "write_file" {
+            assessment: if name == "edit" {
                 EffectAssessment {
                     reversibility: EffectReversibility::Compensatable,
                     externality: EffectExternality::Workspace,
@@ -3892,7 +3892,7 @@ async fn write_root_review_effect(
     id: &str,
     content: &str,
 ) {
-    root_review_target_tool(runtime, id, "write_file", "review-effect.txt", content).await;
+    root_review_target_tool(runtime, id, "edit", "review-effect.txt", content).await;
 }
 
 async fn root_review_target_tool(
@@ -4064,7 +4064,7 @@ async fn root_reads_generic_results(
     }
     if write_effect {
         let written = runtime.execute_tool_batch_step(&[crate::conversation::ModelToolCall {
-            id: "root-write-effect".into(), name: "write_file".into(),
+            id: "root-write-effect".into(), name: "edit".into(),
             input: serde_json::json!({"path":"review-effect.txt","content":"actually persisted revised content"}).to_string(),
             depends_on: vec![],
         }], &crate::SharedPrompter::none(), 2).await.unwrap();
@@ -4648,7 +4648,7 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
         );
         let late = runtime.execute_tool_batch_step(&[crate::conversation::ModelToolCall {
             id: "late-root-write-after-verification".into(),
-            name: "write_file".into(),
+            name: "edit".into(),
             input: serde_json::json!({"path":"review-effect.txt","content":"forbidden late mutation"}).to_string(),
             depends_on: vec![],
         }], &crate::SharedPrompter::none(), 99).await.unwrap();

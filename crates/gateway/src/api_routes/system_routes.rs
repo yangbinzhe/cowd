@@ -330,8 +330,8 @@ async fn tool_mutation_preview_handler(
         .execute_tool_receipt(
             &tool_host,
             &state.workspace_root,
-            "mutation_preview",
-            serde_json::json!({ "edits": edits }),
+            "edit",
+            serde_json::json!({ "action": "preview", "edits": edits }),
             "preview",
             "medium",
         )
@@ -351,8 +351,9 @@ async fn tool_mutation_apply_handler(
         .execute_tool_receipt(
             &tool_host,
             &state.workspace_root,
-            "apply_patch_transaction",
+            "edit",
             serde_json::json!({
+                "action": "patch",
                 "edits": edits,
                 "expected_hashes": body.expected_hashes,
             }),
@@ -374,7 +375,7 @@ async fn tool_checkpoints_handler(
             &tool_host,
             &state.workspace_root,
             "checkpoint",
-            serde_json::json!({}),
+            serde_json::json!({ "action": "list" }),
             "read_only",
             "low",
         )
@@ -394,7 +395,7 @@ async fn tool_checkpoint_create_handler(
             &tool_host,
             &state.workspace_root,
             "checkpoint",
-            serde_json::json!({ "label": body.label }),
+            serde_json::json!({ "action": "create", "label": body.label }),
             "checkpoint",
             "medium",
         )
@@ -414,7 +415,7 @@ async fn tool_checkpoint_diff_handler(
             &tool_host,
             &state.workspace_root,
             "checkpoint",
-            serde_json::json!({ "id": id }),
+            serde_json::json!({ "action": "diff", "id": id }),
             "read_only",
             "low",
         )
@@ -434,7 +435,7 @@ async fn tool_checkpoint_restore_handler(
             &tool_host,
             &state.workspace_root,
             "checkpoint",
-            serde_json::json!({ "id": id }),
+            serde_json::json!({ "action": "restore", "id": id }),
             "restore",
             "high",
         )
@@ -474,10 +475,8 @@ fn is_webui_generic_tool_allowed(tool_name: &str) -> bool {
             | "glob_search"
             | "grep_search"
             | "workspace_snapshot"
-            | "mutation_preview"
-            | "edit_many_preview"
-            | "patch_plan"
-            | "checkpoint"
+            // NOTE: `edit` (a WRITE tool) is deliberately excluded - this is the
+            // read-only generic-tool surface. `mutation_preview` used to be here.
             | "checkpoint"
             | "tool_batch_readonly"
             | "tool_cache_stats"

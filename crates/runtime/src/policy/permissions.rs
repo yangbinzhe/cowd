@@ -725,14 +725,14 @@ mod tests {
     fn allows_tools_when_active_mode_meets_requirement() {
         let policy = PermissionPolicy::new(PermissionMode::WorkspaceWrite)
             .with_tool_requirement("read_file", PermissionMode::ReadOnly)
-            .with_tool_requirement("write_file", PermissionMode::WorkspaceWrite);
+            .with_tool_requirement("edit", PermissionMode::WorkspaceWrite);
 
         assert_eq!(
             policy.authorize("read_file", "{}", None),
             PermissionOutcome::Allow
         );
         assert_eq!(
-            policy.authorize("write_file", "{}", None),
+            policy.authorize("edit", "{}", None),
             PermissionOutcome::Allow
         );
     }
@@ -791,12 +791,12 @@ mod tests {
     #[test]
     fn read_only_escalations_route_to_approval_instead_of_hard_deny() {
         let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
-            .with_tool_requirement("write_file", PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("edit", PermissionMode::WorkspaceWrite)
             .with_tool_requirement("bash", PermissionMode::DangerFullAccess);
 
         assert!(matches!(
             policy.route_required_with_context(
-                "write_file",
+                "edit",
                 "{}",
                 PermissionMode::WorkspaceWrite,
                 &PermissionContext::default(),
@@ -932,7 +932,7 @@ mod tests {
     #[test]
     fn hook_allow_cannot_widen_the_active_permission_ceiling() {
         let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
-            .with_tool_requirement("write_file", PermissionMode::WorkspaceWrite);
+            .with_tool_requirement("edit", PermissionMode::WorkspaceWrite);
         let context = PermissionContext::new(
             Some(PermissionOverride::Allow),
             Some("hook recommended the action".to_string()),
@@ -943,7 +943,7 @@ mod tests {
         };
 
         let outcome = policy.authorize_with_context(
-            "write_file",
+            "edit",
             r#"{"path":"src/lib.rs"}"#,
             &context,
             Some(&mut prompter),
@@ -995,12 +995,12 @@ mod tests {
     #[test]
     fn cloned_policy_observes_revisioned_mode_changes_during_an_active_turn() {
         let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
-            .with_tool_requirement("write_file", PermissionMode::WorkspaceWrite);
+            .with_tool_requirement("edit", PermissionMode::WorkspaceWrite);
         let turn_snapshot = policy.clone();
         let control = policy.execution_policy_control();
 
         assert!(matches!(
-            turn_snapshot.authorize("write_file", "{}", None),
+            turn_snapshot.authorize("edit", "{}", None),
             PermissionOutcome::Deny { .. }
         ));
         let revision = control
@@ -1016,7 +1016,7 @@ mod tests {
         assert_eq!(revision, 2);
         assert_eq!(turn_snapshot.active_mode(), PermissionMode::WorkspaceWrite);
         assert_eq!(
-            turn_snapshot.authorize("write_file", "{}", None),
+            turn_snapshot.authorize("edit", "{}", None),
             PermissionOutcome::Allow
         );
     }

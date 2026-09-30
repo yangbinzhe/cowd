@@ -3406,7 +3406,7 @@ pub(super) fn graph_metadata_effect(
     let effect_kind = match normalized.as_str() {
         "read_file" | "read_many" | "grep_search" | "grep_search" | "glob_search" | "glob_many"
         | "workspace_snapshot" => ToolEffectKind::Read,
-        "write_file" | "edit_file" | "apply_patch_transaction" | "notebook_edit" => {
+        "edit" | "edit" | "edit" | "edit" => {
             ToolEffectKind::Write
         }
         _ => return None,

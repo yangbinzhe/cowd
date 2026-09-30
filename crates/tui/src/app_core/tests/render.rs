@@ -1664,7 +1664,7 @@ fn approval_dialog_binds_canonical_request_and_requires_explicit_yes() {
     state.app.gateway.gateway_approval_items =
         vec![crate::runtime_control_store::ApprovalSummary {
             id: "approval-exact-1".to_string(),
-            tool_name: "write_file".to_string(),
+            tool_name: "edit".to_string(),
             risk: Some("high".to_string()),
             requester: Some("session:s".to_string()),
             input_preview: "workspace/file.txt".to_string(),
@@ -1696,7 +1696,7 @@ fn approval_dialog_binds_canonical_request_and_requires_explicit_yes() {
         } => {
             assert!(!default, "Enter must never approve a side effect");
             assert!(message.contains("approval-exact-1"));
-            assert!(message.contains("write_file"));
+            assert!(message.contains("edit"));
             assert!(message.contains("Risk: high"));
             assert!(message.contains("workspace/file.txt"));
             assert!(message.contains("Policy revision: 7"));

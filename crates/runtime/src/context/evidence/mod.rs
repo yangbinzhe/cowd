@@ -92,7 +92,7 @@ fn summarize_json(tool_name: &str, output: &str) -> String {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(output) else {
         return output.to_string();
     };
-    if matches!(tool_name, "write_file" | "edit_file") {
+    if matches!(tool_name, "edit" | "edit") {
         if let Some(receipt) = mutation_receipt(tool_name, &value) {
             return receipt;
         }
@@ -123,7 +123,7 @@ fn mutation_receipt(tool_name: &str, value: &serde_json::Value) -> Option<String
     let original = object
         .get("originalFile")
         .and_then(serde_json::Value::as_str);
-    let (content, replacement_count, replace_all) = if tool_name == "edit_file" {
+    let (content, replacement_count, replace_all) = if tool_name == "edit" {
         let original = original?;
         let old = object.get("oldString")?.as_str()?;
         let new = object.get("newString")?.as_str()?;
@@ -318,7 +318,7 @@ mod tests {
         })
         .to_string();
         let receipt = build_tool_receipt(
-            "edit_file",
+            "edit",
             &output,
             false,
             EvidenceRef::observed("tool", "mutation-raw"),
@@ -344,7 +344,7 @@ mod tests {
         })
         .to_string();
         let receipt = build_tool_receipt(
-            "apply_patch_transaction",
+            "edit",
             &output,
             false,
             EvidenceRef::observed("tool", "transaction-raw"),

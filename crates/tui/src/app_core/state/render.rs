@@ -360,7 +360,7 @@ impl TuiState {
                         .iter()
                         .filter_map(|e| {
                             if let crate::app::TimelineEntry::ToolCall { name, output, .. } = e {
-                                if (name == "edit_file"
+                                if (name == "edit"
                                     || name == "patch_file"
                                     || name == "apply_diff")
                                     && !output.is_empty()

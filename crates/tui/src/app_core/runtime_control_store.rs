@@ -2731,7 +2731,7 @@ mod tests {
     fn approval_summary_consumes_canonical_policy_and_effect_facts() {
         let item = approval_summary_from_json(&serde_json::json!({
             "approval_id": "approval-typed",
-            "action": "write_file",
+            "action": "edit",
             "risk": "critical",
             "summary": "write workspace file",
             "skippable": false,

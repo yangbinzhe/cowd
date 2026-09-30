@@ -1413,7 +1413,7 @@ mod tests {
             .observe_tool_scope("read_file", "read:cowd/src/lib.rs", Some("before"), 1)
             .unwrap();
         let write = resolver
-            .observe_tool_scope("write_file", "write:cowd/src/lib.rs", Some("after"), 2)
+            .observe_tool_scope("edit", "write:cowd/src/lib.rs", Some("after"), 2)
             .unwrap();
         let early = evaluate_observed_acceptance(
             &required,
@@ -1493,13 +1493,13 @@ mod tests {
             &["verify_after_write:cowd/dir".to_string()],
         );
         let wa = resolver
-            .observe_tool_scope("write_file", "write:cowd/dir/a.rs", Some("a"), 1)
+            .observe_tool_scope("edit", "write:cowd/dir/a.rs", Some("a"), 1)
             .unwrap();
         let wb = resolver
-            .observe_tool_scope("write_file", "write:cowd/dir/b.rs", Some("b"), 2)
+            .observe_tool_scope("edit", "write:cowd/dir/b.rs", Some("b"), 2)
             .unwrap();
         let wc = resolver
-            .observe_tool_scope("write_file", "write:cowd/dir/c.rs", Some("c"), 3)
+            .observe_tool_scope("edit", "write:cowd/dir/c.rs", Some("c"), 3)
             .unwrap();
         let ra = resolver
             .observe_tool_scope("read_file", "read:cowd/dir/a.rs", Some("a"), 4)
@@ -1569,10 +1569,10 @@ mod tests {
             &["verify_after_write:cowd/src/lib.rs".to_string()],
         );
         let write_a = resolver
-            .observe_tool_scope("write_file", "write:cowd/src/lib.rs", Some("a"), 1)
+            .observe_tool_scope("edit", "write:cowd/src/lib.rs", Some("a"), 1)
             .unwrap();
         let write_b = resolver
-            .observe_tool_scope("write_file", "write:cowd/src/lib.rs", Some("b"), 2)
+            .observe_tool_scope("edit", "write:cowd/src/lib.rs", Some("b"), 2)
             .unwrap();
         let read_a_after = resolver
             .observe_tool_scope("read_file", "read:cowd/src/lib.rs", Some("a"), 3)

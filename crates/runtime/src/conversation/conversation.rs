@@ -2744,8 +2744,8 @@ pub trait ToolExecutor: Send + Sync + 'static {
         let identity = normalized_tool_identity(requested);
         if let Some(canonical) = match identity.as_str() {
             "read" => Some("read_file"),
-            "write" => Some("write_file"),
-            "edit" => Some("edit_file"),
+            "write" => Some("edit"),
+            "edit" => Some("edit"),
             "glob" => Some("glob_search"),
             "grep" => Some("grep_search"),
             _ => None,

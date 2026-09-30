@@ -80,6 +80,7 @@ pub struct ToolSpec {
 pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
     let resolver_id = match normalize_tool_name(name).as_str() {
         "bash" | "powershell" => "builtin.command",
+        "edit" => "runtime.action_edit",
         "checkpoint" => "runtime.action_checkpoint",
         "background" => "runtime.action_background",
         // `execute_code` and `repl` always enter the kernel-hardened workspace
@@ -99,9 +100,6 @@ pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
         | "workspace_snapshot"
         | "tool_batch_readonly"
         | "tool_cache_stats"
-        | "mutation_preview"
-        | "edit_many_preview"
-        | "patch_plan"
         | "checkpoint_list"
         | "checkpoint_diff"
         | "ask"
@@ -112,11 +110,7 @@ pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
         | "testing_permission" => "builtin.readonly",
         "lsp" => "builtin.readonly_process",
         "vision_analyze" => "builtin.readonly_process",
-        "write_file"
-        | "edit_file"
-        | "apply_patch_transaction"
-        | "notebook_edit"
-        | "todo_write"
+        "todo_write"
         | "config"
         | "plan_mode" => "builtin.workspace_write",
         "web_fetch" | "web_search" | "remote_trigger"
@@ -329,162 +323,6 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
-            name: "write_file",
-            family: ToolFamily::Mutate,
-            tier: ToolTier::Orchestration,
-            permission_key: "edit",
-            description: "Create or fully replace a workspace text file. Boundary: it overwrites - use edit_file for a targeted replacement and mutation_preview to dry-run first. Large content is budgeted.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "content": { "type": "string" }
-                },
-                "required": ["path", "content"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::WorkspaceWrite,
-        },
-        ToolSpec {
-            name: "edit_file",
-            family: ToolFamily::Mutate,
-            tier: ToolTier::Orchestration,
-            permission_key: "edit",
-            description: "Replace an exact string in one workspace file (replace_all for every occurrence). Boundary: the old string must match exactly once unless replace_all is set; the tool fails closed on a miss rather than guessing.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "old_string": { "type": "string" },
-                    "new_string": { "type": "string" },
-                    "replace_all": { "type": "boolean" }
-                },
-                "required": ["path", "old_string", "new_string"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::WorkspaceWrite,
-        },
-        ToolSpec {
-            name: "mutation_preview",
-            family: ToolFamily::Mutate,
-            tier: ToolTier::Orchestration,
-            permission_key: "edit",
-            description: "Dry-run multiple text replacements without writing anything, reporting resulting content, replacement counts and hash changes per file. Canonical name for this operation: edit_many_preview and patch_plan are aliases routing to the same handler, kept so existing callers keep working. Use it to validate a multi-file edit before apply_patch_transaction.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "edits": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "path": { "type": "string" },
-                                "old_string": { "type": "string" },
-                                "new_string": { "type": "string" },
-                                "replace_all": { "type": "boolean" }
-                            },
-                            "required": ["path", "old_string", "new_string"],
-                            "additionalProperties": false
-                        }
-                    }
-                },
-                "required": ["edits"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "edit_many_preview",
-            family: ToolFamily::Mutate,
-            tier: ToolTier::Orchestration,
-            permission_key: "edit",
-            description: "Alias for mutation_preview.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "edits": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "path": { "type": "string" },
-                                "old_string": { "type": "string" },
-                                "new_string": { "type": "string" },
-                                "replace_all": { "type": "boolean" }
-                            },
-                            "required": ["path", "old_string", "new_string"],
-                            "additionalProperties": false
-                        }
-                    }
-                },
-                "required": ["edits"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "patch_plan",
-            family: ToolFamily::Mutate,
-            tier: ToolTier::Orchestration,
-            permission_key: "edit",
-            description: "Alias for mutation_preview.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "edits": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "path": { "type": "string" },
-                                "old_string": { "type": "string" },
-                                "new_string": { "type": "string" },
-                                "replace_all": { "type": "boolean" }
-                            },
-                            "required": ["path", "old_string", "new_string"],
-                            "additionalProperties": false
-                        }
-                    }
-                },
-                "required": ["edits"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "apply_patch_transaction",
-            family: ToolFamily::Mutate,
-            tier: ToolTier::Orchestration,
-            permission_key: "edit",
-            description: "Apply a multi-file mutation plan after expected-hash verification, in declaration order under the per-call scope lock. Boundary: a tampered or stale target hash refuses the whole transaction; the effect escalates to the strictest sub-edit, so a write orchestration needs write authorization.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "edits": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "path": { "type": "string" },
-                                "old_string": { "type": "string" },
-                                "new_string": { "type": "string" },
-                                "replace_all": { "type": "boolean" }
-                            },
-                            "required": ["path", "old_string", "new_string"],
-                            "additionalProperties": false
-                        }
-                    },
-                    "expected_hashes": {
-                        "type": "object",
-                        "additionalProperties": { "type": "string" }
-                    }
-                },
-                "required": ["edits"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::WorkspaceWrite,
-        },
-        ToolSpec {
             name: "checkpoint",
             family: ToolFamily::Mutate,
             tier: ToolTier::Orchestration,
@@ -497,6 +335,34 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "id": { "type": "string", "description": "Checkpoint id for diff/restore." },
                     "label": { "type": "string" },
                     "paths": { "type": "array", "items": { "type": "string" }, "description": "Optional workspace-relative paths for a bounded checkpoint." }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "edit",
+            family: ToolFamily::Mutate,
+            tier: ToolTier::Orchestration,
+            permission_key: "edit",
+            description: "The ONE workspace mutation primitive. action=write (path, content): create or fully replace a file. action=replace (path, old_string, new_string, replace_all?): replace an exact string in one file; the old string must match exactly once unless replace_all is set. action=preview (edits): dry-run several replacements, reporting resulting content, counts and hash changes without writing - always validate a multi-file edit this way first. action=patch (edits, expected_hashes?): apply a multi-file plan after expected-hash verification, in declaration order under the per-call scope lock. action=notebook (notebook_path, ...): replace, insert or delete a Jupyter cell source without executing it. Boundary: write/preview/patch/replace touch the workspace and need write authorization while preview is read-only; patch refuses the whole transaction on a stale hash, and notebook edits cell source only, never executing it.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["write", "replace", "preview", "patch", "notebook"] },
+                    "path": { "type": "string" },
+                    "content": { "type": "string" },
+                    "old_string": { "type": "string" },
+                    "new_string": { "type": "string" },
+                    "replace_all": { "type": "boolean" },
+                    "edits": { "type": "array", "items": { "type": "object", "properties": { "path": { "type": "string" }, "old_string": { "type": "string" }, "new_string": { "type": "string" }, "replace_all": { "type": "boolean" } }, "required": ["path", "old_string", "new_string"], "additionalProperties": false } },
+                    "expected_hashes": { "type": "object", "additionalProperties": { "type": "string" } },
+                    "notebook_path": { "type": "string" },
+                    "cell_id": { "type": "string" },
+                    "new_source": { "type": "string" },
+                    "cell_type": { "type": "string", "enum": ["code", "markdown"] },
+                    "edit_mode": { "type": "string", "enum": ["replace", "insert", "delete"] }
                 },
                 "required": ["action"],
                 "additionalProperties": false
@@ -932,26 +798,6 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
-            name: "notebook_edit",
-            family: ToolFamily::Mutate,
-            tier: ToolTier::Orchestration,
-            permission_key: "edit",
-            description: "Replace, insert or delete a Jupyter notebook cell. Boundary: it edits cell source only - it does not execute the notebook.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "notebook_path": { "type": "string" },
-                    "cell_id": { "type": "string" },
-                    "new_source": { "type": "string" },
-                    "cell_type": { "type": "string", "enum": ["code", "markdown"] },
-                    "edit_mode": { "type": "string", "enum": ["replace", "insert", "delete"] }
-                },
-                "required": ["notebook_path"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::WorkspaceWrite,
-        },
-        ToolSpec {
             name: "sleep",
             family: ToolFamily::Session,
             tier: ToolTier::Orchestration,
@@ -1362,7 +1208,7 @@ fn every_tool_documentation_states_power_and_boundary_without_false_claims() {
             .unwrap_or_else(|| panic!("{name} spec is missing"))
     };
     // Documented aliases: they intentionally defer to their canonical tool.
-    const ALIASES: &[&str] = &["edit_many_preview", "patch_plan"];
+    const ALIASES: &[&str] = &[];
 
     for spec in &specs {
         if ALIASES.contains(&spec.name) {
@@ -1641,7 +1487,7 @@ mod family_taxonomy_tests {
     #[test]
     fn every_tool_declares_a_family_tier_and_permission_key() {
         let specs = mvp_tool_specs();
-        assert_eq!(specs.len(), 39, "the catalog size is the contract");
+        assert_eq!(specs.len(), 33, "the catalog size is the contract");
         for spec in &specs {
             assert!(
                 !spec.permission_key.is_empty(),
@@ -1693,7 +1539,6 @@ mod family_taxonomy_tests {
     #[test]
     fn canonical_tools_do_not_share_a_permission_slot_beyond_the_legacy_ledger() {
         const LEGACY: &[(&str, &str, &str, usize)] = &[
-            ("Mutate", "edit", "Orchestration", 5),
         ];
         let mut slots: BTreeMap<(&str, &str, &str), usize> = BTreeMap::new();
         for spec in mvp_tool_specs() {

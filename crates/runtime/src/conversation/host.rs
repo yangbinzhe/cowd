@@ -2814,7 +2814,7 @@ mod write_obligation_probe {
             .expect("required write");
         let observed = resolver
             .observe_tool_scope(
-                "write_file",
+                "edit",
                 "write:cross-team-decision-report.html",
                 Some("d6340e8783fa57ad2c78f51b708e7e9f98f592fc3037a1003cb71fcbf343f108"),
                 7,

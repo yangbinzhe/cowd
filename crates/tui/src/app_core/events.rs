@@ -780,7 +780,7 @@ mod tests {
                 .expect("capacity");
         }
         tx.send(CowdEvent::ApprovalRequested {
-            tool: "write_file".to_string(),
+            tool: "edit".to_string(),
         })
         .expect("approval retained");
         for _ in 0..EVENT_CHANNEL_CAPACITY {
@@ -788,7 +788,7 @@ mod tests {
         }
         assert!(matches!(
             rx.try_recv().expect("reliable approval after older events"),
-            CowdEvent::ApprovalRequested { tool } if tool == "write_file"
+            CowdEvent::ApprovalRequested { tool } if tool == "edit"
         ));
     }
 }

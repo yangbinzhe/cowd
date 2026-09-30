@@ -99,7 +99,7 @@ impl Fixture {
                 }
                 let events = if *round < 4 {
                     let name = if *round < 2 {
-                        "write_file"
+                        "edit"
                     } else {
                         "read_file"
                     };
@@ -202,7 +202,7 @@ impl Fixture {
                 )
                 .unwrap(),
                 source_ref: "skill://paired-evidence/SKILL.md".into(),
-                tool_refs: vec!["write_file".into(), "read_file".into()],
+                tool_refs: vec!["edit".into(), "read_file".into()],
             }],
         );
         let mut profiles = producer.profiles();
@@ -264,7 +264,7 @@ impl Fixture {
         assert_eq!(
             calls
                 .iter()
-                .filter(|call| call.tool_name == "write_file")
+                .filter(|call| call.tool_name == "edit")
                 .count(),
             2,
             "{calls:?}"
@@ -277,7 +277,7 @@ impl Fixture {
             2
         );
         let mut paths = BTreeSet::new();
-        for call in calls.iter().filter(|call| call.tool_name == "write_file") {
+        for call in calls.iter().filter(|call| call.tool_name == "edit") {
             assert!(call.evaluation_isolated);
             let input: serde_json::Value = serde_json::from_str(&call.input).unwrap();
             let path = input["path"].as_str().unwrap();
@@ -404,7 +404,7 @@ impl crate::RuntimeExecutionHost for FileHost {
             Err(error) => panic!("read actual prior state: {error}"),
         };
         let output = match request.tool_name.as_str() {
-            "write_file" => {
+            "edit" => {
                 std::fs::create_dir_all(path.parent().unwrap()).unwrap();
                 std::fs::write(&path, input["content"].as_str().unwrap()).unwrap();
                 format!("wrote {}", path.display())
@@ -422,11 +422,11 @@ impl crate::RuntimeExecutionHost for FileHost {
         self.calls.lock().unwrap().push(request.clone());
         let resolver =
             crate::path_identity::WorkspacePathIdentityResolver::discover(&self.root).unwrap();
-        let mut observed = if request.tool_name == "write_file" {
+        let mut observed = if request.tool_name == "edit" {
             let digest = format!("{:x}", Sha256::digest(std::fs::read(&path).unwrap()));
             let mut evidence = resolver
                 .observe_trusted_tool_output_file(
-                    "write_file",
+                    "edit",
                     harness_contract::context::WorkspaceAccessMode::Write,
                     input["path"].as_str().unwrap(),
                     &digest,
@@ -464,10 +464,10 @@ impl crate::RuntimeExecutionHost for FileHost {
         name: &str,
         input: &serde_json::Value,
     ) -> Option<ToolEffectDescriptor> {
-        if !matches!(name, "write_file" | "read_file") {
+        if !matches!(name, "edit" | "read_file") {
             return None;
         }
-        let write = name == "write_file";
+        let write = name == "edit";
         let mut scope = PermissionScope::new(
             PermissionResource::File,
             if write {

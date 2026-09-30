@@ -50,8 +50,8 @@ pub struct ToolExposurePlanner;
 const HOT_TOOLS: &[&str] = &[
     "read_file",
     "read_many",
-    "write_file",
-    "edit_file",
+    "edit",
+    "edit",
     "bash",
     "grep_search",
     "glob_search",
@@ -233,9 +233,9 @@ mod tests {
             descriptors: vec![
                 descriptor("tool_search", ToolPermissionMode::ReadOnly),
                 descriptor("custom_reader", ToolPermissionMode::ReadOnly),
-                descriptor("write_file", ToolPermissionMode::WorkspaceWrite),
+                descriptor("edit", ToolPermissionMode::WorkspaceWrite),
             ],
-            activation_candidates: vec!["custom_reader".to_string(), "write_file".to_string()],
+            activation_candidates: vec!["custom_reader".to_string(), "edit".to_string()],
         };
         let policy = ToolExposurePolicy {
             allowed_ids: BTreeSet::new(),
@@ -252,7 +252,7 @@ mod tests {
         );
         assert_eq!(state.revision, 2);
         assert!(state.active.contains("custom_reader"));
-        assert!(!state.active.contains("write_file"));
+        assert!(!state.active.contains("edit"));
     }
 
     #[test]
@@ -264,7 +264,7 @@ mod tests {
                 descriptor("read_file", ToolPermissionMode::ReadOnly),
                 descriptor("grep_search", ToolPermissionMode::ReadOnly),
                 descriptor("glob_search", ToolPermissionMode::ReadOnly),
-                descriptor("write_file", ToolPermissionMode::WorkspaceWrite),
+                descriptor("edit", ToolPermissionMode::WorkspaceWrite),
             ],
             activation_candidates: Vec::new(),
         };
@@ -279,7 +279,7 @@ mod tests {
         assert!(state.active.contains("read_file"));
         assert!(state.active.contains("grep_search"));
         assert!(state.active.contains("glob_search"));
-        assert!(!state.active.contains("write_file"));
+        assert!(!state.active.contains("edit"));
     }
 
     #[test]
@@ -292,7 +292,7 @@ mod tests {
                 descriptor("read_file", ToolPermissionMode::ReadOnly),
                 descriptor("grep_search", ToolPermissionMode::ReadOnly),
                 descriptor("glob_search", ToolPermissionMode::ReadOnly),
-                descriptor("write_file", ToolPermissionMode::WorkspaceWrite),
+                descriptor("edit", ToolPermissionMode::WorkspaceWrite),
                 descriptor("bash", ToolPermissionMode::WorkspaceWrite),
                 descriptor("mcp_custom_tool", ToolPermissionMode::ReadOnly),
             ],
@@ -308,7 +308,7 @@ mod tests {
         assert!(state.active.contains("read_file"));
         assert!(state.active.contains("grep_search"));
         assert!(state.active.contains("glob_search"));
-        assert!(state.active.contains("write_file"));
+        assert!(state.active.contains("edit"));
         assert!(state.active.contains("bash"));
         assert!(!state.active.contains("mcp_custom_tool"));
     }
@@ -332,7 +332,7 @@ mod tests {
 
         let state = ToolExposurePlanner.plan(&receipt, ["tool_search".to_string()], &policy);
         assert!(state.active.contains("read_file"));
-        assert!(!state.active.contains("write_file"));
+        assert!(!state.active.contains("edit"));
         assert!(!state.active.contains("bash"));
     }
 

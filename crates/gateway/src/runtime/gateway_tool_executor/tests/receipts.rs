@@ -314,8 +314,8 @@
         let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
             &runtime::tool_dispatch::ToolRequest {
                 tool_use_id: "patch".to_string(),
-                tool_name: "apply_patch_transaction".to_string(),
-                input: "{}".to_string(),
+                tool_name: "edit".to_string(),
+                input: "{\"action\":\"patch\"}".to_string(),
                 depends_on: Vec::new(),
             },
         );
@@ -365,8 +365,8 @@
         let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
             &runtime::tool_dispatch::ToolRequest {
                 tool_use_id: "actual-patch".to_string(),
-                tool_name: "apply_patch_transaction".to_string(),
-                input: "{}".to_string(),
+                tool_name: "edit".to_string(),
+                input: "{\"action\":\"patch\"}".to_string(),
                 depends_on: Vec::new(),
             },
         );
@@ -399,8 +399,8 @@
         let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
             &runtime::tool_dispatch::ToolRequest {
                 tool_use_id: "notebook".to_string(),
-                tool_name: "notebook_edit".to_string(),
-                input: "{}".to_string(),
+                tool_name: "edit".to_string(),
+                input: "{\"action\":\"notebook\"}".to_string(),
                 depends_on: Vec::new(),
             },
         );

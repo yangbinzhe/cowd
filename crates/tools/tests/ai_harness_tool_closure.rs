@@ -83,7 +83,7 @@ fn live_tool_write_descriptor_requires_runtime_authorization() {
 
     let host = test_host("deny-test", &root);
     let input = json!({"path": target, "content": "must not be written"});
-    let effect = host.pin_snapshot().describe_effect("write_file", &input);
+    let effect = host.pin_snapshot().describe_effect("edit", &input);
     assert_eq!(
         effect.required_permission,
         ToolPermissionMode::WorkspaceWrite
@@ -122,7 +122,7 @@ fn live_tool_batch_readonly_accepts_read_tools_and_rejects_write_tools() {
     assert!(output.contains("batch evidence"));
 
     let write_batch = json!({
-        "calls": [{"name": "write_file", "input": {"path": root.join("bad.txt"), "content": "no"}}]
+        "calls": [{"name": "edit", "input": {"path": root.join("bad.txt"), "content": "no"}}]
     });
     let error = lease
         .execute(
@@ -160,10 +160,10 @@ fn lease_blocks_external_and_control_plane_paths_for_workspace_file_tools() {
     };
 
     denied("read_file", json!({"path": "../outside.txt"}));
-    denied("write_file", json!({"path": outside, "content": "no"}));
+    denied("edit", json!({"action": "write", "path": outside, "content": "no"}));
     denied(
-        "edit_file",
-        json!({"path": ".cowd/runtime.sqlite", "old_string": "control", "new_string": "no"}),
+        "edit",
+        json!({"action": "replace", "path": ".cowd/runtime.sqlite", "old_string": "control", "new_string": "no"}),
     );
     denied("glob_search", json!({"pattern": "*.txt", "path": ".cowd"}));
     denied(

@@ -252,7 +252,7 @@
                     checkpoint_counter.fetch_add(1, Ordering::SeqCst);
                     Ok(r#"{"id":"checkpoint-test"}"#.to_string())
                 })
-                .register("write_file", move |_| {
+                .register("edit", move |_| {
                     mutation_counter.fetch_add(1, Ordering::SeqCst);
                     Ok("written".to_string())
                 }),
@@ -262,7 +262,7 @@
         .without_memory();
         let requests = vec![crate::tool_dispatch::ToolRequest {
             tool_use_id: "write-1".to_string(),
-            tool_name: "write_file".to_string(),
+            tool_name: "edit".to_string(),
             input: r#"{"path":"src/lib.rs","content":"x"}"#.to_string(),
             depends_on: Vec::new(),
         }];
@@ -969,8 +969,8 @@
                 "tool_search".to_string(),
                 "read_file".to_string(),
                 "grep_search".to_string(),
-                "edit_file".to_string(),
-                "write_file".to_string(),
+                "edit".to_string(),
+                "edit".to_string(),
             ]
         }
     }
@@ -993,8 +993,8 @@
         .without_memory();
 
         runtime.require_next_model_tools([
-            "edit_file".to_string(),
-            "write_file".to_string(),
+            "edit".to_string(),
+            "edit".to_string(),
             "unknown_mutator".to_string(),
         ]);
         runtime
@@ -1013,7 +1013,7 @@
         assert_eq!(projections.len(), 2);
         assert_eq!(
             projections[0].active_ids,
-            vec!["edit_file".to_string(), "write_file".to_string()]
+            vec!["edit".to_string()]
         );
         assert!(!projections[0]
             .active_ids

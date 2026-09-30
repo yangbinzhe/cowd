@@ -74,8 +74,8 @@ impl FileChangesPanel {
 
         for entry in timeline {
             if let crate::app::TimelineEntry::ToolCall { name, output, .. } = entry {
-                if name == "edit_file"
-                    || name == "write_file"
+                if name == "edit"
+                    || name == "edit"
                     || name == "patch_file"
                     || name == "apply_diff"
                     || name == "Bash"
@@ -583,7 +583,7 @@ mod tests {
         let timeline = vec![
             crate::app::TimelineEntry::ToolCall {
                 id: "tc1".to_string(),
-                name: "edit_file".to_string(),
+                name: "edit".to_string(),
                 preview: "editing main.rs".to_string(),
                 output:
                     "Updated file: src/main.rs\n+fn new_func() {}\n-old_func();\n context line\n"
@@ -595,7 +595,7 @@ mod tests {
             },
             crate::app::TimelineEntry::ToolCall {
                 id: "tc2".to_string(),
-                name: "write_file".to_string(),
+                name: "edit".to_string(),
                 preview: "writing lib.rs".to_string(),
                 output: "File: src/lib.rs\n+pub fn hello() {}\n+pub fn world() {}\n".to_string(),
                 done: true,

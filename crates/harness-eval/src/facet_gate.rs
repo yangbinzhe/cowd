@@ -411,7 +411,7 @@ mod timeline_tests {
 
     #[test]
     fn a_write_tool_is_not_a_read() {
-        let timeline = json!({"events": [event("write_file", &json!({"path": "a.rs"}).to_string(), false)]});
+        let timeline = json!({"events": [event("edit", &json!({"path": "a.rs"}).to_string(), false)]});
         assert!(read_paths(&timeline, &[]).is_empty(), "only reads count");
     }
 }

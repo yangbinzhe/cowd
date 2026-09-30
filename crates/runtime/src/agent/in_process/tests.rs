@@ -850,7 +850,7 @@ fn concurrency_test_executor(
     ScopedRuntimeToolExecutor {
         tool_batch: None,
         host,
-        allowed_tools: BTreeSet::from(["write_file".to_string()]),
+        allowed_tools: BTreeSet::from(["edit".to_string()]),
         session_id: "session".to_string(),
         sandbox_posture: harness_contract::policy::SandboxPosture::ReadOnlySandbox,
         policy_revision: 1,
@@ -894,13 +894,13 @@ async fn delegated_leaf_effects_serialize_conflicts_and_parallelize_unrelated_pa
 
     let same = tokio::join!(
         first.execute_scoped(
-            "write_file",
+            "edit",
             r#"{"path":"fixtures/sub/target.txt","content":"one"}"#,
             None,
             None,
         ),
         second.execute_scoped(
-            "write_file",
+            "edit",
             r#"{"path":"fixtures/sub/target.txt","content":"two"}"#,
             None,
             None,
@@ -913,13 +913,13 @@ async fn delegated_leaf_effects_serialize_conflicts_and_parallelize_unrelated_pa
     host.reset();
     let parent_child = tokio::join!(
         first.execute_scoped(
-            "write_file",
+            "edit",
             r#"{"path":"fixtures/sub","content":"parent"}"#,
             None,
             None,
         ),
         second.execute_scoped(
-            "write_file",
+            "edit",
             r#"{"path":"fixtures/sub/target.txt","content":"child"}"#,
             None,
             None,
@@ -932,13 +932,13 @@ async fn delegated_leaf_effects_serialize_conflicts_and_parallelize_unrelated_pa
     host.reset();
     let unrelated = tokio::join!(
         first.execute_scoped(
-            "write_file",
+            "edit",
             r#"{"path":"fixtures/left.txt","content":"left"}"#,
             None,
             None,
         ),
         second.execute_scoped(
-            "write_file",
+            "edit",
             r#"{"path":"fixtures/right.txt","content":"right"}"#,
             None,
             None,
@@ -1055,7 +1055,7 @@ fn test_tool_descriptor_for_input(
             ToolPermissionMode::ReadOnly,
             PermissionResource::Tool,
         ),
-        "checkpoint" | "write_file" | "artifact_materialize" => (
+        "checkpoint" | "edit" | "artifact_materialize" => (
             ToolEffectKind::Write,
             PermissionOperation::Write,
             ToolPermissionMode::WorkspaceWrite,
@@ -1089,11 +1089,11 @@ fn test_tool_descriptor_for_input(
 
 #[test]
 fn read_only_ceiling_never_escalates_for_a_write_tool() {
-    let tools = BTreeSet::from(["write_file".to_string()]);
+    let tools = BTreeSet::from(["edit".to_string()]);
     let policy = permission_policy(None, PermissionMode::ReadOnly, &tools);
     assert_eq!(policy.active_mode(), PermissionMode::ReadOnly);
     assert_eq!(
-        policy.required_mode_for("write_file"),
+        policy.required_mode_for("edit"),
         PermissionMode::WorkspaceWrite
     );
 }
@@ -1324,7 +1324,7 @@ fn workspace_internal_absolute_resource_path_is_normalized_once() {
     .to_string();
 
     let normalized =
-        normalize_delegated_resource_paths("write_file", &input, root.path(), &resolver, None)
+        normalize_delegated_resource_paths("edit", &input, root.path(), &resolver, None)
             .expect("normalize internal absolute path");
     let normalized: serde_json::Value = serde_json::from_str(&normalized).expect("json");
     assert_eq!(normalized["path"], "fixtures/target.txt");
@@ -1576,11 +1576,11 @@ fn absolute_escape_and_parent_traversal_remain_unauthorized() {
 
 #[test]
 fn permission_policy_uses_the_explicit_packet_ceiling() {
-    let tools = BTreeSet::from(["write_file".to_string()]);
+    let tools = BTreeSet::from(["edit".to_string()]);
     let policy = permission_policy(None, PermissionMode::WorkspaceWrite, &tools);
     assert_eq!(policy.active_mode(), PermissionMode::WorkspaceWrite);
     assert_eq!(
-        policy.required_mode_for("write_file"),
+        policy.required_mode_for("edit"),
         PermissionMode::WorkspaceWrite
     );
 }
@@ -1842,7 +1842,7 @@ fn team_tool_boundary_rejects_symlink_escape_for_existing_and_new_targets() {
     let executor = ScopedRuntimeToolExecutor {
         tool_batch: None,
         host: Arc::new(EchoRuntimeExecutionHost),
-        allowed_tools: BTreeSet::from(["read_file".to_string(), "write_file".to_string()]),
+        allowed_tools: BTreeSet::from(["read_file".to_string(), "edit".to_string()]),
         session_id: "session".to_string(),
         sandbox_posture: harness_contract::policy::SandboxPosture::ReadOnlySandbox,
         policy_revision: 1,
@@ -1877,7 +1877,7 @@ fn team_tool_boundary_rejects_symlink_escape_for_existing_and_new_targets() {
         .is_err());
     assert!(executor
         .enforce_resource_ceiling(
-            "write_file",
+            "edit",
             r#"{"path":"crates/runtime/escape/new.txt","content":"denied"}"#,
         )
         .is_err());
@@ -1924,7 +1924,7 @@ async fn scoped_executor_advertises_only_packet_authorized_tools() {
         ]
     );
     assert!(executor.classify_tool_safety("read_file", "{}").is_some());
-    assert!(executor.classify_tool_safety("write_file", "{}").is_none());
+    assert!(executor.classify_tool_safety("edit", "{}").is_none());
     let discovery: harness_contract::tool::ToolDiscoveryReceipt = serde_json::from_str(
         &executor
             .execute_output("tool_search", r#"{"query":"read"}"#)
@@ -1986,7 +1986,7 @@ async fn scoped_executor_routes_hidden_checkpoint_for_runtime_guard_only() {
         .expect("Runtime guard must see the hidden checkpoint descriptor");
     let effective = crate::AuthorizationNegotiator::compile_effective_descriptor(
         &descriptor,
-        r#"{"label":"guard"}"#,
+        r#"{"action":"create","label":"guard"}"#,
     );
     let authorization = crate::ToolPolicy
         .authorize(
@@ -2005,10 +2005,10 @@ async fn scoped_executor_routes_hidden_checkpoint_for_runtime_guard_only() {
 
     assert_eq!(
         executor
-            .execute_authorized_output(&authorization, "checkpoint", r#"{"label":"guard"}"#,)
+            .execute_authorized_output(&authorization, "checkpoint", r#"{"action":"create","label":"guard"}"#,)
             .await
             .expect("hidden checkpoint should reach the pinned Runtime host"),
-        harness_contract::context::ToolOutputDraft::bounded_inline("authorized:checkpoint_create")
+        harness_contract::context::ToolOutputDraft::bounded_inline("authorized:checkpoint")
     );
     assert!(executor
         .receipts
@@ -2419,7 +2419,7 @@ async fn scoped_executor_propagates_runtime_authorization_for_normal_agent_tools
         .await
         .is_err());
     assert!(executor
-        .execute_authorized_output(&authorization, "write_file", r#"{"path":"README.md"}"#)
+        .execute_authorized_output(&authorization, "edit", r#"{"path":"README.md"}"#)
         .await
         .is_err());
 }
@@ -2826,7 +2826,7 @@ fn delegated_prompt_rejects_simulated_tool_markup() {
     let mutation_prompt = system_prompt(
         &packet,
         std::path::Path::new("/workspace"),
-        &["read_file".into(), "write_file".into()],
+        &["read_file".into(), "edit".into()],
     )
     .join("\n");
     assert!(mutation_prompt.contains("Read each target at most once before mutation"));
@@ -2843,7 +2843,7 @@ fn scoped_tool_effect_key_is_stable_across_worker_recovery() {
         "node-1",
         2,
         3,
-        "write_file",
+        "edit",
         r#"{\"path\":\"src/lib.rs\",\"content\":\"updated\"}"#,
     );
     let recovered = deterministic_scoped_tool_idempotency_key(
@@ -2851,7 +2851,7 @@ fn scoped_tool_effect_key_is_stable_across_worker_recovery() {
         "node-1",
         2,
         3,
-        "write_file",
+        "edit",
         r#"{\"path\":\"src/lib.rs\",\"content\":\"updated\"}"#,
     );
     let next_effect = deterministic_scoped_tool_idempotency_key(
@@ -2859,13 +2859,13 @@ fn scoped_tool_effect_key_is_stable_across_worker_recovery() {
         "node-1",
         2,
         4,
-        "write_file",
+        "edit",
         r#"{\"path\":\"src/lib.rs\",\"content\":\"updated\"}"#,
     );
 
     assert_eq!(first, recovered);
     assert_ne!(first, next_effect);
-    assert!(first.contains("agent-tool:graph-1:node-1:2:3:write_file:"));
+    assert!(first.contains("agent-tool:graph-1:node-1:2:3:edit:"));
 }
 
 #[test]
@@ -2879,7 +2879,7 @@ fn recovered_receipt_context_is_bounded_and_explicitly_fences_tools() {
         authorized_scopes: vec!["write:src/lib.rs".to_string()],
         outcome: crate::RuntimeToolExecutionOutcome {
             tool_use_id: "tool-7".to_string(),
-            tool_name: "write_file".to_string(),
+            tool_name: "edit".to_string(),
             status: crate::RuntimeToolExecutionStatus::Executed,
             category: crate::ToolSafetyCategory::WriteLocal,
             output: Some("committed output".to_string()),
@@ -2909,7 +2909,7 @@ fn autonomous_checkpoint_tool_overlay_is_minimal_and_action_specific() {
         "task_claim".to_string(),
         "message_publish".to_string(),
         "read_file".to_string(),
-        "write_file".to_string(),
+        "edit".to_string(),
     ];
 
     assert!(autonomy_checkpoint_tool_plan(&packet, false, false).is_empty());
@@ -2924,7 +2924,7 @@ fn autonomous_checkpoint_tool_overlay_is_minimal_and_action_specific() {
             "task_claim".to_string(),
             "message_publish".to_string(),
             "read_file".to_string(),
-            "write_file".to_string(),
+            "edit".to_string(),
         ]
     );
     assert!(!execution.iter().any(|tool| tool == "tool_search"));
@@ -3443,7 +3443,7 @@ fn autonomy_progress_digest_advances_on_semantic_workspace_progress_not_receipt_
     let receipt = |sequence, digest: &str| ScopedToolExecutionReceipt {
         sequence,
         provider_invocation_id: Some(format!("provider:{sequence}")),
-        tool_name: "edit_file".to_string(),
+        tool_name: "edit".to_string(),
         effect_kind: harness_contract::tool::ToolEffectKind::Write,
         resource_scopes: vec!["workspace:.".to_string()],
         paths: vec!["result.md".to_string()],

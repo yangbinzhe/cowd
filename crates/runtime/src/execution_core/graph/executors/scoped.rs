@@ -452,7 +452,7 @@ mod tests {
                                 std::fs::write(&path, "finished").unwrap();
                                 Ok(crate::RuntimeToolExecutionOutcome {
                                     tool_use_id: "leaf".into(),
-                                    tool_name: "write_file".into(),
+                                    tool_name: "edit".into(),
                                     status: crate::RuntimeToolExecutionStatus::Executed,
                                     category: crate::ToolSafetyCategory::WriteLocal,
                                     output: None,

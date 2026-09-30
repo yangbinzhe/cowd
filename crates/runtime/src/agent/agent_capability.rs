@@ -181,9 +181,9 @@ fn capability_mapping(capability: &str) -> CapabilityMapping {
         },
         "write" => CapabilityMapping {
             tools: &[
-                "write_file",
-                "edit_file",
-                "apply_patch_transaction",
+                "edit",
+                "edit",
+                "edit",
                 "bash",
                 "tool_orchestrate",
                 "background",
@@ -300,7 +300,7 @@ pub(crate) fn runtime_capability_map_contains_tool(tool_ref: &str) -> bool {
 fn required_host_tool_alternatives(capability: &str) -> &'static [&'static str] {
     match capability {
         "network" | "web" => &["web_search", "web_fetch", "mcp_tool"],
-        "write" => &["write_file", "edit_file"],
+        "write" => &["edit", "edit"],
         "test" => &["bash", "execute_code"],
         "rollback" => &["bash", "checkpoint"],
         "connector_action" => &["mcp_tool"],
@@ -310,7 +310,7 @@ fn required_host_tool_alternatives(capability: &str) -> &'static [&'static str] 
 
 pub(crate) fn agent_tool_permission(tool: &str) -> PermissionMode {
     match tool {
-        "write_file" | "edit_file" | "artifact_materialize" => PermissionMode::WorkspaceWrite,
+        "edit" | "edit" | "artifact_materialize" => PermissionMode::WorkspaceWrite,
         "execute_code" => PermissionMode::ReadOnly,
         "bash" | "checkpoint" | "mcp_tool" => PermissionMode::DangerFullAccess,
         _ => PermissionMode::ReadOnly,
@@ -367,13 +367,13 @@ mod tests {
         });
 
         assert_eq!(resolved.permission_mode, PermissionMode::WorkspaceWrite);
-        assert!(resolved.allowed_tools.contains("write_file"));
-        assert!(resolved.allowed_tools.contains("edit_file"));
+        assert!(resolved.allowed_tools.contains("edit"));
+        assert!(resolved.allowed_tools.contains("edit"));
         assert!(resolved.allowed_tools.contains("bash"));
         assert!(resolved.allowed_tools.contains("execute_code"));
         assert!(resolved.allowed_tools.contains("context_retrieve"));
         assert_eq!(
-            resolved.permission_policy.required_mode_for("write_file"),
+            resolved.permission_policy.required_mode_for("edit"),
             PermissionMode::WorkspaceWrite
         );
         assert_eq!(

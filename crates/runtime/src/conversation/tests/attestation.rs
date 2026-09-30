@@ -223,7 +223,7 @@
         );
         assert_eq!(
             order.lock().unwrap().as_slice(),
-            ["read_file", "write_file"]
+            ["read_file", "edit"]
         );
         assert_eq!(
             summary.tool_results.len(),
@@ -253,7 +253,7 @@
             .iter()
             .map(|event| event.kind.as_str())
             .collect::<Vec<_>>();
-        for tool_name in ["read_file", "write_file"] {
+        for tool_name in ["read_file", "edit"] {
             assert!(
                 events.iter().any(|event| {
                     event.kind == "tool.invocation.started"
@@ -542,13 +542,13 @@
         let same_file = resource_scopes_for_tool_calls(&[
             ModelToolCall {
                 id: "write-a".into(),
-                name: "write_file".into(),
+                name: "edit".into(),
                 input: r#"{"path":"src/lib.rs","content":"a"}"#.into(),
                 depends_on: Vec::new(),
             },
             ModelToolCall {
                 id: "write-b".into(),
-                name: "edit_file".into(),
+                name: "edit".into(),
                 input: r#"{"path":"src/lib.rs","old_string":"a","new_string":"b"}"#.into(),
                 depends_on: Vec::new(),
             },
@@ -558,13 +558,13 @@
         let different_files = resource_scopes_for_tool_calls(&[
             ModelToolCall {
                 id: "write-a".into(),
-                name: "write_file".into(),
+                name: "edit".into(),
                 input: r#"{"path":"src/a.rs","content":"a"}"#.into(),
                 depends_on: Vec::new(),
             },
             ModelToolCall {
                 id: "write-b".into(),
-                name: "write_file".into(),
+                name: "edit".into(),
                 input: r#"{"path":"src/b.rs","content":"b"}"#.into(),
                 depends_on: Vec::new(),
             },
@@ -631,7 +631,7 @@
         let calls = [
             ModelToolCall {
                 id: "write".into(),
-                name: "write_file".into(),
+                name: "edit".into(),
                 input: r#"{"path":"src/lib.rs","content":"updated"}"#.into(),
                 depends_on: Vec::new(),
             },
@@ -744,7 +744,7 @@
         let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
             .expect("resolver");
         let write = resolver
-            .observe_tool_scope("edit_file", "write:src/lib.rs", Some("same"), 1)
+            .observe_tool_scope("edit", "write:src/lib.rs", Some("same"), 1)
             .unwrap();
         let read = resolver
             .observe_tool_scope("read_file", "read:src/lib.rs", Some("same"), 2)
@@ -827,7 +827,7 @@
         let target = root.path().join("fixtures/target.txt");
         let calls = [ModelToolCall {
             id: "write".into(),
-            name: "write_file".into(),
+            name: "edit".into(),
             input: serde_json::json!({"path": target, "content": "updated"}).to_string(),
             depends_on: Vec::new(),
         }];
@@ -1056,7 +1056,7 @@
 
         let write = resolver
             .observe_tool_scope(
-                "write_file",
+                "edit",
                 "write:fixtures/target.txt",
                 Some("current"),
                 1,
@@ -1080,7 +1080,7 @@
             crate::path_identity::WorkspacePathIdentityResolver::discover(root.path()).unwrap();
         let write = resolver
             .observe_tool_scope(
-                "write_file",
+                "edit",
                 "write:report/index.html",
                 Some("report-digest"),
                 1,
@@ -1291,7 +1291,7 @@
             .unwrap();
         let write = resolver
             .observe_tool_scope(
-                "write_file",
+                "edit",
                 "write:crates/runtime/src/lib.rs",
                 Some("digest"),
                 1,

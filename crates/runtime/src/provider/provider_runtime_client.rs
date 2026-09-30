@@ -2739,7 +2739,7 @@ mod tests {
 
     #[test]
     fn explicit_projection_selects_bootstrap_and_active_ids_only() {
-        let tools = vec![tool("tool_search"), tool("read_file"), tool("write_file")];
+        let tools = vec![tool("tool_search"), tool("read_file"), tool("edit")];
         let projection = exposure(&["tool_search"], &["read_file"], 3);
         let visible = tool_definitions_for_exposure(&tools, Some(&projection))
             .into_iter()
@@ -3126,7 +3126,7 @@ mod tests {
         let mut delegated = ProviderRuntimeClient::new(
             Arc::clone(&registry),
             "primary".to_string(),
-            vec![tool("read_file"), tool("write_file")],
+            vec![tool("read_file"), tool("edit")],
         )
         .unwrap()
         .with_stable_tool_schema(true);

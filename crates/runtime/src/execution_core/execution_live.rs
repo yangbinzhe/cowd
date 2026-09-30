@@ -2216,7 +2216,7 @@ impl ExecutionLiveStore {
 fn file_touch_path(tool_name: &str, preview: &str) -> Option<String> {
     if !matches!(
         tool_name,
-        "write_file" | "edit_file" | "apply_patch" | "apply_patch_transaction"
+        "edit" | "edit" | "apply_patch" | "edit"
     ) {
         return None;
     }
@@ -3535,7 +3535,7 @@ mod tests {
             activity_binding: None,
             event: Box::new(CowdEvent::ApprovalRequested {
                 request_id: request_id.to_string(),
-                tool: "write_file".to_string(),
+                tool: "edit".to_string(),
             }),
         };
 

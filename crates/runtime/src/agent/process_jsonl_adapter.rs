@@ -2735,7 +2735,7 @@ mod tests {
         );
         assert_ne!(
             identity,
-            process_tool_request_fingerprint("tool_result", "write_file", &first).unwrap()
+            process_tool_request_fingerprint("tool_result", "edit", &first).unwrap()
         );
         assert_ne!(
             identity,
@@ -3598,7 +3598,7 @@ try:
  claim=receive()
  if 'error' in claim:
   send('error',error='task_claim: '+json.dumps(claim,ensure_ascii=False)[:700]);raise SystemExit(1)
- send('action_request',request_id='effect-write',tool_name='write_file',input={'path':'.cowd/agentic/proof.txt','content':'process effect proof'})
+ send('action_request',request_id='effect-write',tool_name='edit',input={'action':'write','path':'.cowd/agentic/proof.txt','content':'process effect proof'})
  answer=receive()
  if 'error' in answer:
   send('error',error='write_file: '+json.dumps(answer,ensure_ascii=False)[:700]);raise SystemExit(1)
@@ -3625,7 +3625,7 @@ except Exception:
                 .packet
                 .allowed_tools
                 .iter()
-                .any(|tool| tool == "write_file"),
+                .any(|tool| tool == "edit"),
             "admission did not expose write_file: {:?}",
             fixture.packet.allowed_tools
         );

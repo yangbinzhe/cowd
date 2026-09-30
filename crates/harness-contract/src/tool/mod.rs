@@ -417,7 +417,7 @@ mod tests {
                     reason: "allowed".to_string(),
                 },
                 ToolActivationDecision {
-                    canonical_id: "write_file".to_string(),
+                    canonical_id: "edit".to_string(),
                     status: ToolActivationStatus::Denied,
                     reason: "read-only lease".to_string(),
                 },
@@ -434,7 +434,7 @@ mod tests {
     fn effect_and_authorization_contracts_have_stable_wire_names() {
         let scope = PermissionScope::new(PermissionResource::File, PermissionOperation::Write);
         let descriptor = ToolEffectDescriptor {
-            tool_id: "write_file".to_string(),
+            tool_id: "edit".to_string(),
             descriptor_hash: "sha256:descriptor".to_string(),
             effect_kind: ToolEffectKind::Write,
             idempotency: ToolIdempotency::IdempotentWithKey,

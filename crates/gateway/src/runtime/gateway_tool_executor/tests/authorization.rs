@@ -130,7 +130,7 @@
             .validate_tool_input("bash", r#"{"command":"pwd"}"#)
             .expect("valid bash input");
         executor
-            .validate_tool_input("enter_plan_mode", "{}")
+            .validate_tool_input("plan_mode", r#"{"action":"enter"}"#)
             .expect("valid no-argument tool");
     }
 

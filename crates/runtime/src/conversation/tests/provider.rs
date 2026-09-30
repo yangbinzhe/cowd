@@ -3341,7 +3341,7 @@ fn governed_plan_retargets_one_strategy_from_research_to_approved_write() {
         MockApi,
         StaticToolExecutor::new()
             .register("web_search", |_| Ok("external evidence".to_string()))
-            .register("write_file", |_| Ok("written".to_string())),
+            .register("edit", |_| Ok("written".to_string())),
         PermissionPolicy::new(PermissionMode::WorkspaceWrite),
         vec!["system".to_string()],
     )
@@ -3403,7 +3403,7 @@ fn governed_plan_retargets_one_strategy_from_research_to_approved_write() {
 
     let write = ModelToolCall {
         id: "write".to_string(),
-        name: "write_file".to_string(),
+        name: "edit".to_string(),
         input: r#"{"path":"target/report.md","content":"verified"}"#.to_string(),
         depends_on: Vec::new(),
     };
@@ -3451,7 +3451,7 @@ fn collaboration_strategy_admits_agent_inspection_with_bounded_workspace_work() 
                     harness_contract::agent_action::STATE_INSPECT_TOOL_ID,
                     |_| Ok("inspected".to_string()),
                 )
-                .register("write_file", |_| Ok("written".to_string())),
+                .register("edit", |_| Ok("written".to_string())),
         ),
         PermissionPolicy::new(PermissionMode::WorkspaceWrite),
         vec!["system".to_string()],
@@ -3474,7 +3474,7 @@ fn collaboration_strategy_admits_agent_inspection_with_bounded_workspace_work() 
         },
         ModelToolCall {
             id: "write".to_string(),
-            name: "write_file".to_string(),
+            name: "edit".to_string(),
             input: r#"{"path":"target/report.md","content":"verified"}"#.to_string(),
             depends_on: Vec::new(),
         },
@@ -3541,7 +3541,7 @@ fn explicit_team_obligation_survives_a_non_collaboration_setup_batch() {
         Session::new(),
         MockApi,
         CollaborationAvailableStaticExecutor(
-            StaticToolExecutor::new().register("write_file", |_| Ok("written".to_string())),
+            StaticToolExecutor::new().register("edit", |_| Ok("written".to_string())),
         ),
         PermissionPolicy::new(PermissionMode::WorkspaceWrite),
         vec!["system".to_string()],
@@ -3557,7 +3557,7 @@ fn explicit_team_obligation_survives_a_non_collaboration_setup_batch() {
 
     let calls = vec![ModelToolCall {
         id: "setup-write".to_string(),
-        name: "write_file".to_string(),
+        name: "edit".to_string(),
         input: r#"{"path":"target/setup.md","content":"prepared"}"#.to_string(),
         depends_on: Vec::new(),
     }];

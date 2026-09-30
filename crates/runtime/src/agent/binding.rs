@@ -554,7 +554,7 @@ mod tests {
 
         let mut escalated_tool = request.clone();
         escalated_tool.granted_capabilities = vec![AgentCapability::Read];
-        escalated_tool.allowed_tool_contract_refs = vec!["write_file".to_string()];
+        escalated_tool.allowed_tool_contract_refs = vec!["edit".to_string()];
         assert!(matches!(
             compiler.compile(escalated_tool),
             Err(AgentBindingError::InvalidRequest(_))

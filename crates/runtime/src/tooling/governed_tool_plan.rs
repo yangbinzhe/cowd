@@ -2072,7 +2072,7 @@ mod tests {
             &workspace,
             &[request_with_input(
                 "write-root",
-                "write_file",
+                "edit",
                 r#"{"path":".","content":"no"}"#,
                 Vec::new(),
             )],
@@ -2168,13 +2168,13 @@ mod tests {
         let plan = GovernedToolPlan::from_requests(&[
             ToolRequest {
                 tool_use_id: "write-1".to_string(),
-                tool_name: "write_file".to_string(),
+                tool_name: "edit".to_string(),
                 input: r#"{"path":"src/lib.rs","content":"a"}"#.to_string(),
                 depends_on: Vec::new(),
             },
             ToolRequest {
                 tool_use_id: "edit-1".to_string(),
-                tool_name: "edit_file".to_string(),
+                tool_name: "edit".to_string(),
                 input: r#"{"path":"src/lib.rs","old_string":"a","new_string":"b"}"#.to_string(),
                 depends_on: Vec::new(),
             },
@@ -2199,13 +2199,13 @@ mod tests {
         let plan = GovernedToolPlan::from_requests(&[
             ToolRequest {
                 tool_use_id: "write-a".to_string(),
-                tool_name: "write_file".to_string(),
+                tool_name: "edit".to_string(),
                 input: r#"{"path":"src/a.rs","content":"a"}"#.to_string(),
                 depends_on: Vec::new(),
             },
             ToolRequest {
                 tool_use_id: "write-b".to_string(),
-                tool_name: "write_file".to_string(),
+                tool_name: "edit".to_string(),
                 input: r#"{"path":"src/b.rs","content":"b"}"#.to_string(),
                 depends_on: Vec::new(),
             },
@@ -2237,7 +2237,7 @@ mod tests {
             GovernedToolPlan::from_requests(&[request("network-1", "web_search", Vec::new())]);
         let write_plan = GovernedToolPlan::from_requests(&[request_with_input(
             "write-1",
-            "write_file",
+            "edit",
             r#"{"path":"src/lib.rs","content":"x"}"#,
             Vec::new(),
         )]);
@@ -2313,7 +2313,7 @@ mod tests {
     fn execution_graph_mutation_requires_typed_gates_and_modifiers() {
         let plan = GovernedToolPlan::from_requests(&[request_with_input(
             "write-1",
-            "write_file",
+            "edit",
             r#"{"path":"src/lib.rs","content":"x"}"#,
             Vec::new(),
         )]);
@@ -2507,13 +2507,13 @@ mod tests {
         let one_path = GovernedToolPlan::from_requests(&[
             request_with_input(
                 "write-1",
-                "write_file",
+                "edit",
                 r#"{"path":"src/lib.rs","content":"x"}"#,
                 Vec::new(),
             ),
             request_with_input(
                 "edit-1",
-                "edit_file",
+                "edit",
                 r#"{"path":"src/lib.rs","old_string":"x","new_string":"y"}"#,
                 Vec::new(),
             ),
@@ -2527,13 +2527,13 @@ mod tests {
         let multiple_paths = GovernedToolPlan::from_requests(&[
             request_with_input(
                 "write-1",
-                "write_file",
+                "edit",
                 r#"{"path":"src/lib.rs","content":"x"}"#,
                 Vec::new(),
             ),
             request_with_input(
                 "write-2",
-                "write_file",
+                "edit",
                 r#"{"path":"src/main.rs","content":"y"}"#,
                 Vec::new(),
             ),

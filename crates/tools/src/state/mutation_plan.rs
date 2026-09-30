@@ -144,7 +144,7 @@ pub fn preview_mutations(
     }
 
     Ok(MutationPreview {
-        kind: "mutation_preview".to_string(),
+        kind: "edit".to_string(),
         file_count: files.len(),
         conflict_count,
         files,

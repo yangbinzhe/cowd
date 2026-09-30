@@ -170,13 +170,13 @@ mod tests {
         let err = prepare_readonly_invocations(
             &context,
             &[PreparedToolCall {
-                name: "write_file".to_string(),
+                name: "edit".to_string(),
                 input: json!({"path": "x", "content": "no"}),
             }],
         )
         .expect_err("write_file must be rejected");
 
         assert_eq!(err.code, "validation_error");
-        assert!(err.message.contains("write_file"));
+        assert!(err.message.contains("edit"));
     }
 }

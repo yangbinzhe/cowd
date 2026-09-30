@@ -28,13 +28,46 @@ fn gateway_observed_evidence(
             .collect(),
         "artifact_materialize" => materialized_artifact_evidence(resolver, &output, sequence)
             .into_iter().collect(),
-        "write_file" => write_file_evidence(resolver, "write_file", &output, sequence)
-            .into_iter()
-            .collect(),
-        "edit_file" => edit_file_evidence(resolver, &output, sequence)
-            .into_iter()
-            .collect(),
-        "apply_patch_transaction" => patch_transaction_evidence(resolver, &output, sequence),
+        "edit" => {
+            // The merged mutation primitive carries its operation in `action`,
+            // and each operation has its own evidence shape, so dispatch on it
+            // instead of assuming the first (write) adapter.
+            let action = serde_json::from_str::<serde_json::Value>(&request.input)
+                .ok()
+                .and_then(|input| {
+                    input
+                        .get("action")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            match action.as_str() {
+                "write" => write_file_evidence(resolver, "edit", &output, sequence)
+                    .into_iter()
+                    .collect(),
+                "replace" => edit_file_evidence(resolver, &output, sequence)
+                    .into_iter()
+                    .collect(),
+                "patch" => patch_transaction_evidence(resolver, &output, sequence),
+                "notebook" => output
+                    .get("error")
+                    .is_none_or(serde_json::Value::is_null)
+                    .then(|| {
+                        write_file_evidence_from_fields(
+                            resolver,
+                            "edit",
+                            &output,
+                            "notebook_path",
+                            "updated_file",
+                            sequence,
+                        )
+                    })
+                    .flatten()
+                    .into_iter()
+                    .collect(),
+                _ => Vec::new(),
+            }
+        }
         "glob_search" => discovery_evidence(
             resolver,
             "glob_search",
@@ -60,22 +93,6 @@ fn gateway_observed_evidence(
                     sequence,
                 )
             })
-            .collect(),
-        "notebook_edit" => output
-            .get("error")
-            .is_none_or(serde_json::Value::is_null)
-            .then(|| {
-                write_file_evidence_from_fields(
-                    resolver,
-                    "notebook_edit",
-                    &output,
-                    "notebook_path",
-                    "updated_file",
-                    sequence,
-                )
-            })
-            .flatten()
-            .into_iter()
             .collect(),
         "web_fetch" => output
             .get("url")
@@ -299,7 +316,7 @@ fn patch_transaction_evidence(
             is_sha256_hex(previous).then_some(())?;
             resolver
                 .observe_trusted_tool_output_file(
-                    "apply_patch_transaction",
+                    "edit",
                     harness_contract::context::WorkspaceAccessMode::Write,
                     path,
                     digest,
@@ -346,7 +363,7 @@ fn edit_file_evidence(
     };
     resolver
         .observe_trusted_tool_output_file(
-            "edit_file",
+            "edit",
             harness_contract::context::WorkspaceAccessMode::Write,
             output.get("filePath")?.as_str()?,
             &format!("{:x}", Sha256::digest(updated.as_bytes())),

@@ -221,36 +221,48 @@ impl SystemService {
         }
         match tool_name {
             "checkpoint" => {
-                let input = serde_json::from_value::<CheckpointCreateInput>(input)
-                    .map_err(|error| error.to_string())?;
-                serde_json::to_string_pretty(
-                    &checkpoint_create_in(workspace_root, input)
-                        .map_err(|error| error.to_string())?,
-                )
-                .map_err(|error| error.to_string())
-            }
-            "checkpoint" => serde_json::to_string_pretty(
-                &checkpoint_list_in(workspace_root).map_err(|error| error.to_string())?,
-            )
-            .map_err(|error| error.to_string()),
-            "checkpoint" => {
-                let input = serde_json::from_value::<CheckpointDiffInput>(input)
-                    .map_err(|error| error.to_string())?;
-                serde_json::to_string_pretty(
-                    &checkpoint_diff_in(workspace_root, input)
-                        .map_err(|error| error.to_string())?,
-                )
-                .map_err(|error| error.to_string())
-            }
-            "checkpoint" => {
-                let input = serde_json::from_value::<CheckpointRestoreInput>(input)
-                    .map_err(|error| error.to_string())?;
-                let output = serde_json::to_string_pretty(
-                    &checkpoint_restore_in(workspace_root, input)
-                        .map_err(|error| error.to_string())?,
-                )
-                .map_err(|error| error.to_string())?;
-                Ok(output)
+                // The merged checkpoint tool carries its operation in `action`.
+                let action = input
+                    .get("action")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                match action {
+                    "create" => {
+                        let input = serde_json::from_value::<CheckpointCreateInput>(input)
+                            .map_err(|error| error.to_string())?;
+                        serde_json::to_string_pretty(
+                            &checkpoint_create_in(workspace_root, input)
+                                .map_err(|error| error.to_string())?,
+                        )
+                        .map_err(|error| error.to_string())
+                    }
+                    "list" => serde_json::to_string_pretty(
+                        &checkpoint_list_in(workspace_root).map_err(|error| error.to_string())?,
+                    )
+                    .map_err(|error| error.to_string()),
+                    "diff" => {
+                        let input = serde_json::from_value::<CheckpointDiffInput>(input)
+                            .map_err(|error| error.to_string())?;
+                        serde_json::to_string_pretty(
+                            &checkpoint_diff_in(workspace_root, input)
+                                .map_err(|error| error.to_string())?,
+                        )
+                        .map_err(|error| error.to_string())
+                    }
+                    "restore" => {
+                        let input = serde_json::from_value::<CheckpointRestoreInput>(input)
+                            .map_err(|error| error.to_string())?;
+                        let output = serde_json::to_string_pretty(
+                            &checkpoint_restore_in(workspace_root, input)
+                                .map_err(|error| error.to_string())?,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        Ok(output)
+                    }
+                    other => Err(format!(
+                        "checkpoint action must be create|list|diff|restore, got {other:?}"
+                    )),
+                }
             }
             _ => {
                 let effect = lease.describe_effect(tool_name, &input);
@@ -417,7 +429,7 @@ fn managed_tool_tags(tool_name: &str) -> Vec<&'static str> {
     let mut tags = Vec::new();
     if matches!(
         normalized.as_str(),
-        "mutation_preview" | "edit_many_preview" | "patch_plan" | "apply_patch_transaction"
+        "edit" | "edit" | "edit" | "edit"
     ) {
         tags.push("mutation");
     }
@@ -442,7 +454,7 @@ fn normalize_tool_name(name: &str) -> String {
 
 fn changed_refs_for_tool(tool_name: &str, data: &serde_json::Value) -> Vec<String> {
     match tool_name {
-        "apply_patch_transaction" => data
+        "edit" => data
             .get("applied")
             .and_then(serde_json::Value::as_array)
             .into_iter()
@@ -450,7 +462,7 @@ fn changed_refs_for_tool(tool_name: &str, data: &serde_json::Value) -> Vec<Strin
             .filter_map(|item| item.get("path").and_then(serde_json::Value::as_str))
             .map(|path| format!("file:{path}"))
             .collect(),
-        "checkpoint" | "checkpoint" => data
+        "checkpoint" => data
             .get("id")
             .and_then(serde_json::Value::as_str)
             .map(|id| vec![format!("checkpoint:{id}")])
@@ -461,9 +473,7 @@ fn changed_refs_for_tool(tool_name: &str, data: &serde_json::Value) -> Vec<Strin
 
 fn warnings_for_tool(tool_name: &str, data: &serde_json::Value) -> Vec<String> {
     let mut warnings = Vec::new();
-    if tool_name == "checkpoint" {
-        warnings.push("restore replaces workspace files from a checkpoint".to_string());
-    }
+
     if data
         .get("conflictCount")
         .and_then(serde_json::Value::as_u64)
@@ -477,7 +487,7 @@ fn warnings_for_tool(tool_name: &str, data: &serde_json::Value) -> Vec<String> {
 
 fn next_actions_for_tool(tool_name: &str, data: &serde_json::Value) -> Vec<String> {
     match tool_name {
-        "mutation_preview" | "patch_plan" | "edit_many_preview" => {
+        "edit" => {
             if data
                 .get("conflictCount")
                 .and_then(serde_json::Value::as_u64)
@@ -489,8 +499,7 @@ fn next_actions_for_tool(tool_name: &str, data: &serde_json::Value) -> Vec<Strin
                 vec!["Resolve conflicts before applying".to_string()]
             }
         }
-        "checkpoint" => vec!["Use checkpoint diff before restore".to_string()],
-        "checkpoint" => vec!["Refresh workspace and inspect diff".to_string()],
+        "checkpoint" => vec!["Use checkpoint(action=diff) before restore".to_string()],
         _ => Vec::new(),
     }
 }

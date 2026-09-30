@@ -641,7 +641,7 @@ mod tests {
             authorized_scopes: vec!["workspace:.".into()],
             outcome: crate::RuntimeToolExecutionOutcome {
                 tool_use_id: "write".into(),
-                tool_name: "write_file".into(),
+                tool_name: "edit".into(),
                 status: crate::RuntimeToolExecutionStatus::Executed,
                 category: crate::ToolSafetyCategory::WriteLocal,
                 output: None,

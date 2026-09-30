@@ -3386,7 +3386,7 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
             let path = extract_tool_path(&parsed);
             format!("\x1b[2m📄 Reading {path}…\x1b[0m")
         }
-        "write_file" | "Write" => {
+        "edit" | "Write" => {
             let path = extract_tool_path(&parsed);
             let lines = parsed
                 .get("content")
@@ -3394,7 +3394,7 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
                 .map_or(0, |content| content.lines().count());
             format!("\x1b[1;32m✏️ Writing {path}\x1b[0m \x1b[2m({lines} lines)\x1b[0m")
         }
-        "edit_file" | "Edit" => {
+        "edit" | "Edit" => {
             let path = extract_tool_path(&parsed);
             let old_value = parsed
                 .get("old_string")
@@ -3449,8 +3449,8 @@ fn format_tool_result(name: &str, output: &str, is_error: bool) -> String {
     match name {
         "bash" | "Bash" => format_bash_result(icon, &parsed),
         "read_file" | "Read" => format_read_result(icon, &parsed),
-        "write_file" | "Write" => format_write_result(icon, &parsed),
-        "edit_file" | "Edit" => format_edit_result(icon, &parsed),
+        "edit" | "Write" => format_write_result(icon, &parsed),
+        "edit" | "Edit" => format_edit_result(icon, &parsed),
         "glob_search" | "Glob" => format_glob_result(icon, &parsed),
         "grep_search" | "Grep" => format_grep_result(icon, &parsed),
         _ => format_generic_tool_result(icon, name, &parsed),

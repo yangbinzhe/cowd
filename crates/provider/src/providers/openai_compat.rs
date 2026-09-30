@@ -3819,7 +3819,7 @@ mod tests {
                 input_schema: json!({"type":"object"}),
             }]),
             tool_choice: Some(ToolChoice::Tool {
-                name: "write_file".to_string(),
+                name: "edit".to_string(),
             }),
             ..request
         };
