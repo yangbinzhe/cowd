@@ -901,6 +901,44 @@ impl LiveScenarioRunner {
                 acceptance: LiveAcceptance::Contains("56"),
                 timeout: LiveScenarioTimeout::direct(),
             },
+            // PLAN Experiment Level 1: the minimal capability probe.
+            //
+            // Deliberately neutral - it names the objective and the paths and
+            // says nothing about batching, orchestration or efficiency. That is
+            // what makes it a controlled measurement: any difference between
+            // builds is attributable to the tool surface the model can see, not
+            // to a hint we planted in the prompt. Earlier probes used a
+            // multi-team collaboration scenario, which is far too heavy to
+            // isolate whether one primitive works at all.
+            //
+            // Required facts are pinned per file so completion is unambiguous.
+            LiveScenarioSpec {
+                id: "live_minimal_batch_read",
+                prompt: "请读取以下 6 个源码文件，并对每个文件给出一个可核验的事实（文件路径 + 事实）。crates/tools/src/lib.rs —— workspace 的成员 crate 数量。crates/runtime/src/lib.rs —— 顶层 `pub mod` / `pub use` 的数量。crates/memory/src/lib.rs —— 记忆 crate 的模块数量。crates/gateway/src/main.rs —— main.rs 的行数。crates/provider/src/lib.rs —— provider crate 的公开导出条数。crates/harness-eval/src/lib.rs —— harness-eval 的行数。只使用只读工具，不要调用 bash 或任何写工具；读不到就保留 unresolved，不要凭先验知识作答。",
+                acceptance: LiveAcceptance::ArchitectureQuality {
+                    minimum_teams: 0,
+                    minimum_claimed_cross_team_edges: 0,
+                    evidence_profile: ArchitectureEvidenceProfile::Basic,
+                },
+                timeout: LiveScenarioTimeout::tool(),
+            },
+            // PLAN Experiment Level 1, facet 2: deterministic reduction OUTSIDE
+            // the model. Same neutral-prompt discipline as facet 1 - the
+            // objective names the work and says nothing about sandboxes,
+            // scripting or efficiency. This facet isolates whether the model can
+            // move counting/aggregation into `compute` instead of pulling every
+            // file body into context, which is the only path available now that
+            // we know there is no AST extractor.
+            LiveScenarioSpec {
+                id: "live_minimal_compute_reduce",
+                prompt: "请统计本 workspace 中 Rust 源码的总行数、以及 `.rs` 文件的数量，并给出 `crates/` 下哪一个 crate 的 `.rs` 文件最多（给出 crate 名与文件数）。只使用只读工具，不要调用 bash 或任何写工具；不要逐个人工累加文件内容。",
+                acceptance: LiveAcceptance::ArchitectureQuality {
+                    minimum_teams: 0,
+                    minimum_claimed_cross_team_edges: 0,
+                    evidence_profile: ArchitectureEvidenceProfile::Basic,
+                },
+                timeout: LiveScenarioTimeout::tool(),
+            },
             LiveScenarioSpec {
                 id: "live_tool_evidence",
                 prompt: "请读取当前工作区的 Cargo.toml，给出 workspace package version 和文件路径。必须通过只读工具取得证据，不要猜测。",
