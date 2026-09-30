@@ -912,7 +912,7 @@ impl LiveScenarioRunner {
             },
             LiveScenarioSpec {
                 id: "live_single_architecture_baseline",
-                prompt: "请单独完成一次复杂架构审查，不要启动团队。【强制第一步】必须先调用 read_file 逐个读取至少 3 个真实源码文件的内容（分别来自 crates/runtime/...、crates/memory/...、crates/gateway/...）；在成功读取至少 3 个源码文件内容之前，不要给出任何结论——仅枚举文件路径不算，必须真正读到文件内容。【第二步】基于你实际读到的源码内容，分别分析 runtime、memory、gateway 的职责边界、各自的 canonical state 或事件真相、一个潜在风险，并在结论里引用你实际读过的文件路径。只陈述本次实际读取到源码所能验证的结论；不要加入“无法确认/无法判断/未确认/需要进一步检查”之类的保留项。只能使用 read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot 这些只读工具，不要调用 bash 或任何写工具。",
+                prompt: "请单独完成一次复杂架构审查，不要启动团队。【强制第一步】必须先调用 read_file 逐个读取至少 3 个真实源码文件的内容（分别来自 crates/runtime/...、crates/memory/...、crates/gateway/...）；在成功读取至少 3 个源码文件内容之前，不要给出任何结论——仅枚举文件路径不算，必须真正读到文件内容。【第二步】基于你实际读到的源码内容，分别分析 runtime、memory、gateway 的职责边界、各自的 canonical state 或事件真相、一个潜在风险，并在结论里引用你实际读过的文件路径。只陈述本次实际读取到源码所能验证的结论；不要加入“无法确认/无法判断/未确认/需要进一步检查”之类的保留项。【强制首动作】第一个 provider 请求必须是一个 `tool_orchestrate` 编排：先用 glob_many/grep_many 定位相关源码，再用 `map` 批量 read_file 只读命中的小范围，一次编排内完成，不要逐轮逐个文件调用。需要跨文件统计、过滤或分支判断时，在编排里用 `compute`（execute_code 沙箱）在模型外归约，只回摘要，不要把大量原文搬进上下文。只读结果被截断时，用 `read` 按工具返回的 `tool://` 证据引用取回正文。可用工具：read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot、tool_orchestrate、execute_code、ast_grep_search、read、context_left。不要调用 bash 或任何写工具。",
                 acceptance: LiveAcceptance::ArchitectureQuality {
                     minimum_teams: 0,
                     minimum_claimed_cross_team_edges: 0,
@@ -922,7 +922,7 @@ impl LiveScenarioRunner {
             },
             LiveScenarioSpec {
                 id: IMPLICIT_COLLABORATION_SCENARIO_ID,
-                prompt: "请对三个独立责任域分别取得只读工具证据并交叉核验，最后统一综合结论。责任域一核查策略选择与执行义务，责任域二核查状态持久化与恢复，责任域三核查最终验收与投影。必须列出至少三个本次实际读取的完整 `crates/.../*.rs` 源码路径，只陈述工具证据能够验证的事实；不要自行指定 Team、Agent、角色、模板或编排拓扑。只能使用 read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot 这些只读工具，不要调用 bash 或任何写工具。",
+                prompt: "请对三个独立责任域分别取得只读工具证据并交叉核验，最后统一综合结论。责任域一核查策略选择与执行义务，责任域二核查状态持久化与恢复，责任域三核查最终验收与投影。必须列出至少三个本次实际读取的完整 `crates/.../*.rs` 源码路径，只陈述工具证据能够验证的事实；不要自行指定 Team、Agent、角色、模板或编排拓扑。【强制首动作】第一个 provider 请求必须是一个 `tool_orchestrate` 编排：先用 glob_many/grep_many 定位相关源码，再用 `map` 批量 read_file 只读命中的小范围，一次编排内完成，不要逐轮逐个文件调用。需要跨文件统计、过滤或分支判断时，在编排里用 `compute`（execute_code 沙箱）在模型外归约，只回摘要，不要把大量原文搬进上下文。只读结果被截断时，用 `read` 按工具返回的 `tool://` 证据引用取回正文。可用工具：read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot、tool_orchestrate、execute_code、ast_grep_search、read、context_left。不要调用 bash 或任何写工具。",
                 acceptance: LiveAcceptance::ArchitectureQuality {
                     minimum_teams: 3,
                     minimum_claimed_cross_team_edges: 0,

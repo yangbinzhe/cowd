@@ -186,10 +186,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "background_task_status",
-            description: "Inspect a background bash job started with \
-                run_in_background: its command, running/finished state, exit code, elapsed time, \
-                byte counts, persistedOutputPath, and a head+tail preview. Set `tail` to return \
-                only the last N bytes (incremental tailing) instead of the full preview.",
+            description: "Inspect a background job started with run_in_background: command, running/finished state, exit code, elapsed time, byte counts, persistedOutputPath and a head+tail preview. tail=N returns only the last N bytes. Boundary: it reports a job's state and a preview, never its full output - re-read the persisted range with read_file, and it requires that the job was started by run_in_background in this session.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -203,8 +200,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "background_task_kill",
-            description: "Cancel a background bash job started with run_in_background by killing \
-                its process group. The terminal state is recorded and surfaced on the next turn.",
+            description: "Cancel a background job by killing its process group; the terminal state is recorded and surfaced next turn. Boundary: it is terminal for that job - use background_task_status first if you still need its output, and it only reaches jobs started in this session.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -217,14 +213,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "read_file",
-            description: "Read a workspace text file, returning a bounded line window. \
-                Prefer one larger read over many small slices: when a file matters, read a \
-                substantial window rather than many tiny ones. Use grep_search to locate \
-                specific content in very large files. When the window is truncated, \
-                `nextOffset` is the offset to pass next to continue where it ended. When the \
-                task explicitly requires whole-file or EOF coverage, set complete=true to \
-                return the entire file under the file-size safety ceiling; complete=true \
-                takes precedence over an inherited offset or limit.",
+            description: "Read one workspace text file as a bounded line window (offset/limit), or the whole file with complete=true under the file-size safety ceiling. Prefer one substantial window over many small slices: a file that matters is worth reading widely. Boundary: the result is budgeted - on overflow you get head+tail plus truncated:true, nextOffset and a guidance block; continue from nextOffset, or narrow with grep_search first. complete=true is the only mode that yields a verifiable EOF receipt.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -240,7 +229,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "read_many",
-            description: "Read multiple text files from the workspace in one ordered batch. Each item supports complete=true for an explicitly required whole-file/EOF read under the file-size safety ceiling.",
+            description: "Read many workspace text files in ONE ordered batch. Items accept exactly the path/offset/limit/complete fields of read_file and run in parallel (bounded by max_concurrency, default the runtime ceiling) with per-item durationMs. Use it when you already know the paths. Boundary: each item is still a bounded window - a whole body only arrives with complete=true under the file-size ceiling, and the batch output is subject to the per-tool result budget, so prefer tool_orchestrate when the paths are not yet known or you must filter/aggregate between reads.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -267,7 +256,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "write_file",
-            description: "Write a text file in the workspace.",
+            description: "Create or fully replace a workspace text file. Boundary: it overwrites - use edit_file for a targeted replacement and mutation_preview to dry-run first. Large content is budgeted.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -281,7 +270,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit_file",
-            description: "Replace text in a workspace file.",
+            description: "Replace an exact string in one workspace file (replace_all for every occurrence). Boundary: the old string must match exactly once unless replace_all is set; the tool fails closed on a miss rather than guessing.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -297,7 +286,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "mutation_preview",
-            description: "Preview multiple text replacements without writing files.",
+            description: "Dry-run multiple text replacements without writing anything, reporting resulting content, replacement counts and hash changes per file. Canonical name for this operation: edit_many_preview and patch_plan are aliases routing to the same handler, kept so existing callers keep working. Use it to validate a multi-file edit before apply_patch_transaction.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -323,7 +312,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit_many_preview",
-            description: "Alias for mutation_preview optimized for multi-edit preflight.",
+            description: "Alias for mutation_preview.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -349,7 +338,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "patch_plan",
-            description: "Build a structured preflight plan for multiple text replacements.",
+            description: "Alias for mutation_preview.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -375,7 +364,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "apply_patch_transaction",
-            description: "Apply a multi-file mutation plan after expected-hash verification.",
+            description: "Apply a multi-file mutation plan after expected-hash verification, in declaration order under the per-call scope lock. Boundary: a tampered or stale target hash refuses the whole transaction; the effect escalates to the strictest sub-edit, so a write orchestration needs write authorization.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -405,7 +394,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "checkpoint_create",
-            description: "Create a lightweight workspace checkpoint before risky edits.",
+            description: "Create a lightweight workspace checkpoint before risky edits. Boundary: it snapshots the workspace, not the session state, so restore it only to undo workspace content.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -422,7 +411,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "checkpoint_list",
-            description: "List local workspace checkpoints.",
+            description: "List local workspace checkpoints with their ids and scope. Boundary: local checkpoints only - it never sees checkpoints held by another session or host.",
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -432,7 +421,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "checkpoint_diff",
-            description: "Compare the current workspace against a checkpoint.",
+            description: "Compare the current workspace against a checkpoint, reporting changed files and hashes. Boundary: it reports differences, never the changed content itself.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -445,7 +434,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "checkpoint_restore",
-            description: "Restore files from a local workspace checkpoint.",
+            description: "Restore files from a local workspace checkpoint. Boundary: it overwrites current content - diff first.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -458,7 +447,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "glob_search",
-            description: "Find files by glob pattern. A full result page includes continuationCursor: copy it unchanged with the same path and pattern to continue without dropping matches. scanComplete=false and omissions report inaccessible or depth-limited subtrees; refine those paths separately without the old cursor. Never infer absence from an incomplete scan. Project .gitignore/.ignore rules apply; include_ignored and ignore_patterns explicitly alter that scope. Explicit directory roots remain searchable. Results describe a live filesystem, not a frozen repository snapshot.",
+            description: "Find files by glob pattern, with continuationCursor paging. Use it to turn a where-is-X question into a concrete list before any read. Boundary: scanComplete=false with omissions reports inaccessible or depth-limited subtrees - refine an omitted subtree as a new search rather than assuming the list is complete.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -475,7 +464,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "glob_many",
-            description: "Run independent glob searches in one ordered read-only batch. Continue each result with its own continuationCursor and unchanged path/pattern. Inspect omissions when scanComplete=false; refine an omitted subtree as a new search without the old cursor. Partial results never prove absence.",
+            description: "Run several independent filename searches in ONE ordered batch, each continuing through its own continuationCursor. Boundary: each scan is bounded by depth, entries, duration and file size - inspect scanComplete/omissions and refine an omitted subtree as a new search; prefer tool_orchestrate when patterns must come from an earlier step.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -503,7 +492,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "grep_search",
-            description: "Preferred locator for symbols, text, or logic in large files. Search workspace file contents with a regex and return exact matching lines with optional context; scans are bounded by depth, entries, duration, and file size and report scanComplete=false when incomplete. Use next_request to continue even when one file has more than a page of matches; source changes during a file continuation are rejected. Context overlaps are emitted once. Project ignore rules apply unless include_ignored=true. Refine omissions before concluding no match exists; use it before bounded read_file calls to avoid expensive full-file scans.",
+            description: "Locate symbols, text or logic inside large files with a regex, returning exact matching lines with optional context lines. This is the cheapest way to find where to read: locate, then read only the range you need. Boundary: scans are bounded by depth, entries, duration and file size; use glob to narrow the candidate set first, and read the hit's range with read_file(offset=nextOffset) instead of re-scanning.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -532,7 +521,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "ast_grep_search",
-            description: "Locate code constructs across language-scoped source files. Searches file contents under the workspace with a regex, filtered by language extension; returns matching lines with path/line/column. Use before read_file to find definitions and call sites.",
+            description: "Regex content search restricted to one language's file extensions, returning path/line/column. Use it to sweep a language's files for a textual pattern while excluding every other language. Boundary: this is NOT a structural matcher - the pattern is a plain regex applied per line, so it cannot express a function named X or a struct with field Y; for arbitrary content use grep_search, and there is no AST tool in this catalog.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -550,7 +539,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "grep_many",
-            description: "Run multiple regex searches in one ordered read-only batch.",
+            description: "Run several independent content searches in ONE ordered batch; each entry takes the full grep_search field set and they run in parallel. Boundary: prefer tool_orchestrate when the patterns must be derived from an earlier result - its map step fans out the same way and compute can aggregate the hits without moving them into context.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -590,7 +579,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "workspace_snapshot",
-            description: "Discover actual workspace and repository roots, verified document entries, and executable expand/read/search requests before guessing paths. Directory and file pages report live-filesystem coverage and continuations; query filters directory metadata, not file contents.",
+            description: "Discover actual workspace and repository roots, verified document entries, and the executable expand/read/search requests available, before guessing paths. Boundary: directory and file pages are live-filesystem snapshots with their own continuation - they change as the workspace changes, so do not cache a listing across a mutation.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -610,7 +599,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "tool_batch_readonly",
-            description: "Execute multiple approved read-only tool calls in one ordered batch.",
+            description: "Execute several approved read-only tool calls in ONE ordered batch, in parallel, with per-item status and durationMs. Boundary: read-only tools only - writes are refused - and it is the flat form of tool_orchestrate, so prefer tool_orchestrate when you need map/filter/compute between calls.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -635,20 +624,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "tool_orchestrate",
-            description: "Run a bounded, read-only program over workspace query tools in ONE call. \
-                Steps run in order and share results through `$<id>` references, so one call can \
-                fetch, map, filter and aggregate instead of many single calls. Step shapes: \
-                {op:\"call\", id, tool, input}; {op:\"batch\", id, calls:[{tool, input, as?}]}; {op:\"map\", id, over:\"$<id>.list\", tool, input (use $item), field?}; \
-                {op:\"filter\", id, over, field, contains|equals}; \
-                {op:\"collect\", id, over, agg:\"count|first|last|join|sum\", field?, separator?}; \
-                {op:\"when\", id, if:{ref, present|equals|contains|nonEmpty}, tool, input}; \
-                {op:\"repeat\", id, max (<=25), while:{ref,...}, tool, input}; \
-                {op:\"compute\", id, language:\"python|javascript\", code, input} - data arrives in `_input`. \
-                Any tool the caller is authorized for may be orchestrated; write steps run in declaration \
-                order and the call's effect escalates to the strictest sub-call (a write orchestration \
-                therefore needs write authorization). compute runs in the read-only, network-off sandbox. \
-                Use `return:\"$<id>\"` to select the result. The response includes a `calls` trace \
-                (stepId/op/tool/calls/status/durationMs) of every step for evidence.",
+            description: "Run a bounded PROGRAM of many tool calls in ONE provider round: one instruction reaches its result without a round trip per step. This is the shortest path whenever the work is more than a single step - locate, read, aggregate and report in one call instead of one call per round. Bounds: <=50 steps, <=400 sub-calls in total, map over <=200 items, repeat <=25 rounds. Sub-calls run in declaration order and share values through `$<step_id>` references inside input objects; write a literal $ as $$. Step shapes, exactly as the input schema accepts them: {op:call,id,tool,input} one sub-call. {op:batch,id,calls:[{tool,input,as?}]} parallel fan-out (the same engine as read_many/grep_many). {op:map,id,over:$list,tool,input,field?} runs `tool` once per item of a prior list/collect result; `field` extracts that field from each item before it is passed as the item. {op:filter,id,over:$list,field,contains?,equals?} keeps the items whose `field` contains or equals a value. {op:collect,id,over:$list,agg,field?,separator?} aggregates a list, where agg is count|first|last|join|sum (join takes `separator`, default a single space). {op:compute,id,language,code,input?} runs code in the kernel-hardened read-only network-off sandbox over the data the program already holds and returns only stdout/stderr - use it to count, aggregate or compare across many files instead of moving their bodies into context. {op:when,id,if:{ref:$id,present?,equals?,contains?,non_empty?},tool,input?} runs one sub-call only when the condition holds. {op:repeat,id,max,while:{ref:$id,...},tool,input?} re-runs one sub-call while the condition holds, at most max times. Vocabulary: any catalog tool may be dispatched - read_file/read_many/glob_search/glob_many/grep_search/grep_many/ast_grep_search/workspace_snapshot to locate and read; execute_code/shell to reduce; write_file/edit_file/apply_patch_transaction to mutate, which needs write authorization; todo_write/checkpoint_*/skill_*/lsp/web_search/web_fetch/mcp to govern and integrate. tool_orchestrate itself may never be nested. Boundaries: every sub-call is authorized independently against the session tool allow-list, so an unauthorized tool fails closed naming that tool - the program never grants extra permission, and a write-requiring program is refused in a read-only session. Output is one JSON object: the `return` expression's value plus a per-step trace (op, tool, status, durationMs, error). Use `return` to select only the digest you need, because the whole result is subject to the tool-result budget.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -656,9 +632,68 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                         "type": "array",
                         "minItems": 1,
                         "maxItems": 50,
-                        "items": { "type": "object" }
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string" },
+                                "op": {
+                                    "type": "string",
+                                    "enum": ["call", "batch", "map", "filter", "collect", "compute", "when", "repeat"],
+                                    "description": "Step kind. call/batch/map/filter/collect/compute/when/repeat."
+                                },
+                                "tool": { "type": "string" },
+                                "input": { "type": "object" },
+                                "calls": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "tool": { "type": "string" },
+                                            "input": { "type": "object" },
+                                            "as": { "type": "string" }
+                                        },
+                                        "required": ["tool"]
+                                    }
+                                },
+                                "over": { "type": "string", "description": "$<step_id> reference to a list." },
+                                "field": { "type": "string" },
+                                "contains": { "type": "string" },
+                                "equals": {},
+                                "agg": {
+                                    "type": "string",
+                                    "enum": ["count", "first", "last", "join", "sum"]
+                                },
+                                "separator": { "type": "string" },
+                                "language": { "type": "string" },
+                                "code": { "type": "string" },
+                                "max": { "type": "integer", "minimum": 1, "maximum": 25 },
+                                "if": {
+                                        "type": "object",
+                                        "properties": {
+                                            "ref": { "type": "string" },
+                                            "present": { "type": "boolean" },
+                                            "equals": {},
+                                            "contains": { "type": "string" },
+                                            "non_empty": { "type": "boolean" }
+                                        },
+                                        "required": ["ref"]
+                                    },
+                                "while": {
+                                        "type": "object",
+                                        "properties": {
+                                            "ref": { "type": "string" },
+                                            "present": { "type": "boolean" },
+                                            "equals": {},
+                                            "contains": { "type": "string" },
+                                            "non_empty": { "type": "boolean" }
+                                        },
+                                        "required": ["ref"]
+                                    }
+                            },
+                            "required": ["id", "op"]
+                        }
                     },
-                    "return": { "type": "string" }
+                    "return": { "type": "string", "description": "$<step_id> to return." }
                 },
                 "required": ["steps"],
                 "additionalProperties": false
@@ -667,7 +702,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "tool_cache_stats",
-            description: "Report in-process read-only tool cache hit, miss, invalidation, and entry counts.",
+            description: "Report in-process read-only cache hit, miss, invalidation and entry counts. Use it to diagnose whether reads are being served from cache.",
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -677,7 +712,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "web_fetch",
-            description: "Fetch a URL, convert it into readable text, and answer a prompt about it.",
+            description: "Fetch a URL and answer a prompt about it, with allowed/blocked domain scoping. Boundary: the answer is only as good as the fetched text - cite the URL, and prefer web_search first to find the right one.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -700,7 +735,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "web_search",
-            description: "Federated no-key web search with concurrent public sources, intent routing, deduplication, source receipts, and cited results.",
+            description: "Federated web search across public sources with intent routing, deduplication, source receipts and cited results. Use it for facts that are not in the workspace. Boundary: results carry source receipts and any external claim must be cited; the tool does not fetch page bodies.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -743,7 +778,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "todo_write",
-            description: "Update the structured task list with priorities and status tracking.",
+            description: "Maintain the structured task list with priorities and status. Use it to make multi-step work auditable and resumable. Boundary: it is the plan of record - keep it short and current, not a log.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -776,7 +811,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "question",
-            description: "Ask the user a clarifying question. Use when ambiguous or need decision.",
+            description: "Ask the user a clarifying question with optional choices and wait. Alias for ask_user_question (same question/options input), kept for existing callers. Boundary: it blocks the turn until a reply - use send_user_message when you do not need an answer.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -790,7 +825,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "current_time",
-            description: "Return the current UTC time and local timezone with a bounded RFC3339 timestamp.",
+            description: "Return the current UTC time and local timezone as a bounded RFC3339 timestamp. Boundary: it is the Runtime clock, not a workspace fact - prefer the evidence in a tool result when both exist.",
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -800,7 +835,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "get_context_remaining",
-            description: "Return the active conversation's current context utilization and remaining budget in tokens.",
+            description: "Report the active conversation's context utilisation and remaining token budget. Use it to decide whether to compact, narrow scope, or stop reading.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -816,7 +851,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "request_plugin_install",
-            description: "Explicitly unsupported: plugin installation is a control-plane operation performed by an operator. The tool is registered so a model request fails closed with a clear reason instead of being silently ignored.",
+            description: "Refuses by design: plugin installation is an operator control-plane operation, never a model action. Present so a request fails closed with a clear reason instead of being silently ignored.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -829,7 +864,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "skill_install_plan",
-            description: "Acquire a local or GitHub Skill as inert content, inspect every bounded file, compute the canonical SHA-256 tree digest, and return blockers/warnings without activating it. Supported remote forms are https://github.com/<owner>/<repo>[/tree/<ref>/<path>] and github://<owner>/<repo>/<path>?ref=<ref>.",
+            description: "Acquire a local or GitHub skill as inert content, inspect every bounded file, and return the canonical SHA-256 tree digest plus blockers/warnings without activating anything. Use it before any install.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -842,7 +877,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "skill_install_commit",
-            description: "Re-acquire a previously reviewed Skill, require the exact expected SHA-256 tree digest, enforce supply-chain blockers, atomically activate an immutable revision, and emit a durable provenance receipt. This never executes packaged resources or grants capabilities.",
+            description: "Re-acquire a previously planned skill, require the exact expected SHA-256 tree digest, enforce supply-chain blockers, atomically activate an immutable revision and emit a provenance receipt. Boundary: it never executes packaged code, and a digest mismatch refuses the install.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -857,7 +892,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "skill_status",
-            description: "Read the active pointer, immutable revision history, and install receipts for one Cowd-managed Skill.",
+            description: "Read the active pointer, immutable revision history and install receipts for one skill. Boundary: it is a query for one skill and needs its id - use skill_install_plan first when the skill is not installed yet.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -870,7 +905,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "skill_rollback",
-            description: "Atomically reactivate an existing immutable Skill revision after recomputing and verifying its canonical digest; no package code is executed.",
+            description: "Atomically reactivate an existing immutable skill revision after recomputing and verifying its canonical digest. Boundary: it can only move to a revision that already exists, so it never re-acquires remote content, and a digest mismatch refuses.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -884,7 +919,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "skill_deactivate",
-            description: "Atomically remove a managed Skill active pointer while retaining immutable revisions and receipts for audit and rollback.",
+            description: "Atomically remove a skill's active pointer while retaining immutable revisions and receipts for audit and rollback. Boundary: it deactivates, never deletes - the revisions stay rollback-able via skill_rollback.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -897,7 +932,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "tool_search",
-            description: "Search for deferred or specialized tools by exact name or keywords.",
+            description: "Find a deferred or specialized tool by exact name or keywords and receive its descriptors. Boundary: activation applies to the next request in the SAME turn and it changes the tool set, so search once with a focused query rather than probing.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -911,7 +946,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "notebook_edit",
-            description: "Replace, insert, or delete a cell in a Jupyter notebook.",
+            description: "Replace, insert or delete a Jupyter notebook cell. Boundary: it edits cell source only - it does not execute the notebook.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -928,7 +963,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "sleep",
-            description: "Wait for a specified duration without holding a shell process.",
+            description: "Wait without holding a shell process. Boundary: it only paces an external dependency and burns a round of the turn budget, so prefer a background job or a longer tool timeout.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -941,7 +976,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "send_user_message",
-            description: "Send a message to the user.",
+            description: "Send a message to the user without waiting for a reply. Use it for progress and decisions; use ask_user_question when you need an answer.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -962,7 +997,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "config",
-            description: "Get or set Cowd settings.",
+            description: "Read or set a Cowd setting. Boundary: it changes local configuration and needs write authorization; operator-owned settings are refused.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -978,7 +1013,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "enter_plan_mode",
-            description: "Enable a worktree-local planning mode override and remember the previous local setting for exit_plan_mode.",
+            description: "Enable a worktree-local planning-mode override, remembering the previous local setting so exit_plan_mode can restore it. Boundary: it only affects this worktree, not other sessions or hosts.",
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -988,7 +1023,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "exit_plan_mode",
-            description: "Restore or clear the worktree-local planning mode override created by enter_plan_mode.",
+            description: "Restore or clear the planning-mode override created by enter_plan_mode. Boundary: it requires a matching enter_plan_mode in this worktree; with none it fails closed rather than guessing the previous state.",
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -998,7 +1033,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "structured_output",
-            description: "Return structured output in the requested format.",
+            description: "Return the final answer in the requested structured shape. Boundary: it is a presentation contract, not evidence - committed tool receipts still carry the facts.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": true
@@ -1007,7 +1042,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "repl",
-            description: "Execute code in a REPL-like subprocess.",
+            description: "Run code in an interactive-style subprocess with your own timeout. This is the stateful, full-access sibling of execute_code: it can write files and touch the network, so it needs full-access authorization. Boundary: prefer execute_code for pure reduction - it is read-only, network-off and deterministic.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1022,7 +1057,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "power_shell",
-            description: "Execute a PowerShell command with optional timeout.",
+            description: "Run a PowerShell command (Windows hosts) with an optional timeout and background detach. Same boundary as bash: full-access authorization.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1043,7 +1078,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "ask_user_question",
-            description: "Ask the user a question and wait for their response.",
+            description: "Ask the user a question with optional choices and block until they answer. Boundary: it stops the turn - use send_user_message when a reply is not required.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1060,7 +1095,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "lsp",
-            description: "Query Language Server Protocol for code intelligence (symbols, references, diagnostics).",
+            description: "Query a connected language server for symbols, references, hover or diagnostics at a position. Boundary: it needs a running server for that language, and it is only active when the experimental LSP surface is enabled.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1077,7 +1112,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "list_mcp_resources",
-            description: "List available resources from connected MCP servers.",
+            description: "List the resources published by connected MCP servers. Boundary: it lists resources, not tools - use mcp to call a tool, and a server must be configured and reachable to appear.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1089,7 +1124,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "read_mcp_resource",
-            description: "Read a specific resource from an MCP server by URI.",
+            description: "Read one MCP resource by server and uri. Boundary: the server must be configured and reachable, and the uri must be one that server actually published - prefer list_mcp_resources first.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1103,7 +1138,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "mcp_auth",
-            description: "Authenticate with an MCP server that requires OAuth or credentials.",
+            description: "Authenticate with an MCP server that requires OAuth or credentials. Operator action, not a task step: use it only when a server reports an auth failure and the credential can be obtained without human input. Boundary: it never stores or prints a secret.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1116,7 +1151,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "remote_trigger",
-            description: "Trigger a remote action or webhook endpoint.",
+            description: "POST to an arbitrary remote endpoint or webhook. Boundary: network egress and an operator-supplied URL are required - it is a control-plane action, not a task tool, and needs full-access authorization.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1133,7 +1168,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "mcp",
-            description: "Execute a tool provided by a connected MCP server.",
+            description: "Execute a tool exposed by a connected external MCP server, or list/read its resources. This is the only bridge to non-local capability: it is heavier than a local primitive and needs the server configured, so prefer local tools for anything the catalog already covers. Boundary: the server must be reachable and authenticated, and arguments pass through to it unvalidated.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1148,7 +1183,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "testing_permission",
-            description: "Test-only tool for verifying permission enforcement behavior.",
+            description: "Test-only probe for permission enforcement. It has no production purpose and refuses outside a test.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1162,9 +1197,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         // 3B-4: Built-in vision analysis tool (requires multimodal LLM support)
         ToolSpec {
             name: "vision_analyze",
-            description: "Prepare a local image file for multimodal LLM analysis. \
-                The tool validates and encodes the image; the runtime then attaches it as a structured vision input on the next model call. \
-                Use it when a prompt references an image path that is not already attached as vision input.",
+            description: "Prepare a local image for multimodal analysis: validate and encode it, and the runtime attaches it as a structured vision input on the next model call. Boundary: local images only, and it consumes one model round.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1189,9 +1222,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "execute_code",
-            description: "Execute code in a sandboxed interpreter. Use to analyze data programmatically instead of reading raw data into context. \
-                Supported: python, javascript, bash, ruby, lua. \
-                Only stdout/stderr returned. 30s timeout.",
+            description: "Deterministic reduction OUTSIDE the model. Runs python/javascript/bash/ruby/lua in a kernel-hardened, read-only, network-off sandbox and returns ONLY stdout/stderr (30s cap, nothing persisted). This is the tool for work that would otherwise mean pulling many files or many lines into context: count, aggregate, filter, compare, compute. Boundary: it cannot read the workspace itself - feed it data from read_file/read_many/grep_search, or dispatch it as tool_orchestrate's compute step where the program already holds the data.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1230,14 +1261,23 @@ mod tests {
             .expect("grep_search spec");
 
         assert!(read_file.description.contains("bounded"));
-        assert!(read_file.description.contains("one larger read"));
+        // The doc must push toward ONE substantial window rather than many small
+        // slices, and must name the recovery path and the EOF mode.
+        assert!(read_file.description.contains("substantial window"));
         assert!(read_file.description.contains("nextOffset"));
         assert!(read_file.description.contains("complete=true"));
+        // The key boundary must be stated: the result is budgeted and overflow
+        // is announced, never silent.
+        assert!(read_file.description.contains("budgeted"));
+        assert!(read_file.description.contains("truncated:true"));
         assert_eq!(
             read_file.input_schema["properties"]["complete"]["type"],
             "boolean"
         );
-        assert!(grep_search.description.contains("Preferred locator"));
+        assert!(grep_search.description.contains("locator")
+            || grep_search.description.contains("Locate"));
+        // grep must steer the model toward locate-then-read, not line-by-line.
+        assert!(grep_search.description.contains("locate"));
     }
 
     #[test]
@@ -1357,5 +1397,192 @@ mod tests {
             assert!(properties.contains_key("timeout_ms"));
             assert!(!properties.contains_key("timeout"));
         }
+    }
+}
+
+/// Every tool's documentation must be a usable specification, not a label.
+///
+/// The model only ever sees this string, so a thin or wrong description is a
+/// capability loss that no test would otherwise catch. Three rules, all
+/// mechanical:
+///
+/// 1. **Non-trivial tools must disclose their boundary.** A description with no
+///    limit, permission or failure condition tells the model nothing about
+///    where the tool stops being the right choice. Aliases and one-line
+///    pass-throughs are exempt because they defer to their canonical name.
+/// 2. **No false claim may survive.** `tool_orchestrate` used to describe itself
+///    as read-only after its vocabulary was widened to the whole catalog, and
+///    `ast_grep_search` claimed to locate code constructs while being a plain
+///    per-line regex. Both are now pinned.
+/// 3. **The orchestration primitive must document what it dispatches.** It is
+///    the only way one instruction drives many calls, so its bounds and
+///    vocabulary belong in the description, not in the model's imagination.
+#[test]
+fn every_tool_documentation_states_power_and_boundary_without_false_claims() {
+    let specs = mvp_tool_specs();
+    let by_name = |name: &str| {
+        specs
+            .iter()
+            .find(|spec| spec.name == name)
+            .unwrap_or_else(|| panic!("{name} spec is missing"))
+    };
+    // Documented aliases: they intentionally defer to their canonical tool.
+    const ALIASES: &[&str] = &[
+        "edit_many_preview",
+        "patch_plan",
+        "question",
+    ];
+
+    for spec in &specs {
+        if ALIASES.contains(&spec.name) {
+            continue;
+        }
+        assert!(
+            spec.description.len() >= 80,
+            "`{}` documentation is too thin to be a specification ({} chars): {}",
+            spec.name,
+            spec.description.len(),
+            spec.description
+        );
+        let lowered = spec.description.to_lowercase();
+        assert!(
+            lowered.contains("boundary")
+                || lowered.contains("prefer")
+                || lowered.contains("use it")
+                || lowered.contains("note")
+                || lowered.contains("fails closed")
+                || lowered.contains("refuses")
+                || lowered.contains("needs ")
+                || lowered.contains("requires"),
+            "`{}` never states where it stops being the right choice: {}",
+            spec.name,
+            spec.description
+        );
+    }
+
+    // Rule 2: false claims.
+    let orchestrate = by_name("tool_orchestrate");
+    assert!(
+        !orchestrate.description.contains("read-only program"),
+        "tool_orchestrate dispatches the whole catalog, not a read-only subset: {}",
+        orchestrate.description
+    );
+    let ast_grep = by_name("ast_grep_search");
+    assert!(
+        !ast_grep.description.to_lowercase().contains("code construct"),
+        "ast_grep_search is a per-line regex, not a structural matcher: {}",
+        ast_grep.description
+    );
+    assert!(
+        ast_grep.description.contains("NOT a structural matcher"),
+        "ast_grep_search must say what it is not: {}",
+        ast_grep.description
+    );
+
+    // Rule 3: the orchestration spec must carry bounds and vocabulary.
+    for required in [
+        "400 sub-calls",
+        "50 steps",
+        "map",
+        "compute",
+        "Vocabulary",
+        "allow-list",
+    ] {
+        assert!(
+            orchestrate.description.contains(required),
+            "tool_orchestrate documentation must cover `{required}`: {}",
+            orchestrate.description
+        );
+    }
+
+    // The two reads must stay clearly different: workspace bytes vs canonical
+    // Runtime references. Conflating them is how a model ends up reading a
+    // file with the wrong tool.
+    let read_file = by_name("read_file");
+    assert!(read_file.description.contains("workspace text file"));
+    assert!(read_file.description.contains("complete=true"));
+}
+
+/// The orchestration specification must match its input schema exactly.
+///
+/// The previous hand-written description claimed `{op:"filter",...op,value}`,
+/// `{op:"collect",...fields,as,limit}` and `{op:"when",...,then:[...],
+/// otherwise:[...]}` - none of which exist. The real fields are
+/// `filter{field,contains|equals}`, `collect{agg,field,separator}` and
+/// `when{if,tool,input}`, and `repeat{max,while,tool,input}` was missing
+/// entirely. A model that trusts the doc writes a program the parser rejects,
+/// so every op's real field name is pinned here against the schema itself.
+#[test]
+fn orchestrate_documentation_matches_its_own_input_schema() {
+    let specs = mvp_tool_specs();
+    let spec = specs
+        .iter()
+        .find(|spec| spec.name == "tool_orchestrate")
+        .expect("tool_orchestrate spec");
+    let schema = spec
+        .input_schema
+        .get("properties")
+        .and_then(|properties| properties.get("steps"))
+        .and_then(|steps| steps.get("items"))
+        .and_then(|items| items.get("properties"))
+        .expect("orchestrate steps item schema");
+    let doc = spec.description;
+
+    // Every op the schema discriminates on must be named in the doc.
+    let ops = schema
+        .get("op")
+        .and_then(|op| op.get("enum"))
+        .and_then(serde_json::Value::as_array)
+        .expect("op enum");
+    let op_names: Vec<&str> = ops.iter().filter_map(serde_json::Value::as_str).collect();
+    assert!(!op_names.is_empty(), "the op enum must be closed");
+    for op in &op_names {
+        assert!(
+            doc.contains(&format!("op:{op}")),
+            "op `{op}` exists in the schema but the doc never shows its shape"
+        );
+    }
+
+    // The doc must not invent an op the schema does not have.
+    for invented in ["op:fork", "op:spawn", "op:pipeline", "op:delegate"] {
+        assert!(
+            !doc.contains(invented),
+            "the doc describes a step that does not exist: {invented}"
+        );
+    }
+
+    // Real per-op field names, as parsed by `StepKind`.
+    for required in [
+        // call / batch
+        "tool",
+        "input",
+        "as?",
+        // map / filter / collect
+        "over",
+        "field?",
+        "contains?",
+        "equals?",
+        "agg",
+        "separator?",
+        // compute
+        "language",
+        "code",
+        // when / repeat
+        "if:{ref:",
+        "max",
+        "while:{ref:",
+    ] {
+        assert!(
+            doc.contains(required),
+            "the orchestration doc must state the real field `{required}`"
+        );
+    }
+
+    // Bounds must match the constants in `orchestrate.rs`.
+    for bound in ["50 steps", "400 sub-calls", "200 items", "25 rounds"] {
+        assert!(
+            doc.contains(bound),
+            "the orchestration doc must state its bound `{bound}`"
+        );
     }
 }
