@@ -123,12 +123,9 @@ pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
         | "config"
         | "plan_mode" => "builtin.workspace_write",
         "web_fetch" | "web_search" | "remote_trigger"
-        | "skill_install_plan" => "builtin.network",
-        "request_plugin_install"
-        | "skill_install_commit"
-        | "skill_rollback"
-        | "skill_deactivate" => "builtin.external_unknown",
-        "skill_status" => "builtin.readonly",
+ => "builtin.network",
+        "request_plugin_install" => "builtin.external_unknown",
+        "skill" => "runtime.action_skill",
         "sleep" => "builtin.process",
         "list_mcp_resources" | "read_mcp_resource" | "mcp_auth" | "mcp" => {
             "builtin.external_unknown"
@@ -1027,89 +1024,6 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
-            name: "skill_install_plan",
-            family: ToolFamily::Govern,
-            tier: ToolTier::Orchestration,
-            permission_key: "skill",
-            description: "Acquire a local or GitHub skill as inert content, inspect every bounded file, and return the canonical SHA-256 tree digest plus blockers/warnings without activating anything. Use it before any install.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "source": { "type": "string", "minLength": 1 }
-                },
-                "required": ["source"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "skill_install_commit",
-            family: ToolFamily::Govern,
-            tier: ToolTier::Operator,
-            permission_key: "skill",
-            description: "Re-acquire a previously planned skill, require the exact expected SHA-256 tree digest, enforce supply-chain blockers, atomically activate an immutable revision and emit a provenance receipt. Boundary: it never executes packaged code, and a digest mismatch refuses the install.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "source": { "type": "string", "minLength": 1 },
-                    "expected_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
-                    "allow_warnings": { "type": "boolean", "default": false }
-                },
-                "required": ["source", "expected_digest"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        ToolSpec {
-            name: "skill_status",
-            family: ToolFamily::Govern,
-            tier: ToolTier::Orchestration,
-            permission_key: "skill",
-            description: "Read the active pointer, immutable revision history and install receipts for one skill. Boundary: it is a query for one skill and needs its id - use skill_install_plan first when the skill is not installed yet.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "skill_id": { "type": "string", "minLength": 1 }
-                },
-                "required": ["skill_id"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "skill_rollback",
-            family: ToolFamily::Govern,
-            tier: ToolTier::Operator,
-            permission_key: "skill",
-            description: "Atomically reactivate an existing immutable skill revision after recomputing and verifying its canonical digest. Boundary: it can only move to a revision that already exists, so it never re-acquires remote content, and a digest mismatch refuses.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "skill_id": { "type": "string", "minLength": 1 },
-                    "revision": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
-                },
-                "required": ["skill_id", "revision"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        ToolSpec {
-            name: "skill_deactivate",
-            family: ToolFamily::Govern,
-            tier: ToolTier::Operator,
-            permission_key: "skill",
-            description: "Atomically remove a skill's active pointer while retaining immutable revisions and receipts for audit and rollback. Boundary: it deactivates, never deletes - the revisions stay rollback-able via skill_rollback.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "skill_id": { "type": "string", "minLength": 1 }
-                },
-                "required": ["skill_id"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        ToolSpec {
             name: "tool_search",
             family: ToolFamily::Govern,
             tier: ToolTier::EscapeHatch,
@@ -1247,6 +1161,27 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "run_in_background": { "type": "boolean" }
                 },
                 "required": ["command"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "skill",
+            family: ToolFamily::Govern,
+            tier: ToolTier::Orchestration,
+            permission_key: "skill",
+            description: "Manage local or GitHub skills through ONE entry point. action=install_plan (source): acquire as inert content, inspect every bounded file, return the canonical SHA-256 tree digest plus blockers/warnings; nothing is activated. action=install_commit (source, expected_digest, allow_warnings?): re-acquire, require the exact digest, enforce blockers, atomically activate an immutable revision and emit a provenance receipt. action=status (skill_id): read the active pointer, revision history and receipts. action=rollback (skill_id, revision): atomically reactivate an existing revision after digest verification. action=deactivate (skill_id): remove the active pointer while retaining immutable revisions. Boundary: it never executes packaged code and never deletes revisions, and a digest mismatch refuses.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["install_plan", "install_commit", "status", "rollback", "deactivate"] },
+                    "source": { "type": "string", "minLength": 1 },
+                    "expected_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+                    "allow_warnings": { "type": "boolean", "default": false },
+                    "skill_id": { "type": "string", "minLength": 1 },
+                    "revision": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+                },
+                "required": ["action"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::DangerFullAccess,
@@ -1547,25 +1482,19 @@ mod tests {
     }
 
     #[test]
-    fn skill_supply_chain_tools_separate_review_from_mutation() {
+    fn skill_supply_chain_separates_review_from_mutation() {
         let specs = mvp_tool_specs();
-        let plan = specs
+        let skill = specs
             .iter()
-            .find(|spec| spec.name == "skill_install_plan")
-            .expect("plan tool");
-        let commit = specs
-            .iter()
-            .find(|spec| spec.name == "skill_install_commit")
-            .expect("commit tool");
-        assert_eq!(plan.required_permission, PermissionMode::ReadOnly);
-        assert_eq!(commit.required_permission, PermissionMode::DangerFullAccess);
+            .find(|spec| spec.name == "skill")
+            .expect("skill tool");
+        // The strictest action is the static floor, which is what the
+        // orchestration escalation path uses (it cannot see sub-call input).
+        // The action-aware resolver lowers it to ReadOnly for query actions.
+        assert_eq!(skill.required_permission, PermissionMode::DangerFullAccess);
         assert_eq!(
-            builtin_effect_resolver_spec(plan.name).resolver_id,
-            "builtin.network"
-        );
-        assert_eq!(
-            builtin_effect_resolver_spec(commit.name).resolver_id,
-            "builtin.external_unknown"
+            builtin_effect_resolver_spec(skill.name).resolver_id,
+            "runtime.action_skill"
         );
     }
 
@@ -1888,7 +1817,7 @@ mod family_taxonomy_tests {
     #[test]
     fn every_tool_declares_a_family_tier_and_permission_key() {
         let specs = mvp_tool_specs();
-        assert_eq!(specs.len(), 52, "the catalog size is the contract");
+        assert_eq!(specs.len(), 48, "the catalog size is the contract");
         for spec in &specs {
             assert!(
                 !spec.permission_key.is_empty(),
@@ -1940,8 +1869,6 @@ mod family_taxonomy_tests {
     #[test]
     fn canonical_tools_do_not_share_a_permission_slot_beyond_the_legacy_ledger() {
         const LEGACY: &[(&str, &str, &str, usize)] = &[
-            ("Govern", "skill", "Operator", 3),
-            ("Govern", "skill", "Orchestration", 2),
             ("Locate", "grep", "Orchestration", 2),
             ("Mcp", "mcp", "Orchestration", 3),
             ("Mutate", "checkpoint", "Orchestration", 2),

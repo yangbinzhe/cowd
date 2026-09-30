@@ -862,8 +862,8 @@ fn skill_install_tools_bind_reviewed_digest_and_workspace_source() {
 
     let plan = execute_in_workspace(
         &root,
-        "skill_install_plan",
-        &json!({"source": "reviewed-skill"}),
+        "skill",
+        &json!({"action": "install_plan", "source": "reviewed-skill"}),
     )
     .expect("plan");
     let plan: serde_json::Value = serde_json::from_str(&plan).expect("plan json");
@@ -874,8 +874,9 @@ fn skill_install_tools_bind_reviewed_digest_and_workspace_source() {
 
     let mismatch = execute_in_workspace(
             &root,
-            "skill_install_commit",
+            "skill",
             &json!({
+                "action": "install_commit",
                 "source": "reviewed-skill",
                 "expected_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             }),
@@ -885,8 +886,8 @@ fn skill_install_tools_bind_reviewed_digest_and_workspace_source() {
 
     let receipt = execute_in_workspace(
         &root,
-        "skill_install_commit",
-        &json!({"source": "reviewed-skill", "expected_digest": digest}),
+        "skill",
+        &json!({"action": "install_commit", "source": "reviewed-skill", "expected_digest": digest}),
     )
     .expect("commit");
     let receipt: serde_json::Value = serde_json::from_str(&receipt).expect("receipt json");
@@ -896,8 +897,8 @@ fn skill_install_tools_bind_reviewed_digest_and_workspace_source() {
 
     let status = execute_in_workspace(
         &root,
-        "skill_status",
-        &json!({"skill_id": "reviewed-skill"}),
+        "skill",
+        &json!({"action": "status", "skill_id": "reviewed-skill"}),
     )
     .expect("status");
     let status: serde_json::Value = serde_json::from_str(&status).expect("status json");
@@ -912,8 +913,8 @@ fn skill_install_tools_bind_reviewed_digest_and_workspace_source() {
     .expect("outside prompt");
     let rejected = execute_in_workspace(
         &root,
-        "skill_install_plan",
-        &json!({"source": outside.display().to_string()}),
+        "skill",
+        &json!({"action": "install_plan", "source": outside.display().to_string()}),
     )
     .expect_err("model local sources outside the workspace must fail");
     assert!(rejected.contains("limited to the current workspace"));
@@ -1972,7 +1973,7 @@ fn tool_orchestrate_admits_catalog_tools_and_rejects_unknown_ones() {
         "read_file was always composable"
     );
     assert!(
-        is_allowed_orchestration_tool("skill_install_plan"),
+        is_allowed_orchestration_tool("skill"),
         "long-tail catalog tools are composable too"
     );
     assert!(

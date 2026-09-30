@@ -65,15 +65,29 @@ pub(crate) fn execute_with_lease(
         "tool_orchestrate" => run_orchestrate(lease, input),
         "web_fetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
         "web_search" => from_value::<WebSearchInput>(input).and_then(run_web_search),
-        "skill_install_plan" => from_value::<SkillInstallPlanInput>(input)
-            .and_then(|parsed| run_skill_install_plan(lease, parsed)),
-        "skill_install_commit" => from_value::<SkillInstallCommitInput>(input)
-            .and_then(|parsed| run_skill_install_commit(lease, parsed)),
-        "skill_status" => from_value::<SkillStatusInput>(input).and_then(run_skill_status),
-        "skill_rollback" => from_value::<SkillRollbackInput>(input)
-            .and_then(|parsed| run_skill_rollback(lease, parsed)),
-        "skill_deactivate" => from_value::<SkillStatusInput>(input)
-            .and_then(|parsed| run_skill_deactivate(lease, parsed)),
+        "skill" => {
+            // The merged family's own `action` field is not part of the per-action
+            // input contracts, which deny unknown fields.
+            let action = input.get("action").and_then(serde_json::Value::as_str);
+            let mut rest = input.clone();
+            if let Some(object) = rest.as_object_mut() {
+                object.remove("action");
+            }
+            match action {
+                Some("install_plan") => from_value::<SkillInstallPlanInput>(&rest)
+                    .and_then(|parsed| run_skill_install_plan(lease, parsed)),
+                Some("install_commit") => from_value::<SkillInstallCommitInput>(&rest)
+                    .and_then(|parsed| run_skill_install_commit(lease, parsed)),
+                Some("status") => from_value::<SkillStatusInput>(&rest).and_then(run_skill_status),
+                Some("rollback") => from_value::<SkillRollbackInput>(&rest)
+                    .and_then(|parsed| run_skill_rollback(lease, parsed)),
+                Some("deactivate") => from_value::<SkillStatusInput>(&rest)
+                    .and_then(|parsed| run_skill_deactivate(lease, parsed)),
+                other => Err(format!(
+                    "skill action must be install_plan|install_commit|status|rollback|deactivate, got {other:?}"
+                )),
+            }
+        }
         "todo_write" => {
             from_value::<TodoWriteInput>(input).and_then(|parsed| run_todo_write(lease, parsed))
         }
