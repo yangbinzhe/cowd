@@ -771,6 +771,41 @@ cargo test -p runtime --lib
 cargo test -p gateway --lib
 ```
 
+### 16.1 全量回归的 PostgreSQL 容量前提
+
+`cargo test --workspace` 有 9 个测试二进制需要隔离 PostgreSQL，其中 gateway 的测试执行器
+声明 `max_connections = 64`（`crates/gateway/src/main.rs`，`min_idle_connections = Some(0)`，
+按需获取）。**总需求是各二进制之和，因此 fixture 服务端的 `max_connections` 必须容纳它们。**
+
+若服务端上限过低（例如默认 100），症状**不是** "too many connections"，而是成片的
+
+```
+isolated PostgreSQL test executor: postgres connection config for `gateway-test` is invalid
+```
+
+因为容量预检在配置阶段就会失败，错误信息会误导人去查 URL 或密码。实测：
+
+| fixture `max_connections` | 失败数 | 需要额外限制 | 最长二进制耗时 |
+|---|---|---|---|
+| 100 | 274（全部为 PG 池签名） | `--test-threads=2` | 270.5s |
+| 400 | **0** | 无（默认并行度） | **186.5s** |
+
+设置方式（改完需重启容器，`pg_reload_conf()` 对该参数无效）：
+
+```bash
+docker exec <fixture> psql -U postgres -c "ALTER SYSTEM SET max_connections = 400;"
+docker restart <fixture>          # 重启后可能需等待一次数据目录 fsync 恢复
+psql -h 127.0.0.1 -p <port> -U postgres -tAc "show max_connections"
+```
+
+诊断这类失败时先看计数，可一眼区分"环境容量"与"真实回归"：
+
+```bash
+grep -c "isolated PostgreSQL test executor" <test log>
+```
+
+计数与失败数相同 ⇒ 容量问题；否则才是代码回归。
+
 cowd-edge 验证：
 
 ```bash
