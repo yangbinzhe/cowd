@@ -21,8 +21,13 @@ use crate::{
 struct State {
     entries: BTreeMap<String, MemoryEntry>,
     discovery_revisions: BTreeMap<String, i64>,
-    entities: BTreeMap<String, Entity>,
-    triples: BTreeMap<String, Triple>,
+    /// PLAN B-8: keyed by `(scope_key, id)`, matching the Postgres store's
+    /// scope-partitioned tables. A flat id-keyed map made the in-memory store
+    /// MERGE across scopes while the durable store REPLACED per scope, so a test
+    /// double and production disagreed about what "save the graph for scope X"
+    /// means.
+    entities: BTreeMap<(String, String), Entity>,
+    triples: BTreeMap<(String, String), Triple>,
     verbatim: BTreeMap<String, VerbatimEntry>,
     symbols: BTreeMap<String, CodeSymbol>,
     edges: Vec<SymbolEdge>,
@@ -531,25 +536,43 @@ impl MemoryStore for EphemeralMemoryStore {
             .collect())
     }
 
-    async fn save_entities(&self, _scope_key: &str, values: &[Entity]) -> Result<()> {
+    async fn save_entities(&self, scope_key: &str, values: &[Entity]) -> Result<()> {
         let mut s = self.write()?;
+        // Scope-keyed REPLACE, matching the Postgres store: saving the graph for a
+        // scope replaces that scope's set rather than merging into every scope.
+        s.entities.retain(|(scope, _), _| scope != scope_key);
         for v in values {
-            s.entities.insert(v.id.clone(), v.clone());
+            s.entities
+                .insert((scope_key.to_string(), v.id.clone()), v.clone());
         }
         Ok(())
     }
-    async fn load_entities(&self, _scope_key: &str) -> Result<Vec<Entity>> {
-        Ok(self.read()?.entities.values().cloned().collect())
+    async fn load_entities(&self, scope_key: &str) -> Result<Vec<Entity>> {
+        Ok(self
+            .read()?
+            .entities
+            .iter()
+            .filter(|((scope, _), _)| scope == scope_key)
+            .map(|(_, entity)| entity.clone())
+            .collect())
     }
-    async fn save_triples(&self, _scope_key: &str, values: &[Triple]) -> Result<()> {
+    async fn save_triples(&self, scope_key: &str, values: &[Triple]) -> Result<()> {
         let mut s = self.write()?;
+        s.triples.retain(|(scope, _), _| scope != scope_key);
         for v in values {
-            s.triples.insert(v.id.clone(), v.clone());
+            s.triples
+                .insert((scope_key.to_string(), v.id.clone()), v.clone());
         }
         Ok(())
     }
-    async fn load_triples(&self, _scope_key: &str) -> Result<Vec<Triple>> {
-        Ok(self.read()?.triples.values().cloned().collect())
+    async fn load_triples(&self, scope_key: &str) -> Result<Vec<Triple>> {
+        Ok(self
+            .read()?
+            .triples
+            .iter()
+            .filter(|((scope, _), _)| scope == scope_key)
+            .map(|(_, triple)| triple.clone())
+            .collect())
     }
     async fn save_verbatim(
         &self,
@@ -707,5 +730,80 @@ impl MemoryStore for EphemeralMemoryStore {
                 value: v.clone(),
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+
+    fn entity(id: &str) -> Entity {
+        let now = chrono::Utc::now();
+        Entity {
+            id: id.to_string(),
+            name: id.to_string(),
+            entity_type: crate::entity::EntityType::Concept,
+            confidence: 1.0,
+            frequency: 1,
+            first_seen: now,
+            last_seen: now,
+            source_ids: Vec::new(),
+            source_type: "test".to_string(),
+        }
+    }
+
+    /// PLAN B-8: the in-memory store must mean the same thing by "save the graph
+    /// for scope X" as the durable store - a scope-keyed REPLACE, not a global
+    /// merge. Before this, a test double and production disagreed.
+    #[tokio::test]
+    async fn saving_a_scope_replaces_only_that_scope() {
+        let store = EphemeralMemoryStore::new();
+        store
+            .save_entities("scope-a", &[entity("a1"), entity("a2")])
+            .await
+            .expect("save a");
+        store
+            .save_entities("scope-b", &[entity("b1")])
+            .await
+            .expect("save b");
+
+        let mut a = store
+            .load_entities("scope-a")
+            .await
+            .expect("load a")
+            .into_iter()
+            .map(|entity| entity.id)
+            .collect::<Vec<_>>();
+        a.sort();
+        assert_eq!(a, vec!["a1".to_string(), "a2".to_string()]);
+        assert_eq!(
+            store
+                .load_entities("scope-b")
+                .await
+                .expect("load b")
+                .into_iter()
+                .map(|entity| entity.id)
+                .collect::<Vec<_>>(),
+            vec!["b1".to_string()],
+            "scope-b must be untouched by scope-a"
+        );
+
+        // Re-saving scope-a REPLACES it, and never leaks into scope-b.
+        store
+            .save_entities("scope-a", &[entity("a3")])
+            .await
+            .expect("replace a");
+        assert_eq!(
+            store
+                .load_entities("scope-a")
+                .await
+                .expect("load a")
+                .into_iter()
+                .map(|entity| entity.id)
+                .collect::<Vec<_>>(),
+            vec!["a3".to_string()],
+            "saving a scope replaces that scope's set"
+        );
+        assert_eq!(store.load_entities("scope-b").await.expect("load b").len(), 1);
     }
 }
