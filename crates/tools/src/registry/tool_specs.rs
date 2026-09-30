@@ -3,9 +3,71 @@ use serde_json::{json, Value};
 use crate::permissions::PermissionMode;
 use harness_contract::tool::ToolEffectResolverSpec;
 
+/// The capability family a tool belongs to.
+///
+/// One family is one KIND OF WORK. The structural contract is that every tool
+/// declares exactly one family, and a family is not represented by two live
+/// tools at the same exposure tier. This is the taxonomy the flat catalog
+/// lacked: before it the only groupings were the effect resolver (a permission
+/// dimension, not a functional one) and the catalog source
+/// (builtin / runtime / plugin).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ToolFamily {
+    /// Find files, symbols or content.
+    Locate,
+    /// Read workspace bytes or Runtime references.
+    Read,
+    /// Reduce many inputs to a digest outside the model.
+    Reduce,
+    /// Change files, checkpoints, notebooks or skills.
+    Mutate,
+    /// Structured planning or execution mode.
+    Plan,
+    /// Ask the user.
+    Ask,
+    /// Reach the network.
+    Web,
+    /// Background jobs and per-session counters.
+    Session,
+    /// Analyse an image.
+    Vision,
+    /// Language-server queries.
+    Lsp,
+    /// Bridge to external MCP tools.
+    Mcp,
+    /// Discovery, governance and operator-only control.
+    Govern,
+    /// Drive a bounded program of other tools.
+    Orchestrate,
+    /// Semantic collaboration actions.
+    Collaborate,
+}
+
+/// How a tool is exposed to the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ToolTier {
+    /// Always exposed on the first request of a turn: the working set every task
+    /// is expected to need.
+    Direct,
+    /// Reachable through the orchestration vocabulary or on activation.
+    Orchestration,
+    /// Escape hatch: discovered and activated on demand.
+    EscapeHatch,
+    /// Registered to fail closed; deliberately outside the model's decision
+    /// surface (operator / control-plane only).
+    Operator,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolSpec {
     pub name: &'static str,
+    /// The capability family. Exactly one.
+    pub family: ToolFamily,
+    /// The exposure tier.
+    pub tier: ToolTier,
+    /// The permission family key this tool grants, `"none"` when it grants no
+    /// authority beyond reading.
+    pub permission_key: &'static str,
     pub description: &'static str,
     pub input_schema: Value,
     pub required_permission: PermissionMode,
@@ -119,6 +181,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "bash",
+            family: ToolFamily::Reduce,
+            tier: ToolTier::EscapeHatch,
+            permission_key: "shell",
             description: "Execute a shell command in the current workspace. Prefer \
                 one-shot multi-step chains (&&, |, tee) over repeated single-step calls: each \
                 call is a separate turn of the budget. The shell is the right tool for search, \
@@ -187,6 +252,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "background_task_status",
+            family: ToolFamily::Session,
+            tier: ToolTier::Orchestration,
+            permission_key: "background",
             description: "Inspect a background job started with run_in_background: command, running/finished state, exit code, elapsed time, byte counts, persistedOutputPath and a head+tail preview. tail=N returns only the last N bytes. Boundary: it reports a job's state and a preview, never its full output - re-read the persisted range with read_file, and it requires that the job was started by run_in_background in this session.",
             input_schema: json!({
                 "type": "object",
@@ -201,6 +269,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "background_task_kill",
+            family: ToolFamily::Session,
+            tier: ToolTier::Orchestration,
+            permission_key: "background",
             description: "Cancel a background job by killing its process group; the terminal state is recorded and surfaced next turn. Boundary: it is terminal for that job - use background_task_status first if you still need its output, and it only reaches jobs started in this session.",
             input_schema: json!({
                 "type": "object",
@@ -214,6 +285,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "read_file",
+            family: ToolFamily::Read,
+            tier: ToolTier::Direct,
+            permission_key: "read",
             description: "Read one workspace text file as a bounded line window (offset/limit), or the whole file with complete=true under the file-size safety ceiling. Prefer one substantial window over many small slices: a file that matters is worth reading widely. Boundary: the result is budgeted - on overflow you get head+tail plus truncated:true, nextOffset and a guidance block; continue from nextOffset, or narrow with grep_search first. complete=true is the only mode that yields a verifiable EOF receipt.",
             input_schema: json!({
                 "type": "object",
@@ -230,6 +304,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "read_many",
+            family: ToolFamily::Read,
+            tier: ToolTier::Orchestration,
+            permission_key: "read",
             description: "Read many workspace text files in ONE ordered batch. Items accept exactly the path/offset/limit/complete fields of read_file and run in parallel (bounded by max_concurrency, default the runtime ceiling) with per-item durationMs. Use it when you already know the paths. Boundary: each item is still a bounded window - a whole body only arrives with complete=true under the file-size ceiling, and the batch output is subject to the per-tool result budget, so prefer tool_orchestrate when the paths are not yet known or you must filter/aggregate between reads.",
             input_schema: json!({
                 "type": "object",
@@ -258,6 +335,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "write_file",
+            family: ToolFamily::Mutate,
+            tier: ToolTier::Orchestration,
+            permission_key: "edit",
             description: "Create or fully replace a workspace text file. Boundary: it overwrites - use edit_file for a targeted replacement and mutation_preview to dry-run first. Large content is budgeted.",
             input_schema: json!({
                 "type": "object",
@@ -272,6 +352,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit_file",
+            family: ToolFamily::Mutate,
+            tier: ToolTier::Orchestration,
+            permission_key: "edit",
             description: "Replace an exact string in one workspace file (replace_all for every occurrence). Boundary: the old string must match exactly once unless replace_all is set; the tool fails closed on a miss rather than guessing.",
             input_schema: json!({
                 "type": "object",
@@ -288,6 +371,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "mutation_preview",
+            family: ToolFamily::Mutate,
+            tier: ToolTier::Orchestration,
+            permission_key: "edit",
             description: "Dry-run multiple text replacements without writing anything, reporting resulting content, replacement counts and hash changes per file. Canonical name for this operation: edit_many_preview and patch_plan are aliases routing to the same handler, kept so existing callers keep working. Use it to validate a multi-file edit before apply_patch_transaction.",
             input_schema: json!({
                 "type": "object",
@@ -314,6 +400,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit_many_preview",
+            family: ToolFamily::Mutate,
+            tier: ToolTier::Orchestration,
+            permission_key: "edit",
             description: "Alias for mutation_preview.",
             input_schema: json!({
                 "type": "object",
@@ -340,6 +429,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "patch_plan",
+            family: ToolFamily::Mutate,
+            tier: ToolTier::Orchestration,
+            permission_key: "edit",
             description: "Alias for mutation_preview.",
             input_schema: json!({
                 "type": "object",
@@ -366,6 +458,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "apply_patch_transaction",
+            family: ToolFamily::Mutate,
+            tier: ToolTier::Orchestration,
+            permission_key: "edit",
             description: "Apply a multi-file mutation plan after expected-hash verification, in declaration order under the per-call scope lock. Boundary: a tampered or stale target hash refuses the whole transaction; the effect escalates to the strictest sub-edit, so a write orchestration needs write authorization.",
             input_schema: json!({
                 "type": "object",
@@ -396,6 +491,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "checkpoint_create",
+            family: ToolFamily::Mutate,
+            tier: ToolTier::Orchestration,
+            permission_key: "checkpoint",
             description: "Create a lightweight workspace checkpoint before risky edits. Boundary: it snapshots the workspace, not the session state, so restore it only to undo workspace content.",
             input_schema: json!({
                 "type": "object",
@@ -413,6 +511,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "checkpoint_list",
+            family: ToolFamily::Session,
+            tier: ToolTier::Orchestration,
+            permission_key: "checkpoint",
             description: "List local workspace checkpoints with their ids and scope. Boundary: local checkpoints only - it never sees checkpoints held by another session or host.",
             input_schema: json!({
                 "type": "object",
@@ -423,6 +524,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "checkpoint_diff",
+            family: ToolFamily::Session,
+            tier: ToolTier::Orchestration,
+            permission_key: "checkpoint",
             description: "Compare the current workspace against a checkpoint, reporting changed files and hashes. Boundary: it reports differences, never the changed content itself.",
             input_schema: json!({
                 "type": "object",
@@ -436,6 +540,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "checkpoint_restore",
+            family: ToolFamily::Mutate,
+            tier: ToolTier::Orchestration,
+            permission_key: "checkpoint",
             description: "Restore files from a local workspace checkpoint. Boundary: it overwrites current content - diff first.",
             input_schema: json!({
                 "type": "object",
@@ -449,6 +556,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "glob_search",
+            family: ToolFamily::Locate,
+            tier: ToolTier::Direct,
+            permission_key: "glob",
             description: "Find files by glob pattern, with continuationCursor paging. Use it to turn a where-is-X question into a concrete list before any read. Boundary: scanComplete=false with omissions reports inaccessible or depth-limited subtrees - refine an omitted subtree as a new search rather than assuming the list is complete.",
             input_schema: json!({
                 "type": "object",
@@ -466,6 +576,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "glob_many",
+            family: ToolFamily::Locate,
+            tier: ToolTier::Orchestration,
+            permission_key: "glob",
             description: "Run several independent filename searches in ONE ordered batch, each continuing through its own continuationCursor. Boundary: each scan is bounded by depth, entries, duration and file size - inspect scanComplete/omissions and refine an omitted subtree as a new search; prefer tool_orchestrate when patterns must come from an earlier step.",
             input_schema: json!({
                 "type": "object",
@@ -495,6 +608,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "grep_search",
+            family: ToolFamily::Locate,
+            tier: ToolTier::Direct,
+            permission_key: "grep",
             description: "Locate symbols, text or logic inside large files with a regex, returning exact matching lines with optional context lines. This is the cheapest way to find where to read: locate, then read only the range you need. Boundary: scans are bounded by depth, entries, duration and file size; use glob to narrow the candidate set first, and read the hit's range with read_file(offset=nextOffset) instead of re-scanning.",
             input_schema: json!({
                 "type": "object",
@@ -524,6 +640,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "ast_grep_search",
+            family: ToolFamily::Locate,
+            tier: ToolTier::Orchestration,
+            permission_key: "grep",
             description: "Regex content search restricted to one language's file extensions, returning path/line/column. Use it to sweep a language's files for a textual pattern while excluding every other language. Boundary: this is NOT a structural matcher - the pattern is a plain regex applied per line, so it cannot express a function named X or a struct with field Y; for arbitrary content use grep_search, and there is no AST tool in this catalog.",
             input_schema: json!({
                 "type": "object",
@@ -542,6 +661,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "grep_many",
+            family: ToolFamily::Locate,
+            tier: ToolTier::Orchestration,
+            permission_key: "grep",
             description: "Run several independent content searches in ONE ordered batch; each entry takes the full grep_search field set and they run in parallel. Boundary: prefer tool_orchestrate when the patterns must be derived from an earlier result - its map step fans out the same way and compute can aggregate the hits without moving them into context.",
             input_schema: json!({
                 "type": "object",
@@ -583,6 +705,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "workspace_snapshot",
+            family: ToolFamily::Locate,
+            tier: ToolTier::Direct,
+            permission_key: "read",
             description: "Discover actual workspace and repository roots, verified document entries, and the executable expand/read/search requests available, before guessing paths. Boundary: directory and file pages are live-filesystem snapshots with their own continuation - they change as the workspace changes, so do not cache a listing across a mutation.",
             input_schema: json!({
                 "type": "object",
@@ -603,6 +728,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "tool_batch_readonly",
+            family: ToolFamily::Orchestrate,
+            tier: ToolTier::Direct,
+            permission_key: "read",
             description: "Execute several approved read-only tool calls in ONE ordered batch, in parallel, with per-item status and durationMs. Boundary: read-only tools only - writes are refused - and it is the flat form of tool_orchestrate, so prefer tool_orchestrate when you need map/filter/compute between calls.",
             input_schema: json!({
                 "type": "object",
@@ -629,6 +757,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "tool_orchestrate",
+            family: ToolFamily::Orchestrate,
+            tier: ToolTier::Direct,
+            permission_key: "batch",
             description: "Run a bounded PROGRAM of many tool calls in ONE provider round: one instruction reaches its result without a round trip per step. This is the shortest path whenever the work is more than a single step - locate, read, aggregate and report in one call instead of one call per round. Bounds: <=50 steps, <=400 sub-calls in total, map over <=200 items, repeat <=25 rounds. Sub-calls run in declaration order and share values through `$<step_id>` references inside input objects; write a literal $ as $$. Step shapes, exactly as the input schema accepts them: {op:call,id,tool,input} one sub-call. {op:batch,id,calls:[{tool,input,as?}]} parallel fan-out (the same engine as read_many/grep_many). {op:map,id,over:$list,tool,input,field?} runs `tool` once per item of a prior list/collect result; `field` extracts that field from each sub-call's RESULT before it is collected (it does not pre-select from the input item). {op:filter,id,over:$list,field,contains?,equals?} keeps the items whose `field` contains or equals a value. {op:collect,id,over:$list,agg,field?,separator?} aggregates a list, where agg is count|first|last|join|sum (join takes `separator`, default a single space). {op:compute,id,language,code,input?} runs code in the kernel-hardened read-only network-off sandbox over the data the program already holds and returns only stdout/stderr - use it to count, aggregate or compare across many files instead of moving their bodies into context. {op:when,id,if:{ref:$id,present?,equals?,contains?,non_empty?},tool,input?} runs one sub-call only when the condition holds. {op:repeat,id,max,while:{ref:$id,...},tool,input?} re-runs one sub-call while the condition holds, at most max times. Vocabulary: any catalog tool may be dispatched - read_file/read_many/glob_search/glob_many/grep_search/grep_many/ast_grep_search/workspace_snapshot to locate and read; execute_code/repl to reduce; write_file/edit_file/apply_patch_transaction to mutate, which needs write authorization; todo_write/checkpoint_*/skill_*/lsp/web_search/web_fetch/mcp to govern and integrate. Agentic/collaboration actions (team_create, agent_invite, task_publish, task_claim, task_submit, task_review, message_publish, artifact_commit, state_inspect, objective_*, ...) are NOT dispatchable here - they are their own provider tools and must be called directly. tool_orchestrate itself may never be nested. Boundaries: every sub-call is authorized independently against the session tool allow-list, so an unauthorized tool fails closed naming that tool - the program never grants extra permission, and a write-requiring program is refused in a read-only session. Output is one JSON object: the `return` expression's value plus a per-step trace (op, tool, status, durationMs, error). Use `return` to select only the digest you need, because the whole result is subject to the tool-result budget.",
             input_schema: json!({
                 "type": "object",
@@ -707,6 +838,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "tool_cache_stats",
+            family: ToolFamily::Session,
+            tier: ToolTier::Orchestration,
+            permission_key: "none",
             description: "Report in-process read-only cache hit, miss, invalidation and entry counts. Use it to diagnose whether reads are being served from cache.",
             input_schema: json!({
                 "type": "object",
@@ -717,6 +851,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "web_fetch",
+            family: ToolFamily::Web,
+            tier: ToolTier::Direct,
+            permission_key: "webfetch",
             description: "Fetch a URL and answer a prompt about it, with allowed/blocked domain scoping. Boundary: the answer is only as good as the fetched text - cite the URL, and prefer web_search first to find the right one.",
             input_schema: json!({
                 "type": "object",
@@ -740,6 +877,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "web_search",
+            family: ToolFamily::Web,
+            tier: ToolTier::Direct,
+            permission_key: "websearch",
             description: "Federated web search across public sources with intent routing, deduplication, source receipts and cited results. Use it for facts that are not in the workspace. Boundary: results carry source receipts and any external claim must be cited; the tool does not fetch page bodies.",
             input_schema: json!({
                 "type": "object",
@@ -783,6 +923,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "todo_write",
+            family: ToolFamily::Plan,
+            tier: ToolTier::Direct,
+            permission_key: "todowrite",
             description: "Maintain the structured task list with priorities and status. Use it to make multi-step work auditable and resumable. Boundary: it is the plan of record - keep it short and current, not a log.",
             input_schema: json!({
                 "type": "object",
@@ -816,6 +959,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "question",
+            family: ToolFamily::Ask,
+            tier: ToolTier::Orchestration,
+            permission_key: "ask",
             description: "Ask the user a clarifying question with optional choices and wait. Alias for ask_user_question (same question/options input), kept for existing callers. Boundary: it blocks the turn until a reply - use send_user_message when you do not need an answer.",
             input_schema: json!({
                 "type": "object",
@@ -830,6 +976,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "current_time",
+            family: ToolFamily::Session,
+            tier: ToolTier::Orchestration,
+            permission_key: "none",
             description: "Return the current UTC time and local timezone as a bounded RFC3339 timestamp. Boundary: it is the Runtime clock, not a workspace fact - prefer the evidence in a tool result when both exist.",
             input_schema: json!({
                 "type": "object",
@@ -840,6 +989,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "get_context_remaining",
+            family: ToolFamily::Session,
+            tier: ToolTier::Direct,
+            permission_key: "context",
             description: "Report the active conversation's context utilisation and remaining token budget. Use it to decide whether to compact, narrow scope, or stop reading.",
             input_schema: json!({
                 "type": "object",
@@ -856,6 +1008,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "request_plugin_install",
+            family: ToolFamily::Govern,
+            tier: ToolTier::Operator,
+            permission_key: "none",
             description: "Refuses by design: plugin installation is an operator control-plane operation, never a model action. Present so a request fails closed with a clear reason instead of being silently ignored.",
             input_schema: json!({
                 "type": "object",
@@ -869,6 +1024,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "skill_install_plan",
+            family: ToolFamily::Govern,
+            tier: ToolTier::Orchestration,
+            permission_key: "skill",
             description: "Acquire a local or GitHub skill as inert content, inspect every bounded file, and return the canonical SHA-256 tree digest plus blockers/warnings without activating anything. Use it before any install.",
             input_schema: json!({
                 "type": "object",
@@ -882,6 +1040,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "skill_install_commit",
+            family: ToolFamily::Govern,
+            tier: ToolTier::Operator,
+            permission_key: "skill",
             description: "Re-acquire a previously planned skill, require the exact expected SHA-256 tree digest, enforce supply-chain blockers, atomically activate an immutable revision and emit a provenance receipt. Boundary: it never executes packaged code, and a digest mismatch refuses the install.",
             input_schema: json!({
                 "type": "object",
@@ -897,6 +1058,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "skill_status",
+            family: ToolFamily::Govern,
+            tier: ToolTier::Orchestration,
+            permission_key: "skill",
             description: "Read the active pointer, immutable revision history and install receipts for one skill. Boundary: it is a query for one skill and needs its id - use skill_install_plan first when the skill is not installed yet.",
             input_schema: json!({
                 "type": "object",
@@ -910,6 +1074,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "skill_rollback",
+            family: ToolFamily::Govern,
+            tier: ToolTier::Operator,
+            permission_key: "skill",
             description: "Atomically reactivate an existing immutable skill revision after recomputing and verifying its canonical digest. Boundary: it can only move to a revision that already exists, so it never re-acquires remote content, and a digest mismatch refuses.",
             input_schema: json!({
                 "type": "object",
@@ -924,6 +1091,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "skill_deactivate",
+            family: ToolFamily::Govern,
+            tier: ToolTier::Operator,
+            permission_key: "skill",
             description: "Atomically remove a skill's active pointer while retaining immutable revisions and receipts for audit and rollback. Boundary: it deactivates, never deletes - the revisions stay rollback-able via skill_rollback.",
             input_schema: json!({
                 "type": "object",
@@ -937,6 +1107,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "tool_search",
+            family: ToolFamily::Govern,
+            tier: ToolTier::EscapeHatch,
+            permission_key: "discovery",
             description: "Find a deferred or specialized tool by exact name or keywords and receive its descriptors. Boundary: activation applies to the next request in the SAME turn and it changes the tool set, so search once with a focused query rather than probing.",
             input_schema: json!({
                 "type": "object",
@@ -951,6 +1124,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "notebook_edit",
+            family: ToolFamily::Mutate,
+            tier: ToolTier::Orchestration,
+            permission_key: "edit",
             description: "Replace, insert or delete a Jupyter notebook cell. Boundary: it edits cell source only - it does not execute the notebook.",
             input_schema: json!({
                 "type": "object",
@@ -968,6 +1144,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "sleep",
+            family: ToolFamily::Session,
+            tier: ToolTier::Orchestration,
+            permission_key: "process",
             description: "Wait without holding a shell process. Boundary: it only paces an external dependency and burns a round of the turn budget, so prefer a background job or a longer tool timeout.",
             input_schema: json!({
                 "type": "object",
@@ -981,6 +1160,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "send_user_message",
+            family: ToolFamily::Ask,
+            tier: ToolTier::Orchestration,
+            permission_key: "ask",
             description: "Send a message to the user without waiting for a reply. Use it for progress and decisions; use ask_user_question when you need an answer.",
             input_schema: json!({
                 "type": "object",
@@ -1002,6 +1184,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "config",
+            family: ToolFamily::Govern,
+            tier: ToolTier::Operator,
+            permission_key: "config",
             description: "Read or set a Cowd setting. Boundary: it changes local configuration and needs write authorization; operator-owned settings are refused.",
             input_schema: json!({
                 "type": "object",
@@ -1018,6 +1203,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "enter_plan_mode",
+            family: ToolFamily::Plan,
+            tier: ToolTier::Orchestration,
+            permission_key: "config",
             description: "Enable a worktree-local planning-mode override, remembering the previous local setting so exit_plan_mode can restore it. Boundary: it only affects this worktree, not other sessions or hosts.",
             input_schema: json!({
                 "type": "object",
@@ -1028,6 +1216,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "exit_plan_mode",
+            family: ToolFamily::Plan,
+            tier: ToolTier::Orchestration,
+            permission_key: "config",
             description: "Restore or clear the planning-mode override created by enter_plan_mode. Boundary: it requires a matching enter_plan_mode in this worktree; with none it fails closed rather than guessing the previous state.",
             input_schema: json!({
                 "type": "object",
@@ -1038,6 +1229,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "structured_output",
+            family: ToolFamily::Govern,
+            tier: ToolTier::Orchestration,
+            permission_key: "none",
             description: "Return the final answer in the requested structured shape. Boundary: it is a presentation contract, not evidence - committed tool receipts still carry the facts.",
             input_schema: json!({
                 "type": "object",
@@ -1047,6 +1241,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "repl",
+            family: ToolFamily::Reduce,
+            tier: ToolTier::Orchestration,
+            permission_key: "code",
             description: "Run one code block through the SAME kernel-hardened, read-only, network-off sandbox as execute_code, with a caller-supplied timeout and a REPL-shaped result (stdout, stderr, exit_code). It is not an interactive session and it is not full-access: the workspace is mounted read-only, the network is off, and nothing persists between calls. Boundary: it cannot write files or reach the network - route mutations through write_file/edit_file/apply_patch_transaction and network through web_fetch/mcp; prefer execute_code for pure reduction, or bash when you genuinely need an unsandboxed host command.",
             input_schema: json!({
                 "type": "object",
@@ -1062,6 +1259,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "power_shell",
+            family: ToolFamily::Reduce,
+            tier: ToolTier::EscapeHatch,
+            permission_key: "shell",
             description: "Run a PowerShell command (Windows hosts) with an optional timeout and background detach. Same boundary as bash: full-access authorization.",
             input_schema: json!({
                 "type": "object",
@@ -1083,6 +1283,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "ask_user_question",
+            family: ToolFamily::Ask,
+            tier: ToolTier::Direct,
+            permission_key: "ask",
             description: "Ask the user a question with optional choices and block until they answer. Boundary: it stops the turn - use send_user_message when a reply is not required.",
             input_schema: json!({
                 "type": "object",
@@ -1100,6 +1303,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "lsp",
+            family: ToolFamily::Lsp,
+            tier: ToolTier::Orchestration,
+            permission_key: "lsp",
             description: "Query a connected language server for symbols, references, hover or diagnostics at a position. Boundary: it needs a running server for that language, and it is only active when the experimental LSP surface is enabled.",
             input_schema: json!({
                 "type": "object",
@@ -1117,6 +1323,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "list_mcp_resources",
+            family: ToolFamily::Mcp,
+            tier: ToolTier::Orchestration,
+            permission_key: "mcp",
             description: "List the resources published by connected MCP servers. Boundary: it lists resources, not tools - use mcp to call a tool, and a server must be configured and reachable to appear.",
             input_schema: json!({
                 "type": "object",
@@ -1129,6 +1338,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "read_mcp_resource",
+            family: ToolFamily::Mcp,
+            tier: ToolTier::Orchestration,
+            permission_key: "mcp",
             description: "Read one MCP resource by server and uri. Boundary: the server must be configured and reachable, and the uri must be one that server actually published - prefer list_mcp_resources first.",
             input_schema: json!({
                 "type": "object",
@@ -1143,6 +1355,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "mcp_auth",
+            family: ToolFamily::Mcp,
+            tier: ToolTier::Operator,
+            permission_key: "mcp",
             description: "Authenticate with an MCP server that requires OAuth or credentials. Operator action, not a task step: use it only when a server reports an auth failure and the credential can be obtained without human input. Boundary: it never stores or prints a secret.",
             input_schema: json!({
                 "type": "object",
@@ -1156,6 +1371,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "remote_trigger",
+            family: ToolFamily::Web,
+            tier: ToolTier::Operator,
+            permission_key: "webfetch",
             description: "POST to an arbitrary remote endpoint or webhook. Boundary: network egress and an operator-supplied URL are required - it is a control-plane action, not a task tool, and needs full-access authorization.",
             input_schema: json!({
                 "type": "object",
@@ -1173,6 +1391,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "mcp",
+            family: ToolFamily::Mcp,
+            tier: ToolTier::Orchestration,
+            permission_key: "mcp",
             description: "Execute a tool exposed by a connected external MCP server, or list/read its resources. This is the only bridge to non-local capability: it is heavier than a local primitive and needs the server configured, so prefer local tools for anything the catalog already covers. Boundary: the server must be reachable and authenticated, and arguments pass through to it unvalidated.",
             input_schema: json!({
                 "type": "object",
@@ -1188,6 +1409,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "testing_permission",
+            family: ToolFamily::Govern,
+            tier: ToolTier::Operator,
+            permission_key: "none",
             description: "Test-only probe for permission enforcement. It has no production purpose and refuses outside a test.",
             input_schema: json!({
                 "type": "object",
@@ -1202,6 +1426,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         // 3B-4: Built-in vision analysis tool (requires multimodal LLM support)
         ToolSpec {
             name: "vision_analyze",
+            family: ToolFamily::Vision,
+            tier: ToolTier::Orchestration,
+            permission_key: "vision",
             description: "Prepare a local image for multimodal analysis: validate and encode it, and the runtime attaches it as a structured vision input on the next model call. Boundary: local images only, and it consumes one model round.",
             input_schema: json!({
                 "type": "object",
@@ -1227,6 +1454,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "execute_code",
+            family: ToolFamily::Reduce,
+            tier: ToolTier::Direct,
+            permission_key: "code",
             description: "Deterministic reduction OUTSIDE the model. Runs python/javascript/bash/ruby/lua in a kernel-hardened, read-only, network-off sandbox and returns ONLY stdout/stderr (30s cap, nothing persisted). This is the tool for work that would otherwise mean pulling many files or many lines into context: count, aggregate, filter, compare, compute. The workspace is mounted read-only with the working directory inside it, so the code CAN read authorised workspace files; it cannot write and cannot reach the network. Boundary: it cannot write files or touch the network - feed it data from read_file/read_many/grep_search, or dispatch it as tool_orchestrate's compute step where the program already holds the data.",
             input_schema: json!({
                 "type": "object",
@@ -1695,4 +1925,140 @@ fn the_tool_catalog_serializes_deterministically_for_provider_caching() {
         "one more active id yields exactly one more entry"
     );
 }
+}
+
+#[cfg(test)]
+mod family_taxonomy_tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// Documented aliases defer to a canonical tool, so they never occupy a
+    /// permission slot of their own.
+    const ALIASES: &[&str] = &["edit_many_preview", "patch_plan", "question"];
+
+    /// The taxonomy the flat catalog lacked: every tool declares exactly one
+    /// capability family and exposure tier and a non-empty permission key, and
+    /// the family assignment is total.
+    #[test]
+    fn every_tool_declares_a_family_tier_and_permission_key() {
+        let specs = mvp_tool_specs();
+        assert_eq!(specs.len(), 56, "the catalog size is the contract");
+        for spec in &specs {
+            assert!(
+                !spec.permission_key.is_empty(),
+                "`{}` has no permission key",
+                spec.name
+            );
+        }
+        let families = specs.iter().map(|spec| spec.family).collect::<BTreeSet<_>>();
+        assert!(
+            families.len() >= 10,
+            "the taxonomy must actually partition the catalog"
+        );
+        // The Direct tier is the turn working set: an ordinary turn needs these
+        // on its very first request, so they cannot be deferred.
+        let direct = specs
+            .iter()
+            .filter(|spec| spec.tier == ToolTier::Direct)
+            .map(|spec| spec.name)
+            .collect::<BTreeSet<_>>();
+        for required in [
+            "read_file",
+            "grep_search",
+            "glob_search",
+            "tool_orchestrate",
+            "execute_code",
+            "todo_write",
+        ] {
+            assert!(
+                direct.contains(required),
+                "`{required}` must be Direct: an ordinary turn needs it on the first request"
+            );
+        }
+        assert!(
+            specs
+                .iter()
+                .filter(|spec| spec.tier == ToolTier::Operator)
+                .all(|spec| spec.permission_key != "discovery"),
+            "operator-tier tools are never the discovery surface"
+        );
+    }
+
+    /// A permission slot is `(family, permission_key, tier)`. Two live *canonical*
+    /// tools in one slot is exactly the "many tools for one job" ambiguity this
+    /// taxonomy exists to remove.
+    ///
+    /// The catalog still carries legacy collisions, so this test freezes them:
+    /// no NEW one may appear, and merging a family removes its ledger entry. The
+    /// ledger may only shrink.
+    #[test]
+    fn canonical_tools_do_not_share_a_permission_slot_beyond_the_legacy_ledger() {
+        const LEGACY: &[(&str, &str, &str, usize)] = &[
+            ("Govern", "none", "Operator", 2),
+            ("Govern", "skill", "Operator", 3),
+            ("Govern", "skill", "Orchestration", 2),
+            ("Locate", "grep", "Orchestration", 2),
+            ("Mcp", "mcp", "Orchestration", 3),
+            ("Mutate", "checkpoint", "Orchestration", 2),
+            ("Mutate", "edit", "Orchestration", 5),
+            ("Plan", "config", "Orchestration", 2),
+            ("Reduce", "shell", "EscapeHatch", 2),
+            ("Session", "background", "Orchestration", 2),
+            ("Session", "checkpoint", "Orchestration", 2),
+            ("Session", "none", "Orchestration", 2),
+        ];
+        let mut slots: BTreeMap<(&str, &str, &str), usize> = BTreeMap::new();
+        for spec in mvp_tool_specs() {
+            if ALIASES.contains(&spec.name) {
+                continue;
+            }
+            let slot = (
+                family_name(spec.family),
+                spec.permission_key,
+                tier_name(spec.tier),
+            );
+            *slots.entry(slot).or_default() += 1;
+        }
+        let actual = slots
+            .into_iter()
+            .filter(|(_, count)| *count >= 2)
+            .collect::<BTreeMap<_, _>>();
+        let expected = LEGACY
+            .iter()
+            .map(|(family, key, tier, count)| ((*family, *key, *tier), *count))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            actual, expected,
+            "a permission slot may only hold the legacy collisions already recorded: \
+             merging removes entries, nothing may add one"
+        );
+    }
+
+    fn family_name(family: ToolFamily) -> &'static str {
+        match family {
+            ToolFamily::Locate => "Locate",
+            ToolFamily::Read => "Read",
+            ToolFamily::Reduce => "Reduce",
+            ToolFamily::Mutate => "Mutate",
+            ToolFamily::Plan => "Plan",
+            ToolFamily::Ask => "Ask",
+            ToolFamily::Web => "Web",
+            ToolFamily::Session => "Session",
+            ToolFamily::Vision => "Vision",
+            ToolFamily::Lsp => "Lsp",
+            ToolFamily::Mcp => "Mcp",
+            ToolFamily::Govern => "Govern",
+            ToolFamily::Orchestrate => "Orchestrate",
+            ToolFamily::Collaborate => "Collaborate",
+        }
+    }
+
+    fn tier_name(tier: ToolTier) -> &'static str {
+        match tier {
+            ToolTier::Direct => "Direct",
+            ToolTier::Orchestration => "Orchestration",
+            ToolTier::EscapeHatch => "EscapeHatch",
+            ToolTier::Operator => "Operator",
+        }
+    }
 }
