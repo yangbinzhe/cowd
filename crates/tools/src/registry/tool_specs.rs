@@ -79,7 +79,7 @@ pub struct ToolSpec {
 #[must_use]
 pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
     let resolver_id = match normalize_tool_name(name).as_str() {
-        "bash" | "powershell" | "power_shell" => "builtin.command",
+        "bash" | "powershell" => "builtin.command",
         "background" => "runtime.action_background",
         // `execute_code` and `repl` always enter the kernel-hardened workspace
         // sandbox with a bounded timeout/output budget. They must not inherit
@@ -214,6 +214,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" },
+                    "shell": { "type": "string", "enum": ["auto", "bash", "powershell"], "description": "Host shell backend; `auto` picks by platform, `powershell` runs the Windows PowerShell backend." },
                     "cwd": { "type": "string" },
                     "timeout_ms": {
                         "type": "integer",
@@ -1140,30 +1141,6 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
-            name: "power_shell",
-            family: ToolFamily::Reduce,
-            tier: ToolTier::EscapeHatch,
-            permission_key: "shell",
-            description: "Run a PowerShell command (Windows hosts) with an optional timeout and background detach. Same boundary as bash: full-access authorization.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "command": { "type": "string" },
-                    "timeout_ms": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 300000,
-                        "description": "Wall-clock timeout in milliseconds."
-                    },
-                    "description": { "type": "string" },
-                    "run_in_background": { "type": "boolean" }
-                },
-                "required": ["command"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
-        ToolSpec {
             name: "skill",
             family: ToolFamily::Govern,
             tier: ToolTier::Orchestration,
@@ -1452,7 +1429,7 @@ mod tests {
 
     #[test]
     fn shell_timeout_contract_uses_explicit_milliseconds_only() {
-        for name in ["bash", "power_shell"] {
+        for name in ["bash"] {
             let spec = mvp_tool_specs()
                 .into_iter()
                 .find(|spec| spec.name == name)
@@ -1769,7 +1746,7 @@ mod family_taxonomy_tests {
     #[test]
     fn every_tool_declares_a_family_tier_and_permission_key() {
         let specs = mvp_tool_specs();
-        assert_eq!(specs.len(), 45, "the catalog size is the contract");
+        assert_eq!(specs.len(), 44, "the catalog size is the contract");
         for spec in &specs {
             assert!(
                 !spec.permission_key.is_empty(),
@@ -1824,7 +1801,6 @@ mod family_taxonomy_tests {
             ("Locate", "grep", "Orchestration", 2),
             ("Mutate", "checkpoint", "Orchestration", 2),
             ("Mutate", "edit", "Orchestration", 5),
-            ("Reduce", "shell", "EscapeHatch", 2),
             ("Session", "checkpoint", "Orchestration", 2),
         ];
         let mut slots: BTreeMap<(&str, &str, &str), usize> = BTreeMap::new();

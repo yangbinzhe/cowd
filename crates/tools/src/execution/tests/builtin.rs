@@ -363,14 +363,14 @@ printf 'pwsh:%s' "$1"
     std::env::set_var("PATH", format!("{}:{}", dir.display(), original_path));
 
     let result = execute_tool(
-        "power_shell",
-        &json!({"command": "Write-Output hello", "timeout_ms": 1000}),
+        "bash",
+        &json!({"shell": "powershell", "command": "Write-Output hello", "timeout_ms": 1000}),
     )
     .expect("PowerShell should succeed");
 
     let background = execute_tool(
-        "power_shell",
-        &json!({"command": "Write-Output hello", "run_in_background": true}),
+        "bash",
+        &json!({"shell": "powershell", "command": "Write-Output hello", "run_in_background": true}),
     )
     .expect("background powershell execution is a model capability");
     let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
@@ -402,7 +402,7 @@ fn powershell_errors_when_shell_is_missing() {
     std::fs::create_dir_all(&empty_dir).expect("create empty dir");
     std::env::set_var("PATH", empty_dir.display().to_string());
 
-    let err = execute_tool("power_shell", &json!({"command": "Write-Output hello"}))
+    let err = execute_tool("bash", &json!({"shell": "powershell", "command": "Write-Output hello"}))
         .expect_err("PowerShell should fail when shell is missing");
 
     std::env::set_var("PATH", original_path);
@@ -490,12 +490,12 @@ fn orchestrate_can_dispatch_the_whole_builtin_catalog_but_never_itself() {
         .map(|spec| spec.name.to_string())
         .collect();
 
-    assert_eq!(catalog.len(), 45, "the catalog size is the contract");
+    assert_eq!(catalog.len(), 44, "the catalog size is the contract");
     let catalog: Vec<String> = catalog
         .into_iter()
         .filter(|name| name != "tool_orchestrate")
         .collect();
-    assert_eq!(catalog.len(), 44, "the catalog minus the orchestrator itself");
+    assert_eq!(catalog.len(), 43, "the catalog minus the orchestrator itself");
     for name in &catalog {
         assert!(dispatchable(name), "`{name}` is in the catalog, so it must be composable");
     }

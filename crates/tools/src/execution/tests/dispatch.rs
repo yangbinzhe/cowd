@@ -172,7 +172,6 @@ fn exposes_mvp_tools() {
     assert!(names.contains(&"plan_mode"));
     assert!(names.contains(&"structured_output"));
     assert!(names.contains(&"repl"));
-    assert!(names.contains(&"power_shell"));
     for removed in [
         "Agent",
         "TaskCreate",

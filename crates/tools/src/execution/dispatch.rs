@@ -9,8 +9,19 @@ pub(crate) fn execute_with_lease(
 ) -> Result<String, String> {
     match name {
         "bash" => {
-            let bash_input: BashCommandInput = from_value(input)?;
-            run_bash(lease, bash_input)
+            if input.get("shell").and_then(serde_json::Value::as_str) == Some("powershell") {
+                // `shell` selects the backend and is not part of the PowerShell
+                // input contract, which denies unknown fields.
+                let mut restored = input.clone();
+                if let Some(object) = restored.as_object_mut() {
+                    object.remove("shell");
+                }
+                let ps_input: PowerShellInput = from_value(&restored)?;
+                run_powershell(lease, ps_input)
+            } else {
+                let bash_input: BashCommandInput = from_value(input)?;
+                run_bash(lease, bash_input)
+            }
         }
         "background" => match input.get("action").and_then(|value| value.as_str()) {
             Some("status") => run_background_task_status(lease, input),
@@ -125,10 +136,6 @@ pub(crate) fn execute_with_lease(
             from_value::<StructuredOutputInput>(input).and_then(run_structured_output)
         }
         "repl" => from_value::<ReplInput>(input).and_then(|parsed| run_repl(lease, parsed)),
-        "power_shell" => {
-            let ps_input: PowerShellInput = from_value(input)?;
-            run_powershell(lease, ps_input)
-        }
         "ask" => {
             if input.get("message").is_some() {
                 from_value::<BriefInput>(input).and_then(|parsed| run_brief(lease, parsed))

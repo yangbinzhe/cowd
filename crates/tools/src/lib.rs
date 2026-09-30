@@ -637,7 +637,6 @@ mod tests {
             ("tool_search", "tool_search"),
             ("tool-search", "tool_search"),
             ("GLOB-SEARCH", "glob_search"),
-            ("power_shell", "power_shell"),
         ] {
             assert_eq!(
                 catalog.canonical_name(requested).as_deref(),
