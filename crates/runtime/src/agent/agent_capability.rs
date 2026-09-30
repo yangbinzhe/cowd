@@ -165,10 +165,10 @@ fn capability_mapping(capability: &str) -> CapabilityMapping {
         "search" => CapabilityMapping {
             tools: &[
                 "grep_search",
-                "grep_many",
+                "grep_search",
                 "glob_search",
                 "glob_many",
-                "ast_grep_search",
+                "grep_search",
                 "lsp",
                 "tool_search",
                 "context_retrieve",
@@ -346,10 +346,10 @@ mod tests {
         assert!(resolved.allowed_tools.contains("read_many"));
         assert!(resolved.allowed_tools.contains("workspace_snapshot"));
         assert!(resolved.allowed_tools.contains("grep_search"));
-        assert!(resolved.allowed_tools.contains("grep_many"));
+        assert!(resolved.allowed_tools.contains("grep_search"));
         assert!(resolved.allowed_tools.contains("glob_search"));
         assert!(resolved.allowed_tools.contains("glob_many"));
-        assert!(resolved.allowed_tools.contains("ast_grep_search"));
+        assert!(resolved.allowed_tools.contains("grep_search"));
         assert!(resolved.allowed_tools.contains("lsp"));
         assert!(resolved.allowed_tools.contains("tool_search"));
         assert!(resolved.allowed_tools.contains("context_retrieve"));

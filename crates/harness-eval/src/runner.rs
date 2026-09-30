@@ -862,7 +862,7 @@ fn run_full_real_tool_scenarios() -> FullRealToolEval {
     tool_details.push(run_eval_tool_call(
         2,
         "repo_refactor",
-        "grep_many",
+        "grep_search",
         json!({
             "searches": [
                 { "pattern": "team_create|task_publish", "path": "crates", "glob": "*.rs" },
@@ -874,7 +874,7 @@ fn run_full_real_tool_scenarios() -> FullRealToolEval {
     tool_details.push(run_eval_tool_call(
         3,
         "reality_memory",
-        "grep_many",
+        "grep_search",
         json!({
             "searches": [
                 { "pattern": "KnowledgeFabric|context_governance|suppressed_for_current_turn", "path": "crates", "glob": "*.rs" },

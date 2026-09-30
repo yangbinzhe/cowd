@@ -107,7 +107,7 @@ impl GatewayToolExecutor {
             "audio" | "video" => ["bash", "execute_code", "read_file"].as_slice(),
             "pdf" | "document" | "archive" => ["bash", "read_file", "read_many"].as_slice(),
             "csv" => ["execute_code", "read_file", "read_many"].as_slice(),
-            "text" | "markdown" | "code" => ["read_file", "read_many", "grep_many"].as_slice(),
+            "text" | "markdown" | "code" => ["read_file", "read_many", "grep_search"].as_slice(),
             _ => ["read_file", "bash", "execute_code"].as_slice(),
         };
         let available = self.available_tool_names();

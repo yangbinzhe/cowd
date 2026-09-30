@@ -202,7 +202,7 @@ impl ResourceCapabilitySnapshot {
             tools: vec![
                 "read_file".to_string(),
                 "read_many".to_string(),
-                "grep_many".to_string(),
+                "grep_search".to_string(),
                 "glob_many".to_string(),
                 "tool_batch_readonly".to_string(),
                 "vision_analyze".to_string(),

@@ -95,8 +95,6 @@ pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
         | "glob_search"
         | "glob_many"
         | "grep_search"
-        | "grep_many"
-        | "ast_grep_search"
         | "workspace_snapshot"
         | "tool_batch_readonly"
         | "tool_cache_stats"
@@ -609,11 +607,18 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             family: ToolFamily::Locate,
             tier: ToolTier::Direct,
             permission_key: "grep",
-            description: "Locate symbols, text or logic inside large files with a regex, returning exact matching lines with optional context lines. This is the cheapest way to find where to read: locate, then read only the range you need. Boundary: scans are bounded by depth, entries, duration and file size; use glob to narrow the candidate set first, and read the hit's range with read_file(offset=nextOffset) instead of re-scanning.",
+            description: "Locate symbols, text or logic inside large files; the cheapest way to locate and then read only the range you need. Three shapes, one tool: (a) a single `pattern` regex returning matching lines with optional context; (b) `searches:[...]` runs several independent searches in ONE ordered batch, each taking the single-search field set; (c) `pattern` + `language` sweeps only that language's file extensions. Boundary: scans are bounded by depth, entries, duration and file size, and this is NOT a structural/AST matcher - the pattern is a plain regex applied per line, so it cannot express a function named X; narrow the candidate set with glob first, and read the hit's range with read_file(offset=nextOffset) instead of re-scanning.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "pattern": { "type": "string" },
+                    "language": { "type": "string", "description": "Restrict the sweep to one language's file extensions." },
+                    "case_sensitive": { "type": "boolean" },
+                    "max_files": { "type": "integer", "minimum": 1, "maximum": 2000 },
+                    "max_matches": { "type": "integer", "minimum": 1, "maximum": 500 },
+                    "searches": { "type": "array", "maxItems": 200, "items": { "type": "object", "properties": { "pattern": { "type": "string" }, "path": { "type": "string" }, "glob": { "type": "string" }, "output_mode": { "type": "string", "enum": ["content", "files_with_matches", "count"] }, "context": { "type": "integer", "minimum": 0 }, "-n": { "type": "boolean" }, "-i": { "type": "boolean" }, "head_limit": { "type": "integer", "minimum": 1 } }, "required": ["pattern"] }, "description": "Several independent searches in ONE ordered batch." },
+                    "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 42 },
+
                     "include_ignored": { "type": "boolean", "description": "Include hidden and project-ignored paths; workspace protection still applies." },
                     "ignore_patterns": { "type": "array", "items": { "type": "string" }, "description": "Additional exclusion globs relative to the search root." },
                     "path": { "type": "string" },
@@ -631,72 +636,6 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "multiline": { "type": "boolean" }
                     ,"cursor": { "type": "string", "description": "Opaque query-bound cursor; prefer copying next_request unchanged." }
                 },
-                "required": ["pattern"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "ast_grep_search",
-            family: ToolFamily::Locate,
-            tier: ToolTier::Orchestration,
-            permission_key: "grep",
-            description: "Regex content search restricted to one language's file extensions, returning path/line/column. Use it to sweep a language's files for a textual pattern while excluding every other language. Boundary: this is NOT a structural matcher - the pattern is a plain regex applied per line, so it cannot express a function named X or a struct with field Y; for arbitrary content use grep_search, and there is no AST tool in this catalog.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "pattern": { "type": "string" },
-                    "language": { "type": "string", "description": "rust, python, typescript, javascript, go, java, c, cpp, csharp, ruby, php, shell, sql, toml, yaml, json, markdown" },
-                    "path": { "type": "string" },
-                    "case_sensitive": { "type": "boolean" },
-                    "max_files": { "type": "integer", "minimum": 1, "maximum": 2000 },
-                    "max_matches": { "type": "integer", "minimum": 1, "maximum": 500 }
-                },
-                "required": ["pattern", "language"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "grep_many",
-            family: ToolFamily::Locate,
-            tier: ToolTier::Orchestration,
-            permission_key: "grep",
-            description: "Run several independent content searches in ONE ordered batch; each entry takes the full grep_search field set and they run in parallel. Boundary: prefer tool_orchestrate when the patterns must be derived from an earlier result - its map step fans out the same way and compute can aggregate the hits without moving them into context.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "searches": {
-                        "type": "array",
-                        "maxItems": 200,
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "pattern": { "type": "string" },
-                    "include_ignored": { "type": "boolean", "description": "Include hidden and project-ignored paths; workspace protection still applies." },
-                    "ignore_patterns": { "type": "array", "items": { "type": "string" }, "description": "Additional exclusion globs relative to the search root." },
-                                "path": { "type": "string" },
-                                "glob": { "type": "string" },
-                                "output_mode": { "type": "string", "enum": ["content", "files_with_matches", "count"] },
-                                "-B": { "type": "integer", "minimum": 0 },
-                                "-A": { "type": "integer", "minimum": 0 },
-                                "-C": { "type": "integer", "minimum": 0 },
-                                "context": { "type": "integer", "minimum": 0 },
-                                "-n": { "type": "boolean" },
-                                "-i": { "type": "boolean" },
-                                "type": { "type": "string" },
-                                "head_limit": { "type": "integer", "minimum": 1 },
-                                "offset": { "type": "integer", "minimum": 0 },
-                                "multiline": { "type": "boolean" },
-                                "cursor": { "type": "string", "description": "Copy next_request or continuationCursor for this search." }
-                            },
-                            "required": ["pattern"],
-                            "additionalProperties": false
-                        }
-                    },
-                    "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 42 }
-                },
-                "required": ["searches"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,
@@ -758,7 +697,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             family: ToolFamily::Orchestrate,
             tier: ToolTier::Direct,
             permission_key: "batch",
-            description: "Run a bounded PROGRAM of many tool calls in ONE provider round: one instruction reaches its result without a round trip per step. This is the shortest path whenever the work is more than a single step - locate, read, aggregate and report in one call instead of one call per round. Bounds: <=50 steps, <=400 sub-calls in total, map over <=200 items, repeat <=25 rounds. Sub-calls run in declaration order and share values through `$<step_id>` references inside input objects; write a literal $ as $$. Step shapes, exactly as the input schema accepts them: {op:call,id,tool,input} one sub-call. {op:batch,id,calls:[{tool,input,as?}]} parallel fan-out (the same engine as read_many/grep_many). {op:map,id,over:$list,tool,input,field?} runs `tool` once per item of a prior list/collect result; `field` extracts that field from each sub-call's RESULT before it is collected (it does not pre-select from the input item). {op:filter,id,over:$list,field,contains?,equals?} keeps the items whose `field` contains or equals a value. {op:collect,id,over:$list,agg,field?,separator?} aggregates a list, where agg is count|first|last|join|sum (join takes `separator`, default a single space). {op:compute,id,language,code,input?} runs code in the kernel-hardened read-only network-off sandbox over the data the program already holds and returns only stdout/stderr - use it to count, aggregate or compare across many files instead of moving their bodies into context. {op:when,id,if:{ref:$id,present?,equals?,contains?,non_empty?},tool,input?} runs one sub-call only when the condition holds. {op:repeat,id,max,while:{ref:$id,...},tool,input?} re-runs one sub-call while the condition holds, at most max times. Vocabulary: any catalog tool may be dispatched - read_file/read_many/glob_search/glob_many/grep_search/grep_many/ast_grep_search/workspace_snapshot to locate and read; execute_code/repl to reduce; write_file/edit_file/apply_patch_transaction to mutate, which needs write authorization; todo_write/checkpoint_*/skill_*/lsp/web_search/web_fetch/mcp to govern and integrate. Agentic/collaboration actions (team_create, agent_invite, task_publish, task_claim, task_submit, task_review, message_publish, artifact_commit, state_inspect, objective_*, ...) are NOT dispatchable here - they are their own provider tools and must be called directly. tool_orchestrate itself may never be nested. Boundaries: every sub-call is authorized independently against the session tool allow-list, so an unauthorized tool fails closed naming that tool - the program never grants extra permission, and a write-requiring program is refused in a read-only session. Output is one JSON object: the `return` expression's value plus a per-step trace (op, tool, status, durationMs, error). Use `return` to select only the digest you need, because the whole result is subject to the tool-result budget.",
+            description: "Run a bounded PROGRAM of many tool calls in ONE provider round: one instruction reaches its result without a round trip per step. This is the shortest path whenever the work is more than a single step - locate, read, aggregate and report in one call instead of one call per round. Bounds: <=50 steps, <=400 sub-calls in total, map over <=200 items, repeat <=25 rounds. Sub-calls run in declaration order and share values through `$<step_id>` references inside input objects; write a literal $ as $$. Step shapes, exactly as the input schema accepts them: {op:call,id,tool,input} one sub-call. {op:batch,id,calls:[{tool,input,as?}]} parallel fan-out (the same engine as read_many). {op:map,id,over:$list,tool,input,field?} runs `tool` once per item of a prior list/collect result; `field` extracts that field from each sub-call's RESULT before it is collected (it does not pre-select from the input item). {op:filter,id,over:$list,field,contains?,equals?} keeps the items whose `field` contains or equals a value. {op:collect,id,over:$list,agg,field?,separator?} aggregates a list, where agg is count|first|last|join|sum (join takes `separator`, default a single space). {op:compute,id,language,code,input?} runs code in the kernel-hardened read-only network-off sandbox over the data the program already holds and returns only stdout/stderr - use it to count, aggregate or compare across many files instead of moving their bodies into context. {op:when,id,if:{ref:$id,present?,equals?,contains?,non_empty?},tool,input?} runs one sub-call only when the condition holds. {op:repeat,id,max,while:{ref:$id,...},tool,input?} re-runs one sub-call while the condition holds, at most max times. Vocabulary: any catalog tool may be dispatched - read_file/read_many/glob_search/glob_many/grep_search/workspace_snapshot to locate and read; execute_code/repl to reduce; write_file/edit_file/apply_patch_transaction to mutate, which needs write authorization; todo_write/checkpoint_*/skill_*/lsp/web_search/web_fetch/mcp to govern and integrate. Agentic/collaboration actions (team_create, agent_invite, task_publish, task_claim, task_submit, task_review, message_publish, artifact_commit, state_inspect, objective_*, ...) are NOT dispatchable here - they are their own provider tools and must be called directly. tool_orchestrate itself may never be nested. Boundaries: every sub-call is authorized independently against the session tool allow-list, so an unauthorized tool fails closed naming that tool - the program never grants extra permission, and a write-requiring program is refused in a read-only session. Output is one JSON object: the `return` expression's value plus a per-step trace (op, tool, status, durationMs, error). Use `return` to select only the digest you need, because the whole result is subject to the tool-result budget.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1506,16 +1445,19 @@ fn every_tool_documentation_states_power_and_boundary_without_false_claims() {
         "tool_orchestrate dispatches the whole catalog, not a read-only subset: {}",
         orchestrate.description
     );
-    let ast_grep = by_name("ast_grep_search");
+    // The regex-only reality of the old `ast_grep_search` is now stated on the
+    // one `grep_search` tool, so the model cannot believe a structural matcher
+    // exists when it does not.
+    let grep = by_name("grep_search");
     assert!(
-        !ast_grep.description.to_lowercase().contains("code construct"),
-        "ast_grep_search is a per-line regex, not a structural matcher: {}",
-        ast_grep.description
+        !grep.description.to_lowercase().contains("code construct"),
+        "grep_search is a per-line regex, not a structural matcher: {}",
+        grep.description
     );
     assert!(
-        ast_grep.description.contains("NOT a structural matcher"),
-        "ast_grep_search must say what it is not: {}",
-        ast_grep.description
+        grep.description.contains("NOT a structural/AST matcher"),
+        "grep_search must say what it is not: {}",
+        grep.description
     );
 
     // Rule 3: the orchestration spec must carry bounds and vocabulary.
@@ -1746,7 +1688,7 @@ mod family_taxonomy_tests {
     #[test]
     fn every_tool_declares_a_family_tier_and_permission_key() {
         let specs = mvp_tool_specs();
-        assert_eq!(specs.len(), 44, "the catalog size is the contract");
+        assert_eq!(specs.len(), 42, "the catalog size is the contract");
         for spec in &specs {
             assert!(
                 !spec.permission_key.is_empty(),
@@ -1798,7 +1740,6 @@ mod family_taxonomy_tests {
     #[test]
     fn canonical_tools_do_not_share_a_permission_slot_beyond_the_legacy_ledger() {
         const LEGACY: &[(&str, &str, &str, usize)] = &[
-            ("Locate", "grep", "Orchestration", 2),
             ("Mutate", "checkpoint", "Orchestration", 2),
             ("Mutate", "edit", "Orchestration", 5),
             ("Session", "checkpoint", "Orchestration", 2),

@@ -853,7 +853,7 @@ mod tests {
             .unwrap();
         lease
             .validate_input(
-                "grep_many",
+                "grep_search",
                 &serde_json::json!({"searches":[output["next_request"].clone()]}),
             )
             .unwrap();

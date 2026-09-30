@@ -2920,7 +2920,7 @@ pub(crate) fn runtime_capability_context_item(
     let batch_tools = [
         "workspace_snapshot",
         "read_many",
-        "grep_many",
+        "grep_search",
         "glob_many",
         "tool_batch_readonly",
     ]

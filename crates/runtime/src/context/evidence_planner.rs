@@ -341,7 +341,7 @@ mod tests {
         assert!(plan
             .recommended_calls
             .iter()
-            .any(|call| call.name == "grep_many" || call.name == "workspace_snapshot"));
+            .any(|call| call.name == "grep_search" || call.name == "workspace_snapshot"));
         assert!(plan
             .use_subagents_when
             .iter()
@@ -360,7 +360,7 @@ mod tests {
         assert!(plan
             .recommended_calls
             .iter()
-            .any(|call| call.name == "grep_many" || call.name == "workspace_snapshot"));
+            .any(|call| call.name == "grep_search" || call.name == "workspace_snapshot"));
     }
 
     #[test]

@@ -36,7 +36,7 @@ pub fn plan_context_fanout_for_intent(
                 json!({"include_git": true, "include_files": true, "max_files": 400}),
             ),
             call(
-                "grep_many",
+                "grep_search",
                 json!({"searches": [
                     {"pattern": "TODO|FIXME|panic!|unwrap\\(", "path": ".", "glob": "*.rs"},
                     {"pattern": "cargo test|validate.sh", "path": "."}
@@ -49,7 +49,7 @@ pub fn plan_context_fanout_for_intent(
                 json!({"include_git": true, "include_files": true, "max_files": 300}),
             ),
             call(
-                "grep_many",
+                "grep_search",
                 json!({"searches": [
                     {"pattern": "error|failed|panic|exception", "path": "."},
                     {"pattern": "#\\[test\\]|describe\\(|it\\(", "path": "."}
@@ -99,7 +99,7 @@ pub fn plan_context_fanout_for_intent(
                 json!({"include_git": true, "include_files": true, "max_files": 500}),
             ),
             call(
-                "grep_many",
+                "grep_search",
                 json!({"searches": [
                     {"pattern": "pub struct|pub enum|pub fn", "path": "crates", "glob": "*.rs", "head_limit": 40},
                     {"pattern": "ToolExecutor|execute_tool|RuntimeEvent", "path": "crates", "glob": "*.rs", "head_limit": 80}

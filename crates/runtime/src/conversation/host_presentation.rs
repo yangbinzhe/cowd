@@ -3232,7 +3232,7 @@ pub(super) fn tool_call_coverage_keys(call: &ModelToolCall) -> Vec<String> {
             | "glob_search"
             | "glob_many"
             | "grep_search"
-            | "grep_many"
+            | "grep_search"
             | "lsp"
             | "toolsearch"
             | "tool_search"
@@ -3404,7 +3404,7 @@ pub(super) fn graph_metadata_effect(
     // governed compiler.
     let normalized = tool_name.trim().replace('-', "_").to_ascii_lowercase();
     let effect_kind = match normalized.as_str() {
-        "read_file" | "read_many" | "grep_search" | "grep_many" | "glob_search" | "glob_many"
+        "read_file" | "read_many" | "grep_search" | "grep_search" | "glob_search" | "glob_many"
         | "workspace_snapshot" => ToolEffectKind::Read,
         "write_file" | "edit_file" | "apply_patch_transaction" | "notebook_edit" => {
             ToolEffectKind::Write

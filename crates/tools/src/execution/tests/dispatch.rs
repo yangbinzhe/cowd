@@ -46,7 +46,7 @@ fn ast_grep_search_filters_by_language_extension() {
     fs::write(root.join("b.py"), "def foo():\n    pass\n").unwrap();
     let result = execute_in_workspace(
         &root,
-        "ast_grep_search",
+        "grep_search",
         &json!({"pattern": "fn foo", "language": "rust"}),
     )
     .expect("ast_grep_search succeeds");
@@ -628,14 +628,14 @@ fn tool_search_supports_keyword_and_select_queries() {
 
     let source_search = execute_tool(
         "tool_search",
-        &json!({"query": "select:grep_search,grep_many,read_file"}),
+        &json!({"query": "select:grep_search,read_file"}),
     )
     .expect("ToolSearch should expose executable source tools");
     let source_output: serde_json::Value =
         serde_json::from_str(&source_search).expect("valid json");
     assert_eq!(
         source_output["activation_candidates"],
-        json!(["grep_search", "grep_many", "read_file"])
+        json!(["grep_search", "read_file"])
     );
 
     let exact_grep = execute_tool(
@@ -1530,7 +1530,7 @@ fn glob_many_and_grep_many_preserve_order() {
     assert_eq!(globbed_value["results"][2]["index"], 2);
 
     let grepped = execute_tool(
-        "grep_many",
+        "grep_search",
         &json!({
             "searches": [
                 { "pattern": "alpha", "path": "nested", "glob": "*.rs" },

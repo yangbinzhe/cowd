@@ -61,13 +61,16 @@ pub(crate) fn execute_with_lease(
             from_value::<GlobManyInput>(input).and_then(|parsed| run_glob_many(lease, parsed))
         }
         "grep_search" => {
-            from_value::<GrepSearchInput>(input).and_then(|parsed| run_grep_search(lease, parsed))
+            if input.get("searches").is_some() {
+                from_value::<GrepManyInput>(input).and_then(|parsed| run_grep_many(lease, parsed))
+            } else if input.get("language").is_some() {
+                from_value::<AstGrepSearchInput>(input)
+                    .and_then(|parsed| run_ast_grep_search(lease, parsed))
+            } else {
+                from_value::<GrepSearchInput>(input)
+                    .and_then(|parsed| run_grep_search(lease, parsed))
+            }
         }
-        "grep_many" => {
-            from_value::<GrepManyInput>(input).and_then(|parsed| run_grep_many(lease, parsed))
-        }
-        "ast_grep_search" => from_value::<AstGrepSearchInput>(input)
-            .and_then(|parsed| run_ast_grep_search(lease, parsed)),
         "workspace_snapshot" => from_value::<WorkspaceSnapshotInput>(input)
             .and_then(|parsed| run_workspace_snapshot(lease, parsed)),
         "tool_batch_readonly" => from_value::<ToolBatchReadonlyInput>(input)

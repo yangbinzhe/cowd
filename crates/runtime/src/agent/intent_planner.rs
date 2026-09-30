@@ -60,14 +60,14 @@ fn intent_from_domain(domain: TaskDomain) -> TaskIntent {
 
 fn recommended_tools_for(intent: TaskIntent) -> Vec<String> {
     let tools = match intent {
-        TaskIntent::Review => vec!["workspace_snapshot", "grep_many", "read_many"],
-        TaskIntent::Bugfix => vec!["grep_many", "read_many", "tool_batch_readonly"],
+        TaskIntent::Review => vec!["workspace_snapshot", "grep_search", "read_many"],
+        TaskIntent::Bugfix => vec!["grep_search", "read_many", "tool_batch_readonly"],
         TaskIntent::Frontend => vec!["workspace_snapshot", "glob_many", "read_many"],
-        TaskIntent::Backend => vec!["workspace_snapshot", "grep_many", "read_many"],
+        TaskIntent::Backend => vec!["workspace_snapshot", "grep_search", "read_many"],
         TaskIntent::Docs => vec!["glob_many", "read_many"],
         TaskIntent::Release => vec!["workspace_snapshot", "tool_batch_readonly"],
-        TaskIntent::Test => vec!["workspace_snapshot", "grep_many"],
-        TaskIntent::Explore => vec!["workspace_snapshot", "grep_many", "read_many"],
+        TaskIntent::Test => vec!["workspace_snapshot", "grep_search"],
+        TaskIntent::Explore => vec!["workspace_snapshot", "grep_search", "read_many"],
     };
     tools.into_iter().map(str::to_string).collect()
 }

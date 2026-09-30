@@ -74,7 +74,7 @@ impl ToolSafetyCategory {
             | "tail"
             | "grep"
             | "grep_search"
-            | "grep_many"
+            | "grep_search"
             | "rg"
             | "glob"
             | "glob_search"

@@ -4082,7 +4082,7 @@ fn collect_checked_source_receipts(value: &Value, receipts: &mut BTreeSet<String
                 .is_some_and(|tool| {
                     matches!(
                         tool,
-                        "read_file" | "read_many" | "grep_search" | "grep_many"
+                        "read_file" | "read_many" | "grep_search" | "grep_search"
                     )
                 });
             let succeeded = values.get("is_error").and_then(Value::as_bool) == Some(false);

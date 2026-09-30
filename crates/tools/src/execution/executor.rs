@@ -233,7 +233,7 @@ fn run_ast_grep_search(lease: &ToolHostLease, input: AstGrepSearchInput) -> Resu
         }
     }
     serde_json::to_string_pretty(&serde_json::json!({
-        "kind": "ast_grep_search",
+        "kind": "grep_search",
         "pattern": input.pattern,
         "language": input.language,
         "files_scanned": files_scanned,
@@ -654,12 +654,12 @@ fn run_grep_search(lease: &ToolHostLease, input: GrepSearchInput) -> Result<Stri
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_grep_many(lease: &ToolHostLease, input: GrepManyInput) -> Result<String, String> {
-    require_batch_bound("grep_many", input.searches.len())?;
+    require_batch_bound("grep_search", input.searches.len())?;
     let results = run_ordered_batch(input.searches, input.max_concurrency, |item| {
         let output = run_grep_search(lease, item)?;
         serde_json::from_str(&output).or(Ok(Value::String(output)))
     });
-    to_pretty_json(batch_output("grep_many", results))
+    to_pretty_json(batch_output("grep_search", results))
 }
 
 #[path = "workspace_snapshot.rs"]
@@ -848,7 +848,7 @@ pub(crate) fn is_allowed_readonly_batch_tool(name: &str) -> bool {
             | "glob_search"
             | "glob_many"
             | "grep_search"
-            | "grep_many"
+            | "grep_search"
             | "workspace_snapshot"
             | "tool_cache_stats"
             | "mutation_preview"
