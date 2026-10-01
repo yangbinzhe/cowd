@@ -186,7 +186,18 @@ impl RuntimeBudgetPlan {
         // cannot verify anything and burns rounds re-reading. Size the lease so
         // a whole file (and a small batch) fits, with a hard per-call floor.
         let tool_total = scaled_budget(subsystem_budget_tokens, 0.28, 8_192, 120_000) as usize;
-        let tool_single = scaled_budget(tool_total as u64, 0.5, 32_000, 32_000)
+        // A single tool result is the *largest* per-round increment to the
+        // provider prompt, and live measurement shows it is what caps prefix
+        // reuse: with `per_tool_max_tokens` pinned at 32_000 tokens (floor ==
+        // cap), one attempt's model-visible prompt diverged 257KB / 40% from the
+        // reusable prefix, and a fifteen-call read turn reached 349k prompt
+        // tokens with a 40% cache hit ratio. A whole source file in this repo is
+        // 5k-10k tokens, so 12_000 tokens still carries one whole file plus the
+        // receipt envelope, while the read-family soft floor
+        // (`READ_TOOL_RESULT_FLOOR_TOKENS`) keeps an exhausted lease from
+        // starving a later read into a stub. Anything longer stays reachable
+        // through the `tool://` full-output reference.
+        let tool_single = scaled_budget(tool_total as u64, 0.5, 12_000, 12_000)
             .min(tool_total as u64) as usize;
         let subagent_default_budget =
             scaled_budget(subsystem_budget_tokens, profile_multiplier, 512, 160_000);
@@ -324,8 +335,13 @@ mod tests {
         let lease = plan.tool_result_budget;
 
         assert!(
-            lease.per_tool_max_tokens >= 32_000,
+            lease.per_tool_max_tokens >= 12_000,
             "one whole source file (5k-10k tokens) plus head-room must fit a single call, got {}",
+            lease.per_tool_max_tokens
+        );
+        assert!(
+            lease.per_tool_max_tokens <= 16_000,
+            "a single tool result must not dominate the prompt: live measurement showed 32_000 tokens per call holding prefix reuse at 60%, got {}",
             lease.per_tool_max_tokens
         );
         assert!(
