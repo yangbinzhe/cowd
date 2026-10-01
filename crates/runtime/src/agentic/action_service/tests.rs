@@ -3060,3 +3060,219 @@ fn an_inferred_team_minimum_is_a_floor_and_not_a_ceiling() {
         "an autonomous objective must never be capped"
     );
 }
+
+#[tokio::test]
+async fn an_accepted_task_rejects_re_review_and_re_submit_but_allows_supersede() {
+    let temporary = tempfile::tempdir().expect("artifact root");
+    let artifacts = Arc::new(crate::ArtifactStore::for_test_default(temporary.path()));
+    let content = artifacts
+        .write_bytes(
+            harness_contract::context::ArtifactWriteDescriptor {
+                media_type: "text/markdown".to_string(),
+                visibility_scope: "session:session-1".to_string(),
+                expected_bytes: None,
+                original_name: Some("verified-report.md".to_string()),
+            },
+            b"verified production evidence",
+        )
+        .await
+        .expect("durable content");
+    let service = AgentActionService::new(Arc::new(RuntimeEventStore::for_test()))
+        .with_artifact_store(artifacts);
+    let team = service
+        .apply(&root(
+            "gate-team",
+            AgentAction::TeamCreate(TeamCreateInput {
+                name: "Idempotency".to_string(),
+                mission: "close work exactly once".to_string(),
+                objective: None,
+            }),
+        ))
+        .expect("team")
+        .changed_refs[0]
+        .clone();
+    let worker = service
+        .apply(&root(
+            "gate-worker",
+            AgentAction::AgentInvite(AgentInviteInput {
+                team_ref: team.clone(),
+                role: "implementer".to_string(),
+                mission: "produce".to_string(),
+                required_capabilities: vec!["read".to_string()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
+            }),
+        ))
+        .expect("worker")
+        .changed_refs[0]
+        .clone();
+    let reviewer = service
+        .apply(&root(
+            "gate-reviewer",
+            AgentAction::AgentInvite(AgentInviteInput {
+                team_ref: team.clone(),
+                role: "reviewer".to_string(),
+                mission: "verify".to_string(),
+                required_capabilities: vec!["read".to_string()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
+            }),
+        ))
+        .expect("reviewer")
+        .changed_refs[0]
+        .clone();
+    let publish = |title: &str| AgentAction::TaskPublish(TaskPublishInput {
+        team_ref: team.clone(),
+        title: title.to_string(),
+        objective: "produce a grounded report".to_string(),
+        acceptance: "durable report and independent review".to_string(),
+        acceptance_checks: Vec::new(),
+        required_capabilities: vec!["read".to_string()],
+        depends_on: Vec::new(),
+        obligation_refs: Vec::new(),
+        purpose: Default::default(),
+        execution_requirements: Vec::new(),
+        expertise_hints: Vec::new(),
+    });
+    let task = service
+        .apply(&root("gate-task", publish("Verified report")))
+        .expect("task")
+        .changed_refs[0]
+        .clone();
+    service
+        .apply(&managed(
+            "gate-claim",
+            &team,
+            &worker,
+            AgentAction::TaskClaim(TaskClaimInput {
+                task_ref: task.clone(),
+                reason: None,
+            }),
+        ))
+        .expect("claim");
+    let commit = service
+        .apply(&managed(
+            "gate-commit",
+            &team,
+            &worker,
+            AgentAction::ArtifactCommit(ArtifactCommitInput {
+                content_ref: content.selector.clone(),
+                kind: "final_report".to_string(),
+                title: "Verified report".to_string(),
+                relates_to: vec![task.clone()],
+            }),
+        ))
+        .expect("commit");
+    let artifact = commit.changed_refs[0].clone();
+    service
+        .apply(&managed(
+            "gate-submit",
+            &team,
+            &worker,
+            AgentAction::TaskSubmit(TaskSubmitInput {
+                deliverable: None,
+                task_ref: task.clone(),
+                artifact_refs: vec![artifact.clone()],
+                evidence_refs: vec![content.selector.clone()],
+                unresolved: Vec::new(),
+            }),
+        ))
+        .expect("submit");
+    service
+        .apply(&managed(
+            "gate-review",
+            &team,
+            &reviewer,
+            AgentAction::TaskReview(TaskReviewInput {
+                task_ref: task.clone(),
+                decision: TaskReviewDecision::Accept,
+                reason: "acceptance met".to_string(),
+                evidence_refs: vec![content.selector.clone()],
+            }),
+        ))
+        .expect("review");
+
+    // Idempotency gate: an already-Accepted Task rejects re-review / re-submit.
+    let re_review = service
+        .apply(&managed(
+            "gate-re-review",
+            &team,
+            &reviewer,
+            AgentAction::TaskReview(TaskReviewInput {
+                task_ref: task.clone(),
+                decision: TaskReviewDecision::Accept,
+                reason: "again".to_string(),
+                evidence_refs: vec![content.selector.clone()],
+            }),
+        ))
+        .expect("re-review");
+    assert_eq!(re_review.status, AgentActionStatus::Rejected);
+    assert_eq!(re_review.error.expect("error").code, "task_already_accepted");
+    let re_submit = service
+        .apply(&managed(
+            "gate-re-submit",
+            &team,
+            &worker,
+            AgentAction::TaskSubmit(TaskSubmitInput {
+                deliverable: None,
+                task_ref: task.clone(),
+                artifact_refs: vec![artifact.clone()],
+                evidence_refs: vec![content.selector.clone()],
+                unresolved: Vec::new(),
+            }),
+        ))
+        .expect("re-submit");
+    assert_eq!(re_submit.status, AgentActionStatus::Rejected);
+    assert_eq!(re_submit.error.expect("error").code, "task_already_accepted");
+
+    let replacement = service
+        .apply(&root(
+            "gate-replacement",
+            AgentAction::TaskPublish(TaskPublishInput {
+                team_ref: team.clone(),
+                title: "Revised report".to_string(),
+                objective: "produce a grounded report under a changed criterion".to_string(),
+                acceptance: "durable report and independent review".to_string(),
+                acceptance_checks: Vec::new(),
+                required_capabilities: vec!["read".to_string()],
+                depends_on: Vec::new(),
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
+            }),
+        ))
+        .expect("replacement")
+        .changed_refs[0]
+        .clone();
+
+    // An accepted Task is final truth: supersede is also rejected, so the only
+    // way to change a conclusion is to publish a NEW Task (which stays allowed).
+    let superseded = service
+        .apply(&root(
+            "gate-supersede",
+            AgentAction::TaskSupersede(TaskSupersedeInput {
+                task_ref: task.clone(),
+                replacement_task_refs: vec![replacement.clone()],
+                reason: "acceptance criteria changed".to_string(),
+                evidence_refs: vec![content.selector.clone()],
+            }),
+        ))
+        .expect("supersede");
+    assert_eq!(superseded.status, AgentActionStatus::Rejected);
+    assert_eq!(
+        superseded.error.expect("error").code,
+        "task_not_supersedable",
+        "accepted truth is immutable; the model publishes a new Task instead"
+    );
+    assert!(
+        !replacement.is_empty(),
+        "the newly published Task is the real way to change a conclusion"
+    );
+}

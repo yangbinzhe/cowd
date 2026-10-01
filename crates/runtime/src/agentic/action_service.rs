@@ -299,6 +299,36 @@ impl AgentActionService {
             ));
         }
 
+        // ── Idempotency gate ────────────────────────────────────────────────
+        // An already-Accepted Task is closed. Re-reviewing or re-submitting it
+        // burns a provider round and an event without changing any fact. A live
+        // 1-team run spent 169 of its 239 tool calls here and never reached the
+        // terminal action. To change an accepted conclusion the model publishes a
+        // superseding Task, which keeps the audit trail; supersede/withdraw/
+        // release are lifecycle actions and are deliberately NOT gated.
+        if matches!(
+            envelope.action,
+            AgentAction::TaskReview(_) | AgentAction::TaskSubmit(_)
+        ) {
+            let gated_task_ref = match &envelope.action {
+                AgentAction::TaskReview(input) => Some(input.task_ref.as_str()),
+                AgentAction::TaskSubmit(input) => Some(input.task_ref.as_str()),
+                _ => None,
+            };
+            if let Some(task_ref) = gated_task_ref {
+                if let Some(task) = projection.tasks.get(task_ref) {
+                    if task.status == AgenticTaskStatus::Accepted {
+                        return Ok(rejected(
+                            envelope,
+                            projection.revision,
+                            "task_already_accepted",
+                            "this Task is already Accepted; publish a superseding Task instead of re-reviewing or re-submitting it",
+                        ));
+                    }
+                }
+            }
+        }
+
         if matches!(envelope.action, AgentAction::StateInspect(_)) {
             let goal = projection
                 .root_execution_id
