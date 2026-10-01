@@ -1151,18 +1151,34 @@ where
         let collaboration_obligation = self
             .active_turn_strategy()
             .and_then(|state| state.decision.collaboration_obligation);
-        if let Some(obligation) = collaboration_obligation {
+        // Expose the Agent-first actions whenever collaboration is in play, not
+        // only when the operator froze a count: the model must always be able
+        // to see the capability it may choose, even when no obligation exists.
+        let collaboration_visible = self.active_turn_strategy().is_some_and(|state| {
+            collaboration_obligation.is_some()
+                || state.decision.strategy.understanding.requests_multi_agent
+                || state.decision.pattern() == harness_contract::core::ExecutionPattern::Collaborate
+        });
+        if collaboration_visible {
             for tool in harness_contract::agent_action::AGENT_ACTION_TOOL_IDS {
                 exposure.active.insert((*tool).to_string());
                 exposure.deferred.remove(*tool);
             }
-            exposure.reason =
-                "collaboration execution obligation activates Agent-first actions".to_string();
+            exposure.reason = match collaboration_obligation.as_ref() {
+                Some(obligation) => format!(
+                    "operator Team obligation (minimum {}) activates Agent-first actions",
+                    obligation.minimum_team_count
+                ),
+                None => {
+                    "collaboration is available; Agent-first actions exposed for the model to choose"
+                        .to_string()
+                }
+            };
             tracing::info!(
-                team_required = true,
-                minimum_team_count = obligation.minimum_team_count,
+                team_required = collaboration_obligation.is_some(),
+                minimum_team_count = collaboration_obligation.as_ref().map(|o| o.minimum_team_count),
                 active = ?exposure.active,
-                "collaboration execution obligation activated Agent-first actions"
+                "Agent-first actions exposed for a collaboration-capable turn"
             );
         }
         let one_shot_tool_overlay =
