@@ -9,23 +9,42 @@ pub(crate) fn execute_with_lease(
 ) -> Result<String, String> {
     match name {
         "bash" => {
-            if input.get("shell").and_then(serde_json::Value::as_str) == Some("powershell") {
-                // `shell` selects the backend and is not part of the PowerShell
-                // input contract, which denies unknown fields.
-                let mut restored = input.clone();
+            // `shell` is a backend selector, not part of the bash/powershell
+            // input contract (both deny unknown fields). Strip it for every
+            // value, then route: powershell -> the PowerShell backend, anything
+            // else (auto/bash/absent) -> the bash backend.
+            let shell = input.get("shell").and_then(serde_json::Value::as_str);
+            let mut restored = input.clone();
+            if shell.is_some() {
                 if let Some(object) = restored.as_object_mut() {
                     object.remove("shell");
                 }
+            }
+            if shell == Some("powershell") {
                 let ps_input: PowerShellInput = from_value(&restored)?;
                 run_powershell(lease, ps_input)
             } else {
-                let bash_input: BashCommandInput = from_value(input)?;
+                let bash_input: BashCommandInput = from_value(&restored)?;
                 run_bash(lease, bash_input)
             }
         }
         "background" => match input.get("action").and_then(|value| value.as_str()) {
-            Some("status") => run_background_task_status(lease, input),
-            Some("kill") => run_background_task_kill(lease, input),
+            Some("status") => {
+                // `action` selects the operation and is not part of the
+                // per-action contract, which denies unknown fields.
+                let mut stripped = input.clone();
+                if let Some(object) = stripped.as_object_mut() {
+                    object.remove("action");
+                }
+                run_background_task_status(lease, &stripped)
+            }
+            Some("kill") => {
+                let mut stripped = input.clone();
+                if let Some(object) = stripped.as_object_mut() {
+                    object.remove("action");
+                }
+                run_background_task_kill(lease, &stripped)
+            }
             other => Err(format!(
                 "background action must be `status` or `kill`, got {other:?}"
             )),
@@ -67,14 +86,21 @@ pub(crate) fn execute_with_lease(
                 "checkpoint action must be create|list|diff|restore, got {other:?}"
             )),
         },
-        "glob_search" => from_value::<GlobSearchInputValue>(input)
-            .and_then(|parsed| run_glob_search(lease, parsed)),
+        "glob_search" => {
+            if input.get("patterns").is_some() {
+                from_value::<GlobSearchManyInput>(input)
+                    .and_then(|parsed| run_glob_search_many(lease, parsed))
+            } else {
+                from_value::<GlobSearchInputValue>(input)
+                    .and_then(|parsed| run_glob_search(lease, parsed))
+            }
+        }
         "grep_search" => {
             if input.get("searches").is_some() {
-                from_value::<GrepManyInput>(input).and_then(|parsed| run_grep_many(lease, parsed))
+                from_value::<GrepSearchBatchInput>(input).and_then(|parsed| run_grep_search_batch(lease, parsed))
             } else if input.get("language").is_some() {
-                from_value::<AstGrepSearchInput>(input)
-                    .and_then(|parsed| run_ast_grep_search(lease, parsed))
+                from_value::<GrepSearchLanguageInput>(input)
+                    .and_then(|parsed| run_grep_search_language(lease, parsed))
             } else {
                 from_value::<GrepSearchInput>(input)
                     .and_then(|parsed| run_grep_search(lease, parsed))
@@ -144,6 +170,12 @@ pub(crate) fn execute_with_lease(
             from_value::<StructuredOutputInput>(input).and_then(run_structured_output)
         }
         "ask" => {
+            if input.get("message").is_some() && input.get("question").is_some() {
+                return Err(
+                    "ask is either a `question` (blocking) or a `message` (brief), not both"
+                        .to_string(),
+                );
+            }
             if input.get("message").is_some() {
                 from_value::<BriefInput>(input).and_then(|parsed| run_brief(lease, parsed))
             } else {
@@ -167,9 +199,6 @@ pub(crate) fn execute_with_lease(
                 "mcp action must be call|list|read|auth, got {other:?}"
             )),
         },
-        "testing_permission" => {
-            from_value::<TestingPermissionInput>(input).and_then(run_testing_permission)
-        }
         "vision_analyze" => run_vision_analyze(lease, input),
         "execute_code" => {
             use crate::sandbox_exec::execute_code_in_workspace;

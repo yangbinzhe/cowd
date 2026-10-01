@@ -103,8 +103,7 @@ pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
         | "tool_search"
         | "structured_output"
         | "current_time"
-        | "get_context_remaining"
-        | "testing_permission" => "builtin.readonly",
+        | "get_context_remaining" => "builtin.readonly",
         "lsp" => "builtin.readonly_process",
         "vision_analyze" => "builtin.readonly_process",
         "todo_write"
@@ -293,7 +292,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             family: ToolFamily::Mutate,
             tier: ToolTier::Orchestration,
             permission_key: "checkpoint",
-            description: "Manage local workspace checkpoints through ONE entry point. action=create (label?, paths?): snapshot the workspace before risky edits. action=list: list local checkpoints with ids and scope. action=diff (id): compare the workspace against a checkpoint. action=restore (id): overwrite files from a checkpoint - diff first. Boundary: checkpoints cover workspace content only, never session state, and are local to this session and host.",
+            description: "Manage local workspace checkpoints through ONE entry point. action=create (label?, paths?): snapshot the workspace before risky edits. action=list: list local checkpoints with ids and scope. action=diff (id): compare the workspace against a checkpoint - it reports differences, never the changed content itself. action=restore (id): overwrite files from a checkpoint - diff first. Boundary: checkpoints cover workspace content only, never session state, and are local to this session and host.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -312,7 +311,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             family: ToolFamily::Mutate,
             tier: ToolTier::Orchestration,
             permission_key: "edit",
-            description: "The ONE workspace mutation primitive. action=write (path, content): create or fully replace a file. action=replace (path, old_string, new_string, replace_all?): replace an exact string in one file; the old string must match exactly once unless replace_all is set. action=preview (edits): dry-run several replacements, reporting resulting content, counts and hash changes without writing - always validate a multi-file edit this way first. action=patch (edits, expected_hashes?): apply a multi-file plan after expected-hash verification, in declaration order under the per-call scope lock. action=notebook (notebook_path, ...): replace, insert or delete a Jupyter cell source without executing it. Boundary: write/preview/patch/replace touch the workspace and need write authorization while preview is read-only; patch refuses the whole transaction on a stale hash, and notebook edits cell source only, never executing it.",
+            description: "The ONE workspace mutation primitive. action=write (path, content): create or fully replace a file; large content is budgeted to the write ceiling. action=replace (path, old_string, new_string, replace_all?): replace an exact string in one file; the old string must match exactly once unless replace_all is set. action=preview (edits): dry-run several replacements, reporting resulting content, counts and hash changes without writing - always validate a multi-file edit this way first. action=patch (edits, expected_hashes?): apply a multi-file plan after expected-hash verification, in declaration order under the per-call scope lock; its effect escalates to the strictest sub-edit, so orchestrating a write needs write authorization. action=notebook (notebook_path, ...): replace, insert or delete a Jupyter cell source without executing it. Boundary: write/preview/patch/replace touch the workspace and need write authorization while preview is read-only; patch refuses the whole transaction on a stale hash, and notebook edits cell source only, never executing it.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -345,12 +344,31 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "pattern": { "type": "string" },
+                    "patterns": {
+                        "type": "array",
+                        "maxItems": 200,
+                        "description": "Several independent glob patterns in ONE call; the symmetric counterpart of grep_search.searches. Use this instead of N separate glob_search calls.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "pattern": { "type": "string" },
+                                "path": { "type": "string" },
+                                "include_ignored": { "type": "boolean" },
+                                "ignore_patterns": { "type": "array", "items": { "type": "string" } }
+                            },
+                            "required": ["pattern"]
+                        }
+                    },
                     "include_ignored": { "type": "boolean", "description": "Include hidden and project-ignored paths; workspace protection still applies." },
                     "ignore_patterns": { "type": "array", "items": { "type": "string" }, "description": "Additional exclusion globs relative to the search root." },
                     "path": { "type": "string" },
-                    "cursor": { "type": "string", "description": "Opaque query-bound cursor; prefer copying next_request unchanged." }
+                    "cursor": { "type": "string", "description": "Opaque query-bound cursor; prefer copying next_request unchanged." },
+                    "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 42, "description": "Only with `patterns`: cap parallel sub-searches." }
                 },
-                "required": ["pattern"],
+                "anyOf": [
+                    { "required": ["pattern"] },
+                    { "required": ["patterns"] }
+                ],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,
@@ -366,10 +384,10 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "properties": {
                     "pattern": { "type": "string" },
                     "language": { "type": "string", "description": "Restrict the sweep to one language's file extensions." },
-                    "case_sensitive": { "type": "boolean" },
-                    "max_files": { "type": "integer", "minimum": 1, "maximum": 2000 },
-                    "max_matches": { "type": "integer", "minimum": 1, "maximum": 500 },
-                    "searches": { "type": "array", "maxItems": 200, "items": { "type": "object", "properties": { "pattern": { "type": "string" }, "path": { "type": "string" }, "glob": { "type": "string" }, "output_mode": { "type": "string", "enum": ["content", "files_with_matches", "count"] }, "context": { "type": "integer", "minimum": 0 }, "-n": { "type": "boolean" }, "-i": { "type": "boolean" }, "head_limit": { "type": "integer", "minimum": 1 } }, "required": ["pattern"] }, "description": "Several independent searches in ONE ordered batch." },
+                    "case_sensitive": { "type": "boolean", "description": "Only with `language`: case-sensitive language sweep. Ignored otherwise." },
+                    "max_files": { "type": "integer", "minimum": 1, "maximum": 2000, "description": "Only with `language`: cap the swept file count." },
+                    "max_matches": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Only with `language`: cap total matches." },
+                    "searches": { "type": "array", "maxItems": 200, "items": { "type": "object", "properties": { "pattern": { "type": "string" }, "path": { "type": "string" }, "glob": { "type": "string" }, "output_mode": { "type": "string", "enum": ["content", "files_with_matches", "count"] }, "context": { "type": "integer", "minimum": 0 }, "-n": { "type": "boolean" }, "-i": { "type": "boolean" }, "head_limit": { "type": "integer", "minimum": 1 }, "include_ignored": { "type": "boolean", "description": "Include hidden and project-ignored paths." }, "ignore_patterns": { "type": "array", "items": { "type": "string" } }, "-B": { "type": "integer", "minimum": 0 }, "-A": { "type": "integer", "minimum": 0 }, "-C": { "type": "integer", "minimum": 0 }, "type": { "type": "string" }, "offset": { "type": "integer", "minimum": 0 }, "multiline": { "type": "boolean" }, "cursor": { "type": "string" } }, "required": ["pattern"] }, "description": "Several independent searches in ONE ordered batch." },
                     "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 42 },
 
                     "include_ignored": { "type": "boolean", "description": "Include hidden and project-ignored paths; workspace protection still applies." },
@@ -389,6 +407,10 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "multiline": { "type": "boolean" }
                     ,"cursor": { "type": "string", "description": "Opaque query-bound cursor; prefer copying next_request unchanged." }
                 },
+                "anyOf": [
+                    { "required": ["pattern"] },
+                    { "required": ["searches"] }
+                ],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,
@@ -439,14 +461,19 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                                     "description": "Step kind. call/batch/map/filter/collect/compute/when/repeat."
                                 },
                                 "tool": { "type": "string" },
-                                "input": { "type": "object" },
+                                "input": {},
+                                "on_error": {
+                                    "type": "string",
+                                    "enum": ["fail", "collect"],
+                                    "description": "batch/map failure policy: `fail` (default) aborts the whole program on the first sub-call error; `collect` returns per-item {ok,output,error,durationMs} and continues."
+                                },
                                 "calls": {
                                     "type": "array",
                                     "items": {
                                         "type": "object",
                                         "properties": {
                                             "tool": { "type": "string" },
-                                            "input": { "type": "object" },
+                                            "input": {},
                                             "as": { "type": "string" }
                                         },
                                         "required": ["tool"]
@@ -490,7 +517,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                             "required": ["id", "op"]
                         }
                     },
-                    "return": { "type": "string", "description": "$<step_id> to return." }
+                    "return": { "type": "string", "description": "$<step_id> to return." },
+                    "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 42, "description": "Upper bound on parallel batch/map sub-calls; Runtime still clamps to the workspace limit." }
                 },
                 "required": ["steps"],
                 "additionalProperties": false
@@ -515,7 +543,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             family: ToolFamily::Web,
             tier: ToolTier::Direct,
             permission_key: "webfetch",
-            description: "Fetch a URL and answer a prompt about it, with allowed/blocked domain scoping. Boundary: the answer is only as good as the fetched text - cite the URL, and prefer web_search first to find the right one.",
+            description: "Fetch a URL and return a bounded text extract (page title plus a bounded preview) for the given prompt, with allowed/blocked domain scoping. Boundary: it returns fetched text only - it does NOT answer the prompt with a model, so read the returned content yourself; cite the URL, and prefer web_search first to find the right one.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -846,22 +874,6 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             }),
             required_permission: PermissionMode::DangerFullAccess,
         },
-        ToolSpec {
-            name: "testing_permission",
-            family: ToolFamily::Govern,
-            tier: ToolTier::Operator,
-            permission_key: "testing",
-            description: "Test-only probe for permission enforcement. It has no production purpose and refuses outside a test.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "action": { "type": "string" }
-                },
-                "required": ["action"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::DangerFullAccess,
-        },
         // 3B-4: Built-in vision analysis tool (requires multimodal LLM support)
         ToolSpec {
             name: "vision_analyze",
@@ -902,7 +914,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "properties": {
                     "language": {
                         "type": "string",
-                        "enum": ["python", "javascript", "bash", "ruby", "lua"],
+                        "enum": ["python", "javascript", "bash", "ruby", "lua", "go", "rust"],
                         "description": "Programming language to execute"
                     },
                     "code": {
@@ -1379,7 +1391,7 @@ mod family_taxonomy_tests {
     #[test]
     fn every_tool_declares_a_family_tier_and_permission_key() {
         let specs = mvp_tool_specs();
-        assert_eq!(specs.len(), 29, "the catalog size is the contract");
+        assert_eq!(specs.len(), 28, "the catalog size is the contract");
         for spec in &specs {
             assert!(
                 !spec.permission_key.is_empty(),

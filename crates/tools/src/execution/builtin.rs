@@ -135,7 +135,9 @@ pub(super) fn run_read_mcp_resource(
     lease: &ToolHostLease,
     input: McpResourceInput,
 ) -> Result<String, String> {
-    let uri = input.uri.as_deref().unwrap_or("");
+    let Some(uri) = input.uri.as_deref().filter(|uri| !uri.trim().is_empty()) else {
+        return Err("mcp action=read requires a non-empty `uri`".to_string());
+    };
     let server = input.server.as_deref().unwrap_or("default");
     let Some(service) = lease.snapshot().mcp.as_ref() else {
         return mcp_service_unavailable("read_resource", server);
@@ -312,15 +314,6 @@ pub(super) fn run_mcp_tool(lease: &ToolHostLease, input: McpToolInput) -> Result
             "status": "error"
         })),
     }
-}
-
-#[allow(clippy::needless_pass_by_value)]
-pub(super) fn run_testing_permission(input: TestingPermissionInput) -> Result<String, String> {
-    to_pretty_json(json!({
-        "action": input.action,
-        "permitted": true,
-        "message": "Testing permission tool stub"
-    }))
 }
 
 // ── 3B-4: Vision Analyze Tool ──────────────────────────────────────────────────

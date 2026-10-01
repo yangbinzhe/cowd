@@ -36,6 +36,30 @@ pub(crate) struct OrchestrateInput {
     steps: Vec<Step>,
     #[serde(default, rename = "return")]
     ret: Option<String>,
+    #[serde(default)]
+    max_concurrency: Option<usize>,
+}
+
+/// batch/map failure policy. `fail` (default) aborts the whole program on the
+/// first sub-call error; `collect` returns a per-item receipt and continues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OnError {
+    Fail,
+    Collect,
+}
+
+/// Per-item receipt for a `collect` batch/map entry: preserves the status and
+/// duration the batch engine already measured, so a caller can read the
+/// successful items without losing the failed ones.
+fn batch_item_value(result: &crate::executor::BatchToolItemOutput) -> Value {
+    serde_json::json!({
+        "ok": result.output.is_some(),
+        "status": result.status,
+        "durationMs": result.duration_ms,
+        "output": result.output,
+        "error": result.error,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,6 +79,8 @@ enum StepKind {
     },
     Batch {
         calls: Vec<BatchCall>,
+        #[serde(default)]
+        on_error: Option<OnError>,
     },
     Map {
         over: String,
@@ -63,6 +89,8 @@ enum StepKind {
         input: Value,
         #[serde(default)]
         field: Option<String>,
+        #[serde(default)]
+        on_error: Option<OnError>,
     },
     Filter {
         over: String,
@@ -155,7 +183,13 @@ pub(crate) fn run_orchestrate(lease: &ToolHostLease, input: &Value) -> Result<St
         let before = total_calls;
         let started = std::time::Instant::now();
         let (op, tool) = step_descriptor(&step.kind);
-        match evaluate(lease, &step.kind, &state, &mut total_calls) {
+        match evaluate(
+            lease,
+            &step.kind,
+            &state,
+            &mut total_calls,
+            parsed.max_concurrency,
+        ) {
             Ok(value) => {
                 calls_trace.push(step_trace(
                     &step.id,
@@ -277,7 +311,7 @@ pub fn requested_sub_call_tools(tool_name: &str, input: &Value) -> SubCallAuthor
             | StepKind::Map { tool, .. }
             | StepKind::When { tool, .. }
             | StepKind::Repeat { tool, .. } => names.push(tool.clone()),
-            StepKind::Batch { calls } => {
+            StepKind::Batch { calls, .. } => {
                 names.extend(calls.iter().map(|call| call.tool.clone()));
             }
             StepKind::Compute { .. } => names.push("execute_code".to_string()),
@@ -299,13 +333,14 @@ fn evaluate(
     kind: &StepKind,
     state: &State,
     total_calls: &mut usize,
+    max_concurrency: Option<usize>,
 ) -> Result<Value, String> {
     match kind {
         StepKind::Call { tool, input } => {
             let resolved = resolve_value(input, state, None)?;
             call_tool(lease, tool, &resolved, total_calls)
         }
-        StepKind::Batch { calls } => {
+        StepKind::Batch { calls, on_error } => {
             if calls.len() > MAX_MAP_ITEMS {
                 return Err(format!(
                     "batch has {} calls, over the limit of {MAX_MAP_ITEMS}",
@@ -326,14 +361,19 @@ fn evaluate(
                 ));
             }
             let items = prepared.clone();
-            let results = crate::executor::run_ordered_batch(prepared, None, |call| {
+            let results = crate::executor::run_ordered_batch(prepared, max_concurrency, |call| {
                 call_tool_uncounted(lease, &call.1, &call.2)
             });
             *total_calls += items.len();
+            let collect = matches!(on_error, Some(OnError::Collect));
             let mut object = Map::new();
             for (index, result) in results.into_iter().enumerate() {
                 let (alias, tool, _) = &items[index];
                 let key = alias.clone().unwrap_or_else(|| format!("{tool}[{index}]"));
+                if collect {
+                    object.insert(key, batch_item_value(&result));
+                    continue;
+                }
                 match result.output {
                     Some(value) => {
                         object.insert(key, value);
@@ -352,6 +392,7 @@ fn evaluate(
             tool,
             input,
             field,
+            on_error,
         } => {
             let list = resolve_ref(over, state, None)?;
             let items = list
@@ -370,13 +411,18 @@ fn evaluate(
                 ));
             }
             // Bounded parallel fan-out, matching `read_many`/`grep_many`.
-            let results = crate::executor::run_ordered_batch(items.clone(), None, |item| {
+            let results = crate::executor::run_ordered_batch(items.clone(), max_concurrency, |item| {
                 let resolved = resolve_value(input, state, Some(&item))?;
                 call_tool_uncounted(lease, tool, &resolved)
             });
             *total_calls += items.len();
+            let collect = matches!(on_error, Some(OnError::Collect));
             let mut outputs = Vec::with_capacity(results.len());
             for result in results {
+                if collect {
+                    outputs.push(batch_item_value(&result));
+                    continue;
+                }
                 match result.output {
                     Some(value) => outputs.push(select_field(value, field.as_deref())),
                     None => {

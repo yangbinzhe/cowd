@@ -102,8 +102,7 @@ impl ToolSafetyCategory {
             | "skill_view"
             | "ask"
             | "tool_search"
-            | "runtime_capabilities"
-            | "mcp" => Self::ReadOnly,
+            | "runtime_capabilities" => Self::ReadOnly,
 
             "add" | "calculator" => Self::ReadOnly,
 
@@ -120,7 +119,7 @@ impl ToolSafetyCategory {
 
             "web_search" | "web_fetch" | "http_request" => Self::Network,
 
-            "bash" | "powershell" | "execute_code" | "mcp" | "remote_trigger" | "agent"
+            "bash" | "powershell" | "execute_code" | "remote_trigger" | "agent"
             | "task_create" | "run_task_packet" | "task_stop" | "task_update" | "worker_create"
             | "worker_send_prompt" | "worker_restart" | "worker_terminate" | "team_create"
             | "team_delete" | "cron_create" | "cron_delete" | "config"
@@ -217,9 +216,7 @@ fn normalize_tool_name_for_safety(name: &str) -> String {
         "toolsearch" => "tool_search".to_string(),
         "runtimecapabilities" => "runtime_capabilities".to_string(),
         "contextretrieve" => "context_retrieve".to_string(),
-        "listmcpresources" => "list_mcp_resources".to_string(),
-        "readmcpresource" => "read_mcp_resource".to_string(),
-        "mcpauth" => "mcp_auth".to_string(),
+        "listmcpresources" | "readmcpresource" | "mcpauth" => "mcp".to_string(),
         "remotetrigger" => "remote_trigger".to_string(),
         "notebookedit" => "edit".to_string(),
         "structuredoutput" => "structured_output".to_string(),
@@ -254,6 +251,23 @@ fn normalize_tool_name_for_safety(name: &str) -> String {
 pub fn classify_tool_request(tool_name: &str, input: &str) -> ToolSafetyCategory {
     let normalized = normalize_tool_name_for_safety(tool_name);
     let fallback = ToolSafetyCategory::from_tool_name(&normalized);
+    // `mcp` is one merged tool with read-only and effecting actions; classify
+    // by action instead of a blanket category.
+    if normalized == "mcp" {
+        let action = serde_json::from_str::<serde_json::Value>(input)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("action")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
+        return match action.as_deref() {
+            Some("list") | Some("read") => ToolSafetyCategory::ReadOnly,
+            Some("call") | Some("auth") => ToolSafetyCategory::Network,
+            _ => fallback,
+        };
+    }
     if normalized != "bash" {
         return fallback;
     }

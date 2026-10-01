@@ -1932,3 +1932,79 @@ fn tool_orchestrate_supports_filter_when_and_repeat() {
     let _ = fs::remove_dir_all(&root);
 }
 
+
+#[test]
+fn background_selector_is_not_rejected_as_unknown_field() {
+    // Regression (family merge): the merged `background` schema requires
+    // `action`, while the per-action handlers deny unknown fields. Dispatch
+    // must strip `action` before parsing, for both actions.
+    for action in ["status", "kill"] {
+        let result =
+            execute_tool("background", &json!({ "action": action, "jobId": "missing-job" }));
+        let rendered = format!("{result:?}");
+        assert!(
+            !rendered.contains("unknown field"),
+            "background action={action} must not fail on the selector: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn bash_shell_selector_is_accepted_for_every_backend() {
+    // Regression (family merge): `shell` is a backend selector, not part of
+    // BashCommandInput (deny_unknown_fields). It must be stripped for
+    // auto/bash and routed for powershell, never rejected as unknown.
+    for shell in ["auto", "bash", "powershell"] {
+        let result = execute_tool("bash", &json!({ "shell": shell, "command": "true" }));
+        let rendered = format!("{result:?}");
+        assert!(
+            !rendered.contains("unknown field"),
+            "bash shell={shell} must not fail on the selector: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn glob_search_accepts_multiple_patterns_in_one_call() {
+    // Restores the batch `glob_many` capability inside the merged tool, the
+    // symmetric counterpart of `grep_search.searches`.
+    let output = execute_tool(
+        "glob_search",
+        &json!({ "patterns": [{ "pattern": "*.rs" }, { "pattern": "*.toml" }] }),
+    )
+    .expect("multi-pattern glob must succeed");
+    let parsed: serde_json::Value = serde_json::from_str(&output).expect("json");
+    assert_eq!(parsed["count"], json!(2), "{parsed}");
+    assert!(
+        parsed["results"].as_array().is_some_and(|rows| rows.len() == 2),
+        "{parsed}"
+    );
+}
+
+#[test]
+fn orchestrate_collect_returns_per_item_receipts() {
+    // Restores partial-success semantics: with `on_error=collect` a failing
+    // sub-call yields a per-item receipt instead of aborting the program.
+    let output = execute_tool(
+        "tool_orchestrate",
+        &json!({
+            "steps": [{
+                "id": "b",
+                "op": "batch",
+                "on_error": "collect",
+                "calls": [
+                    { "tool": "glob_search", "input": { "pattern": "*.rs" } },
+                    { "tool": "read_file", "input": { "path": "definitely/missing.rs" } }
+                ]
+            }]
+        }),
+    )
+    .expect("collect must not abort the program");
+    let parsed: serde_json::Value = serde_json::from_str(&output).expect("json");
+    let items = parsed["result"]["b"]
+        .as_object()
+        .expect("per-item receipts");
+    assert_eq!(items.len(), 2, "{parsed}");
+    assert!(items.values().any(|item| item["ok"] == json!(true)));
+    assert!(items.values().any(|item| item["ok"] == json!(false)));
+}

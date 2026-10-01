@@ -451,10 +451,33 @@ impl ToolHostLease {
         let (canonical_id, value) =
             self.authorize_and_canonicalize(authorization, tool_id, input)?;
         if canonical_id == "bash" {
-            let bash_input: crate::bash::BashCommandInput = serde_json::from_value(value.clone())
-                .map_err(|error| {
-                ToolHostError::Execution(format!("invalid bash input: {error}"))
-            })?;
+            // `shell` is a backend selector, not part of the bash/powershell
+            // input contract (both deny unknown fields), so it is stripped
+            // before parsing. PowerShell has no async streaming executor, so
+            // it is routed through the sync dispatcher; `auto`/`bash`/absent
+            // fall through to the async bash executor.
+            let shell = value
+                .get("shell")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if shell.as_deref() == Some("powershell") {
+                let lease = self.for_authorized_read_cache(authorization)?;
+                let canonical = canonical_id.clone();
+                let value = value.clone();
+                return tokio::task::spawn_blocking(move || lease.dispatch_sync(&canonical, &value))
+                    .await
+                    .map_err(|error| ToolHostError::Execution(error.to_string()))?;
+            }
+            let mut bash_value = value.clone();
+            if shell.is_some() {
+                if let Some(object) = bash_value.as_object_mut() {
+                    object.remove("shell");
+                }
+            }
+            let bash_input: crate::bash::BashCommandInput =
+                serde_json::from_value(bash_value).map_err(|error| {
+                    ToolHostError::Execution(format!("invalid bash input: {error}"))
+                })?;
             let output = crate::bash::execute_bash_async_in_workspace(
                 bash_input,
                 self.workspace_root(),

@@ -88,6 +88,11 @@ fn run_background_task_status(lease: &ToolHostLease, input: &Value) -> Result<St
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct BackgroundTaskKillInput {
     job_id: String,
+    /// Accepted and ignored: `tail` belongs to `status`, but the merged tool
+    /// shares one schema, so rejecting it here would break a valid kill call.
+    #[serde(default)]
+    #[allow(dead_code)]
+    tail: Option<usize>,
 }
 
 fn run_background_task_kill(lease: &ToolHostLease, input: &Value) -> Result<String, String> {
@@ -96,7 +101,7 @@ fn run_background_task_kill(lease: &ToolHostLease, input: &Value) -> Result<Stri
 }
 
 #[derive(Debug, Deserialize)]
-struct AstGrepSearchInput {
+struct GrepSearchLanguageInput {
     pattern: String,
     language: String,
     #[serde(default)]
@@ -143,7 +148,7 @@ fn ast_language_extensions(language: &str) -> Vec<&'static str> {
     }
 }
 
-fn run_ast_grep_search(lease: &ToolHostLease, input: AstGrepSearchInput) -> Result<String, String> {
+fn run_grep_search_language(lease: &ToolHostLease, input: GrepSearchLanguageInput) -> Result<String, String> {
     if input.pattern.trim().is_empty() {
         return Err("ast_grep_search requires a non-empty pattern".to_string());
     }
@@ -629,8 +634,31 @@ fn run_grep_search(lease: &ToolHostLease, input: GrepSearchInput) -> Result<Stri
     to_pretty_json(grep_search(lease.path_policy(), &input).map_err(io_to_string)?)
 }
 
+#[derive(Debug, Deserialize)]
+struct GlobSearchManyInput {
+    patterns: Vec<GlobSearchInputValue>,
+    #[serde(default)]
+    max_concurrency: Option<usize>,
+}
+
+/// Several independent glob patterns in one call — the symmetric counterpart
+/// of `grep_search.searches`, restoring the batch `glob_many` capability that
+/// the family merge otherwise moved entirely into `tool_orchestrate`.
 #[allow(clippy::needless_pass_by_value)]
-fn run_grep_many(lease: &ToolHostLease, input: GrepManyInput) -> Result<String, String> {
+fn run_glob_search_many(
+    lease: &ToolHostLease,
+    input: GlobSearchManyInput,
+) -> Result<String, String> {
+    require_batch_bound("glob_search", input.patterns.len())?;
+    let results = run_ordered_batch(input.patterns, input.max_concurrency, |item| {
+        let output = run_glob_search(lease, item)?;
+        serde_json::from_str(&output).or(Ok(Value::String(output)))
+    });
+    to_pretty_json(batch_output("glob_search", results))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_grep_search_batch(lease: &ToolHostLease, input: GrepSearchBatchInput) -> Result<String, String> {
     require_batch_bound("grep_search", input.searches.len())?;
     let results = run_ordered_batch(input.searches, input.max_concurrency, |item| {
         let output = run_grep_search(lease, item)?;
@@ -1183,7 +1211,7 @@ struct GlobSearchInputValue {
 }
 
 #[derive(Debug, Deserialize)]
-struct GrepManyInput {
+struct GrepSearchBatchInput {
     searches: Vec<GrepSearchInput>,
     max_concurrency: Option<usize>,
 }
@@ -1270,12 +1298,14 @@ struct SleepInput {
 struct BriefInput {
     message: String,
     attachments: Option<Vec<String>>,
+    #[serde(default)]
     status: BriefStatus,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum BriefStatus {
+    #[default]
     Normal,
     Proactive,
 }
@@ -1395,11 +1425,6 @@ struct McpToolInput {
     tool: String,
     #[serde(default)]
     arguments: Option<Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TestingPermissionInput {
-    action: String,
 }
 
 #[derive(Debug, Serialize)]
