@@ -1345,8 +1345,65 @@ where
                             } else {
                             state.assistant_messages.pop();
                             state.pending_transcript.remove(&ticket.node_id);
+                            // The framework states what is left; the model keeps
+                            // deciding how. Name the outstanding rungs explicitly
+                            // instead of burying them inside the checkpoint blob.
+                            // Inline derivation of the outstanding rungs (the
+                            // same facts `agentic_closure_view` renders into the
+                            // checkpoint), so the re-drive names them up front.
+                            let remaining_steps = agentic_program
+                                .as_ref()
+                                .map(|program| {
+                                    let tasks = program.tasks.values().collect::<Vec<_>>();
+                                    let published = tasks.len();
+                                    let claimed = tasks
+                                        .iter()
+                                        .filter(|task| task.claimant.is_some())
+                                        .count();
+                                    let reviewed = tasks
+                                        .iter()
+                                        .filter(|task| task.reviewed_by.is_some())
+                                        .count();
+                                    let accepted = tasks
+                                        .iter()
+                                        .filter(|task| {
+                                            task.status == crate::AgenticTaskStatus::Accepted
+                                        })
+                                        .count();
+                                    let mut outstanding: Vec<String> = Vec::new();
+                                    if program.teams.len()
+                                        < usize::from(program.required_team_count.max(1))
+                                    {
+                                        outstanding.push("team".to_string());
+                                    }
+                                    if published == 0 {
+                                        outstanding.push("publish_task".to_string());
+                                    }
+                                    if claimed < published {
+                                        outstanding.push("claim_task".to_string());
+                                    }
+                                    if reviewed < published {
+                                        outstanding.push("independent_review".to_string());
+                                    }
+                                    if accepted < published {
+                                        outstanding.push("accepted_task".to_string());
+                                    }
+                                    if !program.unresolved.is_empty() {
+                                        outstanding.push("classify_issues".to_string());
+                                    }
+                                    if program.completion_request.is_none() {
+                                        outstanding.push("objective_complete_request".to_string());
+                                    }
+                                    outstanding.join(", ")
+                                })
+                                .unwrap_or_default();
                             let reason = format!(
-                                "Agent-first collaboration is not yet verified: observed {verified_team_executions} verified Team(s), required at least {required_team_executions}. Current Program state: {}. Continue through the small Team/Agent/Task/Artifact actions; do not resubmit a full graph or repeat this final answer. The model owns the next semantic decision and Runtime will return a receipt for each action.",
+                                "Agent-first collaboration is not yet verified: observed {verified_team_executions} verified Team(s), required at least {required_team_executions}. Outstanding closure steps: [{}]. Current Program state: {}. Continue through the small Team/Agent/Task/Artifact actions; do not resubmit a full graph or repeat this final answer. The model owns the next semantic decision and Runtime will return a receipt for each action.",
+                                if remaining_steps.is_empty() {
+                                    "none recorded".to_string()
+                                } else {
+                                    remaining_steps
+                                },
                                 agentic_program.as_ref().map_or_else(
                                     || "not_started".to_string(),
                                     |program| {
