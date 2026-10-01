@@ -204,6 +204,14 @@ pub fn runtime_capability_primer() -> String {
         "Read Runtime facts through one canonical reference with `read_ref`: task://, agent://, tool://, artifact://, session://. The scheme selects the authorized reader; do not guess field names on legacy readers.",
         "## Recovery",
         "On rejection or restart, inspect current state and continue from the returned revision; never repeat an unchanged failing action.",
+        "## Collaboration rules (Agent-first)",
+        "1. Sub-agents run the work. While any sub-task is in flight your only role is to coordinate: WAIT for it before yielding, and DO NOT redo its work yourself.",
+        "2. Wait with `state_inspect(wait_for_workers=true)`; scale the wait to the outstanding work rather than guessing a fixed timeout.",
+        "3. Parallelize independent work: publish independent Tasks concurrently and issue independent calls in the same response.",
+        "4. Close what you finished: release a claim you no longer own, and withdraw a Task that is no longer needed. Dangling work keeps the Objective open.",
+        "5. When you delegate, tell the delegate explicitly: (a) it is NOT alone and must not revert or overwrite others' committed work; (b) whether it may spawn further agents (default: it may NOT, to prevent unbounded recursion).",
+        "6. Spawn a Team or a Task only when the work is genuinely large, spans independent responsibility domains, or needs an independent reviewer. For simple or straightforward work you do not need to spawn anything at all.",
+        "7. Before each batch of calls send at most one short sentence naming the grouped action; skip it for a single trivial read.",
     ]
     .join("\n")
 }
@@ -384,7 +392,7 @@ mod prompt_core_tests {
     #[test]
     fn primer_is_short_and_states_ownership_and_exit_discipline() {
         let primer = runtime_capability_primer();
-        assert!(primer.len() <= 2_600, "primer must stay small: {}", primer.len());
+        assert!(primer.len() <= 4_200, "primer must stay small: {}", primer.len());
         assert!(primer.contains("Shortest path first"));
         assert!(primer.contains("Prefer parallelizing independent tool calls."));
         assert!(primer.contains("closure.exit_ready"));
@@ -418,5 +426,32 @@ mod prompt_core_tests {
     fn no_callable_tool_yields_no_guidance_section() {
         assert!(render_tool_guidance(&std::collections::BTreeSet::new()).is_empty());
         assert!(render_tool_guidance(&set(&["state_inspect"])).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod collaboration_rule_tests {
+    use super::{render_tool_guidance, runtime_capability_primer};
+
+    #[test]
+    fn collaboration_rules_pin_waiting_role_separation_and_lifecycle() {
+        let primer = runtime_capability_primer();
+        assert!(primer.contains("WAIT for it before yielding"));
+        assert!(primer.contains("DO NOT redo its work yourself"));
+        assert!(primer.contains("release a claim you no longer own"));
+        assert!(primer.contains("withdraw a Task that is no longer needed"));
+        assert!(primer.contains("must not revert or overwrite others' committed work"));
+        assert!(primer.contains("it may NOT, to prevent unbounded recursion"));
+        assert!(primer.contains("state_inspect(wait_for_workers=true)"));
+    }
+
+    #[test]
+    fn collaboration_rules_never_prescribe_a_topology() {
+        let primer = runtime_capability_primer()
+            + &render_tool_guidance(&std::collections::BTreeSet::new());
+        for banned in ["must create", "至少", "至少 N", "at least N Team", "N 个团队"] {
+            assert!(!primer.contains(banned), "prescriptive topology: {banned}");
+        }
+        assert!(primer.contains("For simple or straightforward work you do not need to spawn anything at all"));
     }
 }
