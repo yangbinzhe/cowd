@@ -2008,3 +2008,113 @@ fn orchestrate_collect_returns_per_item_receipts() {
     assert!(items.values().any(|item| item["ok"] == json!(true)));
     assert!(items.values().any(|item| item["ok"] == json!(false)));
 }
+
+/// One deterministic artifact answering "is every execution mode complete?".
+///
+/// Each mode is exercised through the real dispatcher. Together the modes form
+/// the capability contract the model-facing surface promises: quick single
+/// tools, parallel fan-out, orchestrated programs, multi-pattern locate,
+/// batched content search, out-of-model reduction, partial-failure tolerance
+/// and shell backend selection.
+#[test]
+fn execution_capability_matrix_is_complete() {
+    // The shared test host is built from the process cwd; pin the cwd to the
+    // crate root under the env lock so the matrix is not order-dependent when
+    // cargo runs tests in parallel.
+    let _guard = env_lock().lock().unwrap_or_else(|poison| poison.into_inner());
+    let original_cwd = std::env::current_dir().expect("cwd");
+    std::env::set_current_dir(env!("CARGO_MANIFEST_DIR")).expect("chdir to crate root");
+    let mut failures: Vec<String> = Vec::new();
+    let mut check = |mode: &str, result: Result<String, String>| match result {
+        Ok(output) if serde_json::from_str::<serde_json::Value>(&output).is_ok() => {}
+        Ok(_) => failures.push(format!("{mode}: output was not JSON")),
+        Err(error) => failures.push(format!("{mode}: {error}")),
+    };
+
+    // 1. quick: one tool, one round.
+    check(
+        "quick_single_tool",
+        execute_tool("read_file", &json!({ "path": "src/lib.rs" })),
+    );
+
+    // 2. parallel: several tools inside one program.
+    check(
+        "parallel_batch",
+        execute_tool(
+            "tool_orchestrate",
+            &json!({ "steps": [{ "id": "p", "op": "batch", "calls": [
+                { "tool": "glob_search", "input": { "pattern": "*.rs" } },
+                { "tool": "glob_search", "input": { "pattern": "*.toml" } }
+            ] }] }),
+        ),
+    );
+
+    // 3. orchestrated program: several steps in ONE call.
+    check(
+        "orchestrated_program",
+        execute_tool(
+            "tool_orchestrate",
+            &json!({ "steps": [
+                { "id": "g", "op": "call", "tool": "glob_search", "input": { "pattern": "*.rs" } },
+                { "id": "r", "op": "call", "tool": "read_file", "input": { "path": "src/lib.rs" } },
+                { "id": "n", "op": "compute", "language": "python", "code": "print('ok')" }
+            ] }),
+        ),
+    );
+
+    // 4. multi-pattern locate in one call (restored `glob_many`).
+    check(
+        "multi_pattern_locate",
+        execute_tool(
+            "glob_search",
+            &json!({ "patterns": [{ "pattern": "*.rs" }, { "pattern": "*.toml" }] }),
+        ),
+    );
+
+    // 5. batched content search in one call (restored `grep_many`).
+    check(
+        "batched_content_search",
+        execute_tool(
+            "grep_search",
+            &json!({ "searches": [
+                { "pattern": "pub fn", "output_mode": "count" },
+                { "pattern": "struct ", "output_mode": "count" }
+            ] }),
+        ),
+    );
+
+    // 6. deterministic reduction outside the model.
+    check(
+        "compute_reduction",
+        execute_tool(
+            "execute_code",
+            &json!({ "language": "python", "code": "print(1 + 1)" }),
+        ),
+    );
+
+    // 7. partial-failure tolerance (restored `read_many`/`glob_many` semantics).
+    check(
+        "partial_failure_collect",
+        execute_tool(
+            "tool_orchestrate",
+            &json!({ "steps": [{ "id": "b", "op": "batch", "on_error": "collect", "calls": [
+                { "tool": "glob_search", "input": { "pattern": "*.rs" } },
+                { "tool": "read_file", "input": { "path": "no/such/file.rs" } }
+            ] }] }),
+        ),
+    );
+
+    // 8. shell backend selector (restored `power_shell`).
+    check(
+        "shell_backend_selector",
+        execute_tool("bash", &json!({ "shell": "auto", "command": "true" })),
+    );
+
+    std::env::set_current_dir(original_cwd).expect("restore cwd");
+    drop(_guard);
+    assert!(
+        failures.is_empty(),
+        "execution capability gaps:\n{}",
+        failures.join("\n")
+    );
+}
