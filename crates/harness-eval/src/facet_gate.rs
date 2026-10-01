@@ -145,31 +145,79 @@ pub(crate) fn read_paths_from_tool_input(input: &serde_json::Value) -> Vec<Strin
     out
 }
 
+/// Read-only tools whose successful invocation proves the model accessed a path
+/// it named in the input. The capability under test is "acquire the file", not
+/// "use one specific tool", so `grep_search`/`glob_search`/`execute_code` count
+/// too — but only when the model explicitly named the path in the input of a
+/// tool that then completed successfully.
+pub(crate) const PATH_ACCESS_TOOLS: &[&str] = &[
+    "read_file",
+    "tool_orchestrate",
+    "grep_search",
+    "glob_search",
+    "execute_code",
+    "read_ref",
+    "workspace_snapshot",
+];
+
+/// Workspace-path-like tokens embedded in a tool input (the model may name a
+/// path inside a `code` string or a glob). Only tokens containing `/` that look
+/// like a real file are returned, so prose or a bare word cannot fake a
+/// receipt.
+pub(crate) fn extract_path_tokens(text: &str) -> Vec<String> {
+    text.split(|character: char| {
+        !(character.is_ascii_alphanumeric() || matches!(character, '/' | '.' | '_' | '-'))
+    })
+    .map(|token| token.trim_matches(|character: char| matches!(character, '.' | '-' | '_')))
+    .filter(|token| {
+        token.contains('/')
+            && (token.ends_with(".rs")
+                || token.ends_with(".toml")
+                || token.ends_with(".md")
+                || token.contains("crates/"))
+    })
+    .map(ToString::to_string)
+    .collect()
+}
+
 pub fn collect_read_paths(timeline: &serde_json::Value, projections: &[serde_json::Value]) -> Vec<String> {
-    let accepts_tool = |name: &str| matches!(name, "read_file" | "tool_orchestrate");
-    let mut out = timeline
+    let mut out = Vec::new();
+    for event in timeline
         .get("events")
         .and_then(serde_json::Value::as_array)
         .into_iter()
         .flatten()
-        .filter(|event| {
-            event.get("kind").and_then(serde_json::Value::as_str) == Some("tool.invocation.completed")
-                && event.pointer("/payload/status").and_then(serde_json::Value::as_str) == Some("completed")
-                && event.pointer("/payload/is_error").and_then(serde_json::Value::as_bool) == Some(false)
-                && event
-                    .pointer("/payload/tool_name")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(accepts_tool)
-        })
-        .filter_map(|event| {
-            event
-                .pointer("/payload/input_preview")
-                .and_then(serde_json::Value::as_str)
-                .and_then(|input| serde_json::from_str::<serde_json::Value>(input).ok())
-                .map(|input| read_paths_from_tool_input(&input))
-        })
-        .flatten()
-        .collect::<Vec<_>>();
+    {
+        if event.get("kind").and_then(serde_json::Value::as_str) != Some("tool.invocation.completed")
+            || event.pointer("/payload/status").and_then(serde_json::Value::as_str) != Some("completed")
+            || event.pointer("/payload/is_error").and_then(serde_json::Value::as_bool) != Some(false)
+        {
+            continue;
+        }
+        let Some(tool) = event
+            .pointer("/payload/tool_name")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        if !PATH_ACCESS_TOOLS.contains(&tool) {
+            continue;
+        }
+        let Some(input_preview) = event
+            .pointer("/payload/input_preview")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        // Precise structured extraction (read_file `path`/`files[]`, and
+        // `tool_orchestrate` `steps[].calls[]`).
+        if let Ok(input) = serde_json::from_str::<serde_json::Value>(input_preview) {
+            out.extend(read_paths_from_tool_input(&input));
+        }
+        // Any workspace path the model explicitly named to a read-only tool that
+        // then completed successfully.
+        out.extend(extract_path_tokens(input_preview));
+    }
     // Projection activities carry the resolved path, which is what a required
     // path is compared against.
     for projection in projections {
@@ -316,6 +364,20 @@ mod tests {
             read_paths_from_tool_input(&serde_json::json!({ "files": [{ "path": "b.rs" }] })),
             vec!["b.rs".to_string()]
         );
+    }
+
+    /// (B): a path the model named to a successful read-only tool other than
+    /// `read_file` (grep/glob/execute_code) still proves the file was accessed.
+    #[test]
+    fn non_read_file_inputs_still_count_as_path_access() {
+        assert!(extract_path_tokens(
+            "count lines in crates/tools/src/lib.rs and crates/gateway/src/main.rs"
+        )
+        .contains(&"crates/tools/src/lib.rs".to_string()));
+        assert!(extract_path_tokens(r#"{"path":"crates/harness-eval/src/lib.rs"}"#)
+            .contains(&"crates/harness-eval/src/lib.rs".to_string()));
+        // Prose without a real path must not fabricate a receipt.
+        assert!(extract_path_tokens("read the file and count the mods").is_empty());
     }
 
     /// The arm-E failure, fixed: a correct answer with durable receipts passes.
