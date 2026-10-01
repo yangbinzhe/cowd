@@ -131,6 +131,7 @@ where
                 state.execution_role.is_delegated_leaf(),
                 state.started_at.elapsed(),
                 collaboration_wall_budget(),
+                state.last_verified_progress,
             ) {
                 let disclosure = "Execution blocked safely: bounded convergence reached the Agent-first collaboration budget with the required verified-Team minimum still unmet. The objective is only partially satisfied and unresolved work stays in the Program projection; Runtime stopped the turn instead of running unbounded.".to_string();
                 state.terminal_override = Some((GoalCompletion::Partial, disclosure));
@@ -304,6 +305,7 @@ where
                     state.execution_role.is_delegated_leaf(),
                     state.started_at.elapsed(),
                     collaboration_wall_budget(),
+                    state.last_verified_progress,
                 );
                 let collaboration_ceiling_reached = collaboration_ceiling_reached(
                     state.collaboration_obligation.as_ref(),
@@ -2921,15 +2923,24 @@ pub(super) fn collaboration_wall_budget() -> Option<std::time::Duration> {
 /// objective-level wall-clock ceiling. A `None` budget (the default) never
 /// fires. Delegated leaves never inherit the root's budget, and a turn without
 /// a Team obligation is bounded by the no-progress fuse alone.
+///
+/// The ceiling is deliberately **progress-exempt**: a turn with verified
+/// progress is never fused by elapsed time alone. Elapsed time is only
+/// consulted once progress has stopped, which is exactly what the no-progress
+/// fuse already measures; this guard exists for the case where nominal progress
+/// (dispatching/claiming) continues without any *verified* progress. A turn that
+/// keeps making real progress must never be stopped for being long-lived.
 fn collaboration_budget_elapsed(
     obligation: Option<&harness_contract::strategy::CollaborationExecutionObligation>,
     is_delegated_leaf: bool,
     elapsed: std::time::Duration,
     budget: Option<std::time::Duration>,
+    has_verified_progress: bool,
 ) -> bool {
     budget.is_some_and(|budget| {
         obligation.is_some_and(|obligation| obligation.minimum_team_count > 0)
             && !is_delegated_leaf
+            && !has_verified_progress
             && elapsed >= budget
     })
 }
@@ -3056,25 +3067,29 @@ mod safety_fuse_streak_tests {
             Some(&obligation),
             false,
             Duration::from_secs(100),
-            Some(Duration::from_secs(100))
+            Some(Duration::from_secs(100)),
+            false
         ));
         assert!(!collaboration_budget_elapsed(
             Some(&obligation),
             false,
             Duration::from_secs(99),
-            Some(Duration::from_secs(100))
+            Some(Duration::from_secs(100)),
+            false
         ));
         assert!(!collaboration_budget_elapsed(
             Some(&obligation),
             true,
             Duration::from_secs(10_000),
-            Some(Duration::from_secs(100))
+            Some(Duration::from_secs(100)),
+            false
         ));
         assert!(!collaboration_budget_elapsed(
             None,
             false,
             Duration::from_secs(10_000),
-            Some(Duration::from_secs(100))
+            Some(Duration::from_secs(100)),
+            false
         ));
         // Disabled (the default) never bounds by time, no matter how long the
         // turn has run: a turn that keeps making real progress must not be
@@ -3083,7 +3098,17 @@ mod safety_fuse_streak_tests {
             Some(&obligation),
             false,
             Duration::from_secs(10_000_000),
-            None
+            None,
+            false
+        ));
+        // The ceiling is progress-exempt: a turn with verified progress is
+        // never fused by elapsed time, however long it has run.
+        assert!(!collaboration_budget_elapsed(
+            Some(&obligation),
+            false,
+            Duration::from_secs(10_000_000),
+            Some(Duration::from_secs(100)),
+            true
         ));
     }
 
@@ -4028,6 +4053,7 @@ where
                 state.execution_role.is_delegated_leaf(),
                 state.started_at.elapsed(),
                 collaboration_wall_budget(),
+                state.last_verified_progress,
             ) {
                 let disclosure = "Execution blocked safely: bounded convergence reached the Agent-first collaboration budget with the required verified-Team minimum still unmet. The objective is only partially satisfied and unresolved work stays in the Program projection; Runtime stopped the turn instead of running unbounded.".to_string();
                 state.terminal_override = Some((GoalCompletion::Partial, disclosure));
