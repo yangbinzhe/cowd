@@ -781,11 +781,20 @@ fn exact_evidence_mode_expands_tool_delivery_without_bypassing_context_ceiling()
         );
 
     assert!(
-        exact.tool_result_budget.max_total_tokens > standard.tool_result_budget.max_total_tokens
+        exact.tool_result_budget.max_total_tokens > standard.tool_result_budget.max_total_tokens,
+        "exact evidence may raise the turn's TOTAL lease so several whole files fit"
     );
-    assert_eq!(
+    assert!(
+        exact.tool_result_budget.per_tool_max_tokens
+            < exact.tool_result_budget.max_total_tokens,
+        "a single result must no longer be granted the whole lease: {} vs {}",
         exact.tool_result_budget.per_tool_max_tokens,
         exact.tool_result_budget.max_total_tokens
+    );
+    assert!(
+        exact.tool_result_budget.per_tool_max_tokens <= 16_000,
+        "one result must never dominate the prompt, got {}",
+        exact.tool_result_budget.per_tool_max_tokens
     );
     assert!(
         exact.tool_result_budget.max_total_tokens as u64 + exact.max_output_tokens
@@ -4071,5 +4080,31 @@ async fn compaction_raw_journal_failure_retains_original_window() {
     assert_eq!(
         runtime.session_snapshot().await.materialize_messages(),
         before
+    );
+}
+
+#[test]
+fn a_single_exact_evidence_result_cannot_exceed_the_ceiling() {
+    let plan = crate::budget_policy::RuntimeBudgetPlan::derive(
+        crate::budget_policy::RuntimeBudgetInputs::new(262_144, 32_768),
+    );
+    let before_total = plan.tool_result_budget.max_total_tokens;
+    let raised =
+        ConversationRuntime::<MockApi, StaticToolExecutor>::apply_exact_evidence_delivery_budget(
+            plan,
+        );
+    assert!(
+        raised.tool_result_budget.max_total_tokens >= before_total,
+        "the turn lease may grow so whole files still fit"
+    );
+    assert!(
+        raised.tool_result_budget.per_tool_max_tokens <= 16_000,
+        "one result must never dominate the prompt, got {}",
+        raised.tool_result_budget.per_tool_max_tokens
+    );
+    assert!(
+        raised.tool_result_budget.per_tool_max_tokens >= 12_000,
+        "a whole source file must still fit one call, got {}",
+        raised.tool_result_budget.per_tool_max_tokens
     );
 }

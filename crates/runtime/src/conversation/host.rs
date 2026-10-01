@@ -2255,6 +2255,27 @@ pub(super) fn agentic_turn_framing(
             let mut view = agentic_closure_view(&program);
             if let Some(object) = view.as_object_mut() {
                 object.insert("budgets".to_string(), budgets);
+                // Live occupancy: the model needs to know how much is already
+                // running before it decides to spawn or wait. Reference
+                // harnesses state the available concurrency slots; we state the
+                // observed occupancy, which is the part we can measure durably.
+                object.insert(
+                    "capacity".to_string(),
+                    serde_json::json!({
+                        "required_teams": program.required_team_count,
+                        "teams": program.teams.len(),
+                        "agents": program.agents.len(),
+                        "active_teams": program
+                            .teams
+                            .values()
+                            .filter(|team| {
+                                serde_json::to_value(team.lifecycle).ok()
+                                    == Some(serde_json::json!("active"))
+                            })
+                            .count(),
+                        "note": "Runtime runs the work. While any sub-task is in flight your only role is to coordinate; spawn only for genuinely independent domains.",
+                    }),
+                );
             }
             view
         }

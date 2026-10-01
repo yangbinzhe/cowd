@@ -62,6 +62,18 @@ impl DispatchMode {
         }
     }
 
+    /// The single durable action that terminates this mode. Each dispatch mode
+    /// carries exactly one completion contract; a run that ends without it did
+    /// not complete. Getting Started's `agent-contracts` pins the same idea per
+    /// agent, and this keeps the three modes mutually unambiguous.
+    pub(super) const fn terminal_action(self) -> &'static str {
+        match self {
+            Self::Execute => "task_submit",
+            Self::Review => "task_review",
+            Self::Coordination(_) => "message_publish",
+        }
+    }
+
     pub(super) const fn attempt_mode(self) -> harness_contract::agent_action::AgentAttemptMode {
         use harness_contract::agent_action::AgentAttemptMode;
         match self {
@@ -401,5 +413,33 @@ mod delivery_lease_tests {
         let writable = objective_delivery_instruction(true);
         assert!(writable.contains("artifact_publish"));
         assert!(writable.contains("artifact_commit"));
+    }
+}
+
+#[cfg(test)]
+mod dispatch_mode_contract_tests {
+    use super::DispatchMode;
+
+    #[test]
+    fn every_dispatch_mode_has_exactly_one_terminating_action() {
+        assert_eq!(DispatchMode::Execute.terminal_action(), "task_submit");
+        assert_eq!(DispatchMode::Review.terminal_action(), "task_review");
+        assert_eq!(
+            DispatchMode::Coordination(0).terminal_action(),
+            "message_publish"
+        );
+    }
+
+    #[test]
+    fn the_three_modes_are_mutually_unambiguous() {
+        let modes = [
+            DispatchMode::Execute.terminal_action(),
+            DispatchMode::Review.terminal_action(),
+            DispatchMode::Coordination(0).terminal_action(),
+        ];
+        let mut unique = modes.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), modes.len(), "each mode must own a distinct exit");
     }
 }

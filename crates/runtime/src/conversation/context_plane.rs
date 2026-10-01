@@ -1426,10 +1426,24 @@ where
             .saturating_sub(request_safety_reserve);
         let exact_total = usize::try_from(exact_total).unwrap_or(usize::MAX);
         if exact_total > plan.tool_result_budget.max_total_tokens {
+            // The exact-evidence path carries whole file bodies, so the turn's
+            // TOTAL lease may grow to the subsystem ceiling. A single result must
+            // still not dominate the prompt: one whole source file in this repo
+            // is 5k-10k tokens, so a hard per-result ceiling keeps a whole file
+            // plus the receipt envelope while refusing the "tens of thousands in
+            // one result" case that makes every later round re-send it.
+            const EXACT_EVIDENCE_PER_RESULT_CEILING: usize = 16_000;
             plan.tool_result_budget.max_total_tokens = exact_total;
-            plan.tool_result_budget.per_tool_max_tokens = exact_total;
+            plan.tool_result_budget.per_tool_max_tokens = exact_total
+                .min(EXACT_EVIDENCE_PER_RESULT_CEILING)
+                .max(plan.tool_result_budget.per_tool_max_tokens.min(EXACT_EVIDENCE_PER_RESULT_CEILING));
         }
         plan
+    }
+
+    #[cfg(test)]
+    fn exact_evidence_per_result_ceiling_tokens() -> usize {
+        16_000
     }
 
     pub(super) fn context_window_resolution_for_model(
