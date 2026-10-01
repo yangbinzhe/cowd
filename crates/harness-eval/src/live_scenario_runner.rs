@@ -31,6 +31,10 @@ const EXPLICIT_TEAM_SCENARIO_ID: &str = "live_explicit_team_requirement";
 /// A deliberately small, short collaboration used to exercise the whole
 /// team/task/review/completion loop at a scale a weak local model can finish.
 const SMALL_TEAM_SCENARIO_ID: &str = "live_small_two_team_collaboration";
+/// Exactly ONE Team, named explicitly by the operator. This is the control for
+/// the no-team and two-team scenarios: it proves a single-Team topology is
+/// reachable and honoured (floor == ceiling == 1).
+const ONE_TEAM_SCENARIO_ID: &str = "live_one_team_execution";
 const RELEASE_CERTIFICATION_SCENARIOS: [&str; 6] = [
     "live_direct_terminal",
     "live_tool_evidence",
@@ -998,6 +1002,18 @@ impl LiveScenarioRunner {
                 acceptance: LiveAcceptance::ArchitectureQuality {
                     minimum_teams: 3,
                     minimum_claimed_cross_team_edges: 1,
+                    evidence_profile: ArchitectureEvidenceProfile::Basic,
+                },
+                timeout: LiveScenarioTimeout::team(),
+            },
+            // Exactly ONE Team, named explicitly by the operator. Team/role/Task
+            // shape stays model-owned; the operator's constraint is the count.
+            LiveScenarioSpec {
+                id: ONE_TEAM_SCENARIO_ID,
+                prompt: "【操作者要求】本场景要求实际启动 1 个 Team(操作者给定的硬性验收约束);Team 的名称、角色与 Task 划分由你自主决定，但总数必须是 1 个。在这个 Team 内完成：读取 crates/runtime/src/lib.rs、crates/tools/src/lib.rs、crates/memory/src/lib.rs 三个源码文件，每个文件给出一个可核验事实（文件路径 + 事实），并在结论里列出至少三个本次实际读取的完整 `crates/.../*.rs` 路径。每项 Task 要由 Agent 领取、提交 durable artifact/evidence 引用，并由不同的 Agent 独立 review 后才算完成；最终 artifact 综合三项事实。只使用只读源码工具与 Agent Action，不要调用 bash 或任何写文件工具。Do not invent files, links or tool output; keep any unresolved item explicit.",
+                acceptance: LiveAcceptance::ArchitectureQuality {
+                    minimum_teams: 1,
+                    minimum_claimed_cross_team_edges: 0,
                     evidence_profile: ArchitectureEvidenceProfile::Basic,
                 },
                 timeout: LiveScenarioTimeout::team(),
