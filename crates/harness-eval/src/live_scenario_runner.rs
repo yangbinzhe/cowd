@@ -4523,21 +4523,6 @@ fn has_successful_runtime_tool_completion(
         let path = path.trim_start_matches("./");
         path == target || path.ends_with(&format!("/{target}"))
     };
-    let input_path = |input: &Value| -> Option<String> {
-        input
-            .get("path")
-            .and_then(Value::as_str)
-            .map(ToString::to_string)
-            .or_else(|| {
-                input
-                    .get("files")
-                    .and_then(Value::as_array)
-                    .and_then(|files| files.first())
-                    .and_then(|file| file.get("path"))
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string)
-            })
-    };
     timeline
         .get("events")
         .and_then(Value::as_array)
@@ -4556,9 +4541,11 @@ fn has_successful_runtime_tool_completion(
                     .pointer("/payload/input_preview")
                     .and_then(Value::as_str)
                     .and_then(|input| serde_json::from_str::<Value>(input).ok())
-                    .and_then(|input| input_path(&input))
-                    .as_deref()
-                    .is_some_and(|path| accepts_path(path))
+                    .is_some_and(|input| {
+                        crate::facet_gate::read_paths_from_tool_input(&input)
+                            .iter()
+                            .any(|path| accepts_path(path))
+                    })
                 && ["invocation_id", "tool_call_id"].iter().all(|key| {
                     event
                         .get("payload")

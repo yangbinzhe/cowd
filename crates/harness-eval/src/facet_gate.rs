@@ -112,21 +112,41 @@ impl FacetVerdict {
 /// Single implementation, used by both the runner and these tests. Reading via a
 /// batch counts as reading, and every path in the batch is unwrapped; a failed
 /// or errored read is not evidence.
+/// Every read path named by a tool input, descending into `tool_orchestrate`
+/// `steps`/`calls` so a batched read counts as reading each named file. Direct
+/// `read_file` (`path`) and `files[]` inputs are handled too.
+pub(crate) fn read_paths_from_tool_input(input: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(path) = input.get("path").and_then(serde_json::Value::as_str) {
+        out.push(path.to_string());
+    }
+    if let Some(files) = input.get("files").and_then(serde_json::Value::as_array) {
+        out.extend(
+            files
+                .iter()
+                .filter_map(|file| file.get("path").and_then(serde_json::Value::as_str))
+                .map(ToString::to_string),
+        );
+    }
+    if let Some(steps) = input.get("steps").and_then(serde_json::Value::as_array) {
+        for step in steps {
+            if let Some(calls) = step.get("calls").and_then(serde_json::Value::as_array) {
+                for call in calls {
+                    if let Some(call_input) = call.get("input") {
+                        out.extend(read_paths_from_tool_input(call_input));
+                    }
+                }
+            }
+            if let Some(step_input) = step.get("input") {
+                out.extend(read_paths_from_tool_input(step_input));
+            }
+        }
+    }
+    out
+}
+
 pub fn collect_read_paths(timeline: &serde_json::Value, projections: &[serde_json::Value]) -> Vec<String> {
     let accepts_tool = |name: &str| matches!(name, "read_file" | "tool_orchestrate");
-    let paths_from_input = |input: &serde_json::Value| -> Vec<String> {
-        if let Some(path) = input.get("path").and_then(serde_json::Value::as_str) {
-            return vec![path.to_string()];
-        }
-        input
-            .get("files")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|file| file.get("path").and_then(serde_json::Value::as_str))
-            .map(ToString::to_string)
-            .collect()
-    };
     let mut out = timeline
         .get("events")
         .and_then(serde_json::Value::as_array)
@@ -146,7 +166,7 @@ pub fn collect_read_paths(timeline: &serde_json::Value, projections: &[serde_jso
                 .pointer("/payload/input_preview")
                 .and_then(serde_json::Value::as_str)
                 .and_then(|input| serde_json::from_str::<serde_json::Value>(input).ok())
-                .map(|input| paths_from_input(&input))
+                .map(|input| read_paths_from_tool_input(&input))
         })
         .flatten()
         .collect::<Vec<_>>();
@@ -269,6 +289,33 @@ mod tests {
             answer: "pub mod aaak_compression;".to_string(),
             marked_unresolved: false,
         }
+    }
+
+    /// A batched read through `tool_orchestrate` still reads each named file, so
+    /// its steps/calls must yield the same read receipts as direct `read_file`.
+    #[test]
+    fn orchestrate_batch_reads_count_as_read_receipts() {
+        let input = serde_json::json!({
+            "steps": [{
+                "op": "batch",
+                "id": "read-files",
+                "calls": [
+                    { "tool": "read_file", "input": { "path": "crates/tools/src/lib.rs" } },
+                    { "tool": "read_file", "input": { "path": "crates/runtime/src/lib.rs" } }
+                ]
+            }]
+        });
+        let paths = read_paths_from_tool_input(&input);
+        assert!(paths.contains(&"crates/tools/src/lib.rs".to_string()));
+        assert!(paths.contains(&"crates/runtime/src/lib.rs".to_string()));
+        assert_eq!(
+            read_paths_from_tool_input(&serde_json::json!({ "path": "a.rs" })),
+            vec!["a.rs".to_string()]
+        );
+        assert_eq!(
+            read_paths_from_tool_input(&serde_json::json!({ "files": [{ "path": "b.rs" }] })),
+            vec!["b.rs".to_string()]
+        );
     }
 
     /// The arm-E failure, fixed: a correct answer with durable receipts passes.
