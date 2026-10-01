@@ -24,7 +24,10 @@ const GROUP_THEORY_SCENARIO_ID: &str = "live_group_theory_ai_research_simulation
 const LARGE_SCALE_SCENARIO_ID: &str = "live_qwen38_large_scale_collaboration";
 const AUTONOMOUS_DEEPSEEK_SCENARIO_ID: &str = "live_autonomous_collaboration_deepseek";
 const AUTONOMOUS_DEEPSEEK_OUTPUT_PATH: &str = "group-theory-ai-autonomous-evaluation.html";
-const IMPLICIT_COLLABORATION_SCENARIO_ID: &str = "live_implicit_collaboration_obligation";
+/// Live scenario that pins an OPERATOR-named Team count. The scenario (the
+/// operator) explicitly requires three Teams, the only remaining source of a
+/// binding Team obligation now that prose inference was removed.
+const EXPLICIT_TEAM_SCENARIO_ID: &str = "live_explicit_team_requirement";
 /// A deliberately small, short collaboration used to exercise the whole
 /// team/task/review/completion loop at a scale a weak local model can finish.
 const SMALL_TEAM_SCENARIO_ID: &str = "live_small_two_team_collaboration";
@@ -32,7 +35,7 @@ const RELEASE_CERTIFICATION_SCENARIOS: [&str; 6] = [
     "live_direct_terminal",
     "live_tool_evidence",
     "live_single_architecture_baseline",
-    IMPLICIT_COLLABORATION_SCENARIO_ID,
+    EXPLICIT_TEAM_SCENARIO_ID,
     "live_team_projection",
     "live_agent_escalation",
 ];
@@ -970,8 +973,8 @@ impl LiveScenarioRunner {
                 timeout: LiveScenarioTimeout::team(),
             },
             LiveScenarioSpec {
-                id: IMPLICIT_COLLABORATION_SCENARIO_ID,
-                prompt: "请对三个独立责任域分别取得只读工具证据并交叉核验，最后统一综合结论。责任域一核查策略选择与执行义务，责任域二核查状态持久化与恢复，责任域三核查最终验收与投影。必须列出至少三个本次实际读取的完整 `crates/.../*.rs` 源码路径，只陈述工具证据能够验证的事实；选择最短路径。能用一次 `tool_orchestrate` 编排完成的，就不要拆成多个回合逐个调用：一个编排最多 400 次子调用、50 个步骤，其中 `map` 可对列表逐项并行处理，`filter`/`collect` 做筛选与聚合(count/first/last/join/sum)，`when`/`repeat` 表达条件与循环，`compute` 在只读沙箱内对编排已取到的数据做确定性地计算与统计。因此：跨文件的统计、过滤、分支与交叉校验，请放进编排的 `compute` 步骤在模型外完成，只把摘要带回上下文，而不要把大量原文逐段搬进上下文；需要多轮才能收敛的长确定性任务，也可以用 `repeat` 在一个编排内描述完整流程。如果你判断某个目标用单个工具更直接，那也尽管直接用——编排是手段，最短路径才是目的。只读结果被截断时，用 `read_ref` 按工具返回的 `tool://` 证据引用取回正文。可用工具：read_file、glob_search、grep_search、workspace_snapshot、tool_orchestrate、execute_code、read_ref。不要调用 bash 或任何写工具。",
+                id: EXPLICIT_TEAM_SCENARIO_ID,
+                prompt: "【操作者要求】本场景要求实际启动 3 个 Team（操作者给定的硬性验收约束）；Team 的用途、角色、Task 划分、依赖与综合仍由你自主决定。请对三个独立责任域分别取得只读工具证据并交叉核验，最后统一综合结论。责任域一核查策略选择与执行义务，责任域二核查状态持久化与恢复，责任域三核查最终验收与投影。必须列出至少三个本次实际读取的完整 `crates/.../*.rs` 源码路径，只陈述工具证据能够验证的事实；选择最短路径。能用一次 `tool_orchestrate` 编排完成的，就不要拆成多个回合逐个调用：一个编排最多 400 次子调用、50 个步骤，其中 `map` 可对列表逐项并行处理，`filter`/`collect` 做筛选与聚合(count/first/last/join/sum)，`when`/`repeat` 表达条件与循环，`compute` 在只读沙箱内对编排已取到的数据做确定性地计算与统计。因此：跨文件的统计、过滤、分支与交叉校验，请放进编排的 `compute` 步骤在模型外完成，只把摘要带回上下文，而不要把大量原文逐段搬进上下文；需要多轮才能收敛的长确定性任务，也可以用 `repeat` 在一个编排内描述完整流程。如果你判断某个目标用单个工具更直接，那也尽管直接用——编排是手段，最短路径才是目的。只读结果被截断时，用 `read_ref` 按工具返回的 `tool://` 证据引用取回正文。可用工具：read_file、glob_search、grep_search、workspace_snapshot、tool_orchestrate、execute_code、read_ref。不要调用 bash 或任何写工具。",
                 acceptance: LiveAcceptance::ArchitectureQuality {
                     minimum_teams: 3,
                     minimum_claimed_cross_team_edges: 0,
@@ -981,7 +984,7 @@ impl LiveScenarioRunner {
             },
             LiveScenarioSpec {
                 id: "live_team_projection",
-                prompt: "【编排自主权】团队、Agent、Task 与依赖拓扑由你在分析目标后自主决定，不要套用预设数量、名称或每队人数：目标可被单个 Agent 独立完成时就用单 Agent，不要为形式而建队；目标包含若干相互独立的责任域、需要不同视角交叉核验、或工作量超出单 Agent 一个回合时，就应当拆分，并让无依赖的分支物理并行推进，而不是用简单路径一点一点顺序探索。拆分粒度由你自己判断——该合并的合并，该拆细的拆细；跨分支的综合必须通过 depends_on 消费上游已 accepted 的结果。遇到运行中暴露的新风险或缺口，按需再建 Team 或 Task，流程不是预先写死的。使用 Program/Team topic 交换带 artifact/evidence 引用的摘要，最终 artifact 只能在依赖满足后提交。【读取纪律】只读工具的输出**可能被截断**（返回 head+tail 预览并给 `persistedOutputPath` / `nextOffset`），这是**正常现象**，不是错误：请用 `read_file` 的 `offset`/`limit` 只读你需要的小范围，或按 `nextOffset` 续读；**禁止反复重试整文件读取**；遇到截断必须**继续推进**（建任务、派工、提交），不要卡在读取上。【建队后】这是 Agent-first 复杂架构审查。根据 runtime、memory、gateway 的责任边界自主创本场景按 3 个有真实 Task 的 Team 验收（这是验收标准，不是你的拓扑模板：你仍然自主决定建几个、怎么分）；不要套用固定 Team 名、固定角色或每队固定人数。无依赖审查必须物理并发，跨组件综合 Task 必须 depends_on 至少两个已 accepted 的上游 Task，并通过 topic 的 artifact/evidence refs 消费其结果。每项 Task 都要由 Agent 领取、提交 artifact/evidence，并由不同 Agent 独立 review。最终 artifact 列出至少三个本次实际读取的完整 `crates/.../*.rs` 路径。只使用只读源码工具与 Agent Action，不用 bash 或写文件工具。",
+                prompt: "【编排自主权】团队、Agent、Task 与依赖拓扑由你在分析目标后自主决定，不要套用预设数量、名称或每队人数：目标可被单个 Agent 独立完成时就用单 Agent，不要为形式而建队；目标包含若干相互独立的责任域、需要不同视角交叉核验、或工作量超出单 Agent 一个回合时，就应当拆分，并让无依赖的分支物理并行推进，而不是用简单路径一点一点顺序探索。拆分粒度由你自己判断——该合并的合并，该拆细的拆细；跨分支的综合必须通过 depends_on 消费上游已 accepted 的结果。遇到运行中暴露的新风险或缺口，按需再建 Team 或 Task，流程不是预先写死的。使用 Program/Team topic 交换带 artifact/evidence 引用的摘要，最终 artifact 只能在依赖满足后提交。【读取纪律】只读工具的输出**可能被截断**（返回 head+tail 预览并给 `persistedOutputPath` / `nextOffset`），这是**正常现象**，不是错误：请用 `read_file` 的 `offset`/`limit` 只读你需要的小范围，或按 `nextOffset` 续读；**禁止反复重试整文件读取**；遇到截断必须**继续推进**（建任务、派工、提交），不要卡在读取上。【建队后】这是 Agent-first 复杂架构审查。根据 runtime、memory、gateway 的责任边界自主创本场景按【操作者要求】实际启动 3 个有真实 Task 的 Team（操作者给定的硬性验收约束）；Team 的名称、角色与 Task 划分由你自主决定，但总数必须满足 3 个。不要套用固定 Team 名或固定角色。无依赖审查必须物理并发，跨组件综合 Task 必须 depends_on 至少两个已 accepted 的上游 Task，并通过 topic 的 artifact/evidence refs 消费其结果。每项 Task 都要由 Agent 领取、提交 artifact/evidence，并由不同 Agent 独立 review。最终 artifact 列出至少三个本次实际读取的完整 `crates/.../*.rs` 路径。只使用只读源码工具与 Agent Action，不用 bash 或写文件工具。",
                 acceptance: LiveAcceptance::ArchitectureQuality {
                     minimum_teams: 3,
                     minimum_claimed_cross_team_edges: 2,
@@ -991,7 +994,7 @@ impl LiveScenarioRunner {
             },
             LiveScenarioSpec {
                 id: "live_agent_escalation",
-                prompt: "这是 Agent-first 动态扩队验收。先让至少两个自主选择责任域的 Team 并发取得 Runtime 与 Gateway 的真实源码证据；不要固定 Team 名、角色名或人数。观察首批 artifact/evidence 后，根 Agent 当实际证据暴露出前序结论未覆盖的交叉风险时，按需再建 Team 或 Task 复核并依赖前序 accepted 结果，建不建、建几个由证据决定。所有 Task 必须经过 claim、artifact/evidence submit 与不同 Agent review；新 Team 通过 topic refs 消费上游事实后提出质疑并综合。最终 artifact 列出至少三个实际读取的完整源码路径。只使用只读源码工具和 Agent Action，不用 bash 或写文件工具。",
+                prompt: "【操作者要求】本场景要求累计实际启动 3 个 Team（操作者给定的硬性验收约束）；Team 的用途、角色与 Task 划分由你自主决定。这是 Agent-first 动态扩队验收。先让至少两个自主选择责任域的 Team 并发取得 Runtime 与 Gateway 的真实源码证据；不要固定 Team 名、角色名或人数。观察首批 artifact/evidence 后，根 Agent 当实际证据暴露出前序结论未覆盖的交叉风险时，按需再建 Team 或 Task 复核并依赖前序 accepted 结果，建不建、建几个由证据决定。所有 Task 必须经过 claim、artifact/evidence submit 与不同 Agent review；新 Team 通过 topic refs 消费上游事实后提出质疑并综合。最终 artifact 列出至少三个实际读取的完整源码路径。只使用只读源码工具和 Agent Action，不用 bash 或写文件工具。",
                 acceptance: LiveAcceptance::ArchitectureQuality {
                     minimum_teams: 3,
                     minimum_claimed_cross_team_edges: 1,

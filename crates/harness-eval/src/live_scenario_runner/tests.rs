@@ -188,7 +188,7 @@ fn release_certification_requires_every_registered_core_scenario() {
         .into_iter()
         .filter(|scenario| {
             scenario.get("scenario_id").and_then(Value::as_str)
-                != Some(IMPLICIT_COLLABORATION_SCENARIO_ID)
+                != Some(EXPLICIT_TEAM_SCENARIO_ID)
         })
         .collect::<Vec<_>>();
     assert!(!release_certification_scenarios_present(&incomplete));

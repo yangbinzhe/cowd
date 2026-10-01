@@ -51,7 +51,7 @@ MAX_PROVIDER_TOKENS="${COWD_EVAL_MAX_PROVIDER_TOKENS:-unbounded-explicit-opt-in}
   exit 2
 }
 case "$SCENARIO_ID" in
-  live_direct_terminal|live_tool_evidence|live_single_architecture_baseline|live_small_two_team_collaboration|live_implicit_collaboration_obligation|live_team_projection|live_agent_escalation|live_group_theory_ai_research_simulation|live_qwen38_large_scale_collaboration|live_autonomous_collaboration_deepseek|live_minimal_batch_read|live_minimal_compute_reduce) ;;
+  live_direct_terminal|live_tool_evidence|live_single_architecture_baseline|live_small_two_team_collaboration|live_explicit_team_requirement|live_team_projection|live_agent_escalation|live_group_theory_ai_research_simulation|live_qwen38_large_scale_collaboration|live_autonomous_collaboration_deepseek|live_minimal_batch_read|live_minimal_compute_reduce) ;;
   *) echo "unsupported paid live scenario: $SCENARIO_ID" >&2; exit 2 ;;
 esac
 

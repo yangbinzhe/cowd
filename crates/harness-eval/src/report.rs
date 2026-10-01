@@ -246,7 +246,9 @@ pub fn evaluate_agentic_program_closure(value: &Value) -> Value {
         .unwrap_or_default() as usize;
     check(
         "teams_materialized",
-        required_team_count > 0 && teams.len() >= required_team_count,
+        // An autonomous objective may legitimately use zero Teams; only an
+        // operator-named requirement has to be met.
+        required_team_count == 0 || teams.len() >= required_team_count,
         json!({"required": required_team_count, "observed": teams.len()}),
     );
 

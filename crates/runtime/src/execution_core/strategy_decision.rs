@@ -732,7 +732,7 @@ mod tests {
 
     #[test]
     fn the_implicit_collaboration_scenario_freezes_no_team_minimum() {
-        // Exact live-scenario prompt (live_implicit_collaboration_obligation).
+        // Exact live scenario prompt (live_explicit_team_requirement).
         // A prose-only "three responsibility domains" request no longer binds a
         // Team topology; the model decides, so the scenario is measured on the
         // model's own judgment rather than a frozen minimum.
