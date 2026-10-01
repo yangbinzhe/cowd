@@ -202,6 +202,8 @@ pub fn runtime_capability_primer() -> String {
         "Runtime tells you what is satisfied and what remains. Finish the outstanding rungs; do not redo finished ones. When `closure.exit_ready` holds, YOU call `objective_complete_request` and Runtime verifies it. If you judge the goal unreachable after repeated attempts with no new progress, use the `blocked` form with a reason, human review and next steps.",
         "## Canonical references",
         "Read Runtime facts through one canonical reference with `read_ref`: task://, agent://, tool://, artifact://, session://. The scheme selects the authorized reader; do not guess field names on legacy readers.",
+        "## Instruction precedence",
+        "Workspace rules arrive from AGENTS.md-style files (system-level, then this workspace, then nested trees). Precedence: direct instructions from Runtime or the operator > more deeply nested rules > outer rules.",
         "## Recovery",
         "On rejection or restart, inspect current state and continue from the returned revision; never repeat an unchanged failing action.",
         "## Collaboration rules (Agent-first)",
@@ -453,5 +455,30 @@ mod collaboration_rule_tests {
             assert!(!primer.contains(banned), "prescriptive topology: {banned}");
         }
         assert!(primer.contains("For simple or straightforward work you do not need to spawn anything at all"));
+    }
+}
+
+#[cfg(test)]
+mod project_rule_tests {
+    use super::{render_tool_guidance, runtime_capability_primer};
+
+    #[test]
+    fn primer_states_project_rule_precedence() {
+        let primer = runtime_capability_primer();
+        assert!(primer.contains("AGENTS.md-style files"));
+        assert!(primer.contains("## Instruction precedence"));
+        assert!(primer.contains(
+            "direct instructions from Runtime or the operator > more deeply nested rules > outer rules"
+        ));
+    }
+
+    #[test]
+    fn primer_claims_no_second_instruction_mechanism() {
+        // The framework already loads layered AGENTS.md/COWD.md/CLAUDE.md; the
+        // primer only states precedence and never invents a second loader.
+        let primer = runtime_capability_primer();
+        assert!(!primer.contains("~/.cowd/AGENTS.md"));
+        assert!(!primer.contains("collect_agents_rules"));
+        assert!(!render_tool_guidance(&std::collections::BTreeSet::new()).contains("AGENTS.md"));
     }
 }
