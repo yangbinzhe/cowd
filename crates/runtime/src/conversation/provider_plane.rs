@@ -375,9 +375,9 @@ where
         self.configure_terminal_tool_exposure(exposure_reason);
 
         let mut prompt = PromptAssembly::new(self.system_prompt.clone());
-        // Same turn-scoped stamp as the main context path: the clock must not be
-        // re-rendered per attempt or this attempt's prefix can never extend past
-        // it.
+        // A terminal synthesis is its own request with its own system section, so
+        // it shares no prefix with the model steps that preceded it; it keeps its
+        // own stamp rather than reaching for a turn carrier it cannot access.
         let clock_stamp = crate::prompt::RuntimeClockStamp::now();
         prompt.push_runtime_context(crate::prompt::runtime_clock_section_at(&clock_stamp));
         prompt.push_runtime_context(system_section);
@@ -1005,6 +1005,37 @@ where
             .await
     }
 
+    /// One clock for a whole model-step invocation.
+    ///
+    /// Semantic compaction can rebuild the prompt mid-step (the second
+    /// `prepare_*` call), and a stamp minted there would re-render a moving clock
+    /// segment between two requests that were supposed to share a prefix. Kept as
+    /// its own function so the reasoning does not add lines to the step itself.
+    fn turn_step_clock(&self) -> crate::prompt::RuntimeClockStamp {
+        crate::prompt::RuntimeClockStamp::now()
+    }
+
+    /// Prepare this step's prompt from the step's shared clock stamp.
+    ///
+    /// Extracted so the two preparations a step makes (the initial one and the
+    /// post-compaction rebuild) cannot drift apart on the clock, and so the call
+    /// sites stop paying five lines each for the same four arguments.
+    async fn prepare_step_prompt(
+        &self,
+        user_input: &str,
+        budget: u64,
+        items: Vec<ContextItem>,
+        clock_stamp: &crate::prompt::RuntimeClockStamp,
+    ) -> PromptAssembly {
+        self.prepare_reality_context_with_budget_and_items(
+            user_input,
+            budget,
+            items,
+            clock_stamp,
+        )
+        .await
+    }
+
     /// Execute one Provider step while optionally dispatching completed,
     /// descriptor-proven read-only tool items through the graph-owned early
     /// lane. The dispatcher is supplied by the graph Host; this method never
@@ -1016,6 +1047,7 @@ where
         early_dispatcher: Option<Arc<dyn EarlyToolDispatcher>>,
         provider_retry_fenced: bool,
     ) -> Result<ModelStepResult, RuntimeError> {
+        let clock_stamp = self.turn_step_clock();
         if self.cancellation_token.is_cancelled() {
             return Err(RuntimeError::new(
                 "turn cancelled before provider execution",
@@ -1302,10 +1334,8 @@ where
         let mut one_shot_context_items = self.take_next_model_context_items();
         let context_select_started = Instant::now();
         let mut prompt = self
-            .prepare_reality_context_with_budget_and_items(
-                user_input,
-                collection_budget,
-                one_shot_context_items.clone(),
+            .prepare_step_prompt(
+                user_input, collection_budget, one_shot_context_items.clone(), &clock_stamp,
             )
             .await;
         crate::execution_core::performance::observe_duration(
@@ -1448,10 +1478,8 @@ where
                 Some(compaction) => {
                     request_messages = self.session.read().await.messages_view();
                     prompt = self
-                        .prepare_reality_context_with_budget_and_items(
-                            user_input,
-                            collection_budget,
-                            one_shot_context_items,
+                        .prepare_step_prompt(
+                            user_input, collection_budget, one_shot_context_items, &clock_stamp,
                         )
                         .await;
                     apply_runtime_controls(&mut prompt);

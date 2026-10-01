@@ -1825,6 +1825,7 @@ where
             user_input,
             total_budget_tokens,
             next_model_context_items,
+            &crate::prompt::RuntimeClockStamp::now(),
         )
         .await
     }
@@ -1834,11 +1835,10 @@ where
         user_input: &str,
         total_budget_tokens: u64,
         next_model_context_items: Vec<ContextItem>,
+        clock_stamp: &crate::prompt::RuntimeClockStamp,
     ) -> PromptAssembly {
         let _perf_start = std::time::Instant::now();
-        // One clock per prepared prompt: every provider attempt built from this
-        // assembly renders the same bytes, so the prefix stays reusable.
-        let clock_stamp = crate::prompt::RuntimeClockStamp::now();
+
 
         let Some(mgr) = self.memory_manager.as_ref() else {
             let (runtime_reality_context_items, session_context_items) = tokio::join!(

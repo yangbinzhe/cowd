@@ -2307,6 +2307,66 @@
             .any(|line| line.contains("profile:MainTurn")));
     }
 
+    /// A prompt preparation renders the clock it is GIVEN, never one it mints.
+    ///
+    /// Semantic compaction rebuilds the prompt mid-step, so the model step
+    /// prepares twice per invocation. Each preparation used to mint its own
+    /// stamp, so the two requests of one step disagreed on the clock and could not
+    /// share a prefix.
+    ///
+    /// The stamp is now a parameter. This test is load-bearing in the only way
+    /// that is possible at seconds resolution: the SAME stamp is handed to two
+    /// preparations more than a second apart. A preparation that minted its own
+    /// stamp would render a different time in each; one that renders what it was
+    /// given renders identical bytes. (Comparing two freshly minted stamps within
+    /// one second proves nothing - both are equal either way.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_preparation_renders_the_clock_it_was_given() {
+        let rt = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["stable system".to_string()],
+        )
+        .without_memory();
+
+        let clock_segment = |prompt: &PromptAssembly| {
+            prompt
+                .runtime_context
+                .iter()
+                .find(|segment| segment.contains("Runtime clock"))
+                .cloned()
+                .expect("the runtime clock segment is always emitted")
+        };
+
+        let stamp = crate::prompt::RuntimeClockStamp::now();
+        let first = rt
+            .prepare_reality_context_with_budget_and_items(
+                "first preparation",
+                8_192,
+                Vec::new(),
+                &stamp,
+            )
+            .await;
+        // Past the stamp's one-second resolution, so a minted stamp would differ.
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        let second = rt
+            .prepare_reality_context_with_budget_and_items(
+                "second preparation",
+                8_192,
+                Vec::new(),
+                &stamp,
+            )
+            .await;
+
+        assert_eq!(
+            clock_segment(&first),
+            clock_segment(&second),
+            "a preparation must render the clock it was handed, not mint its own"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn m2_prepare_without_memory_records_degraded_context_envelope() {
         let session = Session::new();
