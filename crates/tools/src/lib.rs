@@ -749,6 +749,60 @@ mod tests {
         assert!(catalog.required_permission("mcp__alpha__echo").is_some());
     }
 
+    /// PLAN B-4, at scale: the existing guard proves ONE MCP tool stays out of
+    /// the provider array. A bigger server (or a hot-reconnected one) is the
+    /// case that actually matters, because the array sits inside cache
+    /// breakpoint 2 - if a single MCP schema ever re-entered it, every message
+    /// after it would be re-sent for the rest of the session. This pins the
+    /// invariant byte-for-byte at a size no single server will approach.
+    #[test]
+    fn adding_any_number_of_mcp_tools_never_changes_the_provider_tool_array() {
+        let definition = |name: &str| RuntimeToolDefinition {
+            name: name.to_string(),
+            description: None,
+            input_schema: serde_json::json!({ "type": "object" }),
+            required_permission: PermissionMode::ReadOnly,
+            effect_resolver: ToolEffectResolverSpec {
+                resolver_id: "runtime.readonly".to_string(),
+                resolver_version: 1,
+            },
+        };
+        let base = ToolCatalog::builtin()
+            .with_runtime_tools(vec![definition("team_create")])
+            .expect("core runtime tool");
+        let discovered = (0..256usize)
+            .map(|index| definition(&format!("mcp__server{index}__tool")))
+            .collect();
+        let with_mcp = ToolCatalog::builtin()
+            .with_runtime_tools(vec![definition("team_create")])
+            .expect("core runtime tool")
+            .extend_runtime_tools(discovered)
+            .expect("MCP runtime tools");
+
+        // Render the two things that actually reach the wire: ordered names and
+        // each input schema. Comparing these, not the structs, keeps the test
+        // honest about bytes and not about incidental fields.
+        let array = |catalog: &ToolCatalog| -> Vec<String> {
+            catalog
+                .definitions(None)
+                .into_iter()
+                .map(|entry| format!("{}:{:?}", entry.name, entry.input_schema))
+                .collect()
+        };
+        assert_eq!(
+            array(&base),
+            array(&with_mcp),
+            "256 MCP tools must not move a single byte of the provider tool array"
+        );
+        // They stay resolvable, which is the whole point of keeping them in the
+        // registry while keeping them out of the prompt.
+        assert_eq!(
+            with_mcp.canonical_name("mcp__server255__tool").as_deref(),
+            Some("mcp__server255__tool")
+        );
+        assert!(with_mcp.required_permission("mcp__server0__tool").is_some());
+    }
+
     #[derive(Debug)]
     struct FakeMcpService {
         name: &'static str,

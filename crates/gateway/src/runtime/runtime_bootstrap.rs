@@ -417,7 +417,7 @@ pub(crate) fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition
     definitions.push(RuntimeToolDefinition {
         name: "agent_action_batch".to_string(),
         description: Some(
-            "Apply several Agent actions in ONE provider round. Each entry is {tool, input}, where tool is any Agent action (team_create, agent_invite, task_publish, task_claim, task_release, task_supersede, task_withdraw, task_submit, task_review, message_publish, artifact_commit, objective_update, objective_review, objective_complete_request, membership_update, team_update). Every entry is validated, authorized, committed and physically dispatched EXACTLY as if it had been its own call - the batch grants no extra permission, and each action gets its own durable identity derived from this call. Use it to publish several independent Tasks, or to advance a multi-step program, without one round per action. state_inspect is accepted but never waits here; inspect separately when you need results. Bounds: at most 25 actions per call, applied in order. Boundary: it dispatches Agent actions only, never workspace/shell/network tools; a rejected action fails the whole batch with its own reason."
+            "Apply several Agent actions in ONE provider round. Each entry is {tool, input}, where tool is any Agent action (team_create, agent_invite, task_publish, task_claim, task_release, task_supersede, task_withdraw, task_submit, task_review, message_publish, artifact_commit, objective_update, objective_review, objective_complete_request, membership_update, team_update). Every entry is validated, authorized, committed and physically dispatched EXACTLY as if it had been its own call - the batch grants no extra permission, and each action gets its own durable identity derived from this call. Use it to publish several independent Tasks, or to advance a multi-step program, without one round per action. state_inspect is accepted but never waits here; inspect separately when you need results. Bounds: at most 25 actions per call, applied in order. Boundary: it dispatches Agent actions only, never workspace/shell/network tools; a rejected action fails the whole batch with its own reason. To mix workspace tools with these actions in the same round, emit them as separate parallel tool calls in one response; tool_orchestrate serves dependency-chain programs of workspace calls."
                 .to_string(),
         ),
         input_schema: json!({
@@ -782,7 +782,6 @@ mod tests {
                 && tool.effect_resolver.resolver_id == "runtime.agent_action"),
             "the batch tool must share the Agent-action effect resolver"
         );
-
         let evidence_tool = tools
             .iter()
             .find(|tool| tool.name == "evidence_retrieve")
@@ -820,6 +819,27 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing runtime tool {tool_name}"));
             assert_eq!(tool.input_schema["type"], "object");
         }
+    }
+
+    /// `agent_action_batch` states its boundary in two halves, and both must
+    /// survive any future edit: the negative half (never workspace/shell/network
+    /// tools, so the model does not burn rounds discovering it by rejection) and
+    /// the positive half (how a round actually mixes the two kinds).
+    #[test]
+    fn agent_action_batch_description_states_both_its_boundary_and_how_to_work_around_it() {
+        let batch = runtime_capability_tool_definitions()
+            .into_iter()
+            .find(|tool| tool.name == "agent_action_batch")
+            .expect("agent_action_batch is a runtime capability tool");
+        let description = batch.description.expect("a description is the contract here");
+        assert!(
+            description.contains("never workspace/shell/network tools"),
+            "the negative half of the boundary must stay explicit"
+        );
+        assert!(
+            description.contains("separate parallel tool calls in one response"),
+            "the positive half must tell the model how to combine the two kinds"
+        );
     }
 
     #[test]
