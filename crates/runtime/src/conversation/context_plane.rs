@@ -1638,6 +1638,14 @@ where
         for header in &envelope.assembled.runtime_header {
             prompt.push_runtime_context(header.clone());
         }
+        // Degraded sources must be visible to the model. Without this marker a
+        // silent drop is indistinguishable from "there is no evidence": the model
+        // reasons over a partial context and cannot disclose what it lacks.
+        // The marker is a constant per source, so it is byte-stable and cannot
+        // itself fork the provider prefix.
+        for source in &envelope.diagnostics.degraded_sources {
+            prompt.push_runtime_context(omitted_source_marker(*source));
+        }
         for item in &envelope.selected {
             prompt.push_context_item(item);
         }
@@ -2277,5 +2285,48 @@ where
             "memory context projection updated"
         );
         Arc::clone(&projection.messages)
+    }
+}
+
+/// Model-visible marker for a context source whose retrieval failed or was
+/// skipped. Deliberately a constant per source kind: it must be byte-stable
+/// across requests so it cannot fork the provider prefix, and it must never
+/// carry the underlying error detail.
+fn omitted_source_marker(source: crate::context_runtime::ContextSourceKind) -> String {
+    format!(
+        "## Context source unavailable: {source:?}\n\
+         This source could not be retrieved for the current request and was \
+         omitted rather than silently dropped. Treat any related conclusion as \
+         unverified and state the gap explicitly; do not assume the source is \
+         empty or absent."
+    )
+}
+
+#[cfg(test)]
+mod omitted_marker_tests {
+    use super::omitted_source_marker;
+
+    #[test]
+    fn the_marker_is_a_byte_stable_constant() {
+        let first = omitted_source_marker(crate::context_runtime::ContextSourceKind::Memory);
+        let second = omitted_source_marker(crate::context_runtime::ContextSourceKind::Memory);
+        assert_eq!(first, second, "the marker must not fork the prefix");
+    }
+
+    #[test]
+    fn the_marker_is_explicit_and_leaks_no_detail() {
+        let marker = omitted_source_marker(crate::context_runtime::ContextSourceKind::Memory);
+        assert!(marker.contains("Context source unavailable"));
+        assert!(marker.contains("omitted rather than silently dropped"));
+        assert!(!marker.contains("error:"));
+        assert!(!marker.contains("Panic"));
+    }
+
+    #[test]
+    fn distinct_sources_get_distinct_markers() {
+        assert_ne!(
+            omitted_source_marker(crate::context_runtime::ContextSourceKind::Memory),
+            omitted_source_marker(crate::context_runtime::ContextSourceKind::Knowledge)
+        );
     }
 }

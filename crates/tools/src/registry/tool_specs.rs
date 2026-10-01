@@ -1500,6 +1500,36 @@ mod family_taxonomy_tests {
     /// The names this framework merged away must never reappear in the catalog.
     /// Merging removed a duplicate; a regression that re-adds one would silently
     /// undo the convergence, so it is pinned here.
+    /// The existing ratchet only covers `mvp_tool_specs()`. The LIVE registry
+    /// also exposes runtime and plugin tools, which is what a provider array is
+    /// actually built from — so a retired name resurrected there would reach the
+    /// model without the catalog ratchet noticing.
+    #[test]
+    fn retired_tool_names_do_not_reappear_in_the_live_registry() {
+        const RETIRED: &[&str] = &[
+            "read_many", "glob_many", "grep_many", "ast_grep_search", "tool_batch_readonly",
+            "write_file", "edit_file", "apply_patch_transaction", "mutation_preview",
+            "edit_many_preview", "patch_plan", "notebook_edit", "repl", "power_shell",
+            "send_user_message", "question", "ask_user_question",
+            "checkpoint_create", "checkpoint_list", "checkpoint_diff", "checkpoint_restore",
+            "skill_install_plan", "skill_install_commit", "skill_status", "skill_rollback",
+            "skill_deactivate", "list_mcp_resources", "read_mcp_resource", "mcp_auth",
+            "enter_plan_mode", "exit_plan_mode", "background_task_status", "background_task_kill",
+        ];
+        let catalog = crate::ToolCatalog::builtin();
+        let names = catalog
+            .definitions(None)
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<BTreeSet<_>>();
+        for retired in RETIRED {
+            assert!(
+                !names.contains(*retired),
+                "`{retired}` was merged away and must not reappear in the live registry"
+            );
+        }
+    }
+
     #[test]
     fn retired_tool_names_do_not_reappear_in_the_catalog() {
         const RETIRED: &[&str] = &[
