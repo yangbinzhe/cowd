@@ -274,8 +274,20 @@ pub(super) fn validate_transition(
                         .to_string(),
                 ));
             }
-            crate::agentic::supervision::completion_gap(projection, input)
-                .map(|gap| ("objective_not_verifiable", gap))
+            // An accepted exception exit is a judgement about the goal, not a
+            // completion claim: the verifier still reports the remaining gap,
+            // but Runtime records the request as a human-review Partial rather
+            // than forcing the model to keep working forever. `apply_locked`
+            // has already rejected it while the Program was not quiescent.
+            match crate::agentic::supervision::completion_gap(projection, input) {
+                Some(gap) if input.blocked && crate::agentic::action_service::agentic_program_is_quiescent(projection) => {
+                    Some((
+                        "objective_blocked_for_human_review",
+                        format!("the Objective cannot be completed: {gap}"),
+                    ))
+                }
+                other => other.map(|gap| ("objective_not_verifiable", gap)),
+            }
         }
     }
 }

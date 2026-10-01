@@ -464,6 +464,18 @@ pub struct ObjectiveCompleteRequestInput {
     /// visible in the Program projection but are not duplicated here.
     #[serde(default)]
     pub unresolved: Vec<String>,
+    /// EXCEPTION EXIT: the model judges the goal unreachable after repeated
+    /// attempts with no new progress. Requires a non-empty `blocked_reason`,
+    /// `human_review_required` and at least one `recommended_next_action`;
+    /// Runtime falsifies it with the no-progress streak before accepting it.
+    #[serde(default)]
+    pub blocked: bool,
+    #[serde(default)]
+    pub blocked_reason: Option<String>,
+    #[serde(default)]
+    pub human_review_required: bool,
+    #[serde(default)]
+    pub recommended_next_actions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

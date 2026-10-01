@@ -484,10 +484,38 @@ impl AgentActionService {
                 ));
             }
         }
+        // ── Exception exit (blocked) ────────────────────────────────────────
+        // The DECISION that a goal is unreachable belongs to the model. Runtime
+        // only verifies that progress really has stopped, and never masks a real
+        // gap: an accepted blocked exit ends as an honest Partial whose
+        // `unresolved` stays visible.
+        if let AgentAction::ObjectiveCompleteRequest(input) = &envelope.action {
+            if input.blocked {
+                if input.blocked_reason.as_deref().unwrap_or("").trim().is_empty()
+                    || !input.human_review_required
+                    || input.recommended_next_actions.is_empty()
+                {
+                    return Ok(rejected(
+                        envelope,
+                        projection.revision,
+                        "blocked_exit_incomplete",
+                        "a blocked exit requires a non-empty blocked_reason, human_review_required=true and at least one recommended_next_action",
+                    ));
+                }
+                if !agentic_program_is_quiescent(&projection) {
+                    return Ok(rejected(
+                        envelope,
+                        projection.revision,
+                        "blocked_exit_unearned",
+                        "the Program still has work in flight; a blocked exit is not permitted until the remaining work is exhausted",
+                    ));
+                }
+            }
+        }
         if let Some((code, message)) =
             validate_transition(&projection, envelope, now_ms(), self.graphs.as_ref())
         {
-            if code == "objective_not_verifiable"
+            if matches!(code, "objective_not_verifiable" | "objective_blocked_for_human_review")
                 && matches!(envelope.action, AgentAction::ObjectiveCompleteRequest(_))
             {
                 // F2b: an authorization-time completion rejection never became a
@@ -2410,3 +2438,26 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests;
+
+/// A blocked exit is only "earned" when the Program is quiescent — the model has
+/// already exhausted the work it can do. While any Task can still be claimed,
+/// submitted or reviewed, the model is not stuck and must keep working instead.
+pub(crate) const BLOCKED_EXIT_MAX_REMAINING_WORK: usize = 0;
+
+/// True when every Task is terminal, i.e. the Program can make no further
+/// progress on its own and only the model's judgement remains.
+fn agentic_program_is_quiescent(projection: &AgenticProgramProjection) -> bool {
+    projection
+        .tasks
+        .values()
+        .filter(|task| {
+            !matches!(
+                task.status,
+                AgenticTaskStatus::Accepted
+                    | AgenticTaskStatus::Withdrawn
+                    | AgenticTaskStatus::Superseded
+            )
+        })
+        .count()
+        <= BLOCKED_EXIT_MAX_REMAINING_WORK
+}

@@ -563,6 +563,10 @@ mod tests {
                     actor: actor.clone(),
                     expected_revision: None,
                     action: AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
+                    blocked: false,
+                    blocked_reason: None,
+                    human_review_required: false,
+                    recommended_next_actions: Vec::new(),
                         result_refs: vec!["tool://result".into()],
                         evidence_refs: vec!["tool://evidence".into()],
                         unresolved: vec![],
@@ -888,6 +892,10 @@ mod tests {
                 actor: actor.clone(),
                 expected_revision: None,
                 action: AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
+                blocked: false,
+                blocked_reason: None,
+                human_review_required: false,
+                recommended_next_actions: Vec::new(),
                     result_refs: vec!["tool://result".into()],
                     evidence_refs: vec!["tool://evidence".into()],
                     unresolved: vec![],

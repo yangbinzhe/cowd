@@ -560,6 +560,10 @@ fn completion_objective_input(
         result_refs,
         evidence_refs,
         unresolved: Vec::new(),
+        blocked: false,
+        blocked_reason: None,
+        human_review_required: false,
+        recommended_next_actions: Vec::new(),
     })
 }
 

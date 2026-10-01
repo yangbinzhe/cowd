@@ -1417,6 +1417,10 @@ fn legacy_goal_terminal_recovery_is_durable_and_idempotent() {
             &team_id,
             &reviewer_id,
             AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
+            blocked: false,
+            blocked_reason: None,
+            human_review_required: false,
+            recommended_next_actions: Vec::new(),
                 result_refs: vec![artifact_ref.clone()],
                 evidence_refs: vec!["artifact://abc".to_string()],
                 unresolved: Vec::new(),
@@ -1432,6 +1436,10 @@ fn legacy_goal_terminal_recovery_is_durable_and_idempotent() {
         .apply(&root(
             "complete",
             AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
+            blocked: false,
+            blocked_reason: None,
+            human_review_required: false,
+            recommended_next_actions: Vec::new(),
                 result_refs: vec![artifact_ref],
                 evidence_refs: vec!["artifact://abc".to_string()],
                 unresolved: Vec::new(),
@@ -1725,6 +1733,10 @@ async fn production_artifact_authority_closes_submit_review_and_completion_chain
             .apply(&root(
                 "blocked-objective-complete",
                 AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
+                blocked: false,
+                blocked_reason: None,
+                human_review_required: false,
+                recommended_next_actions: Vec::new(),
                     result_refs: vec![artifact.clone()],
                     evidence_refs: vec![content.selector.clone()],
                     unresolved: vec!["Objective-level delivery blocker".to_string()],
@@ -1826,6 +1838,10 @@ async fn production_artifact_authority_closes_submit_review_and_completion_chain
             .apply(&root(
                 "durable-complete",
                 AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
+                blocked: false,
+                blocked_reason: None,
+                human_review_required: false,
+                recommended_next_actions: Vec::new(),
                     result_refs: vec![artifact],
                     evidence_refs: vec![content.selector],
                     unresolved: Vec::new(),
@@ -1855,6 +1871,10 @@ fn completion_cannot_bypass_real_artifact_and_task_review() {
         .apply(&root(
             "complete",
             AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
+            blocked: false,
+            blocked_reason: None,
+            human_review_required: false,
+            recommended_next_actions: Vec::new(),
                 result_refs: vec!["artifact:missing".to_string()],
                 evidence_refs: Vec::new(),
                 unresolved: Vec::new(),
@@ -2796,6 +2816,10 @@ fn failed_task_supersede_is_cas_idempotent_recoverable_and_not_fake_completion()
         super::super::supervision::completion_gap(
             &incomplete_projection,
             &ObjectiveCompleteRequestInput {
+            blocked: false,
+            blocked_reason: None,
+            human_review_required: false,
+            recommended_next_actions: Vec::new(),
                 result_refs: vec![final_artifact_ref.clone()],
                 evidence_refs: vec!["tool://failure-receipt".to_string()],
                 unresolved: Vec::new(),
@@ -2834,6 +2858,10 @@ fn failed_task_supersede_is_cas_idempotent_recoverable_and_not_fake_completion()
         super::super::supervision::completion_gap(
             &supervisor_projection,
             &ObjectiveCompleteRequestInput {
+            blocked: false,
+            blocked_reason: None,
+            human_review_required: false,
+            recommended_next_actions: Vec::new(),
                 result_refs: vec![final_artifact_ref],
                 evidence_refs: vec!["tool://accepted-evidence".to_string()],
                 unresolved: Vec::new(),
@@ -3274,5 +3302,195 @@ async fn an_accepted_task_rejects_re_review_and_re_submit_but_allows_supersede()
     assert!(
         !replacement.is_empty(),
         "the newly published Task is the real way to change a conclusion"
+    );
+}
+
+fn blocked_exit_blocked() -> bool {
+    true
+}
+
+#[tokio::test]
+async fn blocked_exit_requires_a_reason_human_review_and_next_actions() {
+    let service = crate::AgentActionService::new(Arc::new(RuntimeEventStore::for_test()));
+    let team = service
+        .apply(&root(
+            "blocked-team",
+            AgentAction::TeamCreate(TeamCreateInput {
+                name: "Blocked".to_string(),
+                mission: "prove the exception exit is guarded".to_string(),
+                objective: None,
+            }),
+        ))
+        .expect("team")
+        .changed_refs[0]
+        .clone();
+    let missing_reason = service
+        .apply(&root(
+            "blocked-no-reason",
+            AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
+                result_refs: vec![team.clone()],
+                evidence_refs: Vec::new(),
+                unresolved: Vec::new(),
+                blocked: true,
+                blocked_reason: Some(String::new()),
+                human_review_required: true,
+                recommended_next_actions: vec!["retry".to_string()],
+            }),
+        ))
+        .expect("blocked exit");
+    assert_eq!(missing_reason.status, AgentActionStatus::Rejected);
+    assert_eq!(
+        missing_reason.error.expect("error").code,
+        "blocked_exit_incomplete"
+    );
+
+    let no_next_steps = service
+        .apply(&root(
+            "blocked-no-next",
+            AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
+                result_refs: vec![team.clone()],
+                evidence_refs: Vec::new(),
+                unresolved: Vec::new(),
+                blocked: true,
+                blocked_reason: Some("the external source is unreachable".to_string()),
+                human_review_required: true,
+                recommended_next_actions: Vec::new(),
+            }),
+        ))
+        .expect("blocked exit");
+    assert_eq!(no_next_steps.status, AgentActionStatus::Rejected);
+    assert_eq!(
+        no_next_steps.error.expect("error").code,
+        "blocked_exit_incomplete"
+    );
+    assert!(blocked_exit_blocked());
+}
+
+#[tokio::test]
+async fn blocked_exit_is_rejected_while_work_is_still_in_flight() {
+    let service = crate::AgentActionService::new(Arc::new(RuntimeEventStore::for_test()));
+    let team = service
+        .apply(&root(
+            "inflight-team",
+            AgentAction::TeamCreate(TeamCreateInput {
+                name: "InFlight".to_string(),
+                mission: "prove a blocked exit is not an excuse to stop working".to_string(),
+                objective: None,
+            }),
+        ))
+        .expect("team")
+        .changed_refs[0]
+        .clone();
+    let task = service
+        .apply(&root(
+            "inflight-task",
+            AgentAction::TaskPublish(TaskPublishInput {
+                team_ref: team.clone(),
+                title: "Open work".to_string(),
+                objective: "still doable".to_string(),
+                acceptance: "durable evidence".to_string(),
+                acceptance_checks: Vec::new(),
+                required_capabilities: vec!["read".to_string()],
+                depends_on: Vec::new(),
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
+            }),
+        ))
+        .expect("task")
+        .changed_refs[0]
+        .clone();
+    let premature = service
+        .apply(&root(
+            "blocked-premature",
+            AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
+                result_refs: vec![team.clone()],
+                evidence_refs: Vec::new(),
+                unresolved: Vec::new(),
+                blocked: true,
+                blocked_reason: Some("I decided this is unreachable".to_string()),
+                human_review_required: true,
+                recommended_next_actions: vec!["retry later".to_string()],
+            }),
+        ))
+        .expect("premature blocked exit");
+    assert_eq!(premature.status, AgentActionStatus::Rejected);
+    assert_eq!(
+        premature.error.expect("error").code,
+        "blocked_exit_unearned",
+        "work is still in flight, so the Program is not quiescent"
+    );
+    assert!(!task.is_empty());
+}
+
+#[tokio::test]
+async fn blocked_exit_is_accepted_once_every_task_is_terminal() {
+    let service = crate::AgentActionService::new(Arc::new(RuntimeEventStore::for_test()));
+    let team = service
+        .apply(&root(
+            "quiesced-team",
+            AgentAction::TeamCreate(TeamCreateInput {
+                name: "Quiesced".to_string(),
+                mission: "prove a well-formed blocked exit is accepted for human review".to_string(),
+                objective: None,
+            }),
+        ))
+        .expect("team")
+        .changed_refs[0]
+        .clone();
+    let task = service
+        .apply(&root(
+            "quiesced-task",
+            AgentAction::TaskPublish(TaskPublishInput {
+                team_ref: team.clone(),
+                title: "Attempted work".to_string(),
+                objective: "unreachable in practice".to_string(),
+                acceptance: "durable evidence".to_string(),
+                acceptance_checks: Vec::new(),
+                required_capabilities: vec!["read".to_string()],
+                depends_on: Vec::new(),
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
+            }),
+        ))
+        .expect("task")
+        .changed_refs[0]
+        .clone();
+    service
+        .apply(&root(
+            "quiesced-withdraw",
+            AgentAction::TaskWithdraw(harness_contract::agent_action::TaskWithdrawInput {
+                task_ref: task.clone(),
+                reason_ref: "objectively unreachable".to_string(),
+                evidence_refs: Vec::new(),
+            }),
+        ))
+        .expect("withdraw");
+    let blocked = service
+        .apply(&root(
+            "quiesced-blocked",
+            AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
+                result_refs: vec![team.clone()],
+                evidence_refs: Vec::new(),
+                unresolved: vec!["the source could not be read".to_string()],
+                blocked: true,
+                blocked_reason: Some("every read-only path was exhausted".to_string()),
+                human_review_required: true,
+                recommended_next_actions: vec!["obtain the source externally".to_string()],
+            }),
+        ))
+        .expect("blocked exit");
+    assert_eq!(
+        blocked.error.expect("error").code,
+        "objective_blocked_for_human_review",
+        "a quiescent Program with a well-formed blocked exit becomes a durably recorded human-review Partial"
+    );
+    assert!(blocked.actionable.iter().any(|hint| hint.contains("human review"))
+        || blocked.actionable.iter().any(|hint| hint.contains("inspect")),
+        "the model must be told what to do with the recorded partial: {:?}",
+        blocked.actionable
     );
 }

@@ -1806,6 +1806,10 @@ mod tests {
             .apply(&root(
                 "request-program-completion",
                 AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
+                blocked: false,
+                blocked_reason: None,
+                human_review_required: false,
+                recommended_next_actions: Vec::new(),
                     result_refs: vec![final_artifact.clone()],
                     evidence_refs: vec![research_artifact.clone(), final_artifact.clone()],
                     unresolved: Vec::new(),

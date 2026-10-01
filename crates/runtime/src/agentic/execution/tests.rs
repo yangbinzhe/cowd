@@ -1380,6 +1380,10 @@ async fn exercise_reviewed_goal_delivery(
                 .apply(&bind_root(root(
                     id,
                     AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
+                    blocked: false,
+                    blocked_reason: None,
+                    human_review_required: false,
+                    recommended_next_actions: Vec::new(),
                         result_refs: vec![artifact.clone()],
                         evidence_refs: vec![content.selector.clone()],
                         unresolved: vec![],
@@ -1440,6 +1444,10 @@ async fn exercise_reviewed_goal_delivery(
             "before-original-review",
             AgentAction::ObjectiveCompleteRequest(
                 harness_contract::agent_action::ObjectiveCompleteRequestInput {
+                blocked: false,
+                blocked_reason: None,
+                human_review_required: false,
+                recommended_next_actions: Vec::new(),
                     result_refs: vec![artifact.clone()],
                     evidence_refs: vec![content.selector.clone()],
                     unresolved: vec![],
@@ -1886,6 +1894,10 @@ async fn exercise_reviewed_goal_delivery(
             "experience-complete",
             AgentAction::ObjectiveCompleteRequest(
                 harness_contract::agent_action::ObjectiveCompleteRequestInput {
+                blocked: false,
+                blocked_reason: None,
+                human_review_required: false,
+                recommended_next_actions: Vec::new(),
                     result_refs: vec![artifact],
                     evidence_refs: vec![content.selector],
                     unresolved: vec![],
@@ -4442,6 +4454,10 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
             .submit_agent_action(&bind(
                 "stale-self-review-completion",
                 AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
+                blocked: false,
+                blocked_reason: None,
+                human_review_required: false,
+                recommended_next_actions: Vec::new(),
                     result_refs: references.clone(),
                     evidence_refs: vec![content.selector.clone()],
                     unresolved: vec![],
@@ -4560,6 +4576,10 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
         .submit_agent_action(&bind(
             "root-complete",
             AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
+            blocked: false,
+            blocked_reason: None,
+            human_review_required: false,
+            recommended_next_actions: Vec::new(),
                 result_refs: references,
                 evidence_refs: vec![content.selector],
                 unresolved: vec![],
