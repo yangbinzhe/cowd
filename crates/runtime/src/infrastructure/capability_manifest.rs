@@ -184,24 +184,71 @@ fn action_purpose(action: &str) -> &'static str {
     }
 }
 
+/// The minimal, capability-independent core of the system prompt. Kept small and
+/// stable so it stays inside the shared Provider cache prefix; per-capability
+/// usage is appended by [`render_tool_guidance`] so a model only ever reads the
+/// guidance for tools it can actually call (opencode's `${OPENCODE_TOOL_GUIDANCE}`
+/// pattern).
 #[must_use]
 pub fn runtime_capability_primer() -> String {
     [
         "## Agent-first collaboration contract",
+        "You own semantic decisions: Team purpose, roles, Tasks, dependencies, discussion, challenge, replanning, synthesis, and WHEN to close the Objective. Runtime owns actor identity, authorization, revisions, idempotency, leases, concurrent execution, durable artifacts, recovery, and terminal truth. Publish independent Tasks without artificial dependencies so Runtime can execute them concurrently. A Task is complete only after a real claimant submits durable evidence and a different Agent accepts it.",
         "## Shortest path first",
-        "Decide the whole answer before the first call, then make the calls. Reach the result in the FEWEST provider round-trips: every call you can issue in this response, issue now - do not hold one back to inspect a result you could have read in parallel. Batch independent work into ONE response, or into one `tool_orchestrate` program (batch / map / compute) instead of a chain of single calls. Do not decompose a bounded job into per-step rounds: one round of many calls beats many rounds of one call. Use a single tool only when it is already the whole job. Fewer rounds means fewer tokens, faster closure, and less drift.",
-        "Never move large file bodies into context. Read only the range you need, and run counting, aggregation, filtering and comparison inside `tool_orchestrate`'s compute/collect steps or `execute_code`, bringing back only the summary plus a `tool://` evidence ref. The message history is the dominant part of every request, so every byte you avoid appending raises Provider cache reuse and cuts tokens.",
-        "You own semantic decisions: Team purpose, roles, Tasks, dependencies, discussion, challenge, replanning, and synthesis.",
-        "Use small Agent actions incrementally. Do not emit a complete graph, template proposal, or long JSON plan.",
-        "Runtime owns actor identity, authorization, revisions, idempotency, leases, concurrent execution, durable artifacts, recovery, and terminal truth.",
-        "Publish independent Tasks without artificial dependencies so Runtime can execute them concurrently.",
-        "Read Runtime facts through one canonical reference with `read_ref`, for example task://<task_ref>, agent://<agent_id>, tool://<short_call_id>, artifact://<hash>, session://<session_id>. The scheme selects the authorized reader; do not guess field names on the legacy readers.",
-        "Keep long reasoning and deliverables in normal content or workspace files. Action payloads carry compact semantic fields and durable refs.",
-        "A Task is complete only after a real claimant submits durable evidence and a different Agent accepts it.",
-        "Before you finish, drive the Objective terminal: once every required Team has accepted work, the final artifact is durable and independently reviewed, and no objective-level blocker remains, call `objective_complete_request` and then let the Runtime verify it. A final answer without that action does not close the Objective. Accepted Task limitations remain visible disclosures and are not a second completion veto.",
+        "Decide the whole answer before the first call, then make the calls. Reach the result in the FEWEST provider round-trips: every call you can issue in this response, issue now. Batch independent work into ONE response, or into one `tool_orchestrate` program (batch / map / compute) instead of a chain of single calls.",
+        "Prefer parallelizing independent tool calls.",
+        "Never move large file bodies into context: read only the range you need, and run counting/aggregation/filtering inside `tool_orchestrate` compute/collect or `execute_code`, returning only a summary plus a `tool://` ref.",
+        "## Closure discipline",
+        "Runtime tells you what is satisfied and what remains. Finish the outstanding rungs; do not redo finished ones. When `closure.exit_ready` holds, YOU call `objective_complete_request` and Runtime verifies it. If you judge the goal unreachable after repeated attempts with no new progress, use the `blocked` form with a reason, human review and next steps.",
+        "## Canonical references",
+        "Read Runtime facts through one canonical reference with `read_ref`: task://, agent://, tool://, artifact://, session://. The scheme selects the authorized reader; do not guess field names on legacy readers.",
+        "## Recovery",
         "On rejection or restart, inspect current state and continue from the returned revision; never repeat an unchanged failing action.",
     ]
     .join("\n")
+}
+
+/// Usage guidance for the tools that are ACTUALLY callable on this request.
+/// A tool that is not callable gets no guidance, so a model is never told about
+/// a capability it cannot use — and the prompt stays proportional to the surface.
+#[must_use]
+pub fn render_tool_guidance(present: &std::collections::BTreeSet<String>) -> String {
+    let mut lines: Vec<&str> = Vec::new();
+    if present.contains("tool_orchestrate") {
+        lines.push(
+            "- `tool_orchestrate`: run a bounded PROGRAM of many calls in ONE round. `batch` a known file set, `map` a list, `filter`/`collect` to aggregate (count|first|last|join|sum), `compute` to reduce. `on_error=collect` returns per-item {ok,output,error,durationMs} instead of aborting.",
+        );
+    }
+    if present.contains("glob_search") {
+        lines.push(
+            "- `glob_search`: `patterns:[...]` searches several globs in ONE call; prefer it over N single `glob_search` calls.",
+        );
+    }
+    if present.contains("grep_search") {
+        lines.push(
+            "- `grep_search`: `searches:[...]` runs several independent content searches in ONE ordered batch; `language` sweeps one language's extensions.",
+        );
+    }
+    if present.contains("execute_code") {
+        lines.push(
+            "- `execute_code`: deterministic reduction OUTSIDE the model (python/javascript/bash/ruby/lua/go/rust). Count, aggregate, filter and compare across many files; only stdout returns.",
+        );
+    }
+    if present.contains("read_file") {
+        lines.push(
+            "- `read_file`: one bounded window; `complete=true` yields a verifiable EOF receipt. On truncation continue from `nextOffset` instead of re-reading whole files.",
+        );
+    }
+    if present.contains("bash") {
+        lines.push(
+            "- `bash`: `shell` selects the backend (auto|bash|powershell). Prefer dedicated tools over the shell.",
+        );
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("## Available tool shapes\n{}", lines.join("\n"))
+    }
 }
 
 #[must_use]
@@ -324,4 +371,52 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
             "tool": "evidence_retrieve",
         },
     })
+}
+
+#[cfg(test)]
+mod prompt_core_tests {
+    use super::{render_tool_guidance, runtime_capability_primer};
+
+    fn set(items: &[&str]) -> std::collections::BTreeSet<String> {
+        items.iter().map(|item| (*item).to_string()).collect()
+    }
+
+    #[test]
+    fn primer_is_short_and_states_ownership_and_exit_discipline() {
+        let primer = runtime_capability_primer();
+        assert!(primer.len() <= 2_600, "primer must stay small: {}", primer.len());
+        assert!(primer.contains("Shortest path first"));
+        assert!(primer.contains("Prefer parallelizing independent tool calls."));
+        assert!(primer.contains("closure.exit_ready"));
+        assert!(primer.contains("objective_complete_request"));
+        assert!(primer.contains("blocked"));
+        assert!(!primer.contains("incrementally"));
+        assert!(!primer.contains("Do not emit a complete graph"));
+    }
+
+    #[test]
+    fn tool_guidance_only_mentions_callable_tools() {
+        let only_read = render_tool_guidance(&set(&["read_file"]));
+        assert!(only_read.contains("read_file"));
+        assert!(!only_read.contains("tool_orchestrate"));
+        assert!(!only_read.contains("patterns:[...]"));
+        assert!(!only_read.contains("compute"));
+
+        let orchestrated = render_tool_guidance(&set(&[
+            "read_file",
+            "tool_orchestrate",
+            "glob_search",
+            "execute_code",
+        ]));
+        assert!(orchestrated.contains("tool_orchestrate"));
+        assert!(orchestrated.contains("patterns:[...]"));
+        assert!(orchestrated.contains("on_error=collect"));
+        assert!(orchestrated.contains("execute_code"));
+    }
+
+    #[test]
+    fn no_callable_tool_yields_no_guidance_section() {
+        assert!(render_tool_guidance(&std::collections::BTreeSet::new()).is_empty());
+        assert!(render_tool_guidance(&set(&["state_inspect"])).is_empty());
+    }
 }

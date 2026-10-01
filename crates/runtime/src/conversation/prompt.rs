@@ -989,9 +989,14 @@ mod tests {
         let rendered = SystemPromptBuilder::new().render();
 
         assert!(rendered.contains("Agent-first collaboration contract"));
-        assert!(rendered.contains("small Agent actions incrementally"));
+        assert!(rendered.contains("Shortest path first"));
+        assert!(
+            !rendered.contains("small Agent actions incrementally"),
+            "the contradictory incremental-step rule must stay deleted"
+        );
         assert!(rendered.contains("Runtime owns actor identity"));
-        assert!(rendered.contains("independent Tasks"));
+        assert!(rendered.contains("Publish independent Tasks without artificial dependencies"));
+        assert!(rendered.contains("a different Agent accepts it"));
     }
 
     #[test]
@@ -1021,7 +1026,11 @@ mod tests {
             .render();
 
         assert!(rendered.contains("Agent-first collaboration contract"));
-        assert!(rendered.contains("small Agent actions incrementally"));
+        assert!(rendered.contains("Shortest path first"));
+        assert!(
+            !rendered.contains("small Agent actions incrementally"),
+            "the contradictory incremental-step rule must stay deleted"
+        );
         assert!(rendered.contains("independent Tasks"));
         assert!(!rendered
             .contains("Each declared result artifact is a required terminal structured field"));
@@ -1063,6 +1072,7 @@ mod tests {
 
         assert!(rendered.contains("Agent-first collaboration contract"));
         assert!(rendered.contains("A Task is complete only after a real claimant"));
+        assert!(rendered.contains("a different Agent accepts it"));
         fs::remove_dir_all(root).expect("cleanup large model config");
     }
 

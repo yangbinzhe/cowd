@@ -1318,6 +1318,21 @@ where
         // prose only under measured pressure.
         let compact_runtime_guidance = collection_budget <= 32_768;
         let apply_runtime_controls = |prompt: &mut PromptAssembly| {
+            // Capability-conditional usage guidance: only for tools that are
+            // ACTUALLY callable on this request. It lives after the dynamic
+            // boundary by construction, because the callable set varies per
+            // request — the small capability-independent core stays in the
+            // shared cache prefix.
+            let callable = exposure
+                .projection(0)
+                .active_ids
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+            let tool_shapes = crate::capability_manifest::render_tool_guidance(&callable);
+            if !tool_shapes.is_empty() {
+                prompt.push_runtime_context(tool_shapes);
+            }
             prompt.push_runtime_context(crate::evidence_planner::evidence_plan_prompt(&evidence));
             prompt.push_runtime_context(
                 crate::execution_core::runtime_execution_guidance_prompt_with_tool_exposure_mode(
