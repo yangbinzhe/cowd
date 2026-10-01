@@ -114,6 +114,58 @@ impl PostgresConnectionConfig {
     }
 }
 
+/// Connection count a test fixture pool should use, sized off the concurrency
+/// the suite will actually run.
+///
+/// Two properties of the executor make the fixture value different from the
+/// production default:
+///
+/// 1. The three workload lanes share ONE pool (`connect_with_migration_mode`
+///    clones the same handle into all three), so `max_connections` is the
+///    ceiling for every test thread regardless of which lane it uses.
+/// 2. `cargo test` runs one thread per core by default, and a fixture holds a
+///    connection while it creates its schema and runs migrations. Some tests
+///    hold two (a fixture plus a `reconnect`ed pool), so the ceiling needs
+///    headroom over the thread count rather than matching it exactly.
+///
+/// A pool smaller than that turns any slow query into mass starvation: waiters
+/// queue behind the checkout timeout and fail as a group, which reads as a
+/// flaky fixture rather than a mis-sized pool.
+///
+/// It is deliberately NOT sized by doubling the machine's core count. When the
+/// suite is split across concurrent `cargo test` processes each process still
+/// derives its own ceiling from the core count, so N processes multiply the
+/// cluster-wide connection demand by N for no reason. Set
+/// `COWD_TEST_POOL_CONNECTIONS` to the real per-process concurrency (usually the
+/// `--test-threads` value) when sharding the suite.
+///
+/// Production callers set `max_connections` explicitly; this is for fixtures.
+#[must_use]
+pub fn test_fixture_pool_size() -> u32 {
+    if let Some(explicit) = std::env::var("COWD_TEST_POOL_CONNECTIONS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| *value > 0)
+    {
+        return explicit;
+    }
+    let threads = std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get);
+    // Half again over the thread count, not double: it covers the tests that
+    // hold a second pool while staying proportional to real concurrency.
+    u32::try_from(threads.saturating_mul(3) / 2).unwrap_or(u32::MAX)
+}
+
+/// Checkout ceiling a test fixture should use.
+///
+/// Production traffic gives up fast so a caller is not stuck behind a broken
+/// backend. A fixture is different: it is the only thing running, so a short
+/// ceiling converts one slow query into a queue-wide failure instead of just
+/// making that one test slower.
+#[must_use]
+pub const fn test_fixture_checkout_timeout_ms() -> u64 {
+    30_000
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PostgresWorkloadClass {
@@ -1602,6 +1654,37 @@ fn apply_migration(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_explicit_pool_size_wins_and_lets_a_sharded_suite_stay_proportional() {
+        // The variable is only read by these assertions and restored
+        // immediately; the whole test module runs these two tests serially.
+        unsafe { std::env::set_var("COWD_TEST_POOL_CONNECTIONS", "12") };
+        assert_eq!(test_fixture_pool_size(), 12);
+        unsafe { std::env::remove_var("COWD_TEST_POOL_CONNECTIONS") };
+
+        // A blank or non-numeric value must not silently pin the pool to 1.
+        unsafe { std::env::set_var("COWD_TEST_POOL_CONNECTIONS", "  ") };
+        assert!(test_fixture_pool_size() > 1);
+        unsafe { std::env::remove_var("COWD_TEST_POOL_CONNECTIONS") };
+    }
+
+    #[test]
+    fn the_default_pool_gives_headroom_over_the_thread_count_without_doubling_it() {
+        unsafe { std::env::remove_var("COWD_TEST_POOL_CONNECTIONS") };
+        let threads =
+            u32::try_from(std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get))
+                .unwrap_or(u32::MAX);
+        let size = test_fixture_pool_size();
+        assert!(
+            size >= threads,
+            "the pool must cover the default one-thread-per-core run: {size} < {threads}"
+        );
+        assert!(
+            size < threads.saturating_mul(2),
+            "the default must stay proportional, not double: {size} for {threads} threads"
+        );
+    }
 
     fn real_pool_set() -> PostgresPoolSet {
         let url = std::env::var("COWD_TEST_POSTGRES_URL")

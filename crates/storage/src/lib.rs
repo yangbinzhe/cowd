@@ -28,7 +28,8 @@ pub use postgres::{
     PostgresExecutorHealth, PostgresExecutorMetrics, PostgresMigrationMode,
     PostgresMigrationReport, PostgresMigrationSpec, PostgresPoolLaneConfig, PostgresPoolLaneHealth,
     PostgresPoolSet, PostgresPoolSetConfig, PostgresTransaction, PostgresWorkloadClass,
-    ResolvedPostgresUrl, SecretRefResolver, StaticSecretRefResolver,
+    ResolvedPostgresUrl, SecretRefResolver, StaticSecretRefResolver, test_fixture_checkout_timeout_ms,
+    test_fixture_pool_size,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

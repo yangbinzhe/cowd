@@ -27,6 +27,12 @@ impl PostgresTestScope {
             std::env::var("COWD_TEST_POSTGRES_URL").expect("isolated test PostgreSQL required");
         let resolver = StaticSecretRefResolver::new([("fixture.pg".into(), url)]);
         let config = PostgresConnectionConfig::new(&schema, "fixture.pg", "cowd-owned-test-schema");
+        // Sized off the machine's parallelism: the pool is shared by every test
+        // thread and by all three workload lanes, so the 8-connection default
+        // starves as soon as `cargo test` reaches double digits of threads.
+        let mut config = config;
+        config.max_connections = storage::test_fixture_pool_size();
+        config.checkout_timeout_ms = storage::test_fixture_checkout_timeout_ms();
         let base = PostgresExecutor::connect(config.clone(), &resolver).expect("test connection");
         base.checkout_critical()
             .expect("namespace connection")

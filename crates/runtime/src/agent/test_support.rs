@@ -20,8 +20,12 @@ fn postgres_executor() -> PostgresExecutor {
                 "runtime.test.pg",
                 "cowd-runtime-test",
             );
-            config.max_connections = 8;
+            config.max_connections = storage::test_fixture_pool_size();
             config.min_idle_connections = None;
+            // The 5s production ceiling turns one slow query into a queue-wide
+            // failure when 24 test threads share one pool. See
+            // `storage::test_fixture_checkout_timeout_ms`.
+            config.checkout_timeout_ms = storage::test_fixture_checkout_timeout_ms();
             PostgresExecutor::connect(config, &resolver).map_err(|error| error.to_string())
         })
         .clone()
