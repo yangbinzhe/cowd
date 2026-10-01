@@ -1591,15 +1591,16 @@ where
         let profile = self.context_profile();
         let mut identity = ContextIdentity::main(session_id.clone());
         identity.mode = ContextRuntimeKernel::mode_for_profile(profile);
-        let governance_report_id =
-            ContextRuntimeKernel::governance_report_id(&session_id, user_input);
         let canonical_prompt = PromptAssembly::new(self.system_prompt.clone());
         let mut runtime_header = canonical_prompt.runtime_system_segments().to_vec();
         runtime_header.extend(ContextRuntimeKernel::runtime_header(&identity, profile));
         runtime_header.push(crate::prompt::runtime_clock_section_at(clock_stamp));
-        runtime_header.push(format!(
-            "context_governance_report_id:{governance_report_id}"
-        ));
+        // The governance report id deliberately stays out of the model-visible
+        // prompt. It is bookkeeping for `RealityRecallDecision`, which reads the
+        // same value from the structured report (`context_runtime.rs`), so the
+        // model gains nothing from it - and because it is a hash of THIS turn's
+        // user input, it changes every turn and sits in front of the stable
+        // context. Its bytes were pure prefix churn.
         let mut selected_items = self.external_context_items();
         if let Some(cwd) = workspace_root {
             selected_items.extend(crate::prompt::discover_project_context_items_for_profile(

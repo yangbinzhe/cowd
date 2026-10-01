@@ -2328,10 +2328,19 @@
             .runtime_context
             .iter()
             .any(|line| line.contains("profile:MainTurn")));
-        assert!(prompt
-            .runtime_context
-            .iter()
-            .any(|segment| segment.contains("context_governance_report_id:")));
+        // The governance report id is bookkeeping for `RealityRecallDecision`,
+        // which reads it from the structured report. It is a hash of THIS turn's
+        // user input, so it changes every turn while sitting in front of the
+        // stable context - its prompt bytes were pure prefix churn. It must
+        // therefore stay out of the model-visible prompt entirely, while the
+        // structured path (`envelope.intent`) still carries what it needs.
+        assert!(
+            !prompt
+                .runtime_context
+                .iter()
+                .any(|segment| segment.contains("context_governance_report_id:")),
+            "the governance report id must not appear in the model-visible prompt"
+        );
         assert_eq!(envelope.intent, "remember this");
         assert_eq!(envelope.assembled.stable_head, vec!["stable system"]);
         assert_eq!(
