@@ -1258,10 +1258,151 @@ pub mod test_support {
         }
     }
 
+    /// Directories this process created for tests.
+    ///
+    /// The owner PID is part of the name so the next process can tell a live
+    /// root from a leaked one without guessing from age alone.
     fn unique_test_root(label: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("cowd-{label}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).expect("gateway test root should be writable");
-        root
+        test_root_dir(label)
+    }
+}
+
+/// Allocate one fresh test root under the temp directory, sweeping roots
+/// abandoned by processes that are gone first.
+///
+/// Roots used to be a fresh UUID directory that nothing ever deleted, so a
+/// couple of days of runs left tens of thousands of them behind (about 26k
+/// directories and 245k files) and exhausted the tmpfs inode table.
+/// Unrelated tests then failed with `No space left on device`, which reads
+/// as a product failure rather than a housekeeping one.
+///
+/// A killed or panicked process cannot clean up after itself, so the sweep
+/// runs at the start of the next process instead of trusting each test to
+/// clean up. A root is removed only when its owning process no longer
+/// exists, or - for roots created before the PID was recorded - when it is
+/// old and no live process holds a file in it.
+fn test_root_dir(label: &str) -> PathBuf {
+    sweep_stale_test_roots();
+    let root = std::env::temp_dir().join(format!(
+        "cowd-{label}-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&root).expect("gateway test root should be writable");
+    root
+}
+
+/// Sweep test roots abandoned by processes that are gone. Runs at most once
+/// per process, so every test root allocation pays for at most one sweep.
+fn sweep_stale_test_roots() {
+    static SWEPT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    SWEPT.get_or_init(sweep_stale_test_roots_once);
+}
+
+/// Roots with no recorded owner are reclaimed once they are this old AND no
+/// live process holds a file or working directory in them.
+///
+/// Deliberately short: the alternative is a multi-hour threshold, which for a
+/// developer running the suite all day is the same as never reclaiming. A live
+/// test process that created a root and then went 45 minutes without touching
+/// it is not a realistic case, and the holder scan is the real protection.
+const STALE_TEST_ROOT_AFTER: std::time::Duration = std::time::Duration::from_secs(45 * 60);
+
+/// A test root name this crate created: `cowd-<label>-<uuid>` before the owner
+/// PID was recorded, `cowd-<label>-<pid>-<uuid>` after.
+struct TestRootName {
+    pid: Option<u32>,
+}
+
+/// Recognize a test root, and only a test root.
+///
+/// The trailing v4 UUID is what keeps unrelated `cowd-*` directories - a
+/// developer's own gateway under the same temp directory, for instance - out of
+/// the sweep. The label may itself contain dashes, so the UUID is stripped from
+/// the end rather than splitting the whole name.
+fn parse_test_root_name(name: &str) -> Option<TestRootName> {
+    let rest = name.strip_prefix("cowd-")?;
+    let mut head = rest;
+    for _ in 0..5 {
+        head = head.rsplit_once('-')?.0;
+    }
+    if head.is_empty() {
+        return None;
+    }
+    // A trailing all-digit segment is the recorded owner PID.
+    let pid = match head.rsplit_once('-') {
+        Some((label, pid)) if !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()) => {
+            if label.is_empty() {
+                return None;
+            }
+            pid.parse().ok()
+        }
+        _ => None,
+    };
+    Some(TestRootName { pid })
+}
+
+fn sweep_stale_test_roots_once() {
+    let temp = std::env::temp_dir();
+    let Ok(entries) = std::fs::read_dir(&temp) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+
+    // Roots a live process still holds a file or working directory in are never
+    // removed, so a concurrently running test is safe even when its name carries
+    // no PID. Both open descriptors and the current working directory count:
+    // a harness that chdir'd into a root is using it just as much.
+    let mut held = std::collections::HashSet::new();
+    if let Ok(processes) = std::fs::read_dir("/proc") {
+        for process in processes.flatten() {
+            let Ok(fds) = std::fs::read_dir(process.path().join("fd")) else {
+                continue;
+            };
+            for fd in fds.flatten() {
+                let Ok(target) = std::fs::read_link(fd.path()) else {
+                    continue;
+                };
+                let Ok(rest) = target.strip_prefix(&temp) else {
+                    continue;
+                };
+                if let Some(first) = rest.components().next() {
+                    held.insert(temp.join(first));
+                }
+            }
+            if let Ok(cwd) = std::fs::read_link(process.path().join("cwd")) {
+                if let Ok(rest) = cwd.strip_prefix(&temp) {
+                    if let Some(first) = rest.components().next() {
+                        held.insert(temp.join(first));
+                    }
+                }
+            }
+        }
+    }
+
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(root) = parse_test_root_name(&name) else {
+            continue;
+        };
+        let path = temp.join(&name);
+        // A recorded owner that is gone is unambiguous, so age does not matter.
+        let owner_gone = match root.pid {
+            Some(pid) => !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            None => now
+                .duration_since(
+                    entry
+                        .metadata()
+                        .and_then(|meta| meta.modified())
+                        .unwrap_or(now),
+                )
+                .is_ok_and(|age| age > STALE_TEST_ROOT_AFTER),
+        };
+        if owner_gone && !held.contains(&path) {
+            let _ = std::fs::remove_dir_all(&path);
+        }
     }
 }
 

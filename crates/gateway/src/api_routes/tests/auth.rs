@@ -231,7 +231,10 @@ use super::*;
     }
 
     fn test_profile_manager() -> Arc<ProfileManager> {
-        let dir = std::env::temp_dir().join(format!("cowd-api-profiles-{}", uuid::Uuid::new_v4()));
+        // Routed through the shared root allocator so the abandoned-directory
+        // sweep covers the highest-volume creator in this crate: this one
+        // helper alone left ~16k directories in the temp directory.
+        let dir = unique_test_workspace("api-profiles");
         let manager = Arc::new(ProfileManager::new_with_profiles_dir(dir));
         manager.initialize().unwrap();
         manager
@@ -530,9 +533,9 @@ use super::*;
     }
 
     fn unique_test_workspace(label: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("cowd-{label}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&path).unwrap();
-        path
+        // One allocator for every gateway test root, so the sweep that
+        // reclaims abandoned directories is reached by all of them.
+        super::test_root_dir(label)
     }
 
     fn isolated_test_config_home() -> PathBuf {
