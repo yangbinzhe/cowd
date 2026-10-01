@@ -188,6 +188,8 @@ fn action_purpose(action: &str) -> &'static str {
 pub fn runtime_capability_primer() -> String {
     [
         "## Agent-first collaboration contract",
+        "## Shortest path first",
+        "Decide the whole answer before the first call, then make the calls. Reach the result in the FEWEST provider round-trips: every call you can issue in this response, issue now - do not hold one back to inspect a result you could have read in parallel. Batch independent work into ONE response, or into one `tool_orchestrate` program (batch / map / compute) instead of a chain of single calls. Do not decompose a bounded job into per-step rounds: one round of many calls beats many rounds of one call. Use a single tool only when it is already the whole job. Fewer rounds means fewer tokens, faster closure, and less drift.",
         "You own semantic decisions: Team purpose, roles, Tasks, dependencies, discussion, challenge, replanning, and synthesis.",
         "Use small Agent actions incrementally. Do not emit a complete graph, template proposal, or long JSON plan.",
         "Runtime owns actor identity, authorization, revisions, idempotency, leases, concurrent execution, durable artifacts, recovery, and terminal truth.",

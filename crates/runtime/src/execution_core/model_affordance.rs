@@ -47,9 +47,9 @@ pub fn runtime_execution_guidance_prompt_with_tool_exposure_mode(
     } else if decision.strategy.understanding.requires_external_facts
         || decision.strategy.understanding.requires_tool_evidence
     {
-        "Acceptance requires grounded evidence. Do not claim a file, web, or workspace fact from prose alone: invoke the applicable read-only tool, retain its receipt/evidence ref, then synthesize from that result."
+        "Acceptance requires grounded evidence. Do not claim a file, web, or workspace fact from prose alone: invoke the applicable read-only tool, retain its receipt/evidence ref, then synthesize from that result. Reach the result in the fewest round-trips: batch every call you can issue now, or compose them into one `tool_orchestrate` program, instead of a chain of single calls."
     } else {
-        "Choose the next useful semantic action from the current objective, observations, and callable native schemas. Runtime does not prescribe a business workflow."
+        "Choose the next useful semantic action from the current objective, observations, and callable native schemas. Runtime does not prescribe a business workflow. Reach the result in the fewest round-trips: batch every call you can issue now, or compose them into one `tool_orchestrate` program, instead of a chain of single calls."
     };
     let tool_contract = exposure.map_or_else(
         || {
