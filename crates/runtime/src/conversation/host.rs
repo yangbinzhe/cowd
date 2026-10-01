@@ -2359,8 +2359,37 @@ fn agentic_closure_view(program: &crate::AgenticProgramProjection) -> serde_json
             .unwrap_or("unknown")
     };
 
+    // What is already satisfied. Naming it is as load-bearing as naming what is
+    // missing: it is what tells the model "do not redo this" and, when the list
+    // is complete, that the exit condition has been reached and it may verify
+    // through the one action that closes the Objective.
+    let mut satisfied: Vec<&'static str> = Vec::new();
+    if teams >= required_teams {
+        satisfied.push("team");
+    }
+    if published > 0 {
+        satisfied.push("publish_task");
+    }
+    if claimed >= published && published > 0 {
+        satisfied.push("claim_task");
+    }
+    if reviewed >= published && published > 0 {
+        satisfied.push("independent_review");
+    }
+    if accepted >= published && published > 0 {
+        satisfied.push("accepted_task");
+    }
+    if program.unresolved.is_empty() {
+        satisfied.push("classify_issues");
+    }
+
     serde_json::json!({
         "current": current,
+        // The exit condition is a fact, not a request: when it is true every
+        // framework-owned condition holds and the MODEL decides to close out.
+        // Runtime then verifies the request and rejects it if anything
+        // regressed. The framework never submits on the model's behalf.
+        "exit_ready": remaining.is_empty() && program.completion_request.is_none(),
         "facts": {
             "teams": teams,
             "required_teams": required_teams,
@@ -2370,6 +2399,7 @@ fn agentic_closure_view(program: &crate::AgenticProgramProjection) -> serde_json
             "tasks_accepted": accepted,
             "unresolved": program.unresolved.len(),
         },
+        "satisfied": satisfied,
         "remaining": remaining,
     })
 }
@@ -2624,7 +2654,7 @@ fn compact_agentic_program_checkpoint(
         "next_actions": next_actions,
         "terminal_action": terminal_action.as_ref().map(RootAgenticTerminalAction::checkpoint_detail),
         "closure": agentic_closure_view(program),
-        "instruction": "Use this Runtime projection as current truth. You may continue planning, publish dependent or independent Tasks, and coordinate while members execute. When ready to wait for active workers, call state_inspect with wait_for_workers=true; Runtime waits without provider polling. Do not recreate committed entities. Completion is rejected while any entry remains in `unclassified_issue_refs`: classify EVERY issue_ref there through one message_publish.issue_dispositions (must_resolve, disclose, or resolved) with durable reasons/evidence (a tool://artifact:// receipt OR the issue's own source_ref, its Runtime-created anchor). Keep estimates and assumptions labelled; only the Goal verifier can certify the original objective.",
+        "instruction": "Use this Runtime projection as current truth. You may continue planning, publish dependent or independent Tasks, and coordinate while members execute. When ready to wait for active workers, call state_inspect with wait_for_workers=true; Runtime waits without provider polling. Do not recreate committed entities. Completion is rejected while any entry remains in `unclassified_issue_refs`: classify EVERY issue_ref there through one message_publish.issue_dispositions (must_resolve, disclose, or resolved) with durable reasons/evidence (a tool://artifact:// receipt OR the issue's own source_ref, its Runtime-created anchor). Keep estimates and assumptions labelled; only the Goal verifier can certify the original objective. When `closure.exit_ready` is true every Runtime condition already holds: call `objective_complete_request` yourself to close out the Objective - Runtime verifies it and rejects it if any condition regressed, so you never risk a premature or unverifiable exit. Tasks named in `closure.satisfied` are finished; do not re-review, re-submit or re-commit them. Your job at that point is the exit decision, not more work.",
     })
     .to_string()
 }
