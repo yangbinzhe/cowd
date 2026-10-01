@@ -375,7 +375,11 @@ where
         self.configure_terminal_tool_exposure(exposure_reason);
 
         let mut prompt = PromptAssembly::new(self.system_prompt.clone());
-        prompt.push_runtime_context(crate::prompt::runtime_clock_section());
+        // Same turn-scoped stamp as the main context path: the clock must not be
+        // re-rendered per attempt or this attempt's prefix can never extend past
+        // it.
+        let clock_stamp = crate::prompt::RuntimeClockStamp::now();
+        prompt.push_runtime_context(crate::prompt::runtime_clock_section_at(&clock_stamp));
         prompt.push_runtime_context(system_section);
         let inventory = self.api_client.context_inventory();
         let mut last_error = None;

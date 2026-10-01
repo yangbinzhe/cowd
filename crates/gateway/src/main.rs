@@ -2965,7 +2965,7 @@ registered_agent_actions={}\n\
 {context_retrieval}\n\
 registered_batch_readonly_tools={}\n\
 registered_prepared_readonly_tools={}\n\
-Important: this is a filtered backend catalog, not the current provider function schema set. Runtime injects the authoritative per-request function-call contract separately. Call only functions in that contract; use tool_search to activate eligible deferred candidates. For independent read-only evidence, request multiple active calls together. For collaborative work, use the registered small Agent actions incrementally. When a path repeats, re-plan from retained evidence rather than querying the same capability catalog again.",
+Important: this is a filtered backend catalog, not the current provider function schema set. Runtime injects the authoritative per-request function-call contract separately. Call only functions in that contract; use tool_search to activate eligible deferred candidates. For independent read-only evidence, request multiple active calls together. For collaborative work, use the registered small Agent actions, and batch independent actions into one round rather than one call per round. When a path repeats, re-plan from retained evidence rather than querying the same capability catalog again.",
         tool_definitions.len(),
         if agent_actions.is_empty() {
             "none".to_string()

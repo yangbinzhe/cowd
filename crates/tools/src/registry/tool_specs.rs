@@ -1,6 +1,7 @@
 use serde_json::{json, Value};
 
 use crate::permissions::PermissionMode;
+use crate::RuntimeToolDefinition;
 use harness_contract::tool::ToolEffectResolverSpec;
 
 /// The capability family a tool belongs to.
@@ -1516,12 +1517,33 @@ mod family_taxonomy_tests {
             "skill_deactivate", "list_mcp_resources", "read_mcp_resource", "mcp_auth",
             "enter_plan_mode", "exit_plan_mode", "background_task_status", "background_task_kill",
         ];
-        let catalog = crate::ToolCatalog::builtin();
+        // `ToolCatalog::builtin()` carries no runtime or plugin tools, so asserting
+        // over it only re-tests `mvp_tool_specs()`. Register the same runtime and
+        // MCP-wrapper tools the Gateway registers, so a retired name resurrected
+        // in runtime_tools cannot reach a provider array unnoticed.
+        let runtime_tool = |name: &str| RuntimeToolDefinition {
+            name: name.to_string(),
+            description: Some("Gateway-registered runtime tool.".to_string()),
+            input_schema: json!({"type": "object"}),
+            required_permission: PermissionMode::ReadOnly,
+            effect_resolver: ToolEffectResolverSpec {
+                resolver_id: "builtin.readonly".to_string(),
+                resolver_version: 1,
+            },
+        };
+        let tools = vec![runtime_tool("lark_cli_read")];
+        let catalog = crate::ToolCatalog::builtin()
+            .with_runtime_tools(tools)
+            .expect("registerable runtime tools");
         let names = catalog
             .definitions(None)
             .into_iter()
             .map(|definition| definition.name)
             .collect::<BTreeSet<_>>();
+        assert!(
+            names.len() > mvp_tool_specs().len(),
+            "the live registry must include the runtime tools, otherwise this ratchet is vacuous"
+        );
         for retired in RETIRED {
             assert!(
                 !names.contains(*retired),

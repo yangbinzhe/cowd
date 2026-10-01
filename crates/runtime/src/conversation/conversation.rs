@@ -3898,6 +3898,10 @@ pub struct ConversationRuntime<C, T> {
     /// Latest lease-filtered Fact/Matrix recall report, retained for runtime
     /// audit and projections without turning Gateway into a context assembler.
     last_reality_recall_report: std::sync::Mutex<Option<crate::RealityRecallReport>>,
+    /// Context sources that failed for the current request. Rendered as an
+    /// explicit prompt marker so the model can tell a degradation from absence.
+    degraded_context_sources:
+        std::sync::Mutex<Vec<crate::context_runtime::ContextSourceKind>>,
     /// Optional tool callback for real-time visualization (P0-2).
     tool_callback: Option<Arc<dyn ToolCallback>>,
     /// Optional Gateway-owned Session application port for durable Runtime

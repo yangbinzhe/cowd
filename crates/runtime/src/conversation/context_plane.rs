@@ -1613,12 +1613,48 @@ where
             cache_cohort_segment_count,
         );
         envelope.diagnostics.degraded_sources = degraded_sources;
+        // Sources that failed while this request's items were being gathered
+        // (Fact/Matrix recall degradation, session page-in failure) also deserve
+        // the model-visible marker.
+        for source in self.take_degraded_context_sources() {
+            if !envelope
+                .diagnostics
+                .degraded_sources
+                .contains(&source)
+            {
+                envelope.diagnostics.degraded_sources.push(source);
+            }
+        }
         envelope.diagnostics.cache_hit =
             self.current_context_cache_hit.swap(false, Ordering::AcqRel);
         if let Ok(mut latency) = self.current_context_source_latency_ms.lock() {
             envelope.diagnostics.source_latency_ms = std::mem::take(&mut *latency);
         }
         envelope
+    }
+
+    /// Mark a context source as degraded for this request so
+    /// `provider_prompt_from_envelope` can tell the model it is missing.
+    pub(super) fn degrade_context_source(&self, source: crate::context_runtime::ContextSourceKind) {
+        if let Ok(mut degraded) = self.degraded_context_sources.lock() {
+            if !degraded.contains(&source) {
+                degraded.push(source);
+            }
+        }
+    }
+
+    /// Drain the degraded sources recorded for this request.
+    pub(super) fn take_degraded_context_sources(
+        &self,
+    ) -> Vec<crate::context_runtime::ContextSourceKind> {
+        std::mem::take(
+            &mut *self
+                .degraded_context_sources
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .into_iter()
+        .collect()
     }
 
     pub(super) fn record_context_source_latency(&self, source: &str, elapsed: Duration) {
@@ -2023,6 +2059,9 @@ where
                     detail = ?source.detail,
                     "Runtime Fact/Matrix recall degraded"
                 );
+                // The model must be able to tell a degraded Fact/Matrix backend
+                // from "no facts exist"; record it so the prompt marker fires.
+                self.degrade_context_source(source.source);
             }
         }
         if let Ok(mut last_report) = self.last_reality_recall_report.lock() {
@@ -2067,6 +2106,7 @@ where
                 Ok(None) => return Vec::new(),
                 Err(error) => {
                     tracing::warn!(%error, session_id, "current Session context page-in failed");
+                    self.degrade_context_source(ContextSourceKind::Conversation);
                     return Vec::new();
                 }
             },
@@ -2329,4 +2369,23 @@ mod omitted_marker_tests {
             omitted_source_marker(crate::context_runtime::ContextSourceKind::Knowledge)
         );
     }
+}
+
+#[cfg(test)]
+mod degraded_source_marker_tests {
+    use super::{degraded_source_marker_tests_marker, ContextSourceKind};
+
+    #[test]
+    fn a_degraded_fact_and_matrix_source_are_marked_separately() {
+        assert_ne!(
+            degraded_source_marker_tests_marker(ContextSourceKind::Fact),
+            degraded_source_marker_tests_marker(ContextSourceKind::Matrix)
+        );
+    }
+}
+
+fn degraded_source_marker_tests_marker(
+    source: crate::context_runtime::ContextSourceKind,
+) -> String {
+    omitted_source_marker(source)
 }

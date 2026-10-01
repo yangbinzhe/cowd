@@ -181,6 +181,7 @@ where
             reality_recall: None,
             knowledge_activation: None,
             last_reality_recall_report: std::sync::Mutex::new(None),
+            degraded_context_sources: std::sync::Mutex::new(Vec::new()),
             tool_callback: None,
             session_journal_port: None,
             session_history_reader: None,

@@ -768,9 +768,10 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
             )
             || is_agent_action_tool(tool_name)
         {
-            return self
-                .execute_authorized_output(authorization, tool_name, input)
-                .await;
+            // Pointer-based tools (working_context / evidence_retrieve /
+            // artifact_publish) already hand the model a ref, so the generic
+            // retrieval hint is correct for them.
+            return self.execute_authorized_output(authorization, tool_name, input).await;
         }
         if authorization.tool_id != tool_name || !self.allowed_tools.contains(tool_name) {
             return Err(ToolError::new(
