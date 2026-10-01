@@ -2286,6 +2286,94 @@ impl RootAgenticTerminalAction {
     }
 }
 
+/// Always-on closure view: where the Program stands on the framework-owned
+/// rungs, and exactly what is still outstanding.
+///
+/// Unlike `root_agentic_terminal_action`, which returns `None` while work is
+/// outstanding, this is defined for **every** state — including the stalled one,
+/// which is exactly when the model most needs to know what is left. It carries
+/// no roles, Team assignment, Task contents or workflow template: only durable
+/// facts the Program already records, plus the step names the runtime itself
+/// advertises. The model still decides how to satisfy each remaining rung.
+fn agentic_closure_view(program: &crate::AgenticProgramProjection) -> serde_json::Value {
+    let tasks = program.tasks.values().collect::<Vec<_>>();
+    let published = tasks.len();
+    let claimed = tasks.iter().filter(|task| task.claimant.is_some()).count();
+    let reviewed = tasks.iter().filter(|task| task.reviewed_by.is_some()).count();
+    let accepted = tasks
+        .iter()
+        .filter(|task| task.status == crate::AgenticTaskStatus::Accepted)
+        .count();
+    let teams = program.teams.len();
+    let required_teams = usize::from(program.required_team_count.max(1));
+    let unclassified = program.unresolved.len();
+
+    let mut remaining: Vec<serde_json::Value> = Vec::new();
+    if teams < required_teams {
+        remaining.push(serde_json::json!({
+            "step": "team", "outstanding": required_teams - teams,
+            "hint": "Runtime requires at least this many Teams; names/roles are yours."
+        }));
+    }
+    if published == 0 {
+        remaining.push(serde_json::json!({"step": "publish_task"}));
+    }
+    if claimed < published {
+        remaining.push(serde_json::json!({
+            "step": "claim_task", "outstanding": published - claimed
+        }));
+    }
+    if reviewed < published {
+        remaining.push(serde_json::json!({
+            "step": "independent_review", "outstanding": published - reviewed,
+            "hint": "A different Agent must review each submitted Task."
+        }));
+    }
+    if accepted < published {
+        remaining.push(serde_json::json!({
+            "step": "accepted_task", "outstanding": published - accepted
+        }));
+    }
+    if !program.unresolved.is_empty() {
+        remaining.push(serde_json::json!({
+            "step": "classify_issues", "outstanding": unclassified.max(program.unresolved.len()),
+            "hint": "Completion is rejected while any entry stays unclassified; dispose them through one message_publish.issue_dispositions."
+        }));
+    }
+    if program.completion_request.is_none() {
+        remaining.push(serde_json::json!({
+            "step": "objective_complete_request",
+            "hint": "The Objective cannot close without this action; accepted Tasks alone do not certify it."
+        }));
+    }
+
+    let current = if program.completion_request.is_some() {
+        "completion_requested"
+    } else if remaining.is_empty() {
+        "closure_ready"
+    } else {
+        remaining
+            .first()
+            .and_then(|step| step.get("step"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+    };
+
+    serde_json::json!({
+        "current": current,
+        "facts": {
+            "teams": teams,
+            "required_teams": required_teams,
+            "tasks_published": published,
+            "tasks_claimed": claimed,
+            "tasks_reviewed": reviewed,
+            "tasks_accepted": accepted,
+            "unresolved": program.unresolved.len(),
+        },
+        "remaining": remaining,
+    })
+}
+
 pub(super) fn root_agentic_terminal_action(
     program: &crate::AgenticProgramProjection,
 ) -> Option<RootAgenticTerminalAction> {
@@ -2535,6 +2623,7 @@ fn compact_agentic_program_checkpoint(
         "unresolved_count": program.unresolved.len(),
         "next_actions": next_actions,
         "terminal_action": terminal_action.as_ref().map(RootAgenticTerminalAction::checkpoint_detail),
+        "closure": agentic_closure_view(program),
         "instruction": "Use this Runtime projection as current truth. You may continue planning, publish dependent or independent Tasks, and coordinate while members execute. When ready to wait for active workers, call state_inspect with wait_for_workers=true; Runtime waits without provider polling. Do not recreate committed entities. Completion is rejected while any entry remains in `unclassified_issue_refs`: classify EVERY issue_ref there through one message_publish.issue_dispositions (must_resolve, disclose, or resolved) with durable reasons/evidence (a tool://artifact:// receipt OR the issue's own source_ref, its Runtime-created anchor). Keep estimates and assumptions labelled; only the Goal verifier can certify the original objective.",
     })
     .to_string()
@@ -2593,6 +2682,27 @@ fn agentic_checkpoint_artifact_content(
         ),
         complete: false,
     })
+}
+
+#[test]
+#[cfg(test)]
+fn closure_view_names_the_outstanding_rung_in_a_stalled_program() {
+    let mut program =
+        crate::AgenticProgramProjection::empty("program:test", "objective:test");
+    program.required_team_count = 1;
+    let view = agentic_closure_view(&program);
+    // No Team, no Task, no completion request: every framework-owned rung is
+    // outstanding and `current` names the first one instead of being undefined.
+    assert_eq!(view["current"], serde_json::json!("team"));
+    let steps = view["remaining"]
+        .as_array()
+        .expect("remaining")
+        .iter()
+        .filter_map(|step| step.get("step").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>();
+    assert!(steps.contains(&"publish_task"), "{steps:?}");
+    assert!(steps.contains(&"objective_complete_request"), "{steps:?}");
+    assert_eq!(view["facts"]["required_teams"], serde_json::json!(1));
 }
 
 #[cfg(test)]
