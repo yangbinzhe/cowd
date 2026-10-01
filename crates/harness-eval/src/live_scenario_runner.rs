@@ -1754,6 +1754,48 @@ impl LiveScenarioRunner {
             "timeline": observer.timeline(),
             "timeline_collection_error": timeline_error,
             "projection": projection.unwrap_or(Value::Null),
+            // Where an Agent-first turn actually stopped, derived from the
+            // collected timeline so a stall is diagnosable instead of being a
+            // single uninterpretable error string. `remaining` is the protocol
+            // checklist the framework owns; the model's own judgement is what
+            // advances it, so knowing which rung was never reached is the whole
+            // answer to "where did it stop".
+            "agentic_progress": Self::agentic_progress_from_timeline(&observer.timeline()),
+        })
+    }
+
+    /// Derive the Agent-first protocol rungs reached from a collected timeline.
+    fn agentic_progress_from_timeline(timeline: &Value) -> Value {
+        let serialized = serde_json::to_string(timeline).unwrap_or_default();
+        let count = |needle: &str| serialized.matches(needle).count();
+        let teams = count("\"team_create\"");
+        let published = count("\"task_publish\"");
+        let submitted = count("\"task_submit\"");
+        let reviewed = count("\"task_review\"");
+        let completion_requested = serialized.contains("objective_complete_request");
+        let mut remaining = Vec::new();
+        if teams == 0 {
+            remaining.push("team_create".to_string());
+        }
+        if published == 0 {
+            remaining.push("task_publish".to_string());
+        }
+        if published > submitted {
+            remaining.push("task_submit".to_string());
+        }
+        if submitted > reviewed {
+            remaining.push("independent_task_review".to_string());
+        }
+        if !completion_requested {
+            remaining.push("objective_complete_request".to_string());
+        }
+        json!({
+            "teams_created": teams,
+            "tasks_published": published,
+            "tasks_submitted": submitted,
+            "tasks_reviewed": reviewed,
+            "objective_complete_requested": completion_requested,
+            "remaining": remaining,
         })
     }
 

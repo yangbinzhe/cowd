@@ -5134,8 +5134,12 @@ where
             state.clean_terminal_synthesis_attempted = true;
             state.clean_terminal_synthesis_next = true;
         }
-        state.last_verified_progress =
-            !new_observed_fingerprints.is_empty() || !agentic_progress_refs.is_empty();
+        // "Verified progress" means a durable Program-level change was applied
+        // this batch (an Agent action that is Applied, not duplicate, and did
+        // change refs). Reading a *new file* is not progress: a model that opens
+        // one new path per round would otherwise be exempt from every bound,
+        // which is exactly the unbounded-70-rounds failure this guards against.
+        state.last_verified_progress = !agentic_progress_refs.is_empty();
         let verified_evidence_refs = if state.last_verified_progress {
             new_observed_fingerprints
                 .iter()
