@@ -523,7 +523,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
             let mut receipt = self.tool_discovery_receipt();
             receipt.query = query;
             return serde_json::to_string(&receipt)
-                .map(harness_contract::context::ToolOutputDraft::bounded_inline)
+                .map(|output| delegated_tool_draft(output, None))
                 .map_err(|error| {
                     ToolError::new(format!("serialize agent tool discovery: {error}"))
                 });
@@ -549,7 +549,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
         self.enforce_resource_ceiling(tool_name, &normalized_input)?;
         self.execute_scoped(tool_name, &normalized_input, None, None)
             .await
-            .map(harness_contract::context::ToolOutputDraft::bounded_inline)
+            .map(|output| delegated_tool_draft(output, None))
     }
 
     fn tool_discovery_receipt(&self) -> harness_contract::tool::ToolDiscoveryReceipt {
@@ -652,7 +652,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
             return self
                 .execute_internal_checkpoint(input, authorization.clone())
                 .await
-                .map(harness_contract::context::ToolOutputDraft::bounded_inline);
+                .map(|output| delegated_tool_draft(output, None));
         }
         // Runtime-owned collaborative tools must be delegated back to the
         // Gateway RuntimeExecutionHost. They are not pure ToolHost adapters;
@@ -675,7 +675,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
             return self
                 .execute_delegated_runtime_tool(tool_name, input, authorization.clone())
                 .await
-                .map(harness_contract::context::ToolOutputDraft::bounded_inline);
+                .map(|output| delegated_tool_draft(output, None));
         }
         if !self.allowed_tools.contains(tool_name) {
             return Err(ToolError::new(
@@ -698,7 +698,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
             None,
         )
         .await
-        .map(harness_contract::context::ToolOutputDraft::bounded_inline)
+        .map(|output| delegated_tool_draft(output, None))
     }
 
     fn available_tool_names(&self) -> Vec<String> {
@@ -793,7 +793,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
             Some(provider_invocation_id),
         )
         .await
-        .map(harness_contract::context::ToolOutputDraft::bounded_inline)
+        .map(|output| delegated_tool_draft(output, Some(provider_invocation_id)))
     }
 
     fn has_tool(&self, tool_name: &str) -> bool {
@@ -918,5 +918,81 @@ mod tests {
             "not json"
         )
         .is_err());
+    }
+}
+
+/// Inline budget for a delegated Agent's own tool receipt. A whole source file
+/// in this repository is 5k-10k tokens, so this carries one whole file while a
+/// long output is compacted to a head/tail preview plus the ref needed to page
+/// the rest -- the message history is the dominant part of every provider
+/// request, so a delegated Agent dragging whole bodies into it inflates every
+/// later round.
+const DELEGATED_TOOL_INLINE_TOKEN_BUDGET: u64 = 12_000;
+const DELEGATED_TOOL_PREVIEW_CHARS: usize = 4_000;
+const DELEGATED_TOOL_TAIL_CHARS: usize = 1_000;
+
+/// Build the delegated Agent's tool draft: the whole output when it fits the
+/// inline budget, otherwise a head/tail preview plus an explicit pointer to the
+/// durable receipt. The pointer is derived from the provider invocation id the
+/// caller already holds, so it can never be a fabricated ref.
+fn delegated_tool_draft(
+    output: String,
+    provider_invocation_id: Option<&str>,
+) -> harness_contract::context::ToolOutputDraft {
+    let tokens = crate::context_ledger::estimate_text_tokens(&output);
+    if tokens <= DELEGATED_TOOL_INLINE_TOKEN_BUDGET {
+        return harness_contract::context::ToolOutputDraft::bounded_inline(output);
+    }
+    let total_chars = output.chars().count();
+    let head: String = output.chars().take(DELEGATED_TOOL_PREVIEW_CHARS).collect();
+    let tail: String = output
+        .chars()
+        .skip(total_chars.saturating_sub(DELEGATED_TOOL_TAIL_CHARS))
+        .collect();
+    let hint = match provider_invocation_id {
+        Some(id) if !id.trim().is_empty() => format!(
+            "This result was compacted to protect the provider prompt: {tokens} tokens reduced to a preview. Re-read only what you need through `read_ref` or by re-running the tool with a narrower range, citing tool call `{id}`."
+        ),
+        _ => "This result was compacted to protect the provider prompt. Re-read only what you need through `read_ref` or by re-running the tool with a narrower range.".to_string(),
+    };
+    harness_contract::context::ToolOutputDraft::bounded_inline(format!(
+        "{hint}\n\n[head of the result]\n{head}\n\n[... compacted ...]\n\n[tail of the result]\n{tail}"
+    ))
+}
+
+#[cfg(test)]
+mod delegated_draft_tests {
+    use super::{delegated_tool_draft, DELEGATED_TOOL_INLINE_TOKEN_BUDGET};
+
+    #[test]
+    fn a_whole_file_stays_inline() {
+        let body = "fn main() {}\n".repeat(400);
+        let draft = delegated_tool_draft(body.clone(), Some("call-1"));
+        let rendered = format!("{draft:?}");
+        assert!(
+            rendered.contains("fn main()"),
+            "a normal-sized result must be passed through whole"
+        );
+        assert!(!rendered.contains("compacted to protect the provider prompt"));
+    }
+
+    #[test]
+    fn a_huge_output_is_compacted_with_a_retrieval_hint() {
+        let huge = "x".repeat(400_000);
+        let draft = delegated_tool_draft(huge, Some("call-2"));
+        let rendered = format!("{draft:?}");
+        assert!(rendered.contains("compacted to protect the provider prompt"));
+        assert!(rendered.contains("call-2"));
+        assert!(rendered.contains("read_ref"));
+        let kept = rendered.len();
+        assert!(
+            kept < huge_len_for_assertion(),
+            "a compacted result must be far smaller than the raw output"
+        );
+        assert!(DELEGATED_TOOL_INLINE_TOKEN_BUDGET >= 8_000);
+    }
+
+    fn huge_len_for_assertion() -> usize {
+        400_000
     }
 }
