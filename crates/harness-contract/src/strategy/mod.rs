@@ -3536,20 +3536,31 @@ fn explicit_team_ordinal_count(normalized: &str) -> u8 {
         .unwrap_or_default()
 }
 
-/// Chinese noun stems that turn a preceding English `team`/`teams` into an
-/// attributive compound (`一个 team 说明文件` = "a team documentation file").
-/// Deliberately a small curated set: verbs/adverbs that legitimately follow a
-/// counted Team (`Team 并行核查`, `Team 分别审查`) must never be stripped.
-const TEAM_MODIFIER_NOUNS: &[&str] = &[
-    "说明", "文档", "目录", "模板", "规范", "文件", "名称", "数量", "清单", "编号",
-    "设计", "职责", "边界", "优劣", "报告", "流程", "架构", "概念", "定义", "优点",
-    "缺点", "成员", "角色",
+/// Whether a character is a CJK ideograph.
+fn is_cjk(character: char) -> bool {
+    matches!(
+        u32::from(character),
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF
+    )
+}
+
+/// Verbs/adverbs that can directly follow a counted Team used as the head noun
+/// (`三个 Team 并行核查`, `Team 分别审查`). Ambiguous noun/verb stems (`研究`,
+/// `审查`, `协作`, `报告`, `设计`, `分析`) are deliberately excluded: an English
+/// `team` followed by one of those is attributive (`一个 team 研究报告`,
+/// `一个 team 协作机制说明`) and must not count. This is a heuristic, not a
+/// parser; the safe failure mode is under-counting, never over-forcing.
+const TEAM_FOLLOW_VERBS: &[&str] = &[
+    "并行", "分别", "负责", "执行", "完成", "开展", "进行", "汇总", "综合", "独立", "交叉",
+    "分工", "给出", "取得", "开始", "启动", "复核", "检查", "处理", "生成", "撰写", "输出",
+    "交付", "汇报", "制定", "实现", "提供", "列出", "整理", "推进", "参与", "支撑", "覆盖",
+    "实际", "真正", "实时", "共同", "各自", "自主", "同时", "依次", "分批",
 ];
 
 /// Drop English `team`/`teams` tokens that modify a following Chinese noun, e.g.
-/// `一个 team 说明文件` ("a team documentation file"). Such a token is not a
+/// `一个 team 研究报告` ("a team research report"). Such a token is not a
 /// count-able Team entity and must never bind a topology. Genuine counted Teams
-/// (`三个 Team 并行核查`) are followed by a verb/adverb or ASCII and are kept.
+/// are followed by a verb/adverb (`三个 Team 并行核查`), a boundary, or ASCII.
 fn strip_modifier_english_team(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0;
@@ -3560,7 +3571,9 @@ fn strip_modifier_english_team(text: &str) -> String {
             end += 1;
         }
         let tail = text[end..].trim_start_matches(' ');
-        let is_modifier = TEAM_MODIFIER_NOUNS.iter().any(|noun| tail.starts_with(noun));
+        let followed_by_cjk = tail.chars().next().is_some_and(is_cjk);
+        let is_modifier =
+            followed_by_cjk && !TEAM_FOLLOW_VERBS.iter().any(|verb| tail.starts_with(verb));
         out.push_str(&text[cursor..start]);
         if !is_modifier {
             out.push_str(&text[start..end]);

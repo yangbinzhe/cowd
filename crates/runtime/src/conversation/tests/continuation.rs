@@ -109,7 +109,7 @@ async fn bare_continue_actual_host_inherits_goal_and_program_before_current_prov
         turn_id: "old-turn".into(),
         root_execution_id: Some("old-host-root".into()),
         required_team_count: 1,
-        exact_team_count: None,
+        exact_team_count: Some(1),
         objective_summary: "Deliver the original source-backed report".into(),
         model_lease: "old-model".into(),
         permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),

@@ -1148,13 +1148,14 @@ where
                 "runtime Skill tool references applied to the current provider request"
             );
         }
-        let collaboration_obligation = self
-            .active_turn_strategy()
-            .and_then(|state| state.decision.collaboration_obligation);
+        let active_strategy = self.active_turn_strategy();
+        let collaboration_obligation = active_strategy
+            .as_ref()
+            .and_then(|state| state.decision.collaboration_obligation.clone());
         // Expose the Agent-first actions whenever collaboration is in play, not
         // only when the operator froze a count: the model must always be able
         // to see the capability it may choose, even when no obligation exists.
-        let collaboration_visible = self.active_turn_strategy().is_some_and(|state| {
+        let collaboration_visible = active_strategy.as_ref().is_some_and(|state| {
             collaboration_obligation.is_some()
                 || state.decision.strategy.understanding.requests_multi_agent
                 || state.decision.pattern() == harness_contract::core::ExecutionPattern::Collaborate

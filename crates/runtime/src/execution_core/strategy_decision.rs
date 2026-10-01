@@ -731,11 +731,9 @@ mod tests {
     }
 
     #[test]
-    fn the_implicit_collaboration_scenario_freezes_no_team_minimum() {
-        // Exact live scenario prompt (live_explicit_team_requirement).
-        // A prose-only "three responsibility domains" request no longer binds a
-        // Team topology; the model decides, so the scenario is measured on the
-        // model's own judgment rather than a frozen minimum.
+    fn a_prose_only_responsibility_prompt_freezes_no_team_minimum() {
+        // The old live_implicit_collaboration_obligation prompt names three
+        // responsibility domains but no Team count; it must not bind topology.
         let prompt = "请对三个独立责任域分别取得只读工具证据并交叉核验，最后统一综合结论。\
             责任域一核查策略选择与执行义务，责任域二核查状态持久化与恢复，责任域三核查最终验收与投影。\
             必须列出至少三个本次实际读取的完整 `crates/.../*.rs` 源码路径，只陈述工具证据能够验证的事实；\
@@ -744,6 +742,22 @@ mod tests {
         let decision = build_runtime_execution_decision(prompt, None);
         assert_eq!(decision.strategy.understanding.required_team_count, 0);
         assert!(decision.collaboration_obligation.is_none());
+    }
+
+    #[test]
+    fn the_explicit_team_scenario_freezes_three_teams() {
+        // The live_explicit_team_requirement scenario states the three-Team
+        // requirement as the operator's explicit constraint, so it binds.
+        let prompt = "【操作者要求】本场景要求实际启动 3 个 Team（操作者给定的硬性验收约束）；Team 的用途、角色、Task 划分、依赖与综合仍由你自主决定。请对三个独立责任域分别取得只读工具证据并交叉核验，最后统一综合结论。";
+        let decision = build_runtime_execution_decision(prompt, None);
+        assert_eq!(decision.strategy.understanding.required_team_count, 3);
+        assert_eq!(
+            decision
+                .collaboration_obligation
+                .as_ref()
+                .map(|obligation| obligation.required_team_count()),
+            Some(3)
+        );
     }
 
     #[test]

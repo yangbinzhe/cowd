@@ -1581,6 +1581,14 @@ fn a_numberless_team_request_is_a_capability_hint_not_a_binding_count() {
         "由团队生成的报告请改为中文",
         "把结果分成三组展示",
         "讨论一下团队分工方式",
+        // Attributive English `team` before a noun must never count.
+        "一个 team 研究报告",
+        "给我一个 team 审查报告",
+        "生成一个 team 工作计划",
+        "整理一个 team 协作机制说明",
+        "一个 team 的说明文件",
+        "一个 team 相关的研究报告",
+        "写一个 team 评审报告",
     ] {
         let understanding = understand(&StrategyInput::from_prompt(prompt));
         assert_eq!(understanding.required_team_count, 0, "{prompt}");

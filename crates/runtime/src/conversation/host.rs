@@ -981,10 +981,18 @@ where
             resolved_objective = source.objective_summary.clone();
             graph.objective = resolved_objective.clone();
             let mut turn_state = state.lock().await;
-            if source.required_team_count > 0 {
+            // Only an operator-named Team requirement survives a continuation.
+            // A pre-G1 inferred minimum has `exact_team_count == None` and is
+            // dropped, so an upgrade cannot resurrect a forced topology.
+            let continued_required_team_count = if source.exact_team_count.is_some() {
+                source.required_team_count
+            } else {
+                0
+            };
+            if continued_required_team_count > 0 {
                 turn_state.collaboration_obligation = Some(harness_contract::strategy::CollaborationExecutionObligation {
-                    minimum_team_count: source.required_team_count,
-                    exact_team_count: Some(source.required_team_count),
+                    minimum_team_count: continued_required_team_count,
+                    exact_team_count: Some(continued_required_team_count),
                 });
             }
             let mut item = ContextItem::new(
@@ -1004,8 +1012,8 @@ where
             Some(harness_contract::agent_action::AgentActorBinding {
                 program_id: harness_contract::agent_action::program_id_for_objective(&objective_id), objective_id,
                 session_id: session_id.clone(), turn_id: turn_ref.clone(), root_execution_id: Some(graph.id.clone()),
-                required_team_count: source.required_team_count, objective_summary: source.objective_summary.clone(),
-                exact_team_count: None,
+                required_team_count: continued_required_team_count, objective_summary: source.objective_summary.clone(),
+                exact_team_count: source.exact_team_count.filter(|_| continued_required_team_count > 0),
                 model_lease: runtime.lock().await.current_model().unwrap_or("default").to_string(),
                 permission_ceiling: Some(policy.permission_mode),
                 resource_scopes: root_delegation_resource_scopes(evaluation_control.as_ref(), Some(&policy)),

@@ -41,8 +41,8 @@ pub struct AgenticProgramProjection {
     pub turn_id: String,
     pub root_execution_id: Option<String>,
     pub required_team_count: u8,
-    /// The operator's NAMED Team count, `None` when the runtime only inferred a
-    /// structural minimum. Only a named count is a binding ceiling.
+    /// The operator's NAMED Team count; `None` when the operator named none.
+    /// Only a named count is a binding ceiling.
     pub exact_team_count: Option<u8>,
     pub objective_summary: String,
     pub model_lease: String,

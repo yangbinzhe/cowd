@@ -241,8 +241,8 @@ fn root_agent_action_actor(
         .execution_decision
         .and_then(|decision| decision.collaboration_obligation.as_ref())
         .map_or(0, |obligation| obligation.required_team_count());
-    // The ceiling needs the operator's NAMED count, which is `None` when the
-    // runtime inferred a structural minimum and the model may still choose more.
+    // The ceiling needs the operator's NAMED count; it is `None` when the
+    // operator named none and the model chooses the topology freely.
     let exact_team_count = binding
         .execution_decision
         .and_then(|decision| decision.collaboration_obligation.as_ref())

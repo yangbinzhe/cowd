@@ -488,15 +488,10 @@ pub struct AgentActorBinding {
     /// inherited by delegated actors and never accepted in model tool JSON.
     #[serde(default)]
     pub required_team_count: u8,
-    /// The operator's NAMED Team count, present only when they actually named one.
-    ///
-    /// `required_team_count` is a FLOOR and is non-zero for two different
-    /// situations: the user named a number, and the runtime inferred a structural
-    /// minimum from independent workstreams. Only the first is a topology the
-    /// operator specified, so only the first may become a binding CEILING - the
-    /// inferred case explicitly leaves the model free to choose a larger topology
-    /// (see `strategy_decision`). Carrying the `Option` is what keeps the two
-    /// apart; a bare count cannot.
+    /// The operator's NAMED Team count. Present exactly when the operator named
+    /// one; it is the only source of a binding team contract, so it is also the
+    /// only case that may become a binding CEILING. A prose "use teams" hint
+    /// never raises this, and the model stays free to choose the topology.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exact_team_count: Option<u8>,
     /// Trusted immutable preview of the user Objective. It is persisted when
