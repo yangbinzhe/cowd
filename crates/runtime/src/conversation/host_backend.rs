@@ -1345,12 +1345,42 @@ where
                             } else {
                             state.assistant_messages.pop();
                             state.pending_transcript.remove(&ticket.node_id);
+                            // #GoalState + #ScratchPad: the model's position and
+                            // the three exit channels, injected together with the
+                            // re-drive so a stalled turn never continues blind.
+                            let framing = crate::host::agentic_turn_framing(
+                                self.services.as_ref(),
+                                &state.session_id,
+                                &state.turn_id,
+                                state.iterations,
+                                state.tool_results.len(),
+                                state.started_at.elapsed().as_millis(),
+                            );
+                            let mut goal_state = ContextItem::new(
+                                format!("goal-state:{}", ticket.node_id),
+                                ContextSourceKind::Task,
+                                ContextRole::Instruction,
+                                format!(
+                                    "#GoalState {}",
+                                    serde_json::to_string(&framing)
+                                        .unwrap_or_else(|_| "{}".to_string())
+                                ),
+                            );
+                            goal_state.authority = ContextAuthority::System;
+                            goal_state.visibility = ContextVisibility::Private;
+                            state.pending_next_model_context.push(goal_state);
+                            let mut scratch_pad = ContextItem::new(
+                                format!("scratch-pad:{}", ticket.node_id),
+                                ContextSourceKind::Task,
+                                ContextRole::Instruction,
+                                "#ScratchPad\nBefore you act, record four lines: `Goal:` the objective; `Actions:` the action(s) you will issue now; `Observation:` what the last result actually showed; `Reflection:` closure.current=…, closure.exit_ready=…, unmet=[…] => therefore choose ONE of: (a) advance the next unmet rung, (b) exit_ready -> call objective_complete_request, (c) judged unreachable after repeated attempts -> call objective_complete_request with blocked=true, a blocked_reason, human_review_required=true and recommended_next_actions.\nRuntime does not read this back: the durable Program projection stays the single source of truth for what is satisfied.".to_string(),
+                            );
+                            scratch_pad.authority = ContextAuthority::System;
+                            scratch_pad.visibility = ContextVisibility::Private;
+                            state.pending_next_model_context.push(scratch_pad);
                             // The framework states what is left; the model keeps
                             // deciding how. Name the outstanding rungs explicitly
                             // instead of burying them inside the checkpoint blob.
-                            // Inline derivation of the outstanding rungs (the
-                            // same facts `agentic_closure_view` renders into the
-                            // checkpoint), so the re-drive names them up front.
                             let remaining_steps = agentic_program
                                 .as_ref()
                                 .map(|program| {

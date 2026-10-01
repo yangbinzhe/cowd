@@ -2228,6 +2228,65 @@ fn required_team_execution_count_for_execution_context(
     }
 }
 
+/// Framing context for the current turn: where the Program stands, what is
+/// still outstanding, and what this turn has cost. Rendered into
+/// `#GoalState` on every provider request so the model never has to infer its
+/// own position from an opaque projection.
+///
+/// Pure: derived only from durable Program facts. The framework does NOT parse
+/// the model's own summary, so the Program projection stays the single source of
+/// truth.
+#[must_use]
+pub(super) fn agentic_turn_framing(
+    services: &crate::RuntimeServices,
+    session_id: &str,
+    turn_id: &str,
+    iterations: usize,
+    tool_calls: usize,
+    elapsed_ms: u128,
+) -> serde_json::Value {
+    let budgets = serde_json::json!({
+        "rounds": iterations,
+        "tool_calls": tool_calls,
+        "elapsed_ms": elapsed_ms,
+    });
+    match root_agentic_program_projection(services, session_id, turn_id) {
+        Some(program) => {
+            let mut view = agentic_closure_view(&program);
+            if let Some(object) = view.as_object_mut() {
+                object.insert("budgets".to_string(), budgets);
+            }
+            view
+        }
+        None => serde_json::json!({
+            "closure": {
+                "current": "not_started",
+                "exit_ready": false,
+                "satisfied": [],
+                "remaining": [{"step": "team_create"}],
+            },
+            "budgets": budgets,
+        }),
+    }
+}
+
+/// One-line summary used by the root re-drive and the deferred-protocol
+/// continuation so the model sees the outstanding rungs without parsing a whole
+/// checkpoint blob.
+#[must_use]
+pub(super) fn outstanding_closure_steps(program: &crate::AgenticProgramProjection) -> Vec<String> {
+    agentic_closure_view(program)["remaining"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| {
+                    row.get("step").and_then(serde_json::Value::as_str).map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn root_agentic_program_projection(
     services: &crate::RuntimeServices,
     session_id: &str,
@@ -5396,4 +5455,33 @@ struct TurnSynthesizeBackend<C: ApiClient, T: ToolExecutor> {
     runtime: Arc<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
     state: Arc<tokio::sync::Mutex<TurnGraphState>>,
     services: Arc<crate::RuntimeServices>,
+}
+
+#[cfg(test)]
+mod turn_framing_tests {
+    use super::{agentic_turn_framing, outstanding_closure_steps};
+
+    #[test]
+    fn framing_without_a_program_reports_not_started_and_budgets() {
+        let services = crate::RuntimeServices::in_memory().expect("services");
+        let view = agentic_turn_framing(&services, "no-session", "no-turn", 7, 12, 90_000);
+        assert_eq!(view["closure"]["current"], serde_json::json!("not_started"));
+        assert_eq!(view["closure"]["exit_ready"], serde_json::json!(false));
+        assert_eq!(view["budgets"]["rounds"], serde_json::json!(7));
+        assert_eq!(view["budgets"]["tool_calls"], serde_json::json!(12));
+        assert_eq!(view["budgets"]["elapsed_ms"], serde_json::json!(90_000));
+    }
+
+    #[test]
+    fn outstanding_steps_names_every_open_rung() {
+        let mut program = crate::AgenticProgramProjection::empty("program:test", "objective:test");
+        program.required_team_count = 2;
+        let steps = outstanding_closure_steps(&program);
+        assert!(steps.contains(&"team".to_string()), "{steps:?}");
+        assert!(steps.contains(&"publish_task".to_string()), "{steps:?}");
+        assert!(
+            steps.contains(&"objective_complete_request".to_string()),
+            "{steps:?}"
+        );
+    }
 }
