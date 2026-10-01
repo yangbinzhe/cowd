@@ -3935,7 +3935,7 @@ fn explicit_team_obligation_is_durable_and_recoverable() {
     .without_memory()
     .with_runtime_event_store(Arc::clone(&store));
     runtime
-        .begin_turn_strategy("provider-turn", "必须启动 Team 分别审查三个独立域并综合")
+        .begin_turn_strategy("provider-turn", "必须启动两个 Team 分别审查三个独立域并综合")
         .expect("admit team strategy");
     runtime
         .bind_turn_strategy_execution("provider-turn", "provider-graph")
@@ -3958,7 +3958,7 @@ fn explicit_team_obligation_is_durable_and_recoverable() {
             .collaboration_obligation
             .as_ref()
             .map(|obligation| obligation.minimum_team_count),
-        Some(1)
+        Some(2)
     );
 }
 

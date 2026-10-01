@@ -1873,13 +1873,10 @@ impl StrategyRouter {
                         || !estimate.quality_optimization_ready())
             })
         {
-            reasons.push(if automatic_team_is_structurally_required(&understanding) {
-                "automatic Team is required by independently verifiable responsibility domains; historical calibration may tune capacity but cannot erase the current objective's ownership obligations"
-                    .to_string()
-            } else {
+            reasons.push(
                 "automatic Team requires calibrated or observed topology evidence; Runtime does not turn inferred workstreams into a business topology obligation"
-                    .to_string()
-            });
+                    .to_string(),
+            );
         }
         let selected_candidate = if matches!(source, StrategyDecisionSource::ExperienceAdapted) {
             candidate_for_pattern(pattern).unwrap_or_else(|| {
@@ -2233,21 +2230,6 @@ fn candidate_estimate(
     }
 }
 
-/// An objective can itself require independent, tool-backed ownership: three
-/// or more independently verifiable responsibility domains that all demand
-/// acquired evidence. The predicate is semantic and data-derived -- no Team
-/// name, template, provider family, or price participates -- so historical
-/// calibration may tune capacity but cannot erase the current objective's
-/// ownership obligations. It is a convergence boundary, not a topology: the
-/// model still chooses Team count above the minimum, Agents, roles and Tasks.
-#[must_use]
-pub fn automatic_team_is_structurally_required(understanding: &TaskUnderstanding) -> bool {
-    !understanding.forbids_team
-        && understanding.required_team_count == 0
-        && understanding.independent_workstreams >= 3
-        && understanding.requires_tool_evidence
-}
-
 fn select_execution_candidate(
     understanding: &TaskUnderstanding,
     estimates: &[ExecutionCandidateEstimate],
@@ -2270,19 +2252,6 @@ fn select_execution_candidate(
             .map_or(ExecutionCandidateKind::Direct, |estimate| {
                 estimate.candidate
             });
-    }
-    // A current objective can itself require independent ownership. In that
-    // case calibration may tune capacity, but it cannot erase the need to
-    // materialize the accountable workstreams, so this branch precedes the
-    // calibrated-evidence gate below.
-    if automatic_team_is_structurally_required(understanding) {
-        if let Some(team) = estimates
-            .iter()
-            .find(|estimate| estimate.candidate == ExecutionCandidateKind::Team)
-            .filter(|estimate| estimate.eligible && estimate.expected_quality_lift_bp > 0)
-        {
-            return team.candidate;
-        }
     }
     // Automatic Team selection requires a genuinely multi-domain
     // topology and calibrated evidence. Duration and quality remain separate
@@ -2459,12 +2428,14 @@ pub fn understand(input: &StrategyInput) -> TaskUnderstanding {
     // user-selected single-agent execution mode into its opposite.
     let forbids_team = explicitly_forbids_collaboration(&normalized);
     let affirmative_collaboration = affirmative_collaboration_text(&normalized);
+    // Binding team topology comes only from an operator-named count. A bare
+    // request to "use teams" (no countable noun) is a capability hint the model
+    // may honour, not a framework-inferred obligation, so it never raises
+    // `required_team_count`. `组`/`group` is not a Team and never counts.
     let required_team_count = if forbids_team {
         0
     } else {
-        explicit_team_count(&affirmative_collaboration).max(u8::from(
-            explicit_team_execution_required(&affirmative_collaboration),
-        ))
+        explicit_team_count(&affirmative_collaboration)
     };
     let requests_multi_agent = (contains_any(&affirmative_collaboration, MULTI_AGENT_TERMS)
         || required_team_count > 0)
@@ -3049,25 +3020,8 @@ fn independent_workstreams(normalized: &str) -> u8 {
     .iter()
     .filter(|term| contains_bounded_term(normalized, term))
     .count();
-    let explicit_team_handoff = if contains_any(
-        normalized,
-        &[
-            "另一个团队",
-            "另外一个团队",
-            "第二个团队",
-            "下一团队",
-            "another team",
-            "second team",
-            "next team",
-        ],
-    ) {
-        2
-    } else {
-        0
-    };
     (domains as u8)
         .max(explicit_workstream_count(normalized))
-        .max(explicit_team_handoff)
         .clamp(1, 8)
 }
 
@@ -3421,7 +3375,7 @@ pub fn explicit_team_count(prompt: &str) -> u8 {
     let ordinal_count = explicit_team_ordinal_count(&normalized);
     let mut cardinal_normalized = normalized.clone();
     for (chinese, _, count) in COUNTS {
-        for role in ["团队", "研究团队", "协作团队", "组"] {
+        for role in ["团队", "研究团队", "协作团队"] {
             cardinal_normalized = cardinal_normalized
                 .replace(&format!("第{chinese}个{role}"), "")
                 .replace(&format!("第{chinese}{role}"), "")
@@ -3431,6 +3385,10 @@ pub fn explicit_team_count(prompt: &str) -> u8 {
                 .replace(&format!("第 {count} {role}"), "");
         }
     }
+    // English `team`/`teams` that modifies a following Chinese noun
+    // (`一个 team 说明文件` = "a team documentation file") is not a count-able
+    // Team entity and must never bind a topology.
+    let english_normalized = strip_modifier_english_team(&cardinal_normalized);
     let mut requested = 0_u8;
     for (chinese, english, count) in COUNTS.iter().rev() {
         let arabic = count.to_string();
@@ -3449,18 +3407,18 @@ pub fn explicit_team_count(prompt: &str) -> u8 {
         let english_match = ["team", "teams", "research team", "research teams"]
             .iter()
             .any(|role| {
-                cardinal_normalized.contains(&format!("{english} {role}"))
-                    || cardinal_normalized.contains(&format!("{arabic} {role}"))
-                    || cardinal_normalized.contains(&format!("{chinese}个{role}"))
-                    || cardinal_normalized.contains(&format!("{chinese}个 {role}"))
-                    || cardinal_normalized.contains(&format!("{chinese}名{role}"))
-                    || cardinal_normalized.contains(&format!("{chinese}{role}"))
-                    || cardinal_normalized.contains(&format!("{chinese} {role}"))
-                    || cardinal_normalized.contains(&format!("{arabic}个{role}"))
-                    || cardinal_normalized.contains(&format!("{arabic}个 {role}"))
-                    || cardinal_normalized.contains(&format!("{arabic}名{role}"))
-                    || counted_role_phrase(&cardinal_normalized, english, role, true)
-                    || counted_role_phrase(&cardinal_normalized, &arabic, role, true)
+                english_normalized.contains(&format!("{english} {role}"))
+                    || english_normalized.contains(&format!("{arabic} {role}"))
+                    || english_normalized.contains(&format!("{chinese}个{role}"))
+                    || english_normalized.contains(&format!("{chinese}个 {role}"))
+                    || english_normalized.contains(&format!("{chinese}名{role}"))
+                    || english_normalized.contains(&format!("{chinese}{role}"))
+                    || english_normalized.contains(&format!("{chinese} {role}"))
+                    || english_normalized.contains(&format!("{arabic}个{role}"))
+                    || english_normalized.contains(&format!("{arabic}个 {role}"))
+                    || english_normalized.contains(&format!("{arabic}名{role}"))
+                    || counted_role_phrase(&english_normalized, english, role, true)
+                    || counted_role_phrase(&english_normalized, &arabic, role, true)
             });
         // Natural-language Chinese often qualifies an English `Team` between
         // its cardinality and the noun (for example, `三个协作 Team`). That is
@@ -3482,51 +3440,15 @@ pub fn explicit_team_count(prompt: &str) -> u8 {
                             format!("{arabic} {qualifier} {role}"),
                         ]
                         .iter()
-                        .any(|pattern| cardinal_normalized.contains(pattern))
+                        .any(|pattern| english_normalized.contains(pattern))
                     })
                 })
-                || qualified_chinese_team_phrase(&cardinal_normalized, chinese)
-                || qualified_chinese_team_phrase(&cardinal_normalized, &arabic);
+                || qualified_chinese_team_phrase(&english_normalized, chinese)
+                || qualified_chinese_team_phrase(&english_normalized, &arabic);
         if chinese_match || english_match || qualified_english_team_match {
             requested = requested.max(*count);
             break;
         }
-    }
-    for (chinese, english, count) in COUNTS.iter().rev() {
-        let arabic = count.to_string();
-        if [
-            format!("共{chinese}组"),
-            format!("总共{chinese}组"),
-            format!("{chinese}组"),
-            format!("共{arabic}组"),
-            format!("总共{arabic}组"),
-            format!("{arabic}组"),
-            format!("共 {arabic} 组"),
-            format!("总共 {arabic} 组"),
-            format!("{arabic} 组"),
-            format!("{english} groups"),
-            format!("{arabic} groups"),
-            format!("total {english} groups"),
-            format!("total {arabic} groups"),
-        ]
-        .iter()
-        .any(|pattern| cardinal_normalized.contains(pattern))
-        {
-            requested = requested.max(*count);
-            break;
-        }
-    }
-    if [
-        "另一个团队",
-        "另外一个团队",
-        "下一团队",
-        "another team",
-        "next team",
-    ]
-    .iter()
-    .any(|term| normalized.contains(term))
-    {
-        requested = requested.max(2);
     }
     if requested == 0 {
         requested = ordinal_count;
@@ -3584,52 +3506,6 @@ pub fn explicit_team_fan_in_required(prompt: &str) -> bool {
         .any(|term| normalized.contains(term))
 }
 
-/// Whether the user requires a real Team execution even when no explicit
-/// cardinality was given. The result is consumed only while constructing
-/// `TaskUnderstanding`; downstream Runtime code uses `required_team_count`.
-#[must_use]
-pub fn explicit_team_execution_required(prompt: &str) -> bool {
-    let normalized = affirmative_collaboration_text(&prompt.to_ascii_lowercase());
-    // An execution verb and its collaboration object must occur in the same
-    // clause. Joining unrelated clauses can turn "discuss Teams, do not start
-    // execution" or "create a file; explain Teams" into a hard obligation.
-    normalized
-        .split(['，', ',', '。', '.', '；', ';', '！', '!', '？', '?', '\n'])
-        .any(|clause| {
-            let mentions_team = [
-                "团队",
-                "协作",
-                "多agent",
-                "多 agent",
-                "多智能体",
-                "组队",
-                "team",
-                "multi-agent",
-                "multi agent",
-            ]
-            .iter()
-            .any(|marker| clause.contains(marker));
-            let requires_execution = [
-                "实际启动",
-                "启动",
-                "创建",
-                "组建",
-                "发起",
-                "拉起",
-                "用一个团队",
-                "使用一个团队",
-                "交给团队",
-                "由团队",
-                "launch",
-                "start",
-                "create",
-            ]
-            .iter()
-            .any(|marker| clause.contains(marker));
-            mentions_team && requires_execution && !explicitly_forbids_collaboration(clause)
-        })
-}
-
 fn explicit_team_ordinal_count(normalized: &str) -> u8 {
     const ORDINALS: &[(&str, &str, u8)] = &[
         ("第一", "first", 1),
@@ -3645,19 +3521,54 @@ fn explicit_team_ordinal_count(normalized: &str) -> u8 {
         .iter()
         .rev()
         .find_map(|(chinese, english, count)| {
-            (["团队", "研究团队", "协作团队", "组"].iter().any(|role| {
+            (["团队", "研究团队", "协作团队"].iter().any(|role| {
                 normalized.contains(&format!("{chinese}个{role}"))
                     || normalized.contains(&format!("{chinese}{role}"))
                     || normalized.contains(&format!("第{count}个{role}"))
                     || normalized.contains(&format!("第{count}{role}"))
                     || normalized.contains(&format!("第 {count} 个 {role}"))
                     || normalized.contains(&format!("第 {count} {role}"))
-            }) || ["team", "research team", "group"]
+            }) || ["team", "research team"]
                 .iter()
                 .any(|role| normalized.contains(&format!("{english} {role}"))))
             .then_some(*count)
         })
         .unwrap_or_default()
+}
+
+/// Chinese noun stems that turn a preceding English `team`/`teams` into an
+/// attributive compound (`一个 team 说明文件` = "a team documentation file").
+/// Deliberately a small curated set: verbs/adverbs that legitimately follow a
+/// counted Team (`Team 并行核查`, `Team 分别审查`) must never be stripped.
+const TEAM_MODIFIER_NOUNS: &[&str] = &[
+    "说明", "文档", "目录", "模板", "规范", "文件", "名称", "数量", "清单", "编号",
+    "设计", "职责", "边界", "优劣", "报告", "流程", "架构", "概念", "定义", "优点",
+    "缺点", "成员", "角色",
+];
+
+/// Drop English `team`/`teams` tokens that modify a following Chinese noun, e.g.
+/// `一个 team 说明文件` ("a team documentation file"). Such a token is not a
+/// count-able Team entity and must never bind a topology. Genuine counted Teams
+/// (`三个 Team 并行核查`) are followed by a verb/adverb or ASCII and are kept.
+fn strip_modifier_english_team(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while let Some(relative) = text[cursor..].find("team") {
+        let start = cursor + relative;
+        let mut end = start + 4;
+        if text[end..].starts_with('s') {
+            end += 1;
+        }
+        let tail = text[end..].trim_start_matches(' ');
+        let is_modifier = TEAM_MODIFIER_NOUNS.iter().any(|noun| tail.starts_with(noun));
+        out.push_str(&text[cursor..start]);
+        if !is_modifier {
+            out.push_str(&text[start..end]);
+        }
+        cursor = end;
+    }
+    out.push_str(&text[cursor..]);
+    out
 }
 
 fn breaks_counted_role_phrase(character: char) -> bool {

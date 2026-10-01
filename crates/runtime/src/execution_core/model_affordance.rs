@@ -18,14 +18,13 @@ pub fn runtime_execution_guidance_prompt_with_tool_exposure(
     runtime_execution_guidance_prompt_with_tool_exposure_mode(decision, exposure, false)
 }
 
-/// Render the collaboration constraint so the model can tell an advisory
-/// obligation from a hard terminal requirement. Without this, a model that
-/// reads "generic complexity never requires a preset topology" cannot know
-/// that terminal verification rejects fewer than the required Team count.
+/// Render the collaboration constraint so the model can tell an operator-named
+/// Team minimum from ordinary model agency. An obligation exists only when the
+/// operator named a Team count; without it the model owns the topology.
 fn collaboration_constraint(decision: &RuntimeExecutionDecision) -> String {
     match decision.collaboration_obligation.as_ref() {
         Some(obligation) if obligation.minimum_team_count > 0 => format!(
-            "HARD minimum_teams={0}: terminal verification rejects completion until at least {0} distinct Teams have accepted independently reviewed Tasks; form them explicitly, because a single-agent effort or prose role split cannot satisfy it.",
+            "OPERATOR minimum_teams={0}: the operator named this Team count; terminal verification rejects completion until at least {0} distinct Teams have accepted independently reviewed Tasks. Form them explicitly, because a single-agent effort or prose role split cannot satisfy it.",
             obligation.minimum_team_count
         ),
         _ => "none".to_string(),
@@ -44,7 +43,7 @@ pub fn runtime_execution_guidance_prompt_with_tool_exposure_mode(
     compact: bool,
 ) -> String {
     let contract_instruction = if decision.collaboration_obligation.is_some() {
-        "This objective requires real collaboration. Create Teams, invite Agents, and publish bounded Tasks through the small Agent actions. Continue from durable receipts until every Task is independently reviewed; a prose role split does not satisfy this requirement."
+        "The operator requested a specific Team count. Create Teams, invite Agents, and publish bounded Tasks through the small Agent actions. Continue from durable receipts until every Task is independently reviewed; a prose role split does not satisfy this requirement."
     } else if decision.strategy.understanding.requires_external_facts
         || decision.strategy.understanding.requires_tool_evidence
     {
@@ -106,7 +105,7 @@ pub fn runtime_execution_guidance_prompt_with_tool_exposure_mode(
         );
     }
     format!(
-        "## Runtime environment contract\nevidence_mode={:?}; complexity={:?}; risk={:?}; execution_mode={:?}\nCollaboration execution constraint: {}\nContract instruction: {}\n{}\nThe model owns Team purpose, roles, Tasks, dependencies, discussion, review choices, replanning, and synthesis. Runtime binds identities, permissions, revisions, leases, execution, durable receipts, and terminal verification. Use any active small Agent action when collaboration adds value; generic complexity alone never requires a preset topology, but when a HARD minimum_teams is stated above it is enforced by terminal verification. Keep long content in normal output or files and pass compact durable references through actions. Inspect current Program state after rejection or recovery instead of repeating an unchanged action.",
+        "## Runtime environment contract\nevidence_mode={:?}; complexity={:?}; risk={:?}; execution_mode={:?}\nCollaboration execution constraint: {}\nContract instruction: {}\n{}\nThe model owns Team purpose, roles, Tasks, dependencies, discussion, review choices, replanning, and synthesis. Runtime binds identities, permissions, revisions, leases, execution, durable receipts, and terminal verification. Use any active small Agent action when collaboration adds value; generic complexity alone never requires a preset topology, but an operator-named minimum_teams is enforced by terminal verification. Keep long content in normal output or files and pass compact durable references through actions. Inspect current Program state after rejection or recovery instead of repeating an unchanged action.",
         decision.evidence_mode,
         decision.complexity(),
         decision.risk(),
@@ -142,11 +141,12 @@ mod tests {
     #[test]
     fn collaboration_guidance_requires_a_graph_backed_team() {
         let decision =
-            build_runtime_execution_decision("必须实际启动协作团队，完成复杂架构审查。", None);
+            build_runtime_execution_decision("必须实际启动一个协作团队，完成复杂架构审查。", None);
 
         let prompt = runtime_execution_guidance_prompt(&decision);
 
-        assert!(prompt.contains("Create Teams, invite Agents"));
+        assert!(decision.collaboration_obligation.is_some());
+        assert!(prompt.contains("The operator requested a specific Team count"));
         assert!(prompt.contains("independently reviewed"));
     }
 
@@ -160,24 +160,32 @@ mod tests {
 
         assert!(decision.collaboration_obligation.is_none());
         assert!(prompt.contains("generic complexity alone never requires a preset topology"));
-        assert!(!prompt.contains("HARD minimum_teams="));
+        assert!(!prompt.contains("minimum_teams="));
         for legacy in ["recommended_pattern=", "template_id"] {
             assert!(!prompt.contains(legacy), "legacy planner token: {legacy}");
         }
     }
 
     #[test]
-    fn structural_ownership_surfaces_the_collaboration_minimum_to_the_model() {
+    fn an_operator_team_minimum_is_surfaced_to_the_model() {
+        // Only an operator-named Team count freezes an obligation; the prompt
+        // must attribute it to the operator, not to a runtime inference.
         let decision = build_runtime_execution_decision(
-            "全面审查 runtime gateway frontend 三个独立责任域，分别取得工具证据并综合",
+            "启动三个 Team 分别审查 runtime、gateway、frontend 责任域，取得工具证据并综合",
             None,
         );
         let prompt = runtime_execution_guidance_prompt(&decision);
 
-        assert!(decision.collaboration_obligation.is_some());
-        assert!(prompt.contains("HARD minimum_teams=3"));
+        assert_eq!(
+            decision
+                .collaboration_obligation
+                .as_ref()
+                .map(|obligation| obligation.minimum_team_count),
+            Some(3)
+        );
+        assert!(prompt.contains("OPERATOR minimum_teams=3"));
         assert!(prompt.contains("terminal verification rejects completion"));
-        assert!(prompt.contains("requires real collaboration"));
+        assert!(prompt.contains("The operator requested a specific Team count"));
     }
 
     #[test]

@@ -114,54 +114,6 @@ pub fn complexity_reasons(
     reasons
 }
 
-/// Advisory team-formation plan derived from complexity, the observed
-/// independent workstreams and the available Team-slot ceiling. Advisory only:
-/// the model owns Team purpose, roles and the Task graph. This exists so the
-/// framework can bound over-fragmentation, encode when delegation is worth it,
-/// and expose an auditable recommendation instead of leaving team count to a
-/// single trigger.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TeamFormationPlan {
-    pub recommended_teams: u8,
-    pub max_teams: u8,
-    pub role_differentiation: bool,
-}
-
-#[must_use]
-pub fn team_formation_plan(
-    complexity: TaskComplexity,
-    independent_workstreams: u8,
-    team_slot_ceiling: u8,
-) -> TeamFormationPlan {
-    let ceiling = team_slot_ceiling.clamp(2, 8);
-    let (floor, cap) = match complexity {
-        // Simple work never needs a Team; a single agent (or light delegation)
-        // is cheaper and faster.
-        TaskComplexity::Trivial | TaskComplexity::Simple => (0, 0),
-        // Moderate work may delegate but should not fan out into a Team of
-        // Teams.
-        TaskComplexity::Moderate => (0, ceiling.min(3)),
-        // Complex work benefits from at least two independent Teams but stays
-        // capped so it does not over-fragment.
-        TaskComplexity::Complex => (2, ceiling.min(6)),
-        // Strategic work may use the full available ceiling.
-        TaskComplexity::Strategic => (2, ceiling),
-    };
-    if cap == 0 {
-        return TeamFormationPlan {
-            recommended_teams: 0,
-            max_teams: 0,
-            role_differentiation: false,
-        };
-    }
-    let recommended = independent_workstreams.clamp(floor, cap);
-    TeamFormationPlan {
-        recommended_teams: recommended,
-        max_teams: cap,
-        role_differentiation: recommended >= 2,
-    }
-}
-
 /// Advise whether a struggling collaboration turn should stop chasing its Team
 /// minimum and degrade toward a lighter topology. Consumes the behavioral
 /// guardrail signals (identical-call streak, low-novelty streak, failure
@@ -665,47 +617,21 @@ fn build_runtime_execution_decision_inner(
             why: "complex evidence can be acquired through an evidence graph".to_string(),
         });
     }
+    // A binding collaboration obligation exists ONLY when the operator named a
+    // Team count. The framework never infers a topology obligation from prose:
+    // the model alone decides whether to use Teams, so no obligation is frozen
+    // from `independent_workstreams` or any other textual signal.
     let collaboration_obligation = if explicit_collaboration_requested {
         CollaborationExecutionObligation::for_explicit_request(&strategy.understanding)
             .map_err(|error| blocked_reasons.push(error))
             .ok()
-    } else if !delegated_leaf
-        && resource_health.collaboration_available
-        && strategy.pattern == ExecutionPattern::Collaborate
-        && strategy.selected_candidate == ExecutionCandidateKind::Team
-        && harness_contract::strategy::automatic_team_is_structurally_required(
-            &strategy.understanding,
-        )
-    {
-        // The objective itself requires independent, tool-backed ownership.
-        // Freeze only a minimum bounded by the observed Team-slot ceiling; the
-        // model still chooses Teams, Agents, roles, Tasks and any Team count
-        // above the minimum.
-        let team_slot_ceiling = strategy.resource_snapshot.team_slots.clamp(2, 8) as u8;
-        Some(CollaborationExecutionObligation {
-            minimum_team_count: strategy
-                .understanding
-                .independent_workstreams
-                .min(team_slot_ceiling)
-                .clamp(2, 8),
-            exact_team_count: None,
-        })
     } else {
         None
     };
 
     let catalog = ExecutionPatternCatalog::current();
     let recommended_spec = catalog.find(recommended_pattern);
-    let team_plan = team_formation_plan(
-        strategy.understanding.complexity,
-        strategy.understanding.independent_workstreams,
-        u8::try_from(strategy.resource_snapshot.team_slots.clamp(2, 8)).unwrap_or(8),
-    );
-    let mut complexity_reasons = complexity_reasons(&strategy.understanding);
-    complexity_reasons.push(format!(
-        "team-formation: recommended_teams={} max_teams={} role_differentiation={}",
-        team_plan.recommended_teams, team_plan.max_teams, team_plan.role_differentiation
-    ));
+    let complexity_reasons = complexity_reasons(&strategy.understanding);
     RuntimeExecutionDecision {
         decision_id: format!("execution-decision-{}", Uuid::new_v4()),
         decision_revision: 1,
@@ -790,28 +716,23 @@ mod tests {
     }
 
     #[test]
-    fn independent_tool_backed_responsibility_domains_freeze_an_automatic_team_obligation() {
+    fn independent_tool_backed_responsibility_domains_freeze_no_team_obligation() {
+        // Prose responsibility domains no longer freeze a Team obligation: with
+        // no operator-named count, the model decides whether to use Teams.
         let decision = build_runtime_execution_decision(
             "全面审查 runtime gateway frontend 三个独立责任域，分别给出工具证据后综合",
             None,
         );
-        assert_eq!(decision.pattern(), ExecutionPattern::Collaborate);
-        assert_eq!(
-            decision
-                .collaboration_obligation
-                .as_ref()
-                .map(|obligation| obligation.required_team_count()),
-            Some(3)
-        );
+        assert!(decision.collaboration_obligation.is_none());
+        assert_eq!(decision.strategy.understanding.required_team_count, 0);
     }
 
     #[test]
-    fn the_implicit_collaboration_scenario_freezes_a_minimum_of_three_teams() {
+    fn the_implicit_collaboration_scenario_freezes_no_team_minimum() {
         // Exact live-scenario prompt (live_implicit_collaboration_obligation).
-        // Runtime receives only this text (the COWD_EVAL_CONTROL line is parsed
-        // separately), so this pins the end-to-end decision: no Team name and no
-        // explicit count, yet three independently verifiable, tool-backed
-        // responsibility domains must become an automatic Team obligation.
+        // A prose-only "three responsibility domains" request no longer binds a
+        // Team topology; the model decides, so the scenario is measured on the
+        // model's own judgment rather than a frozen minimum.
         let prompt = "请对三个独立责任域分别取得只读工具证据并交叉核验，最后统一综合结论。\
             责任域一核查策略选择与执行义务，责任域二核查状态持久化与恢复，责任域三核查最终验收与投影。\
             必须列出至少三个本次实际读取的完整 `crates/.../*.rs` 源码路径，只陈述工具证据能够验证的事实；\
@@ -819,15 +740,7 @@ mod tests {
             只能使用 read_file、glob_search、grep_search、workspace_snapshot 这些只读工具（批量读用 tool_orchestrate 的 batch/map 步），不要调用 bash 或任何写工具。";
         let decision = build_runtime_execution_decision(prompt, None);
         assert_eq!(decision.strategy.understanding.required_team_count, 0);
-        assert_eq!(decision.strategy.understanding.independent_workstreams, 3);
-        assert_eq!(decision.pattern(), ExecutionPattern::Collaborate);
-        assert_eq!(
-            decision
-                .collaboration_obligation
-                .as_ref()
-                .map(|obligation| obligation.required_team_count()),
-            Some(3)
-        );
+        assert!(decision.collaboration_obligation.is_none());
     }
 
     #[test]
@@ -1074,10 +987,6 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason.starts_with("complexity resolved:")));
-        assert!(team
-            .reasons
-            .iter()
-            .any(|reason| reason.starts_with("team-formation:")));
     }
 
     #[test]
@@ -1091,35 +1000,6 @@ mod tests {
         assert!(reasons
             .iter()
             .any(|r| r.starts_with("complexity resolved:")));
-    }
-
-    #[test]
-    fn team_formation_plan_encodes_when_delegation_is_worth_it() {
-        // Simple work never recommends a Team.
-        let simple = team_formation_plan(TaskComplexity::Simple, 5, 8);
-        assert_eq!(simple.recommended_teams, 0);
-        assert_eq!(simple.max_teams, 0);
-        assert!(!simple.role_differentiation);
-
-        // Moderate work can delegate but is capped: never a Team of Teams.
-        let moderate = team_formation_plan(TaskComplexity::Moderate, 6, 8);
-        assert_eq!(moderate.recommended_teams, 3);
-        assert_eq!(moderate.max_teams, 3);
-
-        // Complex work floors at two Teams and differentiates roles.
-        let complex = team_formation_plan(TaskComplexity::Complex, 1, 8);
-        assert_eq!(complex.recommended_teams, 2);
-        assert!(complex.role_differentiation);
-
-        // Strategic work tracks observed workstreams up to the ceiling.
-        let strategic = team_formation_plan(TaskComplexity::Strategic, 4, 8);
-        assert_eq!(strategic.recommended_teams, 4);
-        assert_eq!(strategic.max_teams, 8);
-
-        // The Team-slot ceiling is honoured and clamped to a sane range.
-        let capped = team_formation_plan(TaskComplexity::Strategic, 12, 5);
-        assert_eq!(capped.recommended_teams, 5);
-        assert_eq!(capped.max_teams, 5);
     }
 
     #[test]

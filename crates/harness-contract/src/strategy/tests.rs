@@ -110,7 +110,8 @@ fn explicit_team_cardinality_is_distinct_from_agent_cardinality() {
     assert!(!explicit_team_fan_in_required("启动三个协作 Team 并行核查"));
     assert_eq!(
         explicit_team_count("一个团队负责研究，另一个团队负责复核"),
-        2
+        1,
+        "only the explicit numeral binds; `另一个团队` is not an operator count"
     );
     assert_eq!(explicit_team_count("启动三个 Agent 组成一个团队"), 1);
     assert_eq!(explicit_team_count("启动三个 Agent 并行分析"), 0);
@@ -118,11 +119,16 @@ fn explicit_team_cardinality_is_distinct_from_agent_cardinality() {
         explicit_team_count("第一个团队研究，第二个团队复核，第三个团队汇总"),
         3
     );
-    assert_eq!(explicit_team_count("第一组研究，第二组复核，第三组汇总"), 3);
-    assert_eq!(explicit_team_count("共 4 组并行检查"), 4);
+    assert_eq!(
+        explicit_team_count("第一组研究，第二组复核，第三组汇总"),
+        0,
+        "`组`/`group` is not a Team and must never bind topology"
+    );
+    assert_eq!(explicit_team_count("共 4 组并行检查"), 0);
     assert_eq!(
         understand(&StrategyInput::from_prompt("必须实际启动协作团队")).required_team_count,
-        1
+        0,
+        "a numberless request to use Teams is a capability hint, not a binding count"
     );
     assert_eq!(
         understand(&StrategyInput::from_prompt(
@@ -431,7 +437,7 @@ fn recognizes_persisted_html_artifacts_and_sequential_teams() {
 
     assert!(decision.understanding.requires_write);
     assert!(decision.understanding.requests_multi_agent);
-    assert_eq!(decision.understanding.independent_workstreams, 2);
+    assert_eq!(decision.understanding.independent_workstreams, 1);
 }
 
 #[test]
@@ -1412,22 +1418,15 @@ fn negative_benefit_is_exact_profile_scoped_expiring_and_veto_only() {
 }
 
 #[test]
-fn independent_evidence_freezes_a_structural_team_boundary() {
-    // Three independently verifiable, tool-backed responsibility domains are a
-    // structural ownership requirement: Runtime selects the Team candidate and
-    // freezes a minimum, while the model still chooses the topology.
+fn independent_evidence_no_longer_freezes_a_structural_team_boundary() {
+    // Three prose responsibility domains with tool evidence no longer select the
+    // Team candidate by structure: with no operator count nothing binds, and
+    // the model alone decides whether to use Teams.
     let decision = decide_strategy(&StrategyInput::from_prompt(
         "全面审查 runtime gateway frontend 三个独立责任域，分别给出工具证据后综合",
     ));
-    assert_eq!(decision.selected_candidate, ExecutionCandidateKind::Team);
-    assert_eq!(decision.pattern, ExecutionPattern::Collaborate);
-    let team = decision
-        .candidate_estimates
-        .iter()
-        .find(|estimate| estimate.candidate == ExecutionCandidateKind::Team)
-        .unwrap();
-    assert_eq!(team.duration_provenance, MeasureProvenance::Assumed);
-    assert_eq!(team.quality_provenance, MeasureProvenance::Assumed);
+    assert_ne!(decision.selected_candidate, ExecutionCandidateKind::Team);
+    assert_eq!(decision.understanding.required_team_count, 0);
 }
 
 #[test]
@@ -1561,41 +1560,57 @@ fn inferred_workstreams_cannot_create_a_collaboration_obligation() {
 #[test]
 fn singular_explicit_team_freezes_one_exact_team() {
     let understanding = understand(&StrategyInput::from_prompt(
-        "请启动协作团队审查架构并给出工具证据",
+        "请启动一个协作团队审查架构并给出工具证据",
     ));
     assert_eq!(understanding.required_team_count, 1);
     assert!(understanding.requests_multi_agent);
     let obligation = CollaborationExecutionObligation::for_explicit_request(&understanding)
-        .expect("uncounted explicit Team obligation");
+        .expect("explicit Team obligation");
     assert_eq!(obligation.minimum_team_count, 1);
     assert_eq!(obligation.exact_team_count, Some(1));
 }
 
 #[test]
-fn inferred_responsibility_units_require_a_team_without_prescribing_topology() {
+fn a_numberless_team_request_is_a_capability_hint_not_a_binding_count() {
+    // The user asked to use Teams but named no countable Team. That is a
+    // capability the model may honour; the framework must not freeze a
+    // topology obligation from it (`创建一个 team 说明文件` must not bind).
+    for prompt in [
+        "请启动协作团队审查架构并给出工具证据",
+        "创建一个 team 说明文件",
+        "由团队生成的报告请改为中文",
+    ] {
+        let understanding = understand(&StrategyInput::from_prompt(prompt));
+        assert_eq!(understanding.required_team_count, 0, "{prompt}");
+        assert!(
+            CollaborationExecutionObligation::for_explicit_request(&understanding).is_err(),
+            "{prompt}"
+        );
+    }
+}
+
+#[test]
+fn inferred_responsibility_units_do_not_bind_a_team_obligation() {
+    // Three prose "responsibility domains" with tool evidence used to force a
+    // structural Team. They are now advisory only: no binding obligation.
     let input = StrategyInput::from_prompt(
         "请对三个独立责任域分别取得工具证据并交叉核验，最后统一综合结论",
     );
     let decision = decide_strategy(&input);
     assert_eq!(decision.understanding.required_team_count, 0);
-    assert_eq!(decision.understanding.independent_workstreams, 3);
     assert!(decision.understanding.requires_tool_evidence);
-    assert_eq!(decision.selected_candidate, ExecutionCandidateKind::Team);
+    assert!(!decision.understanding.requests_multi_agent);
 }
 
 #[test]
-fn topology_non_prescription_freezes_a_minimum_without_a_singular_cardinality() {
+fn topology_non_prescription_never_binds_a_prose_minimum() {
     let prompt = "请对三个独立责任域分别取得只读工具证据并交叉核验，最后统一综合结论。责任域一核查策略选择与执行义务，责任域二核查状态持久化与恢复，责任域三核查最终验收与投影。必须列出至少三个本次实际读取的完整 crates/.../*.rs 源码路径；不要自行指定 Team、Agent、角色、模板或编排拓扑。";
     let decision = decide_strategy(&StrategyInput::from_prompt(prompt));
 
     assert_eq!(decision.understanding.required_team_count, 0);
-    assert_eq!(decision.understanding.independent_workstreams, 3);
     assert!(!decision.understanding.requests_multi_agent);
-    // No user-visible Team name or count is prescribed, yet the structural
-    // ownership boundary still selects the Team candidate and freezes a minimum.
-    assert_eq!(decision.selected_candidate, ExecutionCandidateKind::Team);
+    // No user-visible Team count is prescribed, so no topology is frozen.
     assert_eq!(explicit_team_count(prompt), 0);
-    assert!(!explicit_team_execution_required(prompt));
 }
 
 #[test]
@@ -1622,6 +1637,7 @@ fn collaboration_obligation_rejects_zero_or_forbidden_team() {
 
 #[test]
 fn execution_verbs_cannot_borrow_team_objects_from_another_clause() {
+    // None of these names a countable Team, so none may bind a topology.
     for prompt in [
         "审计当前 Team 设计是否合理，但不要启动任何执行",
         "请用一句话说明当前工作目录的名称；这是连通性检查，不需要创建团队。",
@@ -1631,29 +1647,28 @@ fn execution_verbs_cannot_borrow_team_objects_from_another_clause() {
         "创建一个说明文件. Explain Teams",
         "Explain team organization; create a documentation file",
         "Discuss team design, do not start execution",
+        "Start a team for review; do not create files",
+        "先分析风险；创建团队开展复核",
     ] {
-        assert!(!explicit_team_execution_required(prompt), "{prompt}");
         assert_eq!(
             understand(&StrategyInput::from_prompt(prompt)).required_team_count,
             0,
             "{prompt}"
         );
     }
-    for prompt in [
-        "启动一个团队进行研究，但不要创建文件",
-        "Start a team for review; do not create files",
-        "先分析风险；创建团队开展复核",
-    ] {
-        assert!(explicit_team_execution_required(prompt), "{prompt}");
-    }
+    // Only a countable Team binds.
+    assert_eq!(
+        understand(&StrategyInput::from_prompt("启动一个团队进行研究，但不要创建文件"))
+            .required_team_count,
+        1
+    );
 }
 
 #[test]
-fn independent_tool_backed_responsibility_domains_require_a_structural_team() {
-    // The objective never names a Team and explicitly forbids the *user* from
-    // prescribing a topology, yet the work itself is three independently
-    // verifiable, tool-evidenced responsibility domains. Runtime materializes
-    // that ownership boundary instead of flattening it into one agent.
+fn independent_tool_backed_responsibility_domains_do_not_force_a_team() {
+    // Three independently verifiable, tool-evidenced responsibility domains
+    // used to materialize a Team obligation. That is now the model's call: the
+    // framework freezes no topology from prose.
     let prompt = "请对三个独立责任域分别取得只读工具证据并交叉核验，最后统一综合结论。\
         责任域一核查策略选择与执行义务，责任域二核查状态持久化与恢复，责任域三核查最终验收与投影。\
         必须列出至少三个本次实际读取的完整源码路径，只陈述工具证据能够验证的事实；\
@@ -1665,46 +1680,35 @@ fn independent_tool_backed_responsibility_domains_require_a_structural_team() {
         "a topology-prescription clause is not a Team prohibition"
     );
     assert_eq!(understanding.required_team_count, 0);
-    assert!(understanding.independent_workstreams >= 3);
     assert!(understanding.requires_tool_evidence);
-    assert!(automatic_team_is_structurally_required(&understanding));
-    assert_eq!(
-        decide_strategy(&StrategyInput::from_prompt(prompt)).pattern,
-        ExecutionPattern::Collaborate
-    );
 }
 
 #[test]
-fn a_team_prohibition_single_domain_or_explicit_count_is_not_a_structural_obligation() {
-    // "不要启动团队" is a real prohibition, not a topology prescription.
+fn a_team_prohibition_single_domain_or_explicit_count_is_not_a_prose_obligation() {
+    // "不要启动团队" is a real prohibition.
     let forbidden = understand(&StrategyInput::from_prompt(
         "单独分析 runtime、memory、gateway 的职责边界并给出源码路径，不要启动团队。",
     ));
     assert!(forbidden.forbids_team);
-    assert!(!automatic_team_is_structurally_required(&forbidden));
 
-    // One responsibility domain is not independent ownership.
+    // One responsibility domain names no Team.
     let single = understand(&StrategyInput::from_prompt(
         "读取 runtime 模块源码并给出完整证据路径。",
     ));
-    assert!(single.independent_workstreams < 3);
-    assert!(!automatic_team_is_structurally_required(&single));
+    assert_eq!(single.required_team_count, 0);
 
-    // An explicit Team contract owns the count; the implicit predicate stays out.
+    // An explicit Team count is the only binding source.
     let explicit = understand(&StrategyInput::from_prompt(
         "启动三个责任域团队，只读工具取证并交叉核验。",
     ));
-    assert!(explicit.required_team_count > 0);
-    assert!(!automatic_team_is_structurally_required(&explicit));
+    assert_eq!(explicit.required_team_count, 3);
 }
 
 #[test]
 fn domain_matching_respects_token_boundaries() {
-    // `latest` must not be read as the `test` domain, so two real component
-    // names stay two and no Team boundary is manufactured.
+    // `latest` must not be read as the `test` domain.
     let understanding = understand(&StrategyInput::from_prompt(
         "Review the latest backend and frontend changes and cite the evidence",
     ));
     assert_eq!(understanding.independent_workstreams, 2);
-    assert!(!automatic_team_is_structurally_required(&understanding));
 }
