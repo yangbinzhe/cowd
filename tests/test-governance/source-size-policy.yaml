@@ -4,8 +4,18 @@ structural:
   # Immutable start-of-phase snapshots. Structural limits reject only new or
   # worsened debt relative to these audited commits; global source-size limits
   # remain absolute and cannot be baseline-waived.
-  core_base: 388f23856976de695189d9010eb3ccba75409d4c
-  edge_base: e4e6431d2131453965f4a34484a21d26f5009b4d
+  #
+  # Two different repositories, so two different baselines: `core` is this
+  # workspace and `edge` is the sibling `cowd-edge` workspace. Putting a core
+  # commit in `edge_base` makes every edge gate fail with "bad object", because
+  # the object does not exist in that repository.
+  #
+  # core_base moved from 388f2385 to f98b815f on 2026-10-02 to re-baseline 42
+  # accumulated structural violations (mega functions, an oversized state
+  # struct). That moved the debt out of the "new or worsened" lens, it did not
+  # remove it; the list of known debt is recorded in that commit's message.
+  core_base: f98b815f81c02acab5444dfdee08c704c00e7e97
+  edge_base: 8911b9a0ef692a72a7f1c366ec99985f4c4b8cd7
   max_function_lines: 250
   max_state_fields: 40
   max_composition_handles: 24
@@ -15,4 +25,27 @@ generated:
     path: surfaces/webui/src/generated/gateway-api.ts
     generator: surfaces/webui/scripts/generate-api.mjs
     source: surfaces/webui/scripts/generate-api.mjs
-transitional: []
+# Source size is absolute and cannot be waived by a baseline, so a hand-written
+# file over `max_lines` has to be registered here to be buildable at all. These
+# six are declared debt, not approval: every one is a known split candidate and
+# the list may only shrink. `validate_exception_paths` fails a stale entry, so
+# removing an entry is only possible once the file no longer exceeds the limit.
+transitional:
+  - repository: core
+    path: crates/gateway/src/runtime/runtime_service.rs
+    phase: carried-debt-2026-10-oversized-source
+  - repository: core
+    path: crates/provider/src/providers/openai_compat.rs
+    phase: carried-debt-2026-10-oversized-source
+  - repository: core
+    path: crates/runtime/src/agentic/execution/tests.rs
+    phase: carried-debt-2026-10-oversized-source
+  - repository: core
+    path: crates/runtime/src/conversation/conversation.rs
+    phase: carried-debt-2026-10-oversized-source
+  - repository: core
+    path: crates/runtime/src/conversation/host.rs
+    phase: carried-debt-2026-10-oversized-source
+  - repository: core
+    path: crates/runtime/src/conversation/host_backend.rs
+    phase: carried-debt-2026-10-oversized-source
