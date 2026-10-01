@@ -1579,6 +1579,8 @@ fn a_numberless_team_request_is_a_capability_hint_not_a_binding_count() {
         "请启动协作团队审查架构并给出工具证据",
         "创建一个 team 说明文件",
         "由团队生成的报告请改为中文",
+        "把结果分成三组展示",
+        "讨论一下团队分工方式",
     ] {
         let understanding = understand(&StrategyInput::from_prompt(prompt));
         assert_eq!(understanding.required_team_count, 0, "{prompt}");
@@ -1587,6 +1589,11 @@ fn a_numberless_team_request_is_a_capability_hint_not_a_binding_count() {
             "{prompt}"
         );
     }
+    // An operator-named Arabic count still binds.
+    assert_eq!(
+        understand(&StrategyInput::from_prompt("用 3 个团队并行审查")).required_team_count,
+        3
+    );
 }
 
 #[test]

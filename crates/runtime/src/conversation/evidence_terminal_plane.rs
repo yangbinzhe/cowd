@@ -1528,7 +1528,15 @@ where
                         .cloned()
                         .and_then(|value| serde_json::from_value(value).ok())
                         .and_then(|obligation: harness_contract::strategy::CollaborationExecutionObligation| {
-                            obligation.validate().ok().map(|()| obligation)
+                            // Only an operator-named obligation is honoured on
+                            // recovery. A persisted pre-G1 inferred obligation
+                            // (`exact_team_count == None`) is discarded so an
+                            // upgrade cannot resurrect a forced topology.
+                            obligation
+                                .validate()
+                                .ok()
+                                .filter(|_| obligation.exact_team_count.is_some())
+                                .map(|()| obligation)
                         }),
                     pattern,
                 })

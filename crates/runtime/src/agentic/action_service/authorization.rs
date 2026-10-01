@@ -41,14 +41,11 @@ pub(super) fn validate_transition(
     match &envelope.action {
         AgentAction::StateInspect(_) => None,
         AgentAction::TeamCreate(_) => {
-            // PLAN B2 (corrected): only a Team count the OPERATOR NAMED is a
-            // binding ceiling. `required_team_count` is a floor and is non-zero
-            // for two different situations - the user named a number, and the
-            // runtime inferred a structural minimum from independent workstreams.
-            // Capping the inferred case at its own minimum would overrule the
-            // model's topology choice, which `strategy_decision` explicitly leaves
-            // open ("the model still chooses ... any Team count above the
-            // minimum"). `exact_team_count` is `Some` only for the named case.
+            // Only an operator-named Team count is a binding ceiling. Since
+            // prose inference was removed, `required_team_count > 0` and
+            // `exact_team_count == Some` hold together for exactly that case;
+            // autonomous work leaves `required_team_count == 0` and is never
+            // capped, so the model keeps its full topology choice.
             if let Some(ceiling) = projection
                 .exact_team_count
                 .filter(|_| projection.required_team_count > 0)

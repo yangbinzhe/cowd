@@ -525,13 +525,16 @@ fn build_runtime_execution_decision_inner(
     let delegated_leaf = context_profile == Some(ContextProfile::SubAgent);
     let mut strategy = decide_strategy(&input);
     let mut blocked_reasons = Vec::new();
-    let explicit_collaboration_requested =
+    // Only an operator-named Team count (or an explicit prohibition handled in
+    // `understand`) can produce `required_team_count > 0`; the framework never
+    // infers one from prose.
+    let operator_named_team_count =
         !delegated_leaf && strategy.understanding.required_team_count > 0;
     if (strategy.pattern == ExecutionPattern::Collaborate
         || strategy.understanding.requests_multi_agent)
         && !resource_health.collaboration_available
     {
-        if explicit_collaboration_requested {
+        if operator_named_team_count {
             if strategy.pattern != ExecutionPattern::Collaborate {
                 if let Err(error) = strategy.retarget(
                     ExecutionPattern::Collaborate,
@@ -621,7 +624,7 @@ fn build_runtime_execution_decision_inner(
     // Team count. The framework never infers a topology obligation from prose:
     // the model alone decides whether to use Teams, so no obligation is frozen
     // from `independent_workstreams` or any other textual signal.
-    let collaboration_obligation = if explicit_collaboration_requested {
+    let collaboration_obligation = if operator_named_team_count {
         CollaborationExecutionObligation::for_explicit_request(&strategy.understanding)
             .map_err(|error| blocked_reasons.push(error))
             .ok()
