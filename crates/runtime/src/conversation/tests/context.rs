@@ -138,6 +138,7 @@
             Vec::new(),
             Vec::new(),
             runtime.context_budget_tokens(),
+            &crate::prompt::RuntimeClockStamp::now(),
         );
 
         assert_eq!(runtime.context_profile(), ContextProfile::YoloGoal);
@@ -173,6 +174,7 @@
             Vec::new(),
             Vec::new(),
             runtime.context_budget_tokens(),
+            &crate::prompt::RuntimeClockStamp::now(),
         );
 
         assert_eq!(

@@ -123,25 +123,64 @@ impl CowdIdentityContract {
 
 /// Builds the authoritative wall-clock facts for one provider request.
 ///
-/// This section belongs after the stable prompt boundary and must be rebuilt
-/// for every model step. Long-lived sessions therefore do not retain the
-/// Gateway build date or the time at which their Runtime carrier was created.
+/// A runtime clock captured ONCE per turn.
+///
+/// The clock used to be re-rendered on every provider attempt, which put a
+/// seconds-resolution changing segment between the reusable prefix and the
+/// context packets: the prefix could never extend past it, which is the dominant
+/// cap on provider prefix reuse. A turn-scoped stamp keeps the value
+/// byte-identical for every attempt inside one turn (so the whole tail becomes
+/// reusable) while still changing between turns, so the model loses nothing.
+/// High-precision measurement remains available through `current_time`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeClockStamp {
+    local: String,
+    utc: String,
+    timezone: String,
+    offset: String,
+}
+
+impl RuntimeClockStamp {
+    /// Capture the clock for this turn.
+    #[must_use]
+    pub fn now() -> Self {
+        let utc = Utc::now();
+        let local = utc.with_timezone(&Local);
+        let timezone = runtime_timezone_name().unwrap_or_else(|| local.offset().to_string());
+        Self {
+            local: local.to_rfc3339_opts(SecondsFormat::Secs, true),
+            utc: utc.to_rfc3339_opts(SecondsFormat::Secs, true),
+            timezone,
+            offset: local.offset().to_string(),
+        }
+    }
+}
+
+/// Render the clock from a turn-scoped stamp. Pure: the same stamp always
+/// renders the same bytes, which is what lets every provider attempt inside one
+/// turn share its prefix.
+#[must_use]
+pub fn runtime_clock_section_at(stamp: &RuntimeClockStamp) -> String {
+    format!(
+        "## Runtime clock
+         - Current local time: {}
+         - Current UTC time: {}
+         - Time zone: {} ({})
+         This clock is supplied by Runtime for the current turn and is authoritative over older date metadata. Use a governed time tool only when the task requires a fresh high-precision measurement or a different time zone.",
+        stamp.local,
+        stamp.utc,
+        stamp.timezone,
+        stamp.offset,
+    )
+}
+
+/// This section belongs after the stable prompt boundary and is rendered from
+/// the turn-scoped stamp (see [`RuntimeClockStamp`]). Long-lived sessions
+/// therefore do not retain the Gateway build date or the time at which their
+/// Runtime carrier was created.
 #[must_use]
 pub fn runtime_clock_section() -> String {
-    let utc = Utc::now();
-    let local = utc.with_timezone(&Local);
-    let timezone = runtime_timezone_name().unwrap_or_else(|| local.offset().to_string());
-    format!(
-        "## Runtime clock\n\
-         - Current local time: {}\n\
-         - Current UTC time: {}\n\
-         - Time zone: {} ({})\n\
-         This clock is supplied by Runtime for the current model request and is authoritative over older date metadata. Use a governed time tool only when the task requires a fresh high-precision measurement or a different time zone.",
-        local.to_rfc3339_opts(SecondsFormat::Secs, true),
-        utc.to_rfc3339_opts(SecondsFormat::Secs, true),
-        timezone,
-        local.offset(),
-    )
+    runtime_clock_section_at(&RuntimeClockStamp::now())
 }
 
 fn runtime_timezone_name() -> Option<String> {
@@ -1405,5 +1444,48 @@ mod tests {
             .as_deref()
             .is_some_and(|path| path.contains("CLAUDE.md")));
         assert!(items[0].content.contains("Project rules"));
+    }
+}
+
+#[cfg(test)]
+mod clock_stamp_tests {
+    use super::{runtime_clock_section_at, RuntimeClockStamp};
+    use crate::prompt_assembly::PromptAssembly;
+
+    #[test]
+    fn one_stamp_renders_identical_bytes_on_every_request() {
+        let stamp = RuntimeClockStamp::now();
+        let first = runtime_clock_section_at(&stamp);
+        let second = runtime_clock_section_at(&stamp.clone());
+        assert_eq!(
+            first, second,
+            "every provider attempt inside one turn must render the same prefix"
+        );
+        assert!(first.contains("## Runtime clock"));
+        assert!(first.contains("Current local time:"));
+    }
+
+    #[test]
+    fn distinct_turn_stamps_render_distinct_sections() {
+        let first = runtime_clock_section_at(&RuntimeClockStamp::now());
+        // A stamp taken even one second later must differ: the value still has
+        // to move forward between turns, or the turn's context goes stale.
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        let second = runtime_clock_section_at(&RuntimeClockStamp::now());
+        assert_ne!(first, second, "the clock must still advance between turns");
+    }
+
+    #[test]
+    fn the_clock_stays_out_of_the_stable_prefix() {
+        let stamp = RuntimeClockStamp::now();
+        let assembly = PromptAssembly::new(vec![
+            "stable identity".to_string(),
+            crate::SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string(),
+            runtime_clock_section_at(&stamp),
+        ]);
+        assert!(!assembly
+            .stable_system_text()
+            .expect("stable prefix")
+            .contains("Runtime clock"));
     }
 }

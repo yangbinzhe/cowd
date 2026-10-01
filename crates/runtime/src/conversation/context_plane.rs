@@ -1569,6 +1569,7 @@ where
         omitted: Vec<ContextOmission>,
         degraded_sources: Vec<ContextSourceKind>,
         total_budget_tokens: u64,
+        clock_stamp: &crate::prompt::RuntimeClockStamp,
     ) -> ContextEnvelope {
         let session_id = self.session_id().to_string();
         let workspace_root = self
@@ -1581,7 +1582,7 @@ where
         let canonical_prompt = PromptAssembly::new(self.system_prompt.clone());
         let mut runtime_header = canonical_prompt.runtime_system_segments().to_vec();
         runtime_header.extend(ContextRuntimeKernel::runtime_header(&identity, profile));
-        runtime_header.push(crate::prompt::runtime_clock_section());
+        runtime_header.push(crate::prompt::runtime_clock_section_at(clock_stamp));
         runtime_header.push(format!(
             "context_governance_report_id:{governance_report_id}"
         ));
@@ -1776,6 +1777,9 @@ where
         next_model_context_items: Vec<ContextItem>,
     ) -> PromptAssembly {
         let _perf_start = std::time::Instant::now();
+        // One clock per prepared prompt: every provider attempt built from this
+        // assembly renders the same bytes, so the prefix stays reusable.
+        let clock_stamp = crate::prompt::RuntimeClockStamp::now();
 
         let Some(mgr) = self.memory_manager.as_ref() else {
             let (runtime_reality_context_items, session_context_items) = tokio::join!(
@@ -1802,6 +1806,7 @@ where
                 Vec::new(),
                 unavailable_sources,
                 total_budget_tokens,
+                &clock_stamp,
             );
             return self
                 .finalize_context_prompt(user_input, envelope, None)
@@ -1870,6 +1875,7 @@ where
                         omissions,
                         Vec::new(),
                         total_budget_tokens,
+                        &clock_stamp,
                     );
                     return self
                         .finalize_context_prompt(user_input, envelope, None)
@@ -1969,6 +1975,7 @@ where
                     omissions,
                     Vec::new(),
                     total_budget_tokens,
+                    &clock_stamp,
                 );
                 self.finalize_context_prompt(user_input, envelope, knowledge_report)
                     .await
@@ -1988,6 +1995,7 @@ where
                     Vec::new(),
                     unavailable_sources,
                     total_budget_tokens,
+                    &clock_stamp,
                 );
                 self.finalize_context_prompt(user_input, envelope, None)
                     .await

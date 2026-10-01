@@ -247,7 +247,26 @@ fn deduplicate(items: Vec<ContextItem>) -> Vec<ContextItem> {
             }
         }
     }
-    by_identity.into_values().collect()
+    // `HashMap::into_values()` has no defined order, and the caller's `sort_by`
+    // is stable, so a tie in the comparator (duplicate identity, or a NaN score)
+    // would leak HashMap iteration order into the rendered context — the same
+    // input then renders different bytes. Emit in an explicit total order.
+    let mut deduplicated: Vec<ContextItem> = by_identity.into_values().collect();
+    deduplicated.sort_by(|left, right| {
+        compare_candidates(left, right).then_with(|| {
+            left.source_id
+                .clone()
+                .unwrap_or_else(|| format!("{:?}:{}", left.source, left.id))
+                .cmp(
+                    &right
+                        .source_id
+                        .clone()
+                        .unwrap_or_else(|| format!("{:?}:{}", right.source, right.id)),
+                )
+                .then_with(|| left.id.cmp(&right.id))
+        })
+    });
+    deduplicated
 }
 
 fn compare_candidates(left: &ContextItem, right: &ContextItem) -> Ordering {
@@ -422,5 +441,60 @@ mod tests {
         let allocation = ContextAllocator::allocate(vec![lower, higher], &demand);
         assert!(allocation.selected.iter().any(|item| item.id == "user"));
         assert!(!allocation.selected.iter().any(|item| item.id == "derived"));
+    }
+}
+
+#[cfg(test)]
+mod determinism_tests {
+    use super::{deduplicate, ContextItem};
+    use super::super::{ContextAuthority, ContextRole, ContextSourceKind};
+
+    fn item(id: &str, source_id: &str, score: f32) -> ContextItem {
+        let mut built = ContextItem::new(
+            id,
+            ContextSourceKind::Memory,
+            ContextRole::Evidence,
+            &format!("body:{id}"),
+        );
+        built.score = score;
+        built.token_estimate = 8;
+        built.source_id = Some(source_id.to_string());
+        built.authority = ContextAuthority::System;
+        built
+    }
+
+    #[test]
+    fn deduplicated_order_is_independent_of_insertion_order() {
+        let forward = vec![
+            item("a", "s:1", 5.0),
+            item("b", "s:2", 5.0),
+            item("c", "s:3", 5.0),
+        ];
+        let mut reversed = forward.clone();
+        reversed.reverse();
+
+        let left = deduplicate(forward)
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        let right = deduplicated_ids(reversed);
+        assert_eq!(left, right, "insertion order must not change the render");
+    }
+
+    fn deduplicated_ids(items: Vec<ContextItem>) -> Vec<String> {
+        deduplicate(items).into_iter().map(|item| item.id).collect()
+    }
+
+    #[test]
+    fn a_nan_score_still_yields_a_deterministic_order() {
+        let items = vec![
+            item("a", "s:1", f32::NAN),
+            item("b", "s:2", f32::NAN),
+            item("c", "s:3", f32::NAN),
+        ];
+        let first = deduplicated_ids(items.clone());
+        let mut shuffled = items;
+        shuffled.reverse();
+        assert_eq!(first, deduplicated_ids(shuffled));
     }
 }
