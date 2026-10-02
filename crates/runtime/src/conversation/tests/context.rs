@@ -3529,3 +3529,59 @@ async fn consume_provider_stream_fails_unbounded_content_without_a_step_boundary
         "unexpected failure: {failure}"
     );
 }
+
+    /// Per-request turn state must land in the volatile tail, not among the
+    /// byte-stable packets.
+    ///
+    /// `#GoalState` re-renders `elapsed_ms` and `rounds` on every request, so as an
+    /// ordinary packet it forked the prefix ahead of every stable segment behind
+    /// it. Measured on a one-team run: the divergence sat at message [1] and the
+    /// reusable prefix was the system prompt alone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn goal_state_is_emitted_as_a_volatile_tail_section() {
+        let rt = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["stable system".to_string()],
+        )
+        .without_memory();
+
+        rt.push_next_model_context_item(ContextItem::new(
+            "goal-state:node-1".to_string(),
+            ContextSourceKind::Task,
+            ContextRole::Instruction,
+            "#GoalState {\"elapsed_ms\":41489,\"rounds\":1}".to_string(),
+        ));
+        rt.push_next_model_context_item(ContextItem::new(
+            "workspace:orientation".to_string(),
+            ContextSourceKind::Workspace,
+            ContextRole::Orientation,
+            "orientation content".to_string(),
+        ));
+
+        let prompt = rt.prepare_reality_context("turn").await;
+
+        assert!(
+            prompt
+                .volatile_tail
+                .iter()
+                .any(|segment| segment.contains("#GoalState")),
+            "goal state must be emitted as a volatile tail section"
+        );
+        assert!(
+            !prompt
+                .contextual_packets
+                .iter()
+                .any(|packet| packet.source_id.starts_with("goal-state:")),
+            "goal state must not stay among the evictable packets"
+        );
+        assert!(
+            prompt
+                .contextual_packets
+                .iter()
+                .any(|packet| packet.source_id.starts_with("workspace:")),
+            "stable packets must keep their packing path"
+        );
+    }

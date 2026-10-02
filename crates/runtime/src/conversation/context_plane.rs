@@ -9,6 +9,17 @@ use super::*;
 /// the request it was built for. The rendering site substitutes the live section.
 pub(crate) const VOLATILE_CLOCK_SENTINEL: &str = "\u{1}cowd-volatile-clock\u{1}";
 
+/// Identity of the turn-position packet Runtime re-renders on every request.
+///
+/// `#GoalState` carries `elapsed_ms` and `rounds`, both of which change on every
+/// provider request by construction (see `agentic_turn_framing`). As a normal
+/// context packet it sat among content that is byte-stable across requests, so it
+/// forked the prefix before every stable segment behind it could be reused.
+///
+/// Routing on the packet's own identity, not its prose: the text is free to be
+/// reworded without silently changing where it lands.
+pub(crate) const GOAL_STATE_PACKET_PREFIX: &str = "goal-state:";
+
 impl<C, T> ConversationRuntime<C, T>
 where
     C: ApiClient,
@@ -1724,7 +1735,17 @@ where
             prompt.push_runtime_context(omitted_source_marker(*source));
         }
         for item in &envelope.selected {
-            prompt.push_context_item(item);
+            // Per-request turn state goes to the tail. Everything else stays a
+            // packet: packets are the only content the hard-cap packer can
+            // evict, and moving an evictable item out of that path would take it
+            // out of admission control.
+            if item.id.starts_with(GOAL_STATE_PACKET_PREFIX) {
+                let rendered = crate::PromptContextPacket::from_item(item)
+                    .render_for_user_context();
+                prompt.push_volatile_tail(rendered);
+            } else {
+                prompt.push_context_item(item);
+            }
         }
         prompt
     }
