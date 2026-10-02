@@ -2461,6 +2461,53 @@ mod tests {
     }
 
     #[test]
+    /// The precondition for moving turn-stable content into the cohort prefix.
+    ///
+    /// `provider_input_messages` builds `immutable_prefix` from the cohort prefix
+    /// plus the private user brief, and this function emits
+    /// `immutable_prefix ++ history ++ context`. If that ordering ever changed,
+    /// moving stable content into the cohort prefix would silently stop working:
+    /// nothing would fail, the bytes would simply stay behind the growing history
+    /// and become permanently unreusable. The existing test pins context AFTER
+    /// history; this pins the immutable material BEFORE it.
+    #[test]
+    fn immutable_cohort_material_is_emitted_before_history() {
+        let history = vec![provider::InputMessage::user_text("history-entry")];
+        let context = vec![provider::InputMessage::user_text("turn-local-tail")];
+        let immutable = vec![provider::InputMessage::user_text("COHORT-MARKER")];
+        let mut state = ProviderPromptHistory::default();
+
+        let messages =
+            compile_provider_input_messages(&mut state, immutable.clone(), history.clone(), context.clone());
+
+        assert_eq!(messages.len(), 3, "immutable + history + context");
+        assert!(matches!(
+            messages[0].content.as_slice(),
+            [InputContentBlock::Text { text }] if text == "COHORT-MARKER"
+        ), "the cohort prefix must be the very first message");
+        assert!(matches!(
+            messages[1].content.as_slice(),
+            [InputContentBlock::Text { text }] if text == "history-entry"
+        ), "history must follow the immutable prefix");
+        assert!(matches!(
+            messages[2].content.as_slice(),
+            [InputContentBlock::Text { text }] if text == "turn-local-tail"
+        ), "request-local context must stay last");
+
+        // GroW history must not splice anything in front of the immutable prefix.
+        let mut grown = history;
+        grown.push(provider::InputMessage {
+            role: "assistant".to_string(),
+            content: vec![InputContentBlock::Text { text: "provider-output".to_string() }],
+        });
+        let regrown =
+            compile_provider_input_messages(&mut state, immutable, grown, context);
+        assert!(matches!(
+            regrown[0].content.as_slice(),
+            [InputContentBlock::Text { text }] if text == "COHORT-MARKER"
+        ), "a longer history must not push the cohort prefix back");
+    }
+
     fn request_local_context_is_appended_after_exact_history() {
         let prompt = PromptAssembly::new(vec![
             "stable-system".to_string(),
