@@ -57,11 +57,6 @@ pub fn runtime_execution_guidance_prompt_with_tool_exposure_mode(
                 .to_string()
         },
         |exposure| {
-            let active = if exposure.active_ids.is_empty() {
-                "none".to_string()
-            } else {
-                exposure.active_ids.join(", ")
-            };
             let deferred = if exposure.deferred_ids.is_empty() {
                 "none".to_string()
             } else {
@@ -77,18 +72,10 @@ pub fn runtime_execution_guidance_prompt_with_tool_exposure_mode(
                 "Deferred catalog capabilities cannot be activated on this request because `tool_search` is not an active native function schema. Do not simulate them."
             };
             if compact {
-                return format!(
-                    "## Current function-call contract\nCallable native schemas: [{active}]. Deferred catalog capabilities are unavailable until an explicit `tool_search` activation; never simulate them.\nexposure_revision={}; catalog_revision={}; reason={}",
-                    exposure.exposure_revision,
-                    exposure.catalog_revision,
-                    exposure.reason,
-                );
+                return "## Current function-call contract\nDeferred catalog capabilities are unavailable until an explicit `tool_search` activation; never simulate them.".to_string();
             }
             format!(
-                "## Current function-call contract\nOnly these native provider function schemas are callable on this request: [{active}].\nDeferred catalog candidates (not callable yet): [{deferred}].\n{discovery_instruction}\nexposure_revision={}; catalog_revision={}; reason={}",
-                exposure.exposure_revision,
-                exposure.catalog_revision,
-                exposure.reason,
+                "## Current function-call contract\nThe callable set for this request is exactly the native function schemas the provider supplies.\nDeferred catalog candidates (not callable yet): [{deferred}].\n{discovery_instruction}"
             )
         },
     );
@@ -208,7 +195,12 @@ mod tests {
             }),
         );
 
-        assert!(prompt.contains("Only these native provider function schemas"));
+        // The callable set is NOT enumerated in prose any more: the provider's
+        // `tools` array already carries exactly those schemas, so naming them
+        // again was a byte-for-byte duplicate. What the prose must still carry is
+        // what the schema array cannot say - the deferred set and how to reach it.
+        assert!(!prompt.contains("Only these native provider function schemas"));
+        assert!(prompt.contains("native function schemas the provider supplies"));
         assert!(prompt.contains("Deferred catalog candidates (not callable yet)"));
         assert!(prompt.contains("make one focused `tool_search` call"));
         assert!(prompt.contains("Do not emit simulated markup"));
@@ -231,7 +223,9 @@ mod tests {
             }),
             true,
         );
-        assert!(prompt.contains("Callable native schemas: [tool_search, read_file]"));
+        assert!(!prompt.contains("Callable native schemas: ["));
+        assert!(!prompt.contains("exposure_revision="));
+        assert!(!prompt.contains("catalog_revision="));
         assert!(prompt.contains("never simulate them"));
         assert!(prompt.len() < 2_000);
     }

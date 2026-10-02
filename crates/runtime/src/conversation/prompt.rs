@@ -375,14 +375,16 @@ impl SystemPromptBuilder {
             .or_else(|| self.config.as_ref().and_then(RuntimeConfig::model))
             .filter(|model| !model.trim().is_empty())
             .unwrap_or("unknown");
-        lines.extend(prepend_bullets(vec![
-            format!("Active model: {active_model}"),
-            format!(
-                "Platform: {} {}",
-                self.os_name.as_deref().unwrap_or("unknown"),
-                self.os_version.as_deref().unwrap_or("unknown")
-            ),
-        ]));
+        // `Active model` and `Platform` are deliberately absent. Neither is
+        // actionable: no tool takes a model name or a platform string, and the
+        // identity contract already establishes what the assistant is. Both were
+        // also unstable - the model line changes whenever the provider falls back
+        // to another candidate, which forked the prompt prefix for no benefit -
+        // and a platform reporting "unknown unknown" carries no information at
+        // all. Runtime keeps the real values in its own configuration; the model
+        // reaches them through the governed configuration capability when a task
+        // actually needs them.
+        let _ = (&self.active_model, &self.os_name, &self.os_version);
         if let Some(date) = self
             .project_context
             .as_ref()
@@ -1086,7 +1088,14 @@ mod tests {
             .with_model_profile("gateway-small", 16_384)
             .render();
 
-        assert!(rendered.contains("Active model: gateway-small"));
+        // The model name is deliberately NOT in the prompt: nothing consumes it
+        // (no tool takes it, the identity contract already says what the
+        // assistant is) and it changes whenever the provider falls back to
+        // another candidate, forking the prompt prefix for no benefit. Capacity
+        // from the pinned profile is still rendered - that is what this fixture
+        // is actually about.
+        assert!(!rendered.contains("Active model:"));
+        assert!(!rendered.contains("Platform: unknown unknown"));
         assert!(rendered.contains("Agent-first collaboration contract"));
         assert!(!rendered
             .contains("Each declared result artifact is a required terminal structured field"));
