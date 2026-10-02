@@ -145,11 +145,26 @@
         assert_eq!(envelope.profile, ContextProfile::YoloGoal);
         assert_eq!(envelope.identity.mode, ContextMode::YoloGoal);
         assert!(envelope.assembled.runtime_header[0].contains("profile:YoloGoal"));
-        assert!(envelope
-            .assembled
-            .runtime_header
-            .iter()
-            .any(|section| section.contains("## Runtime clock")));
+        // The clock is NOT stored in the envelope. A durable envelope embedding a
+        // wall-clock string would disagree with the request it was built for, so
+        // it carries a sentinel and the rendering site substitutes the live
+        // section. The sentinel's presence is what this asserts.
+        assert!(
+            envelope
+                .assembled
+                .runtime_header
+                .iter()
+                .any(|section| section == crate::conversation::context_plane::VOLATILE_CLOCK_SENTINEL),
+            "the envelope must carry the volatile-clock sentinel, not clock text"
+        );
+        assert!(
+            !envelope
+                .assembled
+                .runtime_header
+                .iter()
+                .any(|section| section.contains("## Runtime clock")),
+            "clock text must never be persisted into the envelope"
+        );
     }
 
     #[test]
@@ -182,7 +197,7 @@
             canonical.cache_cohort_segment_count()
         );
         let rebuilt = ConversationRuntime::<MockApi, StaticToolExecutor>::
-            provider_prompt_from_envelope(&envelope);
+            provider_prompt_from_envelope(&envelope, &crate::prompt::RuntimeClockStamp::now());
         assert_eq!(
             rebuilt.cache_cohort_system_text(),
             canonical.cache_cohort_system_text()
@@ -2333,11 +2348,11 @@
 
         let clock_segment = |prompt: &PromptAssembly| {
             prompt
-                .runtime_context
+                .volatile_tail
                 .iter()
                 .find(|segment| segment.contains("Runtime clock"))
                 .cloned()
-                .expect("the runtime clock segment is always emitted")
+                .expect("the clock is emitted as its own volatile tail section")
         };
 
         let stamp = crate::prompt::RuntimeClockStamp::now();

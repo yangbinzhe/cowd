@@ -379,7 +379,7 @@ where
         // it shares no prefix with the model steps that preceded it; it keeps its
         // own stamp rather than reaching for a turn carrier it cannot access.
         let clock_stamp = crate::prompt::RuntimeClockStamp::now();
-        prompt.push_runtime_context(crate::prompt::runtime_clock_section_at(&clock_stamp));
+        prompt.push_volatile_tail(crate::prompt::runtime_clock_section_at(&clock_stamp));
         prompt.push_runtime_context(system_section);
         let inventory = self.api_client.context_inventory();
         let mut last_error = None;

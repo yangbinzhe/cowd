@@ -2,6 +2,13 @@
 
 use super::*;
 
+/// Placeholder the envelope carries where the per-request clock section belongs.
+///
+/// A sentinel rather than the clock text itself: the envelope is durable, and
+/// embedding a wall-clock string in it would make a stored envelope disagree with
+/// the request it was built for. The rendering site substitutes the live section.
+pub(crate) const VOLATILE_CLOCK_SENTINEL: &str = "\u{1}cowd-volatile-clock\u{1}";
+
 impl<C, T> ConversationRuntime<C, T>
 where
     C: ApiClient,
@@ -1210,6 +1217,7 @@ where
         user_input: &str,
         envelope: ContextEnvelope,
         knowledge: Option<KnowledgeTurnReport>,
+        clock_stamp: &crate::prompt::RuntimeClockStamp,
     ) -> PromptAssembly {
         let fact_decision = self
             .runtime_fact_decision_for_context(user_input, &envelope)
@@ -1221,7 +1229,7 @@ where
             None,
         );
         self.remember_context_governance_report(report).await;
-        let mut prompt = Self::provider_prompt_from_envelope(&envelope);
+        let mut prompt = Self::provider_prompt_from_envelope(&envelope, clock_stamp);
         prompt.set_cache_cohort_user_prefix(self.cache_cohort_user_prefix());
         prompt.set_immutable_user_prefix(self.immutable_user_prefix());
         self.remember_context_envelope(envelope).await;
@@ -1594,7 +1602,10 @@ where
         let canonical_prompt = PromptAssembly::new(self.system_prompt.clone());
         let mut runtime_header = canonical_prompt.runtime_system_segments().to_vec();
         runtime_header.extend(ContextRuntimeKernel::runtime_header(&identity, profile));
-        runtime_header.push(crate::prompt::runtime_clock_section_at(clock_stamp));
+        // The clock is NOT part of the attested header. It is per-request data and
+        // is emitted as the last section of the context instead, so a segment that
+        // changes every request cannot sit in front of segments that do not.
+        runtime_header.push(VOLATILE_CLOCK_SENTINEL.to_string());
         // The governance report id deliberately stays out of the model-visible
         // prompt. It is bookkeeping for `RealityRecallDecision`, which reads the
         // same value from the structured report (`context_runtime.rs`), so the
@@ -1681,13 +1692,28 @@ where
         }
     }
 
-    pub(super) fn provider_prompt_from_envelope(envelope: &ContextEnvelope) -> PromptAssembly {
+    pub(super) fn provider_prompt_from_envelope(
+        envelope: &ContextEnvelope,
+        clock_stamp: &crate::prompt::RuntimeClockStamp,
+    ) -> PromptAssembly {
         let mut prompt = PromptAssembly::from_stable_system_with_cache_cohort(
             envelope.assembled.stable_head.clone(),
             envelope.assembled.cache_cohort_segment_count,
         );
         for header in &envelope.assembled.runtime_header {
-            prompt.push_runtime_context(header.clone());
+            // The sentinel marks the one per-request segment the envelope carries.
+            // Routing on it is explicit: the alternative - matching the clock's
+            // prose - would break the day the clock text is reworded.
+            if header == VOLATILE_CLOCK_SENTINEL {
+                // The stamp is handed in, not minted here: a caller that rebuilds a
+                // prompt twice from one prepared envelope must render the same
+                // clock both times, or the two requests disagree on when the turn
+                // happened. A genuinely new request gets a genuinely new stamp from
+                // its caller.
+                prompt.push_volatile_tail(crate::prompt::runtime_clock_section_at(clock_stamp));
+            } else {
+                prompt.push_runtime_context(header.clone());
+            }
         }
         // Degraded sources must be visible to the model. Without this marker a
         // silent drop is indistinguishable from "there is no evidence": the model
@@ -1868,7 +1894,7 @@ where
                 &clock_stamp,
             );
             return self
-                .finalize_context_prompt(user_input, envelope, None)
+                .finalize_context_prompt(user_input, envelope, None, clock_stamp)
                 .await;
         };
 
@@ -1937,7 +1963,7 @@ where
                         &clock_stamp,
                     );
                     return self
-                        .finalize_context_prompt(user_input, envelope, None)
+                        .finalize_context_prompt(user_input, envelope, None, clock_stamp)
                         .await;
                 }
 
@@ -2036,7 +2062,7 @@ where
                     total_budget_tokens,
                     &clock_stamp,
                 );
-                self.finalize_context_prompt(user_input, envelope, knowledge_report)
+                self.finalize_context_prompt(user_input, envelope, knowledge_report, clock_stamp)
                     .await
             }
             Err(err) => {
@@ -2056,7 +2082,7 @@ where
                     total_budget_tokens,
                     &clock_stamp,
                 );
-                self.finalize_context_prompt(user_input, envelope, None)
+                self.finalize_context_prompt(user_input, envelope, None, clock_stamp)
                     .await
             }
         }
