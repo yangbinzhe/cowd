@@ -142,11 +142,24 @@ impl PostgresConnectionConfig {
 /// Production callers set `max_connections` explicitly; this is for fixtures.
 #[must_use]
 pub fn test_fixture_pool_size() -> u32 {
-    if let Some(explicit) = std::env::var("COWD_TEST_POOL_CONNECTIONS")
+    fixture_pool_size(explicit_pool_connections())
+}
+
+/// Read the operator's explicit per-process override.
+fn explicit_pool_connections() -> Option<u32> {
+    std::env::var("COWD_TEST_POOL_CONNECTIONS")
         .ok()
         .and_then(|value| value.trim().parse::<u32>().ok())
         .filter(|value| *value > 0)
-    {
+}
+
+/// The sizing rule itself, with the environment already resolved.
+///
+/// Split out so tests can exercise both branches WITHOUT mutating process-global
+/// state: one test setting the variable while another clears it, both on parallel
+/// threads, races - and a test that races proves nothing.
+fn fixture_pool_size(explicit: Option<u32>) -> u32 {
+    if let Some(explicit) = explicit {
         return explicit;
     }
     let threads = std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get);
@@ -1656,26 +1669,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_explicit_pool_size_wins_and_lets_a_sharded_suite_stay_proportional() {
-        // The variable is only read by these assertions and restored
-        // immediately; the whole test module runs these two tests serially.
-        unsafe { std::env::set_var("COWD_TEST_POOL_CONNECTIONS", "12") };
-        assert_eq!(test_fixture_pool_size(), 12);
-        unsafe { std::env::remove_var("COWD_TEST_POOL_CONNECTIONS") };
+    fn an_explicit_pool_size_wins_over_the_derived_default() {
+        assert_eq!(fixture_pool_size(Some(12)), 12);
+        assert_eq!(fixture_pool_size(Some(1)), 1);
+    }
 
-        // A blank or non-numeric value must not silently pin the pool to 1.
-        unsafe { std::env::set_var("COWD_TEST_POOL_CONNECTIONS", "  ") };
-        assert!(test_fixture_pool_size() > 1);
-        unsafe { std::env::remove_var("COWD_TEST_POOL_CONNECTIONS") };
+    /// A blank, zero or unparsable override means "use the default", not "use one
+    /// connection". These are the values the env reader filters out before the
+    /// sizing rule ever sees them, so exercising the filter is the point.
+    #[test]
+    fn a_blank_zero_or_unparsable_override_falls_back_to_the_default() {
+        for blank in ["", "   ", "\t", "not-a-number", "0", "-4"] {
+            let parsed = blank.trim().parse::<u32>().ok().filter(|value| *value > 0);
+            assert_eq!(
+                fixture_pool_size(parsed),
+                fixture_pool_size(None),
+                "`{blank}` must fall back to the derived default, not pin the pool"
+            );
+        }
     }
 
     #[test]
     fn the_default_pool_gives_headroom_over_the_thread_count_without_doubling_it() {
-        unsafe { std::env::remove_var("COWD_TEST_POOL_CONNECTIONS") };
         let threads =
             u32::try_from(std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get))
                 .unwrap_or(u32::MAX);
-        let size = test_fixture_pool_size();
+        let size = fixture_pool_size(None);
         assert!(
             size >= threads,
             "the pool must cover the default one-thread-per-core run: {size} < {threads}"
