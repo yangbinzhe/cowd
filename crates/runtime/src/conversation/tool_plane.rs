@@ -941,13 +941,12 @@ where
                     );
                 }
                 for msg in pre_hook_result.messages() {
-                    combined.push('\n');
-                    combined.push_str(msg);
+                    combined.push_str(&format!("\n{msg}"));
                 }
                 for msg in post_hook_result.messages() {
-                    combined.push('\n');
-                    combined.push_str(msg);
+                    combined.push_str(&format!("\n{msg}"));
                 }
+                self.append_repetition_diagnosis(tool_name, invocation_record.input_hash.as_str(), failure_kind.unwrap_or(ToolFailureKind::Unknown), &mut combined);
                 let completed_record = if is_error {
                     invocation_record.failed_with_output_policy(
                         failure_kind.unwrap_or(ToolFailureKind::Unknown),
@@ -1280,6 +1279,37 @@ where
             summary,
             is_error,
         ))
+    }
+
+    /// Append the repetition diagnosis when this exact call has already failed.
+    ///
+    /// Extracted from the tool path so it does not lengthen a function that is
+    /// already over the structural limit, and because resolving the turn identity
+    /// is worth reading on its own: the ledger is keyed by turn, so the identity
+    /// has to be settled before the failure is recorded.
+    fn append_repetition_diagnosis(
+        &self,
+        tool_name: &str,
+        input_hash: &str,
+        failure_kind: ToolFailureKind,
+        combined: &mut String,
+    ) {
+        let turn_id = self
+            .session_input_stream
+            .active_turn_id()
+            .map(|turn| turn.as_str().to_string())
+            .unwrap_or_else(|| self.session_id().to_string());
+        if let Some(diagnosis) = crate::repetition_guard::record_tool_failure(
+            &turn_id,
+            tool_name,
+            input_hash,
+            failure_kind,
+            combined,
+        ) {
+            combined.push('\n');
+            combined.push('\n');
+            combined.push_str(&diagnosis);
+        }
     }
 
     pub(super) fn tool_model_receipt(

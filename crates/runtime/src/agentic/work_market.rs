@@ -548,7 +548,14 @@ pub(crate) fn apply_task_review(
         task.evidence_refs.sort();
         task.evidence_refs.dedup();
         match input.decision {
-            TaskReviewDecision::Accept => task.status = AgenticTaskStatus::Accepted,
+            TaskReviewDecision::Accept => {
+                task.status = AgenticTaskStatus::Accepted;
+                // Durable progress for this turn: every repetition breaker filed
+                // under it is stale, because a later call that failed before the
+                // accept must not be suppressed by a pre-accept failure. This is
+                // the only production site where a Task becomes Accepted.
+                crate::repetition_guard::clear_turn(&envelope.actor.turn_id);
+            }
             TaskReviewDecision::Challenge | TaskReviewDecision::Rework => {
                 task.status = AgenticTaskStatus::Rework;
                 task.claimant = None;

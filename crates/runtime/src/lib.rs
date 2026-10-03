@@ -324,6 +324,9 @@ pub mod tool_execution_plane;
 pub mod tool_host;
 #[path = "tooling/tool_invocation.rs"]
 pub mod tool_invocation;
+
+#[path = "tooling/repetition_guard.rs"]
+pub mod repetition_guard;
 #[path = "tooling/tool_memory.rs"]
 pub mod tool_memory;
 #[path = "tooling/tool_orchestrator.rs"]
