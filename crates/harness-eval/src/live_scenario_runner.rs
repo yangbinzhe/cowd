@@ -2097,6 +2097,15 @@ fn aggregate_scenario_metrics(scenarios: &[Value]) -> Value {
                 .and_then(Value::as_u64)
         })
         .collect::<Vec<_>>();
+    // A scenario that never reached a terminal state has no metrics object, so `total`
+    // contributes 0 for it while its own evidence records the calls. The durable record is
+    // the authority: one live run reported 0 tool calls for a scenario whose evidence held
+    // 124 terminal tool events. The gate reads the same function, so the report and the gate
+    // cannot disagree about which rule applies.
+    let tool_calls = scenarios
+        .iter()
+        .map(|scenario| crate::report::scenario_tool_call_count(scenario))
+        .sum::<u64>();
     json!({
         "input_tokens": total("input_tokens"),
         "output_tokens": total("output_tokens"),
@@ -2118,7 +2127,7 @@ fn aggregate_scenario_metrics(scenarios: &[Value]) -> Value {
         "cache_tokens": total("cache_tokens"),
         "total_tokens": total("total_tokens"),
         "model_rounds": total("model_rounds"),
-        "tool_calls": total("tool_calls"),
+        "tool_calls": tool_calls,
         "max_agent_count": maximum("agent_count"),
         "max_team_count": maximum("team_count"),
         "wall_ms": distribution(&wall_ms),
@@ -4764,6 +4773,31 @@ mod tool_call_count_tests {
             scenario_tool_calls(&ScenarioTokenUsage::default(), &timeline),
             4,
             "terminal statuses count; `running` is the same call as its terminal event"
+        );
+    }
+
+    /// The aggregate must not present zero for a scenario whose own record holds the calls.
+    ///
+    /// A scenario that fails through the observation window has no metrics object, so the
+    /// aggregate summed nothing for it: one live run presented 0 tool calls for a scenario
+    /// whose evidence held 124 terminal tool events. When no measurement exists, the number
+    /// the report presents for a scenario is its record - the same rule the gate reads.
+    #[test]
+    fn a_scenario_without_metrics_is_counted_from_its_own_record() {
+        let scenarios = vec![serde_json::json!({
+            "scenario_id": "live_one_team_execution",
+            "failure_diagnostics": {"timeline": {"events": [
+                {"payload": {"tool_name": "task_review", "status": "failed"}},
+                {"payload": {"tool_name": "task_review", "status": "running"}},
+                {"payload": {"tool_name": "artifact_publish", "status": "refused"}}
+            ]}}
+        })];
+        assert_eq!(
+            aggregate_scenario_metrics(&scenarios)
+                .get("tool_calls")
+                .and_then(Value::as_u64),
+            Some(2),
+            "the report must not present zero for calls its own record holds"
         );
     }
 }
