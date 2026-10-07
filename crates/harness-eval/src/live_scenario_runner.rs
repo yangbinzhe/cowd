@@ -4709,17 +4709,18 @@ mod tool_call_count_tests {
     /// Golden fixture for the counting definition, taken from the recorded live run
     /// `v0.9.786-1791291862-mission-harness-deep`.
     ///
-    /// That run held 497 event payloads carrying a tool name, exactly 95 of which were
-    /// terminal, and the durable store agreed with 95 while the report read 3. Three
-    /// numbers, three record paths. The definition that reconciles them is "terminal
-    /// statuses only": a `running` payload is the same call as its terminal payload, so
-    /// counting both inflates the number by the number of in-flight records.
+    /// That run held 497 event payloads, 389 of which carried a tool name, and exactly
+    /// 95 of those were terminal (294 were `running`), while the durable store agreed
+    /// with 95 and the report read 3. Three numbers, three record paths. The definition
+    /// that reconciles them is "terminal statuses only": a `running` payload is the same
+    /// call as its terminal payload, so counting both inflates the number by the number
+    /// of in-flight records.
     ///
     /// This fixture exists so the definition cannot be changed by changing a test.
     #[test]
-    fn golden_fixture_the_recorded_run_counts_95_terminal_not_497_payloads() {
+    fn golden_fixture_the_recorded_run_counts_95_terminal_not_389_tool_payloads() {
         let mut events = Vec::new();
-        for index in 0..402 {
+        for index in 0..294 {
             events.push(serde_json::json!({
                 "payload": {"tool_name": "task_review", "status": "running", "input_hash": format!("r{index}")}
             }));
