@@ -7,11 +7,18 @@ impl GatewayToolExecutor {
             .definitions(None)
             .into_iter()
             .find(|definition| definition.name == tool_name);
+        // A tagged schema declares its property set per variant, so reading the
+        // top level answers `[]` for exactly the tools whose input is hardest to
+        // construct. One live run was told seventeen times that a field was
+        // missing and never once what it could send, and answered with eleven
+        // invented shapes. The union across variants is the honest answer.
         let allowed_fields = definition
             .as_ref()
-            .and_then(|definition| definition.input_schema.get("properties"))
-            .and_then(serde_json::Value::as_object)
-            .map(|properties| properties.keys().cloned().collect())
+            .map(|definition| {
+                harness_contract::tool_input_contract::admissible_field_names(
+                    &definition.input_schema,
+                )
+            })
             .unwrap_or_default();
         let schema_hash = lease
             .catalog_receipt()
@@ -586,7 +593,7 @@ impl GatewayToolExecutor {
                 .execute_evidence_retrieve(input, binding.session_id, binding.authorized_scopes)
                 .await;
         }
-        if tool_name == "read" {
+        if is_unified_read_tool(tool_name) {
             let input: UnifiedReadRequest = serde_json::from_value(value)
                 .map_err(|error| self.input_contract_error(tool_name, error))?;
             return self.execute_unified_read(input, binding).await;
@@ -1413,6 +1420,14 @@ impl GatewayToolExecutor {
     }
 }
 
+/// The unified read is exposed as `read_ref`. The guard must name that exact
+/// tool: a stale `read` here sends every read into the MCP catch-all, which
+/// rejects it with "invalid MCP tool name `read_ref`" - one live run lost a
+/// read this way (L5 trace, line 393).
+fn is_unified_read_tool(tool_name: &str) -> bool {
+    tool_name == "read_ref"
+}
+
 /// Map one canonical reference to the existing authorized reader that owns it.
 /// Pure and total: the facade cannot invent a second data path, so a new scheme
 /// must be added here deliberately and routed through a reader that already
@@ -1470,7 +1485,7 @@ fn unified_read_delegation(reference: &str) -> Result<(&'static str, serde_json:
 
 #[cfg(test)]
 mod unified_read_tests {
-    use super::unified_read_delegation;
+    use super::{is_unified_read_tool, unified_read_delegation};
 
     #[test]
     fn routes_each_scheme_to_its_authorized_reader() {
@@ -1504,5 +1519,14 @@ mod unified_read_tests {
         assert!(unified_read_delegation("dir://crates").is_err());
         assert!(unified_read_delegation("node://g/n").is_err());
         assert!(unified_read_delegation("weird://x").is_err());
+    }
+
+    /// The guard and the exposed name must stay one. A stale `read` sends every
+    /// read into the MCP catch-all, which rejects it with
+    /// "invalid MCP tool name `read_ref`".
+    #[test]
+    fn the_read_guard_matches_the_exposed_tool_name() {
+        assert!(is_unified_read_tool("read_ref"));
+        assert!(!is_unified_read_tool("read"));
     }
 }

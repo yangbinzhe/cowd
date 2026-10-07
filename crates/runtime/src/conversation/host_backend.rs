@@ -2449,15 +2449,16 @@ where
                     && fresh_delegated_protocol
                         .as_ref()
                         .is_some_and(DelegatedAgenticProtocolState::is_terminal);
-                let agentic_recovery_attempt =
-                    if post_receipt_failure && pending_delegated_protocol.is_some() {
-                        let mut state = self.state.lock().await;
-                        state.agentic_protocol_recovery_attempts =
-                            state.agentic_protocol_recovery_attempts.saturating_add(1);
-                        Some(state.agentic_protocol_recovery_attempts)
-                    } else {
-                        None
-                    };
+                let agentic_recovery_attempt: Option<u8> = {
+                    let mut state = self.state.lock().await;
+                    let elapsed = state.started_at.elapsed();
+                    delegation_attempt_count(
+                        &mut state.agentic_protocol_recovery_attempts,
+                        post_receipt_failure,
+                        pending_delegated_protocol.is_some(),
+                        elapsed,
+                    )
+                };
                 let intervention = if terminal_provider_route_failure {
                     terminal_provider_route_intervention(&goal_id, ticket, provider_failure_scope)
                 } else if protocol_closed_after_receipt {
@@ -2472,24 +2473,7 @@ where
                 } else if let (Some(protocol), Some(attempt)) =
                     (pending_delegated_protocol, agentic_recovery_attempt)
                 {
-                    RuntimeIntervention {
-                        goal_id: goal_id.clone(),
-                        kind: if attempt <= 2 {
-                            RuntimeInterventionKind::Replan
-                        } else {
-                            RuntimeInterventionKind::Block
-                        },
-                        reason: if attempt <= 2 {
-                            protocol.continuation_instruction()
-                        } else {
-                            format!(
-                                "agentic_protocol_no_progress: Program Task `{}` remained {:?} after two compact closure retries",
-                                protocol.task_id, protocol.status
-                            )
-                        },
-                        evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
-                        expected_graph_revision: None,
-                    }
+                    delegation_intervention(&goal_id, ticket, &protocol, attempt)
                 } else if post_receipt_failure && !tool_exposure_miss {
                     let already_synthesizing =
                         clean_terminal_synthesis || clean_terminal_synthesis_attempted;
@@ -3004,6 +2988,99 @@ pub(super) fn collaboration_wall_budget() -> Option<std::time::Duration> {
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|seconds| *seconds > 0)
         .map(std::time::Duration::from_secs)
+}
+
+/// The attempt count a protocol is escalated to when it has had no recovery
+/// attempt at all within the deadline. It is past the fuse's retry budget, so the
+/// existing no-progress terminus fires instead of replanning again.
+const NO_RECOVERY_ATTEMPT_CEILING: u8 = 3;
+
+/// How long a delegated closure protocol may sit with **zero** recovery attempts
+/// before Runtime stops waiting.
+///
+/// The no-progress fuse counts recovery attempts, and an attempt is only recorded
+/// when the model answers and fails to close. A model that stops answering
+/// therefore never increments the counter, so the fuse never fires: one live run
+/// sat for twenty-three minutes after its last action with a Task stuck in
+/// `Claimed` until the harness timeout cancelled it. This guard covers exactly
+/// that shape - a published protocol the model never responded to again - and
+/// deliberately leaves every other turn alone, because a turn that keeps
+/// answering always has attempts.
+fn zero_recovery_deadline() -> std::time::Duration {
+    std::env::var("COWD_ZERO_RECOVERY_DEADLINE_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(std::time::Duration::from_secs(600))
+}
+
+/// How far this turn is into the no-progress fuse for a delegated closure.
+///
+/// Two ways to advance, and both must stay bounded. A model that answers and
+/// fails to close records an attempt, so repeated failures eventually pass the
+/// fuse's retry budget. A model that stops answering records nothing, and that is
+/// the case that used to wait forever: with no attempt there is nothing to
+/// exceed, so the fuse never fires and the turn runs until an outer timeout
+/// cancels it. When a protocol has had no attempt at all past the deadline it is
+/// carried to the ceiling instead, which lands on the same no-progress terminus.
+
+/// What to tell the Goal when a delegated closure is not finished.
+///
+/// A first or second miss is still a replan with the protocol's own continuation
+/// instruction. Past that the reason stops naming an instruction and records no
+/// progress, because the same instruction has already been tried twice - a
+/// distinct terminus from a protocol violation, which is why it is its own
+/// message rather than the generic one.
+fn delegation_intervention(
+    goal_id: &str,
+    ticket: &NodeExecutionTicket,
+    protocol: &DelegatedAgenticProtocolState,
+    attempt: u8,
+) -> RuntimeIntervention {
+    RuntimeIntervention {
+        goal_id: goal_id.to_string(),
+        kind: if attempt <= 2 {
+            RuntimeInterventionKind::Replan
+        } else {
+            RuntimeInterventionKind::Block
+        },
+        reason: if attempt <= 2 {
+            protocol.continuation_instruction()
+        } else {
+            format!(
+                "agentic_protocol_no_progress: Program Task `{}` remained {:?} after two compact closure retries",
+                protocol.task_id, protocol.status
+            )
+        },
+        evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
+        expected_graph_revision: None,
+    }
+}
+
+/// Which attempt count a pending delegated closure protocol is at.
+///
+/// Two ways to advance, and both must stay bounded. A model that answers and
+/// fails to close records an attempt, so repeated failures eventually pass the
+/// fuse's retry budget. A model that stops answering records nothing, and that is
+/// the case that used to wait forever: with no attempt there is nothing to
+/// exceed, so the fuse never fires and the turn runs until an outer timeout
+/// cancels it. When a protocol has had no attempt at all past the deadline it is
+/// carried to the ceiling instead, which lands on the same no-progress terminus.
+fn delegation_attempt_count(
+    attempts: &mut u8,
+    post_receipt_failure: bool,
+    protocol_pending: bool,
+    elapsed: std::time::Duration,
+) -> Option<u8> {
+    if post_receipt_failure && protocol_pending {
+        *attempts = attempts.saturating_add(1);
+        return Some(*attempts);
+    }
+    if !protocol_pending {
+        return None;
+    }
+    (*attempts == 0 && elapsed >= zero_recovery_deadline()).then_some(NO_RECOVERY_ATTEMPT_CEILING)
 }
 
 /// True when a required-Team collaboration turn has spent its **enabled**
@@ -5866,5 +5943,32 @@ mod tests {
         let mut networked = effect;
         networked.uses_network = true;
         assert!(!is_local_workspace_mutation_effect(&networked));
+    }
+}
+
+#[cfg(test)]
+mod zero_recovery_guard_tests {
+    use super::*;
+
+    /// The guard must never fire while the model is still answering: a turn with
+    /// recovery attempts is bounded by the attempt counter, not by the clock.
+    #[test]
+    fn the_zero_recovery_deadline_is_a_last_resort_not_a_clock() {
+        let deadline = zero_recovery_deadline();
+        assert!(!deadline.is_zero(), "a zero deadline fires immediately");
+        assert!(
+            deadline >= std::time::Duration::from_secs(60),
+            "the deadline must outlast any single model round"
+        );
+    }
+
+    /// The ceiling is what routes an unanswered protocol to the existing
+    /// no-progress terminus instead of replanning it again.
+    #[test]
+    fn the_ceiling_is_past_the_fuse_retry_budget() {
+        assert!(
+            NO_RECOVERY_ATTEMPT_CEILING > 2,
+            "at or below the retry budget this would replan instead of stopping"
+        );
     }
 }

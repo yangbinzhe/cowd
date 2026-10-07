@@ -3491,7 +3491,7 @@ impl RuntimeServices {
             for _ in 0..4 {
                 let graph = match self.graph_state_store.load_async(&graph_id).await {
                     Ok(graph) => graph,
-                    Err(ExecutionStateStoreError::NotFound(_)) => break,
+                    Err(ExecutionStateStoreError::NotFound { .. }) => break,
                     Err(error) => return Err(error.into()),
                 };
                 if graph
@@ -4607,7 +4607,7 @@ async fn project_managed_invocation_terminal(
     };
     let graph = match graph_state_store.load_async(graph_id).await {
         Ok(graph) => graph,
-        Err(ExecutionStateStoreError::NotFound(_)) => return Ok(()),
+        Err(ExecutionStateStoreError::NotFound { .. }) => return Ok(()),
         Err(error) => return Err(error.to_string()),
     };
     if graph

@@ -101,6 +101,24 @@ fn is_canonical_tool_name(value: &str) -> bool {
         })
 }
 
+/// Attach the tool's input contract to its description.
+///
+/// The schema states what a tool accepts and the description states why one uses
+/// it; neither translates into the other, and until now nothing did. A model had
+/// to resolve a `oneOf`, chase a `$ref` into `$defs`, or invent a reference format
+/// to work out what to send - one live run needed seventeen rejected calls and
+/// eleven invented input shapes to discover it. Deriving the missing half from
+/// the schema is done once, here, for every source of definitions: built-in,
+/// runtime-injected, and plugin.
+fn model_facing_description(description: Option<&str>, schema: &Value) -> Option<String> {
+    let summary = harness_contract::tool_input_contract::input_contract_summary(schema)?;
+    let contract = format!("Input contract (from the schema):\n{summary}");
+    match description {
+        Some(description) if !description.is_empty() => Some(format!("{description}\n{contract}")),
+        _ => Some(contract),
+    }
+}
+
 impl ToolCatalog {
     #[must_use]
     pub fn builtin() -> Self {
@@ -262,7 +280,7 @@ impl ToolCatalog {
             .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
             .map(|spec| ToolDefinition {
                 name: spec.name.to_string(),
-                description: Some(spec.description.to_string()),
+                description: model_facing_description(Some(&spec.description), &spec.input_schema),
                 input_schema: spec.input_schema,
             });
         let runtime = self
@@ -278,7 +296,7 @@ impl ToolCatalog {
             .filter(|tool| allowed_tools.is_none_or(|allowed| allowed.contains(tool.name.as_str())))
             .map(|tool| ToolDefinition {
                 name: tool.name.clone(),
-                description: tool.description.clone(),
+                description: model_facing_description(tool.description.as_deref(), &tool.input_schema),
                 input_schema: tool.input_schema.clone(),
             });
         let plugin = self
@@ -290,7 +308,10 @@ impl ToolCatalog {
             })
             .map(|tool| ToolDefinition {
                 name: tool.definition().name.clone(),
-                description: tool.definition().description.clone(),
+                description: model_facing_description(
+                    tool.definition().description.as_deref(),
+                    &tool.definition().input_schema,
+                ),
                 input_schema: tool.definition().input_schema.clone(),
             });
         builtin.chain(runtime).chain(plugin).collect()
@@ -306,7 +327,7 @@ impl ToolCatalog {
             .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
             .map(|spec| KernelToolDefinition {
                 name: spec.name.to_string(),
-                description: Some(spec.description.to_string()),
+                description: model_facing_description(Some(&spec.description), &spec.input_schema),
                 input_schema: spec.input_schema,
                 required_permission: kernel_permission_mode(spec.required_permission),
             });
@@ -316,7 +337,7 @@ impl ToolCatalog {
             .filter(|tool| allowed_tools.is_none_or(|allowed| allowed.contains(tool.name.as_str())))
             .map(|tool| KernelToolDefinition {
                 name: tool.name.clone(),
-                description: tool.description.clone(),
+                description: model_facing_description(tool.description.as_deref(), &tool.input_schema),
                 input_schema: tool.input_schema.clone(),
                 required_permission: kernel_permission_mode(tool.required_permission),
             });
@@ -332,7 +353,10 @@ impl ToolCatalog {
                     .ok()
                     .map(|permission| KernelToolDefinition {
                         name: tool.definition().name.clone(),
-                        description: tool.definition().description.clone(),
+                        description: model_facing_description(
+                            tool.definition().description.as_deref(),
+                            &tool.definition().input_schema,
+                        ),
                         input_schema: tool.definition().input_schema.clone(),
                         required_permission: kernel_permission_mode(permission),
                     })
@@ -471,10 +495,16 @@ impl ToolCatalog {
         self.execute_plugin(name, input)
     }
 
+    #[cfg(test)]
+    pub(crate) fn searchable_tool_specs_for_test(&self) -> Vec<SearchableToolSpec> {
+        self.searchable_tool_specs()
+    }
+
     fn searchable_tool_specs(&self) -> Vec<SearchableToolSpec> {
         let builtin = mvp_tool_specs().into_iter().map(|spec| SearchableToolSpec {
             name: spec.name.to_string(),
-            description: spec.description.to_string(),
+            description: model_facing_description(Some(&spec.description), &spec.input_schema)
+                .unwrap_or_else(|| spec.description.to_string()),
         });
         let runtime = self
             .runtime_tools
@@ -486,11 +516,16 @@ impl ToolCatalog {
             .filter(|tool| !tool.name.starts_with("mcp__"))
             .map(|tool| SearchableToolSpec {
                 name: tool.name.clone(),
-                description: tool.description.clone().unwrap_or_default(),
+                description: model_facing_description(tool.description.as_deref(), &tool.input_schema)
+                    .unwrap_or_default(),
             });
         let plugin = self.plugin_tools.iter().map(|tool| SearchableToolSpec {
             name: tool.definition().name.clone(),
-            description: tool.definition().description.clone().unwrap_or_default(),
+            description: model_facing_description(
+                tool.definition().description.as_deref(),
+                &tool.definition().input_schema,
+            )
+            .unwrap_or_else(|| tool.definition().description.clone().unwrap_or_default()),
         });
         builtin.chain(runtime).chain(plugin).collect()
     }
@@ -601,6 +636,132 @@ pub mod tool_cache;
 pub mod tool_orchestrator;
 #[path = "registry/tool_specs.rs"]
 pub mod tool_specs;
+
+#[cfg(test)]
+mod input_contract_tests {
+    use super::*;
+    use harness_contract::tool_input_contract::admissible_field_names;
+
+    /// Every model-facing definition must restate its own required fields. Until
+    /// it did, a tool could be perfectly callable and still be uncallable in
+    /// practice: one live run needed seventeen rejected `artifact_publish` calls
+    /// and eleven invented input shapes because nothing said what `source` could be.
+    #[test]
+    fn every_model_facing_definition_restates_its_own_requirements() {
+        let catalog = ToolCatalog::builtin();
+        let definitions = catalog.definitions(None);
+        assert!(definitions.len() > 20, "expected the builtin surface, got {}", definitions.len());
+        for definition in &definitions {
+            let description = definition.description.clone().unwrap_or_default();
+            let required = definition
+                .input_schema
+                .get("required")
+                .and_then(Value::as_array)
+                .map(|required| {
+                    required
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let variant_required = definition
+                .input_schema
+                .get("oneOf")
+                .and_then(Value::as_array)
+                .map(|variants| {
+                    variants
+                        .iter()
+                        .flat_map(|variant| {
+                            variant
+                                .get("required")
+                                .and_then(Value::as_array)
+                                .map(|required| {
+                                    required
+                                        .iter()
+                                        .filter_map(Value::as_str)
+                                        .map(str::to_string)
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for field in required.into_iter().chain(variant_required) {
+                assert!(
+                    description.contains(&field),
+                    "a tool requires a field its description never names"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_tagged_tool_names_the_legal_values_of_its_discriminator() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "oneOf": [
+                {"type": "object", "properties": {"source": {"const": "file"}}, "required": ["source"]},
+                {"type": "object", "properties": {"source": {"const": "message_block"}}, "required": ["source"]}
+            ]
+        });
+        let description = model_facing_description(Some("publish something"), &schema)
+            .expect("a tagged schema is summarizable");
+        assert!(description.contains("\"file\" | \"message_block\""), "{description}");
+    }
+
+    /// The tools array is part of the prompt prefix. A description that varies
+    /// between two requests would fork that prefix on every turn, which is
+    /// precisely what the cache work exists to prevent.
+    #[test]
+    fn the_same_catalog_renders_the_same_descriptions_twice() {
+        let catalog = ToolCatalog::builtin();
+        let first = catalog.definitions(None);
+        let second = catalog.definitions(None);
+        assert_eq!(first.len(), second.len());
+        for (left, right) in first.iter().zip(second.iter()) {
+            assert_eq!(left.name, right.name);
+            assert_eq!(left.description, right.description, "`{}` is not stable", left.name);
+        }
+    }
+
+    /// The descriptor fingerprint hashes the description, so it has to hash the
+    /// description the model is actually shown. Hashing the raw one would let a
+    /// changed contract keep a stale identity.
+    #[test]
+    fn the_kernel_definitions_show_the_model_the_same_contract() {
+        let catalog = ToolCatalog::builtin();
+        let shown: std::collections::BTreeMap<String, Option<String>> = catalog
+            .definitions(None)
+            .into_iter()
+            .map(|definition| (definition.name, definition.description))
+            .collect();
+        for definition in catalog.kernel_definitions(None) {
+            assert_eq!(
+                shown.get(&definition.name).cloned().flatten(),
+                definition.description,
+                "a tool is fingerprinted with a different description than it shows"
+            );
+        }
+    }
+
+    /// `tool_search` answers with names and descriptions, so it is a second
+    /// model-facing surface and has to carry the same contract as the tools array.
+    #[test]
+    fn tool_search_results_carry_the_contract_too() {
+        let catalog = ToolCatalog::builtin();
+        let specs = catalog.searchable_tool_specs_for_test();
+        let submitted = specs
+            .iter()
+            .find(|spec| spec.name == "bash")
+            .expect("bash is searchable");
+        assert!(
+            submitted.description.contains("Input contract (from the schema):"),
+            "tool_search would advertise a description without the contract"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

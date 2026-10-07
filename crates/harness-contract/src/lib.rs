@@ -45,6 +45,7 @@ pub mod skill;
 pub mod strategy;
 pub mod task;
 pub mod tool;
+pub mod tool_input_contract;
 pub mod turn;
 pub mod verification;
 

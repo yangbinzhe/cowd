@@ -8,7 +8,7 @@
 mod action_service;
 pub(crate) mod continuation;
 pub(crate) mod coordination;
-mod execution;
+pub(crate) mod execution;
 mod ingress;
 pub(crate) mod issues;
 mod program;

@@ -2048,7 +2048,7 @@ async fn rejects_missing_executor_before_persisting_graph() {
     ));
     assert!(matches!(
         state.load(&graph_id),
-        Err(ExecutionStateStoreError::NotFound(_))
+        Err(ExecutionStateStoreError::NotFound { .. })
     ));
 }
 

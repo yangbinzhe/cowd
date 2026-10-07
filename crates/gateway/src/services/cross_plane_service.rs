@@ -374,7 +374,7 @@ impl CrossPlaneService {
                     .await
                     .map_err(|error| CrossPlaneCommitGraphError::Execution(error.to_string()));
             }
-            Err(runtime::execution_core::ExecutionStateStoreError::NotFound(_)) => {}
+            Err(runtime::execution_core::ExecutionStateStoreError::NotFound { .. }) => {}
             Err(error) => return Err(CrossPlaneCommitGraphError::State(error.to_string())),
         }
         if let Some(dispatch_target) = dispatch_target {

@@ -1,4 +1,38 @@
 //! Governed tool-wave execution, evidence preparation, and result publication.
+/// Refuse a call that has already failed deterministically this many times.
+///
+/// A diagnosis is advice the model can ignore; a refusal is what ends the loop.
+/// One live run re-sent one review call one hundred and twenty-two times against
+/// a graph it could not name, paying for every attempt, because nothing refused
+/// it. The input fingerprint is the same one the failure ledger keys on, so a
+/// refused call is exactly a recorded one. Transient failures never count, so a
+/// retry that can legitimately succeed is never refused.
+fn blocked_repeated_call(
+    turn_id: &str,
+    tool_name: &str,
+    tool_use_id: &str,
+    input: &str,
+) -> Option<ConversationMessage> {
+    let input_hash = format!(
+        "{:016x}",
+        model_protocol::fingerprint::stable_hash_bytes(input.as_bytes())
+    );
+    if !crate::repetition_guard::is_dispatch_blocked(turn_id, tool_name, &input_hash) {
+        return None;
+    }
+    tracing::warn!(%tool_name, %turn_id, "dispatch refused for a repeatedly failing call");
+    Some(ConversationMessage::tool_result(
+        tool_use_id.to_string(),
+        tool_name.to_string(),
+        "Runtime refused to dispatch this call again: it has already failed \
+         deterministically this many times in this turn, so retrying it cannot \
+         produce a different result. Take a different action, or report the \
+         objective as blocked through objective_complete_request."
+            .to_string(),
+        true,
+    ))
+}
+
 
 use super::*;
 
@@ -563,17 +597,13 @@ where
     ) -> Result<ConversationMessage, RuntimeError> {
         let tool_use_id = task.tool_call_id.as_str();
         let tool_name = task.tool_name.as_str();
-        let pre_hook_result = self.run_pre_tool_use_hook(tool_name, input);
-        let effective_input = pre_hook_result
-            .updated_input()
-            .map_or_else(|| input.to_string(), ToOwned::to_owned);
-        let model_delivery_requirement = self
-            .tool_executor
-            .model_delivery_requirement(tool_name, &effective_input);
-        let mut permission_context = PermissionContext::new(
-            pre_hook_result.permission_override(),
-            pre_hook_result.permission_reason().map(ToOwned::to_owned),
-        );
+        if let Some(refusal) =
+            blocked_repeated_call(&self.active_turn_id(), tool_name, tool_use_id, input)
+        {
+            return Ok(refusal);
+        }
+        let (pre_hook_result, effective_input, model_delivery_requirement, mut permission_context) =
+            self.prepare_tool_call(tool_name, input);
         if pre_hook_result.is_cancelled() {
             permission_context = PermissionContext::new(
                 Some(crate::permissions::PermissionOverride::Deny),
@@ -1281,6 +1311,53 @@ where
         ))
     }
 
+    /// Resolve what one tool call runs under: its pre-hook outcome, the input
+    /// that hook settled on, the delivery requirement that follows from it, and
+    /// the permission context the hook asked for.
+    ///
+    /// Extracted so the refusal check can stay first in the caller without
+    /// pushing that function further past its structural limit.
+    fn prepare_tool_call(
+        &self,
+        tool_name: &str,
+        input: &str,
+    ) -> (
+        HookRunResult,
+        String,
+        crate::conversation::ToolModelDeliveryRequirement,
+        PermissionContext,
+    ) {
+        let pre_hook_result = self.run_pre_tool_use_hook(tool_name, input);
+        let effective_input = pre_hook_result
+            .updated_input()
+            .map_or_else(|| input.to_string(), ToOwned::to_owned);
+        let model_delivery_requirement = self
+            .tool_executor
+            .model_delivery_requirement(tool_name, &effective_input);
+        let permission_context = PermissionContext::new(
+            pre_hook_result.permission_override(),
+            pre_hook_result.permission_reason().map(ToOwned::to_owned),
+        );
+        (
+            pre_hook_result,
+            effective_input,
+            model_delivery_requirement,
+            permission_context,
+        )
+    }
+
+    /// The turn this failure or refusal belongs to.
+    ///
+    /// The ledger is keyed by turn, so the identity has to be settled before a
+    /// failure is recorded or a dispatch is refused. Resolving it in one place
+    /// keeps both paths on the same identity.
+    fn active_turn_id(&self) -> String {
+        self.session_input_stream
+            .active_turn_id()
+            .map(|turn| turn.as_str().to_string())
+            .unwrap_or_else(|| self.session_id().to_string())
+    }
+
     /// Append the repetition diagnosis when this exact call has already failed.
     ///
     /// Extracted from the tool path so it does not lengthen a function that is
@@ -1294,11 +1371,7 @@ where
         failure_kind: ToolFailureKind,
         combined: &mut String,
     ) {
-        let turn_id = self
-            .session_input_stream
-            .active_turn_id()
-            .map(|turn| turn.as_str().to_string())
-            .unwrap_or_else(|| self.session_id().to_string());
+        let turn_id = self.active_turn_id();
         if let Some(diagnosis) = crate::repetition_guard::record_tool_failure(
             &turn_id,
             tool_name,

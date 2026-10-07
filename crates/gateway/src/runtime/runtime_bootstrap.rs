@@ -388,7 +388,7 @@ pub(crate) fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition
     ];
     definitions.push(RuntimeToolDefinition {
         name: "artifact_publish".into(),
-        description: Some("Publish an explicit file snapshot (hash from read_file), stored Session text block (digest from context_retrieve), or authorized artifact. Returns immutable content_ref/sha256/bytes for artifact_commit. No body in JSON; never guess the latest text.".into()),
+        description: Some("Purpose: CONTENT IDENTITY only - turn an explicit byte source into an immutable content_ref, sha256 and bytes. It registers no deliverable, carries no kind/title, and is not a submission step. To attach a deliverable use artifact_commit; to hand work in use task_submit. Publish an explicit file snapshot (hash from read_file), stored Session text block (digest from context_retrieve), or authorized artifact. Every variant of this tool names its own required fields below; `sha256` must come from a real read_file or context_retrieve return value in this session.".into()),
         input_schema: model_object_input_schema::<harness_contract::content_publication::ArtifactPublishInput>(),
         required_permission: ToolPermissionMode::ReadOnly,
         effect_resolver: runtime_effect_resolver("runtime.readonly"),
@@ -485,7 +485,7 @@ fn agent_action_tool_definitions() -> Vec<RuntimeToolDefinition> {
         ),
         agent_action_definition::<action::TaskSubmitInput>(
             action::TASK_SUBMIT_TOOL_ID,
-            "Submit one claimed Task using committed artifact and evidence references. Long result content must be committed separately, never embedded in this action. unresolved carries honest limitations or follow-up disclosures for the independent reviewer; that reviewer decides whether they block Task acceptance.",
+            "Submit one claimed Task using committed artifact and evidence references. This is the preferred submission path: one deliverable block is enough, because Runtime persists it through exactly the same artifact path as artifact_commit - no separate artifact_publish call is needed. Long result content must be committed separately, never embedded in this action. Long result content must be committed separately, never embedded in this action. unresolved carries honest limitations or follow-up disclosures for the independent reviewer; that reviewer decides whether they block Task acceptance.",
         ),
         agent_action_definition::<action::TaskReviewInput>(
             action::TASK_REVIEW_TOOL_ID,
@@ -497,15 +497,15 @@ fn agent_action_tool_definitions() -> Vec<RuntimeToolDefinition> {
         ),
         agent_action_definition::<action::ArtifactCommitInput>(
             action::ARTIFACT_COMMIT_TOOL_ID,
-            "Attach a deliverable body in one of three ways. Preferred and easiest: content_ref=message://current selects this whole response's substantive body, so you never count blocks. Or content_ref=artifact_publish:... for a file you published. Or content_ref=current_message_block:<zero-based-index> to pick exactly one Text block; an out-of-range index never falls back to another paragraph. Never put the content body in JSON.",
+            "Purpose: DELIVERABLE REGISTRATION - bind a body as a typed, titled artifact in the collaboration graph. It is the one outlet that records kind and title; artifact_publish only produces the content_ref it may consume. Attach a deliverable body in one of three ways. Preferred and easiest: content_ref=message://current selects this whole response's substantive body, so you never count blocks. Or content_ref=artifact_publish:... for a file you published. Or content_ref=current_message_block:<zero-based-index> to pick exactly one Text block; an out-of-range index never falls back to another paragraph. For this tool the body travels as `content_ref`, never as a JSON field.",
         ),
         agent_action_definition::<action::ObjectiveUpdateInput>(
             action::OBJECTIVE_UPDATE_TOOL_ID,
-            "Evolve one non-user Objective criterion from durable source material. Add a new criterion, or replace/retire a derived one with a reason and evidence. Runtime protects immutable user intent and rejects a change that would silently remove user obligations.",
+            "Evolve one non-user Objective criterion from durable source material. operation add requires statement_ref plus at least one source_refs entry; operations replace and retire require criterion_ref, at least one source_refs entry, and reason_ref. Runtime protects immutable user intent and rejects a change that would silently remove user obligations.",
         ),
         agent_action_definition::<action::ObjectiveReviewInput>(
             action::OBJECTIVE_REVIEW_TOOL_ID,
-            "Record an evidence-backed review of one Goal criterion or obligation as satisfied, gapped, or blocked. Copy its exact reference from state_inspect into criterion_ref. Use durable result and evidence references plus a reason; Runtime binds the verdict to the current Objective generation and prevents stale review from finalizing a newer plan.",
+            "Record an evidence-backed review of one Goal criterion or obligation as satisfied, gapped, or blocked. An independent verdict needs at least one result_refs or evidence_refs entry. Copy the criterion reference from state_inspect into criterion_ref and add a reason; Runtime binds the verdict to the current Objective generation and prevents stale review from finalizing a newer plan.",
         ),
         agent_action_definition::<action::MembershipUpdateInput>(
             action::MEMBERSHIP_UPDATE_TOOL_ID,
@@ -517,7 +517,7 @@ fn agent_action_tool_definitions() -> Vec<RuntimeToolDefinition> {
         ),
         agent_action_definition::<action::ObjectiveCompleteRequestInput>(
             action::OBJECTIVE_COMPLETE_REQUEST_TOOL_ID,
-            "Request Objective verification using a committed final artifact, evidence references and explicit Objective-level blockers. Accepted Task limitations remain visible disclosures and are not repeated as blockers. The Supervisor verifies terminal invariants without re-litigating independent Task accept verdicts.",
+            "Request Objective verification using a committed final artifact, evidence references and explicit Objective-level blockers. result_refs must name at least one reviewed artifact reference returned by artifact_commit. Accepted Task limitations remain visible disclosures and are not repeated as blockers. The Supervisor verifies terminal invariants without re-litigating independent Task accept verdicts.",
         ),
     ]
 }
@@ -681,7 +681,7 @@ fn runtime_hook_config_from_plugin_hooks(hooks: PluginHooks) -> runtime::Runtime
 mod tests {
     use super::*;
 
-    #[test]
+     #[test]
     fn runtime_capability_tool_is_always_registered_as_readonly() {
         let tools = runtime_capability_tool_definitions();
 
@@ -821,6 +821,93 @@ mod tests {
         }
     }
 
+    /// Three model-facing paths produce a durable deliverable, and until now
+    /// none of the descriptions said which one a model was supposed to take. A
+    /// live run answered with four commits and zero publishes because the choice
+    /// was never stated. Each outlet must declare its own role and must not claim
+    /// another's.
+    #[test]
+    fn each_artifact_outlet_declares_only_its_own_role() {
+        let mut catalog = tools::ToolCatalog::builtin();
+        catalog = catalog
+            .extend_runtime_tools(runtime_capability_tool_definitions())
+            .expect("runtime capability tools register");
+        let description = |name: &str| {
+            catalog
+                .definitions(None)
+                .into_iter()
+                .find(|tool| tool.name == name)
+                .and_then(|tool| tool.description)
+                .unwrap_or_default()
+        };
+        let publish = description("artifact_publish");
+        let commit = description("artifact_commit");
+        let submit = description("task_submit");
+
+        assert!(publish.contains("CONTENT IDENTITY"), "{publish}");
+        assert!(commit.contains("DELIVERABLE REGISTRATION"), "{commit}");
+        // publish must not claim the deliverable role, and commit must not claim
+        // to be the content primitive.
+        assert!(!publish.contains("DELIVERABLE REGISTRATION"), "{publish}");
+        assert!(!commit.contains("CONTENT IDENTITY"), "{commit}");
+        assert!(
+            submit.contains("preferred submission path"),
+            "the one-shot deliverable path is the cheapest and must be said so: {submit}"
+        );
+        assert!(submit.contains("artifact_commit"), "{submit}");
+    }
+
+
+    /// The contract is attached where definitions leave the catalog, not where
+    /// they are authored, so it has to be checked at the exit a model reads.
+     #[test]
+    fn injected_tools_reach_the_model_with_their_input_contract() {
+        let mut catalog = tools::ToolCatalog::builtin();
+        catalog = catalog
+            .extend_runtime_tools(runtime_capability_tool_definitions())
+            .expect("runtime capability tools register");
+        let rendered = catalog.definitions(None);
+
+        let publish = rendered
+            .iter()
+            .find(|tool| tool.name == "artifact_publish")
+            .expect("artifact_publish is exposed");
+        let description = publish.description.clone().unwrap_or_default();
+        for value in ["\"file\"", "\"message_block\"", "\"artifact\""] {
+            assert!(
+                description.contains(value),
+                "the discriminator's legal values are what a model cannot guess: {description}"
+            );
+        }
+        assert!(description.contains("sha256: string (required)"), "{description}");
+        // The phrase that taught a model to send `{}`.
+        assert!(!description.contains("No body in JSON"), "{description}");
+
+        // Generic: every injected tool that requires a field names it.
+        for tool in &rendered {
+            let description = tool.description.clone().unwrap_or_default();
+            let required = tool
+                .input_schema
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+                .map(|required| {
+                    required
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for field in required {
+                assert!(
+                    description.contains(&field),
+                    "injected tool requires a field its description never names"
+                );
+            }
+        }
+    }
+
+
     /// `agent_action_batch` states its boundary in two halves, and both must
     /// survive any future edit: the negative half (never workspace/shell/network
     /// tools, so the model does not burn rounds discovering it by rejection) and
@@ -842,7 +929,7 @@ mod tests {
         );
     }
 
-    #[test]
+     #[test]
     fn mcp_annotations_select_explicit_external_effect_contracts() {
         for (annotations, expected_permission, expected_resolver) in [
             (
@@ -878,7 +965,7 @@ mod tests {
         }
     }
 
-    #[test]
+     #[test]
     fn every_gateway_runtime_tool_declares_a_concrete_effect_contract() {
         let mut tools = runtime_capability_tool_definitions();
         tools.extend(mcp_wrapper_tool_definitions());

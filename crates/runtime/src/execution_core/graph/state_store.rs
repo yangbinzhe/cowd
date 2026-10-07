@@ -15,8 +15,16 @@ pub enum ExecutionStateStoreError {
     EventStore(#[from] RuntimeEventStoreError),
     #[error("execution graph event payload is invalid: {0}")]
     InvalidPayload(#[from] serde_json::Error),
-    #[error("execution graph `{0}` does not exist")]
-    NotFound(String),
+    /// A graph id that no stream carries, together with **where** it was looked
+    /// up. The caller is the part that cannot be recovered later: a run id passed
+    /// where a graph id belongs produces exactly this error, and without the
+    /// location every investigation starts by grepping for call sites instead of
+    /// reading one line.
+    #[error("execution graph `{graph_id}` does not exist (looked up at {location})")]
+    NotFound {
+        graph_id: String,
+        location: String,
+    },
     #[error("execution graph `{graph_id}` stream is corrupt: {reason}")]
     Corrupt { graph_id: String, reason: String },
     #[error("execution state blocking task failed: {0}")]
@@ -98,7 +106,10 @@ impl ExecutionGraphStateStore {
             }
         })?;
         if events.is_empty() {
-            return Err(ExecutionStateStoreError::NotFound(graph_id.to_string()));
+            return Err(ExecutionStateStoreError::NotFound {
+                graph_id: graph_id.to_string(),
+                location: "<unspecified>".to_string(),
+            });
         }
         let graph = project_graph_events(graph_id, events)?;
         let graph = Arc::new(graph);
@@ -107,9 +118,24 @@ impl ExecutionGraphStateStore {
         Ok(graph)
     }
 
+    #[track_caller]
     pub fn load(&self, graph_id: &str) -> Result<ExecutionGraph, ExecutionStateStoreError> {
-        self.load_snapshot(graph_id)
-            .map(|graph| graph.as_ref().clone())
+        self.load_at(graph_id, &std::panic::Location::caller().to_string())
+    }
+
+    /// Same lookup, with the caller recorded so a miss says where it came from.
+    pub(crate) fn load_at(
+        &self,
+        graph_id: &str,
+        location: &str,
+    ) -> Result<ExecutionGraph, ExecutionStateStoreError> {
+        self.load_snapshot(graph_id).map(|graph| graph.as_ref().clone())
+            .or_else(|error| match error {
+                ExecutionStateStoreError::NotFound { graph_id, .. } => {
+                    Err(ExecutionStateStoreError::NotFound { graph_id, location: location.to_string() })
+                }
+                other => Err(other),
+            })
     }
 
     pub async fn load_snapshot_async(
@@ -123,13 +149,15 @@ impl ExecutionGraphStateStore {
             .map_err(|error| ExecutionStateStoreError::BlockingTask(error.to_string()))?
     }
 
+    #[track_caller]
     pub async fn load_async(
         &self,
         graph_id: impl Into<String>,
     ) -> Result<ExecutionGraph, ExecutionStateStoreError> {
         let store = self.clone();
         let graph_id = graph_id.into();
-        tokio::task::spawn_blocking(move || store.load(&graph_id))
+        let location = std::panic::Location::caller().to_string();
+        tokio::task::spawn_blocking(move || store.load_at(&graph_id, &location))
             .await
             .map_err(|error| ExecutionStateStoreError::BlockingTask(error.to_string()))?
     }
@@ -325,7 +353,10 @@ fn project_graph_events(
         graph.recovery_cursor.commit_cursor = record.commit_cursor;
         projected = Some(graph);
     }
-    projected.ok_or_else(|| ExecutionStateStoreError::NotFound(graph_id.to_string()))
+    projected.ok_or_else(|| ExecutionStateStoreError::NotFound {
+            graph_id: graph_id.to_string(),
+            location: "<unspecified>".to_string(),
+        })
 }
 
 fn is_legacy_full_graph_snapshot(record: &crate::DurableRuntimeEvent) -> bool {
@@ -534,5 +565,36 @@ mod tests {
         assert!(!serde_json::to_string(&projection)
             .expect("serialize public projection")
             .contains("private-prompt-and-runtime-binding"));
+    }
+}
+
+#[cfg(test)]
+mod not_found_location_tests {
+    use super::*;
+
+    /// A missing graph has to say where it was looked up.
+    ///
+    /// The failure this project chased for three runs was one error text -
+    /// "execution graph `run:agentic-graph:<id>` does not exist" - repeated over a
+    /// hundred times with no hint of which of six call sites produced it, so each
+    /// investigation started by grepping for call sites instead of reading one
+    /// line. The location is part of the error now.
+    #[test]
+    fn a_missing_graph_names_the_call_site_that_looked_it_up() {
+        let store = ExecutionGraphStateStore::new(Arc::new(RuntimeEventStore::for_test()));
+        let error = store.load("agentic-graph:absent").expect_err("absent");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("agentic-graph:absent"),
+            "the id must stay in the message: {rendered}"
+        );
+        assert!(
+            rendered.contains("looked up at"),
+            "the call site must be in the message: {rendered}"
+        );
+        assert!(
+            rendered.contains("state_store.rs"),
+            "the call site must name a file: {rendered}"
+        );
     }
 }

@@ -2152,6 +2152,35 @@ fn percentile(sorted: &[u64], percentile: usize) -> u64 {
     sorted[index]
 }
 
+/// How many tool calls a scenario actually made.
+///
+/// Three sources record one and each is silent for a different reason: a provider
+/// usage may omit the count (the local backend does), a timeline projection may
+/// not be materialized for the scenario, and the run's own captured details are
+/// the only record that survives all of that. Before the third was considered, a
+/// run reported zero tool calls while writing `tool-call-1.json` through
+/// `tool-call-3.json` in its own evidence directory.
+fn scenario_tool_calls(usage: &ScenarioTokenUsage, timeline: &Value) -> u64 {
+    let timeline_tool_calls = timeline
+        .pointer("/tool_summary/count")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            timeline
+                .get("tool_timeline")
+                .and_then(Value::as_array)
+                .map(|items| items.len() as u64)
+        })
+        .unwrap_or_default();
+    let captured_tool_calls = timeline
+        .get("tool_call_details")
+        .and_then(Value::as_array)
+        .map_or(0, |details| details.len() as u64);
+    usage
+        .tool_calls
+        .max(timeline_tool_calls)
+        .max(captured_tool_calls)
+}
+
 fn scenario_metrics(
     timeline: &Value,
     projections: &[Value],
@@ -2173,17 +2202,7 @@ fn scenario_metrics(
     let cache_creation_input_tokens = usage.cache_creation_input_tokens;
     let cache_read_input_tokens = usage.cache_read_input_tokens;
     let cache_tokens = cache_creation_input_tokens.saturating_add(cache_read_input_tokens);
-    let timeline_tool_calls = timeline
-        .pointer("/tool_summary/count")
-        .and_then(Value::as_u64)
-        .or_else(|| {
-            timeline
-                .get("tool_timeline")
-                .and_then(Value::as_array)
-                .map(|items| items.len() as u64)
-        })
-        .unwrap_or_default();
-    let tool_calls = usage.tool_calls.max(timeline_tool_calls);
+    let tool_calls = scenario_tool_calls(&usage, timeline);
     let mut agents = BTreeSet::new();
     let mut teams = BTreeSet::new();
     for projection in projections {
@@ -4642,6 +4661,63 @@ fn env_duration_millis(key: &str, default: Duration) -> Duration {
 #[cfg(test)]
 #[path = "live_scenario_runner/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod tool_call_count_tests {
+    use super::*;
+
+    /// Evidence must not contradict itself: a run that captured tool calls must
+    /// not report zero of them. The local provider reports no tool-call count at
+    /// all, so before this the metric read zero while the same run wrote
+    /// `tool-call-1.json` through `tool-call-3.json`.
+    #[test]
+    fn captured_tool_calls_are_counted_even_when_the_provider_reports_none() {
+        let timeline = serde_json::json!({
+            "tool_call_details": [
+                {"summary": {"call_index": 1}, "input": {}, "output": {}},
+                {"summary": {"call_index": 2}, "input": {}, "output": {}}
+            ]
+        });
+        assert_eq!(
+            scenario_tool_calls(&ScenarioTokenUsage::default(), &timeline),
+            2,
+            "the captured calls are the run's own record of them"
+        );
+    }
+
+    /// Characterization (live run 1006c, `live_one_team_execution`, step-3.7-flash):
+    /// the Gateway records tool calls as timeline *events*, not as `tool_summary`,
+    /// `tool_timeline`, or `tool_call_details`. That run had 497 tool events (380
+    /// with a status) while the report said `tool_calls = 3`. The three sources this
+    /// function reads are all absent for a Gateway-run scenario, so the metric still
+    /// reads zero on the shape that actually happens.
+    #[test]
+    fn gateway_timeline_events_are_not_counted_by_the_three_sources() {
+        let timeline = serde_json::json!({
+            "events": [
+                {"payload": {"tool_name": "task_review", "status": "failed", "input_hash": "a"}},
+                {"payload": {"tool_name": "task_review", "status": "failed", "input_hash": "b"}},
+                {"payload": {"tool_name": "artifact_publish", "status": "completed"}}
+            ]
+        });
+        assert_eq!(
+            scenario_tool_calls(&ScenarioTokenUsage::default(), &timeline),
+            0,
+            "characterized: none of the three sources sees a Gateway event payload"
+        );
+        let counted = timeline
+            .get("events")
+            .and_then(Value::as_array)
+            .map_or(0, |events| {
+                events
+                    .iter()
+                    .filter_map(|event| event.get("payload"))
+                    .filter(|payload| payload.get("tool_name").is_some())
+                    .count()
+            });
+        assert_eq!(counted, 3, "the same evidence does contain the calls");
+    }
+}
 
 #[cfg(test)]
 mod scenario_tool_advertisement_tests {

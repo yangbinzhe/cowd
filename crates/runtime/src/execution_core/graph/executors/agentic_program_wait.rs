@@ -302,7 +302,7 @@ pub async fn resolve_agentic_program_wait(
             .await
         {
             Ok(graph) => graph,
-            Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound(_)) => {
+            Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => {
                 return Ok(resolved);
             }
             Err(error) => return Err(error.to_string()),
@@ -397,7 +397,7 @@ pub async fn reconcile_agentic_program_wait_for_settled_graph(
 ) -> Result<usize, String> {
     let graph = match state_store.load_current_async(graph_id.to_string()).await {
         Ok(graph) => graph,
-        Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound(_)) => return Ok(0),
+        Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => return Ok(0),
         Err(error) => return Err(error.to_string()),
     };
     let mut program_ids = agentic_program_ids(&graph);
@@ -559,7 +559,7 @@ async fn active_agentic_child_graphs(
             .await
         {
             Ok(graph) => graph,
-            Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound(_)) => continue,
+            Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => continue,
             Err(error) => return Err(error.to_string()),
         };
         if graph_belongs_to_program(&graph, program_id)

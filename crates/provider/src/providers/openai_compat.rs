@@ -2144,7 +2144,17 @@ fn flatten_tool_result_content(content: &[ToolResultContentBlock]) -> String {
 /// accepts them, so we normalise unconditionally.
 fn normalize_object_schema(schema: &mut Value) {
     if let Some(obj) = schema.as_object_mut() {
-        if obj.get("type").and_then(Value::as_str) == Some("object") {
+        // A schema that already lists variants must not also receive an empty
+        // closed property set. Inserting `properties: {}` plus
+        // `additionalProperties: false` beside a `oneOf` admits only `{}`, while
+        // the variants reject `{}` - so no input can satisfy the tool at all.
+        // That is exactly what happened to `artifact_publish`: the model kept
+        // sending `{}` and the runtime kept answering "missing field `path`",
+        // for an hour, because the exposed schema forbade the field the runtime
+        // required. The variant schemas carry their own property sets, so the
+        // top level has nothing to add.
+        let has_variants = obj.contains_key("oneOf") || obj.contains_key("anyOf");
+        if obj.get("type").and_then(Value::as_str) == Some("object") && !has_variants {
             obj.entry("properties").or_insert_with(|| json!({}));
             obj.entry("additionalProperties")
                 .or_insert(Value::Bool(false));
@@ -2165,6 +2175,52 @@ fn normalize_object_schema(schema: &mut Value) {
             normalize_object_schema(items);
         }
     }
+}
+
+/// A variant schema must survive normalization without becoming unsatisfiable.
+///
+/// `normalize_object_schema` closes an `object` schema by inserting an empty
+/// `properties` and `additionalProperties: false`. Beside a `oneOf` that pair
+/// admits only `{}` while every variant rejects it, so the tool cannot be called
+/// at all - one live run re-sent `{}` to `artifact_publish` for an hour and was
+/// told each time that a field the schema forbade was missing.
+#[test]
+fn a_variant_tool_schema_is_not_closed_into_an_unsatisfiable_one() {
+    let tool = ToolDefinition {
+        name: "variant_tool".to_string(),
+        description: None,
+        input_schema: json!({
+            "type": "object",
+            "oneOf": [
+                {"type": "object", "properties": {"source": {"const": "file"}, "path": {"type": "string"}}, "required": ["source", "path"]},
+            ]
+        }),
+    };
+    let rendered = openai_tool_definition(&tool);
+    let schema = &rendered["function"]["parameters"];
+    assert_eq!(schema["type"], "object");
+    assert!(
+        schema.get("additionalProperties").is_none(),
+        "a top-level closed property set beside `oneOf` makes the tool uncallable: {schema}"
+    );
+    assert!(
+        schema.get("properties").is_none(),
+        "an empty top-level `properties` beside `oneOf` is what admitted only `{{}}`: {schema}"
+    );
+    assert!(schema.get("oneOf").is_some());
+
+    // A plain object schema still gets closed - that behaviour is load-bearing for
+    // every struct-shaped tool.
+    let plain = ToolDefinition {
+        name: "plain".to_string(),
+        description: None,
+        input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+    };
+    let plain_schema = openai_tool_definition(&plain);
+    assert_eq!(
+        plain_schema["function"]["parameters"]["additionalProperties"],
+        json!(false)
+    );
 }
 
 fn openai_tool_definition(tool: &ToolDefinition) -> Value {

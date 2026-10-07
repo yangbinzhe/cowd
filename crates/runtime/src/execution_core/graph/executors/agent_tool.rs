@@ -68,9 +68,16 @@ impl AgentToolBatchDispatcher {
                 .parent_execution
                 .clone()
                 .ok_or_else(|| ToolError::new("Agent ToolBatch omitted parent execution"))?;
+            // `parent.execution_id` is the id the Agent was admitted under, which is
+            // an agent-run id (`run:<graph_id>`). The store keys on the graph id, so
+            // looking the run id up there always fails - and every agent action
+            // runs through this load, so every one of them would report a graph
+            // that exists as missing.
             let parent_graph = services
                 .graph_state_store()
-                .load_async(&parent.execution_id)
+                .load_async(crate::agentic::execution::dispatch::execution_graph_id(
+                    &parent.execution_id,
+                ))
                 .await
                 .map_err(|e| ToolError::new(e.to_string()))?;
             let payload = serde_json::to_string(&BoundAgentTool {

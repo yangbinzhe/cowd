@@ -665,7 +665,7 @@ impl AgentAction {
                 // Runtime expands into exactly that canonical path. An empty
                 // submission with neither is still rejected.
                 if input.artifact_refs.is_empty() && input.deliverable.is_none() {
-                    return Err(AgentActionValidationError::Missing("artifact_refs"));
+                    return Err(AgentActionValidationError::Rejected(TASK_SUBMIT_RESULT_RULE));
                 }
                 unique_nonempty("artifact_refs", &input.artifact_refs)?;
                 unique_nonempty("evidence_refs", &input.evidence_refs)?;
@@ -725,35 +725,19 @@ impl AgentAction {
                 unique_nonempty("source_refs", &input.source_refs)?;
                 unique_nonempty("evidence_requirements", &input.evidence_requirements)?;
                 if matches!(input.operation, ObjectiveUpdateOperation::Add)
-                    && input.statement_ref.is_none()
+                    && (input.statement_ref.is_none() || input.source_refs.is_empty())
                 {
-                    return Err(AgentActionValidationError::Missing("statement_ref"));
-                }
-                if matches!(input.operation, ObjectiveUpdateOperation::Add)
-                    && input.source_refs.is_empty()
-                {
-                    return Err(AgentActionValidationError::Missing("source_refs"));
+                    return Err(AgentActionValidationError::Rejected(OBJECTIVE_ADD_RULE));
                 }
                 if matches!(
                     input.operation,
                     ObjectiveUpdateOperation::Replace | ObjectiveUpdateOperation::Retire
-                ) && input.criterion_ref.is_none()
+                )
+                    && (input.criterion_ref.is_none()
+                        || input.source_refs.is_empty()
+                        || input.reason_ref.is_none())
                 {
-                    return Err(AgentActionValidationError::Missing("criterion_ref"));
-                }
-                if matches!(
-                    input.operation,
-                    ObjectiveUpdateOperation::Replace | ObjectiveUpdateOperation::Retire
-                ) && input.source_refs.is_empty()
-                {
-                    return Err(AgentActionValidationError::Missing("source_refs"));
-                }
-                if matches!(
-                    input.operation,
-                    ObjectiveUpdateOperation::Replace | ObjectiveUpdateOperation::Retire
-                ) && input.reason_ref.is_none()
-                {
-                    return Err(AgentActionValidationError::Missing("reason_ref"));
+                    return Err(AgentActionValidationError::Rejected(OBJECTIVE_EVOLVE_RULE));
                 }
             }
             Self::ObjectiveReview(input) => {
@@ -762,8 +746,8 @@ impl AgentAction {
                 unique_nonempty("result_refs", &input.result_refs)?;
                 unique_nonempty("evidence_refs", &input.evidence_refs)?;
                 if input.result_refs.is_empty() && input.evidence_refs.is_empty() {
-                    return Err(AgentActionValidationError::Missing(
-                        "result_refs_or_evidence_refs",
+                    return Err(AgentActionValidationError::Rejected(
+                        OBJECTIVE_REVIEW_SUPPORT_RULE,
                     ));
                 }
             }
@@ -779,7 +763,7 @@ impl AgentAction {
             }
             Self::ObjectiveCompleteRequest(input) => {
                 if input.result_refs.is_empty() {
-                    return Err(AgentActionValidationError::Missing("result_refs"));
+                    return Err(AgentActionValidationError::Rejected(OBJECTIVE_COMPLETE_RESULT_RULE));
                 }
                 unique_nonempty("result_refs", &input.result_refs)?;
                 unique_nonempty("evidence_refs", &input.evidence_refs)?;
@@ -879,9 +863,40 @@ pub enum AgentActionValidationError {
     Rejected(&'static str),
 }
 
+/// What a Task submit must carry, stated once.
+///
+/// `artifact_refs` is optional in the schema and required in practice unless a
+/// one-shot `deliverable` is present, so reporting it as a missing field names a
+/// field the model did send - and one it was told it could omit. The rule belongs
+/// in one place so the description read before the call and the rejection read
+/// after a wrong one are the same sentence.
+pub const TASK_SUBMIT_RESULT_RULE: &str = "a Task result is either `artifact_refs` naming at least one committed artifact, or one `deliverable` block that Runtime expands into exactly that artifact path";
+
+/// Objective evolution is operation-shaped: what `add` needs is not what `retire`
+/// needs, and neither set is expressible as a plain required field.
+pub const OBJECTIVE_ADD_RULE: &str = "operation `add` requires `statement_ref` plus at least one `source_refs` entry";
+pub const OBJECTIVE_EVOLVE_RULE: &str = "operations `replace` and `retire` require `criterion_ref`, at least one `source_refs` entry, and `reason_ref`";
+
+/// A completion request is the durable statement that the Program is done, so it
+/// has to point at the reviewed artifact that says so.
+pub const OBJECTIVE_COMPLETE_RESULT_RULE: &str = "`result_refs` must name at least one reviewed artifact reference returned by `artifact_commit`";
+
+/// An independent verdict is supported by either a produced result or the
+/// evidence behind it; there is no field literally named for the disjunction.
+pub const OBJECTIVE_REVIEW_SUPPORT_RULE: &str = "an independent verdict needs at least one `result_refs` or `evidence_refs` entry";
+
+/// A field the schema calls optional but that carries a value must carry a real
+/// one. Reporting an empty value as a missing field names a field the model did
+/// send, which is the same phantom as reporting an absent optional.
+pub const NON_EMPTY_VALUE_RULE: &str = "the fields you sent must carry real values; an empty string or empty list is treated as not provided";
+
 fn required(field: &'static str, value: &str) -> Result<(), AgentActionValidationError> {
     if value.trim().is_empty() {
-        Err(AgentActionValidationError::Empty(field))
+        // An empty value is a value the model did send. Naming the field as
+        // missing is the same phantom as reporting an absent optional, so the
+        // instruction states the rule instead of pointing at a field.
+        let _ = field;
+        Err(AgentActionValidationError::Rejected(NON_EMPTY_VALUE_RULE))
     } else {
         Ok(())
     }
@@ -892,7 +907,8 @@ fn optional_nonempty(
     value: Option<&str>,
 ) -> Result<(), AgentActionValidationError> {
     if value.is_some_and(|value| value.trim().is_empty()) {
-        Err(AgentActionValidationError::Empty(field))
+        let _ = field;
+        Err(AgentActionValidationError::Rejected(NON_EMPTY_VALUE_RULE))
     } else {
         Ok(())
     }
@@ -976,6 +992,43 @@ mod tests {
         );
     }
 
+    /// A rule that spans two fields cannot be reported as a missing field: the
+    /// model sent the field, and the schema says it may omit it. One live run was
+    /// told `agent action field \`artifact_refs\` is required` twice while its own
+    /// schema listed only `task_ref` as required, which is a phantom field.
+    #[test]
+    fn a_cross_field_rule_is_reported_as_an_instruction_not_a_phantom_field() {
+        let empty = AgentAction::TaskSubmit(TaskSubmitInput {
+            task_ref: "task-1".to_string(),
+            artifact_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            unresolved: Vec::new(),
+            deliverable: None,
+        });
+        let error = empty.validate().expect_err("an empty result is rejected");
+        assert!(
+            matches!(error, AgentActionValidationError::Rejected(_)),
+            "a field the schema calls optional must not be reported as missing: {error}"
+        );
+        assert!(
+            error.to_string().contains("artifact_refs") && error.to_string().contains("deliverable"),
+            "the rejection has to name both ways out: {error}"
+        );
+
+        let review = AgentAction::ObjectiveReview(ObjectiveReviewInput {
+            criterion_ref: "criterion-1".to_string(),
+            decision: ObjectiveReviewDecision::Satisfied,
+            result_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            reason_ref: "reason-1".to_string(),
+        });
+        let error = review.validate().expect_err("an unsupported verdict is rejected");
+        assert!(
+            matches!(error, AgentActionValidationError::Rejected(_)),
+            "there is no field named `result_refs_or_evidence_refs` in any schema: {error}"
+        );
+    }
+
     #[test]
     fn task_submission_requires_a_real_artifact_reference() {
         let empty = AgentAction::TaskSubmit(TaskSubmitInput {
@@ -987,7 +1040,9 @@ mod tests {
         });
         assert_eq!(
             empty.validate(),
-            Err(AgentActionValidationError::Missing("artifact_refs"))
+            Err(AgentActionValidationError::Rejected(
+                TASK_SUBMIT_RESULT_RULE
+            ))
         );
         // A one-shot deliverable is an equally real Task result: Runtime
         // expands it into exactly the canonical artifact path.
@@ -1061,14 +1116,21 @@ mod tests {
             reason_ref: None,
             evidence_requirements: Vec::new(),
         };
+        // `source_refs` and `reason_ref` are both optional in the schema and both
+        // required by this operation, so neither may be reported as a missing
+        // field: the instruction has to name what the operation needs.
         assert_eq!(
             AgentAction::ObjectiveUpdate(replace.clone()).validate(),
-            Err(AgentActionValidationError::Missing("source_refs"))
+            Err(AgentActionValidationError::Rejected(
+                OBJECTIVE_EVOLVE_RULE
+            ))
         );
         replace.source_refs = vec!["tool://scope-change-evidence".to_string()];
         assert_eq!(
             AgentAction::ObjectiveUpdate(replace.clone()).validate(),
-            Err(AgentActionValidationError::Missing("reason_ref"))
+            Err(AgentActionValidationError::Rejected(
+                OBJECTIVE_EVOLVE_RULE
+            ))
         );
         replace.reason_ref = Some("artifact://scope-change-rationale".to_string());
         assert_eq!(AgentAction::ObjectiveUpdate(replace).validate(), Ok(()));

@@ -1277,7 +1277,7 @@ impl RuntimeServices {
                     .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
                 original.deadline_at_ms
             }
-            Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound(_)) => now_ms()
+            Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => now_ms()
                 .saturating_add(harness_contract::agent::DEFAULT_DELEGATED_EXECUTION_TIMEOUT_MS),
             Err(error) => return Err(error.into()),
         };
@@ -2469,7 +2469,7 @@ impl RuntimeServices {
             };
             let graph = match self.graph_state_store.load_async(graph_id).await {
                 Ok(graph) => graph,
-                Err(ExecutionStateStoreError::NotFound(_)) => continue,
+                Err(ExecutionStateStoreError::NotFound { .. }) => continue,
                 Err(error) => return Err(RuntimeServicesError::GraphState(error)),
             };
             if graph

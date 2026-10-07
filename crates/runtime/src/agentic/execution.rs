@@ -26,7 +26,7 @@ use super::program::{
 };
 
 mod admission;
-mod dispatch;
+pub(crate) mod dispatch;
 mod heartbeat;
 mod helpers;
 #[cfg(test)]

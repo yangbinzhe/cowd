@@ -1301,7 +1301,7 @@ mod gate_tests {
                 "commit": commit,
                 "candidate_source_sha256": source_sha256,
                 "target_repo_dirty_state": dirty,
-                "version": "0.9.711",
+                "version": env!("CARGO_PKG_VERSION"),
                 "command": "harness-eval deep --allow-real-model"
             }
         })

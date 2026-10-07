@@ -598,6 +598,26 @@ mod tests {
         assert_eq!(first.status, ToolInvocationStatus::Running);
     }
 
+    /// The refusal is looked up with a 64-bit hash (`tool_plane.rs:16-18`), while
+    /// the ledger is written with this record's full SHA-256. Two different keys
+    /// over the same input mean `is_dispatch_blocked` can never see a count the
+    /// recorder wrote - the dispatch-level refusal is dead in production, which is
+    /// consistent with the live run recording zero refusals. RED until both paths
+    /// use one hash.
+    #[test]
+    fn the_refusal_key_and_the_recorded_key_hash_the_same_input_identically() {
+        let input = "{\"decision\":\"rework\",\"reason\":\"clause not met\"}";
+        let recorded = stable_hash(input);
+        let refusal = format!(
+            "{:016x}",
+            model_protocol::fingerprint::stable_hash_bytes(input.as_bytes())
+        );
+        assert_eq!(
+            recorded, refusal,
+            "the refusal looks up a key the recorder never wrote"
+        );
+    }
+
     #[test]
     fn bash_start_record_carries_command_category() {
         let record = ToolInvocationRecord::started(

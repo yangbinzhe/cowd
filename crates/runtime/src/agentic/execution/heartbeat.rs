@@ -1,4 +1,20 @@
 use super::*;
+use super::dispatch::execution_graph_id;
+
+/// How many times one Task's lease may be renewed before the keeper gives up.
+///
+/// Renewal exists to keep a live claim from expiring while the Agent works. It is
+/// not a way to keep a claim alive forever: an Agent that claimed a Task and then
+/// stopped making progress left this keeper renewing for minutes in one live run,
+/// while the root turn waited for a Program closure that never came. Once the cap
+/// is reached the lease is allowed to expire, which is a path Runtime already
+/// owns - the Task becomes reclaimable (`task_claim_expired`) rather than stuck.
+fn claim_heartbeat_renewal_cap() -> u32 {
+    std::env::var("COWD_AGENTIC_CLAIM_RENEWAL_CAP")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(12)
+}
 
 fn claim_heartbeat_interval_ms() -> u64 {
     super::super::work_market::claim_lease_ms() / 3
@@ -60,7 +76,16 @@ pub(super) async fn agentic_claim_heartbeat_state(
     let Some(services) = services.upgrade() else {
         return AgenticClaimDriverState::Stop;
     };
-    let graph = match services.graph_state_store().load_async(execution_id).await {
+    // A claim records the id the Agent was admitted under, which is an agent-run
+    // id (`run:<graph_id>`). The execution-graph store keys on the graph id
+    // alone, so looking the run id up there can never succeed: one live run
+    // failed the same `task_review` one hundred and twenty-two times on exactly
+    // that mismatch while the graph it named existed the whole time.
+    let graph = match services
+        .graph_state_store()
+        .load_async(execution_graph_id(execution_id))
+        .await
+    {
         Ok(graph) if !agentic_graph_is_terminal(&graph) => graph,
         _ => return AgenticClaimDriverState::Stop,
     };
@@ -256,6 +281,7 @@ pub(super) async fn run_agentic_claim_heartbeat(
     // `interval` ticks immediately; consume that tick so Runtime never
     // renews before the Agent has claimed.
     heartbeat.tick().await;
+    let mut renewals: u32 = 0;
     loop {
         match agentic_claim_heartbeat_state(services.clone(), &task_ref, &execution_id, &actor)
             .await
@@ -266,6 +292,19 @@ pub(super) async fn run_agentic_claim_heartbeat(
                 }
             }
             AgenticClaimDriverState::Owned => {
+                // A claim that is never worked on must not be kept alive by its
+                // own keeper. Each renewal here means the Task is still `Claimed`
+                // and nothing moved it forward, so after the cap the lease is
+                // allowed to expire instead of being renewed forever.
+                renewals += 1;
+                if renewals > claim_heartbeat_renewal_cap() {
+                    tracing::debug!(
+                        %task_ref,
+                        renewals,
+                        "agentic claim heartbeat stopped renewing; the lease is allowed to expire"
+                    );
+                    return;
+                }
                 tokio::select! {
                     changed = commits.changed() => {
                         if changed.is_err() {
@@ -288,5 +327,27 @@ pub(super) async fn run_agentic_claim_heartbeat(
             }
             AgenticClaimDriverState::Stop => return,
         }
+    }
+}
+
+#[cfg(test)]
+mod renewal_cap_tests {
+    use super::*;
+
+    /// The keeper renews while a Task stays `Claimed`, so without a finite cap it
+    /// renews forever. One live run spent twenty-three minutes after its last
+    /// real action renewing a claim nobody was working on, while the root turn
+    /// waited for a closure that never came. The cap is what makes the keeper
+    /// terminate and hands the lease back to the reclaim path Runtime already has.
+    #[test]
+    fn the_renewal_cap_is_finite_and_positive() {
+        assert!(
+            claim_heartbeat_renewal_cap() > 0,
+            "a zero cap would expire a lease before the Agent could work"
+        );
+        assert!(
+            claim_heartbeat_renewal_cap() <= 64,
+            "a cap this large is no cap at all"
+        );
     }
 }

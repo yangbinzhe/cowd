@@ -247,6 +247,41 @@ fn routed_lane_model(lane_model: Option<&str>, program_lease: &str) -> String {
         .map_or_else(|| program_lease.to_string(), str::to_string)
 }
 
+#[cfg(test)]
+mod execution_graph_id_tests {
+    use super::execution_graph_id;
+
+    /// The whole defect: an agent-run id reached the execution-graph store, which
+    /// has no node by that name, so every resolution failed while the graph it
+    /// named existed. Any id handed to that store must be a graph id.
+    #[test]
+    fn an_agent_run_id_is_translated_to_the_graph_it_names() {
+        assert_eq!(execution_graph_id("run:agentic-graph:abc"), "agentic-graph:abc");
+        assert_eq!(
+            execution_graph_id("run:session-ingress-graph:44a9b9b3fb4a4b76"),
+            "session-ingress-graph:44a9b9b3fb4a4b76"
+        );
+    }
+
+    /// A real graph id must pass through untouched, or the translation would
+    /// create the very mismatch it exists to remove.
+    #[test]
+    fn a_graph_id_is_left_alone() {
+        assert_eq!(execution_graph_id("agentic-graph:abc"), "agentic-graph:abc");
+        assert_eq!(execution_graph_id("session-ingress-graph:abc"), "session-ingress-graph:abc");
+        assert_eq!(execution_graph_id(""), "");
+    }
+
+    /// Only the `run:` prefix is an agent-run marker. Anything else is an id the
+    /// caller already owns.
+    #[test]
+    fn only_the_run_prefix_is_a_run_marker() {
+        assert_eq!(execution_graph_id("runner:abc"), "runner:abc");
+        assert_eq!(execution_graph_id("runs:abc"), "runs:abc");
+    }
+}
+
+
 fn agentic_supervisor_actor(
     projection: &AgenticProgramProjection,
     execution_id: Option<String>,
@@ -722,7 +757,7 @@ impl RuntimeServices {
         for attempt in &attempts {
             let terminal = match self
                 .graph_state_store()
-                .load_async(&attempt.execution_id)
+                .load_async(execution_graph_id(&attempt.execution_id))
                 .await
             {
                 Ok(graph) if agentic_graph_is_terminal(&graph) => true,
@@ -734,12 +769,12 @@ impl RuntimeServices {
                     .await
                     .map_err(|error| error.to_string())?;
                     self.graph_state_store()
-                        .load_async(&attempt.execution_id)
+                        .load_async(execution_graph_id(&attempt.execution_id))
                         .await
                         .map(|graph| agentic_graph_is_terminal(&graph))
                         .map_err(|error| error.to_string())?
                 }
-                Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound(_)) => {
+                Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => {
                     // Supervisor registration is durable before the executor
                     // can start.  No graph means no effect was admitted.
                     true
@@ -916,14 +951,14 @@ impl RuntimeServices {
             for (task_ref, attempt) in stranded_attempts {
                 let reason = match self
                     .graph_state_store()
-                    .load_async(&attempt.execution_id)
+                    .load_async(execution_graph_id(&attempt.execution_id))
                     .await
                 {
                     Ok(graph) if !agentic_graph_is_terminal(&graph) => continue,
                     Ok(_) => {
                         "startup recovered a terminal Agent graph with an unsettled Task attempt"
                     }
-                    Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound(_)) => {
+                    Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => {
                         if attempt.mode == harness_contract::agent_action::AgentAttemptMode::Coordination
                             && projection.coordination_wake(attempt.generation).is_some_and(|(_, wake)| projection.coordination_request_current(wake))
                             && projection.coordination_team_id_for(&attempt.agent_id, attempt.generation)
@@ -983,19 +1018,19 @@ impl RuntimeServices {
                 .values()
                 .filter(|task| task.status == AgenticTaskStatus::Claimed)
                 .filter(|task| task.active_attempts.is_empty())
-                .filter_map(|task| {
-                    task.claim_execution_id
-                        .as_ref()
-                        .map(|execution_id| (task.task_id.clone(), execution_id.clone()))
-                })
+                .filter_map(|task| task.claim_execution_id.as_ref().map(|execution_id| {
+                    (task.task_id.clone(), execution_graph_id(&execution_id).to_string())
+                }))
                 .collect::<Vec<_>>();
             let mut released_orphan = false;
             for (task_ref, execution_id) in orphaned_claims {
+                // Same namespace translation as the heartbeat: this id is the one
+                // the Agent was admitted under, which is an agent-run id.
                 let recovery_reason = match self.graph_state_store().load_async(&execution_id).await
                 {
                     Ok(graph) if !agentic_graph_is_terminal(&graph) => continue,
                     Ok(_) => "startup recovered a terminal graph with an unsettled claim",
-                    Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound(_)) => {
+                    Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => {
                         "startup recovered an orphaned graph reservation"
                     }
                     Err(error) => return Err(error.to_string()),
@@ -1395,7 +1430,7 @@ impl RuntimeServices {
                     // terminal graphs awaiting their normal settlement.
                     return Ok(Vec::new());
                 }
-                Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound(_)) => {}
+                Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => {}
                 Err(error) => {
                     return Err(format!(
                         "agentic_graph_admission_read_failed:{graph_id}:{error}"
@@ -1852,4 +1887,16 @@ mod lane_routing_tests {
         dispatch_starvation_clear(&other);
         assert!(dispatch_starvation_bound() >= 1);
     }
+}
+
+/// The graph id an agent-run id refers to.
+///
+/// An Agent is admitted under an agent-run id, `run:<graph_id>`, and that is the
+/// id a claim records. The execution-graph store keys on the graph id alone, so
+/// passing the run id there can never match: one live run failed the same
+/// `task_review` one hundred and twenty-two times on that mismatch while the
+/// graph it named existed the whole time. Stripping the prefix is the whole
+/// translation, and it is derived from the one place the prefix is built.
+pub(crate) fn execution_graph_id(id: &str) -> &str {
+    id.strip_prefix("run:").unwrap_or(id)
 }
