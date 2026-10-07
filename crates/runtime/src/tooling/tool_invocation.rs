@@ -436,7 +436,13 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn stable_hash(input: &str) -> String {
+#[must_use]
+pub(crate) fn stable_hash(input: &str) -> String {
+    // One hash for one input. The refusal path and the record path must agree, or
+    // the ledger can never be read back: the record wrote a full SHA-256 while the
+    // refusal looked up a 64-bit fingerprint, so a dispatch refusal could not fire
+    // in production even when the ledger had the entry. The test that pins this is
+    // `the_refusal_key_and_the_recorded_key_hash_the_same_input_identically`.
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     format!("{:x}", hasher.finalize())
@@ -598,23 +604,45 @@ mod tests {
         assert_eq!(first.status, ToolInvocationStatus::Running);
     }
 
-    /// The refusal is looked up with a 64-bit hash (`tool_plane.rs:16-18`), while
-    /// the ledger is written with this record's full SHA-256. Two different keys
-    /// over the same input mean `is_dispatch_blocked` can never see a count the
-    /// recorder wrote - the dispatch-level refusal is dead in production, which is
-    /// consistent with the live run recording zero refusals. RED until both paths
-    /// use one hash.
+    /// The refusal and the record must key on the same derivation of the same
+    /// input. They did not: the refusal hashed a 64-bit fingerprint while the
+    /// ledger was written with this record's full SHA-256, so `is_dispatch_blocked`
+    /// could never see a count the recorder wrote - the dispatch-level refusal was
+    /// dead in production, which matches the live run recording zero refusals.
+    ///
+    /// Asserted end to end, because comparing two calls of one function proves
+    /// nothing: the ledger is written through the record's own hash and read back
+    /// through the hash the refusal path derives.
     #[test]
-    fn the_refusal_key_and_the_recorded_key_hash_the_same_input_identically() {
+    fn the_refusal_looks_up_the_key_the_recorder_actually_wrote() {
         let input = "{\"decision\":\"rework\",\"reason\":\"clause not met\"}";
-        let recorded = stable_hash(input);
-        let refusal = format!(
-            "{:016x}",
-            model_protocol::fingerprint::stable_hash_bytes(input.as_bytes())
+        let turn = "turn-hash-wiring";
+        let record = ToolInvocationRecord::started(
+            "session-1",
+            1,
+            "toolu-1",
+            "task_review",
+            input,
+            ToolSafetyCategory::ReadOnly,
+            100,
         );
-        assert_eq!(
-            recorded, refusal,
-            "the refusal looks up a key the recorder never wrote"
+        for _ in 0..crate::repetition_guard::repetition_bound() {
+            crate::repetition_guard::record_tool_failure(
+                turn,
+                "task_review",
+                &record.input_hash,
+                &canonical_input_refs(input),
+                crate::tool_invocation::ToolFailureKind::ExecutionError,
+                "graph `run:4f9a2b` does not exist",
+            );
+        }
+        assert!(
+            crate::repetition_guard::is_dispatch_blocked(
+                turn,
+                "task_review",
+                &stable_hash(input)
+            ),
+            "the key the refusal derives must be the key the recorder wrote"
         );
     }
 

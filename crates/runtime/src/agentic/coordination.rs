@@ -44,6 +44,18 @@ pub(crate) mod tests {
         pub workspace: tempfile::TempDir,
     }
 
+    impl Fixture {
+        /// Unique per fixture instance.
+        ///
+        /// The repetition ledger is keyed on the turn, so fixtures that share one
+        /// turn share one breaker: one fixture's failures refused another fixture's
+        /// call, and a test that asserts the framework does not extend the model
+        /// loop was extended by a different test's failures.
+        pub fn turn_id(&self) -> String {
+            format!("coord-turn-{}", self.workspace.path().display())
+        }
+    }
+
     #[derive(Default)]
     struct ActionHost(std::sync::OnceLock<std::sync::Weak<crate::RuntimeServices>>);
     // The test controls the decision/Process exchange explicitly. Keep the
@@ -317,7 +329,7 @@ pub(crate) mod tests {
             objective_id: "coord-objective".into(),
             program_id: "coord-program".into(),
             session_id: "coord-session".into(),
-            turn_id: "coord-turn".into(),
+            turn_id: format!("coord-turn-{}", workspace.path().display()),
             root_execution_id: None,
             required_team_count: 0,
             exact_team_count: None,
@@ -832,7 +844,7 @@ pub(crate) mod tests {
             packet.mission_id(),
             packet.task_id(),
             packet.session_id(),
-            "coord-turn",
+            fixture.turn_id(),
             &graph.id,
         )
         .unwrap();

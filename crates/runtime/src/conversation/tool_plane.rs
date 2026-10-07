@@ -13,10 +13,7 @@ fn blocked_repeated_call(
     tool_use_id: &str,
     input: &str,
 ) -> Option<ConversationMessage> {
-    let input_hash = format!(
-        "{:016x}",
-        model_protocol::fingerprint::stable_hash_bytes(input.as_bytes())
-    );
+    let input_hash = crate::tool_invocation::stable_hash(input);
     if !crate::repetition_guard::is_dispatch_blocked(turn_id, tool_name, &input_hash) {
         return None;
     }
@@ -976,7 +973,7 @@ where
                 for msg in post_hook_result.messages() {
                     combined.push_str(&format!("\n{msg}"));
                 }
-                self.append_repetition_diagnosis(tool_name, invocation_record.input_hash.as_str(), failure_kind.unwrap_or(ToolFailureKind::Unknown), &mut combined);
+                self.append_repetition_diagnosis(tool_name, invocation_record.input_hash.as_str(), &invocation_record.input_refs, failure_kind.unwrap_or(ToolFailureKind::Unknown), &mut combined);
                 let completed_record = if is_error {
                     invocation_record.failed_with_output_policy(
                         failure_kind.unwrap_or(ToolFailureKind::Unknown),
@@ -1368,6 +1365,7 @@ where
         &self,
         tool_name: &str,
         input_hash: &str,
+        input_refs: &[String],
         failure_kind: ToolFailureKind,
         combined: &mut String,
     ) {
@@ -1376,6 +1374,7 @@ where
             &turn_id,
             tool_name,
             input_hash,
+            input_refs,
             failure_kind,
             combined,
         ) {
