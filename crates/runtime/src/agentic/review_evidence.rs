@@ -203,11 +203,20 @@ fn record_effect_observation(
     }
 }
 
-fn physical_packet(services: &RuntimeServices, graph_id: &str) -> Result<AgentTaskPacket, String> {
-    let graph = services
-        .graph_state_store()
-        .load(graph_id)
-        .map_err(|error| error.to_string())?;
+    /// The review path reads through the durable-verified store, not the hot cache.
+    /// Event notification precedes the writer's cache publish, so a hot read can miss
+    /// a graph that exists; a failure produced by that window is timing, not a dead
+    /// end, and must not be counted as one. This is the read the store's own comment
+    /// prescribes for a consumer acknowledging a notification.
+    async fn physical_packet(
+        services: &RuntimeServices,
+        graph_id: &str,
+    ) -> Result<AgentTaskPacket, String> {
+        let graph = services
+            .graph_state_store()
+            .load_current_async(graph_id.to_string())
+            .await
+            .map_err(|error| error.to_string())?;
     graph
         .nodes
         .iter()
@@ -241,7 +250,7 @@ impl RuntimeServices {
                     .execution_id
                     .as_deref()
                     .ok_or("review has no physical run")?,
-            )?;
+            ).await?;
             let scope = packet
                 .agentic_binding
                 .as_ref()

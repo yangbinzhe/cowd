@@ -485,7 +485,7 @@ fn agent_action_tool_definitions() -> Vec<RuntimeToolDefinition> {
         ),
         agent_action_definition::<action::TaskSubmitInput>(
             action::TASK_SUBMIT_TOOL_ID,
-            "Submit one claimed Task using committed artifact and evidence references. This is the preferred submission path: one deliverable block is enough, because Runtime persists it through exactly the same artifact path as artifact_commit - no separate artifact_publish call is needed. Long result content must be committed separately, never embedded in this action. Long result content must be committed separately, never embedded in this action. unresolved carries honest limitations or follow-up disclosures for the independent reviewer; that reviewer decides whether they block Task acceptance.",
+            "Submit one claimed Task using committed artifact and evidence references. This is the preferred submission path: one deliverable block is enough, because Runtime persists it through exactly the same artifact path as artifact_commit - no separate artifact_publish call is needed. Long result content must be committed separately, never embedded in this action. unresolved carries honest limitations or follow-up disclosures for the independent reviewer; that reviewer decides whether they block Task acceptance.",
         ),
         agent_action_definition::<action::TaskReviewInput>(
             action::TASK_REVIEW_TOOL_ID,
@@ -681,7 +681,7 @@ fn runtime_hook_config_from_plugin_hooks(hooks: PluginHooks) -> runtime::Runtime
 mod tests {
     use super::*;
 
-     #[test]
+    #[test]
     fn runtime_capability_tool_is_always_registered_as_readonly() {
         let tools = runtime_capability_tool_definitions();
 

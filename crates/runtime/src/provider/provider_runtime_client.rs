@@ -1251,6 +1251,16 @@ async fn forward_provider_attempt(
             return;
         }
     };
+    // The tool schema array as it is serialized on this request. It is the region
+    // covered by cache breakpoint 2 and sits ahead of every other segment in the
+    // reusable prefix, so its size is what decides whether "append a contract
+    // summary" can reduce reuse at all. Measured from the wire body rather than from
+    // the definitions, so it is comparable with `model_visible_prompt_bytes`.
+    let tool_array_bytes = wire_request.body.get("tools").map_or(0, |tools| {
+        serde_json::to_vec(tools).unwrap_or_default().len()
+    });
+    let prompt_composition =
+        prompt_composition.map(|composition| composition.with_tool_array_bytes(tool_array_bytes));
     let security_domain = evidence_context
         .as_ref()
         .map_or(entry.request_context.request_id.as_str(), |context| {

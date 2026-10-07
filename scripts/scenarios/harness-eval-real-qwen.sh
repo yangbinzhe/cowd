@@ -254,7 +254,12 @@ if [[ -n "$(git -C "$ROOT" status --porcelain=v1 --untracked-files=all)" ]]; the
   rm -f "$TMP_INDEX"
   CANDIDATE_SHA="$(git -C "$ROOT" rev-parse HEAD)"
   if [[ -n "$STATE_TREE" ]]; then
-    CANDIDATE_SOURCE_SHA256="$STATE_TREE"
+    # The field is named sha256 and the report gate validates it as one, so the value
+    # has to be a sha256. A git tree id is 40 hex chars: it does separate two dirty
+    # states, but it can never satisfy the gate, so a dirty-tree run always fails
+    # `evidence_manifest_complete`. Hashing the tree content keeps the property the
+    # comment asks for and makes the field honest about its name.
+    CANDIDATE_SOURCE_SHA256="$(git -C "$ROOT" cat-file tree "$STATE_TREE" | sha256sum | awk '{print $1}')"
   else
     CANDIDATE_SOURCE_SHA256="$(git -C "$ROOT" status --porcelain=v1 --untracked-files=all | sha256sum | awk '{print $1}')"
   fi

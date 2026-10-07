@@ -2104,6 +2104,7 @@ fn aggregate_scenario_metrics(scenarios: &[Value]) -> Value {
         "cache_read_input_tokens": total("cache_read_input_tokens"),
         "model_visible_prompt_bytes": total("model_visible_prompt_bytes"),
         "reusable_prefix_bytes": total("reusable_prefix_bytes"),
+        "tool_array_bytes": total("tool_array_bytes"),
         "warm_model_visible_prompt_bytes": total("warm_model_visible_prompt_bytes"),
         "warm_reusable_prefix_bytes": total("warm_reusable_prefix_bytes"),
         "warm_input_miss_tokens": total("warm_input_miss_tokens"),
@@ -2154,12 +2155,15 @@ fn percentile(sorted: &[u64], percentile: usize) -> u64 {
 
 /// How many tool calls a scenario actually made.
 ///
-/// Three sources record one and each is silent for a different reason: a provider
+/// Four sources record one and each is silent for a different reason: a provider
 /// usage may omit the count (the local backend does), a timeline projection may
-/// not be materialized for the scenario, and the run's own captured details are
-/// the only record that survives all of that. Before the third was considered, a
-/// run reported zero tool calls while writing `tool-call-1.json` through
-/// `tool-call-3.json` in its own evidence directory.
+/// not be materialized for the scenario, the run's own captured details are the
+/// only record that survives all of that, and a Gateway run records calls as event
+/// payloads that none of the three reads.
+///
+/// The fourth source counts terminal statuses only. A `running` event and its
+/// `completed` event are the same call twice: one live run held 497 payloads with a
+/// tool name while exactly 95 were terminal, and the durable store agreed with 95.
 fn scenario_tool_calls(usage: &ScenarioTokenUsage, timeline: &Value) -> u64 {
     let timeline_tool_calls = timeline
         .pointer("/tool_summary/count")
@@ -2179,6 +2183,12 @@ fn scenario_tool_calls(usage: &ScenarioTokenUsage, timeline: &Value) -> u64 {
         .tool_calls
         .max(timeline_tool_calls)
         .max(captured_tool_calls)
+        .max(crate::report::terminal_tool_events_in_events(
+            timeline
+                .get("events")
+                .and_then(Value::as_array)
+                .map_or(&[][..], |events| events.as_slice()),
+        ))
 }
 
 fn scenario_metrics(
@@ -2385,6 +2395,10 @@ fn scenario_metrics(
                 json!(provider_attempts.reusable_prefix_bytes),
             ),
             (
+                "tool_array_bytes".to_string(),
+                json!(provider_attempts.tool_array_bytes),
+            ),
+            (
                 "warm_model_visible_prompt_bytes".to_string(),
                 json!(provider_attempts.warm_prompt_bytes),
             ),
@@ -2447,6 +2461,7 @@ struct ProviderAttemptMetrics {
     warm_input_miss_tokens: u64,
     warm_cache_creation_input_tokens: u64,
     warm_cache_read_input_tokens: u64,
+    tool_array_bytes: u64,
 }
 
 impl ProviderAttemptMetrics {
@@ -2564,6 +2579,12 @@ fn provider_attempt_metrics(timeline: &Value) -> ProviderAttemptMetrics {
         let reusable = value_u64(&request, &["reusable_prefix_bytes"]);
         metrics.prompt_bytes = metrics.prompt_bytes.saturating_add(prompt);
         metrics.reusable_prefix_bytes = metrics.reusable_prefix_bytes.saturating_add(reusable);
+        metrics.tool_array_bytes = metrics.tool_array_bytes.saturating_add(
+            request
+                .pointer("/prompt_composition/tool_array_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+        );
         let cold = request.get("cache_cold_leader").and_then(Value::as_bool) == Some(true);
         if cold {
             metrics.cold_leaders = metrics.cold_leaders.saturating_add(1);
@@ -4685,37 +4706,64 @@ mod tool_call_count_tests {
         );
     }
 
-    /// Characterization (live run 1006c, `live_one_team_execution`, step-3.7-flash):
-    /// the Gateway records tool calls as timeline *events*, not as `tool_summary`,
-    /// `tool_timeline`, or `tool_call_details`. That run had 497 tool events (380
-    /// with a status) while the report said `tool_calls = 3`. The three sources this
-    /// function reads are all absent for a Gateway-run scenario, so the metric still
-    /// reads zero on the shape that actually happens.
+    /// Golden fixture for the counting definition, taken from the recorded live run
+    /// `v0.9.786-1791291862-mission-harness-deep`.
+    ///
+    /// That run held 497 event payloads carrying a tool name, exactly 95 of which were
+    /// terminal, and the durable store agreed with 95 while the report read 3. Three
+    /// numbers, three record paths. The definition that reconciles them is "terminal
+    /// statuses only": a `running` payload is the same call as its terminal payload, so
+    /// counting both inflates the number by the number of in-flight records.
+    ///
+    /// This fixture exists so the definition cannot be changed by changing a test.
     #[test]
-    fn gateway_timeline_events_are_not_counted_by_the_three_sources() {
+    fn golden_fixture_the_recorded_run_counts_95_terminal_not_497_payloads() {
+        let mut events = Vec::new();
+        for index in 0..402 {
+            events.push(serde_json::json!({
+                "payload": {"tool_name": "task_review", "status": "running", "input_hash": format!("r{index}")}
+            }));
+        }
+        for index in 0..95 {
+            events.push(serde_json::json!({
+                "payload": {"tool_name": "task_review", "status": "failed", "input_hash": format!("f{index}")}
+            }));
+        }
+        assert_eq!(
+            crate::report::terminal_tool_events_in_events(&events),
+            95,
+            "the durable store agreed with 95; the definition must agree with it"
+        );
+        let timeline = serde_json::json!({ "events": events });
+        assert_eq!(
+            scenario_tool_calls(&ScenarioTokenUsage::default(), &timeline),
+            95,
+            "the metric and the gate must read the same function"
+        );
+    }
+
+    /// Inverted from the characterization in 1006i: the fourth source is the Gateway
+    /// event payload, and it counts terminal statuses only.
+    ///
+    /// The characterization recorded that none of the three sources saw a Gateway event
+    /// payload. That was true and is now closed - the same evidence that made the
+    /// characterization true is what the fourth source reads.
+    #[test]
+    fn gateway_terminal_events_are_counted_and_running_events_are_not() {
         let timeline = serde_json::json!({
             "events": [
                 {"payload": {"tool_name": "task_review", "status": "failed", "input_hash": "a"}},
                 {"payload": {"tool_name": "task_review", "status": "failed", "input_hash": "b"}},
-                {"payload": {"tool_name": "artifact_publish", "status": "completed"}}
+                {"payload": {"tool_name": "artifact_publish", "status": "completed"}},
+                {"payload": {"tool_name": "artifact_publish", "status": "running"}},
+                {"payload": {"tool_name": "task_review", "status": "refused"}}
             ]
         });
         assert_eq!(
             scenario_tool_calls(&ScenarioTokenUsage::default(), &timeline),
-            0,
-            "characterized: none of the three sources sees a Gateway event payload"
+            4,
+            "terminal statuses count; `running` is the same call as its terminal event"
         );
-        let counted = timeline
-            .get("events")
-            .and_then(Value::as_array)
-            .map_or(0, |events| {
-                events
-                    .iter()
-                    .filter_map(|event| event.get("payload"))
-                    .filter(|payload| payload.get("tool_name").is_some())
-                    .count()
-            });
-        assert_eq!(counted, 3, "the same evidence does contain the calls");
     }
 }
 

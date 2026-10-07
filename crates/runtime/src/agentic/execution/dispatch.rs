@@ -1898,5 +1898,7 @@ mod lane_routing_tests {
 /// graph it named existed the whole time. Stripping the prefix is the whole
 /// translation, and it is derived from the one place the prefix is built.
 pub(crate) fn execution_graph_id(id: &str) -> &str {
-    id.strip_prefix("run:").unwrap_or(id)
+    // One source: the store entry itself normalizes, so this is the same rule, not
+    // a second copy that can drift from it.
+    crate::execution_core::graph::graph_id_for_lookup(id)
 }

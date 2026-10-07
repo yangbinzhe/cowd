@@ -22,6 +22,9 @@ pub enum ToolInvocationStatus {
     Failed,
     Denied,
     TimedOut,
+    /// Runtime declined to dispatch the call. It never executed, so it has no
+    /// failure kind: the record says what Runtime decided, not what a tool returned.
+    Refused,
 }
 
 impl ToolInvocationStatus {
@@ -33,6 +36,7 @@ impl ToolInvocationStatus {
             Self::Failed => "failed",
             Self::Denied => "denied",
             Self::TimedOut => "timed_out",
+            Self::Refused => "refused",
         }
     }
 }
@@ -266,6 +270,20 @@ impl ToolInvocationRecord {
     pub fn failed(mut self, kind: ToolFailureKind, output: &str, ended_at_ms: u64) -> Self {
         self = self.with_output_digest(output, DEFAULT_OUTPUT_REF_MIN_LINES);
         self.apply_failure(kind, ended_at_ms)
+    }
+
+    /// A refusal is a decision, not an execution result, so it carries no failure
+    /// kind. Recording it is what makes the evidence chain able to say that Runtime
+    /// refused - without this the chain shows a tool result and a ledger that
+    /// disagrees with it.
+    #[must_use]
+    pub fn refused(mut self, reason: &str, ended_at_ms: u64) -> Self {
+        self = self.with_output_digest(reason, DEFAULT_OUTPUT_REF_MIN_LINES);
+        self.status = ToolInvocationStatus::Refused;
+        self.ended_at_ms = Some(ended_at_ms);
+        self.duration_ms = Some(ended_at_ms.saturating_sub(self.started_at_ms));
+        self.is_error = Some(true);
+        self
     }
 
     #[must_use]

@@ -176,6 +176,9 @@ pub fn record_tool_failure(
     let call_entry = ledger.entry(call_key).or_default();
     call_entry.count = call_entry.count.saturating_add(1);
     call_entry.signature = signature.clone();
+    // The same failure has the same classification under both keys; a refusal that
+    // reports `state_derived` from the call entry would otherwise always say false.
+    call_entry.state_derived = state_derived;
     let call_count = call_entry.count;
     let cause_entry = ledger.entry(cause_key).or_default();
     cause_entry.count = cause_entry.count.saturating_add(1);
@@ -238,30 +241,53 @@ pub fn record_tool_failure(
 /// on the next attempt - one live run re-sent one review call one hundred and
 /// twenty-two times for exactly that reason. Transient failures never count, so a
 /// retry that can legitimately succeed is never refused.
-pub fn is_dispatch_blocked(turn_id: &str, tool_name: &str, input_hash: &str) -> bool {
+/// What a refusal is worth recording: the cause it refused and the count that
+/// triggered it. A refusal that is only a log line cannot be reconciled with the
+/// ledger, and a report built from tool events cannot show that Runtime refused at
+/// all - the tool result the model saw was produced without an invocation record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusalRecord {
+    pub cause_signature: String,
+    pub count: usize,
+    pub state_derived: bool,
+}
+
+pub fn refusal_for(turn_id: &str, tool_name: &str, input_hash: &str) -> Option<RefusalRecord> {
     // A poller legitimately re-issues identical calls while waiting on external
     // progress (`host_backend.rs:2876-2879` exempts them from the loop guard), and
     // the closure tools are the model's last exit - the diagnosis itself directs
     // the model to `objective_complete_request`. Refusing either would contradict
     // the guard's own intent or deadlock the turn.
     if is_exempt_tool(tool_name) {
-        return false;
+        return None;
     }
     let bound = repetition_bound();
     let ledger = repetition_ledger()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if ledger
-        .get(&format!("call:{turn_id}:{tool_name}:{input_hash}"))
-        .is_some_and(|entry| entry.count >= bound)
-    {
-        return true;
+    if let Some(entry) = ledger.get(&format!("call:{turn_id}:{tool_name}:{input_hash}")) {
+        if entry.count >= bound {
+            return Some(RefusalRecord {
+                cause_signature: entry.signature.clone(),
+                count: entry.count,
+                state_derived: entry.state_derived,
+            });
+        }
     }
     let prefix = format!("cause:{turn_id}:{tool_name}:");
     ledger
         .range(prefix.clone()..)
         .take_while(|(key, _)| key.starts_with(&prefix))
-        .any(|(_, entry)| entry.state_derived && entry.count >= bound)
+        .find(|(_, entry)| entry.state_derived && entry.count >= bound)
+        .map(|(_, entry)| RefusalRecord {
+            cause_signature: entry.signature.clone(),
+            count: entry.count,
+            state_derived: entry.state_derived,
+        })
+}
+
+pub fn is_dispatch_blocked(turn_id: &str, tool_name: &str, input_hash: &str) -> bool {
+    refusal_for(turn_id, tool_name, input_hash).is_some()
 }
 
 /// Whether a tool is never refused: pollers (waiting on external progress) and the
@@ -500,6 +526,36 @@ mod repetition_guard_tests {
                 "characterized: turn {turn_index} sees only its own failure"
             );
         }
+    }
+
+    /// A refusal must name what it rejected. A log line cannot be reconciled with
+    /// the ledger, and a report built from tool events cannot show that Runtime
+    /// refused at all.
+    #[test]
+    fn a_refusal_names_the_cause_and_the_count_it_refused_on() {
+        let turn = turn!();
+        for _ in 0..repetition_bound() {
+            record_tool_failure(
+                turn,
+                "task_review",
+                "hash-r",
+                &[],
+                ToolFailureKind::ExecutionError,
+                "graph `run:4f9a2b` does not exist",
+            );
+        }
+        let refusal = refusal_for(turn, "task_review", "hash-r")
+            .expect("the refusal must be reportable");
+        assert_eq!(refusal.count, repetition_bound());
+        assert!(
+            refusal.cause_signature.contains('#'),
+            "the cause must be the masked signature, not one message: {refusal:?}"
+        );
+        assert!(refusal.state_derived);
+        // Recording a refusal must not change what the ledger counts, or the report
+        // and the ledger would disagree about how many times the call failed.
+        let again = refusal_for(turn, "task_review", "hash-r").expect("still refused");
+        assert_eq!(again.count, refusal.count, "a refusal is not a failure");
     }
 
     /// A transient failure can succeed on retry, so it must never buy a refusal.

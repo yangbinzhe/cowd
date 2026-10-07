@@ -1,35 +1,4 @@
 //! Governed tool-wave execution, evidence preparation, and result publication.
-/// Refuse a call that has already failed deterministically this many times.
-///
-/// A diagnosis is advice the model can ignore; a refusal is what ends the loop.
-/// One live run re-sent one review call one hundred and twenty-two times against
-/// a graph it could not name, paying for every attempt, because nothing refused
-/// it. The input fingerprint is the same one the failure ledger keys on, so a
-/// refused call is exactly a recorded one. Transient failures never count, so a
-/// retry that can legitimately succeed is never refused.
-fn blocked_repeated_call(
-    turn_id: &str,
-    tool_name: &str,
-    tool_use_id: &str,
-    input: &str,
-) -> Option<ConversationMessage> {
-    let input_hash = crate::tool_invocation::stable_hash(input);
-    if !crate::repetition_guard::is_dispatch_blocked(turn_id, tool_name, &input_hash) {
-        return None;
-    }
-    tracing::warn!(%tool_name, %turn_id, "dispatch refused for a repeatedly failing call");
-    Some(ConversationMessage::tool_result(
-        tool_use_id.to_string(),
-        tool_name.to_string(),
-        "Runtime refused to dispatch this call again: it has already failed \
-         deterministically this many times in this turn, so retrying it cannot \
-         produce a different result. Take a different action, or report the \
-         objective as blocked through objective_complete_request."
-            .to_string(),
-        true,
-    ))
-}
-
 
 use super::*;
 
@@ -594,9 +563,8 @@ where
     ) -> Result<ConversationMessage, RuntimeError> {
         let tool_use_id = task.tool_call_id.as_str();
         let tool_name = task.tool_name.as_str();
-        if let Some(refusal) =
-            blocked_repeated_call(&self.active_turn_id(), tool_name, tool_use_id, input)
-        {
+        let refusal = self.blocked_repeated_call(tool_name, tool_use_id, input, iterations);
+        if let Some(refusal) = refusal {
             return Ok(refusal);
         }
         let (pre_hook_result, effective_input, model_delivery_requirement, mut permission_context) =
@@ -1348,7 +1316,7 @@ where
     /// The ledger is keyed by turn, so the identity has to be settled before a
     /// failure is recorded or a dispatch is refused. Resolving it in one place
     /// keeps both paths on the same identity.
-    fn active_turn_id(&self) -> String {
+    pub(crate) fn active_turn_id(&self) -> String {
         self.session_input_stream
             .active_turn_id()
             .map(|turn| turn.as_str().to_string())
@@ -1361,6 +1329,76 @@ where
     /// already over the structural limit, and because resolving the turn identity
     /// is worth reading on its own: the ledger is keyed by turn, so the identity
     /// has to be settled before the failure is recorded.
+    /// Refuse a call that has already failed deterministically this many times.
+    ///
+    /// A diagnosis is advice the model can ignore; a refusal is what ends the loop.
+    /// One live run re-sent one review call one hundred and twenty-two times against
+    /// a graph it could not name, paying for every attempt, because nothing refused
+    /// it. The input fingerprint is the same one the failure ledger keys on, so a
+    /// refused call is exactly a recorded one. Transient failures never count, so a
+    /// retry that can legitimately succeed is never refused.
+    ///
+    /// The refusal is also recorded as evidence. A refusal that only returns a tool
+    /// result leaves the report unable to reconcile with the ledger: the model was
+    /// answered, but no invocation record exists for the answer.
+    fn blocked_repeated_call(
+        &self,
+        tool_name: &str,
+        tool_use_id: &str,
+        input: &str,
+        iterations: usize,
+    ) -> Option<ConversationMessage> {
+        let turn_id = self.active_turn_id();
+        let input_hash = crate::tool_invocation::stable_hash(input);
+        let Some(refusal) = crate::repetition_guard::refusal_for(&turn_id, tool_name, &input_hash)
+        else {
+            return None;
+        };
+        tracing::warn!(%tool_name, %turn_id, "dispatch refused for a repeatedly failing call");
+        let reason = format!(
+            "Runtime refused to dispatch this call again: it has already failed \
+             deterministically {} times in this turn, so retrying it cannot produce a \
+             different result. Take a different action, or report the objective as \
+             blocked through objective_complete_request.",
+            refusal.count
+        );
+        let record = self
+            .start_tool_invocation_record(tool_use_id, tool_name, input, iterations)
+            .refused(&reason, now_ms());
+        let refs = vec![
+            RuntimeEventRef {
+                kind: "tool_invocation".to_string(),
+                id: record.invocation_id.clone(),
+            },
+            RuntimeEventRef {
+                kind: "tool_call".to_string(),
+                id: record.tool_call_id.clone(),
+            },
+        ];
+        self.append_execution_runtime_event(
+            RuntimeEventScope::Tool,
+            "tool.invocation.refused",
+            Some(record.status.as_str().to_string()),
+            refs,
+            serde_json::json!({
+                "invocation_id": record.invocation_id,
+                "tool_call_id": record.tool_call_id,
+                "tool_name": record.tool_name,
+                "turn_id": turn_id,
+                "input_hash": record.input_hash,
+                "cause_signature": refusal.cause_signature,
+                "count": refusal.count,
+                "state_derived": refusal.state_derived,
+            }),
+        );
+        Some(ConversationMessage::tool_result(
+            tool_use_id.to_string(),
+            tool_name.to_string(),
+            reason,
+            true,
+        ))
+    }
+
     fn append_repetition_diagnosis(
         &self,
         tool_name: &str,

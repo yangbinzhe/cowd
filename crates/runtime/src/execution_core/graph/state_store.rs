@@ -50,6 +50,25 @@ pub struct ExecutionChildLink {
     pub child_objective: String,
 }
 
+/// The store keys on the graph id alone, while a claim records the id the Agent
+/// was admitted under - an agent-run id (`run:<graph_id>`). Looking that up here
+/// can never succeed: one live run failed the same `task_review` one hundred and
+/// twenty-two times on exactly that mismatch while the graph existed the whole
+/// time.
+///
+/// Normalizing at the store entry, rather than at each call site, is the point.
+/// Two call sites (`review_evidence.rs` and `review_evidence/results.rs`) did not
+/// normalize, and that is where the 28 failures in the live run came from. A rule
+/// that depends on every caller remembering it is not a rule.
+///
+/// `runner:` and `runs:` are separate namespaces, not run ids, so they are left
+/// alone. The error keeps the id that was asked for: a message that renames the
+/// id cannot be matched against what the model or the caller actually saw.
+#[must_use]
+pub fn graph_id_for_lookup(graph_id: &str) -> &str {
+    graph_id.strip_prefix("run:").unwrap_or(graph_id)
+}
+
 impl ExecutionGraphStateStore {
     pub(crate) fn subscribe_commits(&self) -> tokio::sync::watch::Receiver<u64> {
         self.event_store.subscribe_commits()
@@ -79,27 +98,28 @@ impl ExecutionGraphStateStore {
         &self,
         graph_id: &str,
     ) -> Result<Arc<ExecutionGraph>, ExecutionStateStoreError> {
-        if let Some(graph) = self.hot_graphs.get(graph_id) {
+        let key = graph_id_for_lookup(graph_id);
+        if let Some(graph) = self.hot_graphs.get(key) {
             if !self.verify_durable_revision
-                || self.event_store.stream_revision(graph_id)? == graph.revision
+                || self.event_store.stream_revision(key)? == graph.revision
             {
                 return Ok(graph);
             }
         }
-        let permit = self.hot_graphs.recovery_permit(graph_id);
+        let permit = self.hot_graphs.recovery_permit(key);
         if !permit.is_leader() && !self.verify_durable_revision {
-            if let Some(graph) = self.hot_graphs.get(graph_id) {
+            if let Some(graph) = self.hot_graphs.get(key) {
                 return Ok(graph);
             }
             drop(permit);
             return self.load_snapshot(graph_id);
         }
         if !self.verify_durable_revision {
-            if let Some(graph) = self.hot_graphs.get(graph_id) {
+            if let Some(graph) = self.hot_graphs.get(key) {
                 return Ok(graph);
             }
         }
-        let events = self.event_store.list_stream(graph_id).map_err(|error| {
+        let events = self.event_store.list_stream(key).map_err(|error| {
             ExecutionStateStoreError::Corrupt {
                 graph_id: graph_id.to_string(),
                 reason: error,
@@ -111,7 +131,7 @@ impl ExecutionGraphStateStore {
                 location: "<unspecified>".to_string(),
             });
         }
-        let graph = project_graph_events(graph_id, events)?;
+        let graph = project_graph_events(key, events)?;
         let graph = Arc::new(graph);
         self.hot_graphs.record_recovery();
         self.hot_graphs.publish_snapshot(Arc::clone(&graph));
@@ -149,14 +169,20 @@ impl ExecutionGraphStateStore {
             .map_err(|error| ExecutionStateStoreError::BlockingTask(error.to_string()))?
     }
 
-    #[track_caller]
+    /// `#[track_caller]` is a no-op on an async fn, so the location this records is
+    /// the store entry, not the call site. The message says so instead of implying a
+    /// caller it never saw. Capturing the real caller would mean adding a location
+    /// parameter to every async call site - signature pollution for observability.
     pub async fn load_async(
         &self,
         graph_id: impl Into<String>,
     ) -> Result<ExecutionGraph, ExecutionStateStoreError> {
         let store = self.clone();
         let graph_id = graph_id.into();
-        let location = std::panic::Location::caller().to_string();
+        let location = format!(
+            "{} (async: store entry, not the caller)",
+            std::panic::Location::caller()
+        );
         tokio::task::spawn_blocking(move || store.load_at(&graph_id, &location))
             .await
             .map_err(|error| ExecutionStateStoreError::BlockingTask(error.to_string()))?
@@ -596,5 +622,64 @@ mod not_found_location_tests {
             rendered.contains("state_store.rs"),
             "the call site must name a file: {rendered}"
         );
+    }
+
+    /// The store normalizes a run id at its own entry, so a call site that forgets
+    /// the translation still resolves. Two call sites did forget
+    /// (`review_evidence.rs`, `review_evidence/results.rs`), and that is where the
+    /// 28 failures of one live run came from while the graph existed the whole time.
+    ///
+    /// Proved by which stream the store reads: a non-graph event is planted under the
+    /// graph id. If the entry normalized, the store finds it and reports the scope
+    /// mismatch; if it did not, the run-id stream is empty and the store reports
+    /// NotFound.
+    #[test]
+    fn the_store_normalizes_a_run_id_at_its_own_entry_not_at_the_call_site() {
+        let event_store = Arc::new(RuntimeEventStore::for_test());
+        event_store
+            .append(crate::runtime_event_store::RuntimeEventInput {
+                stream_id: "agentic-graph:entry-normalization".to_string(),
+                scope: RuntimeEventScope::Goal,
+                kind: "probe".to_string(),
+                status: None,
+                actor: None,
+                refs: Vec::new(),
+                payload: serde_json::json!({}),
+            })
+            .expect("plant");
+        let store = ExecutionGraphStateStore::new(Arc::clone(&event_store));
+        let error = store
+            .load("run:agentic-graph:entry-normalization")
+            .expect_err("the stream is not a graph stream");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("corrupt"),
+            "the store must have read the graph-id stream: {rendered}"
+        );
+    }
+
+    /// The error keeps the id that was asked for. A message that renames the id
+    /// cannot be matched against what the model or the caller actually saw, and the
+    /// whole value of this error is that it names the thing that was looked up.
+    #[test]
+    fn the_error_keeps_the_id_that_was_asked_for() {
+        let store = ExecutionGraphStateStore::new(Arc::new(RuntimeEventStore::for_test()));
+        let error = store
+            .load("run:agentic-graph:asked-for")
+            .expect_err("absent");
+        assert!(
+            error.to_string().contains("run:agentic-graph:asked-for"),
+            "the message must name the id that was asked for: {error}"
+        );
+    }
+
+    /// `runner:` and `runs:` are separate namespaces, not run ids. Normalizing them
+    /// would merge three different identity spaces into one.
+    #[test]
+    fn runner_and_runs_are_not_run_ids() {
+        assert_eq!(graph_id_for_lookup("run:agentic-graph:abc"), "agentic-graph:abc");
+        assert_eq!(graph_id_for_lookup("runner:abc"), "runner:abc");
+        assert_eq!(graph_id_for_lookup("runs:abc"), "runs:abc");
+        assert_eq!(graph_id_for_lookup("agentic-graph:abc"), "agentic-graph:abc");
     }
 }

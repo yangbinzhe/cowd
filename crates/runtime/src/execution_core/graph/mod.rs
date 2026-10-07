@@ -38,7 +38,7 @@ pub use resources::{
 pub(crate) use runner::validate_worktree_path;
 pub(crate) use runner::ExecutionGraphRunner;
 pub use runner::{ExecutionRunReport, ExecutionRunnerError};
-pub use state_store::{ExecutionGraphStateStore, ExecutionStateStoreError};
+pub use state_store::{graph_id_for_lookup, ExecutionGraphStateStore, ExecutionStateStoreError};
 
 #[cfg(test)]
 mod tests;

@@ -171,6 +171,23 @@ impl HarnessEvalReportGateItem {
             repair_hint: repair_hint.into(),
         }
     }
+
+    /// A gate that cannot be evaluated at this level says so. Printing the evaluated
+    /// object's failure state as evidence for a pass tells an auditor nothing about
+    /// why it passed.
+    fn not_required(
+        name: impl Into<String>,
+        evidence: impl Into<String>,
+        repair_hint: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            status: "not_required".to_string(),
+            required: false,
+            evidence: evidence.into(),
+            repair_hint: repair_hint.into(),
+        }
+    }
 }
 
 impl HarnessEvalReportGate {
@@ -561,6 +578,93 @@ fn agentic_closure_gate_evidence(closure: &Value) -> String {
     )
 }
 
+/// Terminal tool statuses. A `running` record and its terminal record are the same
+/// call, so counting both inflates the number by the number of in-flight records.
+pub(crate) const TERMINAL_TOOL_STATUSES: [&str; 5] =
+    ["completed", "failed", "denied", "timed_out", "refused"];
+
+/// The single counting rule: terminal tool events in a record set.
+///
+/// The metric and the gate must read this, not two versions of it. One live run held
+/// 497 payloads with a tool name while exactly 95 were terminal, and the durable store
+/// agreed with 95 while the report read 3 - the report and the evidence were reading two
+/// different record paths.
+#[must_use]
+pub(crate) fn terminal_tool_events_in_events(events: &[Value]) -> u64 {
+    events
+        .iter()
+        .filter_map(|event| event.get("payload"))
+        .filter(|payload| payload.get("tool_name").is_some())
+        .filter(|payload| {
+            payload
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| TERMINAL_TOOL_STATUSES.contains(&status))
+        })
+        .count() as u64
+}
+
+/// Terminal tool events recorded in the scenario evidence.
+#[must_use]
+pub(crate) fn terminal_tool_events(report: &Value) -> u64 {
+    report
+        .get("scenarios")
+        .and_then(Value::as_array)
+        .map_or(0, |scenarios| {
+            scenarios
+                .iter()
+                .map(|scenario| {
+                    scenario
+                        .pointer("/failure_diagnostics/timeline/events")
+                        .and_then(Value::as_array)
+                        .map_or(0, |events| terminal_tool_events_in_events(events))
+                })
+                .sum()
+        })
+}
+
+/// The tool-lane gates, from one counting source.
+///
+/// The claim gate and the reconciliation gate must read the same function, otherwise a
+/// run can pass the claim gate on a headline counter while its own evidence contradicts
+/// it - which is exactly what one live run did (report 3, evidence 95, store 95).
+///
+/// The DB cross-check itself stays a script: the harness does not hold the database
+/// in-process, the isolated run creates it from the shell wrapper.
+fn push_tool_evidence_gate_items(
+    items: &mut Vec<HarnessEvalReportGateItem>,
+    level: &str,
+    report: &Value,
+    tool_calls: u64,
+    claims_tool_validation: bool,
+) {
+    let terminal_events = terminal_tool_events(report);
+    items.push(HarnessEvalReportGateItem::new(
+        "claimed_tool_validation_has_tool_evidence",
+        !claims_tool_validation || tool_calls.max(terminal_events) > 0,
+        true,
+        format!(
+            "claims_tool_validation={claims_tool_validation}, tool_calls={tool_calls}, terminal_tool_events={terminal_events}"
+        ),
+        "reports that claim tool validation must include real local tool execution evidence",
+    ));
+    items.push(if terminal_events == 0 {
+        HarnessEvalReportGateItem::not_required(
+            "report_counts_match_durable_store",
+            format!("terminal tool events in evidence: 0 ({level} records no tool lane)"),
+            "not applicable at this level; the comparison is only meaningful once the run records tool events",
+        )
+    } else {
+        HarnessEvalReportGateItem::new(
+            "report_counts_match_durable_store",
+            tool_calls == terminal_events,
+            true,
+            format!("report tool_calls={tool_calls}, terminal tool events in evidence={terminal_events}"),
+            "the report and the evidence must agree exactly; a difference is a counting-source problem, not a behaviour change",
+        )
+    });
+}
+
 #[must_use]
 pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
     let level = report
@@ -813,13 +917,7 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
         format!("claims_orchestration={claims_orchestration}, runtime_actions={runtime_actions}"),
         "reports that claim orchestration must include runtime action trace evidence",
     ));
-    items.push(HarnessEvalReportGateItem::new(
-        "claimed_tool_validation_has_tool_evidence",
-        !claims_tool_validation || tool_calls > 0,
-        true,
-        format!("claims_tool_validation={claims_tool_validation}, tool_calls={tool_calls}"),
-        "reports that claim tool validation must include real local tool execution evidence",
-    ));
+    push_tool_evidence_gate_items(&mut items, level, report, tool_calls, claims_tool_validation);
     items.push(HarnessEvalReportGateItem::new(
         "claimed_memory_context_has_context_report",
         !claims_memory_context
@@ -1504,6 +1602,86 @@ mod gate_tests {
             gate_item(&unknown_cache, "real_provider_cache_usage_known").status,
             "failed",
             "a declared known flag must not override an unknown physical attempt"
+        );
+    }
+
+    /// The one gate added for the tool/harness layer: the report and the evidence must
+    /// read the same record.
+    ///
+    /// The contradiction it asserts was observed, not imagined - one live run reported
+    /// 3 tool calls while its own evidence held 95 terminal tool events and the durable
+    /// store agreed with 95. A level that records no tool lane says `not_required`
+    /// instead of passing on an empty set.
+    #[test]
+    fn report_counts_must_match_the_evidence_or_say_not_required() {
+        let evidence = json!([
+            {"payload": {"tool_name": "task_review", "status": "failed"}},
+            {"payload": {"tool_name": "task_review", "status": "running"}},
+            {"payload": {"tool_name": "artifact_publish", "status": "refused"}}
+        ]);
+        let diverging = json!({
+            "level": "deep",
+            "execution_trace": {
+                "tool_calls": 3,
+                "total_usage": {"total_tokens": 1, "usage_source": "real_provider"}
+            },
+            "scenarios": [{"failure_diagnostics": {"timeline": {"events": evidence}}}]
+        });
+        let gate = evaluate_report_gate(&diverging);
+        let item = gate_item(&gate, "report_counts_match_durable_store");
+        assert_eq!(
+            item.status, "failed",
+            "report 3 against evidence 2: {item:?}"
+        );
+
+        // The same evidence counted by the same rule reconciles, and the claim gate
+        // stops failing on a headline number that the evidence contradicts.
+        let reconciled = json!({
+            "level": "deep",
+            "next_gen_scenarios": [{ "claims_tool_validation": true }],
+            "execution_trace": {
+                "tool_calls": 2,
+                "total_usage": {"total_tokens": 1, "usage_source": "real_provider"}
+            },
+            "scenarios": [{"failure_diagnostics": {"timeline": {"events": evidence}}}]
+        });
+        let reconciled_gate = evaluate_report_gate(&reconciled);
+        assert_eq!(
+            gate_item(&reconciled_gate, "report_counts_match_durable_store").status,
+            "passed"
+        );
+
+        // The headline number read zero while the evidence held calls. Reading the same
+        // source is what makes that case pass on evidence rather than on a counter.
+        let zero_reported = json!({
+            "level": "deep",
+            "next_gen_scenarios": [{ "claims_tool_validation": true }],
+            "execution_trace": {
+                "tool_calls": 0,
+                "total_usage": {"total_tokens": 1, "usage_source": "real_provider"}
+            },
+            "scenarios": [{"failure_diagnostics": {"timeline": {"events": evidence}}}]
+        });
+        let zero_gate = evaluate_report_gate(&zero_reported);
+        assert_eq!(
+            gate_item(&zero_gate, "claimed_tool_validation_has_tool_evidence").status,
+            "passed",
+            "the evidence holds the calls even when the headline counter reads zero"
+        );
+
+        let quick = json!({
+            "level": "quick",
+            "execution_trace": {
+                "tool_calls": 0,
+                "total_usage": {"total_tokens": 0, "usage_source": "deterministic_smoke"}
+            },
+            "scenarios": []
+        });
+        let quick_gate = evaluate_report_gate(&quick);
+        assert_eq!(
+            gate_item(&quick_gate, "report_counts_match_durable_store").status,
+            "not_required",
+            "a level with no tool lane must say so, not pass on an empty set"
         );
     }
 

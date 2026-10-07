@@ -851,8 +851,12 @@ pub struct AgentActionErrorObservation {
 pub enum AgentActionValidationError {
     #[error("agent action field `{0}` is required")]
     Missing(&'static str),
-    #[error("agent action field `{0}` cannot be empty")]
-    Empty(&'static str),
+    /// The model did send this field, so the field name is real information: the
+    /// phantom-field rule only applies to fields the schema says may be absent. The
+    /// rule stays next to the name so the model knows both which field and what to
+    /// change.
+    #[error("agent action field `{0}` cannot be empty; {1}")]
+    Empty(&'static str, &'static str),
     #[error("agent action field `{0}` contains duplicate values")]
     Duplicate(&'static str),
     #[error("agent action field `{0}` has an invalid canonical form")]
@@ -892,11 +896,14 @@ pub const NON_EMPTY_VALUE_RULE: &str = "the fields you sent must carry real valu
 
 fn required(field: &'static str, value: &str) -> Result<(), AgentActionValidationError> {
     if value.trim().is_empty() {
-        // An empty value is a value the model did send. Naming the field as
-        // missing is the same phantom as reporting an absent optional, so the
-        // instruction states the rule instead of pointing at a field.
-        let _ = field;
-        Err(AgentActionValidationError::Rejected(NON_EMPTY_VALUE_RULE))
+        // An empty value is a value the model did send, so the field name is real
+        // information and not a phantom. The phantom-field rule applies to fields the
+        // schema says may be absent; here the model has to know which field it sent
+        // empty, and what "empty" means for it.
+        Err(AgentActionValidationError::Empty(
+            field,
+            NON_EMPTY_VALUE_RULE,
+        ))
     } else {
         Ok(())
     }
@@ -907,8 +914,11 @@ fn optional_nonempty(
     value: Option<&str>,
 ) -> Result<(), AgentActionValidationError> {
     if value.is_some_and(|value| value.trim().is_empty()) {
-        let _ = field;
-        Err(AgentActionValidationError::Rejected(NON_EMPTY_VALUE_RULE))
+        // Sent, but empty: the name is real. An absent optional is not this case.
+        Err(AgentActionValidationError::Empty(
+            field,
+            NON_EMPTY_VALUE_RULE,
+        ))
     } else {
         Ok(())
     }
@@ -1026,6 +1036,33 @@ mod tests {
         assert!(
             matches!(error, AgentActionValidationError::Rejected(_)),
             "there is no field named `result_refs_or_evidence_refs` in any schema: {error}"
+        );
+    }
+
+    /// A field the model actually sent empty is not a phantom: the name is the only
+    /// actionable part of the message. The rule still has to travel with it, because
+    /// the name alone does not say what "empty" means for that field.
+    #[test]
+    fn an_empty_field_names_the_field_and_still_states_the_rule() {
+        let error = AgentAction::TeamCreate(TeamCreateInput {
+            name: String::new(),
+            mission: "mission-1".to_string(),
+            objective: None,
+        })
+        .validate()
+        .expect_err("an empty name is a field the model sent");
+        assert!(
+            matches!(
+                error,
+                AgentActionValidationError::Empty("name", NON_EMPTY_VALUE_RULE)
+            ),
+            "the field the model sent must be named: {error}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("`name`"), "the message must name the field: {message}");
+        assert!(
+            message.contains(NON_EMPTY_VALUE_RULE),
+            "the rule must stay: {message}"
         );
     }
 

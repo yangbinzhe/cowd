@@ -622,6 +622,13 @@ where
     }
 
     pub(super) fn record_turn_completed(&self, summary: &TurnSummary) {
+        // The turn boundary is where a breaker's scope ends. Everything filed under
+        // this turn is stale from here: the next turn replans anyway, and a breaker
+        // that outlives its turn can suppress a call that would now succeed.
+        // This runs before the tracer check, because a turn without a tracer still
+        // ended, and a clear that depends on observability being configured would
+        // leave the ledger growing on exactly the paths that fail.
+        crate::repetition_guard::clear_turn(&self.active_turn_id());
         let Some(session_tracer) = &self.session_tracer else {
             return;
         };
@@ -1734,6 +1741,9 @@ where
         let active = self
             .active_turn_strategy()
             .ok_or_else(|| RuntimeError::new("early stop has no turn strategy"))?;
+        // An early stop ends the turn without a normal completion, so the breakers
+        // filed under it must not survive into the next turn.
+        crate::repetition_guard::clear_turn(&self.active_turn_id());
         self.revise_active_turn_strategy(
             active.selected_candidate,
             active.decision.pattern(),

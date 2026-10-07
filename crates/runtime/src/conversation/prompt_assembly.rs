@@ -28,6 +28,15 @@ pub struct PromptComposition {
     /// matrix / task / workspace / ...), so a divergence can be attributed to a
     /// named source rather than to "context".
     pub contextual_packet_bytes: std::collections::BTreeMap<String, usize>,
+    /// The tool schema array as it appears in the request.
+    ///
+    /// This is the one of the six regions that was not measured, and it is the one
+    /// the question "did appending contract summaries reduce reuse?" is about: the
+    /// tool array sits at the head of the reusable prefix, so anything that grows it
+    /// pushes every later segment past the cache breakpoint. Without a column for it,
+    /// a fall in the reuse ratio cannot be separated from a fall caused by memory or
+    /// skills.
+    pub tool_array_bytes: usize,
 }
 
 impl PromptComposition {
@@ -40,6 +49,7 @@ impl PromptComposition {
             + self.cache_cohort_user_prefix_bytes
             + self.immutable_user_prefix_bytes
             + self.runtime_context_bytes
+            + self.tool_array_bytes
     }
 
     /// Fraction of the prompt side that is guaranteed byte-stable across
@@ -51,6 +61,17 @@ impl PromptComposition {
             return 0;
         }
         u32::try_from(self.stable_system_bytes.saturating_mul(10_000) / total).unwrap_or(10_000)
+    }
+
+    /// Attach the tool schema array's bytes.
+    ///
+    /// The value has to come from the wire request, not from a re-serialization of the
+    /// definitions: the number is only comparable with `model_visible_prompt_bytes` when
+    /// it counts the same bytes that the cache identity hashes.
+    #[must_use]
+    pub fn with_tool_array_bytes(mut self, tool_array_bytes: usize) -> Self {
+        self.tool_array_bytes = tool_array_bytes;
+        self
     }
 }
 
@@ -236,6 +257,9 @@ impl PromptAssembly {
             // renderings can never double-count.
             runtime_context_bytes: contextual_packets_total,
             contextual_packet_bytes,
+            // The tool array is not part of the assembly; it is attached at the wire
+            // site, where the exact bytes that go on the request are known.
+            tool_array_bytes: 0,
         }
     }
 

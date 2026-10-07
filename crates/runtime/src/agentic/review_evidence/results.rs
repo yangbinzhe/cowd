@@ -276,7 +276,7 @@ pub(super) async fn resolve_result(
                 None
             };
             let (actor_ref, execution, packet) = if let Some(execution) = execution {
-                let packet = super::physical_packet(services, &execution)?;
+                let packet = super::physical_packet(services, &execution).await?;
                 (
                     artifact.committed_by.clone(),
                     format!("agent-run:{}", packet.assignment.run_id),
@@ -318,7 +318,7 @@ pub(super) async fn resolve_result(
                     )
                 })?;
                 if let Some(execution) = &owner.execution_id {
-                    let packet = super::physical_packet(services, execution)?;
+                    let packet = super::physical_packet(services, execution).await?;
                     (
                         owner.actor_id,
                         format!("agent-run:{}", packet.assignment.run_id),
@@ -431,7 +431,7 @@ pub(super) async fn resolve_result(
                         })
                         .map(|reference| reference.id.as_str())
                         .ok_or("result Tool activity has no physical execution reference")?;
-                    let packet = super::physical_packet(services, execution)?;
+                    let packet = super::physical_packet(services, execution).await?;
                     if packet.assignment.run_id != *run {
                         return Err("result Tool activity does not match physical producer".into());
                     }

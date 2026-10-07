@@ -2451,12 +2451,12 @@ where
                         .is_some_and(DelegatedAgenticProtocolState::is_terminal);
                 let agentic_recovery_attempt: Option<u8> = {
                     let mut state = self.state.lock().await;
-                    let elapsed = state.started_at.elapsed();
-                    delegation_attempt_count(
-                        &mut state.agentic_protocol_recovery_attempts,
+                    guarded_delegation_attempt(
+                        self.services.as_ref(),
+                        &mut state,
+                        ticket,
                         post_receipt_failure,
-                        pending_delegated_protocol.is_some(),
-                        elapsed,
+                        pending_delegated_protocol,
                     )
                 };
                 let intervention = if terminal_provider_route_failure {
@@ -3013,6 +3013,108 @@ fn zero_recovery_deadline() -> std::time::Duration {
         .filter(|seconds| *seconds > 0)
         .map(std::time::Duration::from_secs)
         .unwrap_or(std::time::Duration::from_secs(600))
+}
+
+/// Whether a pending protocol reached the ceiling by elapsed time alone.
+///
+/// A model that keeps failing to close records attempts; a model that stopped
+/// answering records none. Both land on the same ceiling number, so the two cannot be
+/// told apart from the number afterwards - and "still working" and "stuck" are
+/// different facts that an operator must be able to distinguish.
+fn zero_recovery_stall(attempts: u8, protocol_pending: bool, elapsed: std::time::Duration) -> bool {
+    protocol_pending && attempts == 0 && elapsed >= zero_recovery_deadline()
+}
+
+/// The attempt count for a pending delegated closure, plus the durable record when the
+/// ceiling was reached by elapsed time alone.
+///
+/// The two branches produce the same number, so the record has to be written where the
+/// branch is known. Reading it back from the returned number cannot tell "still working"
+/// from "stuck", and that distinction is the whole point of the event.
+fn guarded_delegation_attempt(
+    services: &crate::RuntimeServices,
+    state: &mut TurnGraphState,
+    ticket: &NodeExecutionTicket,
+    post_receipt_failure: bool,
+    protocol: Option<&DelegatedAgenticProtocolState>,
+) -> Option<u8> {
+    let elapsed = state.started_at.elapsed();
+    let attempt = delegation_attempt_count(
+        &mut state.agentic_protocol_recovery_attempts,
+        post_receipt_failure,
+        protocol.is_some(),
+        elapsed,
+    );
+    if let Some(protocol) = protocol.filter(|_| {
+        zero_recovery_stall(state.agentic_protocol_recovery_attempts, true, elapsed)
+    }) {
+        record_program_closure_timeout(
+            services,
+            &state.session_id,
+            &state.turn_id,
+            ticket,
+            protocol,
+            elapsed,
+        );
+    }
+    attempt
+}
+
+/// The durable record of a stalled delegated closure.
+///
+/// The guard changes an in-memory counter and nothing else, so the event stream shows
+/// a turn that simply stopped: nothing says which Program Task it was stuck on, or that
+/// the stall was recognized at all. Naming the Program and the Task is the whole
+/// content of this event, and it is what makes "still working" and "stuck" separable
+/// after the fact.
+fn record_program_closure_timeout(
+    services: &crate::RuntimeServices,
+    session_id: &str,
+    turn_id: &str,
+    ticket: &NodeExecutionTicket,
+    protocol: &DelegatedAgenticProtocolState,
+    elapsed: std::time::Duration,
+) {
+    let append = services.event_store().append(crate::RuntimeEventInput {
+        stream_id: format!("session:{session_id}"),
+        scope: crate::RuntimeEventScope::Session,
+        kind: "agentic.program_closure_timeout".to_string(),
+        status: Some("stalled".to_string()),
+        actor: Some("conversation_runtime.delegated_closure".to_string()),
+        refs: vec![
+            crate::RuntimeEventRef {
+                kind: "agentic_program".to_string(),
+                id: protocol.program_id.clone(),
+            },
+            crate::RuntimeEventRef {
+                kind: "agentic_task".to_string(),
+                id: protocol.task_id.clone(),
+            },
+            crate::RuntimeEventRef {
+                kind: "execution_graph".to_string(),
+                id: ticket.graph_id.clone(),
+            },
+            crate::RuntimeEventRef {
+                kind: "execution_node".to_string(),
+                id: ticket.node_id.clone(),
+            },
+            crate::RuntimeEventRef {
+                kind: "turn".to_string(),
+                id: turn_id.to_string(),
+            },
+        ],
+        payload: serde_json::json!({
+            "program_id": protocol.program_id,
+            "task_id": protocol.task_id,
+            "task_status": format!("{:?}", protocol.status),
+            "elapsed_ms": elapsed.as_millis(),
+            "deadline_ms": zero_recovery_deadline().as_millis(),
+            "reason": "a pending delegated closure recorded no attempt past the deadline",
+        }),
+    });
+    if let Err(error) = append {
+        tracing::warn!(%error, "program closure timeout event could not be recorded");
+    }
 }
 
 /// How far this turn is into the no-progress fuse for a delegated closure.
@@ -5970,5 +6072,24 @@ mod zero_recovery_guard_tests {
             NO_RECOVERY_ATTEMPT_CEILING > 2,
             "at or below the retry budget this would replan instead of stopping"
         );
+    }
+
+    /// The two ways to reach the ceiling must stay distinguishable, because the durable
+    /// record names them differently.
+    ///
+    /// A model that keeps failing to close records attempts; a model that stopped
+    /// answering records none. Both produce the same number, so a report cannot tell
+    /// "still working" from "stuck" unless the branch is known at the moment it fires.
+    #[test]
+    fn the_stall_branch_is_not_the_increment_branch() {
+        let past = zero_recovery_deadline() + std::time::Duration::from_secs(1);
+        // Increment branch: attempts exist, so elapsed time alone is not a stall.
+        assert!(!zero_recovery_stall(NO_RECOVERY_ATTEMPT_CEILING, true, past));
+        // Stall branch: no attempt at all past the deadline.
+        assert!(zero_recovery_stall(0, true, past));
+        // A protocol that reached its own end is not stalled.
+        assert!(!zero_recovery_stall(0, false, past));
+        // Before the deadline, no attempt is a model that is still working.
+        assert!(!zero_recovery_stall(0, true, std::time::Duration::from_secs(1)));
     }
 }
