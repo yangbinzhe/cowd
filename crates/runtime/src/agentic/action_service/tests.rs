@@ -3658,3 +3658,178 @@ fn a_task_action_reports_the_task_it_settled_as_the_entity_it_changed() {
         "an observation that changes no entity must still report none: {observed:?}"
     );
 }
+
+/// A rework verdict returns the Task to the market: claimant cleared, attempts
+/// cleared, status `Rework`. It does **not** advance `review_generation`, and the
+/// generation only moves when a review attempt *fails* (`work_market.rs`).
+///
+/// A dispatched Agent execution is identified by
+/// `digest(program | task | agent | mode | generation)`, and the Review mode's
+/// generation is exactly `review_generation`. So every review round of the same
+/// (Task, reviewer) pair has the *same* graph identity: the second round collides
+/// with the first, and `dispatch_agentic_task` swallows it as an existing durable
+/// admission instead of admitting a new graph.
+///
+/// In run #6 this is why the Program never settled. Task `8a8f5e9b` was reviewed
+/// `rework` at 07:47:07, re-claimed at claim generation 2 and re-submitted at
+/// 07:49:10 - the fourth `task_submit` in the run, and the first one that produced
+/// no `task_attempt_dispatch`. The Task stayed `Submitted` forever, so the barrier's
+/// only non-fuse release conditions (`all_tasks_accepted` needs all Tasks accepted;
+/// `worker_quiescent` needs no unsettled Task) could never be met, and the root graph
+/// had no ready node to recover it.
+#[test]
+fn a_rework_round_must_be_reviewable_again_in_its_own_graph() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = AgentActionService::new(store.clone());
+    let team = service
+        .apply(&root(
+            "e3-team",
+            AgentAction::TeamCreate(TeamCreateInput {
+                name: "Evidence".into(),
+                mission: "produce and verify one fact".into(),
+                objective: None,
+            }),
+        ))
+        .unwrap()
+        .changed_refs[0]
+        .clone();
+    let executor = service
+        .apply(&root(
+            "e5-executor",
+            AgentAction::AgentInvite(AgentInviteInput {
+                team_ref: team.clone(),
+                role: "researcher".into(),
+                mission: "produce a fact".into(),
+                required_capabilities: vec!["read".into()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: vec![],
+                execution_requirements: vec![],
+            }),
+        ))
+        .unwrap()
+        .changed_refs[0]
+        .clone();
+    let reviewer = service
+        .apply(&root(
+            "e5-reviewer",
+            AgentAction::AgentInvite(AgentInviteInput {
+                team_ref: team.clone(),
+                role: "reviewer".into(),
+                mission: "verify the fact independently".into(),
+                required_capabilities: vec!["read".into()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: vec![],
+                execution_requirements: vec![],
+            }),
+        ))
+        .unwrap()
+        .changed_refs[0]
+        .clone();
+    let task = service
+        .apply(&root(
+            "e5-task",
+            AgentAction::TaskPublish(TaskPublishInput {
+                team_ref: team.clone(),
+                title: "One fact".into(),
+                objective: "extract one verifiable fact".into(),
+                acceptance: "artifact plus evidence".into(),
+                acceptance_checks: Vec::new(),
+                required_capabilities: vec!["read".into()],
+                depends_on: Vec::new(),
+
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
+            }),
+        ))
+        .unwrap()
+        .changed_refs[0]
+        .clone();
+
+    let submit_once = |action_id: &str| {
+        service
+            .apply(&managed(
+                action_id,
+                &team,
+                &executor,
+                AgentAction::TaskClaim(TaskClaimInput {
+                    task_ref: task.clone(),
+                    reason: None,
+                }),
+            ))
+            .unwrap();
+        let artifact = service
+            .apply(&managed(
+                &format!("{action_id}-artifact"),
+                &team,
+                &executor,
+                AgentAction::ArtifactCommit(ArtifactCommitInput {
+                    content_ref: format!("artifact://{action_id}"),
+                    kind: "report".to_string(),
+                    title: "One fact".to_string(),
+                    relates_to: Vec::new(),
+                }),
+            ))
+            .unwrap()
+            .changed_refs[0]
+            .clone();
+        service
+            .apply(&managed(
+                &format!("{action_id}-submit"),
+                &team,
+                &executor,
+                AgentAction::TaskSubmit(
+                    serde_json::from_value(json!({
+                        "task_ref": task,
+                        "artifact_refs": [artifact],
+                        "evidence_refs": ["tool://observation"]
+                    }))
+                    .unwrap(),
+                ),
+            ))
+            .unwrap();
+    };
+    let _ = submit_once("round-1");
+
+    // The first review round sends the Task back.
+    let rework = service
+        .apply(&managed(
+            "e5-review-rework",
+            &team,
+            &reviewer,
+            AgentAction::TaskReview(TaskReviewInput {
+                task_ref: task.clone(),
+                decision: TaskReviewDecision::Rework,
+                reason: "does not state one verifiable fact".to_string(),
+                evidence_refs: vec!["tool://independent-inspection".into()],
+            }),
+        ))
+        .unwrap();
+    println!("rework receipt: {rework:?}");
+    assert_eq!(rework.status, AgentActionStatus::Applied);
+
+    let after_rework = service.project("program-1").unwrap();
+    let reworked = after_rework.tasks.get(&task).unwrap();
+    assert_eq!(reworked.status, crate::AgenticTaskStatus::Rework);
+    let generation_before = reworked.review_generation;
+
+    // The market is entered again and the Task is re-submitted.
+    let _ = submit_once("round-2");
+    let after_resubmit = service.project("program-1").unwrap();
+    let resubmitted = after_resubmit.tasks.get(&task).unwrap();
+    assert_eq!(resubmitted.status, crate::AgenticTaskStatus::Submitted);
+
+    assert!(
+        resubmitted.claim_generation > 1,
+        "the execute round advanced, so the re-execution got a fresh graph"
+    );
+    assert_eq!(
+        resubmitted.review_generation, generation_before,
+        "the review round did not advance, so a re-review of the same Task reuses the first review's graph identity and is swallowed as a duplicate admission - the Task can never be re-reviewed"
+    );
+}

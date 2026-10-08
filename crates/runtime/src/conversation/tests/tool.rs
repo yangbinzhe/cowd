@@ -3054,3 +3054,67 @@
         };
         assert!(!protocol_closure_can_be_required(Some(&protocol), Some(&terminal), &turn));
     }
+
+    /// The gain measure reads the tool result block, and that block carries the
+    /// model-visible text, not the durable receipt. A receipt whose output exceeds the
+    /// preview budget arrives truncated, so the parse fails and the action is invisible
+    /// to the measure. In run #6 the durable record shows `task_claim` changing a Task
+    /// while the same batch's observation reported no distinguishing evidence: 74 of 75
+    /// tool-batch observations reported `provenance: unknown`, and the only `observed`
+    /// one was a `team_create` whose output was small enough to stay inline.
+    #[test]
+    fn the_gain_measure_cannot_read_a_receipt_that_arrives_truncated() {
+        let receipt = harness_contract::agent_action::AgentActionObservation {
+            receipt_id: "receipt:program:test:claim".to_string(),
+            action_id: "action:claim".to_string(),
+            action: "task_claim".to_string(),
+            program_id: "program:test".to_string(),
+            revision: 4,
+            status: harness_contract::agent_action::AgentActionStatus::Applied,
+            duplicate: false,
+            changed_refs: vec!["task:t1".to_string()],
+            actionable: vec!["submit the deliverable".to_string()],
+            projection: Some(serde_json::json!({
+                "padding": "x".repeat(1024),
+                "counts": { "tasks": 1 }
+            })),
+            error: None,
+        };
+        let full = serde_json::to_string(&receipt).expect("receipt");
+        let model_visible = full.chars().take(500).collect::<String>();
+        assert!(
+            model_visible.len() < full.len(),
+            "the fixture must actually exceed the preview budget"
+        );
+
+        assert_eq!(
+            agentic_action_progress_refs(&[ConversationMessage::tool_result(
+                "call-1",
+                "task_claim",
+                &full,
+                false,
+            )]),
+            std::collections::BTreeSet::from([
+                "agentic_changed:task:t1".to_string(),
+                "agentic_receipt:receipt:program:test:claim".to_string(),
+            ]),
+            "the durable receipt is readable"
+        );
+        assert!(
+            serde_json::from_str::<harness_contract::agent_action::AgentActionObservation>(
+                &model_visible
+            )
+            .is_err(),
+            "the model-visible text is not a parseable receipt"
+        );
+        assert!(
+            agentic_action_progress_refs(&[ConversationMessage::tool_result(
+                "call-1",
+                "task_claim",
+                &model_visible,
+                false,
+            )])
+            .is_empty(),
+            "a truncated receipt is invisible to the gain measure"
+        );
+    }
