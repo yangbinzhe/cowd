@@ -1755,10 +1755,21 @@ fn entity_ref(envelope: &AgentActionEnvelope) -> Option<String> {
             return Some(existing_agent_ref.clone());
         }
     }
+    // A claim, a submission and a review each settle one Task. They name that Task
+    // in their input, so the entity they changed is the Task itself - the same
+    // treatment `TaskSupersede` and `TaskWithdraw` already get. Without this, the
+    // three actions that constitute the substance of a delegated Task produced an
+    // empty `changed_refs`, and the progress measure that reads it could never see
+    // them: in one live run 30 of 31 tool-batch observations reported no verified
+    // gain while their own summaries reported new coverage, and the turn was ended
+    // by the no-progress fuse after 21 replans that contradicted their observations.
     let prefix = match envelope.action {
         AgentAction::TeamCreate(_) => "team",
         AgentAction::AgentInvite(_) => "agent",
         AgentAction::TaskPublish(_) => "task",
+        AgentAction::TaskClaim(ref input) => return Some(input.task_ref.clone()),
+        AgentAction::TaskSubmit(ref input) => return Some(input.task_ref.clone()),
+        AgentAction::TaskReview(ref input) => return Some(input.task_ref.clone()),
         AgentAction::TaskSupersede(ref input) => return Some(input.task_ref.clone()),
         AgentAction::TaskWithdraw(ref input) => return Some(input.task_ref.clone()),
         AgentAction::MessagePublish(_) => "message",

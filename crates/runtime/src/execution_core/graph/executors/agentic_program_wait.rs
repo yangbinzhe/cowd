@@ -345,9 +345,17 @@ pub async fn resolve_agentic_program_wait(
         {
             break;
         }
+        // The correlation must reproduce the durable subject the node parked on, which is
+        // the parked revision, not the revision the resolver is resolving at. The commit
+        // gate (PLAN W1 / C4) anchors a resolution on the parked subject, so a correlation
+        // carrying a later revision is refused as unanchored - meaning a barrier could only
+        // ever be released at the exact revision it parked on. In one live run the barrier
+        // parked at Program revision 17 and the Program later reached 30, so every genuine
+        // release was rejected and the root stayed parked until the fuse ended the turn.
+        // The resolution's own revision is still recorded in `result_ref` below.
         let correlation_id = format!(
             "agentic-program-wait:{}:{}:{}",
-            program_id, node.id, revision
+            program_id, node.id, observed_revision
         );
         match supervisor
             .command(
@@ -633,8 +641,8 @@ mod tests {
     use harness_contract::policy::PermissionMode;
 
     use super::{
-        reconcile_agentic_program_wait_for_settled_graph, AgenticProgramWaitExecutor,
-        AgenticProgramWaitRequest,
+        reconcile_agentic_program_wait_for_settled_graph, resolve_agentic_program_wait,
+        AgenticProgramWaitExecutor, AgenticProgramWaitRequest,
     };
     use crate::execution_core::graph::executors::AgentTaskExecutor;
     use crate::RuntimeServices;
@@ -1084,5 +1092,173 @@ mod tests {
         .expect("root terminal");
         assert_eq!(terminal.completed, 1);
         assert_eq!(terminal.waiting, 0);
+    }
+
+    /// Run #5 parked the root barrier at Program revision 17 with three active child
+    /// graphs. Every later Program event settled one more Task, and the last event
+    /// accepted the final one - yet no `ResolveExternal` command was ever recorded for
+    /// the barrier, and the turn was ended by the no-progress fuse 30 checks later.
+    /// The barrier must be releasable against the Program truth the settling event
+    /// produces, not only against the state that existed before it.
+    #[tokio::test]
+    async fn the_event_that_settles_the_last_task_releases_the_parked_barrier() {
+        let services = RuntimeServices::in_memory().expect("runtime");
+        let program_id = "program-wait-last-settle";
+        let root_id = "root-wait-last-settle";
+        let wait_node = register_root_wait(&services, root_id, program_id);
+        open_program(&services, program_id, root_id);
+        let actions = services.agent_action_service();
+        let root = root_actor(program_id, root_id);
+        let apply = |action_id: &str,
+                     actor: &AgentActorBinding,
+                     action: AgentAction| {
+            actions
+                .apply(&AgentActionEnvelope {
+                    action_id: action_id.to_string(),
+                    actor: actor.clone(),
+                    expected_revision: None,
+                    action,
+                })
+                .expect("apply Program action")
+        };
+        let team = apply("settle-team", &root, AgentAction::TeamCreate(TeamCreateInput {
+            name: "Evidence".into(),
+            mission: "produce and verify one fact".into(),
+            objective: None,
+        }));
+        let team = apply("settle-team", &root, AgentAction::TeamCreate(TeamCreateInput {
+            name: "Evidence".into(),
+            mission: "produce and verify one fact".into(),
+            objective: None,
+        }))
+        .changed_refs[0]
+        .clone();
+        let invite = |role: &str, mission: &str| {
+            apply(
+                &format!("settle-invite-{role}"),
+                &root,
+                AgentAction::AgentInvite(
+                    serde_json::from_value(serde_json::json!({
+                        "team_ref": team,
+                        "role": role,
+                        "mission": mission,
+                        "required_capabilities": ["read"]
+                    }))
+                    .unwrap(),
+                ),
+            )
+            .changed_refs[0]
+            .clone()
+        };
+        let executor = invite("Executor", "produce one verifiable fact");
+        let reviewer = invite("Reviewer", "verify the fact independently");
+        let agent_actor = {
+            let mut actor = root.clone();
+            actor.kind = AgentActorKind::Agent;
+            actor.actor_id = executor.clone();
+            actor.team_id = Some(team.clone());
+            actor.agent_id = Some(executor.clone());
+            actor.execution_id = Some("agent-child-last-settle".to_string());
+            actor
+        };
+        let reviewer_actor = {
+            let mut actor = root.clone();
+            actor.kind = AgentActorKind::Agent;
+            actor.actor_id = reviewer.clone();
+            actor.team_id = Some(team.clone());
+            actor.agent_id = Some(reviewer.clone());
+            actor.execution_id = Some("agent-child-last-settle-review".to_string());
+            actor
+        };
+        let task = apply("settle-task", &root, AgentAction::TaskPublish(
+            serde_json::from_value(serde_json::json!({
+                "team_ref": team,
+                "title": "One fact",
+                "objective": "extract one verifiable fact",
+                "acceptance": "artifact plus evidence",
+                "required_capabilities": ["read"]
+            }))
+            .unwrap(),
+        ))
+        .changed_refs[0]
+        .clone();
+        register_agent_child(&services, root_id, &wait_node, program_id, "agent-child-last-settle");
+        services
+            .execution_supervisor()
+            .drive_registered(root_id)
+            .await
+            .expect("drive wait root");
+        assert_eq!(
+            services
+                .graph_state_store()
+                .load(root_id)
+                .expect("root")
+                .node_statuses[&wait_node],
+            ExecutionNodeStatus::WaitingExternal,
+            "the barrier parks while the Task is unsettled"
+        );
+
+        apply("settle-claim", &agent_actor, AgentAction::TaskClaim(
+            serde_json::from_value(serde_json::json!({"task_ref": task})).unwrap(),
+        ));
+        let content = services
+            .artifact_store()
+            .write_bytes(
+                harness_contract::context::ArtifactWriteDescriptor {
+                    media_type: "text/markdown".to_string(),
+                    visibility_scope: format!("session:{program_id}"),
+                    expected_bytes: None,
+                    original_name: Some("fact.md".to_string()),
+                },
+                b"one verifiable fact",
+            )
+            .await
+            .expect("artifact content");
+        let artifact = apply("settle-artifact", &agent_actor, AgentAction::ArtifactCommit(
+            serde_json::from_value(serde_json::json!({
+                "content_ref": content.selector,
+                "kind": "report",
+                "title": "One fact",
+                "relates_to": [task]
+            }))
+            .unwrap(),
+        ))
+        .changed_refs[0]
+        .clone();
+        apply("settle-submit", &agent_actor, AgentAction::TaskSubmit(
+            serde_json::from_value(serde_json::json!({
+                "task_ref": task,
+                "artifact_refs": [artifact],
+                "evidence_refs": ["tool://settle-observation"]
+            }))
+            .unwrap(),
+        ));
+        // The last Program event is the one that settles the Task. It must be read as
+        // the state it produces, otherwise the barrier is evaluated against a Program
+        // that still has live work and the root stays parked forever.
+        let review = apply("settle-review", &reviewer_actor, AgentAction::TaskReview(
+            serde_json::from_value(serde_json::json!({
+                "task_ref": task,
+                "decision": "accept",
+                "reason": "verified",
+                "evidence_refs": ["tool://settle-review"]
+            }))
+            .unwrap(),
+        ));
+        assert_eq!(review.status, harness_contract::agent_action::AgentActionStatus::Applied);
+
+        let resolved = resolve_agentic_program_wait(
+            program_id,
+            &services.agent_action_service(),
+            services.graph_state_store(),
+            services.execution_supervisor().as_ref(),
+            true,
+        )
+        .await
+        .expect("resolve barrier");
+        assert_eq!(
+            resolved, 1,
+            "the event that settles the last Task must release the parked barrier"
+        );
     }
 }

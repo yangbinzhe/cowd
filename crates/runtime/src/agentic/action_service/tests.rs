@@ -3494,3 +3494,167 @@ async fn blocked_exit_is_accepted_once_every_task_is_terminal() {
         blocked.actionable
     );
 }
+
+/// A claim, a submission and a review each settle exactly one Task, and each names that
+/// Task in its input, so the entity they changed is the Task itself - the same treatment
+/// `TaskSupersede` and `TaskWithdraw` already get. They were the only Task actions that
+/// reported no changed entity, so the progress measure that reads `changed_refs` could
+/// never see them: in one live run 30 of 31 tool-batch observations reported no verified
+/// gain while their own summaries reported new coverage, and the turn was ended by the
+/// no-progress fuse after 21 replans that contradicted their observations.
+#[test]
+fn a_task_action_reports_the_task_it_settled_as_the_entity_it_changed() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = AgentActionService::new(store.clone());
+    let team = service
+        .apply(&root(
+            "e3-team",
+            AgentAction::TeamCreate(TeamCreateInput {
+                name: "Evidence".into(),
+                mission: "produce and verify facts".into(),
+                objective: None,
+            }),
+        ))
+        .unwrap()
+        .changed_refs[0]
+        .clone();
+    let agent = service
+        .apply(&root(
+            "e3-agent",
+            AgentAction::AgentInvite(AgentInviteInput {
+                team_ref: team.clone(),
+                role: "researcher".into(),
+                mission: "produce a fact".into(),
+                required_capabilities: vec!["read".into()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: vec![],
+                execution_requirements: vec![],
+            }),
+        ))
+        .unwrap()
+        .changed_refs[0]
+        .clone();
+    let reviewer = service
+        .apply(&root(
+            "e3-reviewer",
+            AgentAction::AgentInvite(AgentInviteInput {
+                team_ref: team.clone(),
+                role: "reviewer".into(),
+                mission: "verify the fact independently".into(),
+                required_capabilities: vec!["read".into()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: vec![],
+                execution_requirements: vec![],
+            }),
+        ))
+        .unwrap()
+        .changed_refs[0]
+        .clone();
+    let task = service
+        .apply(&root(
+            "e3-task",
+            AgentAction::TaskPublish(TaskPublishInput {
+                team_ref: team.clone(),
+                title: "One fact".into(),
+                objective: "extract one verifiable fact".into(),
+                acceptance: "artifact plus evidence".into(),
+                acceptance_checks: Vec::new(),
+                required_capabilities: vec!["read".into()],
+                depends_on: Vec::new(),
+
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
+            }),
+        ))
+        .unwrap()
+        .changed_refs[0]
+        .clone();
+
+    let claim = service
+        .apply(&managed(
+            "e3-claim",
+            &team,
+            &agent,
+            AgentAction::TaskClaim(TaskClaimInput {
+                task_ref: task.clone(),
+                reason: None,
+            }),
+        ))
+        .unwrap();
+    assert_eq!(claim.changed_refs, vec![task.clone()]);
+
+    let artifact = service
+        .apply(&managed(
+            "e3-artifact",
+            &team,
+            &agent,
+            AgentAction::ArtifactCommit(ArtifactCommitInput {
+                content_ref: "artifact://e3-fact".to_string(),
+                kind: "research".to_string(),
+                title: "One fact".to_string(),
+                relates_to: Vec::new(),
+            }),
+        ))
+        .unwrap()
+        .changed_refs[0]
+        .clone();
+
+    for (action_id, actor, action) in [
+        (
+            "e3-submit",
+            &agent,
+            AgentAction::TaskSubmit(
+                serde_json::from_value(json!({
+                    "task_ref": task,
+                    "artifact_refs": [artifact],
+                    "evidence_refs": ["tool://source-observation"]
+                }))
+                .unwrap(),
+            ),
+        ),
+        (
+            "e3-review",
+            &reviewer,
+            AgentAction::TaskReview(TaskReviewInput {
+                task_ref: task.clone(),
+                decision: TaskReviewDecision::Accept,
+                reason: "verified".into(),
+                evidence_refs: vec!["tool://independent-inspection".into()],
+            }),
+        ),
+    ] {
+        let observation = service
+            .apply(&managed(action_id, &team, actor, action))
+            .unwrap();
+        assert_eq!(
+            observation.changed_refs,
+            vec![task.clone()],
+            "{action_id} settled this Task, so it must report the Task as the entity it changed"
+        );
+    }
+
+    // The half that must not change: reading is not progress. An observation that settles
+    // no entity still reports none, so the bound that stops a model opening one new path
+    // per round stays intact.
+    let observed = service
+        .apply(&managed(
+            "e3-inspect",
+            &team,
+            &agent,
+            AgentAction::StateInspect(
+                serde_json::from_value(json!({ "after_revision": null })).unwrap(),
+            ),
+        ))
+        .unwrap();
+    assert_eq!(observed.status, AgentActionStatus::Observed);
+    assert!(
+        observed.changed_refs.is_empty(),
+        "an observation that changes no entity must still report none: {observed:?}"
+    );
+}
