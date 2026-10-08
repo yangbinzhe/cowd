@@ -339,10 +339,19 @@ impl NodeExecutor for AgenticProgramWaitExecutor {
     }
 }
 
-/// Bounded self-rearm count for one parked barrier. Three paid runs showed the
-/// external wake paths missing the decisive moment, so the barrier re-evaluates
-/// itself; the bound keeps that from becoming an unbounded poller.
-pub(crate) const MAX_BARRIER_SELF_REARMS: u32 = 120;
+/// Self-rearm budget for one parked barrier.
+///
+/// The real terminator is the node's own status: the loop returns the moment the
+/// barrier is released, cancelled, or otherwise no longer `WaitingExternal`, so it
+/// cannot outlive the barrier it serves. The count is only a backstop against a node
+/// that is wedged in a status nobody resolves.
+///
+/// It has to cover a whole turn, not a fraction of one. A first attempt used 120
+/// passes at a two-second interval - four minutes - and a paid run whose barrier was
+/// parked for twenty-five minutes exhausted it: the re-arm produced the correct
+/// `resume / worker_quiescent` decision, but ten minutes after the budget ran out,
+/// in the same second the evaluator cancelled the barrier.
+pub(crate) const MAX_BARRIER_SELF_REARMS: u32 = 3_600;
 
 /// Interval between a parked barrier's own re-evaluations. Long enough that a
 /// settling Program is picked up within a couple of rounds, short enough that the
