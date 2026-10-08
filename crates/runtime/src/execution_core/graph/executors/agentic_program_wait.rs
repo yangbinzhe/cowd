@@ -303,15 +303,33 @@ impl NodeExecutor for AgenticProgramWaitExecutor {
                 if !parked {
                     return;
                 }
-                let released = resolve_agentic_program_wait(
-                    &program_id,
-                    &actions,
-                    &state_store,
-                    supervisor.as_ref(),
-                    true,
-                )
-                .await
-                .unwrap_or(0);
+                // A spawned task dies silently on a panic, and an `Err` here is
+                // routinely a transient graph revision conflict. Neither may end the
+                // re-arm: in one live run the re-arm produced fourteen decisions and
+                // then went quiet while the barrier stayed parked, which is the same
+                // failure the re-arm exists to prevent.
+                let attempt = std::panic::AssertUnwindSafe(async {
+                    resolve_agentic_program_wait(
+                        &program_id,
+                        &actions,
+                        &state_store,
+                        supervisor.as_ref(),
+                        true,
+                    )
+                    .await
+                    .unwrap_or(0)
+                });
+                let released = match futures::FutureExt::catch_unwind(attempt).await {
+                    Ok(released) => released,
+                    Err(_) => {
+                        tracing::warn!(
+                            program_id,
+                            root_execution_id,
+                            "barrier self-rearm pass panicked; continuing the bounded loop"
+                        );
+                        0
+                    }
+                };
                 if released > 0 {
                     return;
                 }
