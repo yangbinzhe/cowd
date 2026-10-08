@@ -282,7 +282,7 @@ fn record(
     barrier_candidates: usize,
     observed_revision: u64,
     released: usize,
-    barrier_rejections: &[serde_json::Value],
+    barrier_rejections: &serde_json::Value,
 ) {
     if projection.program_id != program_id
         || projection.root_execution_id.as_deref() != Some(root_execution_id)
@@ -304,7 +304,7 @@ fn record(
         barrier_candidates,
         released,
         observed_revision,
-        barrier_rejections: barrier_rejections.to_vec(),
+        barrier_rejections: barrier_rejections.clone(),
     });
 }
 
@@ -345,16 +345,16 @@ pub async fn resolve_agentic_program_wait(
     let strand_exhausted = strand_resumes >= MAX_TASK_STRAND_RESUMES;
     let mut resolved = 0usize;
     let mut barrier_candidates = 0usize;
-    let mut barrier_rejections: Vec<serde_json::Value> = Vec::new();
+    let mut barrier_rejections = serde_json::Value::Null;
     let mut observed_revision = 0u64;
-    let mut barrier_rejections: Vec<serde_json::Value> = Vec::new();
+    let mut barrier_rejections = serde_json::Value::Null;
     const MAX_GRAPH_CAS_ATTEMPTS: usize = 8;
     if strand_exhausted {
-        record(actions, &projection, program_id, root_execution_id, disposition, reason, 0, 0, 0, &[]);
+        record(actions, &projection, program_id, root_execution_id, disposition, reason, 0, 0, 0, &serde_json::Value::Null);
         return Ok(0);
     }
     if disposition == "wait" {
-        record(actions, &projection, program_id, root_execution_id, disposition, reason, 0, 0, 0, &[]);
+        record(actions, &projection, program_id, root_execution_id, disposition, reason, 0, 0, 0, &serde_json::Value::Null);
         return Ok(0);
     }
     for attempt in 0..MAX_GRAPH_CAS_ATTEMPTS {
@@ -385,10 +385,18 @@ pub async fn resolve_agentic_program_wait(
             // of every run while the durable stream showed the node reaching
             // `waiting_external`, so exactly one of the four conditions below was
             // false and nothing said which.
-            barrier_rejections = graph
-                .nodes
-                .iter()
-                .filter(|node| node.executor_kind == AgenticProgramWaitExecutor::KIND)
+            barrier_rejections = serde_json::json!({
+                "loaded_graph_revision": graph.revision,
+                "loaded_graph_nodes": graph.nodes.len(),
+                "loaded_graph_kinds": graph
+                    .nodes
+                    .iter()
+                    .map(|node| format!("{:?}:{}", node.kind, node.executor_kind))
+                    .collect::<Vec<_>>(),
+                "rejections": graph
+                    .nodes
+                    .iter()
+                    .filter(|node| node.executor_kind == AgenticProgramWaitExecutor::KIND)
                 .map(|node| {
                     let status = graph
                         .node_statuses
@@ -409,7 +417,8 @@ pub async fn resolve_agentic_program_wait(
                         "is_verify": node.kind == ExecutionNodeKind::Verify,
                     })
                 })
-                .collect();
+                .collect::<Vec<_>>(),
+            });
             break;
         };
         barrier_candidates = barrier_candidates.saturating_add(1);

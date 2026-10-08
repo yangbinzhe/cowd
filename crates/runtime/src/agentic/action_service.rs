@@ -49,7 +49,7 @@ pub(crate) struct AgenticWaitDisposition<'a> {
     /// `barrier_candidates` is otherwise unreadable: it cannot distinguish "the node
     /// was never created" from "the node is there but one of the four admission
     /// conditions was false".
-    pub barrier_rejections: Vec<serde_json::Value>,
+    pub barrier_rejections: serde_json::Value,
 }
 
 impl AgentActionService {
