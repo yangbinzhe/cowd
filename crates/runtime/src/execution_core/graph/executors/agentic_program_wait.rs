@@ -308,16 +308,36 @@ impl NodeExecutor for AgenticProgramWaitExecutor {
                 // re-arm: in one live run the re-arm produced fourteen decisions and
                 // then went quiet while the barrier stayed parked, which is the same
                 // failure the re-arm exists to prevent.
+                // Bound each pass as well as the loop. A pass that blocks forever -
+                // on the graph state store's blocking pool, or on the runner's command
+                // lane - wedges the whole re-arm, which is the same failure the re-arm
+                // exists to prevent: in one paid run the re-arm produced thirty-seven
+                // decisions, went quiet four minutes before the final Task accept, and
+                // the barrier stayed parked with all three Tasks accepted until the
+                // evaluator cancelled it.
                 let attempt = std::panic::AssertUnwindSafe(async {
-                    resolve_agentic_program_wait(
-                        &program_id,
-                        &actions,
-                        &state_store,
-                        supervisor.as_ref(),
-                        true,
+                    match tokio::time::timeout(
+                        BARRIER_SELF_REARM_PASS_TIMEOUT,
+                        resolve_agentic_program_wait(
+                            &program_id,
+                            &actions,
+                            &state_store,
+                            supervisor.as_ref(),
+                            true,
+                        ),
                     )
                     .await
-                    .unwrap_or(0)
+                    {
+                        Ok(result) => result.unwrap_or(0),
+                        Err(_) => {
+                            tracing::warn!(
+                                program_id,
+                                root_execution_id,
+                                "barrier self-rearm pass timed out; continuing the bounded loop"
+                            );
+                            0
+                        }
+                    }
                 });
                 let released = match futures::FutureExt::catch_unwind(attempt).await {
                     Ok(released) => released,
@@ -358,6 +378,13 @@ pub(crate) const MAX_BARRIER_SELF_REARMS: u32 = 3_600;
 /// whole budget stays inside one turn.
 pub(crate) const BARRIER_SELF_REARM_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(2);
+
+/// Per-pass ceiling for one self-rearm evaluation. A pass reads the Program journal,
+/// the root graph and possibly several child graphs, and issues a graph command; all
+/// of that is normally milliseconds. The ceiling exists so a wedged pass cannot end
+/// the loop that is supposed to outlive exactly this kind of wedge.
+pub(crate) const BARRIER_SELF_REARM_PASS_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
 
 /// Resolve every waiting barrier for one Program when canonical Program or
 /// child-graph truth says the root model has a semantic decision to make.
