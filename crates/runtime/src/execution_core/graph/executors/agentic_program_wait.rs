@@ -282,6 +282,7 @@ fn record(
     barrier_candidates: usize,
     observed_revision: u64,
     released: usize,
+    barrier_rejections: &[serde_json::Value],
 ) {
     if projection.program_id != program_id
         || projection.root_execution_id.as_deref() != Some(root_execution_id)
@@ -303,6 +304,7 @@ fn record(
         barrier_candidates,
         released,
         observed_revision,
+        barrier_rejections: barrier_rejections.to_vec(),
     });
 }
 
@@ -343,14 +345,16 @@ pub async fn resolve_agentic_program_wait(
     let strand_exhausted = strand_resumes >= MAX_TASK_STRAND_RESUMES;
     let mut resolved = 0usize;
     let mut barrier_candidates = 0usize;
+    let mut barrier_rejections: Vec<serde_json::Value> = Vec::new();
     let mut observed_revision = 0u64;
+    let mut barrier_rejections: Vec<serde_json::Value> = Vec::new();
     const MAX_GRAPH_CAS_ATTEMPTS: usize = 8;
     if strand_exhausted {
-        record(actions, &projection, program_id, root_execution_id, disposition, reason, 0, 0, 0);
+        record(actions, &projection, program_id, root_execution_id, disposition, reason, 0, 0, 0, &[]);
         return Ok(0);
     }
     if disposition == "wait" {
-        record(actions, &projection, program_id, root_execution_id, disposition, reason, 0, 0, 0);
+        record(actions, &projection, program_id, root_execution_id, disposition, reason, 0, 0, 0, &[]);
         return Ok(0);
     }
     for attempt in 0..MAX_GRAPH_CAS_ATTEMPTS {
@@ -376,6 +380,36 @@ pub async fn resolve_agentic_program_wait(
                 )
         });
         let Some(node) = candidate else {
+            // Name which condition rejected the barrier, instead of leaving a zero
+            // count to be inferred. In one live run this count was zero in every pass
+            // of every run while the durable stream showed the node reaching
+            // `waiting_external`, so exactly one of the four conditions below was
+            // false and nothing said which.
+            barrier_rejections = graph
+                .nodes
+                .iter()
+                .filter(|node| node.executor_kind == AgenticProgramWaitExecutor::KIND)
+                .map(|node| {
+                    let status = graph
+                        .node_statuses
+                        .get(&node.id)
+                        .map(|status| format!("{status:?}"))
+                        .unwrap_or_else(|| "absent".to_string());
+                    let payload_matches =
+                        serde_json::from_str::<AgenticProgramWaitRequest>(&node.payload_ref)
+                            .is_ok_and(|candidate| {
+                                candidate.program_id == request.program_id
+                                    && candidate.root_execution_id == request.root_execution_id
+                            });
+                    serde_json::json!({
+                        "node_id": node.id,
+                        "kind": format!("{:?}", node.kind),
+                        "status": status,
+                        "payload_matches": payload_matches,
+                        "is_verify": node.kind == ExecutionNodeKind::Verify,
+                    })
+                })
+                .collect();
             break;
         };
         barrier_candidates = barrier_candidates.saturating_add(1);
@@ -460,6 +494,7 @@ pub async fn resolve_agentic_program_wait(
         barrier_candidates,
         observed_revision,
         resolved,
+        &barrier_rejections,
     );
     Ok(resolved)
 }

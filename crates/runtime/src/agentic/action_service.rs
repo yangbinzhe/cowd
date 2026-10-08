@@ -45,6 +45,11 @@ pub(crate) struct AgenticWaitDisposition<'a> {
     pub barrier_candidates: usize,
     pub released: usize,
     pub observed_revision: u64,
+    /// Every barrier node the resolver saw and why each was rejected. A zero
+    /// `barrier_candidates` is otherwise unreadable: it cannot distinguish "the node
+    /// was never created" from "the node is there but one of the four admission
+    /// conditions was false".
+    pub barrier_rejections: Vec<serde_json::Value>,
 }
 
 impl AgentActionService {
