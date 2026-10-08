@@ -492,7 +492,7 @@ pub fn run_eval_controlled(
         run_id,
         &summary,
         run_status,
-        options,
+        &options,
         requested_at_ms,
         cancelled_after_provider,
     );
@@ -505,7 +505,7 @@ pub fn run_eval_controlled(
 /// function that already carries baselined structural debt.
 fn completed_record(
     run_id: String,
-    summary: &HarnessEvalReportSummary,
+    summary: &crate::HarnessEvalReportSummary,
     run_status: HarnessEvalRunStatus,
     options: &HarnessEvalRunnerOptions,
     requested_at_ms: u128,
