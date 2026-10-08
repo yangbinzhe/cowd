@@ -941,7 +941,7 @@ where
                 for msg in post_hook_result.messages() {
                     combined.push_str(&format!("\n{msg}"));
                 }
-                self.append_repetition_diagnosis(tool_name, invocation_record.input_hash.as_str(), &invocation_record.input_refs, failure_kind.unwrap_or(ToolFailureKind::Unknown), &mut combined);
+                self.append_repetition_diagnosis(tool_name, invocation_record.input_hash.as_str(), &invocation_record.input_refs, is_error, failure_kind.unwrap_or(ToolFailureKind::Unknown), &mut combined);
                 let completed_record = if is_error {
                     invocation_record.failed_with_output_policy(
                         failure_kind.unwrap_or(ToolFailureKind::Unknown),
@@ -1400,14 +1400,24 @@ where
         ))
     }
 
-    fn append_repetition_diagnosis(
+    pub(crate) fn append_repetition_diagnosis(
         &self,
         tool_name: &str,
         input_hash: &str,
         input_refs: &[String],
+        is_error: bool,
         failure_kind: ToolFailureKind,
         combined: &mut String,
     ) {
+        // The breaker answers "the same dead end again", so only a failure belongs in
+        // its ledger. The kind here was defaulted to `Unknown`, which
+        // `counts_toward_breaker` accepts, so a completed call also incremented the
+        // count. In one live run 40 of 62 refusals were issued against inputs that
+        // had never failed - the model was told "this exact failure has now occurred
+        // 2 times" about calls it had just succeeded at twice.
+        if !is_error {
+            return;
+        }
         let turn_id = self.active_turn_id();
         if let Some(diagnosis) = crate::repetition_guard::record_tool_failure(
             &turn_id,

@@ -622,13 +622,12 @@ where
     }
 
     pub(super) fn record_turn_completed(&self, summary: &TurnSummary) {
-        // The turn boundary is where a breaker's scope ends. Everything filed under
-        // this turn is stale from here: the next turn replans anyway, and a breaker
-        // that outlives its turn can suppress a call that would now succeed.
-        // This runs before the tracer check, because a turn without a tracer still
-        // ended, and a clear that depends on observability being configured would
-        // leave the ledger growing on exactly the paths that fail.
-        crate::repetition_guard::clear_turn(&self.active_turn_id());
+        // The clear does not belong here. This runs once per graph turn, and a
+        // delegated Agent's graph turn is inside the session turn whose ledger key
+        // it shares - so a delegated finalize cleared the same ledger 48 times
+        // inside one turn in a live run, and the breaker never accumulated past the
+        // bound. The clear now sits at the boundary that owns it: `after_commit`,
+        // for the role that owns the root presentation.
         let Some(session_tracer) = &self.session_tracer else {
             return;
         };

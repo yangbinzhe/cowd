@@ -348,6 +348,22 @@ pub fn clear_turn(turn_id: &str) {
         .retain(|key, _| !key.contains(needle.as_str()));
 }
 
+/// Clear the breakers filed under one turn, but only for the role that owns it.
+///
+/// The ledger key is the session turn, and a delegated Agent's graph turn is inside
+/// that turn, so a delegated finalize clearing here resets a breaker the root turn
+/// is still relying on. One live run cleared the same ledger 48 times inside one
+/// turn: the count never grew past the bound, the same failing call was refused 62
+/// times, and the loop never closed. Returns whether the clear happened so the
+/// boundary can be asserted.
+pub fn clear_breakers_for_role(turn_id: &str, owns_root_presentation: bool) -> bool {
+    if !owns_root_presentation {
+        return false;
+    }
+    clear_turn(turn_id);
+    true
+}
+
 /// Clear every breaker. Test-only: production clears one turn at a time.
 #[cfg(test)]
 pub fn clear_all() {
@@ -664,6 +680,33 @@ mod repetition_guard_tests {
         assert!(
             !is_dispatch_blocked(turn, "objective_complete_request", "closure-hash"),
             "blocking the exit path is a deadlock, not a guard"
+        );
+    }
+
+    /// The live run this came from: one input was refused 12 times while four calls
+    /// for it actually executed, and every refusal reported count exactly 2. The
+    /// count could not grow past the bound because the ledger was cleared inside the
+    /// turn - by delegated graph turns that share the root turn's key.
+    #[test]
+    fn a_delegated_graph_turn_does_not_clear_the_root_turns_breaker() {
+        const ROOT: &str = "turn-delegated-clear";
+        let fail = |msg: &str| {
+            record_tool_failure(ROOT, "task_review", "h-delegated", &[], ToolFailureKind::ExecutionError, msg)
+        };
+        fail("graph `run:4f9a2b` does not exist");
+        assert!(fail("graph `run:7c1e08` does not exist").is_some());
+        assert!(
+            !clear_breakers_for_role(ROOT, false),
+            "a delegated graph turn is inside the root turn and must not clear its ledger"
+        );
+        assert!(
+            is_dispatch_blocked(ROOT, "task_review", "h-delegated"),
+            "the breaker the delegated turn could not clear must still refuse"
+        );
+        assert!(clear_breakers_for_role(ROOT, true), "the root turn owns the clear");
+        assert!(
+            !is_dispatch_blocked(ROOT, "task_review", "h-delegated"),
+            "at the boundary the breaker is stale and must be released"
         );
     }
 

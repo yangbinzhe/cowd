@@ -1833,6 +1833,18 @@ where
             .map_err(|error| error.to_string())?;
         {
             let mut state = self.state.lock().await;
+            // The breaker's scope is the turn that owns the root presentation. A
+            // delegated Agent's graph turn is inside that turn and shares its ledger
+            // key, so clearing here for a delegated role resets a breaker the root
+            // turn is still relying on: one live run cleared the same ledger 48
+            // times inside one turn and refused the same failing call 62 times
+            // without ever closing the loop. `state.turn_id` is the same id the
+            // guard keys on (`host.rs:644` begins the input stream's active turn
+            // from the same `turn_ref` this state stores).
+            crate::repetition_guard::clear_breakers_for_role(
+                &state.turn_id,
+                state.execution_role.owns_root_presentation(),
+            );
             state.summary = Some(summary);
             state.terminal_commit_owner = None;
             state.committed_terminal_answer = None;

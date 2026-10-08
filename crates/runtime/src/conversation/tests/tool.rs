@@ -14,6 +14,59 @@
         assert!(TurnExecutionRole::DelegatedLeaf.is_delegated_leaf());
     }
 
+    /// The breaker answers "the same dead end again", so only a failure belongs in
+    /// its ledger. The plane called it for every call with the failure kind
+    /// defaulted to `Unknown`, which the breaker accepts, so a completed call also
+    /// counted. In the live run 40 of 62 refusals were issued against inputs that
+    /// had never failed, and the refusal told the model it had failed twice about
+    /// calls it had just succeeded at twice.
+    #[test]
+    fn a_completed_call_is_not_recorded_in_the_ledger() {
+        let runtime = crate::ConversationRuntime::new(
+            Session::new(),
+            FinalAnswerClient,
+            NoopToolExecutor,
+            PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
+            vec!["bounded read".to_string()],
+        )
+        .without_memory();
+        // The ledger is keyed by the active turn; with no turn admitted yet this
+        // runtime falls back to its session id, which is unique per test.
+        let turn = runtime.active_turn_id();
+        let hash = "hash-completed-call".to_string();
+        let mut output = String::new();
+
+        runtime.append_repetition_diagnosis(
+            "read_file",
+            &hash,
+            &[],
+            false,
+            crate::ToolFailureKind::Unknown,
+            &mut output,
+        );
+        assert!(
+            !crate::repetition_guard::is_dispatch_blocked(&turn, "read_file", &hash),
+            "a completed call is not a dead end and must not count toward a breaker that reports a failure count"
+        );
+
+        // The other half of the rule: the exclusion must not weaken the breaker for
+        // the calls it exists for.
+        for _ in 0..2 {
+            runtime.append_repetition_diagnosis(
+                "read_file",
+                &hash,
+                &[],
+                true,
+                crate::ToolFailureKind::ExecutionError,
+                &mut output,
+            );
+        }
+        assert!(
+            crate::repetition_guard::is_dispatch_blocked(&turn, "read_file", &hash),
+            "two deterministic failures must still trip the breaker"
+        );
+    }
+
     #[test]
     fn collaboration_team_slots_are_independent_of_tool_capacity() {
         assert_eq!(collaboration_team_slots(8, 8), 8);
