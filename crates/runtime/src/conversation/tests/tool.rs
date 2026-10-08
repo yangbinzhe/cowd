@@ -2931,3 +2931,126 @@
             ])
         );
     }
+
+    /// A refusal is the Runtime declining to run a call it has already refused for the same
+    /// cause. It is not a new failure. The ledger already treats it that way; the failure
+    /// streak must agree, otherwise the same event is a non-failure for the ledger and a
+    /// failure for the goal plane - the contradiction that sustained 158 refusals in one live
+    /// run: refusal -> `tool_failure` observation -> closure action required again -> replan ->
+    /// same call -> refusal.
+    #[test]
+    fn a_refusal_does_not_advance_the_failure_streak() {
+        let runtime = crate::ConversationRuntime::new(
+            Session::new(),
+            FinalAnswerClient,
+            NoopToolExecutor,
+            PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
+            vec!["bounded read".to_string()],
+        )
+        .without_memory();
+        let turn = runtime.active_turn_id();
+        let call = ModelToolCall {
+            id: "call-refusal-streak".to_string(),
+            name: "task_review".to_string(),
+            input: "{\"task_ref\":\"task:refusal-streak\"}".to_string(),
+            depends_on: vec![],
+        };
+        let hash = crate::tool_invocation::stable_hash(&call.input);
+        let mut output = String::new();
+
+        // Before the breaker trips, an error result is an executed failure and must still
+        // advance the streak.
+        assert_eq!(
+            executed_failures(1, &[call.clone()], &turn),
+            1,
+            "a failure that could have been executed must still count"
+        );
+
+        for _ in 0..2 {
+            output = "review physical Agent packet missing:run:abc123".to_string();
+            runtime.append_repetition_diagnosis(
+                "task_review",
+                &hash,
+                &[],
+                true,
+                crate::ToolFailureKind::ExecutionError,
+                &mut output,
+            );
+        }
+        assert!(
+            crate::repetition_guard::is_dispatch_blocked(&turn, "task_review", &hash),
+            "two deterministic failures must still trip the breaker"
+        );
+        assert_eq!(
+            executed_failures(1, &[call], &turn),
+            0,
+            "the Runtime's own refusal must not be counted as a failure that re-triggers the obligation it refused"
+        );
+    }
+
+    /// The protocol-closure rule exists so a model cannot close a mid-protocol Agent Task with
+    /// prose instead of the durable closure action. That protection must survive. What must
+    /// change is that it cannot re-dispatch an action the guard would refuse: a refused action
+    /// cannot close the protocol, and re-dispatching it only re-produces the refusal.
+    #[test]
+    fn the_protocol_closure_rule_does_not_re_dispatch_an_action_the_guard_would_refuse() {
+        let runtime = crate::ConversationRuntime::new(
+            Session::new(),
+            FinalAnswerClient,
+            NoopToolExecutor,
+            PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
+            vec!["bounded read".to_string()],
+        )
+        .without_memory();
+        let turn = runtime.active_turn_id();
+        let protocol = super::host_backend::DelegatedAgenticProtocolState {
+            program_id: "program:closure-test".to_string(),
+            task_id: "task:closure-test".to_string(),
+            mode: "review".to_string(),
+            status: crate::AgenticTaskStatus::Submitted,
+            artifact_refs: vec!["artifact:closure-test".to_string()],
+            artifact_evidence_refs: vec![],
+            owns_active_attempt: true,
+            review_reason: None,
+        };
+        let synthesize = harness_contract::goal::RuntimeIntervention {
+            goal_id: "goal:closure-test".to_string(),
+            kind: harness_contract::goal::RuntimeInterventionKind::Synthesize,
+            reason: "bounded evidence batches added no coverage".to_string(),
+            evidence_refs: vec![],
+            expected_graph_revision: None,
+        };
+
+        // The protection is intact while the closure action can still be executed.
+        assert!(
+            protocol_closure_can_be_required(Some(&protocol), Some(&synthesize), &turn),
+            "a mid-protocol Task must still be closed by its durable action, not by prose"
+        );
+
+        let mut output = String::new();
+        for _ in 0..2 {
+            output = "review physical Agent packet missing:run:abc123".to_string();
+            runtime.append_repetition_diagnosis(
+                "task_review",
+                "hash-closure-test",
+                &[],
+                true,
+                crate::ToolFailureKind::ExecutionError,
+                &mut output,
+            );
+        }
+
+        // Once the guard would refuse that action, the protocol cannot be closed by it, so the
+        // synthesis must stand and the honest partial names the blocked obligation.
+        assert!(
+            !protocol_closure_can_be_required(Some(&protocol), Some(&synthesize), &turn),
+            "the rule must not re-dispatch an action the guard would refuse"
+        );
+
+        // Unchanged half of the rule: a terminal protocol never requires the conversion.
+        let terminal = harness_contract::goal::RuntimeIntervention {
+            kind: harness_contract::goal::RuntimeInterventionKind::Replan,
+            ..synthesize.clone()
+        };
+        assert!(!protocol_closure_can_be_required(Some(&protocol), Some(&terminal), &turn));
+    }

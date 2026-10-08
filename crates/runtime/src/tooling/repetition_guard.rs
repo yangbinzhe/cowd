@@ -290,6 +290,28 @@ pub fn is_dispatch_blocked(turn_id: &str, tool_name: &str, input_hash: &str) -> 
     refusal_for(turn_id, tool_name, input_hash).is_some()
 }
 
+/// Whether this tool is already blocked in this turn by a recorded cause, independent of the
+/// exact input.
+///
+/// A caller that must decide *before* the model writes the next input cannot name an input
+/// hash, so it asks the question the ledger can answer: has this tool reached the bound for a
+/// deterministic cause in this turn. The protocol-closure rule needs exactly this, because
+/// when the closure action is cause-blocked the protocol cannot be closed by it and
+/// re-dispatching it only re-produces the refusal.
+pub fn cause_blocked_for_tool(turn_id: &str, tool_name: &str) -> bool {
+    if is_exempt_tool(tool_name) {
+        return false;
+    }
+    let bound = repetition_bound();
+    let prefix = format!("cause:{turn_id}:{tool_name}:");
+    repetition_ledger()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .range(prefix.clone()..)
+        .take_while(|(key, _)| key.starts_with(&prefix))
+        .any(|(_, entry)| entry.state_derived && entry.count >= bound)
+}
+
 /// Whether a tool is never refused: pollers (waiting on external progress) and the
 /// closure tools (the model's exit path).
 fn is_exempt_tool(tool_name: &str) -> bool {
@@ -763,5 +785,30 @@ mod repetition_guard_tests {
             tripped.contains("Framework reported: invalid tool arguments"),
             "the diagnosis must repeat the framework's own words: {tripped}"
         );
+    }
+
+    /// The protocol-closure rule decides before the model writes the next input, so it cannot
+    /// name an input hash. It must still be able to ask whether this tool is already blocked
+    /// by a recorded cause - that is the only question that can stop it from re-dispatching a
+    /// call the guard would refuse.
+    #[test]
+    fn a_tripped_cause_blocks_the_tool_for_a_caller_that_cannot_name_the_input() {
+        let turn = turn!();
+        assert!(!cause_blocked_for_tool(&turn, "task_review"));
+        err(
+            turn,
+            ToolFailureKind::ExecutionError,
+            "review physical Agent packet missing:run:abc123",
+        );
+        err(
+            turn,
+            ToolFailureKind::ExecutionError,
+            "review physical Agent packet missing:run:9f8e7d",
+        );
+        assert!(cause_blocked_for_tool(&turn, "task_review"));
+        // A tool with no recorded cause is not blocked.
+        assert!(!cause_blocked_for_tool(&turn, "read_file"));
+        // The closure tools are the model's exit and are never blocked.
+        assert!(!cause_blocked_for_tool(&turn, "objective_complete_request"));
     }
 }

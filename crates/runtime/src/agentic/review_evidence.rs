@@ -224,10 +224,33 @@ fn record_effect_observation(
         .filter_map(|node| {
             serde_json::from_str::<AgentTaskPacket>(&node.payload_ref)
                 .ok()
-                .filter(|packet| packet.graph_id() == graph_id && packet.node_id() == node.id)
+                .filter(|packet| {
+                    packet_identity_matches(packet.graph_id(), packet.run_id(), graph_id)
+                        && packet.node_id() == node.id
+                })
         })
         .next()
         .ok_or_else(|| format!("review physical Agent packet missing:{graph_id}"))
+}
+
+/// The identity check in the caller's namespace.
+///
+/// The caller names an execution id, and there are two binding paths:
+/// `agent/in_process/model_loop.rs:196/367` bind the graph id, `:470` binds the physical run
+/// id. Comparing a run id against `packet.graph_id()` can never hold, so a packet that was
+/// present was reported missing for a run-bound actor - that was the origin of the 158-refusal
+/// run. This normalises the namespace; it does not relax the identity check, and a packet from
+/// a different graph still never matches.
+fn packet_identity_matches(
+    packet_graph_id: &str,
+    packet_run_id: &str,
+    caller_execution_id: &str,
+) -> bool {
+    if caller_execution_id.starts_with("run:") {
+        packet_run_id == caller_execution_id
+    } else {
+        packet_graph_id == caller_execution_id
+    }
 }
 
 impl RuntimeServices {
@@ -913,5 +936,35 @@ mod tests {
         invalid["chunks"][0]["content"] = "".into();
         read.observe(&invalid.to_string(), "receipt:empty");
         assert!(!read.complete());
+    }
+
+    /// The origin of the 158-refusal run: the review reported "packet missing" for a packet
+    /// that was present, because the caller named the physical run id while the packet stored
+    /// the bare graph id.
+    #[test]
+    fn the_identity_check_uses_the_namespace_the_caller_named() {
+        let graph = "agentic-graph:bf5d8374a4c7";
+        let run = "run:agentic-graph:bf5d8374a4c7";
+
+        // The run-bound binding (`model_loop.rs:470`) names the run id.
+        assert!(packet_identity_matches(graph, run, run));
+        // The graph-bound binding (`model_loop.rs:196/367`) names the graph id.
+        assert!(packet_identity_matches(graph, run, graph));
+
+        // Normalising the namespace must not relax the identity check: a packet belonging to a
+        // different graph still never matches, in either namespace. A packet's run id and graph
+        // id name the same graph, so a different graph means both differ.
+        assert!(!packet_identity_matches(
+            "agentic-graph:other",
+            "run:agentic-graph:other",
+            run
+        ));
+        assert!(!packet_identity_matches(
+            "agentic-graph:other",
+            "run:agentic-graph:other",
+            graph
+        ));
+        assert!(!packet_identity_matches(graph, run, "run:agentic-graph:bf5d8374a4c8"));
+        assert!(!packet_identity_matches(graph, run, "agentic-graph:bf5d8374a4c8"));
     }
 }

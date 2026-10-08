@@ -74,6 +74,62 @@ fn next_consecutive_tool_failure_batches(
     }
 }
 
+/// Failures that were actually executed, excluding dispatch refusals.
+///
+/// A refusal is the Runtime declining to run a call it has already refused for the same
+/// cause; it is not a new failure. The repetition ledger already treats it that way
+/// (`repetition_guard.rs:141`). Counting it here made the same event a failure for the goal
+/// plane and a non-failure for the ledger, and that contradiction is what sustained a
+/// 158-refusal loop in one live run: the refusal produced a `tool_failure` observation, the
+/// goal plane required the closure action again, the replan re-dispatched the refused call,
+/// and the guard refused it again.
+///
+/// The predicate is the guard's own, so it cannot disagree with the dispatch decision.
+fn executed_failures(failed: usize, calls: &[ModelToolCall], turn_id: &str) -> usize {
+    failed.saturating_sub(
+        calls
+            .iter()
+            .filter(|call| {
+                crate::repetition_guard::is_dispatch_blocked(
+                    turn_id,
+                    &call.name,
+                    &crate::tool_invocation::stable_hash(&call.input),
+                )
+            })
+            .count(),
+    )
+}
+
+/// Whether the protocol-closure rule may convert a synthesis into a re-dispatch.
+///
+/// The rule exists so a model cannot close a mid-protocol Agent Task with prose instead of
+/// the durable closure action. That protection holds while the action can still be executed.
+/// When the repetition guard would refuse that action for this turn, the protocol cannot be
+/// closed by it, and re-dispatching it is what sustained a 158-refusal loop in one live run:
+/// the refusal produced a `tool_failure` observation, the goal plane required the closure
+/// action again, the replan re-dispatched the refused call, and the guard refused it again.
+/// In that case the synthesis must stand and the honest partial names the blocked obligation.
+///
+/// The exception is deliberately narrow - it applies only when the guard would refuse this
+/// tool in this turn. Every other case keeps the original protection.
+fn protocol_closure_can_be_required(
+    protocol: Option<&host_backend::DelegatedAgenticProtocolState>,
+    intervention: Option<&RuntimeIntervention>,
+    turn_id: &str,
+) -> bool {
+    let Some(protocol) = protocol.filter(|protocol| !protocol.is_terminal()) else {
+        return false;
+    };
+    if !intervention.is_some_and(|candidate| candidate.kind == RuntimeInterventionKind::Synthesize)
+    {
+        return false;
+    }
+    protocol
+        .closure_tool_ids()
+        .iter()
+        .all(|tool| !crate::repetition_guard::cause_blocked_for_tool(turn_id, tool))
+}
+
 fn delegated_tool_failure_replan_available(
     bounded_evidence_role: bool,
     has_successful_tool_evidence: bool,

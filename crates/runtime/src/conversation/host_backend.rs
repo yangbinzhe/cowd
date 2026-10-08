@@ -5115,7 +5115,7 @@ where
         }
         state.consecutive_tool_failure_batches = next_consecutive_tool_failure_batches(
             state.consecutive_tool_failure_batches,
-            failed,
+            executed_failures(failed, &calls, &turn_id),
             false,
         );
         if failed == 0 && (low_novelty || scope_saturated || evidence_saturated) {
@@ -5691,12 +5691,11 @@ where
         // same claimed work in a fresh graph. Preserve all model-led research
         // until this exact boundary, then require only the irreducible durable
         // closure action instead of synthesizing text.
-        let protocol_closure_required = delegated_protocol_for_batch
-            .as_ref()
-            .is_some_and(|protocol| !protocol.is_terminal())
-            && intervention
-                .as_ref()
-                .is_some_and(|candidate| candidate.kind == RuntimeInterventionKind::Synthesize);
+        let protocol_closure_required = protocol_closure_can_be_required(
+            delegated_protocol_for_batch.as_ref(),
+            intervention.as_ref(),
+            &turn_id,
+        );
         if protocol_closure_required {
             let protocol = delegated_protocol_for_batch
                 .as_ref()
