@@ -1511,4 +1511,202 @@ mod tests {
         .expect("re-resolve stranded barrier");
         assert_eq!(re_resolved, 0, "one strand resume per Program revision");
     }
+
+    /// D6 reproduction: the barrier is parked while a Task is unsettled, the Task is
+    /// then settled to `accepted`, and the resolver is asked to release the root.
+    ///
+    /// In paired run 3 every precondition was visibly satisfied and the resolver still
+    /// recorded `resolved_waits: 0`: the barrier node was `WaitingExternal`, its payload
+    /// matched the projection's program_id and root_execution_id word for word, the
+    /// Program read model showed all three Tasks `accepted`, and the resolver's own
+    /// cursor was level with the event stream's head. `wait_disposition` should have
+    /// returned `all_tasks_accepted`. This test pins that expectation so the live
+    /// divergence cannot pass silently again.
+    #[tokio::test]
+    async fn every_task_accepted_releases_the_parked_barrier() {
+        let services = RuntimeServices::in_memory().expect("runtime");
+        let program_id = "program-wait-all-accepted";
+        let root_id = "root-wait-all-accepted";
+        let wait_node = register_root_wait(&services, root_id, program_id);
+        open_program(&services, program_id, root_id);
+        let actions = services.agent_action_service();
+        let root = root_actor(program_id, root_id);
+        let team_ref = actions
+            .project(program_id)
+            .expect("opened projection")
+            .teams
+            .keys()
+            .next()
+            .cloned()
+            .expect("opened Program has a Team");
+        let invite = |action_id: &str, role: &str| {
+            actions
+                .apply(&AgentActionEnvelope {
+                    action_id: action_id.to_string(),
+                    actor: root.clone(),
+                    expected_revision: None,
+                    action: AgentAction::AgentInvite(
+                        serde_json::from_value(serde_json::json!({
+                            "team_ref": team_ref,
+                            "role": role,
+                            "mission": "do and verify the work",
+                            "required_capabilities": ["read"]
+                        }))
+                        .unwrap(),
+                    ),
+                })
+                .expect("invite Agent")
+                .changed_refs[0]
+                .clone()
+        };
+        let worker = invite("all-accepted-worker", "Worker");
+        let reviewer = invite("all-accepted-reviewer", "Reviewer");
+        let task = actions
+            .apply(&AgentActionEnvelope {
+                action_id: "all-accepted-task".to_string(),
+                actor: root.clone(),
+                expected_revision: None,
+                action: AgentAction::TaskPublish(TaskPublishInput {
+                    team_ref: team_ref.clone(),
+                    title: "One verifiable fact".to_string(),
+                    objective: "extract one verifiable fact".to_string(),
+                    acceptance: "artifact plus evidence".to_string(),
+                    acceptance_checks: Vec::new(),
+                    required_capabilities: vec!["read".to_string()],
+                    depends_on: Vec::new(),
+
+                    obligation_refs: Vec::new(),
+                    purpose: Default::default(),
+                    execution_requirements: Vec::new(),
+                    expertise_hints: Vec::new(),
+                }),
+            })
+            .expect("publish Task")
+            .changed_refs[0]
+            .clone();
+        register_agent_child(&services, root_id, &wait_node, program_id, "child-all-accepted");
+        services
+            .execution_supervisor()
+            .drive_registered(root_id)
+            .await
+            .expect("drive wait root");
+        assert_eq!(
+            services
+                .graph_state_store()
+                .load(root_id)
+                .expect("root")
+                .node_statuses[&wait_node],
+            ExecutionNodeStatus::WaitingExternal,
+            "the barrier parks while the Task is unsettled"
+        );
+
+        let agent_actor = |agent_id: &str| {
+            let mut actor = root.clone();
+            actor.kind = AgentActorKind::Agent;
+            actor.actor_id = agent_id.to_string();
+            actor.team_id = Some(team_ref.clone());
+            actor.agent_id = Some(agent_id.to_string());
+            actor.execution_id = Some("child-all-accepted".to_string());
+            actor
+        };
+        actions
+            .apply(&AgentActionEnvelope {
+                action_id: "all-accepted-claim".to_string(),
+                actor: agent_actor(&worker),
+                expected_revision: None,
+                action: AgentAction::TaskClaim(TaskClaimInput {
+                    task_ref: task.clone(),
+                    reason: None,
+                }),
+            })
+            .expect("claim");
+        let content = services
+            .artifact_store()
+            .write_bytes(
+                harness_contract::context::ArtifactWriteDescriptor {
+                    media_type: "text/markdown".to_string(),
+                    visibility_scope: format!("session:{program_id}"),
+                    expected_bytes: None,
+                    original_name: Some("fact.md".to_string()),
+                },
+                b"one verifiable fact",
+            )
+            .await
+            .expect("artifact content");
+        let artifact = actions
+            .apply(&AgentActionEnvelope {
+                action_id: "all-accepted-artifact".to_string(),
+                actor: agent_actor(&worker),
+                expected_revision: None,
+                action: AgentAction::ArtifactCommit(
+                    serde_json::from_value(serde_json::json!({
+                        "content_ref": content.selector,
+                        "kind": "report",
+                        "title": "One fact",
+                        "relates_to": [task]
+                    }))
+                    .unwrap(),
+                ),
+            })
+            .expect("commit artifact")
+            .changed_refs[0]
+            .clone();
+        actions
+            .apply(&AgentActionEnvelope {
+                action_id: "all-accepted-submit".to_string(),
+                actor: agent_actor(&worker),
+                expected_revision: None,
+                action: AgentAction::TaskSubmit(
+                    serde_json::from_value(serde_json::json!({
+                        "task_ref": task,
+                        "artifact_refs": [artifact],
+                        "evidence_refs": ["tool://settle-observation"]
+                    }))
+                    .unwrap(),
+                ),
+            })
+            .expect("submit");
+
+        let projection = actions.project(program_id).expect("projection before review");
+        assert_eq!(
+            projection.tasks.values().map(|task| task.status.clone()).collect::<Vec<_>>(),
+            vec![crate::AgenticTaskStatus::Submitted],
+            "the Task is Submitted, so the barrier is legitimately parked"
+        );
+
+        actions
+            .apply(&AgentActionEnvelope {
+                action_id: "all-accepted-review".to_string(),
+                actor: {
+                    let mut actor = agent_actor(&reviewer);
+                    actor.execution_id = Some("child-all-accepted-review".to_string());
+                    actor
+                },
+                expected_revision: None,
+                action: AgentAction::TaskReview(
+                    serde_json::from_value(serde_json::json!({
+                        "task_ref": task,
+                        "decision": "accept",
+                        "reason": "verified",
+                        "evidence_refs": ["tool://settle-review"]
+                    }))
+                    .unwrap(),
+                ),
+            })
+            .expect("review accept");
+
+        let resolved = resolve_agentic_program_wait(
+            program_id,
+            &actions,
+            services.graph_state_store(),
+            services.execution_supervisor().as_ref(),
+            true,
+        )
+        .await
+        .expect("resolve accepted barrier");
+        assert_eq!(
+            resolved, 1,
+            "every Task accepted must release the parked barrier (D6)"
+        );
+    }
 }
