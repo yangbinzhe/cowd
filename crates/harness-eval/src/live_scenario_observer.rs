@@ -282,6 +282,12 @@ impl LiveScenarioObserver {
             new_items.len()
         );
         if changed {
+            if self.message_baseline_seen {
+                self.mark_progress(elapsed_ms);
+            } else {
+                self.message_baseline_seen = true;
+                self.last_progress_elapsed_ms = elapsed_ms;
+            }
             self.record_changed(
                 "messages",
                 path,
@@ -411,6 +417,12 @@ impl LiveScenarioObserver {
             new_items.len(),
             self.timeline_events.len()
         );
+        let execution_activity = new_items.iter().any(|event| {
+            event
+                .get("kind")
+                .and_then(Value::as_str)
+                .is_some_and(is_execution_activity)
+        });
         if changed {
             self.record_changed(
                 "timeline",
@@ -424,8 +436,13 @@ impl LiveScenarioObserver {
                     "events": new_items,
                 }),
             );
+            // Only durable execution activity re-arms the liveness clock. A page
+            // carrying nothing but Runtime's own housekeeping is still recorded and
+            // counted, but it must not keep a quiet turn looking alive.
             if self.timeline_baseline_seen {
-                self.mark_progress(elapsed_ms);
+                if execution_activity {
+                    self.mark_progress(elapsed_ms);
+                }
             } else {
                 self.timeline_baseline_seen = true;
                 self.last_progress_elapsed_ms = elapsed_ms;
@@ -849,6 +866,54 @@ impl LiveScenarioObserver {
         self.violations.push(message.clone());
         message
     }
+}
+
+/// Whether one durable timeline event is evidence that the execution is still
+/// advancing.
+///
+/// The liveness clock must answer "is the execution still doing work", not "is the
+/// projection still changing". Runtime maintains its own periodic projections, and
+/// those events arrive forever: in one live run the timeline carried 170
+/// `model.item_completed` events and 84 provider request/outcome pairs, yet the
+/// inactivity clock was kept alive almost entirely by `evolution.*` case indexing,
+/// `runtime.strategy.outcome` bookkeeping and `resource.admission.granted`
+/// renewals. The turn had been silent for 33 minutes while the evaluator still
+/// reported `last_active_phase=calling_tool`.
+///
+/// The allowlist is provider-, graph- and protocol-shaped on purpose: an unknown
+/// kind is not treated as progress, so a new housekeeping stream cannot silently
+/// re-arm the clock.
+fn is_execution_activity(kind: &str) -> bool {
+    matches!(
+        kind,
+        "model.item_completed"
+            | "context.provider_request_packed"
+            | "context.provider_attempt_outcome"
+            | "agent.provider.first_output"
+            | "execution_node.transitioned"
+            | "execution_graph.node_transitioned"
+            | "execution_graph.node_transitioned_and_replanned"
+            | "execution_graph.nodes_started"
+            | "execution_graph.nodes_transitioned"
+            | "execution_graph.planned"
+            | "execution.effect.intent"
+            | "execution.effect.receipt"
+            | "agentic.action_applied"
+            | "agentic.program_opened"
+            | "agentic.objective_verdict_bound"
+            | "agent.prepared"
+            | "agent.running"
+            | "agent.execution.started"
+            | "agent.terminal"
+            | "agent.acceptance.evaluated"
+            | "task.created"
+            | "task.graph.linked"
+            | "tool.invocation.started"
+            | "tool.invocation.completed"
+            | "tool.invocation.failed"
+            | "tool.execution_plan.created"
+            | "tool.schedule.created"
+    )
 }
 
 fn response_bytes(response: &Result<Value, String>) -> u64 {
@@ -1302,5 +1367,88 @@ mod tests {
                 .map(Vec::len),
             Some(1)
         );
+    }
+
+    fn events_of_kind(kinds: &[(&str, u64)], cursor: &str) -> Value {
+        let events = kinds
+            .iter()
+            .map(|(kind, sequence)| {
+                json!({
+                    "source": "runtime_lifecycle",
+                    "stream_id": "session:test",
+                    "sequence": sequence,
+                    "kind": kind,
+                    "commit_cursor": sequence + 1,
+                    "transaction_index": 0,
+                    "status": "running",
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "events": events,
+            "has_more": false,
+            "next_cursor": cursor,
+            "degraded": false,
+        })
+    }
+
+    /// Runtime maintains its own periodic projections, and those events arrive
+    /// forever. Counting them as progress is what let a live turn sit silent for 33
+    /// minutes while the evaluator still reported `last_active_phase=calling_tool`.
+    #[test]
+    fn housekeeping_events_do_not_re_arm_the_liveness_clock() {
+        let mut observer = LiveScenarioObserver::default();
+        observer.observe_timeline_page(
+            "/timeline",
+            &Ok(timeline_page(0, 1, true, "v2:1:1:0")),
+            10,
+        );
+        assert_eq!(observer.progress_observations(), 0);
+
+        observer.observe_timeline_page(
+            "/timeline",
+            &Ok(events_of_kind(
+                &[
+                    ("evolution.case.revised.v2", 1),
+                    ("runtime.strategy.outcome", 2),
+                    ("resource.admission.granted", 3),
+                    ("runtime.outcome.recorded.v1", 4),
+                    ("knowledge.candidate.lifecycle.v1", 5),
+                ],
+                "v2:1:6:0",
+            )),
+            20,
+        );
+        assert_eq!(
+            observer.progress_observations(),
+            0,
+            "housekeeping is recorded but is not execution progress"
+        );
+
+        observer.observe_timeline_page(
+            "/timeline",
+            &Ok(events_of_kind(
+                &[("model.item_completed", 6), ("tool.invocation.completed", 7)],
+                "v2:1:8:0",
+            )),
+            30,
+        );
+        assert_eq!(
+            observer.progress_observations(),
+            1,
+            "a real provider or tool step advances the clock again"
+        );
+    }
+
+    #[test]
+    fn the_activity_allowlist_rejects_unknown_kinds() {
+        assert!(is_execution_activity("model.item_completed"));
+        assert!(is_execution_activity("context.provider_attempt_outcome"));
+        assert!(is_execution_activity("execution_node.transitioned"));
+        assert!(is_execution_activity("agentic.action_applied"));
+        assert!(!is_execution_activity("evolution.case.revised.v2"));
+        assert!(!is_execution_activity("runtime.strategy.outcome"));
+        assert!(!is_execution_activity("resource.admission.granted"));
+        assert!(!is_execution_activity(""));
     }
 }

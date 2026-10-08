@@ -607,6 +607,36 @@ pub(crate) fn terminal_tool_events_in_events(events: &[Value]) -> u64 {
         .count() as u64
 }
 
+/// Durable terminal tool events across every recorded live scenario.
+///
+/// This is the evidence lane, and it is not the harness's own tool-batch counter: the
+/// evidence stream also carries the governed actions of delegated Agents, which the
+/// local counter never sees. A deep run that presents only the local counter reads as
+/// though it did almost no work - one live run presented 3 tool calls while its
+/// evidence held 35 terminal events. Both lanes are reported, and the counting rule
+/// itself stays shared with the gate.
+#[must_use]
+pub fn terminal_tool_events(report: &Value) -> u64 {
+    report
+        .get("live_gateway_scenarios")
+        .and_then(|live| live.get("scenarios"))
+        .and_then(Value::as_array)
+        .map(|scenarios| {
+            scenarios
+                .iter()
+                .map(|scenario| scenario_tool_call_count_evidence(scenario))
+                .sum()
+        })
+        .unwrap_or_default()
+}
+
+fn scenario_tool_call_count_evidence(scenario: &Value) -> u64 {
+    scenario
+        .pointer("/failure_diagnostics/timeline/events")
+        .and_then(Value::as_array)
+        .map_or(0, |events| terminal_tool_events_in_events(events))
+}
+
 /// One scenario's tool-call count, from one rule shared by the metric and the gate.
 ///
 /// The reported number is used when the scenario reached a terminal state; otherwise the

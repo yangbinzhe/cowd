@@ -343,6 +343,14 @@ pub fn run_eval_controlled(
         runtime_action_log.push(json!({"index": runtime_action_log.len() + 1, "action": "live_gateway_scenarios", "evidence": "isolated Gateway public API execution with durable session/terminal/projection traces"}));
     }
     let evolution_closure = evaluate_evolution_closure();
+    // The headline reports both tool lanes: the harness's own local tool-batch count,
+    // and the durable terminal tool events in the evidence lane, which also carries
+    // the governed actions of delegated Agents. Presenting only the local counter
+    // reads as though a deep multi-agent run did almost no work.
+    let evidence_tool_events = live_gateway_scenarios
+        .as_ref()
+        .map(|live| crate::report::terminal_tool_events(&json!({"live_gateway_scenarios": live})))
+        .unwrap_or_default();
     let mut report = json!({
         "kind": "mission_harness.eval_report",
         "level": options.level.as_str(),
@@ -357,7 +365,8 @@ pub fn run_eval_controlled(
         "metrics": [
             {"name": "provider_rounds", "value": execution_provider_rounds.to_string(), "notes": if options.level == HarnessEvalLevel::Deep { "derived from independently traced isolated Gateway scenarios; an optional report reviewer is tracked separately" } else { "quick/full gateway runs do not consume provider tokens" }},
             {"name": "runtime_actions", "value": runtime_actions.to_string(), "notes": "library runner exercised scenario, coverage, and knowledge fabric checks"},
-            {"name": "tool_calls", "value": tool_calls.to_string(), "notes": if options.level == HarnessEvalLevel::Full { "full eval executed local read-only tool evidence" } else { "quick smoke lane intentionally does not execute tools" }}
+             {"name": "tool_calls", "value": tool_calls.to_string(), "notes": "the harness's own local tool-batch lane; delegated Agent actions are not in this counter"},
+             {"name": "terminal_tool_events", "value": evidence_tool_events.to_string(), "notes": "durable terminal tool events in the evidence lane, including the governed actions of delegated Agents"}
         ],
         "complex_scenarios": complex,
         "reality_context_eval": reality_context,

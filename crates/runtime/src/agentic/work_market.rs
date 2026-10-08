@@ -36,6 +36,17 @@ pub(crate) fn claim_lease_ms() -> u64 {
 // materially improved retry still gets its opportunities before the bound.
 pub(crate) const MAX_TASK_EXECUTION_ATTEMPTS: u8 = 3;
 pub(crate) const MAX_TASK_REVIEW_ATTEMPTS: u8 = 3;
+/// Bounded review *rounds*. A rework verdict returns the Task to the market, and
+/// the re-executed Task must be reviewable again in its own physical execution:
+/// a dispatched Agent is identified by `digest(program | task | agent | mode |
+/// generation)` and the Review mode's generation is `review_generation`, so a
+/// verdict that does not advance it makes every later review round collide with
+/// the first round's graph and be swallowed as an existing durable admission.
+/// Once the rounds are counted they must also be bounded, otherwise a reviewer
+/// that keeps sending the same Task back parks the root on the Program barrier
+/// forever. This counts verdicts only; physical review attempts keep their own
+/// separate `MAX_TASK_REVIEW_ATTEMPTS` bound.
+pub(crate) const MAX_TASK_REVIEW_ROUNDS: u8 = 3;
 
 pub(crate) fn apply_task_publish(
     projection: &mut AgenticProgramProjection,
@@ -557,7 +568,6 @@ pub(crate) fn apply_task_review(
                 crate::repetition_guard::clear_turn(&envelope.actor.turn_id);
             }
             TaskReviewDecision::Challenge | TaskReviewDecision::Rework => {
-                task.status = AgenticTaskStatus::Rework;
                 task.claimant = None;
                 task.claim_execution_id = None;
                 task.claimed_at_ms = None;
@@ -565,6 +575,18 @@ pub(crate) fn apply_task_review(
                 // Drop every stale attempt so the reworked Task is immediately
                 // eligible for a fresh execute dispatch and does not look busy.
                 task.active_attempts.clear();
+                // The reworked Task re-enters the market, so its next review is a
+                // new round: advance the review generation or the next review
+                // round reuses this round's graph identity. Past the bound the
+                // Task is forced Blocked, which the Program barrier already
+                // treats as a release condition, so the root gets a terminal
+                // instead of an unbounded rework loop.
+                task.review_generation = task.review_generation.saturating_add(1);
+                task.status = if task.review_generation >= u64::from(MAX_TASK_REVIEW_ROUNDS) {
+                    AgenticTaskStatus::Blocked
+                } else {
+                    AgenticTaskStatus::Rework
+                };
             }
         }
     }

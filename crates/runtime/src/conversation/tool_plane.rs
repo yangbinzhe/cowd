@@ -6,6 +6,29 @@ use super::*;
 /// reduce a read to an unusable shell.
 const READ_TOOL_RESULT_FLOOR_TOKENS: u64 = 8_192;
 
+/// An agentic action receipt is a protocol object, not a payload to summarize.
+///
+/// `build_tool_receipt` gives every JSON tool output a prose prefix, which is right
+/// for a read - the model needs the reference and a hint - but wrong here: the
+/// receipt's `status` / `duplicate` / `changed_refs` / `actionable` fields are what
+/// the model acts on, and Runtime's own progress measure parses the very text it
+/// hands the model. In one live run 74 of 75 delegated tool-batch observations
+/// reported no verified gain for that reason, while the same batches' own summaries
+/// reported new coverage.
+///
+/// Deliver the receipt verbatim exactly when it would be counted as progress, so
+/// the measure and the model read one object. Anything that does not parse as an
+/// applied receipt keeps the generic prose receipt.
+fn agentic_action_body(output: &str) -> Option<String> {
+    let observation =
+        serde_json::from_str::<harness_contract::agent_action::AgentActionObservation>(output)
+            .ok()?;
+    (observation.status == harness_contract::agent_action::AgentActionStatus::Applied
+        && !observation.duplicate
+        && !observation.changed_refs.is_empty())
+    .then(|| output.to_string())
+}
+
 impl<C, T> ConversationRuntime<C, T>
 where
     C: ApiClient,
@@ -1010,7 +1033,8 @@ where
                 let audit_projection =
                     crate::context_evidence::audit_projection(&model_receipt, Some(&raw_access));
                 self.push_turn_evidence_audit(audit_projection);
-                let model_summary = model_receipt.summary;
+                let model_summary =
+                    agentic_action_body(&combined).unwrap_or(model_receipt.summary);
                 let output_envelope = harness_contract::context::ToolOutputEnvelope {
                     artifact_ref: Some(harness_contract::context::ArtifactRef::durable(
                         raw_access.retrieval_selector.clone(),
@@ -1797,5 +1821,51 @@ where
             }],
             payload,
         );
+    }
+}
+
+#[cfg(test)]
+mod agentic_action_body_tests {
+    use super::agentic_action_body;
+
+    fn receipt(status: &str, changed_refs: &[&str], duplicate: bool) -> String {
+        serde_json::json!({
+            "receipt_id": "receipt:program:test:action",
+            "action_id": "action",
+            "action": "task_claim",
+            "program_id": "program:test",
+            "revision": 4,
+            "status": status,
+            "duplicate": duplicate,
+            "changed_refs": changed_refs,
+            "actionable": ["submit the deliverable"],
+            "projection": null,
+            "error": null
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn an_applied_agentic_receipt_is_delivered_verbatim() {
+        let body = receipt("applied", &["task:t1"], false);
+        assert_eq!(agentic_action_body(&body).as_deref(), Some(body.as_str()));
+    }
+
+    /// The half that must not change: a receipt that carries no new entity is not
+    /// progress, and must keep the generic prose receipt rather than being
+    /// delivered verbatim. This is what keeps "reading is not progress" intact.
+    #[test]
+    fn a_receipt_without_a_changed_entity_keeps_the_prose_receipt() {
+        assert!(agentic_action_body(&receipt("applied", &[], false)).is_none());
+        assert!(agentic_action_body(&receipt("applied", &["task:t1"], true)).is_none());
+        assert!(agentic_action_body(&receipt("rejected", &["task:t1"], false)).is_none());
+        assert!(agentic_action_body(&receipt("observed", &[], false)).is_none());
+    }
+
+    #[test]
+    fn a_tool_that_is_not_an_agentic_receipt_keeps_the_prose_receipt() {
+        assert!(agentic_action_body("{\"path\":\"a.rs\",\"content\":\"x\"}").is_none());
+        assert!(agentic_action_body("plain text").is_none());
+        assert!(agentic_action_body("").is_none());
     }
 }

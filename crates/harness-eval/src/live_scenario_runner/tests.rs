@@ -1477,3 +1477,79 @@ fn first_provider_response_uses_the_full_complexity_deadline() {
         1,
     ));
 }
+
+fn failed_scenario_spec() -> LiveScenarioSpec {
+    LiveScenarioSpec {
+        id: "live_one_team_execution",
+        prompt: "provider evidence fixture",
+        acceptance: LiveAcceptance::AutonomousCollaboration {
+            minimum_teams: 1,
+            minimum_agents: 3,
+            minimum_tasks: 3,
+            minimum_reviews: 3,
+            minimum_cross_team_edges: 0,
+            minimum_topics: 0,
+            output_path: "out.md",
+        },
+        timeout: LiveScenarioTimeout::team(),
+    }
+}
+
+fn provider_attempt_diagnostics(attempts: usize) -> Value {
+    let mut events = Vec::new();
+    for index in 0..attempts {
+        let request_id = format!("provider-request-{index}");
+        events.push(json!({
+            "kind": "context.provider_request_packed",
+            "payload": {"request_id": request_id, "model": "step-3.7-flash"}
+        }));
+        events.push(json!({
+            "kind": "context.provider_attempt_outcome",
+            "payload": {
+                "request_id": request_id,
+                "usage_status": "known",
+                "cache_dimensions_status": "known",
+                "terminal_status": "completed",
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 10,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0
+                }
+            }
+        }));
+    }
+    json!({"timeline": {"events": events}})
+}
+
+/// A failed scenario spent its provider budget before it failed, so it must report
+/// the same metrics a passing scenario reports. Omitting them is what made the
+/// provider-round gate read zero exactly when it was supposed to check the claim:
+/// both of its sources sum `metrics.model_rounds` per scenario.
+#[test]
+fn a_failed_scenario_still_reports_its_provider_rounds() {
+    let attempts = 3;
+    let diagnostics = provider_attempt_diagnostics(attempts);
+    let scenario = failed_scenario_with_session_and_execution(
+        failed_scenario_spec(),
+        Instant::now(),
+        Vec::new(),
+        "session-1".to_string(),
+        Some("execution-1".to_string()),
+        "scenario aborted for inactivity".to_string(),
+        diagnostics,
+    );
+
+    let metrics = scenario.get("metrics").expect("a failed scenario has metrics");
+    assert_eq!(
+        metrics.get("model_rounds").and_then(Value::as_u64),
+        Some(attempts as u64),
+        "one model round per completed provider attempt, counted for a failed scenario too"
+    );
+    assert_eq!(
+        metrics.get("provider_attempt_count").and_then(Value::as_u64),
+        Some(attempts as u64),
+    );
+    assert_eq!(metrics.get("tool_calls").and_then(Value::as_u64), Some(0));
+    assert_eq!(scenario.get("status").and_then(Value::as_str), Some("failed"));
+}

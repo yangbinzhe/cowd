@@ -356,3 +356,45 @@ mod tests {
         assert!(receipt.summary.contains("bbb"));
     }
 }
+
+/// The model-facing receipt for a JSON tool output is prefixed with a prose
+/// summary, so the output is not deserializable any more. For a read tool that is
+/// fine - the model only needs the reference and a hint. An agentic action
+/// receipt is a protocol object (`status`, `duplicate`, `changed_refs`,
+/// `actionable`, `revision`), and Runtime's own progress measure parses the very
+/// text it hands the model, so the prefix makes a delegated Agent's applied
+/// actions invisible to the measure. This test pins the mechanism.
+#[test]
+fn a_json_receipt_is_no_longer_deserializable_after_the_prose_prefix() {
+    let receipt = serde_json::json!({
+        "receipt_id": "receipt:program:test:claim",
+        "action_id": "action:claim",
+        "action": "task_claim",
+        "program_id": "program:test",
+        "revision": 4,
+        "status": "applied",
+        "duplicate": false,
+        "changed_refs": ["task:t1"],
+        "actionable": ["submit the deliverable"],
+        "projection": serde_json::json!({"padding": "x".repeat(512)}),
+        "error": null
+    })
+    .to_string();
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&receipt).is_ok(),
+        "the durable receipt is JSON"
+    );
+
+    let model_receipt = build_tool_receipt(
+        "task_claim",
+        &receipt,
+        false,
+        EvidenceRef::observed("tool", "raw-claim"),
+        12_000,
+    );
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&model_receipt.summary).is_err(),
+        "the model-facing summary is not JSON: {}",
+        &model_receipt.summary[..60.min(model_receipt.summary.len())]
+    );
+}

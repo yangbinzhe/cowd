@@ -36,7 +36,7 @@ mod provider_rounds;
 mod facet_gate;
 mod observation_limit;
 mod real_provider_runner;
-mod report;
+pub(crate) mod report;
 mod report_store;
 mod runner;
 mod session_actor;

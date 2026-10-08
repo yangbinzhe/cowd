@@ -3796,40 +3796,54 @@ fn a_rework_round_must_be_reviewable_again_in_its_own_graph() {
     };
     let _ = submit_once("round-1");
 
-    // The first review round sends the Task back.
-    let rework = service
-        .apply(&managed(
-            "e5-review-rework",
-            &team,
-            &reviewer,
-            AgentAction::TaskReview(TaskReviewInput {
-                task_ref: task.clone(),
-                decision: TaskReviewDecision::Rework,
-                reason: "does not state one verifiable fact".to_string(),
-                evidence_refs: vec!["tool://independent-inspection".into()],
-            }),
-        ))
-        .unwrap();
-    println!("rework receipt: {rework:?}");
-    assert_eq!(rework.status, AgentActionStatus::Applied);
+    // Each verdict round must be reviewable again in its own physical execution,
+    // and the rounds themselves must be bounded.
+    for round in 1..=crate::agentic::work_market::MAX_TASK_REVIEW_ROUNDS {
+        let rework = service
+            .apply(&managed(
+                &format!("e5-review-rework-{round}"),
+                &team,
+                &reviewer,
+                AgentAction::TaskReview(TaskReviewInput {
+                    task_ref: task.clone(),
+                    decision: TaskReviewDecision::Rework,
+                    reason: "does not state one verifiable fact".to_string(),
+                    evidence_refs: vec!["tool://independent-inspection".into()],
+                }),
+            ))
+            .unwrap();
+        assert_eq!(rework.status, AgentActionStatus::Applied);
 
-    let after_rework = service.project("program-1").unwrap();
-    let reworked = after_rework.tasks.get(&task).unwrap();
-    assert_eq!(reworked.status, crate::AgenticTaskStatus::Rework);
-    let generation_before = reworked.review_generation;
+        let projection = service.project("program-1").unwrap();
+        let reviewed = projection.tasks.get(&task).unwrap();
+        assert!(
+            reviewed.review_generation >= u64::from(round),
+            "the review round advanced, so the re-review gets a fresh graph identity"
+        );
+        let bounded = reviewed.review_generation >= u64::from(crate::agentic::work_market::MAX_TASK_REVIEW_ROUNDS);
+        assert_eq!(
+            reviewed.status,
+            if bounded {
+                crate::AgenticTaskStatus::Blocked
+            } else {
+                crate::AgenticTaskStatus::Rework
+            },
+            "round {round}: bounded review rounds must reach an explicit terminal"
+        );
+        if bounded {
+            break;
+        }
 
-    // The market is entered again and the Task is re-submitted.
-    let _ = submit_once("round-2");
-    let after_resubmit = service.project("program-1").unwrap();
-    let resubmitted = after_resubmit.tasks.get(&task).unwrap();
-    assert_eq!(resubmitted.status, crate::AgenticTaskStatus::Submitted);
-
-    assert!(
-        resubmitted.claim_generation > 1,
-        "the execute round advanced, so the re-execution got a fresh graph"
-    );
-    assert_eq!(
-        resubmitted.review_generation, generation_before,
-        "the review round did not advance, so a re-review of the same Task reuses the first review's graph identity and is swallowed as a duplicate admission - the Task can never be re-reviewed"
-    );
+        // A re-submission is what makes the Task reviewable again; it is also the
+        // only place the execute generation advances.
+        let _ = submit_once(&format!("round-{}", round + 1));
+        let resubmitted = service.project("program-1").unwrap();
+        let resubmitted = resubmitted.tasks.get(&task).unwrap();
+        assert_eq!(
+            resubmitted.claim_generation,
+            u64::from(round) + 1,
+            "the execute round advanced, so the re-execution got a fresh graph"
+        );
+        assert_eq!(resubmitted.status, crate::AgenticTaskStatus::Submitted);
+    }
 }

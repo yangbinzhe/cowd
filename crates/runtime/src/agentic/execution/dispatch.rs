@@ -106,6 +106,19 @@ fn dispatch_starvation_key(
     format!("{program_id}|{task_ref}|{}", mode.as_str())
 }
 
+/// Whether Runtime's own dispatch machinery has already failed to place one Task.
+///
+/// This is the signal that a Task is unreachable rather than merely slow: the
+/// starvation ledger is only written after a "no free eligible member" deferral,
+/// and it clears the moment a dispatch succeeds. A missing child link alone never
+/// produces it, so timing is not mistaken for starvation. Callers must already have
+/// established that no child graph is active and that the Task has no attempt.
+pub(crate) fn dispatch_unplaced_for_task(program_id: &str, task_ref: &str) -> bool {
+    [DispatchMode::Execute, DispatchMode::Review].iter().any(|mode| {
+        dispatch_starvation_count(&dispatch_starvation_key(program_id, task_ref, *mode)) > 0
+    })
+}
+
 /// Opt-in verbose tool-contract logging (`COWD_TOOL_CONTRACT_TRACE=1`). Only
 /// affects logs, never authorization.
 fn tool_contract_trace() -> bool {

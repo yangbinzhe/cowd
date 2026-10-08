@@ -4463,6 +4463,18 @@ fn failed_scenario_with_session_and_execution(
     error: String,
     diagnostics: Value,
 ) -> Value {
+    // A failed scenario already spent its provider budget before it failed, so it
+    // must report the same metrics a passing scenario reports. Omitting them here
+    // is what made the provider-round gate read zero exactly when it was supposed
+    // to check the claim: both of its sources sum `metrics.model_rounds` per
+    // scenario. The diagnostics carry the observer's own timeline, so the failed
+    // scenario is measured by the same algorithm as a passing one.
+    let metrics = scenario_metrics(
+        diagnostics.pointer("/timeline").unwrap_or(&Value::Null),
+        &[],
+        None,
+        started.elapsed(),
+    );
     json!({
         "scenario_id": spec.id,
         "status": "failed",
@@ -4470,6 +4482,7 @@ fn failed_scenario_with_session_and_execution(
         "execution_id": execution_id,
         "elapsed_ms": started.elapsed().as_millis(),
         "error": error,
+        "metrics": metrics,
         "failure_diagnostics": diagnostics,
         "trace": trace,
         "production_trace": Value::Null,

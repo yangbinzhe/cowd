@@ -294,6 +294,18 @@ pub async fn resolve_agentic_program_wait(
     let WaitDisposition::Resume { revision, reason } = disposition else {
         return Ok(0);
     };
+    // A strand resume hands the root one chance to replan, withdraw, or retire the
+    // unreachable Task. The root graph's own barrier nodes are the durable record
+    // of how many chances it has already had: each released barrier keeps its
+    // `agentic-program-checkpoint:` result, so no new state is needed to bound it.
+    let strand_resumes = if reason == "task_stranded" {
+        strand_resume_count(state_store, root_execution_id, program_id).await?
+    } else {
+        0
+    };
+    if strand_resumes >= MAX_TASK_STRAND_RESUMES {
+        return Ok(0);
+    }
     let mut resolved = 0usize;
     const MAX_GRAPH_CAS_ATTEMPTS: usize = 8;
     for attempt in 0..MAX_GRAPH_CAS_ATTEMPTS {
@@ -508,10 +520,21 @@ async fn wait_disposition(
         // settled": a child link may not be durable yet. Never read a missing
         // link as completion while a task is still live (PLAN C5-6).
         if has_unsettled_tasks(projection) {
-            return Ok(WaitDisposition::Wait {
-                revision: projection.revision,
-                active_graphs,
-            });
+            // One bounded exception, and only for a Task Runtime has already
+            // declared undispatched past its own bound. Parking on it forever is
+            // the starvation the fuse later reports, and the root can still
+            // replan, withdraw, or retire it.
+            return if unreachable_task_refs(projection).is_empty() {
+                Ok(WaitDisposition::Wait {
+                    revision: projection.revision,
+                    active_graphs,
+                })
+            } else {
+                Ok(WaitDisposition::Resume {
+                    revision: projection.revision,
+                    reason: "task_stranded",
+                })
+            };
         }
         return Ok(WaitDisposition::Resume {
             revision: projection.revision,
@@ -524,12 +547,76 @@ async fn wait_disposition(
     })
 }
 
+/// Bounded strand resumes per (root, Program). Past the bound the barrier goes back
+/// to waiting and the no-progress fuse produces the honest partial, which is the
+/// correct answer once the root has already been offered the chance and did not
+/// take it.
+pub(crate) const MAX_TASK_STRAND_RESUMES: usize = 2;
+
+/// How many times this root's barriers have already been released for a stranded
+/// Task. Every released barrier keeps its durable `agentic-program-checkpoint`
+/// result, so the count is read from the root graph itself.
+async fn strand_resume_count(
+    state_store: &ExecutionGraphStateStore,
+    root_execution_id: &str,
+    program_id: &str,
+) -> Result<usize, String> {
+    let graph = state_store
+        .load_current_async(root_execution_id.to_string())
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(graph
+        .nodes
+        .iter()
+        .filter(|node| node.executor_kind == AgenticProgramWaitExecutor::KIND)
+        .filter_map(|node| graph.node_results.get(&node.id))
+        .filter_map(|result| result.result_ref.as_deref())
+        .filter(|result_ref| {
+            result_ref.starts_with(&format!("agentic-program-checkpoint:{program_id}:revision:"))
+                && result_ref.ends_with(":task_stranded")
+        })
+        .count())
+}
+
 fn all_tasks_accepted(projection: &AgenticProgramProjection) -> bool {
     !projection.tasks.is_empty()
         && projection
             .tasks
             .values()
             .all(|task| task.status == AgenticTaskStatus::Accepted)
+}
+
+/// Live Tasks that no Agent will ever settle.
+///
+/// A barrier must not read a missing child link as completion (PLAN C5-6), because
+/// a link may simply not be durable yet. But there is a second, distinguishable
+/// state: Runtime's own dispatch machinery has already exhausted its bound for the
+/// Task, which only happens after repeated "no free eligible member" deferrals and
+/// clears the moment a dispatch succeeds. Such a Task is not late; it is
+/// unreachable, and parking the root on it forever is the starvation the no-progress
+/// fuse later reports.
+///
+/// Only meaningful once no child graph is active: a live child may still settle its
+/// own Task.
+fn unreachable_task_refs(projection: &AgenticProgramProjection) -> Vec<String> {
+    projection
+        .tasks
+        .values()
+        .filter(|task| {
+            matches!(
+                task.status,
+                AgenticTaskStatus::Published
+                    | AgenticTaskStatus::Claimed
+                    | AgenticTaskStatus::Submitted
+                    | AgenticTaskStatus::Rework
+            ) && task.active_attempts.is_empty()
+                && crate::agentic::execution::dispatch::dispatch_unplaced_for_task(
+                    &projection.program_id,
+                    &task.task_id,
+                )
+        })
+        .map(|task| task.task_id.clone())
+        .collect()
 }
 
 /// Tasks that were dispatched into the Program but have not settled yet.
@@ -632,7 +719,7 @@ fn now_ms() -> u64 {
 mod tests {
     use harness_contract::agent_action::{
         AgentAction, AgentActionEnvelope, AgentActorBinding, AgentActorKind, AgentInviteInput,
-        TaskPublishInput, TeamCreateInput,
+        TaskClaimInput, TaskPublishInput, TeamCreateInput,
     };
     use harness_contract::execution_graph::{
         ExecutionGraph, ExecutionGraphCommand, ExecutionGraphLineage, ExecutionNodeKind,
@@ -1260,5 +1347,168 @@ mod tests {
             resolved, 1,
             "the event that settles the last Task must release the parked barrier"
         );
+    }
+
+    /// PLAN C5-6 must keep refusing to read a missing child link as completion, so a
+    /// Task with no live child graph still parks the root. But there is a second,
+    /// distinguishable state: Runtime's own dispatch machinery has already exhausted
+    /// its bound for the Task, which only happens after repeated "no free eligible
+    /// member" deferrals. Such a Task is not late, it is unreachable, and parking on
+    /// it forever is exactly the starvation run #6 hit - the root had no ready node,
+    /// no Agent would ever review the re-submitted Task, and the no-progress fuse had
+    /// to end the turn.
+    #[tokio::test]
+    async fn a_task_runtime_cannot_dispatch_anymore_is_offered_to_the_root_once_per_revision() {
+        let services = RuntimeServices::in_memory().expect("runtime");
+        let program_id = "program-wait-stranded";
+        let root_id = "root-wait-stranded";
+        let wait_node = register_root_wait(&services, root_id, program_id);
+        open_program(&services, program_id, root_id);
+        let actions = services.agent_action_service();
+        let root = root_actor(program_id, root_id);
+        let team_ref = actions
+            .project(program_id)
+            .expect("opened projection")
+            .teams
+            .keys()
+            .next()
+            .cloned()
+            .expect("opened Program has a Team");
+        // Exactly one Agent, so the roster is never empty but this one member is
+        // permanently busy: it is the claimant of the other Task.
+        let worker = actions
+            .apply(&AgentActionEnvelope {
+                action_id: "stranded-invite".to_string(),
+                actor: root.clone(),
+                expected_revision: None,
+                action: AgentAction::AgentInvite(
+                    serde_json::from_value(serde_json::json!({
+                        "team_ref": team_ref,
+                        "role": "Worker",
+                        "mission": "do the work",
+                        "required_capabilities": ["read"]
+                    }))
+                    .unwrap(),
+                ),
+            })
+            .expect("invite Agent")
+            .changed_refs[0]
+            .clone();
+        let publish = |action_id: &str, title: &str| {
+            actions
+                .apply(&AgentActionEnvelope {
+                    action_id: action_id.to_string(),
+                    actor: root.clone(),
+                    expected_revision: None,
+                    action: AgentAction::TaskPublish(TaskPublishInput {
+                        team_ref: team_ref.clone(),
+                        title: title.to_string(),
+                        objective: "prove post-action wait eligibility".to_string(),
+                        acceptance: "the claimed child eventually submits evidence".to_string(),
+                        acceptance_checks: Vec::new(),
+                        required_capabilities: vec!["read".to_string()],
+                        depends_on: Vec::new(),
+
+                        obligation_refs: Vec::new(),
+                        purpose: Default::default(),
+                        execution_requirements: Vec::new(),
+                        expertise_hints: Vec::new(),
+                    }),
+                })
+                .expect("publish Task")
+                .changed_refs[0]
+                .clone()
+        };
+        let unreachable = publish("stranded-publish", "Unreachable work");
+        let busy = publish("stranded-busy", "Work the Agent is busy with");
+        let worker_actor = {
+            let mut actor = root.clone();
+            actor.kind = AgentActorKind::Agent;
+            actor.actor_id = worker.clone();
+            actor.team_id = Some(team_ref.clone());
+            actor.agent_id = Some(worker.clone());
+            actor.execution_id = Some("stranded-worker".to_string());
+            actor
+        };
+        actions
+            .apply(&AgentActionEnvelope {
+                action_id: "stranded-claim".to_string(),
+                actor: worker_actor,
+                expected_revision: None,
+                action: AgentAction::TaskClaim(TaskClaimInput {
+                    task_ref: busy.clone(),
+                    reason: None,
+                }),
+            })
+            .expect("claim the other Task");
+
+        let context = crate::agentic::execution::AgenticDispatchContext {
+            session_id: format!("session:{program_id}"),
+            turn_id: format!("turn:{program_id}"),
+            model_lease: "test".to_string(),
+            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+            resource_scopes: Vec::new(),
+        };
+        services
+            .execution_supervisor()
+            .drive_registered(root_id)
+            .await
+            .expect("drive wait root");
+        assert_eq!(
+            services
+                .graph_state_store()
+                .load(root_id)
+                .expect("root")
+                .node_statuses[&wait_node],
+            ExecutionNodeStatus::WaitingExternal,
+            "a Task with no live child graph still parks the root (PLAN C5-6)"
+        );
+
+        // Re-dispatch the unreachable Task: Runtime tried and could not place it.
+        for attempt in 0..4 {
+            let receipt = services
+                .dispatch_agentic_followups(
+                &AgentActionEnvelope {
+                    action_id: format!("stranded-release-{attempt}"),
+                    actor: root.clone(),
+                    expected_revision: None,
+                    action: AgentAction::TaskRelease(
+                        harness_contract::agent_action::TaskReleaseInput {
+                            task_ref: unreachable.clone(),
+                            reason: String::new(),
+                        },
+                    ),
+                },
+                context.clone(),
+            )
+            .await;
+        }
+
+        let resolved = resolve_agentic_program_wait(
+            program_id,
+            &services.agent_action_service(),
+            services.graph_state_store(),
+            services.execution_supervisor().as_ref(),
+            true,
+        )
+        .await
+        .expect("resolve stranded barrier");
+        assert_eq!(
+            resolved, 1,
+            "a Task Runtime cannot dispatch anymore must be offered to the root"
+        );
+
+        // The same Program revision must not release it twice: a root that cannot
+        // act would otherwise be resumed forever and the fuse would never fire.
+        let re_resolved = resolve_agentic_program_wait(
+            program_id,
+            &services.agent_action_service(),
+            services.graph_state_store(),
+            services.execution_supervisor().as_ref(),
+            true,
+        )
+        .await
+        .expect("re-resolve stranded barrier");
+        assert_eq!(re_resolved, 0, "one strand resume per Program revision");
     }
 }
