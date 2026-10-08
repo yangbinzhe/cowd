@@ -270,6 +270,42 @@ impl NodeExecutor for AgenticProgramWaitExecutor {
 /// `allow_same_revision_quiescence` is used by child-settle/startup recovery;
 /// Program-event passes keep it false so replaying the event that originally
 /// created the wait cannot spuriously release an active barrier.
+/// One durable line saying what the barrier resolver decided and what it read. See
+/// `AgentActionService::record_wait_disposition` for why this exists.
+fn record(
+    actions: &crate::AgentActionService,
+    projection: &crate::AgenticProgramProjection,
+    program_id: &str,
+    root_execution_id: &str,
+    disposition: &'static str,
+    reason: Option<&'static str>,
+    barrier_candidates: usize,
+    observed_revision: u64,
+    released: usize,
+) {
+    if projection.program_id != program_id
+        || projection.root_execution_id.as_deref() != Some(root_execution_id)
+    {
+        return;
+    }
+    actions.record_wait_disposition(crate::agentic::AgenticWaitDisposition {
+        program_id,
+        root_execution_id,
+        revision: projection.revision,
+        disposition,
+        reason,
+        all_tasks_accepted: all_tasks_accepted(projection),
+        task_statuses: projection
+            .tasks
+            .iter()
+            .map(|(task_ref, task)| (task_ref.clone(), format!("{:?}", task.status)))
+            .collect(),
+        barrier_candidates,
+        released,
+        observed_revision,
+    });
+}
+
 pub async fn resolve_agentic_program_wait(
     program_id: &str,
     actions: &AgentActionService,
@@ -291,23 +327,32 @@ pub async fn resolve_agentic_program_wait(
         deadline_at_ms,
     };
     let disposition = wait_disposition(&projection, &request, state_store).await?;
-    let WaitDisposition::Resume { revision, reason } = disposition else {
-        return Ok(0);
+    let (revision, reason, disposition) = match disposition {
+        WaitDisposition::Wait { .. } => (projection.revision, None, "wait"),
+        WaitDisposition::Resume { revision, reason } => (revision, Some(reason), "resume"),
     };
     // A strand resume hands the root one chance to replan, withdraw, or retire the
     // unreachable Task. The root graph's own barrier nodes are the durable record
     // of how many chances it has already had: each released barrier keeps its
     // `agentic-program-checkpoint:` result, so no new state is needed to bound it.
-    let strand_resumes = if reason == "task_stranded" {
+    let strand_resumes = if reason == Some("task_stranded") {
         strand_resume_count(state_store, root_execution_id, program_id).await?
     } else {
         0
     };
-    if strand_resumes >= MAX_TASK_STRAND_RESUMES {
+    let strand_exhausted = strand_resumes >= MAX_TASK_STRAND_RESUMES;
+    let mut resolved = 0usize;
+    let mut barrier_candidates = 0usize;
+    let mut observed_revision = 0u64;
+    const MAX_GRAPH_CAS_ATTEMPTS: usize = 8;
+    if strand_exhausted {
+        record(actions, &projection, program_id, root_execution_id, disposition, reason, 0, 0, 0);
         return Ok(0);
     }
-    let mut resolved = 0usize;
-    const MAX_GRAPH_CAS_ATTEMPTS: usize = 8;
+    if disposition == "wait" {
+        record(actions, &projection, program_id, root_execution_id, disposition, reason, 0, 0, 0);
+        return Ok(0);
+    }
     for attempt in 0..MAX_GRAPH_CAS_ATTEMPTS {
         let graph = match state_store
             .load_current_async(root_execution_id.to_string())
@@ -333,7 +378,8 @@ pub async fn resolve_agentic_program_wait(
         let Some(node) = candidate else {
             break;
         };
-        let observed_revision = graph
+        barrier_candidates = barrier_candidates.saturating_add(1);
+        observed_revision = graph
             .node_results
             .get(&node.id)
             .and_then(|result| result.result_ref.as_deref())
@@ -344,10 +390,10 @@ pub async fn resolve_agentic_program_wait(
         // `worker_quiescent` resume: when no child graph is active the barrier
         // is genuinely releasable even if the Program revision never advanced,
         // otherwise the root stays parked forever (G56/G57 root non-finalization).
-        let quiescent_resume = reason == "worker_quiescent";
+        let quiescent_resume = reason == Some("worker_quiescent");
         // A budget resume is equally real even when the Program revision never
         // advanced: the durable deadline is the release condition.
-        let budget_resume = reason == "collaboration_budget";
+        let budget_resume = reason == Some("collaboration_budget");
         if !allow_same_revision_quiescence
             && !quiescent_resume
             && !budget_resume
@@ -376,7 +422,8 @@ pub async fn resolve_agentic_program_wait(
                     expected_revision: graph.revision,
                     node_id: node.id.clone(),
                     result_ref: format!(
-                        "agentic-program-checkpoint:{program_id}:revision:{revision}:{reason}"
+                        "agentic-program-checkpoint:{program_id}:revision:{revision}:{}",
+                        reason.unwrap_or("unspecified")
                     ),
                     correlation_id,
                 },
@@ -403,6 +450,17 @@ pub async fn resolve_agentic_program_wait(
             .await
             .map_err(|error| error.to_string())?;
     }
+    record(
+        actions,
+        &projection,
+        program_id,
+        root_execution_id,
+        disposition,
+        reason,
+        barrier_candidates,
+        observed_revision,
+        resolved,
+    );
     Ok(resolved)
 }
 
@@ -726,6 +784,7 @@ mod tests {
         ExecutionNodeSpec, ExecutionNodeStatus, ExecutionParentBinding,
     };
     use harness_contract::policy::PermissionMode;
+    use serde_json::Value;
 
     use super::{
         reconcile_agentic_program_wait_for_settled_graph, resolve_agentic_program_wait,
@@ -1708,5 +1767,35 @@ mod tests {
             resolved, 1,
             "every Task accepted must release the parked barrier (D6)"
         );
+
+        // The decision itself must be observable, which is the whole point of the
+        // diagnostic record: run #6 style stalls were only inferable from a zero count.
+        let dispositions = wait_dispositions(&services, program_id);
+        assert!(
+            dispositions.iter().any(|event| {
+                event.get("disposition").and_then(Value::as_str) == Some("resume")
+                    && event.get("reason").and_then(Value::as_str) == Some("all_tasks_accepted")
+                    && event.get("released").and_then(Value::as_u64) == Some(1)
+                    && event.get("barrier_candidates").and_then(Value::as_u64) == Some(1)
+                    && event
+                        .get("all_tasks_accepted")
+                        .and_then(Value::as_bool)
+                        == Some(true)
+            }),
+            "a releasing decision must be durable and must name its reason: {dispositions:?}"
+        );
+    }
+
+    fn wait_dispositions(services: &RuntimeServices, program_id: &str) -> Vec<Value> {
+        let store = services.event_store();
+        let stream_id = format!("agentic-program-wait:{program_id}");
+        let revision = store.stream_revision(&stream_id).unwrap_or_default();
+        store
+            .list_stream_after(&stream_id, 0, revision, 1_000, 32 * 1024 * 1024)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|event| event.kind == "agentic.program_wait_disposition")
+            .map(|event| event.payload)
+            .collect()
     }
 }

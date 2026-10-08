@@ -23,6 +23,87 @@ mod delegation;
 use authorization::validate_transition;
 
 const ACTION_EVENT_KIND: &str = "agentic.action_applied";
+/// Durable record of what the root barrier's resolver decided.
+///
+/// The resolver used to report only a count, so a barrier that never released could
+/// not be distinguished from one that was never asked. In paired run 3 all three
+/// Tasks were `accepted`, the barrier was `WaitingExternal`, its payload matched the
+/// projection's program_id and root_execution_id word for word, and the resolver's own
+/// cursor was level with the event stream head - yet `resolved_waits` was 0 and no
+/// `agentic-program-checkpoint` command was ever issued. This record names the
+/// disposition, the reason, the Task statuses the resolver actually read, and whether
+/// it found a candidate barrier node, so the next run answers the question instead of
+/// leaving it to inference.
+pub(crate) struct AgenticWaitDisposition<'a> {
+    pub program_id: &'a str,
+    pub root_execution_id: &'a str,
+    pub revision: u64,
+    pub disposition: &'static str,
+    pub reason: Option<&'static str>,
+    pub all_tasks_accepted: bool,
+    pub task_statuses: Vec<(String, String)>,
+    pub barrier_candidates: usize,
+    pub released: usize,
+    pub observed_revision: u64,
+}
+
+impl AgentActionService {
+    /// Append one barrier disposition record. It goes on its own stream so it never
+    /// advances the semantic Program revision, and its scope is deliberately not
+    /// `Program`: the resolver lane's interest is `agentic.action_applied`, and a
+    /// diagnostic record must not be able to re-arm that lane.
+    pub(crate) fn record_wait_disposition(&self, record: AgenticWaitDisposition<'_>) {
+        let stream_id = format!("agentic-program-wait:{}", record.program_id);
+        let expected = self
+            .store
+            .stream_revision(&stream_id)
+            .unwrap_or_default();
+        let payload = serde_json::json!({
+            "program_id": record.program_id,
+            "root_execution_id": record.root_execution_id,
+            "revision": record.revision,
+            "disposition": record.disposition,
+            "reason": record.reason,
+            "all_tasks_accepted": record.all_tasks_accepted,
+            "task_statuses": record.task_statuses,
+            "barrier_candidates": record.barrier_candidates,
+            "released": record.released,
+            "observed_revision": record.observed_revision,
+        });
+        let request = AppendTransactionRequest {
+            transaction_id: format!(
+                "agentic-wait-disposition:{}:{revision}",
+                record.program_id,
+                revision = record.revision
+            ),
+            expected_streams: vec![ExpectedStreamRevision {
+                stream_id,
+                expected_revision: expected,
+            }],
+            events: vec![RuntimeTransactionEventInput {
+                event: RuntimeEventInput {
+                    stream_id: format!("agentic-program-wait:{}", record.program_id),
+                    scope: RuntimeEventScope::Relation,
+                    kind: "agentic.program_wait_disposition".to_string(),
+                    status: Some(record.disposition.to_string()),
+                    actor: Some(record.root_execution_id.to_string()),
+                    refs: Vec::new(),
+                    payload,
+                },
+                idempotency_key: None,
+                schema_version: 1,
+            }],
+        };
+        if let Err(error) = self.store.append_transaction(request) {
+            tracing::debug!(
+                program_id = record.program_id,
+                %error,
+                "agentic barrier disposition record not appended"
+            );
+        }
+    }
+}
+
 const PROGRAM_OPENED_EVENT_KIND: &str = "agentic.program_opened";
 const OBJECTIVE_VERDICT_EVENT_KIND: &str = "agentic.objective_verdict_bound";
 const COMPLETION_REOPENED_EVENT_KIND: &str = "agentic.completion_reopened";

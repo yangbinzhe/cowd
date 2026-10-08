@@ -21,7 +21,9 @@ pub(crate) mod topic_delivery;
 mod work_market;
 
 pub use action_service::{AgentActionService, AgentActionServiceError};
-pub(crate) use action_service::{AgenticTopicObservationAck, TopicObservationKind};
+pub(crate) use action_service::{
+    AgenticTopicObservationAck, AgenticWaitDisposition, TopicObservationKind,
+};
 pub(crate) use execution::start_agentic_claim_heartbeat;
 pub(crate) use ingress::agentic_program_completion_gap;
 pub use execution::{AgenticDispatchContext, AgenticDispatchReceipt};
