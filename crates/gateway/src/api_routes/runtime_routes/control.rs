@@ -11,6 +11,46 @@ pub(in crate::api_routes) use execution_graph::*;
 pub(in crate::api_routes) use health::*;
 pub(in crate::api_routes) use value_loop::*;
 
+/// Liveness of the lane that releases the Agentic Program barrier.
+///
+/// The barrier's release used to depend on this lane alone, and a lane that stops
+/// being woken is indistinguishable from a Program that never settles: the resolver
+/// reported only a count, and that count was zero. Two paid runs measured the same
+/// signature - the last resolver pass ran 17 and 63 seconds before the final Task
+/// accept, then the lane was silent for ten minutes while the run continued, with a
+/// five-second safety tick. Exposing `worker_running` and `last_pass_duration_ms`
+/// makes "the lane is wedged" a readable fact instead of an inference.
+fn agentic_barrier_lane_health(state: std::sync::Arc<AppState>) -> serde_json::Value {
+    const LANE: &str = "runtime:agentic-program-wait-resolver:v1";
+    let Some(lane) = state
+        .services
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.runtime_services().event_reactor_health().ok())
+        .and_then(|health| {
+            health
+                .lanes
+                .into_iter()
+                .find(|lane| lane.projection_id == LANE)
+        })
+    else {
+        return serde_json::json!({"status": "unavailable", "projection_id": LANE});
+    };
+    serde_json::json!({
+        "status": if lane.worker_running { "available" } else { "wedged" },
+        "projection_id": lane.projection_id,
+        "worker_running": lane.worker_running,
+        "checkpoint_cursor": lane.checkpoint_cursor,
+        "latest_commit_cursor": lane.latest_commit_cursor,
+        "lag_commits": lane.lag_commits,
+        "consecutive_failures": lane.consecutive_failures,
+        "total_passes": lane.total_passes,
+        "last_pass_duration_ms": lane.last_pass_duration_ms,
+        "last_success_at_ms": lane.last_success_at_ms,
+        "last_error": lane.last_error,
+    })
+}
+
 pub(in crate::api_routes) async fn get_runtime_control_plane(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Json<Value> {
@@ -537,7 +577,7 @@ pub(in crate::api_routes) async fn get_runtime_control_plane(
                 "review_on_conflict": control.policy.agent.review_on_conflict,
                 "require_positive_lift": control.policy.agent.require_positive_lift,
             },
-            "task": {
+            "agentic_program_barrier": agentic_barrier_lane_health(std::sync::Arc::clone(&state)), "task": {
                 "status": "available",
                 "total": task_records.len(),
                 "open": open_tasks,
