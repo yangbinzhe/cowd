@@ -4771,8 +4771,9 @@ mod tool_call_count_tests {
         });
         assert_eq!(
             scenario_tool_calls(&ScenarioTokenUsage::default(), &timeline),
-            4,
-            "terminal statuses count; `running` is the same call as its terminal event"
+            3,
+            "terminal statuses count; `running` is the same call as its terminal event, and a \
+             refusal is recorded but is not an execution attempt"
         );
     }
 
@@ -4796,7 +4797,7 @@ mod tool_call_count_tests {
             aggregate_scenario_metrics(&scenarios)
                 .get("tool_calls")
                 .and_then(Value::as_u64),
-            Some(2),
+            Some(1),
             "the report must not present zero for calls its own record holds"
         );
     }

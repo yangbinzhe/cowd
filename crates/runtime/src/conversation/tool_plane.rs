@@ -1381,6 +1381,7 @@ where
             Some(record.status.as_str().to_string()),
             refs,
             serde_json::json!({
+                "status": record.status.as_str().to_string(),
                 "invocation_id": record.invocation_id,
                 "tool_call_id": record.tool_call_id,
                 "tool_name": record.tool_name,

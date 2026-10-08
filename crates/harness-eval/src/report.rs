@@ -580,8 +580,11 @@ fn agentic_closure_gate_evidence(closure: &Value) -> String {
 
 /// Terminal tool statuses. A `running` record and its terminal record are the same
 /// call, so counting both inflates the number by the number of in-flight records.
-pub(crate) const TERMINAL_TOOL_STATUSES: [&str; 5] =
-    ["completed", "failed", "denied", "timed_out", "refused"];
+/// Terminal tool statuses. `refused` is deliberately absent: a refusal is not an execution
+/// attempt, so it must not change the count. It is still recorded as an event with a status,
+/// so the evidence stays readable - the count and the record are different things.
+pub(crate) const TERMINAL_TOOL_STATUSES: [&str; 4] =
+    ["completed", "failed", "denied", "timed_out"];
 
 /// The single counting rule: terminal tool events in a record set.
 ///
@@ -1672,6 +1675,14 @@ mod gate_tests {
         ]);
         let gate_name = "report_tool_counts_do_not_understate_the_evidence";
 
+        // A refusal is recorded but not counted: it is not an execution attempt. The record
+        // and the count are different things, and the gate must not confuse them.
+        assert_eq!(
+            terminal_tool_events_in_events(evidence.as_array().expect("evidence is an array")),
+            1,
+            "the refusal is in the record but does not change the count"
+        );
+
         // The observed defect shape: the report reads fewer than its own record.
         let understated = json!({
             "level": "deep",
@@ -1688,7 +1699,7 @@ mod gate_tests {
         });
         let gate = evaluate_report_gate(&understated);
         let item = gate_item(&gate, gate_name);
-        assert_eq!(item.status, "failed", "reported 0 against evidence 2: {item:?}");
+        assert_eq!(item.status, "failed", "reported 0 against evidence 1: {item:?}");
 
         // A larger reported number is not a defect. The headline counts the harness's own
         // captured calls; the evidence counts the durable event stream, which includes
@@ -1709,7 +1720,7 @@ mod gate_tests {
         assert_eq!(
             gate_item(&evaluate_report_gate(&agrees), gate_name).status,
             "passed",
-            "3 >= 2 is a scope difference, not a shortfall"
+            "3 >= 1 is a scope difference, not a shortfall"
         );
 
         // A scenario with no measured number takes its count from its own record, so the
