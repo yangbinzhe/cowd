@@ -270,6 +270,52 @@ impl NodeExecutor for AgenticProgramWaitExecutor {
 /// `allow_same_revision_quiescence` is used by child-settle/startup recovery;
 /// Program-event passes keep it false so replaying the event that originally
 /// created the wait cannot spuriously release an active barrier.
+/// Release the root's Agentic Program barrier, with one bounded re-read.
+///
+/// A caller that settles a child graph reads the Program projection and decides; the
+/// Program event that settles the *last* Task can be committed after that read, so the
+/// pass sees an unsettled Task, correctly waits, and - because nothing else is
+/// guaranteed to run again - never revisits it. In three paid runs the barrier was
+/// never released for exactly this reason: one run recorded `wait` at revision 38 with
+/// two Tasks accepted and one submitted, the final accept landed 23 seconds later, and
+/// the next resolver pass was 10 minutes after that - one second after the evaluator
+/// had already cancelled the barrier.
+///
+/// The re-read compares against the durable Program head, so it introduces no new
+/// signal source, and it runs at most once per call.
+pub async fn resolve_agentic_program_wait(
+    program_id: &str,
+    actions: &AgentActionService,
+    state_store: &ExecutionGraphStateStore,
+    supervisor: &crate::RuntimeExecutionSupervisor,
+    allow_same_revision_quiescence: bool,
+) -> Result<usize, String> {
+    let first = resolve_wait_once(
+        program_id,
+        actions,
+        state_store,
+        supervisor,
+        allow_same_revision_quiescence,
+    )
+    .await?;
+    if first > 0 {
+        return Ok(first);
+    }
+    let head = actions.program_revision(program_id).unwrap_or(0);
+    let read = actions.project(program_id).map_err(|error| error.to_string())?;
+    if head <= read.revision {
+        return Ok(0);
+    }
+    resolve_wait_once(
+        program_id,
+        actions,
+        state_store,
+        supervisor,
+        allow_same_revision_quiescence,
+    )
+    .await
+}
+
 /// One durable line saying what the barrier resolver decided and what it read. See
 /// `AgentActionService::record_wait_disposition` for why this exists.
 fn record(
@@ -308,7 +354,7 @@ fn record(
     });
 }
 
-pub async fn resolve_agentic_program_wait(
+async fn resolve_wait_once(
     program_id: &str,
     actions: &AgentActionService,
     state_store: &ExecutionGraphStateStore,
@@ -343,6 +389,17 @@ pub async fn resolve_agentic_program_wait(
         0
     };
     let strand_exhausted = strand_resumes >= MAX_TASK_STRAND_RESUMES;
+    // One bounded re-read. A caller that settles a child graph reads the Program
+    // projection and decides; the Program event that settles the *last* Task can be
+    // committed after that read, so the pass sees an unsettled Task, correctly waits,
+    // and - because nothing else is guaranteed to run again - never revisits it. In
+    // three paid runs the barrier was never released for exactly this reason: one run
+    // recorded `wait` at revision 38 with two Tasks accepted and one submitted, the
+    // final accept landed 23 seconds later, and the next resolver pass was 10 minutes
+    // after that - one second after the evaluator had cancelled the barrier.
+    //
+    // The re-read compares against the durable Program head, so it needs no new
+    // signal source, and it runs at most once per call.
     let mut resolved = 0usize;
     let mut barrier_candidates = 0usize;
     let mut barrier_rejections = serde_json::Value::Null;
@@ -1821,6 +1878,203 @@ mod tests {
                         == Some(true)
             }),
             "a releasing decision must be durable and must name its reason: {dispositions:?}"
+        );
+    }
+
+    /// The racy sequence, end to end. A caller that settles a child graph reads the
+    /// Program and waits; the event that settles the *last* Task lands afterwards, so
+    /// nothing revisits the barrier unless the resolver itself does. In three paid
+    /// runs nothing did: one run recorded `wait` at revision 38 with two Tasks
+    /// accepted and one submitted, the final accept landed 23 seconds later, and the
+    /// next resolver pass was 10 minutes after that - one second after the evaluator
+    /// had cancelled the barrier.
+    #[tokio::test]
+    async fn one_call_after_the_final_accept_releases_the_barrier() {
+        let services = RuntimeServices::in_memory().expect("runtime");
+        let program_id = "program-wait-racy";
+        let root_id = "root-wait-racy";
+        let wait_node = register_root_wait(&services, root_id, program_id);
+        open_program(&services, program_id, root_id);
+        let actions = services.agent_action_service();
+        let root = root_actor(program_id, root_id);
+        let team_ref = actions
+            .project(program_id)
+            .expect("opened projection")
+            .teams
+            .keys()
+            .next()
+            .cloned()
+            .expect("opened Program has a Team");
+        let invite = |action_id: &str, role: &str| {
+            actions
+                .apply(&AgentActionEnvelope {
+                    action_id: action_id.to_string(),
+                    actor: root.clone(),
+                    expected_revision: None,
+                    action: AgentAction::AgentInvite(
+                        serde_json::from_value(serde_json::json!({
+                            "team_ref": team_ref,
+                            "role": role,
+                            "mission": "do and verify the work",
+                            "required_capabilities": ["read"]
+                        }))
+                        .unwrap(),
+                    ),
+                })
+                .expect("invite Agent")
+                .changed_refs[0]
+                .clone()
+        };
+        let worker = invite("racy-worker", "Worker");
+        let reviewer = invite("racy-reviewer", "Reviewer");
+        let task = actions
+            .apply(&AgentActionEnvelope {
+                action_id: "racy-task".to_string(),
+                actor: root.clone(),
+                expected_revision: None,
+                action: AgentAction::TaskPublish(TaskPublishInput {
+                    team_ref: team_ref.clone(),
+                    title: "One verifiable fact".to_string(),
+                    objective: "extract one verifiable fact".to_string(),
+                    acceptance: "artifact plus evidence".to_string(),
+                    acceptance_checks: Vec::new(),
+                    required_capabilities: vec!["read".to_string()],
+                    depends_on: Vec::new(),
+
+                    obligation_refs: Vec::new(),
+                    purpose: Default::default(),
+                    execution_requirements: Vec::new(),
+                    expertise_hints: Vec::new(),
+                }),
+            })
+            .expect("publish Task")
+            .changed_refs[0]
+            .clone();
+        register_agent_child(&services, root_id, &wait_node, program_id, "child-racy");
+        services
+            .execution_supervisor()
+            .drive_registered(root_id)
+            .await
+            .expect("drive wait root");
+        assert_eq!(
+            services
+                .graph_state_store()
+                .load(root_id)
+                .expect("root")
+                .node_statuses[&wait_node],
+            ExecutionNodeStatus::WaitingExternal
+        );
+
+        let agent_actor = |agent_id: &str, execution: &str| {
+            let mut actor = root.clone();
+            actor.kind = AgentActorKind::Agent;
+            actor.actor_id = agent_id.to_string();
+            actor.team_id = Some(team_ref.clone());
+            actor.agent_id = Some(agent_id.to_string());
+            actor.execution_id = Some(execution.to_string());
+            actor
+        };
+        actions
+            .apply(&AgentActionEnvelope {
+                action_id: "racy-claim".to_string(),
+                actor: agent_actor(&worker, "child-racy"),
+                expected_revision: None,
+                action: AgentAction::TaskClaim(TaskClaimInput {
+                    task_ref: task.clone(),
+                    reason: None,
+                }),
+            })
+            .expect("claim");
+        let content = services
+            .artifact_store()
+            .write_bytes(
+                harness_contract::context::ArtifactWriteDescriptor {
+                    media_type: "text/markdown".to_string(),
+                    visibility_scope: format!("session:{program_id}"),
+                    expected_bytes: None,
+                    original_name: Some("fact.md".to_string()),
+                },
+                b"one verifiable fact",
+            )
+            .await
+            .expect("artifact content");
+        let artifact = actions
+            .apply(&AgentActionEnvelope {
+                action_id: "racy-artifact".to_string(),
+                actor: agent_actor(&worker, "child-racy"),
+                expected_revision: None,
+                action: AgentAction::ArtifactCommit(
+                    serde_json::from_value(serde_json::json!({
+                        "content_ref": content.selector,
+                        "kind": "report",
+                        "title": "One fact",
+                        "relates_to": [task]
+                    }))
+                    .unwrap(),
+                ),
+            })
+            .expect("commit artifact")
+            .changed_refs[0]
+            .clone();
+        actions
+            .apply(&AgentActionEnvelope {
+                action_id: "racy-submit".to_string(),
+                actor: agent_actor(&worker, "child-racy"),
+                expected_revision: None,
+                action: AgentAction::TaskSubmit(
+                    serde_json::from_value(serde_json::json!({
+                        "task_ref": task,
+                        "artifact_refs": [artifact],
+                        "evidence_refs": ["tool://racy-observation"]
+                    }))
+                    .unwrap(),
+                ),
+            })
+            .expect("submit");
+
+        // The caller's own pass: the Task is still Submitted, so waiting is correct.
+        let waited = resolve_agentic_program_wait(
+            program_id,
+            &actions,
+            services.graph_state_store(),
+            services.execution_supervisor().as_ref(),
+            true,
+        )
+        .await
+        .expect("first resolve");
+        assert_eq!(waited, 0, "an unsettled Task must keep the root parked");
+
+        // The Program event that settles the last Task lands afterwards.
+        actions
+            .apply(&AgentActionEnvelope {
+                action_id: "racy-review".to_string(),
+                actor: agent_actor(&reviewer, "child-racy-review"),
+                expected_revision: None,
+                action: AgentAction::TaskReview(
+                    serde_json::from_value(serde_json::json!({
+                        "task_ref": task,
+                        "decision": "accept",
+                        "reason": "verified",
+                        "evidence_refs": ["tool://racy-review"]
+                    }))
+                    .unwrap(),
+                ),
+            })
+            .expect("review accept");
+
+        // The very next call must release it, without waiting for any other wake.
+        let released = resolve_agentic_program_wait(
+            program_id,
+            &actions,
+            services.graph_state_store(),
+            services.execution_supervisor().as_ref(),
+            true,
+        )
+        .await
+        .expect("second resolve");
+        assert_eq!(
+            released, 1,
+            "one call after the final accept must release the barrier (D6)"
         );
     }
 

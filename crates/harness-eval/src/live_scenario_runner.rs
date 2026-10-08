@@ -593,6 +593,26 @@ fn semantic_health_observation(path: &str, contract: LiveHealthContract, respons
                     .cloned()
                     .unwrap_or(Value::Null),
             ),
+            // The lane that releases the Agentic Program barrier. A wedged lane is
+            // indistinguishable from a Program that never settles: the resolver
+            // reported only a count and that count was zero. Three paid runs measured
+            // the same signature - the last resolver pass ran 17s, 63s and 10m17s
+            // after the final Task accept - and one of them recorded
+            // `resume / all_tasks_accepted` one second after the evaluator had already
+            // cancelled the barrier. Reading its liveness here turns that into a
+            // health fact instead of a post-mortem inference.
+            health_check(
+                "runtime_control_plane.agentic_barrier_worker_running",
+                response
+                    .pointer("/components/agentic_program_barrier/worker_running")
+                    .and_then(Value::as_bool)
+                    != Some(false),
+                json!(true),
+                response
+                    .pointer("/components/agentic_program_barrier")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ),
         ],
         LiveHealthContract::EvolutionProjectors => vec![
             health_check(

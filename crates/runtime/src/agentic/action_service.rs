@@ -864,6 +864,15 @@ impl AgentActionService {
         applied_observation(envelope, &projection, entity_ref, false)
     }
 
+    /// Durable head revision of one Program's journal, without folding it.
+    ///
+    /// Used by the barrier resolver to notice that the Program moved on since the
+    /// projection it just read, so it can re-read once instead of waiting for a
+    /// wake that is not guaranteed to arrive.
+    pub fn program_revision(&self, program_id: &str) -> Result<u64, AgentActionServiceError> {
+        Ok(self.store.stream_revision(&program_stream(program_id))?)
+    }
+
     pub fn project(
         &self,
         program_id: &str,
