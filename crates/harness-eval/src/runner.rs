@@ -82,6 +82,41 @@ pub fn run_eval(
     run_eval_controlled(store, options, HarnessEvalRunControl::default())
 }
 
+/// The record a run writes before any work.
+///
+/// Without it a killed run leaves nothing: the record was written only at the end,
+/// so a run terminated by a signal is indistinguishable from a run that produced no
+/// result. One paid run had 9297 durable events and 62 refusals and left no run
+/// directory, no report, no `runs.jsonl` entry and no error line - the only way to
+/// tell that it had been killed at all was that every normal exit path in `main`
+/// prints something and nothing was printed. `Running` already exists as a status
+/// and the gateway path already writes it at request time; the library runner did not.
+fn running_record(
+    options: &HarnessEvalRunnerOptions,
+    run_id: &str,
+    requested_at_ms: u128,
+) -> HarnessEvalRunRecord {
+    HarnessEvalRunRecord {
+        run_id: run_id.to_string(),
+        level: options.level.as_str().to_string(),
+        status: HarnessEvalRunStatus::Running.as_str().to_string(),
+        requested_at_ms,
+        finished_at_ms: None,
+        authorized_real_model: options.allow_real_model,
+        provider: options.provider.clone(),
+        budget: options.budget.clone(),
+        report_id: None,
+        report_path: None,
+        result_package_dir: None,
+        total_elapsed_ms: None,
+        provider_rounds: 0,
+        tool_calls: 0,
+        total_tokens: 0,
+        scenario_count: 0,
+        message: "harness eval started; no report written yet".to_string(),
+    }
+}
+
 pub fn run_eval_controlled(
     store: &HarnessEvalReportStore,
     options: HarnessEvalRunnerOptions,
@@ -95,6 +130,7 @@ pub fn run_eval_controlled(
             uuid::Uuid::new_v4()
         )
     });
+    store.upsert_run(&running_record(&options, &run_id, requested_at_ms))?;
     if options.level == HarnessEvalLevel::Deep && !options.allow_real_model {
         let record = HarnessEvalRunRecord {
             run_id,
@@ -452,7 +488,30 @@ pub fn run_eval_controlled(
     } else {
         HarnessEvalRunStatus::Failed
     };
-    let record = HarnessEvalRunRecord {
+    let record = completed_record(
+        run_id,
+        &summary,
+        run_status,
+        options,
+        requested_at_ms,
+        cancelled_after_provider,
+    );
+    store.upsert_run(&record)?;
+    Ok(record)
+}
+
+/// The record a run leaves when it reaches its report. Kept separate from
+/// `run_eval_controlled` so the start record above can be written without growing the
+/// function that already carries baselined structural debt.
+fn completed_record(
+    run_id: String,
+    summary: &HarnessEvalReportSummary,
+    run_status: HarnessEvalRunStatus,
+    options: &HarnessEvalRunnerOptions,
+    requested_at_ms: u128,
+    cancelled_after_provider: bool,
+) -> HarnessEvalRunRecord {
+    HarnessEvalRunRecord {
         run_id,
         level: summary.level.clone(),
         status: run_status.as_str().to_string(),
@@ -475,9 +534,7 @@ pub fn run_eval_controlled(
         } else {
             "harness eval smoke completed through library runner".to_string()
         },
-    };
-    store.upsert_run(&record)?;
-    Ok(record)
+    }
 }
 
 fn cancelled_record(
