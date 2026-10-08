@@ -261,9 +261,76 @@ impl NodeExecutor for AgenticProgramWaitExecutor {
         .map_err(|reason| NodeExecutorError::Poll {
             node_id: ticket.node_id.clone(),
             reason,
-        })
+        })?;
+        // A parked barrier must not depend on somebody else waking it.
+        //
+        // It has three external invocation paths - this hook, the graph-settled
+        // observer, and a projection lane - and in paid runs all three missed the
+        // moment that mattered. One run recorded `wait` at Program revision 38 with
+        // two Tasks accepted and one submitted; the final accept and its child graph's
+        // `running -> completed` landed in the same second 23 seconds later; and not
+        // one resolver pass ran in the following ten minutes, so the evaluator
+        // cancelled the barrier and the turn never reached a terminal state. The lane
+        // that was supposed to back the others up ran twice in a fourteen-minute run.
+        //
+        // So the barrier re-arms itself: a bounded number of re-evaluations on a fixed
+        // interval, each of which stops the moment the node is no longer parked. The
+        // bound is what keeps this from becoming a poller - the no-progress fuse still
+        // owns the turn's terminal, and a Program that genuinely cannot settle is
+        // still ended honestly rather than spun on.
+        let actions = self.actions.clone();
+        let state_store = self.state_store.clone();
+        let root_execution_id = request.root_execution_id.clone();
+        let program_id = request.program_id.clone();
+        let node_id = ticket.node_id.clone();
+        let supervisor = std::sync::Arc::downgrade(&supervisor);
+        tokio::spawn(async move {
+            for _ in 0..MAX_BARRIER_SELF_REARMS {
+                tokio::time::sleep(BARRIER_SELF_REARM_INTERVAL).await;
+                let Some(supervisor) = supervisor.upgrade() else {
+                    return;
+                };
+                let parked = match state_store
+                    .load_current_async(root_execution_id.clone())
+                    .await
+                {
+                    Ok(graph) => {
+                        graph.node_statuses.get(&node_id)
+                            == Some(&ExecutionNodeStatus::WaitingExternal)
+                    }
+                    Err(_) => return,
+                };
+                if !parked {
+                    return;
+                }
+                let released = resolve_agentic_program_wait(
+                    &program_id,
+                    &actions,
+                    &state_store,
+                    supervisor.as_ref(),
+                    true,
+                )
+                .await
+                .unwrap_or(0);
+                if released > 0 {
+                    return;
+                }
+            }
+        });
+        Ok(())
     }
 }
+
+/// Bounded self-rearm count for one parked barrier. Three paid runs showed the
+/// external wake paths missing the decisive moment, so the barrier re-evaluates
+/// itself; the bound keeps that from becoming an unbounded poller.
+pub(crate) const MAX_BARRIER_SELF_REARMS: u32 = 120;
+
+/// Interval between a parked barrier's own re-evaluations. Long enough that a
+/// settling Program is picked up within a couple of rounds, short enough that the
+/// whole budget stays inside one turn.
+pub(crate) const BARRIER_SELF_REARM_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(2);
 
 /// Resolve every waiting barrier for one Program when canonical Program or
 /// child-graph truth says the root model has a semantic decision to make.
@@ -582,6 +649,11 @@ pub async fn reconcile_agentic_program_wait_for_settled_graph(
     let mut program_ids = agentic_program_ids(&graph);
     program_ids.sort();
     program_ids.dedup();
+    // Record what this settle produced before deciding anything. In one paid run the
+    // final Task accept and its child graph's `running -> completed` landed in the
+    // same second, yet not one resolver pass ran afterwards - so either the observer
+    // never fired, or it fired and this function found no Program to reconcile. Both
+    // look identical from the resolver's side; this event separates them.
     let mut resolved = 0usize;
     for program_id in program_ids {
         resolved = resolved.saturating_add(
@@ -2075,6 +2147,207 @@ mod tests {
         assert_eq!(
             released, 1,
             "one call after the final accept must release the barrier (D6)"
+        );
+    }
+
+    /// A parked barrier must release itself without anybody waking it. Three paid
+    /// runs had all three external invocation paths miss the decisive moment: the
+    /// final accept and its child graph's `running -> completed` landed in the same
+    /// second, and not one resolver pass ran in the following ten minutes. The
+    /// barrier therefore re-arms itself on a bounded interval and stops the moment it
+    /// is no longer parked.
+    #[tokio::test]
+    async fn a_parked_barrier_releases_itself_without_any_external_wake() {
+        let services = RuntimeServices::in_memory().expect("runtime");
+        let program_id = "program-wait-self-rearm";
+        let root_id = "root-wait-self-rearm";
+        let wait_node = register_root_wait(&services, root_id, program_id);
+        open_program(&services, program_id, root_id);
+        let actions = services.agent_action_service();
+        let root = root_actor(program_id, root_id);
+        let team_ref = actions
+            .project(program_id)
+            .expect("opened projection")
+            .teams
+            .keys()
+            .next()
+            .cloned()
+            .expect("opened Program has a Team");
+        let invite = |action_id: &str, role: &str| {
+            actions
+                .apply(&AgentActionEnvelope {
+                    action_id: action_id.to_string(),
+                    actor: root.clone(),
+                    expected_revision: None,
+                    action: AgentAction::AgentInvite(
+                        serde_json::from_value(serde_json::json!({
+                            "team_ref": team_ref,
+                            "role": role,
+                            "mission": "do and verify the work",
+                            "required_capabilities": ["read"]
+                        }))
+                        .unwrap(),
+                    ),
+                })
+                .expect("invite Agent")
+                .changed_refs[0]
+                .clone()
+        };
+        let worker = invite("rearm-worker", "Worker");
+        let reviewer = invite("rearm-reviewer", "Reviewer");
+        let task = actions
+            .apply(&AgentActionEnvelope {
+                action_id: "rearm-task".to_string(),
+                actor: root.clone(),
+                expected_revision: None,
+                action: AgentAction::TaskPublish(TaskPublishInput {
+                    team_ref: team_ref.clone(),
+                    title: "One verifiable fact".to_string(),
+                    objective: "extract one verifiable fact".to_string(),
+                    acceptance: "artifact plus evidence".to_string(),
+                    acceptance_checks: Vec::new(),
+                    required_capabilities: vec!["read".to_string()],
+                    depends_on: Vec::new(),
+
+                    obligation_refs: Vec::new(),
+                    purpose: Default::default(),
+                    execution_requirements: Vec::new(),
+                    expertise_hints: Vec::new(),
+                }),
+            })
+            .expect("publish Task")
+            .changed_refs[0]
+            .clone();
+        register_agent_child(&services, root_id, &wait_node, program_id, "child-rearm");
+        services
+            .execution_supervisor()
+            .drive_registered(root_id)
+            .await
+            .expect("drive wait root");
+        assert_eq!(
+            services
+                .graph_state_store()
+                .load(root_id)
+                .expect("root")
+                .node_statuses[&wait_node],
+            ExecutionNodeStatus::WaitingExternal
+        );
+
+        let agent_actor = |agent_id: &str, execution: &str| {
+            let mut actor = root.clone();
+            actor.kind = AgentActorKind::Agent;
+            actor.actor_id = agent_id.to_string();
+            actor.team_id = Some(team_ref.clone());
+            actor.agent_id = Some(agent_id.to_string());
+            actor.execution_id = Some(execution.to_string());
+            actor
+        };
+        actions
+            .apply(&AgentActionEnvelope {
+                action_id: "rearm-claim".to_string(),
+                actor: agent_actor(&worker, "child-rearm"),
+                expected_revision: None,
+                action: AgentAction::TaskClaim(TaskClaimInput {
+                    task_ref: task.clone(),
+                    reason: None,
+                }),
+            })
+            .expect("claim");
+        let content = services
+            .artifact_store()
+            .write_bytes(
+                harness_contract::context::ArtifactWriteDescriptor {
+                    media_type: "text/markdown".to_string(),
+                    visibility_scope: format!("session:{program_id}"),
+                    expected_bytes: None,
+                    original_name: Some("fact.md".to_string()),
+                },
+                b"one verifiable fact",
+            )
+            .await
+            .expect("artifact content");
+        let artifact = actions
+            .apply(&AgentActionEnvelope {
+                action_id: "rearm-artifact".to_string(),
+                actor: agent_actor(&worker, "child-rearm"),
+                expected_revision: None,
+                action: AgentAction::ArtifactCommit(
+                    serde_json::from_value(serde_json::json!({
+                        "content_ref": content.selector,
+                        "kind": "report",
+                        "title": "One fact",
+                        "relates_to": [task]
+                    }))
+                    .unwrap(),
+                ),
+            })
+            .expect("commit artifact")
+            .changed_refs[0]
+            .clone();
+        actions
+            .apply(&AgentActionEnvelope {
+                action_id: "rearm-submit".to_string(),
+                actor: agent_actor(&worker, "child-rearm"),
+                expected_revision: None,
+                action: AgentAction::TaskSubmit(
+                    serde_json::from_value(serde_json::json!({
+                        "task_ref": task,
+                        "artifact_refs": [artifact],
+                        "evidence_refs": ["tool://rearm-observation"]
+                    }))
+                    .unwrap(),
+                ),
+            })
+            .expect("submit");
+
+        // Settle the Task, and from here on invoke nothing: no lane, no observer, no
+        // second resolver call. The only thing that can release the barrier is the
+        // barrier itself.
+        actions
+            .apply(&AgentActionEnvelope {
+                action_id: "rearm-review".to_string(),
+                actor: {
+                    let mut actor = agent_actor(&reviewer, "child-rearm-review");
+                    actor
+                },
+                expected_revision: None,
+                action: AgentAction::TaskReview(
+                    serde_json::from_value(serde_json::json!({
+                        "task_ref": task,
+                        "decision": "accept",
+                        "reason": "verified",
+                        "evidence_refs": ["tool://rearm-review"]
+                    }))
+                    .unwrap(),
+                ),
+            })
+            .expect("review accept");
+
+        // Nothing else is invoked from here on: no lane, no observer, no second call.
+        // The only thing that can release the barrier is the barrier itself.
+        let released_itself = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            async {
+                loop {
+                    let still_parked = services
+                        .graph_state_store()
+                        .load_current_async(root_id.to_string())
+                        .await
+                        .ok()
+                        .and_then(|graph| graph.node_statuses.get(&wait_node).copied())
+                        == Some(ExecutionNodeStatus::WaitingExternal);
+                    if !still_parked {
+                        return true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            },
+        )
+        .await
+        .unwrap_or(false);
+        assert!(
+            released_itself,
+            "a parked barrier must release itself without any external wake (D6)"
         );
     }
 
