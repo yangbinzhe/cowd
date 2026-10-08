@@ -158,6 +158,11 @@ pub struct TaskPublishInput {
     pub purpose: TaskPurpose,
     #[serde(default)]
     pub execution_requirements: Vec<String>,
+    /// Who is a good fit for this Task, as free-form domain labels (for example
+    /// "rust", "concurrency", "memory-architecture"). Advisory only: Runtime uses
+    /// them to rank otherwise-eligible members, and never to grant a capability,
+    /// to replace the independence rule, or to make a Task undispatchable. Leave
+    /// empty and Runtime ranks by independence and load alone.
     #[serde(default)]
     pub expertise_hints: Vec<String>,
 }

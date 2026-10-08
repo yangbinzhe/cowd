@@ -302,7 +302,7 @@ pub(super) fn task_objective(
     let mut objective = match mode {
         DispatchMode::Coordination(_) => unreachable!("coordination objective handled above"),
         DispatchMode::Execute => format!(
-            "你是 Agent `{}`（Team `{}`，角色 {}）。\n任务 `{}`：{}\n目标：{}\n验收：{}\n\n按序执行以下协议（不要增加其它步骤）：\n1) state_inspect 查看 Task 真相，确认可领取；\n2) task_claim 领取该确切 Task；\n3) 用只读工具取证（无依赖的调用放进同一批）；\n4) **撰写审查报告**：把你的结论、发现、风险和 file:line 证据引用写成一段完整正文——这是交付物，**不是**源码复制；\n{delivery}\n\n{hard_rules}\n可选：有对其它队有用的发现，可在 topic:{} 发布一条引用证据的摘要。",
+            "你是 Agent `{}`（Team `{}`，角色 {}）。\n任务 `{}`：{}\n目标：{}\n验收：{}\n\n按序执行以下协议（不要增加其它步骤）：\n1) state_inspect 查看 Task 真相，确认可领取；\n2) task_claim 领取该确切 Task；\n3) 用只读工具取证（无依赖的调用放进同一批）；**当验收判据要求文件原文、精确字节或 file:line 时，用 `read_ref` 按范围读取完整内容——工具输出的预览摘要可能被截断，不足以支撑判据**；\n4) **撰写审查报告**：把你的结论、发现、风险和 file:line 证据引用写成一段完整正文——这是交付物，**不是**源码复制；\n{delivery}\n\n{hard_rules}\n可选：有对其它队有用的发现，可在 topic:{} 发布一条引用证据的摘要。",
             member.agent_id,
             task.team_id,
             member.role,

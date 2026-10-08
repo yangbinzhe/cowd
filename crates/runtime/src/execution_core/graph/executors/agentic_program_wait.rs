@@ -582,7 +582,9 @@ async fn wait_disposition(
             // declared undispatched past its own bound. Parking on it forever is
             // the starvation the fuse later reports, and the root can still
             // replan, withdraw, or retire it.
-            return if unreachable_task_refs(projection).is_empty() {
+            return if crate::agentic::execution::dispatch::stranded_task_refs(projection)
+                .is_empty()
+            {
                 Ok(WaitDisposition::Wait {
                     revision: projection.revision,
                     active_graphs,
@@ -644,38 +646,7 @@ fn all_tasks_accepted(projection: &AgenticProgramProjection) -> bool {
             .all(|task| task.status == AgenticTaskStatus::Accepted)
 }
 
-/// Live Tasks that no Agent will ever settle.
-///
-/// A barrier must not read a missing child link as completion (PLAN C5-6), because
-/// a link may simply not be durable yet. But there is a second, distinguishable
-/// state: Runtime's own dispatch machinery has already exhausted its bound for the
-/// Task, which only happens after repeated "no free eligible member" deferrals and
-/// clears the moment a dispatch succeeds. Such a Task is not late; it is
-/// unreachable, and parking the root on it forever is the starvation the no-progress
-/// fuse later reports.
-///
-/// Only meaningful once no child graph is active: a live child may still settle its
-/// own Task.
-fn unreachable_task_refs(projection: &AgenticProgramProjection) -> Vec<String> {
-    projection
-        .tasks
-        .values()
-        .filter(|task| {
-            matches!(
-                task.status,
-                AgenticTaskStatus::Published
-                    | AgenticTaskStatus::Claimed
-                    | AgenticTaskStatus::Submitted
-                    | AgenticTaskStatus::Rework
-            ) && task.active_attempts.is_empty()
-                && crate::agentic::execution::dispatch::dispatch_unplaced_for_task(
-                    &projection.program_id,
-                    &task.task_id,
-                )
-        })
-        .map(|task| task.task_id.clone())
-        .collect()
-}
+
 
 /// Tasks that were dispatched into the Program but have not settled yet.
 ///
@@ -1569,6 +1540,29 @@ mod tests {
         .await
         .expect("re-resolve stranded barrier");
         assert_eq!(re_resolved, 0, "one strand resume per Program revision");
+
+        // The same fact must reach the model. Runtime used to keep it private in the
+        // dispatch starvation ledger, so the root had neither a step nor an
+        // explanation; `actionable` is read on every observation.
+        let inspect = services
+            .agent_action_service()
+            .apply(&AgentActionEnvelope {
+                action_id: "stranded-inspect".to_string(),
+                actor: root.clone(),
+                expected_revision: None,
+                action: AgentAction::StateInspect(
+                    serde_json::from_value(serde_json::json!({})).unwrap(),
+                ),
+            })
+            .expect("inspect");
+        assert!(
+            inspect
+                .actionable
+                .iter()
+                .any(|hint| hint.contains("no Agent able to progress them")),
+            "the model must be told a Task is unreachable, not left without a step: {:?}",
+            inspect.actionable
+        );
     }
 
     /// D6 reproduction: the barrier is parked while a Task is unsettled, the Task is

@@ -113,6 +113,34 @@ fn dispatch_starvation_key(
 /// and it clears the moment a dispatch succeeds. A missing child link alone never
 /// produces it, so timing is not mistaken for starvation. Callers must already have
 /// established that no child graph is active and that the Task has no attempt.
+/// Live Tasks that no Agent will settle.
+///
+/// A Task is stranded when it is still in the market, has no active attempt, and
+/// Runtime's own dispatch machinery has already failed to place it. A missing child
+/// link alone never produces this (PLAN C5-6): only a recorded "no free eligible
+/// member" deferral does, and that record clears the moment a dispatch succeeds.
+///
+/// This is the single predicate shared by the barrier (which offers the root one
+/// bounded chance to replan) and the model-facing guidance (which tells the root the
+/// same fact), so the two cannot disagree about what is stranded.
+pub(crate) fn stranded_task_refs(projection: &crate::AgenticProgramProjection) -> Vec<String> {
+    projection
+        .tasks
+        .values()
+        .filter(|task| {
+            matches!(
+                task.status,
+                crate::AgenticTaskStatus::Published
+                    | crate::AgenticTaskStatus::Claimed
+                    | crate::AgenticTaskStatus::Submitted
+                    | crate::AgenticTaskStatus::Rework
+            ) && task.active_attempts.is_empty()
+                && dispatch_unplaced_for_task(&projection.program_id, &task.task_id)
+        })
+        .map(|task| task.task_id.clone())
+        .collect()
+}
+
 pub(crate) fn dispatch_unplaced_for_task(program_id: &str, task_ref: &str) -> bool {
     [DispatchMode::Execute, DispatchMode::Review].iter().any(|mode| {
         dispatch_starvation_count(&dispatch_starvation_key(program_id, task_ref, *mode)) > 0

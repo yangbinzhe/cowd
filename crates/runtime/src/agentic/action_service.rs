@@ -2423,6 +2423,18 @@ fn actionable(projection: &AgenticProgramProjection, duplicate: bool) -> Vec<Str
             actions.push("Use objective_review for the original criterion with the current delivered result and durable evidence; the reviewer must be distinct from its Runtime-resolved producer. Preserve accepted work.".into());
         }
     }
+    // A Task no Agent will settle is a fact the root must be able to read. Runtime
+    // used to keep it private in the dispatch starvation ledger, so the model had no
+    // step and no explanation: in one live run a reworked Task was re-submitted and
+    // never reviewed again, the root graph had no ready node, and the turn ended by
+    // the no-progress fuse. Runtime states the fact; it does not choose the remedy.
+    let stranded = crate::agentic::execution::dispatch::stranded_task_refs(projection);
+    if !stranded.is_empty() {
+        actions.push(format!(
+            "These Tasks have no Agent able to progress them (Runtime could not dispatch an eligible member): {}. They remain open work in the Program. You can invite a reviewer, withdraw or supersede the Task, or record it as unresolved when requesting completion.",
+            stranded.join(", ")
+        ));
+    }
     if projection.teams.is_empty() {
         actions.push("create a Team or complete directly with a committed artifact".to_string());
     }
