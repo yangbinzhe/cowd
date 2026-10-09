@@ -281,6 +281,7 @@ async fn durable_content_drafts_never_cross_actor_or_attempt_fences() {
         node_id: "agent-node".to_string(),
         attempt: 3,
         actor_id: "agent-a:run-a".to_string(),
+        task_id: Some("task:a".to_string()),
     };
     let actor_b = AgenticContentDraftScope {
         actor_id: "agent-b:run-b".to_string(),
@@ -474,4 +475,94 @@ async fn growing_program_checkpoint_materializes_one_relevant_body_and_preserves
         .unwrap()
         .iter()
         .all(|a| a["content"].is_null()));
+}
+
+/// A body written in an earlier step of the same Task is still this Agent's deliverable.
+///
+/// Runtime resolved only the current response, so a model whose habit is "write the
+/// report, then commit a few steps later" could never submit. In d6v10 one Agent wrote a
+/// 3795-character synthesis report across three steps and lost all thirteen commits to
+/// `content_ref_unresolved`, because no text block and no commit ever shared a step.
+#[tokio::test]
+async fn a_commit_recovers_the_body_written_in_an_earlier_step_of_the_same_task() {
+    let services = crate::RuntimeServices::in_memory().expect("runtime services");
+    let ticket = agentic_content_bridge_ticket("continuation-graph", "model-step-1", 2);
+    let older = ConversationMessage::assistant(vec![ContentBlock::Text {
+        text: "# Synthesis report\n\nthe three facts, synthesized".to_string(),
+    }]);
+    persist_agentic_content_draft(services.as_ref(), &ticket, &older)
+        .await
+        .expect("persist the report written in an earlier step");
+    // This step carries no text at all: the model is committing what it wrote before.
+    let mut calls = vec![explicit_content_commit_call("commit-later")];
+    calls[0].input = serde_json::json!({
+        "title": "authored report",
+        "kind": "report",
+        "content_ref": "message://current",
+        "evidence_refs": [],
+    })
+    .to_string();
+    resolve_explicit_agentic_content_refs(
+        services.as_ref(),
+        &ticket,
+        &ConversationMessage::assistant(vec![]),
+        &mut calls,
+    )
+    .await
+    .expect("resolve prior frame");
+
+    let input: serde_json::Value = serde_json::from_str(&calls[0].input).expect("resolved input");
+    let content_ref = input["content_ref"]
+        .as_str()
+        .expect("resolved content ref")
+        .to_string();
+    assert!(
+        content_ref.starts_with("artifact://"),
+        "the earlier body must become a durable artifact: {content_ref}"
+    );
+    let artifact = services
+        .artifact_store()
+        .resolve(&content_ref)
+        .expect("durable artifact");
+    let content = services
+        .artifact_store()
+        .read(&artifact, "execution:continuation-graph", None)
+        .await
+        .expect("read durable content");
+    assert_eq!(
+        String::from_utf8(content).expect("UTF-8"),
+        "# Synthesis report\n\nthe three facts, synthesized"
+    );
+}
+
+/// The fallback is pinned to one Task. A body written for one Task is never delivered as
+/// another Task's deliverable, which is the protection that keeps the recovery from
+/// substituting unrelated content.
+#[tokio::test]
+async fn the_earlier_body_fallback_never_crosses_a_task_fence() {
+    let services = crate::RuntimeServices::in_memory().expect("runtime services");
+    let ticket = agentic_content_bridge_ticket("continuation-graph", "model-step-1", 2);
+    let mut scope = super::host_backend::AgenticContentDraftScope {
+        execution_id: "agent-execution".to_string(),
+        node_id: "agent-node".to_string(),
+        attempt: 1,
+        actor_id: "agent-a:run-a".to_string(),
+        task_id: Some("task:a".to_string()),
+    };
+    super::host_backend::persist_agentic_content_draft_for_scope(
+        services.as_ref(),
+        &scope,
+        "session:scope-test".to_string(),
+        "body written for task A",
+    )
+    .await
+    .expect("persist task A draft");
+
+    scope.task_id = Some("task:b".to_string());
+    let recovered = super::host_backend::latest_agentic_content_draft(services.as_ref(), &scope)
+        .expect("read task B drafts");
+    assert!(
+        recovered.is_none(),
+        "a body written for one Task must never be recovered for another"
+    );
 }

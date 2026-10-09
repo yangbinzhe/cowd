@@ -2498,12 +2498,21 @@ fn actionable(projection: &AgenticProgramProjection, duplicate: bool) -> Vec<Str
                 .to_string(),
         );
     }
-    if projection
+    // How to submit at all. The old guidance was "review a submitted Task", which names
+    // only one of the four things an Agent holding a Task can do, and said nothing about
+    // the three ways a body becomes committable. In d6v10 one Agent lost all thirteen of
+    // its `artifact_commit` calls to `content_ref_unresolved` - it wrote the report in one
+    // step and committed in a later one, and Runtime only ever resolved the current
+    // response. It then repeated the same call thirteen times, because nothing told it
+    // another shape existed.
+    let claimed = projection
         .tasks
         .values()
-        .any(|task| task.status == AgenticTaskStatus::Submitted)
-    {
-        actions.push("review a submitted Task".to_string());
+        .any(|task| task.status == AgenticTaskStatus::Claimed);
+    if claimed || projection.tasks.values().any(|t| t.status == AgenticTaskStatus::Submitted) {
+        actions.push(
+            "To make a body committable: `artifact_publish` with `MessageBlock{message_id, block_index, sha256, media_type}` publishes any Text block of any of your responses; `artifact_commit` with `content_ref=current_message_block:<zero-based index>` commits a Text block of the response you are writing right now; `artifact_commit` with `content_ref=artifact://<selector>` commits something you already published. A body you wrote in an earlier step stays committable - name it with `artifact_publish(MessageBlock{...})` or use `message://current` and Runtime recovers it. Then `task_submit` with the returned `artifact:...` reference plus real durable evidence refs.".to_string(),
+        );
     }
     if !projection.artifacts.is_empty()
         && projection

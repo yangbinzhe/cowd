@@ -8,6 +8,13 @@ use crate::agentic::program::{AgenticProgramProjection, AgenticTaskStatus, Agent
 
 use super::{actor_agent_id, is_durable_evidence_ref};
 
+/// How to make a body committable, in full.
+///
+/// The previous text named one shape, so a model whose body lived in an earlier step
+/// repeated the same call: in d6v10 one Agent made thirteen `artifact_commit` calls, all
+/// refused, while a 3795-character report it had already written sat uncommitted.
+const ARTIFACT_COMMIT_GUIDANCE: &str = "Commit a non-empty deliverable. Three shapes work: `artifact_publish` with `MessageBlock{message_id, block_index, sha256, media_type}` publishes any Text block of any response you already wrote; `artifact_commit` with `content_ref=current_message_block:<zero-based index>` commits a Text block of the response you are writing right now; `artifact_commit` with `content_ref=artifact://<selector>` commits something you already published. Runtime also recovers a body you wrote in an earlier step of this same Task when the reference names no block. An empty or absent Text block is never committed.";
+
 pub(super) fn validate_transition(
     projection: &AgenticProgramProjection,
     envelope: &AgentActionEnvelope,
@@ -195,7 +202,7 @@ pub(super) fn validate_transition(
             if !input.content_ref.starts_with("artifact://") {
                 return Some((
                     "content_ref_unresolved",
-                    "Commit a non-empty deliverable: use artifact_publish with a non-empty file, or select a current_message_block:<index> that actually contains the findings. An empty or absent Text block is never committed.".to_string(),
+                    ARTIFACT_COMMIT_GUIDANCE.to_string(),
                 ));
             }
             None

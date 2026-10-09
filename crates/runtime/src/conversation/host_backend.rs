@@ -3446,6 +3446,10 @@ pub(super) struct AgenticContentDraftScope {
     pub(super) node_id: String,
     pub(super) attempt: u32,
     pub(super) actor_id: String,
+    /// The Task this draft belongs to. A draft is never reused across Tasks: a body
+    /// written for one Task is not a deliverable for another, so the fallback that
+    /// recovers a body written in an earlier step must be pinned to the same Task.
+    pub(super) task_id: Option<String>,
 }
 
 impl AgenticContentDraftScope {
@@ -3453,8 +3457,12 @@ impl AgenticContentDraftScope {
         format!(
             "agentic-content-draft:{}",
             sha256_digest(&format!(
-                "{}\n{}\n{}\n{}",
-                self.execution_id, self.node_id, self.attempt, self.actor_id
+                "{}\n{}\n{}\n{}\n{}",
+                self.execution_id,
+                self.node_id,
+                self.attempt,
+                self.actor_id,
+                self.task_id.as_deref().unwrap_or("")
             ))
         )
     }
@@ -3717,6 +3725,7 @@ fn agentic_content_draft_scope(
         node_id: ticket.graph_id.clone(),
         attempt: ticket.attempt,
         actor_id: format!("root:{}", ticket.graph_id),
+        task_id: None,
     };
     let Some(packet) = delegated_agent_task_packet(services, ticket) else {
         return root_scope();
@@ -3726,6 +3735,7 @@ fn agentic_content_draft_scope(
         node_id: packet.assignment.node_id.clone(),
         attempt: packet.attempt,
         actor_id: format!("{}:{}", packet.agent_id(), packet.run_id()),
+        task_id: Some(packet.task_id().to_string()),
     }
 }
 
@@ -3791,6 +3801,22 @@ fn agentic_message_text(message: &ConversationMessage) -> Option<String> {
         .collect::<Vec<_>>()
         .join("\n");
     (!content.trim().is_empty()).then_some(content)
+}
+
+/// Read a persisted draft body back as text.
+fn agentic_content_draft_text(
+    services: &crate::RuntimeServices,
+    draft: &AgenticContentDraft,
+) -> Option<String> {
+    let artifact = services
+        .artifact_store()
+        .resolve(&draft.content_ref)
+        .ok()?;
+    let bytes = services
+        .artifact_store()
+        .read_blocking(&artifact, &artifact.visibility_scope, None)
+        .ok()?;
+    String::from_utf8(bytes).ok()
 }
 
 pub(super) fn latest_agentic_content_draft(
@@ -4117,6 +4143,31 @@ pub(super) async fn resolve_explicit_agentic_content_refs(
                 _ => None,
             }
         };
+        // A body written in an earlier step of the same Task is still this Agent's own
+        // deliverable. Runtime used to resolve only the current response, so a model
+        // whose habit is "write the report, then commit a few steps later" could never
+        // submit: in d6v10 one Agent wrote a 3795-character synthesis report across three
+        // steps and lost all thirteen of its commits to `content_ref_unresolved`, because
+        // no text block and no commit ever shared a step. The draft ledger is already
+        // pinned to one execution, node, attempt, actor and Task, so this recovers the
+        // same body and never crosses a Task fence.
+        // Only a reference that names no block at all falls back. An explicit
+        // `current_message_block:<i>` that is out of range stays unresolved: the model
+        // named a specific block, and substituting a different body would silently
+        // deliver something it never selected.
+        let mut prior_text = if selected.is_none() && !is_block_ref {
+            let scope = agentic_content_draft_scope(services, ticket);
+            latest_agentic_content_draft(services, &scope)
+                .ok()
+                .flatten()
+                .and_then(|draft| agentic_content_draft_text(services, &draft))
+        } else {
+            None
+        };
+        // Recover the body written in an earlier step of this same Task. It is kept
+        // alive for the borrow below; `selected` above borrows the current response.
+        let prior_text = if selected.is_none() { prior_text } else { None };
+        let selected = selected.or(prior_text.as_ref().map(|prior| (usize::MAX, prior.as_str())));
         let Some((selected_index, text)) = selected else {
             continue;
         };
