@@ -59,10 +59,13 @@ impl AgentActionService {
     /// diagnostic record must not be able to re-arm that lane.
     pub(crate) fn record_wait_disposition(&self, record: AgenticWaitDisposition<'_>) {
         let stream_id = format!("agentic-program-wait:{}", record.program_id);
-        let expected = self
-            .store
-            .stream_revision(&stream_id)
-            .unwrap_or_default();
+        // Fence the append on the stream head and retry the fence, not the write.
+        // The synchronous reconcile in the tool path and the barrier's own bounded
+        // self-rearm run concurrently and both record here, so a single-shot fence
+        // silently drops whichever arrives second - and a dropped record is a
+        // diagnosis built on an undercount. Nine fixes were derived from exactly
+        // that undercount before this was noticed.
+        let mut attempt = 0_u8;
         let payload = serde_json::json!({
             "program_id": record.program_id,
             "root_execution_id": record.root_execution_id,
@@ -81,10 +84,7 @@ impl AgentActionService {
                 record.program_id,
                 revision = record.revision
             ),
-            expected_streams: vec![ExpectedStreamRevision {
-                stream_id,
-                expected_revision: expected,
-            }],
+            expected_streams: Vec::new(),
             events: vec![RuntimeTransactionEventInput {
                 event: RuntimeEventInput {
                     stream_id: format!("agentic-program-wait:{}", record.program_id),
@@ -99,12 +99,34 @@ impl AgentActionService {
                 schema_version: 1,
             }],
         };
-        if let Err(error) = self.store.append_transaction(request) {
-            tracing::debug!(
-                program_id = record.program_id,
-                %error,
-                "agentic barrier disposition record not appended"
-            );
+        loop {
+            let expected = self
+                .store
+                .stream_revision(&stream_id)
+                .unwrap_or_default();
+            let request = AppendTransactionRequest {
+                transaction_id: request.transaction_id.clone(),
+                expected_streams: vec![ExpectedStreamRevision {
+                    stream_id: stream_id.clone(),
+                    expected_revision: expected,
+                }],
+                events: request.events.clone(),
+            };
+            match self.store.append_transaction(request) {
+                Ok(_) => return,
+                Err(error) if attempt < 8 && error.to_string().contains("revision") => {
+                    attempt = attempt.saturating_add(1);
+                    continue;
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        program_id = record.program_id,
+                        %error,
+                        "agentic barrier disposition record not appended"
+                    );
+                    return;
+                }
+            }
         }
     }
 }
