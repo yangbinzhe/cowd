@@ -514,6 +514,16 @@ async fn resolve_wait_once(
         .project(program_id)
         .map_err(|error| error.to_string())?;
     let Some(root_execution_id) = projection.root_execution_id.as_deref() else {
+        // This exit is silent, and it is the one place a caller cannot tell "nothing
+        // to do" from "never asked". A paid run put a synchronous reconcile in the
+        // same path as the mutation that settles the last Task, and it produced no
+        // decision at all - so the call either never reached here, or left here.
+        tracing::warn!(
+            program_id,
+            revision = projection.revision,
+            tasks = projection.tasks.len(),
+            "Agentic Program barrier resolve skipped: projection has no root execution binding"
+        );
         return Ok(0);
     };
     let deadline_at_ms =
