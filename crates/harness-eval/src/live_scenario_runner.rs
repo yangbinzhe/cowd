@@ -3223,7 +3223,7 @@ impl LiveAcceptance {
                     json!({"name": "durable_task_artifact_evidence", "required": minimum_teams > 0, "accepted_tasks": evidence_integrity.accepted_tasks, "missing_claimants": evidence_integrity.missing_claimants, "missing_independent_reviews": evidence_integrity.missing_independent_reviews, "missing_artifacts": evidence_integrity.missing_artifacts, "missing_evidence": evidence_integrity.missing_evidence, "dangling_artifact_refs": evidence_integrity.dangling_artifact_refs, "passed": evidence_satisfied}),
                     json!({"name": "accepted_cross_team_dependencies", "required": minimum_claimed_cross_team_edges, "observed": accepted_cross_team_dependencies, "passed": edges_satisfied}),
                     json!({"name": "physical_agent_concurrency", "required_overlaps": usize::from(minimum_teams > 1), "observed_overlaps": parallel_overlaps, "passed": parallel_satisfied}),
-                    json!({"name": "physical_agent_waits_resolved", "passed": physical_terminal}),
+                    json!({"name": "physical_agent_waits_resolved", "passed": physical_terminal, "unresolved_agent_activities": unresolved_agent_activities(&projections)}),
                     json!({"name": "physical_agent_graphs_succeeded", "failed_activities": physical_failed_agents, "passed": physical_success}),
                     json!({"name": "runtime_attested_complete_source_coverage", "required": required_complete_source_paths.len(), "observed": complete_source_paths.len(), "missing": missing_complete_source_paths, "passed": complete_source_coverage}),
                     json!({"name": "runtime_attested_independent_source_review", "required": required_independent_source_paths.len(), "observed": independently_reviewed_source_paths.len(), "missing": missing_independently_reviewed_source_paths, "receipt_rule": "distinct exact-content receipts from two different Agent identities", "passed": independent_source_review}),
@@ -3331,7 +3331,7 @@ impl LiveAcceptance {
                         json!({"name": "durable_task_artifact_evidence", "accepted_tasks": evidence.accepted_tasks, "missing_claimants": evidence.missing_claimants, "missing_independent_reviews": evidence.missing_independent_reviews, "missing_artifacts": evidence.missing_artifacts, "missing_evidence": evidence.missing_evidence, "dangling_artifact_refs": evidence.dangling_artifact_refs, "passed": evidence.passed()}),
                         json!({"name": "accepted_cross_team_dependencies", "required": minimum_cross_team_edges, "observed": cross_team_edges, "passed": edges_satisfied}),
                         json!({"name": "physical_agent_concurrency", "required_overlaps": 1, "observed_overlaps": overlaps, "passed": overlaps > 0}),
-                        json!({"name": "physical_agent_waits_resolved", "passed": no_active_agent_waits(projections)}),
+                        json!({"name": "physical_agent_waits_resolved", "passed": no_active_agent_waits(projections), "unresolved_agent_activities": unresolved_agent_activities(projections)}),
                         json!({"name": "physical_agent_graphs_succeeded", "failed_activities": physical_failed_agents, "passed": physical_success}),
                         json!({"name": "durable_final_artifact", "expected_path": output_path, "final_artifact_ref": program.final_artifact_ref, "passed": final_artifact_satisfied}),
                     ],
@@ -3348,6 +3348,9 @@ fn finalize_live_acceptance(
     root_execution_id: &str,
 ) -> LiveAcceptanceResult {
     let outcome = root_business_outcome(timeline, root_execution_id);
+    // Did the harness let this run reach a terminal state, as distinct from whether the objective was satisfied? The two were one gate, so a hung run and an unfinished run looked identical. An aborted run never reaches this function.
+    let durable = result.checks.iter().find(|c| c["name"] == "durable_response").and_then(|c| c["passed"].as_bool()).unwrap_or(false);
+    result.checks.push(json!({"name": "run_reached_terminal_state", "passed": durable && !timeline_terminal_aborted(timeline) && outcome.event_status.is_some(), "evidence": {"durable_response": durable, "root_outcome_status": outcome.event_status}}));
     result.checks.push(json!({
         "name": "root_business_outcome_succeeded",
         "execution_graph_ref": root_execution_id,
@@ -3984,6 +3987,62 @@ fn physical_parallel_overlap_count(projections: &[Value]) -> usize {
     overlaps
 }
 
+/// Whether the evaluator aborted this run for inactivity.
+///
+/// The aborted path returns before `finalize_live_acceptance`, so this only matters
+/// when an abort was recorded on the timeline itself.
+fn timeline_terminal_aborted(timeline: &Value) -> bool {
+    timeline
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|event| {
+            event
+                .get("kind")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.contains("inactivity"))
+        })
+}
+
+/// Agent activities still holding a non-terminal status, for diagnosis.
+///
+/// `physical_agent_waits_resolved` used to publish only a boolean, so a failure named
+/// no execution, no activity and no status - the same reader cannot tell "nothing was
+/// pending" from "one agent never settled". A check that cannot be diagnosed when it
+/// fails is a check that costs a paid run to interpret.
+fn unresolved_agent_activities(projections: &[Value]) -> Vec<Value> {
+    projections
+        .iter()
+        .flat_map(|projection| {
+            projection
+                .get("activities")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter(|activity| {
+            activity
+                .get("agent_instance_id")
+                .and_then(Value::as_str)
+                .is_some()
+                && !matches!(
+                    activity.get("status").and_then(Value::as_str),
+                    Some("completed" | "failed" | "cancelled" | "canceled" | "skipped")
+                )
+        })
+        .map(|activity| {
+            json!({
+                "activity_id": activity.get("activity_id"),
+                "execution_id": activity.get("execution_id"),
+                "agent_instance_id": activity.get("agent_instance_id"),
+                "status": activity.get("status"),
+                "public_summary": activity.get("public_summary"),
+            })
+        })
+        .collect()
+}
+
 fn no_active_agent_waits(projections: &[Value]) -> bool {
     projections.iter().all(|projection| {
         projection
@@ -4006,8 +4065,22 @@ fn no_active_agent_waits(projections: &[Value]) -> bool {
     })
 }
 
+/// Agent activities that ended without ever completing.
+///
+/// A single agent instance can produce several activities across its life: a tool
+/// call fails, the instance retries, and the same instance later completes. Counting
+/// the transient failure as a failed agent graph turns a run that finished into a
+/// failed one - in d6v10 this check reported `failed_activities: 1` for a run whose
+/// durable record holds zero failed or cancelled nodes, seven of seven
+/// `agent.terminal` records `completed`, and a 483-response trace with no failed
+/// activity. The one `partial_failure` outcome in that record says it plainly:
+/// "1 tool calls failed before terminal synthesis".
+///
+/// So an activity counts only when its agent instance never reached `completed`.
+/// An instance that failed and then succeeded is a recovered instance, not a failed
+/// one; an instance whose only record is a failure still counts.
 fn physical_failed_agent_activity_count(projections: &[Value]) -> usize {
-    projections
+    let activities = projections
         .iter()
         .flat_map(|projection| {
             projection
@@ -4016,11 +4089,25 @@ fn physical_failed_agent_activity_count(projections: &[Value]) -> usize {
                 .into_iter()
                 .flatten()
         })
+        .collect::<Vec<_>>();
+    let completed_instances = activities
+        .iter()
         .filter(|activity| {
             activity
                 .get("agent_instance_id")
                 .and_then(Value::as_str)
                 .is_some()
+                && activity.get("status").and_then(Value::as_str) == Some("completed")
+        })
+        .filter_map(|activity| activity.get("agent_instance_id").and_then(Value::as_str))
+        .collect::<std::collections::BTreeSet<_>>();
+    activities
+        .iter()
+        .filter(|activity| {
+            activity
+                .get("agent_instance_id")
+                .and_then(Value::as_str)
+                .is_some_and(|instance| !completed_instances.contains(instance))
                 && matches!(
                     activity.get("status").and_then(Value::as_str),
                     Some("failed" | "cancelled" | "canceled")

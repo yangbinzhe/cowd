@@ -1553,3 +1553,44 @@ fn a_failed_scenario_still_reports_its_provider_rounds() {
     assert_eq!(metrics.get("tool_calls").and_then(Value::as_u64), Some(0));
     assert_eq!(scenario.get("status").and_then(Value::as_str), Some("failed"));
 }
+
+/// A transient tool failure inside a retried agent is not a failed agent graph.
+///
+/// d6v10 reached a terminal state - `error = None`, six durable assistant messages,
+/// zero of 140 tool calls failed, zero ERROR lines in the gateway log, seven of seven
+/// `agent.terminal` records completed - and `physical_agent_graphs_succeeded` still
+/// failed with `failed_activities: 1`. The one `partial_failure` outcome in that run's
+/// record says what the count was really seeing: "1 tool calls failed before terminal
+/// synthesis". Counting it turned a finished run into a failed one.
+#[test]
+fn a_recovered_agent_instance_is_not_a_failed_agent_graph() {
+    let projection = json!({"activities": [
+        {"activity_id": "a1", "agent_instance_id": "inst-1", "status": "failed"},
+        {"activity_id": "a2", "agent_instance_id": "inst-1", "status": "completed"},
+        {"activity_id": "a3", "agent_instance_id": "inst-2", "status": "failed"},
+    ]});
+    assert_eq!(
+        physical_failed_agent_activity_count(std::slice::from_ref(&projection)),
+        1,
+        "the instance that later completed is recovered; the one that never did is failed"
+    );
+}
+
+/// An agent still holding a non-terminal status must be named, not just counted.
+///
+/// `physical_agent_waits_resolved` used to publish a bare boolean, so a failure could
+/// not distinguish "nothing was pending" from "one agent never settled".
+#[test]
+fn an_unresolved_agent_activity_is_named_in_the_evidence() {
+    let projection = json!({"activities": [
+        {"activity_id": "a1", "agent_instance_id": "inst-1", "status": "completed"},
+        {"activity_id": "a2", "agent_instance_id": "inst-2", "status": "running",
+         "execution_id": "exec-2", "public_summary": "still working"},
+    ]});
+    assert!(no_active_agent_waits(std::slice::from_ref(&projection)) == false);
+    let unresolved = unresolved_agent_activities(std::slice::from_ref(&projection));
+    assert_eq!(unresolved.len(), 1);
+    assert_eq!(unresolved[0]["activity_id"], "a2");
+    assert_eq!(unresolved[0]["execution_id"], "exec-2");
+    assert_eq!(unresolved[0]["status"], "running");
+}
