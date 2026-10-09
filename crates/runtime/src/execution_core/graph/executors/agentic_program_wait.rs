@@ -290,15 +290,31 @@ impl NodeExecutor for AgenticProgramWaitExecutor {
                 let Some(supervisor) = supervisor.upgrade() else {
                     return;
                 };
-                let parked = match state_store
-                    .load_current_async(root_execution_id.clone())
-                    .await
+                // This read is the loop's own terminator, so it needs the same ceiling
+                // as a pass. A paid run put a ceiling on the pass alone and the loop
+                // still went quiet forty decisions in, four minutes before the final
+                // Task accept, with all three Tasks eventually accepted and the
+                // barrier parked until the evaluator cancelled it: the read above the
+                // pass had blocked, and no budget or pass ceiling reaches that.
+                let parked = match tokio::time::timeout(
+                    BARRIER_SELF_REARM_PASS_TIMEOUT,
+                    state_store.load_current_async(root_execution_id.clone()),
+                )
+                .await
                 {
-                    Ok(graph) => {
+                    Ok(Ok(graph)) => {
                         graph.node_statuses.get(&node_id)
                             == Some(&ExecutionNodeStatus::WaitingExternal)
                     }
-                    Err(_) => return,
+                    Ok(Err(_)) => return,
+                    Err(_) => {
+                        tracing::warn!(
+                            program_id,
+                            root_execution_id,
+                            "barrier self-rearm status read timed out; continuing the bounded loop"
+                        );
+                        true
+                    }
                 };
                 if !parked {
                     return;
