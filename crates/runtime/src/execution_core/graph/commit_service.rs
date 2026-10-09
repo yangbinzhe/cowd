@@ -1540,15 +1540,15 @@ impl ExecutionCommitService {
                 //   program and revision.
                 // * Class B authoritative: parks on
                 //   `session_handoff_accepted:{subject}:{receipt}` and must be
-                //   resolved with exactly that subject, so the parked reference
-                //   has to quote it.
+                //   resolved with exactly that subject.
+                // A Program id contains a colon, so the parked reference has five
+                // parts; requiring four refused every release as unanchored.
                 let anchored = match parked.as_deref() {
                     Some(parked_ref) if parked_ref.starts_with("agentic-program-wait:") => {
-                        let parts = parked_ref.split(':').collect::<Vec<_>>();
-                        parts.len() == 4
-                            && correlation_id
-                                .starts_with(&format!("agentic-program-wait:{}:", parts[1]))
-                            && correlation_id.ends_with(&format!(":{}", parts[3]))
+                        parked_ref.rsplit_once(":revision:").is_some_and(|(subject, rev)| {
+                            correlation_id.starts_with(&format!("{subject}:"))
+                                && correlation_id.ends_with(&format!(":{rev}"))
+                        })
                     }
                     Some(parked_ref) => parked_ref.starts_with(&format!(
                         "session_handoff_accepted:{correlation_id}:"

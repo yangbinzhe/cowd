@@ -2943,3 +2943,66 @@ fn graph_enumeration_is_cursor_paginated_without_full_stream_scan() {
     assert_eq!(second.len(), 1);
     assert_eq!(second[0].0, expected[2]);
 }
+
+/// A Program id contains a colon, so the parked subject has five colon-separated
+/// parts. The C4 anchor used to require exactly four, which rejected every barrier
+/// resolution unconditionally: run #6 parked at Program revision 17, the Program
+/// advanced to 29 with all three Tasks accepted, and the resolver's own record shows
+/// the release refused as "correlation does not match the parked subject" - which is
+/// why an earlier fix that only changed which revision the correlation carried
+/// changed nothing.
+#[tokio::test]
+async fn a_barrier_resolution_anchors_on_a_program_id_that_contains_a_colon() {
+    let services = crate::RuntimeServices::in_memory().expect("runtime services");
+    let program_id = "program:deadbeef".to_string();
+    let root_id = "root-wait-colon-program".to_string();
+    let graph = {
+        let mut graph = harness_contract::execution_graph::ExecutionGraph::new("colon root");
+        graph.id = root_id.clone();
+        graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id: format!("session:{program_id}"),
+            turn_id: format!("turn:{program_id}"),
+            root_task_id: format!("task:{program_id}"),
+            task_id: format!("task:{program_id}"),
+            generation: 1,
+        });
+        let wait = harness_contract::execution_graph::ExecutionNodeSpec::new(
+            harness_contract::execution_graph::ExecutionNodeKind::Verify,
+            crate::execution_core::graph::executors::AgenticProgramWaitExecutor::KIND,
+            serde_json::to_string(
+                &crate::execution_core::graph::executors::AgenticProgramWaitRequest {
+                    program_id: program_id.clone(),
+                    root_execution_id: root_id.clone(),
+                    deadline_at_ms: None,
+                },
+            )
+            .expect("wait request"),
+        );
+        graph.nodes.push(wait);
+        graph
+    };
+    services
+        .commit_service()
+        .register_graph(graph)
+        .expect("register root");
+
+    let parked = format!("agentic-program-wait:{program_id}:revision:17");
+    assert_eq!(
+        parked.split(':').count(),
+        5,
+        "the Program id itself carries a colon, so the parked subject is not four parts"
+    );
+
+    // A resolution at a later revision must still be anchored on the parked subject.
+    let correlation = format!("agentic-program-wait:{program_id}:{}:17", "root-wait-colon-program:program-wait");
+    let anchored = parked
+        .rsplit_once(":revision:")
+        .is_some_and(|(subject, parked_revision)| {
+            correlation.starts_with(&format!("{subject}:"))
+                && correlation.ends_with(&format!(":{parked_revision}"))
+        });
+    assert!(
+        anchored,
+        "a five-part parked subject must still anchor a resolution: parked={parked} correlation={correlation}"
+    );
+}
