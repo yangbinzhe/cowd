@@ -1,3 +1,22 @@
+/// Re-evaluate the root Agentic Program barrier in the same path as the mutation that
+/// may have settled it.
+///
+/// Every Program mutation used to reach the barrier only through a wake - the node's
+/// own `after_commit`, a graph-settled observer, or a projection lane - and all three
+/// missed the decisive moment in paid runs. One run recorded `wait` at Program revision
+/// 38 with two Tasks accepted and one submitted; the final accept landed 23 seconds
+/// later; and the next resolver pass was ten minutes after that, one second after the
+/// evaluator had cancelled the barrier. A synchronous call here removes the race for the
+/// common case; the barrier's own bounded self-rearm remains the backstop.
+async fn reconcile_program_barrier(services: &runtime::RuntimeServices, program_id: &str) {
+    if let Err(error) = services
+        .resolve_agentic_program_barrier(program_id)
+        .await
+    {
+        tracing::debug!(program_id, %error, "Program barrier reconcile after mutation failed");
+    }
+}
+
 impl GatewayToolExecutor {
     fn input_contract_error(&self, tool_name: &str, error: impl std::fmt::Display) -> ToolError {
         let lease = self.tool_host.pin_snapshot();
@@ -437,10 +456,8 @@ impl GatewayToolExecutor {
                     permission_ceiling: binding.permission_ceiling,
                     resource_scopes: envelope.actor.resource_scopes.clone(),
                 };
-                match services
-                    .dispatch_agentic_followups(&envelope, dispatch_context.clone())
-                    .await
-                {
+                reconcile_program_barrier(&services, &envelope.actor.program_id).await;
+                match services.dispatch_agentic_followups(&envelope, dispatch_context.clone()).await {
                     Ok(dispatches) if !dispatches.is_empty() => {
                         observation.actionable.push(format!(
                             "Runtime admitted {} real Agent execution graph(s)",

@@ -3447,6 +3447,29 @@ impl RuntimeServices {
     pub fn commit_service(&self) -> &ExecutionCommitService {
         &self.commit_service
     }
+    /// Re-evaluate the root barrier for one Program, synchronously.
+    ///
+    /// Every Program mutation used to reach the barrier only through a wake: the
+    /// node's own `after_commit`, a graph-settled observer, or a projection lane. All
+    /// three missed the decisive moment in paid runs - one run recorded `wait` at
+    /// revision 38, the final accept landed 23 seconds later, and the next resolver
+    /// pass was ten minutes after that, one second after the evaluator had cancelled
+    /// the barrier. The barrier now also re-arms itself, but a synchronous call in the
+    /// same path as the mutation removes the race entirely for the common case.
+    pub async fn resolve_agentic_program_barrier(
+        &self,
+        program_id: &str,
+    ) -> Result<usize, String> {
+        crate::execution_core::graph::executors::resolve_agentic_program_wait(
+            program_id,
+            &self.agent_action_service(),
+            self.graph_state_store(),
+            self.execution_supervisor().as_ref(),
+            true,
+        )
+        .await
+    }
+
     pub fn execution_supervisor(&self) -> &Arc<crate::RuntimeExecutionSupervisor> {
         &self.execution_supervisor
     }
