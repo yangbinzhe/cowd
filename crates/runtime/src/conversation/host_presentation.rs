@@ -983,17 +983,7 @@ where
             );
             return Ok(outcome);
         }
-        // A synthesis node can be superseded by durable input and replan into
-        // another model node.  Do not publish Finalizing before that barrier:
-        // the live-status projection correctly treats Finalizing as a
-        // one-way terminal-preparation state, while the graph still has a
-        // legitimate replan path above.
-        if let Some(bus) = self.runtime.lock().await.cowd_bus().cloned() {
-            bus.emit(CowdEvent::ExecutionPhase {
-                status: harness_contract::projection::ExecutionLiveStatus::Finalizing,
-                detail: Some("synthesizing terminal".to_string()),
-            });
-        }
+        // `Finalizing` is published only after the completion-gap decision.
         let projection = self
             .services
             .execution_supervisor()
@@ -1402,6 +1392,9 @@ where
                     if state.completion_gap_continuations < bound {
                         state.completion_gap_continuations =
                             state.completion_gap_continuations.saturating_add(1);
+                        // This turn is not finished, so every terminal fact
+                        // published above must be rolled back.
+                        self.abandon_published_terminal().await;
                         true
                     } else {
                         tracing::warn!(
@@ -1441,6 +1434,8 @@ where
                 .drive_agentic_objective_completion(&session_id, &turn_id, &ticket.graph_id)
                 .await;
         }
+        // The turn is terminal from here on.
+        self.publish_terminal_finalizing().await;
         let terminal_owned = root_terminal_owned_elsewhere(
             self.services.as_ref(),
             execution_role.owns_root_presentation(),
@@ -1891,6 +1886,43 @@ where
             });
         }
         Ok(())
+    }
+}
+
+impl<C, T> TurnSynthesizeBackend<C, T>
+where
+    C: ApiClient + Send + Sync + 'static,
+    T: ToolExecutor,
+{
+    /// A turn that returns to work after a success presentation is not
+    /// terminal. Roll back every terminal fact that presentation published:
+    /// the committed answer, the delivery envelope and the terminal
+    /// presentation. The runner also copies the last two off any
+    /// non-batchable outcome into durable graph state, so leaving them set
+    /// records a terminal the turn never delivered. Run t2 is the proof: the
+    /// Program stayed `open`, the session transcript never received the
+    /// assistant message, and every observer had already been told the turn
+    /// was finalizing.
+    async fn abandon_published_terminal(&self) {
+        let mut state = self.state.lock().await;
+        state.delivery_envelope = None;
+        state.terminal_presentation = None;
+        state.terminal_commit_owner = None;
+        state.committed_terminal_answer = None;
+        state.committed_terminal_completion = None;
+    }
+
+    /// `Finalizing` is a one-way terminal-preparation live status. Publish it
+    /// only once this turn is known to be terminal: announcing it while the
+    /// graph still has a legitimate replan path latches every observer on
+    /// "finalizing" while the turn keeps working.
+    async fn publish_terminal_finalizing(&self) {
+        if let Some(bus) = self.runtime.lock().await.cowd_bus().cloned() {
+            bus.emit(CowdEvent::ExecutionPhase {
+                status: harness_contract::projection::ExecutionLiveStatus::Finalizing,
+                detail: Some("synthesizing terminal".to_string()),
+            });
+        }
     }
 }
 
