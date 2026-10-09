@@ -306,7 +306,19 @@ impl NodeExecutor for AgenticProgramWaitExecutor {
                         graph.node_statuses.get(&node_id)
                             == Some(&ExecutionNodeStatus::WaitingExternal)
                     }
-                    Ok(Err(_)) => return,
+                    // A transient store error is not "the barrier is gone". Returning
+                    // here ended the loop silently in paid runs: the re-arm produced
+                    // twenty-eight to forty decisions, stopped minutes before the
+                    // final Task accept, and the barrier stayed parked with every Task
+                    // accepted until the evaluator cancelled it.
+                    Ok(Err(_)) => {
+                        tracing::warn!(
+                            program_id,
+                            root_execution_id,
+                            "barrier self-rearm status read failed; continuing the bounded loop"
+                        );
+                        true
+                    }
                     Err(_) => {
                         tracing::warn!(
                             program_id,
