@@ -1609,7 +1609,7 @@ impl ExecutionGraphRunner {
                 }
             }
         } else {
-            executor.poll_or_await(&ticket).await
+            execute_node_under_ceiling(&executor, &ticket).await
         };
         let node_duration_ms = resource_started
             .elapsed()
@@ -2493,10 +2493,68 @@ fn has_terminal_fact_kind(result: &ExecutionNodeResult, kind: TerminalFactKind) 
     }
 }
 
+/// Bounded ceiling for a node that carries no durable deadline of its own.
+///
+/// Only `AgentTask` nodes read an absolute deadline from their payload, so every
+/// other kind — `inline_model`, `tool_batch`, `synthesize`, `model` — used to be
+/// awaited without any bound at all. That is not a theoretical gap: a paid run
+/// lost ten minutes to one blocked `inline_model` node and ended in a forced
+/// abort at shutdown, because nothing in the Runtime would ever stop it.
+///
+/// The ceiling is deliberately far above any real step (a root model step in that
+/// same run took 23 seconds, a delegated Agent minutes), so it never truncates
+/// work that is genuinely progressing. It only converts "hangs forever" into
+/// "cancelled with a summary".
+fn node_execution_ceiling() -> std::time::Duration {
+    std::time::Duration::from_secs(
+        std::env::var("COWD_NODE_EXECUTION_CEILING_SECS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1_800),
+    )
+}
+
+/// Await a node that carries no durable deadline of its own, under a bounded
+/// ceiling. A node that is genuinely working is untouched; a node whose executor
+/// stopped making progress is cancelled with an explicit summary instead of
+/// hanging the turn forever.
+async fn execute_node_under_ceiling(
+    executor: &Arc<dyn NodeExecutor>,
+    ticket: &NodeExecutionTicket,
+) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+    match tokio::time::timeout(node_execution_ceiling(), executor.poll_or_await(ticket)).await {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            let ceiling_ms =
+                u64::try_from(node_execution_ceiling().as_millis()).unwrap_or(u64::MAX);
+            tracing::warn!(
+                graph_id = ticket.graph_id,
+                node_id = ticket.node_id,
+                executor_kind = ticket.executor_kind,
+                ceiling_ms,
+                "node execution exceeded its bounded ceiling; cancelling with a summary"
+            );
+            if executor.cancellation_requires_quiescence(ticket) {
+                executor.cancel_bounded(ticket, Duration::from_secs(5)).await?;
+            } else {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    executor.cancel_bounded(ticket, Duration::from_secs(5)),
+                )
+                .await;
+            }
+            Ok(deadline_exceeded_outcome(
+                &ticket.node_id,
+                now_ms().saturating_add(ceiling_ms),
+            ))
+        }
+    }
+}
+
 fn execution_deadline_at_ms(
     node: &harness_contract::execution_graph::ExecutionNodeSpec,
-) -> Result<Option<u64>, ExecutionRunnerError> {
-    if !matches!(
+) -> Result<Option<u64>, ExecutionRunnerError> {    if !matches!(
         node.kind,
         harness_contract::execution_graph::ExecutionNodeKind::AgentTask
     ) {

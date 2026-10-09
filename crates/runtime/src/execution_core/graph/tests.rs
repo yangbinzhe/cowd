@@ -3006,3 +3006,59 @@ async fn a_barrier_resolution_anchors_on_a_program_id_that_contains_a_colon() {
         "a five-part parked subject must still anchor a resolution: parked={parked} correlation={correlation}"
     );
 }
+
+/// Only `AgentTask` nodes read a durable deadline from their payload, so every
+/// other kind used to be awaited with no bound at all. Run t2 is the cost: one
+/// `inline_model` node stopped making progress, the whole Runtime wrote no
+/// further event for ten minutes, the session worker kept renewing its lease the
+/// entire time, and shutdown had to force-abort the turn.
+#[tokio::test]
+async fn a_node_with_no_durable_deadline_is_still_bounded() {
+    let (registry, state, commits) = harness();
+    let pending = Arc::new(PermanentPendingExecutor {
+        cancel_calls: AtomicUsize::new(0),
+    });
+    registry.register(pending.clone()).unwrap();
+    let runner = test_runner(registry, state.clone(), commits.clone());
+    let mut graph = test_graph("a bounded node is never a permanent hang");
+    let graph_id = graph.id.clone();
+    // An `inline_model` node is exactly the kind that carries no deadline.
+    let mut stuck = ExecutionNodeSpec::new(
+        ExecutionNodeKind::InlineModel,
+        pending.kind(),
+        "{}".to_string(),
+    );
+    stuck.id = "stuck-model".to_string();
+    stuck.idempotency_key = "stuck-model-attempt".to_string();
+    graph.nodes = vec![stuck];
+
+    // The ceiling is an operator bound, not a per-node contract, so the test
+    // shortens it rather than waiting out the default.
+    struct Ceiling;
+    impl Drop for Ceiling {
+        fn drop(&mut self) {
+            std::env::remove_var("COWD_NODE_EXECUTION_CEILING_SECS");
+        }
+    }
+    let _ceiling = Ceiling;
+    std::env::set_var("COWD_NODE_EXECUTION_CEILING_SECS", "1");
+
+    tokio::time::timeout(Duration::from_secs(10), runner.start(graph))
+        .await
+        .expect("a node with no durable deadline must still terminate")
+        .expect("graph reaches quiescence");
+    let graph = state.load(&graph_id).unwrap();
+    assert_eq!(
+        graph.node_statuses["stuck-model"],
+        ExecutionNodeStatus::Cancelled,
+        "the bounded ceiling must cancel a node that never returns"
+    );
+    assert_eq!(
+        graph.node_results["stuck-model"]
+            .failure
+            .as_ref()
+            .map(|failure| failure.kind.as_str()),
+        Some("execution_deadline_exceeded")
+    );
+    assert!(pending.cancel_calls.load(Ordering::SeqCst) >= 1);
+}
