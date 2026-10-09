@@ -344,12 +344,19 @@ where
         let messages: HistoryView = messages.into();
         self.execute_terminal_provider_step(
             objective,
+            // The claim this used to make - "no continuation work" - was false
+            // whenever the Objective still had a completion gap, and Runtime
+            // replanned a continuation in exactly that case. Run t2 is the
+            // proof: the model was told there was no continuation work, obeyed,
+            // wrote its final answer, and was then told to keep working. State
+            // what is true of *this request* (it exposes no tools) and stop
+            // there.
             "## Clean terminal synthesis\n\
              Produce the final user-facing answer for the supplied objective from the checked \
-             evidence receipts only. This request has no tools and no continuation work. Do not \
-             emit function calls, simulated tool markup, plans to inspect more data, or promises \
-             to continue. Give the best supported conclusion now and state unresolved facts \
-             explicitly.",
+             evidence receipts only. This request exposes no executable tools, so answer from \
+             the receipts you already hold: do not emit function calls, simulated tool markup, \
+             or plans to inspect more data. Give the best supported conclusion now and state \
+             unresolved facts explicitly.",
             messages,
             "clean terminal synthesis exposes no executable tools",
             None,

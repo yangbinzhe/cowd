@@ -1406,6 +1406,9 @@ where
                     }
                 };
                 if continue_gap {
+                    // The continuation must be a real, tool-enabled model step
+                    // that knows what to do (run t2 got neither).
+                    self.push_completion_gap_guidance(ticket, &gap).await;
                     let iteration = self.state.lock().await.iterations;
                     let next = dynamic_node(
                         ticket,
@@ -1923,6 +1926,50 @@ where
                 detail: Some("synthesizing terminal".to_string()),
             });
         }
+    }
+
+    /// Arm the continuation step that a completion gap replans into.
+    ///
+    /// Two things have to happen or the continuation is inert. The gap has to
+    /// reach the prompt: it used to live only in the graph's replan `reason`, so
+    /// the model was told to "continue working" with no statement of the work -
+    /// run t2 wrote a complete final answer that named both unadjudicated
+    /// issues in prose and was never given the action that adjudicates them.
+    /// And the one-shot terminal state has to be cleared, because the step that
+    /// just finished was a zero-tool clean terminal synthesis.
+    async fn push_completion_gap_guidance(
+        &self,
+        ticket: &NodeExecutionTicket,
+        gap: &str,
+    ) {
+        {
+            let mut state = self.state.lock().await;
+            state.clean_terminal_synthesis_next = false;
+            state.force_text_only_next_model = false;
+            state.force_tool_allowlist_next_model = None;
+        }
+        let mut item = ContextItem::new(
+            format!("objective-completion-gap:{}", ticket.node_id),
+            ContextSourceKind::Task,
+            ContextRole::Instruction,
+            format!(
+                "Runtime returned this turn to work because the Objective is not complete yet: {gap}. \
+                 The final answer you just wrote is not being delivered. Resolve the gap with the Agent \
+                 actions you already have - for an unadjudicated issue, call `message_publish` with \
+                 `issue_dispositions` naming each `issue:` reference and a disposition of `must_resolve`, \
+                 `disclose` or `resolved`, each with a durable `reason_ref` and `evidence_refs` \
+                 (`artifact://`, `tool://`, `task:`, `issue:` or `program:`). `disclose` preserves a \
+                 labelled limitation without asserting an estimate is a measurement. Then present the \
+                 final answer again."
+            ),
+        );
+        item.authority = ContextAuthority::System;
+        item.visibility = ContextVisibility::Private;
+        item.evidence = vec![format!("execution_node:{}", ticket.node_id)];
+        self.runtime
+            .lock()
+            .await
+            .push_next_model_context_item(item);
     }
 }
 
