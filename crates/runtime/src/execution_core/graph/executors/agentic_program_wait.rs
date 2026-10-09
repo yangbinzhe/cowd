@@ -48,7 +48,7 @@ impl AgenticProgramWaitRequest {
             return Ok(None);
         }
         let dispatched =
-            !active_agentic_child_graphs(root_execution_id, &program.program_id, state_store)
+            !active_agentic_child_graphs(root_execution_id, &program.program_id, program, state_store)
                 .await?
                 .is_empty();
         Ok(dispatched.then(|| Self {
@@ -836,7 +836,12 @@ async fn wait_disposition(
         });
     }
     let active_graphs =
-        active_agentic_child_graphs(&request.root_execution_id, &request.program_id, state_store)
+        active_agentic_child_graphs(
+            &request.root_execution_id,
+            &request.program_id,
+            projection,
+            state_store,
+        )
             .await?;
     if active_graphs.is_empty() {
         // "No active child graph" is not the same as "every dispatched task
@@ -935,6 +940,7 @@ fn has_unsettled_tasks(projection: &AgenticProgramProjection) -> bool {
 async fn active_agentic_child_graphs(
     root_execution_id: &str,
     program_id: &str,
+    projection: &crate::AgenticProgramProjection,
     state_store: &ExecutionGraphStateStore,
 ) -> Result<Vec<String>, String> {
     let links = state_store
@@ -956,6 +962,7 @@ async fn active_agentic_child_graphs(
                 .node_statuses
                 .values()
                 .any(|status| !status.is_terminal())
+            && child_graph_task_is_live(&graph, projection)
         {
             active.push(graph.id);
         }
@@ -963,6 +970,53 @@ async fn active_agentic_child_graphs(
     active.sort();
     active.dedup();
     Ok(active)
+}
+
+/// Whether the Task a child graph was dispatched for can still change.
+///
+/// Unknown is live: a graph whose packet is absent, unparseable, or names a Task the
+/// Program does not carry stays active. That is the PLAN C5-6 direction - a child link
+/// may not be durable yet, and a Task may be about to be published - so an unknown Task
+/// is never read as settled.
+fn child_graph_task_is_live(
+    graph: &ExecutionGraph,
+    projection: &crate::AgenticProgramProjection,
+) -> bool {
+    let mut task_refs = graph
+        .nodes
+        .iter()
+        .filter(|node| node.kind == ExecutionNodeKind::AgentTask)
+        .filter_map(|node| {
+            serde_json::from_str::<harness_contract::agent::AgentTaskPacket>(&node.payload_ref)
+                .ok()
+        })
+        .filter_map(|packet| match packet.agentic_binding.map(|binding| binding.focus) {
+            Some(harness_contract::agent::AgenticExecutionFocus::TaskExecute { task_ref })
+            | Some(harness_contract::agent::AgenticExecutionFocus::TaskReview { task_ref }) => {
+                Some(task_ref)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    task_refs.sort();
+    task_refs.dedup();
+    if task_refs.is_empty() {
+        return true;
+    }
+    // The same set `has_unsettled_tasks` uses, so the two cannot disagree about which
+    // Tasks can still move.
+    task_refs.iter().all(|task_ref| {
+        projection.tasks.get(task_ref).is_none_or(|task| {
+            matches!(
+                task.status,
+                AgenticTaskStatus::Published
+                    | AgenticTaskStatus::Claimed
+                    | AgenticTaskStatus::Submitted
+                    | AgenticTaskStatus::Rework
+                    | AgenticTaskStatus::CancelRequested
+            )
+        })
+    })
 }
 
 fn graph_belongs_to_program(graph: &ExecutionGraph, program_id: &str) -> bool {
