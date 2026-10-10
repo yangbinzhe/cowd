@@ -100,10 +100,7 @@ impl AgentActionService {
             }],
         };
         loop {
-            let expected = self
-                .store
-                .stream_revision(&stream_id)
-                .unwrap_or_default();
+            let expected = self.store.stream_revision(&stream_id).unwrap_or_default();
             let request = AppendTransactionRequest {
                 transaction_id: request.transaction_id.clone(),
                 expected_streams: vec![ExpectedStreamRevision {
@@ -307,8 +304,12 @@ impl AgentActionService {
                 })?,
             )?;
             if original.actor != envelope.actor || original.action != envelope.action {
-                return Ok(Some(rejected(envelope, projection.revision, "action_id_conflict",
-                    "action_id already identifies a different actor or payload; use the original request to retry")));
+                return Ok(Some(rejected(
+                    envelope,
+                    projection.revision,
+                    "action_id_conflict",
+                    "action_id already identifies a different actor or payload; use the original request to retry",
+                )));
             }
             let entity_ref = existing
                 .payload
@@ -461,7 +462,7 @@ impl AgentActionService {
                                 projection.revision,
                                 "advisory_evidence_unavailable",
                                 &error,
-                            ))
+                            ));
                         }
                     };
                 let mut observation = inspected_observation(envelope, &projection, goal.as_ref());
@@ -599,7 +600,12 @@ impl AgentActionService {
         // `unresolved` stays visible.
         if let AgentAction::ObjectiveCompleteRequest(input) = &envelope.action {
             if input.blocked {
-                if input.blocked_reason.as_deref().unwrap_or("").trim().is_empty()
+                if input
+                    .blocked_reason
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim()
+                    .is_empty()
                     || !input.human_review_required
                     || input.recommended_next_actions.is_empty()
                 {
@@ -623,8 +629,10 @@ impl AgentActionService {
         if let Some((code, message)) =
             validate_transition(&projection, envelope, now_ms(), self.graphs.as_ref())
         {
-            if matches!(code, "objective_not_verifiable" | "objective_blocked_for_human_review")
-                && matches!(envelope.action, AgentAction::ObjectiveCompleteRequest(_))
+            if matches!(
+                code,
+                "objective_not_verifiable" | "objective_blocked_for_human_review"
+            ) && matches!(envelope.action, AgentAction::ObjectiveCompleteRequest(_))
             {
                 // F2b: an authorization-time completion rejection never became a
                 // durable reopen, so record it durably to keep the completion
@@ -868,17 +876,11 @@ impl AgentActionService {
         if let AgentAction::TaskReview(input) = &envelope.action {
             match input.decision {
                 harness_contract::agent_action::TaskReviewDecision::Accept => {
-                    crate::execution_core::performance::observe_count(
-                        "agentic_task_accepted",
-                        1,
-                    );
+                    crate::execution_core::performance::observe_count("agentic_task_accepted", 1);
                 }
                 harness_contract::agent_action::TaskReviewDecision::Challenge
                 | harness_contract::agent_action::TaskReviewDecision::Rework => {
-                    crate::execution_core::performance::observe_count(
-                        "agentic_task_reworked",
-                        1,
-                    );
+                    crate::execution_core::performance::observe_count("agentic_task_reworked", 1);
                 }
             }
         }
@@ -1327,10 +1329,7 @@ impl AgentActionService {
                     "gap": gap,
                 }),
             },
-            idempotency_key: Some(format!(
-                "completion-rejected:{}",
-                envelope.action_id
-            )),
+            idempotency_key: Some(format!("completion-rejected:{}", envelope.action_id)),
             schema_version: 1,
         };
         let _ = self.store.append_transaction(AppendTransactionRequest {
@@ -1753,8 +1752,11 @@ fn apply_projection_events(
                     && task.claimant.as_deref() == agent_id
                     && task.claim_execution_id.as_deref() == execution_id;
                 if same_owner {
-                    task.lease_expires_at_ms =
-                        Some(event.created_at_ms.saturating_add(super::work_market::claim_lease_ms()));
+                    task.lease_expires_at_ms = Some(
+                        event
+                            .created_at_ms
+                            .saturating_add(super::work_market::claim_lease_ms()),
+                    );
                 }
             }
             projection.revision = event.sequence;
@@ -2048,7 +2050,7 @@ fn inspected_observation(
                     projection.revision,
                     "invalid_state_cursor",
                     &error,
-                )
+                );
             }
         }
     };
@@ -2458,6 +2460,12 @@ fn actionable(projection: &AgenticProgramProjection, duplicate: bool) -> Vec<Str
         {
             actions.push("Use objective_review for the original criterion with the current delivered result and durable evidence; the reviewer must be distinct from its Runtime-resolved producer. Preserve accepted work.".into());
         }
+        // A reopened Program must never also advertise the exit action in the
+        // same receipt: one live run received "resolve the recorded gaps" and
+        // "request Objective completion" together, re-requested completion, and
+        // looped until the observation window expired. While gaps remain, the
+        // gap guidance above is the entire instruction.
+        return actions;
     }
     // A Task no Agent will settle is a fact the root must be able to read. Runtime
     // used to keep it private in the dispatch starvation ledger, so the model had no
@@ -2509,7 +2517,12 @@ fn actionable(projection: &AgenticProgramProjection, duplicate: bool) -> Vec<Str
         .tasks
         .values()
         .any(|task| task.status == AgenticTaskStatus::Claimed);
-    if claimed || projection.tasks.values().any(|t| t.status == AgenticTaskStatus::Submitted) {
+    if claimed
+        || projection
+            .tasks
+            .values()
+            .any(|t| t.status == AgenticTaskStatus::Submitted)
+    {
         actions.push(
             "To make a body committable: `artifact_publish` with `MessageBlock{message_id, block_index, sha256, media_type}` publishes any Text block of any of your responses; `artifact_commit` with `content_ref=current_message_block:<zero-based index>` commits a Text block of the response you are writing right now; `artifact_commit` with `content_ref=artifact://<selector>` commits something you already published. A body you wrote in an earlier step stays committable - name it with `artifact_publish(MessageBlock{...})` or use `message://current` and Runtime recovers it. Then `task_submit` with the returned `artifact:...` reference plus real durable evidence refs.".to_string(),
         );

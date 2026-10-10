@@ -481,8 +481,25 @@ where
                         .min(u64::from(u32::MAX)) as u32,
                     &request,
                 );
+                tracing::info!(
+                    target: "cowd::terminal_provider",
+                    model = %model,
+                    attempt = provider_attempt_sequence,
+                    phase = "admission",
+                    "terminal provider phase entered"
+                );
                 let (provider_lease, provider_queue_wait) =
                     self.acquire_provider_capacity(&model, &request).await?;
+                tracing::info!(
+                    target: "cowd::terminal_provider",
+                    model = %model,
+                    attempt = provider_attempt_sequence,
+                    phase = "stream",
+                    queue_wait_ms = u64::try_from(provider_queue_wait.as_millis()).unwrap_or(u64::MAX),
+                    idle_timeout_ms = u64::try_from(transport_policy.idle_timeout.as_millis()).unwrap_or(u64::MAX),
+                    heartbeat_grace_ms = u64::try_from(transport_policy.heartbeat_grace.as_millis()).unwrap_or(u64::MAX),
+                    "terminal provider phase entered"
+                );
                 let cancellation = self.cancellation_token.clone();
                 let stream_started = Instant::now();
                 let terminal_attempt_id = presentation.map(|(
@@ -536,6 +553,15 @@ where
                     transport_activity,
                 )
                 .await;
+                tracing::info!(
+                    target: "cowd::terminal_provider",
+                    model = %model,
+                    attempt = provider_attempt_sequence,
+                    phase = "stream_finished",
+                    elapsed_ms = u64::try_from(stream_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    failed = stream_run.failure.is_some(),
+                    "terminal provider phase finished"
+                );
                 self.record_provider_resource_outcome(
                     provider_lease.as_ref(),
                     provider_queue_wait,
@@ -1034,13 +1060,8 @@ where
         items: Vec<ContextItem>,
         clock_stamp: &crate::prompt::RuntimeClockStamp,
     ) -> PromptAssembly {
-        self.prepare_reality_context_with_budget_and_items(
-            user_input,
-            budget,
-            items,
-            clock_stamp,
-        )
-        .await
+        self.prepare_reality_context_with_budget_and_items(user_input, budget, items, clock_stamp)
+            .await
     }
 
     /// Execute one Provider step while optionally dispatching completed,
@@ -1342,7 +1363,10 @@ where
         let context_select_started = Instant::now();
         let mut prompt = self
             .prepare_step_prompt(
-                user_input, collection_budget, one_shot_context_items.clone(), &clock_stamp,
+                user_input,
+                collection_budget,
+                one_shot_context_items.clone(),
+                &clock_stamp,
             )
             .await;
         crate::execution_core::performance::observe_duration(
@@ -1486,7 +1510,10 @@ where
                     request_messages = self.session.read().await.messages_view();
                     prompt = self
                         .prepare_step_prompt(
-                            user_input, collection_budget, one_shot_context_items, &clock_stamp,
+                            user_input,
+                            collection_budget,
+                            one_shot_context_items,
+                            &clock_stamp,
                         )
                         .await;
                     apply_runtime_controls(&mut prompt);

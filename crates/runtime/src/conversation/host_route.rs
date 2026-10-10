@@ -62,7 +62,9 @@ where
                 active_model.clone(),
                 config.tool_definitions,
             )?
-            .with_stable_tool_schema(stable_tool_schema(config.execution_role.is_delegated_leaf()))
+            .with_stable_tool_schema(stable_tool_schema(
+                config.execution_role.is_delegated_leaf(),
+            ))
             .with_execution_supervisor(services.execution_supervisor())
             .with_emit_output(config.emit_output)
             .with_stream_callback(config.stream_callback.clone()),
@@ -429,8 +431,10 @@ where
             self.recovered_tool_receipts_require_text_only;
         let (runtime_sender, runtime_receiver) =
             tokio::sync::oneshot::channel::<crate::ConversationRuntime<ProviderRuntimeClient, T>>();
-        let (completion_sender, completion_receiver) =
-            tokio::sync::oneshot::channel::<(Option<crate::ConversationRuntime<ProviderRuntimeClient, T>>, Result<TurnSummary, RuntimeError>)>();
+        let (completion_sender, completion_receiver) = tokio::sync::oneshot::channel::<(
+            Option<crate::ConversationRuntime<ProviderRuntimeClient, T>>,
+            Result<TurnSummary, RuntimeError>,
+        )>();
         let execution_supervisor = Arc::clone(services.execution_supervisor());
         if let Err(error) = execution_supervisor
             .spawn_owned("conversation_turn", Box::pin(async move {

@@ -287,7 +287,12 @@ pub(super) fn validate_transition(
             // than forcing the model to keep working forever. `apply_locked`
             // has already rejected it while the Program was not quiescent.
             match crate::agentic::supervision::completion_gap(projection, input) {
-                Some(gap) if input.blocked && crate::agentic::action_service::agentic_program_is_quiescent(projection) => {
+                Some(gap)
+                    if input.blocked
+                        && crate::agentic::action_service::agentic_program_is_quiescent(
+                            projection,
+                        ) =>
+                {
                     Some((
                         "objective_blocked_for_human_review",
                         format!("the Objective cannot be completed: {gap}"),

@@ -1,4 +1,4 @@
-use super::helpers::{semantic_terms, DispatchMode};
+use super::helpers::{DispatchMode, semantic_terms};
 use super::*;
 
 #[derive(Debug, Clone)]
@@ -383,7 +383,11 @@ pub(super) fn intersect_agentic_tools(
     host_snapshot: Option<&AgenticToolHostSnapshot>,
 ) -> Result<(Vec<String>, Vec<String>, Vec<String>), String> {
     let Some(host_snapshot) = host_snapshot else {
-        return Ok((requested_tools.iter().cloned().collect(), Vec::new(), Vec::new()));
+        return Ok((
+            requested_tools.iter().cloned().collect(),
+            Vec::new(),
+            Vec::new(),
+        ));
     };
     let host_tools = &host_snapshot.tools;
     let host_binding = bind_agent_capability_to_host(resolved, host_tools);

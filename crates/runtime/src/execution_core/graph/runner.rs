@@ -5,12 +5,12 @@ use std::time::Duration;
 
 use harness_contract::acceptance::{AcceptanceVerdict, TerminalFactKind};
 use harness_contract::execution_graph::{
-    validate_execution_graph, ExecutionGraph, ExecutionGraphCommand, ExecutionGraphValidationError,
-    ExecutionNodeResult, ExecutionNodeStatus,
+    ExecutionGraph, ExecutionGraphCommand, ExecutionGraphValidationError, ExecutionNodeResult,
+    ExecutionNodeStatus, validate_execution_graph,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::{futures::OwnedNotified, oneshot, Mutex, Notify, OwnedMutexGuard};
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard, futures::OwnedNotified, oneshot};
 
 use super::commit_service::{
     ExecutionCommitError, ExecutionCommitService, ExecutionEffectState, ExecutionTerminalCommit,
@@ -832,7 +832,10 @@ impl ExecutionGraphRunner {
                 drop(active);
                 drop(coordination);
                 for start in aborted {
-                    let _ = start.executor.cancel_bounded(&start.ticket, Duration::from_secs(5)).await;
+                    let _ = start
+                        .executor
+                        .cancel_bounded(&start.ticket, Duration::from_secs(5))
+                        .await;
                     self.record_resource_terminal(
                         start.resource_kind.as_ref(),
                         start.resource_queue_wait,
@@ -845,7 +848,10 @@ impl ExecutionGraphRunner {
         }
         drop(coordination);
         for start in superseded {
-            let _ = start.executor.cancel_bounded(&start.ticket, Duration::from_secs(5)).await;
+            let _ = start
+                .executor
+                .cancel_bounded(&start.ticket, Duration::from_secs(5))
+                .await;
             self.record_resource_terminal(
                 start.resource_kind.as_ref(),
                 start.resource_queue_wait,
@@ -1084,7 +1090,7 @@ impl ExecutionGraphRunner {
             match disposition {
                 TerminalCommitDisposition::Committed => {
                     durable_progress.notify_one();
-                    let after_commit = executor.after_commit(&ticket).await;
+                    let after_commit = run_after_commit_observed(&executor, &ticket).await;
                     if deadline_terminal {
                         executor.cancellation_finalized(&ticket);
                     }
@@ -1193,7 +1199,9 @@ impl ExecutionGraphRunner {
                 match result {
                     Ok(receipt) => break Ok(receipt),
                     Err(ExecutionCommitError::EventStore(
-                        crate::runtime_event_store::RuntimeEventStoreError::StaleRevision { .. },
+                        crate::runtime_event_store::RuntimeEventStoreError::StaleRevision {
+                            ..
+                        },
                     )) if attempt < MAX_TRANSITION_ATTEMPTS => {
                         current = self.state_store.load_async(graph_id).await?;
                         if current.node_statuses.get(&node_id)
@@ -1235,7 +1243,7 @@ impl ExecutionGraphRunner {
         self.converge_after_terminal_commit(graph_id).await?;
         durable_progress.notify_one();
         if let Some((executor, ticket)) = committed_executor {
-            let after_commit = executor.after_commit(&ticket).await;
+            let after_commit = run_after_commit_observed(&executor, &ticket).await;
             if deadline_terminal {
                 executor.cancellation_finalized(&ticket);
             }
@@ -1267,7 +1275,10 @@ impl ExecutionGraphRunner {
                     .await
                     .remove(&(graph_id.to_string(), node_id))
                 {
-                    let _ = active.executor.cancel_bounded(&active.ticket, Duration::from_secs(5)).await;
+                    let _ = active
+                        .executor
+                        .cancel_bounded(&active.ticket, Duration::from_secs(5))
+                        .await;
                 }
                 Ok(None)
             }
@@ -2134,7 +2145,10 @@ impl ExecutionGraphRunner {
                     | ExecutionGraphCommand::CancelNode { .. }
             ) {
                 for (node_id, executor, ticket) in cancellation_finalizer.active() {
-                    if let Err(error) = executor.cancel_bounded(ticket, Duration::from_secs(5)).await {
+                    if let Err(error) = executor
+                        .cancel_bounded(ticket, Duration::from_secs(5))
+                        .await
+                    {
                         cancellation_errors.push((node_id.clone(), error));
                     }
                 }
@@ -2523,20 +2537,38 @@ async fn execute_node_under_ceiling(
     executor: &Arc<dyn NodeExecutor>,
     ticket: &NodeExecutionTicket,
 ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
-    match tokio::time::timeout(node_execution_ceiling(), executor.poll_or_await(ticket)).await {
+    let ceiling = node_execution_ceiling();
+    let started = std::time::Instant::now();
+    let ceiling_ms = u64::try_from(ceiling.as_millis()).unwrap_or(u64::MAX);
+    // Capture the deadline once. Re-reading an environment-backed ceiling after
+    // expiry could report a deadline different from the one that actually
+    // governed this attempt.
+    let deadline_at_ms = now_ms().saturating_add(ceiling_ms);
+    tracing::debug!(
+        target: "cowd::graph_runner",
+        graph_id = ticket.graph_id,
+        node_id = ticket.node_id,
+        executor_kind = ticket.executor_kind,
+        attempt = ticket.attempt,
+        ceiling_ms,
+        "node execution entered bounded ceiling"
+    );
+    match tokio::time::timeout(ceiling, executor.poll_or_await(ticket)).await {
         Ok(outcome) => outcome,
         Err(_) => {
-            let ceiling_ms =
-                u64::try_from(node_execution_ceiling().as_millis()).unwrap_or(u64::MAX);
             tracing::warn!(
                 graph_id = ticket.graph_id,
                 node_id = ticket.node_id,
                 executor_kind = ticket.executor_kind,
+                attempt = ticket.attempt,
                 ceiling_ms,
+                elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                 "node execution exceeded its bounded ceiling; cancelling with a summary"
             );
             if executor.cancellation_requires_quiescence(ticket) {
-                executor.cancel_bounded(ticket, Duration::from_secs(5)).await?;
+                executor
+                    .cancel_bounded(ticket, Duration::from_secs(5))
+                    .await?;
             } else {
                 let _ = tokio::time::timeout(
                     Duration::from_secs(5),
@@ -2544,17 +2576,44 @@ async fn execute_node_under_ceiling(
                 )
                 .await;
             }
-            Ok(deadline_exceeded_outcome(
-                &ticket.node_id,
-                now_ms().saturating_add(ceiling_ms),
-            ))
+            Ok(deadline_exceeded_outcome(&ticket.node_id, deadline_at_ms))
         }
     }
 }
 
+async fn run_after_commit_observed(
+    executor: &Arc<dyn NodeExecutor>,
+    ticket: &NodeExecutionTicket,
+) -> Result<(), NodeExecutorError> {
+    let started = std::time::Instant::now();
+    tracing::info!(
+        target: "cowd::graph_runner",
+        graph_id = ticket.graph_id,
+        node_id = ticket.node_id,
+        executor_kind = ticket.executor_kind,
+        attempt = ticket.attempt,
+        phase = "after_commit_started",
+        "node post-commit hook entered"
+    );
+    let result = executor.after_commit(ticket).await;
+    tracing::info!(
+        target: "cowd::graph_runner",
+        graph_id = ticket.graph_id,
+        node_id = ticket.node_id,
+        executor_kind = ticket.executor_kind,
+        attempt = ticket.attempt,
+        phase = "after_commit_finished",
+        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        failed = result.is_err(),
+        "node post-commit hook finished"
+    );
+    result
+}
+
 fn execution_deadline_at_ms(
     node: &harness_contract::execution_graph::ExecutionNodeSpec,
-) -> Result<Option<u64>, ExecutionRunnerError> {    if !matches!(
+) -> Result<Option<u64>, ExecutionRunnerError> {
+    if !matches!(
         node.kind,
         harness_contract::execution_graph::ExecutionNodeKind::AgentTask
     ) {
@@ -2823,8 +2882,8 @@ mod dependency_policy_tests {
     };
 
     use super::{
-        dependency_predecessors, dependency_target, quorum_tail_cancellations,
-        verified_predecessor_status, DependencyPredecessor,
+        DependencyPredecessor, dependency_predecessors, dependency_target,
+        quorum_tail_cancellations, verified_predecessor_status,
     };
 
     fn predecessor(status: ExecutionNodeStatus) -> DependencyPredecessor<'static> {

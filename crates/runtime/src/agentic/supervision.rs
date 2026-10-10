@@ -1,11 +1,11 @@
 use harness_contract::agent_action::{AgentActionEnvelope, ObjectiveCompleteRequestInput};
 use std::collections::BTreeSet;
 
+use super::AgentActionService;
 use super::program::{
     AgenticCompletionRequestProjection, AgenticProgramProjection, AgenticProgramStatus,
     AgenticTaskStatus,
 };
-use super::AgentActionService;
 
 pub(crate) fn completion_gap(
     projection: &AgenticProgramProjection,
@@ -468,10 +468,10 @@ mod tests {
         exploration.reviewed_by = None;
         projection.tasks.insert("optional".into(), exploration);
         let request = ObjectiveCompleteRequestInput {
-        blocked: false,
-        blocked_reason: None,
-        human_review_required: false,
-        recommended_next_actions: Vec::new(),
+            blocked: false,
+            blocked_reason: None,
+            human_review_required: false,
+            recommended_next_actions: Vec::new(),
             result_refs: vec!["tool://actual-effect".into()],
             evidence_refs: vec!["tool://effect-verification".into()],
             unresolved: vec![],
@@ -496,10 +496,10 @@ mod tests {
             completion_gap(
                 &projection,
                 &ObjectiveCompleteRequestInput {
-                blocked: false,
-                blocked_reason: None,
-                human_review_required: false,
-                recommended_next_actions: Vec::new(),
+                    blocked: false,
+                    blocked_reason: None,
+                    human_review_required: false,
+                    recommended_next_actions: Vec::new(),
                     result_refs: vec!["workspace://unregistered.md".to_string()],
                     evidence_refs: vec!["tool://verified".to_string()],
                     unresolved: Vec::new(),
@@ -632,10 +632,10 @@ mod tests {
             },
         );
         let request = ObjectiveCompleteRequestInput {
-        blocked: false,
-        blocked_reason: None,
-        human_review_required: false,
-        recommended_next_actions: Vec::new(),
+            blocked: false,
+            blocked_reason: None,
+            human_review_required: false,
+            recommended_next_actions: Vec::new(),
             result_refs: vec!["artifact:final".to_string()],
             evidence_refs: vec!["tool://verified".to_string()],
             unresolved: Vec::new(),
@@ -727,10 +727,10 @@ mod tests {
             completion_gap(
                 &projection,
                 &ObjectiveCompleteRequestInput {
-                blocked: false,
-                blocked_reason: None,
-                human_review_required: false,
-                recommended_next_actions: Vec::new(),
+                    blocked: false,
+                    blocked_reason: None,
+                    human_review_required: false,
+                    recommended_next_actions: Vec::new(),
                     result_refs: vec!["artifact:final".to_string()],
                     evidence_refs: vec!["tool://verified".to_string()],
                     unresolved: Vec::new(),

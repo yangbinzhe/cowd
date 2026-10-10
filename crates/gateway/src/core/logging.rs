@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime};
 
 pub(crate) fn init_logging(version: &str) -> bool {
     use tracing_appender::rolling;
-    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+    use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
     let log_dir = runtime::cowd_dirs::config_home_dir().join("logs");
     let _ = std::fs::create_dir_all(&log_dir);
@@ -16,7 +16,11 @@ pub(crate) fn init_logging(version: &str) -> bool {
         // logging in database and network dependencies.
         "info,gateway=debug"
     } else {
-        "warn,gateway=info"
+        // These bounded Runtime phase markers are needed to locate the last
+        // awaited stage when a long-lived execution stalls in production.
+        // Keep the filter narrow: records carry correlation IDs and timings,
+        // never request/response text.
+        "warn,gateway=info,cowd::synthesize=info,cowd::terminal_provider=info,cowd::graph_runner=info"
     };
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
@@ -181,7 +185,7 @@ fn cleanup_cowd_logs(
 
 #[cfg(test)]
 mod tests {
-    use super::{cleanup_cowd_logs, init_logging, LogRetentionConfig};
+    use super::{LogRetentionConfig, cleanup_cowd_logs, init_logging};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};

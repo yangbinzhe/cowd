@@ -268,116 +268,118 @@ pub(crate) fn effect_review_snapshot(
     let mut terminal_calls = BTreeSet::new();
     let mut session_fence: Option<ExpectedStreamRevision> = None;
     if session_in_scope {
-    let revision = store
-        .stream_revision(&stream_id)
-        .map_err(|error| error.to_string())?;
-    let created_cursor = if let Some(goal) = goal {
-        store
-            .list_stream_after(&format!("goal:{}", goal.id), 0, 1, 1, 4 * 1024 * 1024)?
-            .into_iter()
-            .next()
-            .ok_or("effect review has no durable Goal genesis")?
-            .commit_cursor
-    } else {
-        0
-    };
-    let mut offset = 0;
-    loop {
-        let events = store.list_stream_page_desc(&stream_id, 64, offset)?;
-        if events.is_empty() {
-            break;
-        }
-        offset += events.len();
-        let mut before_goal = false;
-        for event in events {
-            if event.sequence > revision {
-                continue;
+        let revision = store
+            .stream_revision(&stream_id)
+            .map_err(|error| error.to_string())?;
+        let created_cursor = if let Some(goal) = goal {
+            store
+                .list_stream_after(&format!("goal:{}", goal.id), 0, 1, 1, 4 * 1024 * 1024)?
+                .into_iter()
+                .next()
+                .ok_or("effect review has no durable Goal genesis")?
+                .commit_cursor
+        } else {
+            0
+        };
+        let mut offset = 0;
+        loop {
+            let events = store.list_stream_page_desc(&stream_id, 64, offset)?;
+            if events.is_empty() {
+                break;
             }
-            if event.commit_cursor < created_cursor {
-                before_goal = true;
-                continue;
-            }
-            if event.actor.as_deref() != Some("conversation_runtime") {
-                continue;
-            }
-            if matches!(
-                event.kind.as_str(),
-                "tool.invocation.completed" | "tool.invocation.failed" | "tool.invocation.denied"
-            ) {
-                if let (Some(plan), Some(call)) = (
-                    event.payload["governed_plan_id"].as_str(),
-                    event.payload["tool_call_id"].as_str(),
-                ) {
-                    terminal_calls.insert((plan.to_string(), call.to_string()));
+            offset += events.len();
+            let mut before_goal = false;
+            for event in events {
+                if event.sequence > revision {
+                    continue;
                 }
-            }
-            if event.kind == "tool.execution_plan.created" {
-                if let (Some(plan), Some(tasks)) = (
-                    event.payload["plan_id"].as_str(),
-                    event.payload["tasks"].as_array(),
+                if event.commit_cursor < created_cursor {
+                    before_goal = true;
+                    continue;
+                }
+                if event.actor.as_deref() != Some("conversation_runtime") {
+                    continue;
+                }
+                if matches!(
+                    event.kind.as_str(),
+                    "tool.invocation.completed"
+                        | "tool.invocation.failed"
+                        | "tool.invocation.denied"
                 ) {
-                    for task in tasks {
-                        if !task["tool_name"].as_str().is_some_and(goal_metadata_tool)
-                            && serde_json::from_value::<ToolEffectKind>(
-                                task["effect"]["effect_kind"].clone(),
-                            )
-                            .ok()
-                                != Some(ToolEffectKind::Read)
-                        {
-                            if let Some(call) = task["tool_call_id"].as_str() {
-                                planned_effects.insert((plan.to_string(), call.to_string()));
+                    if let (Some(plan), Some(call)) = (
+                        event.payload["governed_plan_id"].as_str(),
+                        event.payload["tool_call_id"].as_str(),
+                    ) {
+                        terminal_calls.insert((plan.to_string(), call.to_string()));
+                    }
+                }
+                if event.kind == "tool.execution_plan.created" {
+                    if let (Some(plan), Some(tasks)) = (
+                        event.payload["plan_id"].as_str(),
+                        event.payload["tasks"].as_array(),
+                    ) {
+                        for task in tasks {
+                            if !task["tool_name"].as_str().is_some_and(goal_metadata_tool)
+                                && serde_json::from_value::<ToolEffectKind>(
+                                    task["effect"]["effect_kind"].clone(),
+                                )
+                                .ok()
+                                    != Some(ToolEffectKind::Read)
+                            {
+                                if let Some(call) = task["tool_call_id"].as_str() {
+                                    planned_effects.insert((plan.to_string(), call.to_string()));
+                                }
                             }
                         }
                     }
                 }
-            }
-            let relevant = if event.kind == "tool.execution_plan.created" {
-                event.payload["tasks"].as_array().is_none_or(|tasks| {
-                    tasks.iter().any(|task| {
-                        !task["tool_name"].as_str().is_some_and(goal_metadata_tool)
-                            && serde_json::from_value::<ToolEffectKind>(
-                                task["effect"]["effect_kind"].clone(),
-                            )
-                            .ok()
-                                != Some(ToolEffectKind::Read)
+                let relevant = if event.kind == "tool.execution_plan.created" {
+                    event.payload["tasks"].as_array().is_none_or(|tasks| {
+                        tasks.iter().any(|task| {
+                            !task["tool_name"].as_str().is_some_and(goal_metadata_tool)
+                                && serde_json::from_value::<ToolEffectKind>(
+                                    task["effect"]["effect_kind"].clone(),
+                                )
+                                .ok()
+                                    != Some(ToolEffectKind::Read)
+                        })
                     })
-                })
-            } else if event.kind.starts_with("tool.invocation.") {
-                !event.payload["tool_name"]
-                    .as_str()
-                    .is_some_and(goal_metadata_tool)
-                    && !super::results::tool_effect_from_store(store, &event)?
-                        .is_some_and(|effect| effect.effect_kind == ToolEffectKind::Read)
-            } else {
-                false
-            };
-            if relevant {
-                last_effect_cursor = last_effect_cursor.max(event.commit_cursor);
-                digest.update(event.event_id.as_bytes());
-                digest.update(event.payload.to_string().as_bytes());
+                } else if event.kind.starts_with("tool.invocation.") {
+                    !event.payload["tool_name"]
+                        .as_str()
+                        .is_some_and(goal_metadata_tool)
+                        && !super::results::tool_effect_from_store(store, &event)?
+                            .is_some_and(|effect| effect.effect_kind == ToolEffectKind::Read)
+                } else {
+                    false
+                };
+                if relevant {
+                    last_effect_cursor = last_effect_cursor.max(event.commit_cursor);
+                    digest.update(event.event_id.as_bytes());
+                    digest.update(event.payload.to_string().as_bytes());
+                }
+            }
+            if before_goal {
+                break;
             }
         }
-        if before_goal {
-            break;
+        if store
+            .stream_revision(&stream_id)
+            .map_err(|error| error.to_string())?
+            != revision
+        {
+            return Err("effect review source changed; retry current effects".into());
         }
-    }
-    if store
-        .stream_revision(&stream_id)
-        .map_err(|error| error.to_string())?
-        != revision
-    {
-        return Err("effect review source changed; retry current effects".into());
-    }
-    if !planned_effects.is_subset(&terminal_calls) {
-        return Err(
+        if !planned_effects.is_subset(&terminal_calls) {
+            return Err(
             "effect_review_pending: admitted writes must settle before current target verification"
                 .into(),
         );
-    }
-    session_fence = Some(ExpectedStreamRevision {
-        stream_id: stream_id.clone(),
-        expected_revision: revision,
-    });
+        }
+        session_fence = Some(ExpectedStreamRevision {
+            stream_id: stream_id.clone(),
+            expected_revision: revision,
+        });
     }
     let mut additional_sources = Vec::new();
     for source in effect_sources.iter().collect::<BTreeSet<_>>() {

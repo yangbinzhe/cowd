@@ -1,5 +1,44 @@
 use super::*;
 
+#[test]
+fn agentic_progress_counts_unique_structured_action_events() {
+    let event = |cursor, action| {
+        json!({
+            "kind": "agentic.action_applied",
+            "commit_cursor": cursor,
+            "payload": {"envelope": {"action": {"kind": action}}}
+        })
+    };
+    let team = event(1, "team_create");
+    let timeline = json!({"events": [
+        team.clone(),
+        team,
+        event(2, "task_publish"),
+        event(3, "task_publish"),
+        event(4, "task_publish"),
+        event(5, "task_submit"),
+        event(6, "task_submit"),
+        event(7, "task_submit"),
+        event(8, "task_review"),
+        event(9, "task_review"),
+        event(10, "task_review"),
+        event(11, "objective_complete_request"),
+        {"kind": "context.provider_request_packed", "payload": {"text": "team_create task_publish"}}
+    ]});
+
+    assert_eq!(
+        LiveScenarioRunner::agentic_progress_from_timeline(&timeline),
+        json!({
+            "teams_created": 1,
+            "tasks_published": 3,
+            "tasks_submitted": 3,
+            "tasks_reviewed": 3,
+            "objective_complete_requested": true,
+            "remaining": []
+        })
+    );
+}
+
 fn successful_root_outcome_timeline(mut timeline: Value) -> Value {
     let event = json!({
         "kind": "runtime.outcome.recorded.v1",
@@ -34,6 +73,67 @@ fn completed_tool_event() -> Value {
             "is_error": false
         }
     })
+}
+
+#[test]
+fn live_acceptance_requires_execution_terminal_durable_response_and_goal_success() {
+    let timeline = successful_root_outcome_timeline(json!({}));
+    let acceptance = LiveAcceptance::Contains("56").evaluate("56", &timeline, &[], None, "root");
+    let finalized = finalize_live_acceptance(acceptance, &timeline, "root");
+    assert!(finalized.passed);
+    assert_eq!(
+        finalized
+            .checks
+            .iter()
+            .find(|check| check["name"] == "durable_response")
+            .unwrap()["passed"],
+        true
+    );
+    assert_eq!(
+        finalized
+            .checks
+            .iter()
+            .find(|check| check["name"] == "run_reached_terminal_state")
+            .unwrap()["passed"],
+        true
+    );
+    assert_eq!(
+        finalized
+            .checks
+            .iter()
+            .find(|check| check["name"] == "root_business_outcome_succeeded")
+            .unwrap()["passed"],
+        true
+    );
+}
+
+#[test]
+fn live_acceptance_cannot_pass_when_durable_response_evidence_is_missing() {
+    let timeline = successful_root_outcome_timeline(json!({}));
+    let acceptance = LiveAcceptanceResult {
+        passed: true,
+        checks: vec![json!({"name": "response_contains", "passed": true})],
+        quality: None,
+    };
+    let finalized = finalize_live_acceptance(acceptance, &timeline, "root");
+    assert!(!finalized.passed);
+    assert_eq!(
+        finalized
+            .checks
+            .iter()
+            .find(|check| check["name"] == "durable_response")
+            .unwrap()["passed"],
+        false
+    );
+    assert_eq!(
+        finalized
+            .checks
+            .iter()
+            .find(|check| check["name"] == "run_reached_terminal_state")
+            .unwrap()["passed"],
+        true,
+        "execution terminal must be reported independently from delivery evidence"
+    );
 }
 
 fn tool_acceptance() -> LiveAcceptance {
@@ -77,9 +177,11 @@ fn autonomous_deepseek_template_is_frozen_and_complete() {
     assert!(template.prompt_template.contains("{minimum_agents}"));
     assert!(template.prompt_template.contains("{minimum_tasks}"));
     assert!(template.prompt_template.contains("task_supersede"));
-    assert!(template
-        .prompt_template
-        .contains("objective_complete_request"));
+    assert!(
+        template
+            .prompt_template
+            .contains("objective_complete_request")
+    );
     assert!(!template.prompt_template.contains("Team A"));
     assert!(!template.prompt_template.contains("恰好"));
 }
@@ -187,8 +289,7 @@ fn release_certification_requires_every_registered_core_scenario() {
     let incomplete = complete
         .into_iter()
         .filter(|scenario| {
-            scenario.get("scenario_id").and_then(Value::as_str)
-                != Some(EXPLICIT_TEAM_SCENARIO_ID)
+            scenario.get("scenario_id").and_then(Value::as_str) != Some(EXPLICIT_TEAM_SCENARIO_ID)
         })
         .collect::<Vec<_>>();
     assert!(!release_certification_scenarios_present(&incomplete));
@@ -234,9 +335,11 @@ fn live_prompt_uses_an_optional_advisory_provider_token_telemetry_lease() {
         ])
     );
     assert_eq!(control["max_total_tokens"], 5_000_000);
-    assert!(control["budget_lease_id"]
-        .as_str()
-        .is_some_and(|id| id.starts_with("live-scenario:live_group_theory")));
+    assert!(
+        control["budget_lease_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("live-scenario:live_group_theory"))
+    );
     assert_eq!(prompt, "complete the research");
 
     let tool_controlled =
@@ -613,20 +716,29 @@ fn architecture_quality_uses_durable_runtime_evidence_not_response_language() {
 fn large_scale_presentation_gate_rejects_old_concatenated_terminal() {
     let old = "team-runtime: # Verified Team evidence bundle\nRuntime delivery facts: 2/2\n[truncated]\n并发波次、关键瓶颈、失效模式、容量边界、扩大规模：Op";
     let checks = large_scale_presentation_checks(old);
-    assert!(checks
-        .iter()
-        .any(|check| check["name"] == "presentation_transport_clean" && check["passed"] == false));
-    assert!(checks
-        .iter()
-        .any(|check| check["name"] == "presentation_complete_ending" && check["passed"] == false));
+    assert!(
+        checks.iter().any(
+            |check| check["name"] == "presentation_transport_clean" && check["passed"] == false
+        )
+    );
+    assert!(
+        checks.iter().any(
+            |check| check["name"] == "presentation_complete_ending" && check["passed"] == false
+        )
+    );
 }
 
 #[test]
 fn large_scale_presentation_gate_accepts_complete_synthesized_terminal() {
-    let response = format!("## 已验证事实\n{}\n\n12/12 目标源码已完整读取到 EOF。\n12/12 目标源码已由两个不同 Agent 身份独立完整读取到 EOF。\n\n## 源码推断\n边界推断。\n\n## 未执行的模拟\n本次未执行模拟。\n\n## 并发波次、关键瓶颈、失效模式、容量边界与扩容结论\n\n判定：适合在当前单节点边界内继续扩大协作规模，但横向扩展必须先完成持久层分片。", LARGE_SCALE_SOURCE_PATHS[..6].join(" "));
-    assert!(large_scale_presentation_checks(&response)
-        .iter()
-        .all(|check| check["passed"] == true));
+    let response = format!(
+        "## 已验证事实\n{}\n\n12/12 目标源码已完整读取到 EOF。\n12/12 目标源码已由两个不同 Agent 身份独立完整读取到 EOF。\n\n## 源码推断\n边界推断。\n\n## 未执行的模拟\n本次未执行模拟。\n\n## 并发波次、关键瓶颈、失效模式、容量边界与扩容结论\n\n判定：适合在当前单节点边界内继续扩大协作规模，但横向扩展必须先完成持久层分片。",
+        LARGE_SCALE_SOURCE_PATHS[..6].join(" ")
+    );
+    assert!(
+        large_scale_presentation_checks(&response)
+            .iter()
+            .all(|check| check["passed"] == true)
+    );
 }
 
 #[test]
@@ -775,21 +887,25 @@ fn independent_source_review_gate_requires_distinct_role_receipts_for_every_targ
         .enumerate()
         .map(|(index, path)| receipt(path, index as u64 + 1, "investigator"))
         .collect::<Vec<_>>();
-    assert!(independently_reviewed_complete_source_receipt_paths(
-        &json!({"observed_acceptance": {"observed_evidence": investigator_only}}),
-        &[],
-    )
-    .is_empty());
+    assert!(
+        independently_reviewed_complete_source_receipt_paths(
+            &json!({"observed_acceptance": {"observed_evidence": investigator_only}}),
+            &[],
+        )
+        .is_empty()
+    );
     assert_eq!(
-            receipt_agent_identity(
-                "agent-tool:team-graph:program:team-a:0:role-a5684f8888daf18c:1:1:2:read_file:digest:read-receipt"
-            ),
-            Some("agent-tool:team-graph:program:team-a:0:role-a5684f8888daf18c")
-        );
-    assert!(receipt_agent_identity(
-        "agent-tool:graph:role-a5684f8888daf18c:not-a-slot:1:2:read_file:receipt"
-    )
-    .is_none());
+        receipt_agent_identity(
+            "agent-tool:team-graph:program:team-a:0:role-a5684f8888daf18c:1:1:2:read_file:digest:read-receipt"
+        ),
+        Some("agent-tool:team-graph:program:team-a:0:role-a5684f8888daf18c")
+    );
+    assert!(
+        receipt_agent_identity(
+            "agent-tool:graph:role-a5684f8888daf18c:not-a-slot:1:2:read_file:receipt"
+        )
+        .is_none()
+    );
 
     let duplicate_reads_from_one_agent = LARGE_SCALE_SOURCE_PATHS
         .iter()
@@ -801,11 +917,13 @@ fn independent_source_review_gate_requires_distinct_role_receipts_for_every_targ
             ]
         })
         .collect::<Vec<_>>();
-    assert!(independently_reviewed_complete_source_receipt_paths(
-        &json!({"observed_acceptance": {"observed_evidence": duplicate_reads_from_one_agent}}),
-        &[],
-    )
-    .is_empty());
+    assert!(
+        independently_reviewed_complete_source_receipt_paths(
+            &json!({"observed_acceptance": {"observed_evidence": duplicate_reads_from_one_agent}}),
+            &[],
+        )
+        .is_empty()
+    );
 }
 
 #[test]
@@ -844,12 +962,14 @@ fn group_theory_gate_requires_exact_reads_from_the_unique_sink_team() {
     let program = agentic_program_projection("verified", true);
     let terminal = terminal_semantic_team_ids(&program);
     assert_eq!(terminal, BTreeSet::from(["team-synthesis".to_string()]));
-    assert!(complete_exact_source_receipt_paths_for_semantic_teams(
-        &observed("team-research"),
-        &[],
-        &terminal,
-    )
-    .is_empty());
+    assert!(
+        complete_exact_source_receipt_paths_for_semantic_teams(
+            &observed("team-research"),
+            &[],
+            &terminal,
+        )
+        .is_empty()
+    );
     assert_eq!(
         complete_exact_source_receipt_paths_for_semantic_teams(
             &observed("team-synthesis"),
@@ -884,11 +1004,10 @@ fn source_receipt_gate_rejects_acquisition_receipts_not_promoted_to_agent_accept
         }
     });
 
-    assert!(complete_exact_source_receipt_paths(
-        &json!({"durable_tool_receipts": [raw_receipt]}),
-        &[],
-    )
-    .is_empty());
+    assert!(
+        complete_exact_source_receipt_paths(&json!({"durable_tool_receipts": [raw_receipt]}), &[],)
+            .is_empty()
+    );
 }
 
 #[test]
@@ -945,18 +1064,22 @@ fn team_acceptance_waits_for_running_descendant_work() {
         completion_health.has_pending_work(),
         "supervisor verdict remains a live Program transition"
     );
-    assert!(LiveAcceptance::ArchitectureQuality {
-        minimum_teams: 1,
-        minimum_claimed_cross_team_edges: 0,
-        evidence_profile: ArchitectureEvidenceProfile::Basic,
-    }
-    .requires_descendant_team_closure());
-    assert!(!LiveAcceptance::ArchitectureQuality {
-        minimum_teams: 0,
-        minimum_claimed_cross_team_edges: 0,
-        evidence_profile: ArchitectureEvidenceProfile::Basic,
-    }
-    .requires_descendant_team_closure());
+    assert!(
+        LiveAcceptance::ArchitectureQuality {
+            minimum_teams: 1,
+            minimum_claimed_cross_team_edges: 0,
+            evidence_profile: ArchitectureEvidenceProfile::Basic,
+        }
+        .requires_descendant_team_closure()
+    );
+    assert!(
+        !LiveAcceptance::ArchitectureQuality {
+            minimum_teams: 0,
+            minimum_claimed_cross_team_edges: 0,
+            evidence_profile: ArchitectureEvidenceProfile::Basic,
+        }
+        .requires_descendant_team_closure()
+    );
 }
 
 #[test]
@@ -1540,18 +1663,25 @@ fn a_failed_scenario_still_reports_its_provider_rounds() {
         diagnostics,
     );
 
-    let metrics = scenario.get("metrics").expect("a failed scenario has metrics");
+    let metrics = scenario
+        .get("metrics")
+        .expect("a failed scenario has metrics");
     assert_eq!(
         metrics.get("model_rounds").and_then(Value::as_u64),
         Some(attempts as u64),
         "one model round per completed provider attempt, counted for a failed scenario too"
     );
     assert_eq!(
-        metrics.get("provider_attempt_count").and_then(Value::as_u64),
+        metrics
+            .get("provider_attempt_count")
+            .and_then(Value::as_u64),
         Some(attempts as u64),
     );
     assert_eq!(metrics.get("tool_calls").and_then(Value::as_u64), Some(0));
-    assert_eq!(scenario.get("status").and_then(Value::as_str), Some("failed"));
+    assert_eq!(
+        scenario.get("status").and_then(Value::as_str),
+        Some("failed")
+    );
 }
 
 /// A transient tool failure inside a retried agent is not a failed agent graph.

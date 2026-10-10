@@ -126,7 +126,7 @@ async fn heartbeat_waits_for_the_agents_real_claim_and_stops_at_graph_terminal()
             }),
         ))
         .expect("real Agent claim");
-    assert_eq!(
+    assert!(matches!(
         agentic_claim_heartbeat_state(
             Arc::downgrade(services.as_ref()),
             &task,
@@ -134,8 +134,8 @@ async fn heartbeat_waits_for_the_agents_real_claim_and_stops_at_graph_terminal()
             &actor,
         )
         .await,
-        AgenticClaimDriverState::Owned
-    );
+        AgenticClaimDriverState::Owned { .. }
+    ));
 
     let graph = services
         .graph_state_store()
@@ -552,17 +552,21 @@ async fn exercise_reviewed_goal_delivery(
     assert!(packet.objective.contains("task_claim"));
     assert!(packet.objective.contains("未领取不得提交"));
     assert!(packet.objective.contains("Current work directory"));
-    assert!(packet
-        .objective
-        .contains(&format!("\"scope_ref\":\"{task_ref}\"")));
+    assert!(
+        packet
+            .objective
+            .contains(&format!("\"scope_ref\":\"{task_ref}\""))
+    );
     assert!(packet.objective.contains("one result owner"));
     assert!(!shared_prefix.contains("Current work directory"));
     assert!(packet.required_acceptance.evidence_obligations.is_empty());
     assert!(packet.objective.contains("read:crates/runtime/Cargo.toml"));
     assert!(packet.objective.contains("orientation only"));
-    assert!(!packet
-        .objective
-        .contains("already committed this exact work"));
+    assert!(
+        !packet
+            .objective
+            .contains("already committed this exact work")
+    );
     let lineage = graph.lineage.as_ref().expect("child lineage");
     assert_eq!(lineage.root_task_id, "task-root-dispatch");
     assert_eq!(lineage.task_id, receipts[0].task_ref);
@@ -604,9 +608,11 @@ async fn exercise_reviewed_goal_delivery(
         ]
     );
     assert!(binding.skill_refs.is_empty());
-    assert!(binding
-        .tool_contract_refs
-        .contains(&"state_inspect".to_string()));
+    assert!(
+        binding
+            .tool_contract_refs
+            .contains(&"state_inspect".to_string())
+    );
     let display = binding.display.expect("display");
     assert_eq!(display.label, "Researcher");
     assert_eq!(display.focus_label.as_deref(), Some("Evidence review"));
@@ -700,20 +706,22 @@ async fn exercise_reviewed_goal_delivery(
         .nonterminal_graph_ids_async()
         .await
         .expect("active graphs");
-    assert!(services
-        .dispatch_agentic_followups(
-            &inspect,
-            AgenticDispatchContext {
-                session_id: "session-dispatch".to_string(),
-                turn_id: "turn-dispatch".to_string(),
-                model_lease: "default".to_string(),
-                permission_ceiling: PermissionMode::ReadOnly,
-                resource_scopes: Vec::new(),
-            },
-        )
-        .await
-        .expect("pure inspection")
-        .is_empty());
+    assert!(
+        services
+            .dispatch_agentic_followups(
+                &inspect,
+                AgenticDispatchContext {
+                    session_id: "session-dispatch".to_string(),
+                    turn_id: "turn-dispatch".to_string(),
+                    model_lease: "default".to_string(),
+                    permission_ceiling: PermissionMode::ReadOnly,
+                    resource_scopes: Vec::new(),
+                },
+            )
+            .await
+            .expect("pure inspection")
+            .is_empty()
+    );
     assert_eq!(
         services
             .graph_state_store()
@@ -1030,10 +1038,12 @@ async fn exercise_reviewed_goal_delivery(
             AgenticTaskStatus::Withdrawn
         );
         assert!(current.tasks[&task_ref].active_attempts.is_empty());
-        assert!(producer_hold
-            .unwrap()
-            .cancelled
-            .load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            producer_hold
+                .unwrap()
+                .cancelled
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
         assert_eq!(
             services.event_store().stream_revision(&index).unwrap(),
             revision,
@@ -1179,11 +1189,13 @@ async fn exercise_reviewed_goal_delivery(
             evidence_refs: vec![content.selector.clone()],
         }),
     };
-    assert!(services
-        .submit_agent_action(&review_envelope)
-        .await
-        .unwrap_err()
-        .contains("review_requires_current_physical_reads"));
+    assert!(
+        services
+            .submit_agent_action(&review_envelope)
+            .await
+            .unwrap_err()
+            .contains("review_requires_current_physical_reads")
+    );
     let review_packet = serde_json::from_str(&review_graph.nodes[0].payload_ref).unwrap();
     let bridge = crate::agent_in_process_worker::ProcessJsonlToolSession::prepare(
         &services,
@@ -1209,27 +1221,31 @@ async fn exercise_reviewed_goal_delivery(
         .get_mut(&task_ref)
         .unwrap()
         .review_generation += 1;
-    assert!(services
-        .independent_result_review(
-            &review_envelope.actor,
-            &newer_generation,
-            &[artifact.clone()],
-            None,
-        )
-        .await
-        .err()
-        .unwrap()
-        .contains("attempt is stale"));
+    assert!(
+        services
+            .independent_result_review(
+                &review_envelope.actor,
+                &newer_generation,
+                &[artifact.clone()],
+                None,
+            )
+            .await
+            .err()
+            .unwrap()
+            .contains("attempt is stale")
+    );
     let mut stolen_run = review_envelope.clone();
     stolen_run.action_id = "review-with-producer-run".into();
     stolen_run.actor.execution_id = actor.execution_id.clone();
     assert!(services.submit_agent_action(&stolen_run).await.is_err());
     if delegated_effect {
-        assert!(services
-            .submit_agent_action(&review_envelope)
-            .await
-            .unwrap_err()
-            .contains("review_requires_effect_observation"));
+        assert!(
+            services
+                .submit_agent_action(&review_envelope)
+                .await
+                .unwrap_err()
+                .contains("review_requires_effect_observation")
+        );
         std::fs::write(
             services.workspace_root().join("unrelated-review.txt"),
             "unrelated",
@@ -1243,11 +1259,13 @@ async fn exercise_reviewed_goal_delivery(
             )
             .await
             .unwrap();
-        assert!(services
-            .submit_agent_action(&review_envelope)
-            .await
-            .unwrap_err()
-            .contains("review_requires_effect_observation"));
+        assert!(
+            services
+                .submit_agent_action(&review_envelope)
+                .await
+                .unwrap_err()
+                .contains("review_requires_effect_observation")
+        );
         bridge
             .execute_tool(
                 "actual-delegated-target",
@@ -1280,10 +1298,12 @@ async fn exercise_reviewed_goal_delivery(
         )
         .await
         .unwrap();
-    assert!(producer_hold
-        .unwrap()
-        .cancelled
-        .load(std::sync::atomic::Ordering::Acquire));
+    assert!(
+        producer_hold
+            .unwrap()
+            .cancelled
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
     if let Some(writer) = writer {
         let error = writer
             .execute_tool(
@@ -1380,10 +1400,10 @@ async fn exercise_reviewed_goal_delivery(
                 .apply(&bind_root(root(
                     id,
                     AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
-                    blocked: false,
-                    blocked_reason: None,
-                    human_review_required: false,
-                    recommended_next_actions: Vec::new(),
+                        blocked: false,
+                        blocked_reason: None,
+                        human_review_required: false,
+                        recommended_next_actions: Vec::new(),
                         result_refs: vec![artifact.clone()],
                         evidence_refs: vec![content.selector.clone()],
                         unresolved: vec![],
@@ -1444,10 +1464,10 @@ async fn exercise_reviewed_goal_delivery(
             "before-original-review",
             AgentAction::ObjectiveCompleteRequest(
                 harness_contract::agent_action::ObjectiveCompleteRequestInput {
-                blocked: false,
-                blocked_reason: None,
-                human_review_required: false,
-                recommended_next_actions: Vec::new(),
+                    blocked: false,
+                    blocked_reason: None,
+                    human_review_required: false,
+                    recommended_next_actions: Vec::new(),
                     result_refs: vec![artifact.clone()],
                     evidence_refs: vec![content.selector.clone()],
                     unresolved: vec![],
@@ -1473,13 +1493,15 @@ async fn exercise_reviewed_goal_delivery(
         gap.tasks[&task_ref].status,
         crate::AgenticTaskStatus::Accepted
     );
-    assert!(services
-        .goal_store()
-        .get("goal:root-agentic-execution")
-        .unwrap()
-        .unwrap()
-        .terminal
-        .is_none());
+    assert!(
+        services
+            .goal_store()
+            .get("goal:root-agentic-execution")
+            .unwrap()
+            .unwrap()
+            .terminal
+            .is_none()
+    );
     if with_effect {
         let (effect_ref, effect_runtime) =
             root_reads_generic_results(&services, read_host, &content.selector, true, true).await;
@@ -1650,11 +1672,13 @@ async fn exercise_reviewed_goal_delivery(
             )
             .await
             .unwrap();
-        assert!(services
-            .submit_agent_action(&check_effect)
-            .await
-            .unwrap_err()
-            .contains("review_requires_effect_observation"));
+        assert!(
+            services
+                .submit_agent_action(&check_effect)
+                .await
+                .unwrap_err()
+                .contains("review_requires_effect_observation")
+        );
         std::fs::write(
             services.workspace_root().join("unrelated-review.txt"),
             "unrelated contents",
@@ -1668,11 +1692,13 @@ async fn exercise_reviewed_goal_delivery(
             )
             .await
             .unwrap();
-        assert!(services
-            .submit_agent_action(&check_effect)
-            .await
-            .unwrap_err()
-            .contains("review_requires_effect_observation"));
+        assert!(
+            services
+                .submit_agent_action(&check_effect)
+                .await
+                .unwrap_err()
+                .contains("review_requires_effect_observation")
+        );
         reader
             .execute_tool(
                 "read-affected-file",
@@ -1732,11 +1758,13 @@ async fn exercise_reviewed_goal_delivery(
         )));
         let mut refreshed = check_effect.clone();
         refreshed.action_id = "effect-review-after-new-write".into();
-        assert!(services
-            .submit_agent_action(&refreshed)
-            .await
-            .unwrap_err()
-            .contains("review_requires_effect_observation"));
+        assert!(
+            services
+                .submit_agent_action(&refreshed)
+                .await
+                .unwrap_err()
+                .contains("review_requires_effect_observation")
+        );
         reader
             .execute_tool(
                 "reread-after-second-write",
@@ -1774,10 +1802,12 @@ async fn exercise_reviewed_goal_delivery(
         assert!(proof.effect_manifest_digest.is_some());
         assert_ne!(proof.effect_manifest_digest, prior_digest);
         assert_eq!(proof.reads.len(), 3);
-        assert!(proof
-            .reads
-            .iter()
-            .all(|read| read.result_kind == harness_contract::goal::GoalResultKind::ToolEffect));
+        assert!(
+            proof
+                .reads
+                .iter()
+                .all(|read| read.result_kind == harness_contract::goal::GoalResultKind::ToolEffect)
+        );
 
         let manifest = proof.work_manifest_digest.clone();
         let withdrawn = bind_root(root(
@@ -1808,9 +1838,11 @@ async fn exercise_reviewed_goal_delivery(
             drained.tasks[&work_receipt.changed_refs[0]].status,
             crate::AgenticTaskStatus::Withdrawn
         );
-        assert!(drained.tasks[&work_receipt.changed_refs[0]]
-            .active_attempts
-            .is_empty());
+        assert!(
+            drained.tasks[&work_receipt.changed_refs[0]]
+                .active_attempts
+                .is_empty()
+        );
         assert!(hold.cancelled.load(std::sync::atomic::Ordering::Acquire));
         assert_eq!(
             crate::agentic::review_evidence::work_manifest_digest(&drained),
@@ -1894,10 +1926,10 @@ async fn exercise_reviewed_goal_delivery(
             "experience-complete",
             AgentAction::ObjectiveCompleteRequest(
                 harness_contract::agent_action::ObjectiveCompleteRequestInput {
-                blocked: false,
-                blocked_reason: None,
-                human_review_required: false,
-                recommended_next_actions: Vec::new(),
+                    blocked: false,
+                    blocked_reason: None,
+                    human_review_required: false,
+                    recommended_next_actions: Vec::new(),
                     result_refs: vec![artifact],
                     evidence_refs: vec![content.selector],
                     unresolved: vec![],
@@ -1986,13 +2018,17 @@ async fn exercise_reviewed_goal_delivery(
         .expect("public experience read model");
     assert_eq!(episodes.len(), 1);
     assert!(episodes[0].is_pattern_eligible(), "{:#?}", episodes[0]);
-    assert!(episodes[0]
-        .resource_summary
-        .context_reservation_tokens
-        .is_none());
-    assert!(!serde_json::to_string(&episodes[0])
-        .unwrap()
-        .contains("Source-backed findings"));
+    assert!(
+        episodes[0]
+            .resource_summary
+            .context_reservation_tokens
+            .is_none()
+    );
+    assert!(
+        !serde_json::to_string(&episodes[0])
+            .unwrap()
+            .contains("Source-backed findings")
+    );
     assert!(
         services
             .collaboration_semantic_patterns(10)
@@ -2169,16 +2205,20 @@ async fn market_offer_prefers_available_member_and_exit_reconciles_busy_work() {
         second[0].agent_ref, volunteer,
         "an admitted but unclaimed opportunity is busy"
     );
-    assert!(services
-        .dispatch_agentic_followups(&publications[2], context.clone())
-        .await
-        .unwrap()
-        .is_empty());
-    assert!(services
-        .dispatch_agentic_followups(&offer, context.clone())
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        services
+            .dispatch_agentic_followups(&publications[2], context.clone())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        services
+            .dispatch_agentic_followups(&offer, context.clone())
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let mut occupied = root(
         "duplicate-member-dispatch",
         AgentAction::TaskAttemptDispatch(TaskAttemptDispatchInput {
@@ -2220,21 +2260,25 @@ async fn market_offer_prefers_available_member_and_exit_reconciles_busy_work() {
     assert_eq!(resumed.len(), 1);
     assert_eq!(resumed[0].task_ref, tasks[2]);
     assert_eq!(resumed[0].agent_ref, volunteer);
-    assert!(services
-        .dispatch_ready_agentic_work("program-dispatch")
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        services
+            .dispatch_ready_agentic_work("program-dispatch")
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let projection = actions.project("program-dispatch").unwrap();
     assert_eq!(
         projection.tasks[&tasks[0]].status,
         AgenticTaskStatus::Published
     );
     assert!(projection.tasks[&tasks[0]].active_attempts.is_empty());
-    assert!(projection
-        .tasks
-        .values()
-        .all(|task| task.claimant.is_none() && task.failed_attempts == 0));
+    assert!(
+        projection
+            .tasks
+            .values()
+            .all(|task| task.claimant.is_none() && task.failed_attempts == 0)
+    );
 }
 
 #[tokio::test]
@@ -2326,11 +2370,13 @@ async fn typed_decline_dispatches_next_member_once_and_exhaustion_stays_quiet() 
             .unwrap();
         assert_eq!(next.len(), usize::from(index == 0));
         assert!(actions.apply(&decline).unwrap().duplicate);
-        assert!(services
-            .dispatch_agentic_followups(&decline, context.clone())
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            services
+                .dispatch_agentic_followups(&decline, context.clone())
+                .await
+                .unwrap()
+                .is_empty()
+        );
         if let Some(next) = next.first() {
             receipt = next.clone();
         }
@@ -2339,17 +2385,17 @@ async fn typed_decline_dispatches_next_member_once_and_exhaustion_stays_quiet() 
     assert_eq!(projection.tasks[&task].status, AgenticTaskStatus::Published);
     assert_eq!(projection.tasks[&task].failed_attempts, 0);
     assert!(projection.tasks[&task].active_attempts.is_empty());
-    assert!(helpers::eligible_members(
-        &projection,
-        &projection.tasks[&task],
-        DispatchMode::Execute
-    )
-    .is_empty());
-    assert!(services
-        .recover_agentic_programs_on_startup()
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        helpers::eligible_members(&projection, &projection.tasks[&task], DispatchMode::Execute)
+            .is_empty()
+    );
+    assert!(
+        services
+            .recover_agentic_programs_on_startup()
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
         actions.project("program-dispatch").unwrap().revision,
         projection.revision
@@ -2469,17 +2515,19 @@ async fn dispatch_tries_admissible_members_without_duplicate_model_work() {
         .unwrap();
     assert_eq!(receipts.len(), 1);
     assert_eq!(receipts[0].agent_ref, valid);
-    assert!(services
-        .dispatch_agentic_task(
-            &projection,
-            &task,
-            DispatchMode::Execute,
-            &context,
-            &trigger
-        )
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        services
+            .dispatch_agentic_task(
+                &projection,
+                &task,
+                DispatchMode::Execute,
+                &context,
+                &trigger
+            )
+            .await
+            .unwrap()
+            .is_empty()
+    );
     // Publishing discussion alone must not launch an idle worker. A typed
     // request for a ready Task enters the existing dispatcher once.
     let followup_task = actions
@@ -3070,11 +3118,13 @@ async fn verify_startup_reconciliation(with_corrupt_program: bool) {
         )
         .expect("cancel root");
     for mode in [DispatchMode::Execute, DispatchMode::Review] {
-        assert!(services
-            .dispatch_agentic_task(&projection, &task_ref, mode, &context, &trigger,)
-            .await
-            .expect("terminal root is not an admission error")
-            .is_empty());
+        assert!(
+            services
+                .dispatch_agentic_task(&projection, &task_ref, mode, &context, &trigger,)
+                .await
+                .expect("terminal root is not an admission error")
+                .is_empty()
+        );
     }
 }
 
@@ -4235,13 +4285,15 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
             }),
         )
     };
-    assert!(services
-        .submit_agent_action(&review(
-            "missing-read",
-            vec![artifact.changed_refs[0].clone()]
-        ))
-        .await
-        .is_err());
+    assert!(
+        services
+            .submit_agent_action(&review(
+                "missing-read",
+                vec![artifact.changed_refs[0].clone()]
+            ))
+            .await
+            .is_err()
+    );
     let (raw, runtime) =
         root_reads_generic_results(&services, host, &content.selector, true, local_effect).await;
     let raw = raw.unwrap();
@@ -4312,10 +4364,12 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
                 },
             )
             .unwrap();
-        assert!(services
-            .approval_result_content("session-dispatch", &reference)
-            .await
-            .is_err());
+        assert!(
+            services
+                .approval_result_content("session-dispatch", &reference)
+                .await
+                .is_err()
+        );
         services
             .approval_queue()
             .decide_surface_human(
@@ -4334,10 +4388,12 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
                 },
             )
             .unwrap();
-        assert!(services
-            .approval_result_content("foreign-session", &reference)
-            .await
-            .is_err());
+        assert!(
+            services
+                .approval_result_content("foreign-session", &reference)
+                .await
+                .is_err()
+        );
         let (_, decided, _) = services
             .approval_result_content("session-dispatch", &reference)
             .await
@@ -4347,10 +4403,12 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
             "denial is an authentic result, not approval to execute"
         );
         references.push(reference.clone());
-        assert!(services
-            .submit_agent_action(&review("external-unread", references.clone()))
-            .await
-            .is_err());
+        assert!(
+            services
+                .submit_agent_action(&review("external-unread", references.clone()))
+                .await
+                .is_err()
+        );
         let activity = serde_json::from_value(serde_json::json!({
             "root_execution_id":"root-agentic-execution", "session_id":"session-dispatch", "turn_id":"turn-dispatch",
             "root_task_id":"task-root-dispatch", "task_id":"task-root-dispatch", "activity_id":"root-agentic-execution:model",
@@ -4380,11 +4438,13 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
         assert_eq!(read.failed, 0, "{:?}", read.messages);
     }
     if local_effect {
-        assert!(services
-            .submit_agent_action(&review("receipt-only", references.clone()))
-            .await
-            .unwrap_err()
-            .contains("review_requires_effect_observation"));
+        assert!(
+            services
+                .submit_agent_action(&review("receipt-only", references.clone()))
+                .await
+                .unwrap_err()
+                .contains("review_requires_effect_observation")
+        );
         std::fs::write(
             services.workspace_root().join("unrelated-review.txt"),
             "unrelated",
@@ -4398,11 +4458,13 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
             "",
         )
         .await;
-        assert!(services
-            .submit_agent_action(&review("wrong-target", references.clone()))
-            .await
-            .unwrap_err()
-            .contains("review_requires_effect_observation"));
+        assert!(
+            services
+                .submit_agent_action(&review("wrong-target", references.clone()))
+                .await
+                .unwrap_err()
+                .contains("review_requires_effect_observation")
+        );
         root_review_target_tool(
             &runtime,
             "root-current-local-target",
@@ -4431,10 +4493,12 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
         assert!(proof.reads.iter().any(
             |read| read.result_kind == harness_contract::goal::GoalResultKind::ExternalDecision
         ));
-        assert!(proof
-            .producer_execution_ids
-            .iter()
-            .any(|id| id.starts_with("approval-decision:")));
+        assert!(
+            proof
+                .producer_execution_ids
+                .iter()
+                .any(|id| id.starts_with("approval-decision:"))
+        );
     }
     if local_effect {
         assert!(
@@ -4454,10 +4518,10 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
             .submit_agent_action(&bind(
                 "stale-self-review-completion",
                 AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
-                blocked: false,
-                blocked_reason: None,
-                human_review_required: false,
-                recommended_next_actions: Vec::new(),
+                    blocked: false,
+                    blocked_reason: None,
+                    human_review_required: false,
+                    recommended_next_actions: Vec::new(),
                     result_refs: references.clone(),
                     evidence_refs: vec![content.selector.clone()],
                     unresolved: vec![],
@@ -4492,11 +4556,13 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
                 .status,
             crate::AgenticProgramStatus::Open
         );
-        assert!(services
-            .submit_agent_action(&review("stale-local-observation", references.clone()))
-            .await
-            .unwrap_err()
-            .contains("review_requires_effect_observation"));
+        assert!(
+            services
+                .submit_agent_action(&review("stale-local-observation", references.clone()))
+                .await
+                .unwrap_err()
+                .contains("review_requires_effect_observation")
+        );
         root_review_target_tool(
             &runtime,
             "root-current-local-target-again",
@@ -4549,11 +4615,13 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
         )
         .await
         .unwrap();
-    assert!(services
-        .submit_agent_action(&review("unpublished-result", vec![orphan.selector]))
-        .await
-        .unwrap_err()
-        .contains("Runtime-resolved producer"));
+    assert!(
+        services
+            .submit_agent_action(&review("unpublished-result", vec![orphan.selector]))
+            .await
+            .unwrap_err()
+            .contains("Runtime-resolved producer")
+    );
     let foreign = services
         .artifact_store()
         .write_bytes(
@@ -4567,19 +4635,21 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
         )
         .await
         .unwrap();
-    assert!(services
-        .submit_agent_action(&review("foreign-result", vec![foreign.selector]))
-        .await
-        .unwrap_err()
-        .contains("not readable"));
+    assert!(
+        services
+            .submit_agent_action(&review("foreign-result", vec![foreign.selector]))
+            .await
+            .unwrap_err()
+            .contains("not readable")
+    );
     let requested = services
         .submit_agent_action(&bind(
             "root-complete",
             AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
-            blocked: false,
-            blocked_reason: None,
-            human_review_required: false,
-            recommended_next_actions: Vec::new(),
+                blocked: false,
+                blocked_reason: None,
+                human_review_required: false,
+                recommended_next_actions: Vec::new(),
                 result_refs: references,
                 evidence_refs: vec![content.selector],
                 unresolved: vec![],
@@ -4618,10 +4688,12 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
             payload: serde_json::json!({}),
         })
         .unwrap();
-    assert!(services
-        .agent_action_service()
-        .commit_program_conclusion(&before, prepared)
-        .is_err());
+    assert!(
+        services
+            .agent_action_service()
+            .commit_program_conclusion(&before, prepared)
+            .is_err()
+    );
     assert_eq!(
         services
             .agent_action_service()
@@ -4630,13 +4702,15 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
             .revision,
         before.revision
     );
-    assert!(services
-        .goal_store()
-        .get("goal:root-agentic-execution")
-        .unwrap()
-        .unwrap()
-        .terminal
-        .is_none());
+    assert!(
+        services
+            .goal_store()
+            .get("goal:root-agentic-execution")
+            .unwrap()
+            .unwrap()
+            .terminal
+            .is_none()
+    );
     let supervisor =
         crate::execution_core::goal::ObjectiveSupervisor::new(Arc::clone(services.goal_store()));
     crate::agentic::supervision::reconcile_completion_request(
@@ -4719,13 +4793,15 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
             verifier_decision: None,
             diagnostic_code: None,
         });
-    assert!(crate::agentic::review_evidence::root_self_review_policy(
-        services.event_store(),
-        &final_program,
-        &independent_goal
-    )
-    .unwrap()
-    .is_none());
+    assert!(
+        crate::agentic::review_evidence::root_self_review_policy(
+            services.event_store(),
+            &final_program,
+            &independent_goal
+        )
+        .unwrap()
+        .is_none()
+    );
     let strategy = services
         .event_store()
         .list_stream("session:session-dispatch")

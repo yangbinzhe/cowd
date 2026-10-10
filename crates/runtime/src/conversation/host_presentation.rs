@@ -906,6 +906,22 @@ where
         &self,
         ticket: &NodeExecutionTicket,
     ) -> Result<NodeExecutionOutcome, String> {
+        let stage_started = std::time::Instant::now();
+        macro_rules! observe_stage {
+            ($stage:expr) => {
+                tracing::info!(
+                    target: "cowd::synthesize",
+                    graph_id = %ticket.graph_id,
+                    node_id = %ticket.node_id,
+                    ticket_digest = %sha256_digest(&ticket.idempotency_key),
+                    attempt = ticket.attempt,
+                    stage = $stage,
+                    elapsed_ms = u64::try_from(stage_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    "synthesize stage entered"
+                );
+            };
+        }
+        observe_stage!("inputs");
         let pending_inputs = self
             .runtime
             .lock()
@@ -984,6 +1000,7 @@ where
             return Ok(outcome);
         }
         // `Finalizing` is published only after the completion-gap decision.
+        observe_stage!("execution_projection");
         let projection = self
             .services
             .execution_supervisor()
@@ -1126,6 +1143,11 @@ where
                 .map(|(_, answer)| answer.as_str())
                 .unwrap_or("Execution ended without a qualified root answer candidate.");
             let collaboration_carrier = is_collaboration_evidence_carrier(raw);
+            observe_stage!(if collaboration_carrier {
+                "terminal_provider_collaboration"
+            } else {
+                "terminal_provider_failure_narration"
+            });
             let narrated = if collaboration_carrier {
                 self.terminal_collaboration_answer(
                     raw,
@@ -1243,6 +1265,7 @@ where
             }
             return Err("terminal_presentation_cancelled".to_string());
         }
+        observe_stage!("session_input_fence");
         let late_inputs = self
             .runtime
             .lock()
@@ -1288,6 +1311,7 @@ where
                 framework_authored: true,
             }));
         }
+        observe_stage!("terminal_state_preparation");
         let now_ms = crate::tool_invocation::now_ms();
         let presentation = execution_role.owns_root_presentation().then(|| {
             harness_contract::outcome::TerminalPresentation {
@@ -1374,9 +1398,17 @@ where
         // the collaboration is objectively complete (`completion_gap` gates it)
         // — so the verified Objective terminal exists and this presentation
         // defers to it instead of failing.
+        observe_stage!("completion_gap_and_objective_drive");
         if execution_role.owns_root_presentation()
             && completion == harness_contract::goal::GoalCompletion::Satisfied
         {
+            // First make any durable Program completion request visible to the
+            // authoritative GoalStore. The gap check must observe that verdict;
+            // checking first can miss a request that has not yet been reduced.
+            self.services
+                .drive_agentic_objective_completion(&session_id, &turn_id, &ticket.graph_id)
+                .await?;
+            observe_stage!("objective_completion_driven");
             // A success presentation while a real completion gap remains means the
             // root finished too early. Do not fail the turn: return the root to
             // continue (bounded) with the gap disclosed, so it can classify
@@ -1392,9 +1424,6 @@ where
                     if state.completion_gap_continuations < bound {
                         state.completion_gap_continuations =
                             state.completion_gap_continuations.saturating_add(1);
-                        // This turn is not finished, so every terminal fact
-                        // published above must be rolled back.
-                        self.abandon_published_terminal().await;
                         true
                     } else {
                         tracing::warn!(
@@ -1406,6 +1435,12 @@ where
                     }
                 };
                 if continue_gap {
+                    // This turn is not finished, so every terminal fact
+                    // published above must be rolled back. Do this after
+                    // releasing `state`: `abandon_published_terminal` acquires
+                    // the same mutex.
+                    self.abandon_published_terminal().await;
+                    observe_stage!("completion_gap_terminal_rollback");
                     // The continuation must be a real, tool-enabled model step
                     // that knows what to do (run t2 got neither).
                     self.push_completion_gap_guidance(ticket, &gap).await;
@@ -1432,10 +1467,83 @@ where
                     }));
                 }
             }
-            let _ = self
-                .services
-                .drive_agentic_objective_completion(&session_id, &turn_id, &ticket.graph_id)
-                .await;
+            // A success presentation while Program-owned rungs remain also
+            // means the root finished too early: every submitted Task still
+            // needs its independent review, and the objective-review Task is
+            // no exception. One live run finalized with
+            // `independent_task_review` outstanding and stalled into the
+            // inactivity watchdog. Return the root to coordinate that rung.
+            if let Some(program) = super::root_agentic_program_projection(
+                self.services.as_ref(),
+                &session_id,
+                &turn_id,
+            ) {
+                let outstanding = super::outstanding_closure_steps(&program)
+                    .into_iter()
+                    .filter(|step| step != "objective_complete_request")
+                    .collect::<Vec<_>>();
+                if !outstanding.is_empty() {
+                    let continue_rungs = {
+                        let mut state = self.state.lock().await;
+                        let bound = completion_gap_continuation_bound();
+                        if state.completion_gap_continuations < bound {
+                            state.completion_gap_continuations =
+                                state.completion_gap_continuations.saturating_add(1);
+                            true
+                        } else {
+                            tracing::warn!(
+                                ?outstanding,
+                                bound,
+                                "closure rung continuation bound reached; presenting the honest terminal instead of continuing"
+                            );
+                            false
+                        }
+                    };
+                    if continue_rungs {
+                        self.abandon_published_terminal().await;
+                        observe_stage!("closure_rung_terminal_rollback");
+                        let mut item = ContextItem::new(
+                            format!("closure-rung-continuation:{}", ticket.node_id),
+                            ContextSourceKind::Task,
+                            ContextRole::Instruction,
+                            format!(
+                                "Runtime returned this turn to work because the collaboration is not finished: outstanding rungs: {}. \
+                                 A submitted Task still needs its independent review by a different Agent, and the objective-review \
+                                 Task is no exception. Invite or assign a reviewer inside the existing Team (do not create another \
+                                 Team), have it read the submitted report through read_ref or evidence_retrieve and record its \
+                                 task_review verdict, then present the final answer again.",
+                                outstanding.join(", ")
+                            ),
+                        );
+                        item.authority = ContextAuthority::System;
+                        item.visibility = ContextVisibility::Private;
+                        item.evidence = vec![format!("execution_node:{}", ticket.node_id)];
+                        self.runtime.lock().await.push_next_model_context_item(item);
+                        let iteration = self.state.lock().await.iterations;
+                        let next = dynamic_node(
+                            ticket,
+                            iteration,
+                            "closure-rung-continuation",
+                            ExecutionNodeKind::InlineModel,
+                            "inline_model",
+                            "inline_model",
+                        );
+                        return Ok(NodeExecutionOutcome::new(completed_result(
+                            Some(format!("{}:closure-rung-continuation", ticket.graph_id)),
+                            ExecutionUsage::default(),
+                        ))
+                        .with_replan(ExecutionGraphReplan {
+                            nodes: vec![next.clone()],
+                            edges: dynamic_edges(&ticket.node_id, &[next]),
+                            reason: format!(
+                                "Program-owned rungs remain; continue working before presenting success: {}",
+                                outstanding.join(", ")
+                            ),
+                            framework_authored: true,
+                        }));
+                    }
+                }
+            }
         }
         // The turn is terminal from here on.
         self.publish_terminal_finalizing().await;
@@ -1486,6 +1594,7 @@ where
             .pending_controlled_recovery_claim_fingerprints =
             controlled_recovery_claim_fingerprints.clone();
         if let Some(ingress) = ingress {
+            observe_stage!("terminal_artifact_and_session_event");
             let presentation = presentation.as_ref().ok_or_else(|| {
                 "root Session ingress terminal is missing its presentation".to_string()
             })?;
@@ -1670,6 +1779,7 @@ where
                     schema_version: 1,
                 });
         }
+        observe_stage!("complete");
         Ok(outcome)
     }
 
@@ -1937,11 +2047,7 @@ where
     /// issues in prose and was never given the action that adjudicates them.
     /// And the one-shot terminal state has to be cleared, because the step that
     /// just finished was a zero-tool clean terminal synthesis.
-    async fn push_completion_gap_guidance(
-        &self,
-        ticket: &NodeExecutionTicket,
-        gap: &str,
-    ) {
+    async fn push_completion_gap_guidance(&self, ticket: &NodeExecutionTicket, gap: &str) {
         {
             let mut state = self.state.lock().await;
             state.clean_terminal_synthesis_next = false;
@@ -1952,24 +2058,52 @@ where
             format!("objective-completion-gap:{}", ticket.node_id),
             ContextSourceKind::Task,
             ContextRole::Instruction,
-            format!(
-                "Runtime returned this turn to work because the Objective is not complete yet: {gap}. \
-                 The final answer you just wrote is not being delivered. Resolve the gap with the Agent \
-                 actions you already have - for an unadjudicated issue, call `message_publish` with \
-                 `issue_dispositions` naming each `issue:` reference and a disposition of `must_resolve`, \
-                 `disclose` or `resolved`, each with a durable `reason_ref` and `evidence_refs` \
-                 (`artifact://`, `tool://`, `task:`, `issue:` or `program:`). `disclose` preserves a \
-                 labelled limitation without asserting an estimate is a measurement. Then present the \
-                 final answer again."
-            ),
+            if gap.contains("original_intent_review_required")
+                || gap.contains("criterion_review_required")
+            {
+                format!(
+                    "Runtime returned this turn to work because the Objective is not complete yet: {gap}. \
+                     The final answer you just wrote is not being delivered. This is an Objective-review \
+                     gap, not a Task-issue classification gap: preserve accepted work and do not repeat \
+                     Task reviews. If every current Agent produced one of the delivered result artifacts, \
+                     invite a fresh reviewer Agent inside the existing Team (do not create another Team) \
+                     and give it a narrowly scoped Objective-review Task. The reviewer must use read-only \
+                     tools such as `read_ref` to inspect each current delivered result and its durable \
+                     evidence, then call `objective_review` under its Runtime-bound Agent identity for the \
+                     exact open criterion with decision `satisfied`, `gap` or `blocked`, current \
+                     `result_refs`, evidence refs produced by those reads, and a durable `reason_ref`. \
+                     For a satisfied verdict, include every result ref in the active completion request \
+                     in one review. When the gap text above lists `uncovered_result_refs`, those are the \
+                     delivered result refs no current review covers yet: read each one with \
+                     `evidence_retrieve`, then submit exactly one `objective_review` whose `result_refs` \
+                     cover that full set, and re-request completion citing the same set - do not add \
+                     newly created review artifacts to the request. Do not resubmit completion or change accepted Tasks/results while \
+                     this review is pending unless the reviewer identifies a concrete flaw; if a review \
+                     attempt is rejected, follow its exact missing refs and `next_request` instructions \
+                     and use a different physical reviewer when Runtime requires one. \
+                     Runtime requires current review receipts from someone distinct from every result \
+                     producer; a prior Task review or prose assertion alone does not satisfy the original \
+                     user-intent criterion. Complete any acceptance review required for the new Task. \
+                     After the Goal projection confirms the criterion is current and satisfied, present the \
+                     final answer again."
+                )
+            } else {
+                format!(
+                    "Runtime returned this turn to work because the Objective is not complete yet: {gap}. \
+                     The final answer you just wrote is not being delivered. Resolve the gap with the Agent \
+                     actions you already have - for an unadjudicated issue, call `message_publish` with \
+                     `issue_dispositions` naming each `issue:` reference and a disposition of `must_resolve`, \
+                     `disclose` or `resolved`, each with a durable `reason_ref` and `evidence_refs` \
+                     (`artifact://`, `tool://`, `task:`, `issue:` or `program:`). `disclose` preserves a \
+                     labelled limitation without asserting an estimate is a measurement. Then present the \
+                     final answer again."
+                )
+            },
         );
         item.authority = ContextAuthority::System;
         item.visibility = ContextVisibility::Private;
         item.evidence = vec![format!("execution_node:{}", ticket.node_id)];
-        self.runtime
-            .lock()
-            .await
-            .push_next_model_context_item(item);
+        self.runtime.lock().await.push_next_model_context_item(item);
     }
 }
 
@@ -3223,11 +3357,7 @@ pub(super) fn tool_batch_coverage_keys(calls: &[ModelToolCall]) -> BTreeSet<Stri
 /// off prematurely, but must still converge before repeatedly rebuilding an
 /// ever-larger provider context from unchanged evidence.
 pub(super) const fn evidence_saturation_limit(bounded_evidence_role: bool) -> usize {
-    if bounded_evidence_role {
-        2
-    } else {
-        3
-    }
+    if bounded_evidence_role { 2 } else { 3 }
 }
 
 pub(super) fn focus_acceptance_is_met(
@@ -3495,11 +3625,9 @@ pub(super) fn graph_metadata_effect(
     // governed compiler.
     let normalized = tool_name.trim().replace('-', "_").to_ascii_lowercase();
     let effect_kind = match normalized.as_str() {
-        "read_file" | "tool_orchestrate" | "grep_search" | "grep_search" | "glob_search" | "tool_orchestrate"
-        | "workspace_snapshot" => ToolEffectKind::Read,
-        "edit" | "edit" | "edit" | "edit" => {
-            ToolEffectKind::Write
-        }
+        "read_file" | "tool_orchestrate" | "grep_search" | "grep_search" | "glob_search"
+        | "tool_orchestrate" | "workspace_snapshot" => ToolEffectKind::Read,
+        "edit" | "edit" | "edit" | "edit" => ToolEffectKind::Write,
         _ => return None,
     };
     let mut targets = Vec::new();

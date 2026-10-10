@@ -12,15 +12,16 @@ use crate::execution_core::{
     NodeExecutionTicket, NodeExecutorError,
 };
 use crate::{
-    model_context_window_with_overrides, permissions::SharedPrompter, AutoCompactionEvent,
-    ContentBlock, ContextAuthority, ContextEnvelope, ContextItem, ContextProfile, ContextRole,
-    ContextSourceKind, ContextVisibility, ConversationMessage, CowdEvent, CowdEventBus,
-    HookAbortSignal, HookProgressReporter, PermissionPolicy, ProviderRuntimeClient,
-    ProviderToolDefinition, ResumeContextPacket, RuntimeError, RuntimeFeatureConfig, Session,
-    SessionReadHead, ToolCallback, ToolExecutor, ToolFailureKind, ToolInvocationRecord,
-    TurnSummary,
+    AutoCompactionEvent, ContentBlock, ContextAuthority, ContextEnvelope, ContextItem,
+    ContextProfile, ContextRole, ContextSourceKind, ContextVisibility, ConversationMessage,
+    CowdEvent, CowdEventBus, HookAbortSignal, HookProgressReporter, PermissionPolicy,
+    ProviderRuntimeClient, ProviderToolDefinition, ResumeContextPacket, RuntimeError,
+    RuntimeFeatureConfig, Session, SessionReadHead, ToolCallback, ToolExecutor, ToolFailureKind,
+    ToolInvocationRecord, TurnSummary, model_context_window_with_overrides,
+    permissions::SharedPrompter,
 };
 use async_trait::async_trait;
+use harness_contract::MeasureProvenance;
 use harness_contract::execution_graph::{
     ExecutionEdge, ExecutionEdgeKind, ExecutionNodeKind, ExecutionNodeResult, ExecutionNodeSpec,
     ExecutionNodeStatus, ExecutionUsage,
@@ -37,7 +38,6 @@ use harness_contract::turn::{
     CollaborationContinuationBinding, ContinuationAuthorization, SessionInputEnvelope,
     SessionInputProjection, SessionInputReceipt, TurnId, TurnInboxSnapshot, TurnInputCheckpoint,
 };
-use harness_contract::MeasureProvenance;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -50,6 +50,12 @@ use host_presentation::*;
 mod host_route;
 
 const PROVIDER_PROTOCOL_RECOVERY_BUDGET: u8 = 1;
+/// A malformed tool-call frame is repairable by the model that emitted it, so
+/// one bounded repair continuation is allowed even after successful tool
+/// receipts. Without it, a single serialization slip late in a collaboration
+/// (one live run: a batch whose `actions` array was sent as a string) became a
+/// zero-tool terminal that discarded the model's in-flight plan.
+const PROVIDER_FRAME_REPAIR_BUDGET: u8 = 1;
 /// Presentation-only recovery reuses already verified receipts with tools
 /// disabled. Two local attempts are substantially cheaper than replaying a
 /// whole multi-Team Program when one provider response omits schema labels,
@@ -461,12 +467,14 @@ fn resolve_turn_continuation_binding(
                 return Ok(None);
             };
             let policy_revision = policy.revision;
-            let Some((candidate, candidate_revision)) = crate::session_continuation::latest_same_session_candidate(
-                services.event_store(),
-                session_id,
-                turn_ref,
-            )
-            .map_err(RuntimeError::new)? else {
+            let Some((candidate, candidate_revision)) =
+                crate::session_continuation::latest_same_session_candidate(
+                    services.event_store(),
+                    session_id,
+                    turn_ref,
+                )
+                .map_err(RuntimeError::new)?
+            else {
                 // A continuation hint is not permission to fabricate a
                 // source Team.  Fall back to the new, current objective so
                 // a stale conversational reference cannot fail a valid new
@@ -485,8 +493,13 @@ fn resolve_turn_continuation_binding(
                 policy_revision,
             )
             .map_err(RuntimeError::new)?;
-            crate::session_continuation::ensure_reauthorized(&binding, session_id, false, policy_revision)
-                .map_err(RuntimeError::new)?;
+            crate::session_continuation::ensure_reauthorized(
+                &binding,
+                session_id,
+                false,
+                policy_revision,
+            )
+            .map_err(RuntimeError::new)?;
             Ok(Some(binding))
         }
         CollaborationReference::ExplicitExecution | CollaborationReference::ExplicitTeamSet => {
@@ -567,9 +580,11 @@ fn continuation_goal_retains_original_intent_and_requires_fresh_verification() {
     assert_eq!(current.source_intent_ref, original.source_intent_ref);
     assert_eq!(current.spec_digest, original.spec_digest);
     assert_eq!(current.criteria[0].status, AcceptanceStatus::Open);
-    assert!(current.criteria[0]
-        .required_evidence
-        .contains(&"execution_graph:next".into()));
+    assert!(
+        current.criteria[0]
+            .required_evidence
+            .contains(&"execution_graph:next".into())
+    );
     assert_eq!(original.criteria[0].status, AcceptanceStatus::Satisfied);
 }
 
@@ -757,6 +772,7 @@ where
             committed_terminal_completion: None,
             last_verified_progress: false,
             consecutive_unverified_model_steps: 0,
+            closure_ready_steps: 0,
             collaboration_convergence_replans: 0,
             completion_gap_continuations: 0,
             started_at: std::time::Instant::now(),
@@ -770,6 +786,7 @@ where
             force_reasoning_effort_next_model: None,
             terminal_recovery_attempts: 0,
             provider_protocol_recovery_attempts: 0,
+            provider_frame_repair_attempts: 0,
             agentic_protocol_recovery_attempts: 0,
             agentic_program_context_revision: None,
             execution_role,
@@ -1953,9 +1970,11 @@ fn evaluation_turn_control(content: &str) -> Result<Option<EvaluationTurnControl
     match (&control.budget_lease_id, control.max_total_tokens) {
         (None, None) => {}
         (Some(lease_id), Some(limit)) if !lease_id.trim().is_empty() && limit > 0 => {}
-        _ => return Err(RuntimeError::new(
-            "evaluation provider token telemetry lease must provide both a non-empty id and a positive limit",
-        )),
+        _ => {
+            return Err(RuntimeError::new(
+                "evaluation provider token telemetry lease must provide both a non-empty id and a positive limit",
+            ));
+        }
     }
     if control.temperature_milli != 0
         || std::env::var("COWD_MODEL_TEMPERATURE").as_deref() != Ok("0")
@@ -2308,7 +2327,9 @@ pub(super) fn agentic_turn_framing(
     });
     match root_agentic_program_projection(services, session_id, turn_id) {
         Some(program) => {
-            let mut view = agentic_closure_view(&program);
+            let completion_gap =
+                crate::agentic::agentic_program_completion_gap(services, session_id, turn_id);
+            let mut view = agentic_closure_view(&program, completion_gap.as_deref());
             if let Some(object) = view.as_object_mut() {
                 object.insert("budgets".to_string(), budgets);
                 // Live occupancy: the model needs to know how much is already
@@ -2352,19 +2373,23 @@ pub(super) fn agentic_turn_framing(
 /// checkpoint blob.
 #[must_use]
 pub(super) fn outstanding_closure_steps(program: &crate::AgenticProgramProjection) -> Vec<String> {
-    agentic_closure_view(program)["remaining"]
+    // Callers without Goal access see Program rungs only; the checkpoint and
+    // budgets views carry the authoritative completion gap.
+    agentic_closure_view(program, None)["remaining"]
         .as_array()
         .map(|rows| {
             rows.iter()
                 .filter_map(|row| {
-                    row.get("step").and_then(serde_json::Value::as_str).map(str::to_string)
+                    row.get("step")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
                 })
                 .collect()
         })
         .unwrap_or_default()
 }
 
-fn root_agentic_program_projection(
+pub(super) fn root_agentic_program_projection(
     services: &crate::RuntimeServices,
     session_id: &str,
     turn_id: &str,
@@ -2431,11 +2456,17 @@ impl RootAgenticTerminalAction {
 /// no roles, Team assignment, Task contents or workflow template: only durable
 /// facts the Program already records, plus the step names the runtime itself
 /// advertises. The model still decides how to satisfy each remaining rung.
-fn agentic_closure_view(program: &crate::AgenticProgramProjection) -> serde_json::Value {
+fn agentic_closure_view(
+    program: &crate::AgenticProgramProjection,
+    completion_gap: Option<&str>,
+) -> serde_json::Value {
     let tasks = program.tasks.values().collect::<Vec<_>>();
     let published = tasks.len();
     let claimed = tasks.iter().filter(|task| task.claimant.is_some()).count();
-    let reviewed = tasks.iter().filter(|task| task.reviewed_by.is_some()).count();
+    let reviewed = tasks
+        .iter()
+        .filter(|task| task.reviewed_by.is_some())
+        .count();
     let accepted = tasks
         .iter()
         .filter(|task| task.status == crate::AgenticTaskStatus::Accepted)
@@ -2477,9 +2508,22 @@ fn agentic_closure_view(program: &crate::AgenticProgramProjection) -> serde_json
         }));
     }
     if program.completion_request.is_none() {
-        remaining.push(serde_json::json!({
+        // While the Goal verifier still records a completion gap, advertising
+        // the exit action is a lie the model will act on: one live run was told
+        // to request completion while the Goal gate required an Objective
+        // review, and it looped on rejected requests until the window expired.
+        if completion_gap.is_none() {
+            remaining.push(serde_json::json!({
             "step": "objective_complete_request",
             "hint": "The Objective cannot close without this action; accepted Tasks alone do not certify it."
+        }));
+        }
+    }
+    if let Some(gap) = completion_gap {
+        remaining.push(serde_json::json!({
+            "step": "objective_review",
+            "outstanding_gap": gap,
+            "hint": "The Goal verifier records a completion gap, so the Objective is not closable yet. Close this gap first; do not re-request completion until it clears."
         }));
     }
 
@@ -2525,7 +2569,18 @@ fn agentic_closure_view(program: &crate::AgenticProgramProjection) -> serde_json
         // framework-owned condition holds and the MODEL decides to close out.
         // Runtime then verifies the request and rejects it if anything
         // regressed. The framework never submits on the model's behalf.
-        "exit_ready": remaining.is_empty() && program.completion_request.is_none(),
+        // `remaining` always carries the request step while no request exists,
+        // so readiness means "every framework-owned rung holds and the only
+        // outstanding action is the model's own completion request". A live
+        // run with four accepted Tasks kept verifying for ten minutes because
+        // this flag never turned true and no signal ever said "request now".
+        "exit_ready": program.completion_request.is_none()
+            && completion_gap.is_none()
+            && remaining.iter().all(|step| {
+                step.get("step").and_then(serde_json::Value::as_str)
+                    == Some("objective_complete_request")
+            }),
+        "completion_gap": completion_gap,
         "facts": {
             "teams": teams,
             "required_teams": required_teams,
@@ -2677,6 +2732,17 @@ fn compact_agentic_program_checkpoint(
         )
     });
     let issues = crate::agentic::issues::issues(program);
+    // The Goal verifier's completion gap is authoritative for closability.
+    // Program task state alone cannot see it, and a checkpoint that claims
+    // readiness while the Goal gate still waits sends the model into a
+    // request/reject loop.
+    let completion_gap = services.and_then(|services| {
+        crate::agentic::agentic_program_completion_gap(
+            services,
+            &program.session_id,
+            &program.turn_id,
+        )
+    });
     let teams = program
         .teams
         .values()
@@ -2789,8 +2855,15 @@ fn compact_agentic_program_checkpoint(
         "unresolved_count": program.unresolved.len(),
         "next_actions": next_actions,
         "terminal_action": terminal_action.as_ref().map(RootAgenticTerminalAction::checkpoint_detail),
-        "closure": agentic_closure_view(program),
+        "closure": agentic_closure_view(program, completion_gap.as_deref()),
         "instruction": "Use this Runtime projection as current truth. You may continue planning, publish dependent or independent Tasks, and coordinate while members execute. When ready to wait for active workers, call state_inspect with wait_for_workers=true; Runtime waits without provider polling. Do not recreate committed entities. Completion is rejected while any entry remains in `unclassified_issue_refs`: classify EVERY issue_ref there through one message_publish.issue_dispositions (must_resolve, disclose, or resolved) with durable reasons/evidence (a tool://artifact:// receipt OR the issue's own source_ref, its Runtime-created anchor). Keep estimates and assumptions labelled; only the Goal verifier can certify the original objective. When `closure.exit_ready` is true every Runtime condition already holds: call `objective_complete_request` yourself to close out the Objective - Runtime verifies it and rejects it if any condition regressed, so you never risk a premature or unverifiable exit. Tasks named in `closure.satisfied` are finished; do not re-review, re-submit or re-commit them. Your job at that point is the exit decision, not more work.",
+        // E1-E4: reads are durable receipts, not conversations. A reviewer
+        // verifies a delivered fact by opening the claimant's receipt with
+        // `evidence_retrieve` (same bytes, Runtime-bound hash), never by
+        // re-reading the source file; one live run re-read a single lib.rs 40
+        // times across agents this way. Independent reads go in ONE batch or
+        // one `tool_orchestrate` program per round, and prefer ranged reads.
+        "efficiency": crate::agentic::order_contract::EVIDENCE_ECONOMY,
     })
     .to_string()
 }
@@ -2853,10 +2926,9 @@ fn agentic_checkpoint_artifact_content(
 #[test]
 #[cfg(test)]
 fn closure_view_names_the_outstanding_rung_in_a_stalled_program() {
-    let mut program =
-        crate::AgenticProgramProjection::empty("program:test", "objective:test");
+    let mut program = crate::AgenticProgramProjection::empty("program:test", "objective:test");
     program.required_team_count = 1;
-    let view = agentic_closure_view(&program);
+    let view = agentic_closure_view(&program, None);
     // No Team, no Task, no completion request: every framework-owned rung is
     // outstanding and `current` names the first one instead of being undefined.
     assert_eq!(view["current"], serde_json::json!("team"));
@@ -2869,6 +2941,115 @@ fn closure_view_names_the_outstanding_rung_in_a_stalled_program() {
     assert!(steps.contains(&"publish_task"), "{steps:?}");
     assert!(steps.contains(&"objective_complete_request"), "{steps:?}");
     assert_eq!(view["facts"]["required_teams"], serde_json::json!(1));
+}
+
+#[test]
+#[cfg(test)]
+fn closure_view_blocks_exit_while_the_goal_completion_gap_remains() {
+    let mut program = crate::AgenticProgramProjection::empty("program:test", "objective:test");
+    program.required_team_count = 1;
+    // Every Program-owned rung is satisfied and no request is pending, yet the
+    // Goal verifier still records a completion gap: the closure view must not
+    // advertise the exit action, because the Goal gate would only reject it.
+    let view = agentic_closure_view(
+        &program,
+        Some("original_intent_review_required:user_intent"),
+    );
+    assert_eq!(
+        view["exit_ready"],
+        serde_json::json!(false),
+        "a Goal completion gap must hold the exit closed"
+    );
+    assert_eq!(
+        view["completion_gap"],
+        serde_json::json!("original_intent_review_required:user_intent")
+    );
+    let steps = view["remaining"]
+        .as_array()
+        .expect("remaining")
+        .iter()
+        .filter_map(|step| step.get("step").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>();
+    assert!(
+        steps.contains(&"objective_review"),
+        "the gap must be named as the outstanding rung: {steps:?}"
+    );
+    assert!(
+        !steps.contains(&"objective_complete_request"),
+        "the exit action must not be advertised while the gap remains: {steps:?}"
+    );
+}
+
+#[test]
+#[cfg(test)]
+fn closure_view_opens_the_exit_when_only_the_request_remains() {
+    let mut program = crate::AgenticProgramProjection::empty("program:test", "objective:test");
+    program.required_team_count = 1;
+    // Every framework-owned rung holds: one Team, one accepted Task, no
+    // unresolved entries, no pending request, no Goal gap. The only
+    // outstanding action is the model's own completion request, so the view
+    // must say so explicitly instead of staying silently not-ready.
+    program.teams.insert(
+        "team:1".to_string(),
+        crate::AgenticTeamProjection {
+            team_id: "team:1".to_string(),
+            name: "team".to_string(),
+            mission: "mission".to_string(),
+            objective: None,
+            lifecycle: Default::default(),
+            member_ids: vec!["agent:1".to_string()],
+            task_ids: vec!["task:1".to_string()],
+            topic_ref: String::new(),
+            created_by: "root".to_string(),
+        },
+    );
+    let mut task = crate::AgenticTaskProjection {
+        task_id: "task:1".to_string(),
+        team_id: "team:1".to_string(),
+        title: "delivered".to_string(),
+        objective: "objective".to_string(),
+        acceptance: "accepted evidence".to_string(),
+        acceptance_checks: Vec::new(),
+        required_capabilities: Vec::new(),
+        depends_on: Vec::new(),
+        status: crate::AgenticTaskStatus::Accepted,
+        claimant: Some("agent:1".to_string()),
+        claim_generation: 1,
+        claim_execution_id: None,
+        claimed_at_ms: None,
+        lease_expires_at_ms: None,
+        active_attempts: Default::default(),
+        artifact_refs: vec!["artifact:1".to_string()],
+        evidence_refs: vec!["tool://receipt".to_string()],
+        unresolved: Vec::new(),
+        review_reason: None,
+        reviewed_by: Some("agent:2".to_string()),
+        failed_attempts: 0,
+        review_generation: 1,
+        failed_review_attempts: 0,
+        last_failure: None,
+        replacement_task_refs: Vec::new(),
+        supersede_evidence_refs: Vec::new(),
+        superseded_reason: None,
+        superseded_by: None,
+        obligation_refs: Vec::new(),
+        purpose: Default::default(),
+        execution_requirements: Vec::new(),
+        expertise_hints: Vec::new(),
+        cancel_requested_by: None,
+        cancel_reason_ref: None,
+        cancel_evidence_refs: Vec::new(),
+        pending_retirement: None,
+    };
+    task.status = crate::AgenticTaskStatus::Accepted;
+    program.tasks.insert("task:1".to_string(), task);
+
+    let view = agentic_closure_view(&program, None);
+    assert_eq!(view["exit_ready"], serde_json::json!(true));
+    assert_eq!(
+        view["current"],
+        serde_json::json!("objective_complete_request")
+    );
 }
 
 #[cfg(test)]
@@ -3173,13 +3354,15 @@ mod write_obligation_probe {
                 4,
             )
             .expect("exact read receipt");
-        assert!(verified_workspace_postcondition_write_evidence(
-            &["write:artifact.txt".to_string()],
-            &BTreeSet::from([4, 5]),
-            &[read],
-            &resolver,
-        )
-        .is_empty());
+        assert!(
+            verified_workspace_postcondition_write_evidence(
+                &["write:artifact.txt".to_string()],
+                &BTreeSet::from([4, 5]),
+                &[read],
+                &resolver,
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -3201,9 +3384,11 @@ mod write_obligation_probe {
             true,
         );
         println!("SCOPES_PROBE {scopes:?}");
-        assert!(scopes
-            .iter()
-            .any(|scope| scope == "write:cross-team-decision-report.html"));
+        assert!(
+            scopes
+                .iter()
+                .any(|scope| scope == "write:cross-team-decision-report.html")
+        );
     }
 }
 
@@ -3445,6 +3630,13 @@ struct TurnGraphState {
     /// Consecutive model steps with no new Runtime-verified evidence or state
     /// transition. Total iterations remain observability telemetry only.
     consecutive_unverified_model_steps: usize,
+    /// Root model steps taken since the closure view last reported every
+    /// framework-owned rung satisfied. A weak model can be woken by
+    /// `all_tasks_accepted` and then coordinate forever without making the exit
+    /// decision; past `closure_drive_after_steps` Runtime drives the completion
+    /// request on the root's behalf (the drive stays behind the completion_gap
+    /// gate, so an incomplete Objective is never forced).
+    closure_ready_steps: usize,
     /// Bounded-convergence counter for the Agent-first collaboration completion
     /// gate. Each time the gate re-drives the root because the verified-Team
     /// minimum is unmet it advances; past the policy bound the turn terminates
@@ -3467,6 +3659,10 @@ struct TurnGraphState {
     force_reasoning_effort_next_model: Option<String>,
     terminal_recovery_attempts: u8,
     provider_protocol_recovery_attempts: u8,
+    /// Bounded malformed-frame repair continuations. Independent of
+    /// `provider_protocol_recovery_attempts` because a frame defect is
+    /// repairable even when the turn already holds successful receipts.
+    provider_frame_repair_attempts: u8,
     /// Bounded extra provider steps reserved only for closing the durable
     /// Agent-first artifact/submit/review transaction after generic safety
     /// heuristics would otherwise withdraw its required action tool.

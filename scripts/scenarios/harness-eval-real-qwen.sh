@@ -34,6 +34,17 @@ WORKSPACE="${COWD_EVAL_WORKSPACE:-$ROOT}"
 GATEWAY_LOG="$RUN_ROOT/gateway.log"
 GATEWAY_PID=""
 PROGRESS_PID=""
+DEEP_MONITOR_PID=""
+DEEP_MONITOR_STALL_SECS="${COWD_EVAL_DEEP_MONITOR_STALL_SECS:-600}"
+# A single-stream local inference server cannot serve concurrent requests: the
+# runtime's default admission ceiling (provider target 64 / max 256, agents 42)
+# queues them behind each other, which shows up as multi-minute round latency
+# and starved agents. The in-flight ceiling is resolved after the provider is
+# known (local providers default to one); set COWD_EVAL_MAX_CONCURRENCY to
+# override explicitly.
+MAX_CONCURRENCY="${COWD_EVAL_MAX_CONCURRENCY:-}"
+DEEP_MONITOR_LAST_MILESTONE=""
+DEEP_MONITOR_LAST_CHANGE_TS=0
 PROVIDER_ID=""
 PROVIDER_BASE_URL=""
 PROVIDER_PROTOCOL=""
@@ -127,6 +138,44 @@ monitor_progress() {
   done
 }
 
+# Deep semantic monitoring. Surface progress counters count events; a rework
+# loop or a redundant-read loop emits events forever while the Objective never
+# advances. This loop compares SEMANTIC milestones (verdicts, reopens,
+# reviews, requests) and stops the run when they have not moved for
+# COWD_EVAL_DEEP_MONITOR_STALL_SECS while the run keeps burning steps.
+monitor_semantic_health() {
+  local interval="${COWD_EVAL_DEEP_MONITOR_INTERVAL_SECS:-60}"
+  local monitor="$ROOT/scripts/diagnostics/deep-run-monitor.py"
+  [[ -f "$monitor" ]] || return 0
+  while kill -0 "$HARNESS_PID" >/dev/null 2>&1; do
+    local report state milestones findings now
+    report="$(python3 "$monitor" "$COWD_TEST_POSTGRES_URL" --investigate 2>/dev/null || true)"
+    [[ -n "$report" ]] || { sleep "$interval"; continue; }
+    state="$(printf '%s' "$report" | jq -r '.conclusion.state // ""' 2>/dev/null || true)"
+    milestones="$(printf '%s' "$report" | jq -r '[.verdicts,.reopens,.objective_reviews,.completion_requests,.reworks,.task_submits] | @csv' 2>/dev/null || true)"
+    findings="$(printf '%s' "$report" | jq -c '.conclusion.findings' 2>/dev/null || echo '[]')"
+    now="$(date +%s)"
+    if [[ -n "$milestones" && "$milestones" != "$DEEP_MONITOR_LAST_MILESTONE" ]]; then
+      DEEP_MONITOR_LAST_MILESTONE="$milestones"
+      DEEP_MONITOR_LAST_CHANGE_TS="$now"
+    fi
+    printf '{"event":"harness_eval_deep_monitor","state":"%s","milestones":"%s","stall_for_s":%d,"findings":%s}\n' \
+      "$state" "$milestones" "$(( now - DEEP_MONITOR_LAST_CHANGE_TS ))" "$findings"
+    if [[ "$DEEP_MONITOR_LAST_CHANGE_TS" -gt 0 ]]; then
+      local stalled_for=$(( now - DEEP_MONITOR_LAST_CHANGE_TS ))
+      # Stop only on CONFIRMED waste: an active finding AND semantic milestones
+      # frozen for the stall window. A single recoverable rework never trips it.
+      if [[ "$stalled_for" -ge "$DEEP_MONITOR_STALL_SECS" && "$state" == "SPINNING" ]]; then
+        printf '{"event":"harness_eval_deep_monitor_stop","reason":"confirmed spinning: findings present and semantic milestones frozen","state":"%s","stall_for_s":%d,"findings":%s}\n' \
+          "$state" "$stalled_for" "$findings" >&2
+        kill "$HARNESS_PID" >/dev/null 2>&1 || true
+        return 0
+      fi
+    fi
+    sleep "$interval"
+  done
+}
+
 yaml_model_field() {
   local file="$1"
   local model="$2"
@@ -192,14 +241,25 @@ resolve_installed_route() {
     echo "native Bailian generation is forbidden; Bailian is reserved for embedding only" >&2
     exit 2
   fi
-  if [[ "$model_lower" == qwen* && "$provider_lower" != "qwen-tokenplan" && "$provider_lower" != "local-ninfer" ]]; then
-    echo "Qwen generation must use the qwen-tokenplan provider, got ${PROVIDER_ID}" >&2
+  if [[ "$model_lower" == qwen* && "$provider_lower" != "qwen-tokenplan" && "$provider_lower" != "local-ninfer" && "$provider_lower" != "local-strata" ]]; then
+    echo "Qwen generation must use qwen-tokenplan or a configured local inference provider, got ${PROVIDER_ID}" >&2
     exit 2
   fi
   if [[ "$model_lower" == deepseek* && "$provider_lower" != "deepseek" && "$provider_lower" != "qwen-tokenplan" ]]; then
     echo "DeepSeek generation must use the configured deepseek provider, got ${PROVIDER_ID}" >&2
     exit 2
   fi
+
+# Resolve the in-flight request ceiling now that the provider is known.
+if [[ -z "$MAX_CONCURRENCY" ]]; then
+  case "$provider_lower" in
+    *local*|*ninfer*|*strata*) MAX_CONCURRENCY=1 ;;
+  esac
+fi
+if [[ -n "$MAX_CONCURRENCY" ]]; then
+  printf 'In-flight request ceiling: %s (provider %s)
+' "$MAX_CONCURRENCY" "$PROVIDER_ID" >&2
+fi
   PROVIDER_BASE_URL="$(yaml_provider_field "$SOURCE_CONFIG_FILE" "$PROVIDER_ID" base_url)"
   PROVIDER_PROTOCOL="$(yaml_provider_field "$SOURCE_CONFIG_FILE" "$PROVIDER_ID" protocol)"
   PROVIDER_CREDENTIAL="$(yaml_provider_field "$SOURCE_CONFIG_FILE" "$PROVIDER_ID" api_key)"
@@ -333,6 +393,24 @@ fi
 cat >>"$CONFIG_HOME/config.yaml" <<EOF
     models:
       - "$MODEL"
+runtime:
+  # The in-flight MODEL-REQUEST ceiling belongs to provider admission only.
+  # Collapsing agent/graph parallelism here would deadlock the supervisor:
+  # a root parked on the Agentic barrier holds its owned-task permit for the
+  # whole wait (proven in Qwen v10/v11: the delegated agent never got a permit,
+  # the barrier never released, the no-progress fuse fired at +300s). Keep the
+  # supervisor at its default parallelism and let the provider admission below
+  # serialize requests to a single-stream server.
+  control:
+    agent:
+      max_parallel_agents: ${COWD_EVAL_AGENT_PARALLELISM:-42}
+  resources:
+    provider:
+      global:
+        minimum: ${MAX_CONCURRENCY:-12}
+        target: ${MAX_CONCURRENCY:-64}
+        maximum: ${MAX_CONCURRENCY:-256}
+        interactiveReserve: $(( ${MAX_CONCURRENCY:-9} > 1 ? ${MAX_CONCURRENCY:-9} - 1 : 0 ))
 permissions:
   # Permission must match the scenario's declared business profile. Read-only
   # research scenarios (e.g. group theory) run with COWD_EVAL_DEFAULT_MODE=read-only;
@@ -496,6 +574,20 @@ env \
   COWD_EVAL_BINARY_SHA256="$GATEWAY_BINARY_SHA256" \
   COWD_EVAL_CANDIDATE_SHA="$CANDIDATE_SHA" \
   COWD_EVAL_CANDIDATE_SOURCE_SHA256="$CANDIDATE_SOURCE_SHA256" \
-  COWD_EVAL_TARGET_REPO_DIRTY_STATE=clean \
+  COWD_EVAL_TARGET_REPO_DIRTY_STATE="$CANDIDATE_STATE" \
   COWD_AI_HARNESS_REPORT_DIR="$EVIDENCE_ROOT" \
-  "${EVAL_COMMAND[@]}"
+  "${EVAL_COMMAND[@]}" &
+HARNESS_PID="$!"
+
+# Run the evaluator in the background so the deep semantic monitor can stop a
+# run that burns steps without advancing the Objective. `wait` preserves the
+# evaluator's exit status for the caller.
+monitor_semantic_health &
+DEEP_MONITOR_PID="$!"
+wait "$HARNESS_PID"
+EVAL_STATUS=$?
+if [[ -n "$DEEP_MONITOR_PID" ]]; then
+  kill "$DEEP_MONITOR_PID" >/dev/null 2>&1 || true
+  wait "$DEEP_MONITOR_PID" >/dev/null 2>&1 || true
+fi
+exit "$EVAL_STATUS"

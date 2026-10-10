@@ -810,17 +810,19 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
         .expect("acknowledge cross-Team page");
 
     let restarted = AgentActionService::new(store);
-    assert!(restarted
-        .topic_observations(
-            "program-1",
-            &cross_team_peer,
-            &team_b,
-            "execution:cross-team-peer",
-            16,
-            48 * 1024,
-        )
-        .expect("restart query")
-        .is_none());
+    assert!(
+        restarted
+            .topic_observations(
+                "program-1",
+                &cross_team_peer,
+                &team_b,
+                "execution:cross-team-peer",
+                16,
+                48 * 1024,
+            )
+            .expect("restart query")
+            .is_none()
+    );
     let own_team_page = restarted
         .topic_observations(
             "program-1",
@@ -833,10 +835,12 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
         .expect("own-Team observations")
         .expect("Program and own-Team messages");
     assert_eq!(own_team_page.entries.len(), 2);
-    assert!(own_team_page
-        .entries
-        .iter()
-        .any(|entry| entry.entry.summary.as_deref() == Some("Team-only implementation note")));
+    assert!(
+        own_team_page
+            .entries
+            .iter()
+            .any(|entry| entry.entry.summary.as_deref() == Some("Team-only implementation note"))
+    );
 
     let own_topic = format!("topic:{team_a}");
     for index in 0..37 {
@@ -1012,31 +1016,35 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
         .projection
         .unwrap();
     assert_ne!(new_scope["not_found"], true);
-    assert!(service
-        .topic_observations(
-            "program-1",
-            &cross_team_peer,
-            &team_b,
-            "execution:cross-team-peer",
-            16,
-            48 * 1024
-        )
-        .unwrap()
-        .is_none());
-    assert!(service
-        .topic_observations(
-            "program-1",
-            &cross_team_peer,
-            &team_a,
-            "execution:new-team-run",
-            16,
-            48 * 1024
-        )
-        .unwrap()
-        .unwrap()
-        .entries
-        .iter()
-        .any(|item| item.topic_ref == own_topic));
+    assert!(
+        service
+            .topic_observations(
+                "program-1",
+                &cross_team_peer,
+                &team_b,
+                "execution:cross-team-peer",
+                16,
+                48 * 1024
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        service
+            .topic_observations(
+                "program-1",
+                &cross_team_peer,
+                &team_a,
+                "execution:new-team-run",
+                16,
+                48 * 1024
+            )
+            .unwrap()
+            .unwrap()
+            .entries
+            .iter()
+            .any(|item| item.topic_ref == own_topic)
+    );
     let directory: StateInspectInput =
         serde_json::from_value(new_scope["directory_request"].clone()).unwrap();
     let first_page = service
@@ -1417,10 +1425,10 @@ fn legacy_goal_terminal_recovery_is_durable_and_idempotent() {
             &team_id,
             &reviewer_id,
             AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
-            blocked: false,
-            blocked_reason: None,
-            human_review_required: false,
-            recommended_next_actions: Vec::new(),
+                blocked: false,
+                blocked_reason: None,
+                human_review_required: false,
+                recommended_next_actions: Vec::new(),
                 result_refs: vec![artifact_ref.clone()],
                 evidence_refs: vec!["artifact://abc".to_string()],
                 unresolved: Vec::new(),
@@ -1436,10 +1444,10 @@ fn legacy_goal_terminal_recovery_is_durable_and_idempotent() {
         .apply(&root(
             "complete",
             AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
-            blocked: false,
-            blocked_reason: None,
-            human_review_required: false,
-            recommended_next_actions: Vec::new(),
+                blocked: false,
+                blocked_reason: None,
+                human_review_required: false,
+                recommended_next_actions: Vec::new(),
                 result_refs: vec![artifact_ref],
                 evidence_refs: vec!["artifact://abc".to_string()],
                 unresolved: Vec::new(),
@@ -1733,10 +1741,10 @@ async fn production_artifact_authority_closes_submit_review_and_completion_chain
             .apply(&root(
                 "blocked-objective-complete",
                 AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
-                blocked: false,
-                blocked_reason: None,
-                human_review_required: false,
-                recommended_next_actions: Vec::new(),
+                    blocked: false,
+                    blocked_reason: None,
+                    human_review_required: false,
+                    recommended_next_actions: Vec::new(),
                     result_refs: vec![artifact.clone()],
                     evidence_refs: vec![content.selector.clone()],
                     unresolved: vec!["Objective-level delivery blocker".to_string()],
@@ -1749,9 +1757,11 @@ async fn production_artifact_authority_closes_submit_review_and_completion_chain
     );
     let before = service.project("program-1").unwrap();
     let issue = super::super::issues::issues(&before).remove(0);
-    assert!(super::super::issues::completion_gap(&before)
-        .unwrap()
-        .starts_with("issue_requires_classification:"));
+    assert!(
+        super::super::issues::completion_gap(&before)
+            .unwrap()
+            .starts_with("issue_requires_classification:")
+    );
     let classify = |action_id: &str, disposition| {
         root(
             action_id,
@@ -1825,9 +1835,11 @@ async fn production_artifact_authority_closes_submit_review_and_completion_chain
     );
     let mut changed = adjudicated.clone();
     changed.tasks.get_mut(&task).unwrap().unresolved[0].push_str(" revised source");
-    assert!(super::super::issues::completion_gap(&changed)
-        .unwrap()
-        .starts_with("issue_requires_classification:"));
+    assert!(
+        super::super::issues::completion_gap(&changed)
+            .unwrap()
+            .starts_with("issue_requires_classification:")
+    );
     let restarted = AgentActionService::new(Arc::clone(&service.store));
     let recovered =
         super::super::issues::issues(&restarted.project("program-1").unwrap()).remove(0);
@@ -1838,10 +1850,10 @@ async fn production_artifact_authority_closes_submit_review_and_completion_chain
             .apply(&root(
                 "durable-complete",
                 AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
-                blocked: false,
-                blocked_reason: None,
-                human_review_required: false,
-                recommended_next_actions: Vec::new(),
+                    blocked: false,
+                    blocked_reason: None,
+                    human_review_required: false,
+                    recommended_next_actions: Vec::new(),
                     result_refs: vec![artifact],
                     evidence_refs: vec![content.selector],
                     unresolved: Vec::new(),
@@ -1871,10 +1883,10 @@ fn completion_cannot_bypass_real_artifact_and_task_review() {
         .apply(&root(
             "complete",
             AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
-            blocked: false,
-            blocked_reason: None,
-            human_review_required: false,
-            recommended_next_actions: Vec::new(),
+                blocked: false,
+                blocked_reason: None,
+                human_review_required: false,
+                recommended_next_actions: Vec::new(),
                 result_refs: vec!["artifact:missing".to_string()],
                 evidence_refs: Vec::new(),
                 unresolved: Vec::new(),
@@ -2758,10 +2770,12 @@ fn failed_task_supersede_is_cas_idempotent_recoverable_and_not_fake_completion()
                 == Some("supersede-commit")
         })
         .expect("supersede audit event");
-    assert!(audit_event
-        .refs
-        .iter()
-        .any(|reference| reference.kind == "replacement_task" && reference.id == part_a));
+    assert!(
+        audit_event
+            .refs
+            .iter()
+            .any(|reference| reference.kind == "replacement_task" && reference.id == part_a)
+    );
     assert!(audit_event.refs.iter().any(|reference| {
         reference.kind == "evidence" && reference.id == "tool://failure-receipt"
     }));
@@ -2816,10 +2830,10 @@ fn failed_task_supersede_is_cas_idempotent_recoverable_and_not_fake_completion()
         super::super::supervision::completion_gap(
             &incomplete_projection,
             &ObjectiveCompleteRequestInput {
-            blocked: false,
-            blocked_reason: None,
-            human_review_required: false,
-            recommended_next_actions: Vec::new(),
+                blocked: false,
+                blocked_reason: None,
+                human_review_required: false,
+                recommended_next_actions: Vec::new(),
                 result_refs: vec![final_artifact_ref.clone()],
                 evidence_refs: vec!["tool://failure-receipt".to_string()],
                 unresolved: Vec::new(),
@@ -2858,10 +2872,10 @@ fn failed_task_supersede_is_cas_idempotent_recoverable_and_not_fake_completion()
         super::super::supervision::completion_gap(
             &supervisor_projection,
             &ObjectiveCompleteRequestInput {
-            blocked: false,
-            blocked_reason: None,
-            human_review_required: false,
-            recommended_next_actions: Vec::new(),
+                blocked: false,
+                blocked_reason: None,
+                human_review_required: false,
+                recommended_next_actions: Vec::new(),
                 result_refs: vec![final_artifact_ref],
                 evidence_refs: vec!["tool://accepted-evidence".to_string()],
                 unresolved: Vec::new(),
@@ -2985,10 +2999,12 @@ fn new_run_membership_authorizes_incremental_work_and_leave_revokes_it() {
     }
     let projection = service.project("program-1").unwrap();
     assert_eq!(projection.tasks.len(), 1);
-    assert!(projection
-        .tasks
-        .values()
-        .all(|task| task.claimant.is_none()));
+    assert!(
+        projection
+            .tasks
+            .values()
+            .all(|task| task.claimant.is_none())
+    );
 }
 
 /// PLAN B2 (corrected): the operator's NAMED Team count is binding - a floor AND
@@ -3155,19 +3171,21 @@ async fn an_accepted_task_rejects_re_review_and_re_submit_but_allows_supersede()
         .expect("reviewer")
         .changed_refs[0]
         .clone();
-    let publish = |title: &str| AgentAction::TaskPublish(TaskPublishInput {
-        team_ref: team.clone(),
-        title: title.to_string(),
-        objective: "produce a grounded report".to_string(),
-        acceptance: "durable report and independent review".to_string(),
-        acceptance_checks: Vec::new(),
-        required_capabilities: vec!["read".to_string()],
-        depends_on: Vec::new(),
-        obligation_refs: Vec::new(),
-        purpose: Default::default(),
-        execution_requirements: Vec::new(),
-        expertise_hints: Vec::new(),
-    });
+    let publish = |title: &str| {
+        AgentAction::TaskPublish(TaskPublishInput {
+            team_ref: team.clone(),
+            title: title.to_string(),
+            objective: "produce a grounded report".to_string(),
+            acceptance: "durable report and independent review".to_string(),
+            acceptance_checks: Vec::new(),
+            required_capabilities: vec!["read".to_string()],
+            depends_on: Vec::new(),
+            obligation_refs: Vec::new(),
+            purpose: Default::default(),
+            execution_requirements: Vec::new(),
+            expertise_hints: Vec::new(),
+        })
+    };
     let task = service
         .apply(&root("gate-task", publish("Verified report")))
         .expect("task")
@@ -3241,7 +3259,10 @@ async fn an_accepted_task_rejects_re_review_and_re_submit_but_allows_supersede()
         ))
         .expect("re-review");
     assert_eq!(re_review.status, AgentActionStatus::Rejected);
-    assert_eq!(re_review.error.expect("error").code, "task_already_accepted");
+    assert_eq!(
+        re_review.error.expect("error").code,
+        "task_already_accepted"
+    );
     let re_submit = service
         .apply(&managed(
             "gate-re-submit",
@@ -3257,7 +3278,10 @@ async fn an_accepted_task_rejects_re_review_and_re_submit_but_allows_supersede()
         ))
         .expect("re-submit");
     assert_eq!(re_submit.status, AgentActionStatus::Rejected);
-    assert_eq!(re_submit.error.expect("error").code, "task_already_accepted");
+    assert_eq!(
+        re_submit.error.expect("error").code,
+        "task_already_accepted"
+    );
 
     let replacement = service
         .apply(&root(
@@ -3432,7 +3456,8 @@ async fn blocked_exit_is_accepted_once_every_task_is_terminal() {
             "quiesced-team",
             AgentAction::TeamCreate(TeamCreateInput {
                 name: "Quiesced".to_string(),
-                mission: "prove a well-formed blocked exit is accepted for human review".to_string(),
+                mission: "prove a well-formed blocked exit is accepted for human review"
+                    .to_string(),
                 objective: None,
             }),
         ))
@@ -3488,8 +3513,15 @@ async fn blocked_exit_is_accepted_once_every_task_is_terminal() {
         "objective_blocked_for_human_review",
         "a quiescent Program with a well-formed blocked exit becomes a durably recorded human-review Partial"
     );
-    assert!(blocked.actionable.iter().any(|hint| hint.contains("human review"))
-        || blocked.actionable.iter().any(|hint| hint.contains("inspect")),
+    assert!(
+        blocked
+            .actionable
+            .iter()
+            .any(|hint| hint.contains("human review"))
+            || blocked
+                .actionable
+                .iter()
+                .any(|hint| hint.contains("inspect")),
         "the model must be told what to do with the recorded partial: {:?}",
         blocked.actionable
     );
@@ -3820,7 +3852,8 @@ fn a_rework_round_must_be_reviewable_again_in_its_own_graph() {
             reviewed.review_generation >= u64::from(round),
             "the review round advanced, so the re-review gets a fresh graph identity"
         );
-        let bounded = reviewed.review_generation >= u64::from(crate::agentic::work_market::MAX_TASK_REVIEW_ROUNDS);
+        let bounded = reviewed.review_generation
+            >= u64::from(crate::agentic::work_market::MAX_TASK_REVIEW_ROUNDS);
         assert_eq!(
             reviewed.status,
             if bounded {
@@ -3846,4 +3879,97 @@ fn a_rework_round_must_be_reviewable_again_in_its_own_graph() {
         );
         assert_eq!(resubmitted.status, crate::AgenticTaskStatus::Submitted);
     }
+}
+
+#[test]
+fn reopened_program_receipts_never_advertise_the_exit_action() {
+    // A reopened Program records completion gaps. Its actionable receipt must
+    // guide the model to close them: one live run received "resolve the
+    // recorded gaps" and "request Objective completion" in the same receipt,
+    // re-requested completion, and looped until the observation window expired.
+    let mut program = crate::AgenticProgramProjection::empty("program:test", "objective:test");
+    program.required_team_count = 1;
+    program.artifacts.insert(
+        "artifact:final".to_string(),
+        crate::AgenticArtifactProjection {
+            artifact_ref: "artifact:final".to_string(),
+            content_ref: "artifact://art_final".to_string(),
+            kind: "report".to_string(),
+            title: "final synthesis".to_string(),
+            relates_to: Vec::new(),
+            committed_by: "agent:worker".to_string(),
+            claim_execution_id: None,
+            claim_generation: None,
+        },
+    );
+    let task = crate::AgenticTaskProjection {
+        task_id: "task:1".to_string(),
+        team_id: "team:1".to_string(),
+        title: "delivered".to_string(),
+        objective: "objective".to_string(),
+        acceptance: "accepted evidence".to_string(),
+        acceptance_checks: Vec::new(),
+        required_capabilities: Vec::new(),
+        depends_on: Vec::new(),
+        status: crate::AgenticTaskStatus::Accepted,
+        claimant: Some("agent:worker".to_string()),
+        claim_generation: 1,
+        claim_execution_id: None,
+        claimed_at_ms: None,
+        lease_expires_at_ms: None,
+        active_attempts: Default::default(),
+        artifact_refs: vec!["artifact:final".to_string()],
+        evidence_refs: vec!["tool://receipt".to_string()],
+        unresolved: Vec::new(),
+        review_reason: None,
+        reviewed_by: Some("agent:reviewer".to_string()),
+        failed_attempts: 0,
+        review_generation: 1,
+        failed_review_attempts: 0,
+        last_failure: None,
+        replacement_task_refs: Vec::new(),
+        supersede_evidence_refs: Vec::new(),
+        superseded_reason: None,
+        superseded_by: None,
+        obligation_refs: Vec::new(),
+        purpose: Default::default(),
+        execution_requirements: Vec::new(),
+        expertise_hints: Vec::new(),
+        cancel_requested_by: None,
+        cancel_reason_ref: None,
+        cancel_evidence_refs: Vec::new(),
+        pending_retirement: None,
+    };
+    program.tasks.insert("task:1".to_string(), task);
+    program.unresolved = vec!["original_intent_review_required:user_intent".to_string()];
+
+    let actions = super::actionable(&program, false);
+    assert!(
+        actions
+            .iter()
+            .any(|action| action.contains("Resolve the recorded gaps")),
+        "{actions:?}"
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|action| action.contains("objective_review")),
+        "{actions:?}"
+    );
+    assert!(
+        !actions
+            .iter()
+            .any(|action| action.contains("request Objective completion")),
+        "the exit action must stay silent while gaps remain: {actions:?}"
+    );
+
+    // Once the gaps clear, the exit action is advertised again.
+    program.unresolved.clear();
+    let actions = super::actionable(&program, false);
+    assert!(
+        actions
+            .iter()
+            .any(|action| action.contains("request Objective completion")),
+        "{actions:?}"
+    );
 }

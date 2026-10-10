@@ -344,32 +344,36 @@ mod tests {
             .expect("replay")
             .expect("idempotent replay");
         assert_eq!(replay.revision, first.revision);
-        assert!(store
-            .reserve_recovery(
-                "objective-supervisor-test",
-                2,
-                7,
-                2,
-                "recovery:2",
-                "blocked"
-            )
-            .expect("second")
-            .is_some());
+        assert!(
+            store
+                .reserve_recovery(
+                    "objective-supervisor-test",
+                    2,
+                    7,
+                    2,
+                    "recovery:2",
+                    "blocked"
+                )
+                .expect("second")
+                .is_some()
+        );
         let latest = store
             .get("objective-supervisor-test")
             .expect("get")
             .expect("goal");
-        assert!(store
-            .reserve_recovery(
-                "objective-supervisor-test",
-                latest.revision,
-                7,
-                2,
-                "recovery:3",
-                "blocked"
-            )
-            .expect("exhausted")
-            .is_none());
+        assert!(
+            store
+                .reserve_recovery(
+                    "objective-supervisor-test",
+                    latest.revision,
+                    7,
+                    2,
+                    "recovery:3",
+                    "blocked"
+                )
+                .expect("exhausted")
+                .is_none()
+        );
     }
 
     #[test]
@@ -448,17 +452,19 @@ mod tests {
             failed.recovery.as_ref().expect("state").status,
             harness_contract::goal::ObjectiveRecoveryStatus::Exhausted
         );
-        assert!(store
-            .reserve_recovery(
-                "objective-supervisor-test",
-                failed.revision,
-                8,
-                2,
-                "recovery:third",
-                "must not re-enter"
-            )
-            .expect("terminal reservation")
-            .is_none());
+        assert!(
+            store
+                .reserve_recovery(
+                    "objective-supervisor-test",
+                    failed.revision,
+                    8,
+                    2,
+                    "recovery:third",
+                    "must not re-enter"
+                )
+                .expect("terminal reservation")
+                .is_none()
+        );
     }
 
     #[test]
@@ -512,9 +518,11 @@ mod tests {
             projection.goal.criteria[0].status,
             AcceptanceStatus::Satisfied
         );
-        assert!(projection
-            .goal
-            .evidence_refs
-            .contains(&"execution_graph:graph-1".to_string()));
+        assert!(
+            projection
+                .goal
+                .evidence_refs
+                .contains(&"execution_graph:graph-1".to_string())
+        );
     }
 }

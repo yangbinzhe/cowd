@@ -116,7 +116,7 @@ pub(crate) fn completion_gap(projection: &AgenticProgramProjection) -> Option<St
         match issue.disposition.as_ref().map(|item| item.disposition) {
             None => return Some(format!("issue_requires_classification:{}", issue.issue_ref)),
             Some(IssueDispositionKind::MustResolve) => {
-                return Some(format!("issue_must_resolve:{}", issue.issue_ref))
+                return Some(format!("issue_must_resolve:{}", issue.issue_ref));
             }
             Some(IssueDispositionKind::Disclose | IssueDispositionKind::Resolved) => {}
         }
@@ -127,9 +127,11 @@ pub(crate) fn completion_gap(projection: &AgenticProgramProjection) -> Option<St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agentic::program::{AgenticProgramProjection, AgenticTaskProjection, AgenticTaskStatus};
+    use crate::agentic::program::{
+        AgenticProgramProjection, AgenticTaskProjection, AgenticTaskStatus,
+    };
     use harness_contract::agent_action::{
-        AgentActorBinding, AgentAction, AgentActionEnvelope, IssueDisposition,
+        AgentAction, AgentActionEnvelope, AgentActorBinding, IssueDisposition,
         IssueDispositionKind, MessagePublishInput,
     };
 

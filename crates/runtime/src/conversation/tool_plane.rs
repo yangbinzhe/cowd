@@ -479,8 +479,7 @@ where
                 return;
             }
         };
-        let Some(descriptor) =
-            executor.registered_tool_effect("checkpoint", &checkpoint_value)
+        let Some(descriptor) = executor.registered_tool_effect("checkpoint", &checkpoint_value)
         else {
             validation.allowed = false;
             validation
@@ -964,7 +963,14 @@ where
                 for msg in post_hook_result.messages() {
                     combined.push_str(&format!("\n{msg}"));
                 }
-                self.append_repetition_diagnosis(tool_name, invocation_record.input_hash.as_str(), &invocation_record.input_refs, is_error, failure_kind.unwrap_or(ToolFailureKind::Unknown), &mut combined);
+                self.append_repetition_diagnosis(
+                    tool_name,
+                    invocation_record.input_hash.as_str(),
+                    &invocation_record.input_refs,
+                    is_error,
+                    failure_kind.unwrap_or(ToolFailureKind::Unknown),
+                    &mut combined,
+                );
                 let completed_record = if is_error {
                     invocation_record.failed_with_output_policy(
                         failure_kind.unwrap_or(ToolFailureKind::Unknown),
@@ -1033,8 +1039,7 @@ where
                 let audit_projection =
                     crate::context_evidence::audit_projection(&model_receipt, Some(&raw_access));
                 self.push_turn_evidence_audit(audit_projection);
-                let model_summary =
-                    agentic_action_body(&combined).unwrap_or(model_receipt.summary);
+                let model_summary = agentic_action_body(&combined).unwrap_or(model_receipt.summary);
                 let output_envelope = harness_contract::context::ToolOutputEnvelope {
                     artifact_ref: Some(harness_contract::context::ArtifactRef::durable(
                         raw_access.retrieval_selector.clone(),
@@ -1386,6 +1391,15 @@ where
              blocked through objective_complete_request.",
             refusal.count
         );
+        // The recorded cause is the recovery path, not bookkeeping: when the
+        // deterministic failure was an unresolvable evidence reference it
+        // names the canonical durable receipt, so the model can correct the
+        // reference instead of guessing a third variant of it.
+        let reason = if refusal.cause_signature.trim().is_empty() {
+            reason
+        } else {
+            format!("{reason} Recorded cause: {}", refusal.cause_signature)
+        };
         let record = self
             .start_tool_invocation_record(tool_use_id, tool_name, input, iterations)
             .refused(&reason, now_ms());

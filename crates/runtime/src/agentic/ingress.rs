@@ -187,19 +187,65 @@ impl RuntimeServices {
             }
             _ => {}
         }
+        // Every unresolvable content ref is reported together with the
+        // canonical receipt Runtime recorded for its tool call. A model can
+        // corrupt the opaque content suffix of an otherwise real call id (one
+        // live run cited `tool-raw-...-6` for the durable
+        // `tool-raw-...-2c77431438342406`); refusing without naming the
+        // canonical id leaves it no recovery path, and the repetition guard
+        // then refuses its retries, so the Task can never be submitted.
+        let mut unresolvable: Vec<String> = Vec::new();
         for evidence_ref in evidence_refs {
             let artifact = if let Some(evidence_id) = evidence_ref.strip_prefix("tool://") {
-                let access = self
+                // A model cites the action-id shape it was handed
+                // (`tool-raw-<call_id>:<attempt>`); durable evidence ids never
+                // carry a colon. The attempt index cannot select different
+                // content - the call id alone names the one recorded receipt -
+                // so resolve that shape instead of refusing it. One live run
+                // lost its whole review Task to exactly this shape mismatch.
+                let mut resolved = self
                     .session_evidence_access(&actor.session_id, evidence_id)
-                    .await
-                    .map_err(|error| format!(
-                        "{} could not resolve evidence {evidence_ref} through the authenticated Session journal: {error}",
-                        action.kind()
-                    ))?
-                    .ok_or_else(|| format!(
-                        "{} evidence {evidence_ref} has no canonical durable receipt in Session {}; use a tool:// reference returned by a completed tool call in this Session",
-                        action.kind(), actor.session_id
-                    ))?;
+                    .await;
+                if matches!(resolved, Ok(None)) {
+                    let attempt_stripped = evidence_id
+                        .rsplit_once(':')
+                        .filter(|(_, suffix)| {
+                            !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit())
+                        })
+                        .map(|(stem, _)| stem.to_string());
+                    if let Some(stem) = attempt_stripped {
+                        let stripped = self.session_evidence_access(&actor.session_id, &stem).await;
+                        if stripped.is_ok() {
+                            resolved = stripped;
+                        }
+                    }
+                }
+                let access = match resolved {
+                    Ok(Some(access)) => access,
+                    Ok(None) => {
+                        let hint = self
+                            .canonical_tool_evidence_hint(&actor.session_id, evidence_id)
+                            .await;
+                        let mut message = format!(
+                            "{} evidence {evidence_ref} has no canonical durable receipt in Session {}; use a tool:// reference returned by a completed tool call in this Session",
+                            action.kind(),
+                            actor.session_id
+                        );
+                        if let Some(canonical) = hint {
+                            message.push_str(&format!(
+                                ". The durable receipt Runtime recorded for this tool call is tool://{canonical}; copy that exact reference"
+                            ));
+                        }
+                        unresolvable.push(message);
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "{} could not resolve evidence {evidence_ref} through the authenticated Session journal: {error}",
+                            action.kind()
+                        ));
+                    }
+                };
                 let artifact = self
                     .artifact_store()
                     .resolve(&access.retrieval_selector)
@@ -262,7 +308,33 @@ impl RuntimeServices {
                     )
                 })?;
         }
+        if !unresolvable.is_empty() {
+            return Err(unresolvable.join("; "));
+        }
         Ok(())
+    }
+
+    /// The canonical durable receipt id for a tool call whose cited content
+    /// suffix is corrupted. The stable call-id prefix still selects exactly
+    /// one recorded receipt (an ambiguous prefix resolves to nothing), so the
+    /// hint can only hand back what Runtime durably recorded - it can never
+    /// invent an id, and the caller's action is still rejected.
+    async fn canonical_tool_evidence_hint(
+        &self,
+        session_id: &str,
+        evidence_id: &str,
+    ) -> Option<String> {
+        let (call_id, _suffix) = evidence_id.rsplit_once('-')?;
+        if call_id.is_empty() {
+            return None;
+        }
+        let access = self
+            .session_evidence_access(session_id, call_id)
+            .await
+            .ok()
+            .flatten()?;
+        let canonical = access.evidence_ref.id;
+        (canonical != evidence_id).then_some(canonical)
     }
 
     /// The sole public Program mutation ingress. actor is a trusted Runtime
@@ -289,8 +361,7 @@ impl RuntimeServices {
         // The physical-read guard must cover every verdict, not only accept:
         // otherwise a reviewer can return rework from metadata alone, never open
         // the submitted body, and the Task can never be independently accepted.
-        let is_review =
-            positive_review || matches!(&envelope.action, AgentAction::TaskReview(_));
+        let is_review = positive_review || matches!(&envelope.action, AgentAction::TaskReview(_));
         let review = if is_review {
             // Resolve both the result set and its manifest from one projection.
             let program = actions
@@ -307,6 +378,13 @@ impl RuntimeServices {
                 }
                 _ => unreachable!("review classification"),
             };
+            if matches!(
+                &envelope.action,
+                AgentAction::ObjectiveReview(input)
+                    if input.decision == harness_contract::agent_action::ObjectiveReviewDecision::Satisfied
+            ) {
+                validate_current_objective_review_scope(&program, results)?;
+            }
             let key = review_attempt_key(envelope);
             match self
                 .independent_result_review(
@@ -419,14 +497,18 @@ impl RuntimeServices {
             || program.session_id != session_id
             || program.turn_id != turn_id
             || program.root_execution_id.as_deref() != Some(root_execution_id)
-            || program.status != crate::AgenticProgramStatus::Open
+            || !matches!(
+                program.status,
+                crate::AgenticProgramStatus::Open
+                    | crate::AgenticProgramStatus::CompletionRequested
+            )
         {
             return Ok(false);
         }
         // A request already exists: drive reconciliation rather than overwriting
         // the single completion-request slot.
         if program.completion_request.is_some() {
-            let _ = self.reconcile_agentic_completion_request(&program_id);
+            self.reconcile_agentic_completion_request(&program_id)?;
             return Ok(true);
         }
         // Cite exactly the accepted work; an empty result set is not completable.
@@ -479,7 +561,7 @@ impl RuntimeServices {
         // Reduce the request now so the deterministic Objective verdict is
         // durable before the caller presents; the durable lane would also do
         // this, but doing it here removes an asynchronous window.
-        let _ = self.reconcile_agentic_completion_request(&program_id);
+        self.reconcile_agentic_completion_request(&program_id)?;
         Ok(true)
     }
 
@@ -556,15 +638,17 @@ fn completion_objective_input(
     if result_refs.is_empty() {
         return None;
     }
-    Some(harness_contract::agent_action::ObjectiveCompleteRequestInput {
-        result_refs,
-        evidence_refs,
-        unresolved: Vec::new(),
-        blocked: false,
-        blocked_reason: None,
-        human_review_required: false,
-        recommended_next_actions: Vec::new(),
-    })
+    Some(
+        harness_contract::agent_action::ObjectiveCompleteRequestInput {
+            result_refs,
+            evidence_refs,
+            unresolved: Vec::new(),
+            blocked: false,
+            blocked_reason: None,
+            human_review_required: false,
+            recommended_next_actions: Vec::new(),
+        },
+    )
 }
 
 /// The completion gap that currently blocks an Objective, if any. Read-only:
@@ -582,11 +666,151 @@ pub fn agentic_program_completion_gap(
         .project_if_exists(&program_id)
         .ok()
         .flatten()?;
+    let root_execution_id = program.root_execution_id.as_deref()?;
+    let goal_id = format!("goal:{root_execution_id}");
+    if let Some(goal) = services.goal_store().projection(&goal_id).ok().flatten() {
+        let bound_to_turn = goal.goal.execution_binding.as_ref().is_some_and(|binding| {
+            binding.objective_id == objective_id
+                && binding.agentic_program_id == program.program_id
+                && binding.session_id == session_id
+                && binding.turn_id == turn_id
+                && binding.root_execution_id == root_execution_id
+        });
+        if bound_to_turn && goal.goal.completion == harness_contract::goal::GoalCompletion::Open {
+            let current_reviews_satisfied = goal.goal.blockers.is_empty()
+                && goal.goal.unresolved.is_empty()
+                && goal.goal.obligations.iter().all(|obligation| {
+                    !obligation.required
+                        || obligation.state
+                            == harness_contract::goal::ObjectiveObligationState::Satisfied
+                })
+                && goal
+                    .goal
+                    .criteria
+                    .iter()
+                    .all(|criterion| match criterion.status {
+                        harness_contract::goal::AcceptanceStatus::Satisfied => goal
+                            .goal
+                            .reviews
+                            .iter()
+                            .rev()
+                            .find(|review| review.criterion_ref == criterion.id)
+                            .is_some_and(|review| {
+                                review.decision == "satisfied"
+                                    && review.spec_revision == goal.goal.spec_revision
+                                    && review.input_manifest_digest == goal.goal.spec_digest
+                            }),
+                        harness_contract::goal::AcceptanceStatus::Waived => true,
+                        _ => false,
+                    });
+            // Name the delivered result refs no current review covers. One
+            // live loop had the root cite four artifacts per request while the
+            // recorded review covered three; nothing told the model which ref
+            // was missing, so it re-issued the same partial review until the
+            // observation window expired.
+            let uncovered_result_refs = {
+                let intent = goal
+                    .goal
+                    .user_intent_criterion_id
+                    .clone()
+                    .unwrap_or_default();
+                let covered = goal
+                    .goal
+                    .reviews
+                    .iter()
+                    .rev()
+                    .find(|review| review.criterion_ref == intent)
+                    .map(|review| review.result_refs.clone())
+                    .unwrap_or_default();
+                // The objective reviewer's own report is evidence of review,
+                // not a delivered result: naming it as uncovered sends the
+                // model into an unbounded review-regress. Filter it out with
+                // the same delivered-set rule the conclusion gate uses.
+                let goal_artifacts = goal
+                    .goal
+                    .evidence_refs
+                    .iter()
+                    .filter(|reference| reference.starts_with("artifact:"))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let delivered =
+                    crate::execution_core::goal::delivered_result_refs(&program, &goal_artifacts);
+                goal.goal
+                    .evidence_refs
+                    .iter()
+                    .filter(|reference| reference.starts_with("artifact:"))
+                    .filter(|reference| delivered.contains(reference))
+                    .filter(|reference| !covered.contains(reference))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            if let Some(gap) = objective_completion_waiting_gap(
+                goal.goal.waiting.as_ref(),
+                current_reviews_satisfied,
+                &uncovered_result_refs,
+            ) {
+                return Some(gap);
+            }
+        }
+    }
     if program.status != crate::AgenticProgramStatus::Open {
         return None;
     }
     let input = completion_objective_input(&program)?;
     crate::agentic::supervision::completion_gap(&program, &input)
+}
+
+fn objective_completion_waiting_gap(
+    waiting: Option<&harness_contract::goal::WaitDescriptor>,
+    current_reviews_satisfied: bool,
+    uncovered_result_refs: &[String],
+) -> Option<String> {
+    let waiting = waiting.filter(|waiting| waiting.reason_code == "completion_gap")?;
+    let review_only = !waiting.required_refs.is_empty()
+        && waiting.required_refs.iter().all(|reference| {
+            reference.starts_with("original_intent_review_required:")
+                || reference.starts_with("criterion_review_required:")
+                || reference.starts_with("criterion_unsatisfied:")
+                || reference
+                    == "cannot satisfy a goal until every current criterion has semantic review or required durable evidence"
+        });
+    if current_reviews_satisfied && review_only {
+        return None;
+    }
+    let mut gap = format!("objective_completion_gap:{}", waiting.reason);
+    if !uncovered_result_refs.is_empty() {
+        gap.push_str(&format!(
+            "; uncovered_result_refs: {}",
+            uncovered_result_refs.join(", ")
+        ));
+    }
+    Some(gap)
+}
+
+/// A satisfied ObjectiveReview is the single semantic proof consumed by the
+/// completion gate. Require it to cover the full result set of the active
+/// completion request; otherwise the Program would durably accept a partial
+/// verdict that can never satisfy `review_covers_current_goal`.
+fn validate_current_objective_review_scope(
+    program: &crate::AgenticProgramProjection,
+    review_result_refs: &[String],
+) -> Result<(), String> {
+    let Some(request) = program.completion_request.as_ref() else {
+        return Ok(());
+    };
+    let missing = request
+        .result_refs
+        .iter()
+        .filter(|reference| !review_result_refs.contains(reference))
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "objective_review_incomplete_current_results: this satisfied verdict must cover every result in the active completion request; missing refs: {}. Read each missing result with evidence_retrieve and complete all returned next_request reads, then submit one objective_review containing the full current result_refs set. Do not repeat a partial satisfied review.",
+        missing.join(", ")
+    ))
 }
 
 /// Count the distinct Teams a submitted artifact integrates: the accepted Task
@@ -647,6 +871,70 @@ mod tests {
         assert!(!is_review_source_changed_retry(
             "Artifact catalog source changed; start a fresh discovery"
         ));
+    }
+
+    #[test]
+    fn objective_review_gap_is_returned_to_the_root_continuation() {
+        let waiting = harness_contract::goal::WaitDescriptor {
+            reason_code: "completion_gap".into(),
+            reason: "original_intent_review_required:user_intent".into(),
+            required_refs: vec!["original_intent_review_required:user_intent".into()],
+            generation: 36,
+        };
+        assert_eq!(
+            objective_completion_waiting_gap(Some(&waiting), false, &[]).as_deref(),
+            Some("objective_completion_gap:original_intent_review_required:user_intent")
+        );
+        let external_wait = harness_contract::goal::WaitDescriptor {
+            reason_code: "waiting_external_decision".into(),
+            ..waiting.clone()
+        };
+        assert_eq!(
+            objective_completion_waiting_gap(Some(&external_wait), false, &[]),
+            None
+        );
+        assert_eq!(
+            objective_completion_waiting_gap(Some(&waiting), true, &[]),
+            None
+        );
+        // Uncovered delivered results are named so the model can complete the
+        // review instead of re-issuing the same partial one.
+        assert_eq!(
+            objective_completion_waiting_gap(
+                Some(&waiting),
+                false,
+                &["artifact:missing".to_string()]
+            )
+            .as_deref(),
+            Some(
+                "objective_completion_gap:original_intent_review_required:user_intent; \
+                 uncovered_result_refs: artifact:missing"
+            )
+        );
+    }
+
+    #[test]
+    fn satisfied_objective_review_must_cover_the_active_completion_result_set() {
+        let mut program = crate::AgenticProgramProjection::empty("program", "objective");
+        program.completion_request = Some(crate::AgenticCompletionRequestProjection {
+            action_id: "complete".into(),
+            requested_by: "root".into(),
+            program_revision: 7,
+            result_refs: vec!["artifact:a".into(), "artifact:b".into()],
+            primary_artifact_ref: Some("artifact:a".into()),
+            evidence_refs: vec![],
+            unresolved: vec![],
+        });
+
+        let error = validate_current_objective_review_scope(&program, &["artifact:a".into()])
+            .expect_err("a partial satisfied review cannot verify this request");
+        assert!(error.contains("artifact:b"));
+        assert!(error.contains("evidence_retrieve"));
+        validate_current_objective_review_scope(
+            &program,
+            &["artifact:a".into(), "artifact:b".into()],
+        )
+        .expect("a complete review scope is allowed");
     }
 
     #[test]
@@ -784,5 +1072,140 @@ mod tests {
             .await
             .expect("no error");
         assert!(!driven, "no Program means no completion to drive");
+    }
+
+    /// A model can corrupt the opaque content suffix of an otherwise real
+    /// tool-call id (one live run cited `tool-raw-...-6` for the durable
+    /// `tool-raw-...-2c77431438342406`). The refusal must stay a refusal -
+    /// accepting the invented id would break evidence integrity - but it must
+    /// name the canonical receipt so the model can repair in one round instead
+    /// of guessing variants until the repetition guard blocks it.
+    #[tokio::test]
+    async fn corrupted_evidence_suffix_is_refused_with_the_canonical_receipt_named() {
+        use harness_contract::agent_action::{AgentActorKind, TaskSubmitInput};
+        use harness_contract::reality::EvidenceRef;
+
+        let canonical = "tool-raw-chatcmpl-tool-aa0d514a557763e5-2c77431438342406";
+        let temp = tempfile::tempdir().expect("temp");
+        let store = std::sync::Arc::new(crate::test_support::session_store());
+        store
+            .create_session(&session::SessionRecord {
+                session_id: "s1".to_string(),
+                platform: "test".to_string(),
+                chat_id: "evidence-hint".to_string(),
+                user_id: None,
+                model: None,
+                created_at: "2026-10-10T00:00:00Z".to_string(),
+                last_activity: "2026-10-10T00:00:00Z".to_string(),
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                status: "active".to_string(),
+            })
+            .await
+            .expect("session");
+        let artifacts = std::sync::Arc::new(
+            crate::ArtifactStore::for_test(
+                temp.path().to_path_buf(),
+                crate::ArtifactStoreConfig::default(),
+            )
+            .expect("artifact store"),
+        );
+        let ports = crate::session_runtime_port::TestSessionPortAdapter::new(store);
+        let facade = crate::context_evidence::raw::RawEvidenceFacade::new(
+            crate::context_evidence::raw::SessionPortRawEvidenceStore::new(
+                ports.clone(),
+                artifacts,
+            ),
+        );
+        let access = facade
+            .persist(crate::context_evidence::raw::RawEvidenceWrite {
+                evidence_ref: EvidenceRef::observed("tool", canonical),
+                session_id: "s1".to_string(),
+                media_type: "text/plain".to_string(),
+                visibility_scope: "session:s1".to_string(),
+                payload: "reviewed body".to_string(),
+                metadata: serde_json::json!({
+                    "tool_name": "read_ref",
+                    "tool_call_id": "chatcmpl-tool-aa0d514a557763e5",
+                }),
+            })
+            .await
+            .expect("durable evidence");
+        assert_eq!(access.evidence_ref.id, canonical);
+
+        let workspace = temp.path().join("ws");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let services = crate::RuntimeServices::test_builder(temp.path(), workspace)
+            .session_ports(ports.clone(), ports.clone(), ports.clone(), ports)
+            .build()
+            .expect("services");
+        let actor = harness_contract::agent_action::AgentActorBinding {
+            objective_id: "objective".to_string(),
+            program_id: "program".to_string(),
+            session_id: "s1".to_string(),
+            turn_id: "turn".to_string(),
+            root_execution_id: None,
+            required_team_count: 0,
+            exact_team_count: None,
+            objective_summary: "review".to_string(),
+            model_lease: "test".to_string(),
+            permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
+            resource_scopes: vec![],
+            actor_id: "agent:1".to_string(),
+            kind: AgentActorKind::Agent,
+            execution_id: None,
+            team_id: None,
+            agent_id: Some("agent:1".to_string()),
+        };
+        let action = AgentAction::TaskSubmit(TaskSubmitInput {
+            task_ref: "task:1".to_string(),
+            deliverable: None,
+            artifact_refs: vec![],
+            evidence_refs: vec!["tool://tool-raw-chatcmpl-tool-aa0d514a557763e5-6".to_string()],
+            unresolved: vec![],
+        });
+        let error = services
+            .validate_agent_action_evidence(&actor, &action)
+            .await
+            .expect_err("a corrupted content suffix must never resolve");
+        assert!(
+            error.contains("tool://tool-raw-chatcmpl-tool-aa0d514a557763e5-6"),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!("tool://{canonical}")),
+            "the refusal must name the canonical receipt: {error}"
+        );
+        assert!(error.contains("copy that exact reference"), "{error}");
+        // The action-id shape a tool result hands the model
+        // (`tool-raw-<call_id>:<attempt>`) names the same durable receipt: the
+        // attempt index cannot select different content, so it must resolve
+        // instead of costing the model its review Task.
+        let attempt_form = AgentAction::TaskSubmit(TaskSubmitInput {
+            task_ref: "task:1".to_string(),
+            deliverable: None,
+            artifact_refs: vec![],
+            evidence_refs: vec![format!("tool://tool-raw-chatcmpl-tool-aa0d514a557763e5:8")],
+            unresolved: vec![],
+        });
+        // The test's Runtime and the evidence facade use separate artifact
+        // stores, so a resolved shape fails later at content resolution. That
+        // is the proof we need: the refusal is no longer "no canonical durable
+        // receipt" - the action-id shape resolved to the recorded receipt.
+        let attempt_error = services
+            .validate_agent_action_evidence(&actor, &attempt_form)
+            .await
+            .expect_err("the test stores are separate, so content resolution fails");
+        assert!(
+            !attempt_error.contains("no canonical durable receipt"),
+            "the action-id shape must resolve to the durable receipt: {attempt_error}"
+        );
+        assert!(
+            attempt_error.contains("points to missing durable content"),
+            "{attempt_error}"
+        );
     }
 }

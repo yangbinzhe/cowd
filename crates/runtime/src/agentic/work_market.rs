@@ -470,12 +470,10 @@ pub(crate) fn apply_task_submit(
                     )
                 })
                 .unwrap_or_else(|| ("report".to_string(), String::new()));
-            let active_claim = projection.tasks.get(&input.task_ref).map(|task| {
-                (
-                    task.claim_execution_id.clone(),
-                    Some(task.claim_generation),
-                )
-            });
+            let active_claim = projection
+                .tasks
+                .get(&input.task_ref)
+                .map(|task| (task.claim_execution_id.clone(), Some(task.claim_generation)));
             projection.artifacts.insert(
                 artifact_ref.clone(),
                 super::program::AgenticArtifactProjection {
@@ -488,7 +486,9 @@ pub(crate) fn apply_task_submit(
                     claim_execution_id: active_claim
                         .as_ref()
                         .and_then(|(execution_id, _)| execution_id.clone()),
-                    claim_generation: active_claim.as_ref().and_then(|(_, generation)| *generation),
+                    claim_generation: active_claim
+                        .as_ref()
+                        .and_then(|(_, generation)| *generation),
                 },
             );
             artifact_refs.push(artifact_ref);

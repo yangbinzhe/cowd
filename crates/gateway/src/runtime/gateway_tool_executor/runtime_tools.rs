@@ -9,15 +9,75 @@
 /// evaluator had cancelled the barrier. A synchronous call here removes the race for the
 /// common case; the barrier's own bounded self-rearm remains the backstop.
 async fn reconcile_program_barrier(services: &runtime::RuntimeServices, program_id: &str) {
-    if let Err(error) = services
-        .resolve_agentic_program_barrier(program_id)
-        .await
-    {
+    if let Err(error) = services.resolve_agentic_program_barrier(program_id).await {
         tracing::debug!(program_id, %error, "Program barrier reconcile after mutation failed");
     }
 }
 
 impl GatewayToolExecutor {
+    /// Absorb a text-protocol corruption at the schema-aware boundary: a weak
+    /// model on the DSML path frequently declares a structured parameter as
+    /// `string="true"`, so an array/object field arrives as a JSON-encoded
+    /// string. When the tool's input schema types that field as array/object
+    /// and the string parses as that exact JSON type, coerce it and let the
+    /// normal contract validation proceed. A field the schema types as string
+    /// is never coerced, so legitimate JSON text in a string field stays
+    /// untouched. One level only; nested shapes belong to the frame-repair
+    /// lane. Returns the repaired field names for observability.
+    fn coerce_string_typed_structured_fields(
+        &self,
+        tool_name: &str,
+        value: &mut serde_json::Value,
+    ) -> Vec<String> {
+        let Some(object) = value.as_object_mut() else {
+            return Vec::new();
+        };
+        let lease = self.tool_host.pin_snapshot();
+        let Some(definition) = lease
+            .snapshot()
+            .catalog
+            .definitions(None)
+            .into_iter()
+            .find(|definition| definition.name == tool_name)
+        else {
+            return Vec::new();
+        };
+        let Some(properties) = definition
+            .input_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+        else {
+            return Vec::new();
+        };
+        let mut repaired = Vec::new();
+        for (field, schema) in properties {
+            let expected = schema.get("type").and_then(serde_json::Value::as_str);
+            if !matches!(expected, Some("array") | Some("object")) {
+                continue;
+            }
+            let Some(serde_json::Value::String(text)) = object.get(field) else {
+                continue;
+            };
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+                continue;
+            };
+            let shape_matches = matches!(
+                (&parsed, expected),
+                (serde_json::Value::Array(_), Some("array"))
+                    | (serde_json::Value::Object(_), Some("object"))
+            );
+            if shape_matches {
+                object.insert(field.clone(), parsed);
+                repaired.push(field.clone());
+            }
+        }
+        repaired
+    }
+
     fn input_contract_error(&self, tool_name: &str, error: impl std::fmt::Display) -> ToolError {
         let lease = self.tool_host.pin_snapshot();
         let definition = lease
@@ -346,6 +406,17 @@ impl GatewayToolExecutor {
         mut value: serde_json::Value,
         binding: RuntimeToolExecutionBinding<'_>,
     ) -> Result<String, ToolError> {
+        // Absorb the text-protocol shape corruption (S1) before any dispatch:
+        // a string-declared array/object field is coerced to its JSON form so
+        // the plan survives instead of dying at the contract boundary.
+        let repaired_fields = self.coerce_string_typed_structured_fields(tool_name, &mut value);
+        if !repaired_fields.is_empty() {
+            tracing::info!(
+                tool_name,
+                ?repaired_fields,
+                "coerced string-typed structured tool input fields at the schema boundary"
+            );
+        }
         if tool_name == "agent_action_batch" {
             return self.execute_agent_action_batch(value, binding).await;
         }
@@ -457,7 +528,10 @@ impl GatewayToolExecutor {
                     resource_scopes: envelope.actor.resource_scopes.clone(),
                 };
                 reconcile_program_barrier(&services, &envelope.actor.program_id).await;
-                match services.dispatch_agentic_followups(&envelope, dispatch_context.clone()).await {
+                match services
+                    .dispatch_agentic_followups(&envelope, dispatch_context.clone())
+                    .await
+                {
                     Ok(dispatches) if !dispatches.is_empty() => {
                         observation.actionable.push(format!(
                             "Runtime admitted {} real Agent execution graph(s)",
@@ -756,7 +830,9 @@ impl GatewayToolExecutor {
             .load_async(graph_id.to_string())
             .await
             .map_err(|error| {
-                ToolError::new(format!("node read could not load graph `{graph_id}`: {error}"))
+                ToolError::new(format!(
+                    "node read could not load graph `{graph_id}`: {error}"
+                ))
             })?;
         let Some(spec) = graph.nodes.iter().find(|spec| spec.id == node_id) else {
             return Err(ToolError::new(format!(
@@ -1486,10 +1562,7 @@ fn unified_read_delegation(reference: &str) -> Result<(&'static str, serde_json:
         | Address::Criterion(id)
         | Address::Obligation(id)
         | Address::Review(id)
-        | Address::Bare(id) => (
-            "state_inspect",
-            serde_json::json!({ "entry_ref": id }),
-        ),
+        | Address::Bare(id) => ("state_inspect", serde_json::json!({ "entry_ref": id })),
         Address::File(_) | Address::Dir(_) | Address::Node { .. } => {
             return Err(
                 "`read` resolves Runtime references (program/task/team/agent/topic/issue/criterion/obligation/review/tool/artifact/session/fact/matrix/memory). Use read_file, glob_search, or grep_search for file:// and dir:// content."
@@ -1519,8 +1592,7 @@ mod unified_read_tests {
             unified_read_delegation("artifact://sha256:deadbeef").expect("artifact routes");
         assert_eq!(reader, "evidence_retrieve");
 
-        let (reader, value) =
-            unified_read_delegation("session://sess:1").expect("session routes");
+        let (reader, value) = unified_read_delegation("session://sess:1").expect("session routes");
         assert_eq!(reader, "context_retrieve");
         assert_eq!(value["source"], "session_history");
 

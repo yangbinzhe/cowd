@@ -285,15 +285,21 @@ pub(super) fn task_objective(
         let Some((topic, entry)) = projection.coordination_wake(revision) else {
             return String::new();
         };
-        return format!("You are coordination Agent `{}`. A member requested help on Task `{}`. Inspect the authorized request below and its referenced evidence, then contribute a useful answer, challenge, or actionable proposal through message_publish on `{}`. Include `{}` in refs so the requester can trace your response. Respect the original execution owner: do not task_claim or task_review from this coordination run. You may propose work, publish an Offer for another task, or invite collaborators within your authorized scope; actual execution requires a new bound run. Do not invent replies or evidence. Your durable response, not final prose, closes this opportunity. No fixed debate rounds are required.\n\nRequest: {}", member.agent_id, task.task_id, topic, entry.entry_id, serde_json::json!(entry));
+        return format!(
+            "You are coordination Agent `{}`. A member requested help on Task `{}`. Inspect the authorized request below and its referenced evidence, then contribute a useful answer, challenge, or actionable proposal through message_publish on `{}`. Include `{}` in refs so the requester can trace your response. Respect the original execution owner: do not task_claim or task_review from this coordination run. You may propose work, publish an Offer for another task, or invite collaborators within your authorized scope; actual execution requires a new bound run. Do not invent replies or evidence. Your durable response, not final prose, closes this opportunity. No fixed debate rounds are required.\n\nRequest: {}",
+            member.agent_id,
+            task.task_id,
+            topic,
+            entry.entry_id,
+            serde_json::json!(entry)
+        );
     }
     let topic_ref = projection.teams.get(&task.team_id).map_or_else(
         || format!("topic:{}", task.team_id),
         |team| team.topic_ref.clone(),
     );
-    let delivery = objective_delivery_instruction(authored_file_write_allowed(
-        &projection.resource_scopes,
-    ));
+    let delivery =
+        objective_delivery_instruction(authored_file_write_allowed(&projection.resource_scopes));
     let hard_rules = if authored_file_write_allowed(&projection.resource_scopes) {
         "硬规则：正文为空会被拒绝；未领取不得提交；不确定的写入 unresolved，不得编造。"
     } else {
@@ -313,8 +319,12 @@ pub(super) fn task_objective(
             topic_ref,
         ),
         DispatchMode::Review => format!(
-            "你是独立复核者 `{}`（不得复核自己）。任务 `{}`，验收判据：{}\n按序执行（勿增加步骤）：\n1) state_inspect 读取该 Task 与其已提交 artifact；\n2) 逐条检查验收判据：针对**每一条**给出“满足/不满足”，并引用你**亲自读取**到的证据（文件/行/字节或回执）；\n3) task_review 给出裁决：\n   - 当证据**确实支持**该条判据时，用 accept（不要因风格、篇幅或措辞拒绝）；\n   - 否则用 rework/challenge，且 `reason` **必须**写明：未满足的**具体条款** + 你实际读取到的**证据缺口**（例如“第(2)条要求 file:line，正文仅…，缺少…”）；禁止笼统拒绝。\n不要重做作者的工作；Runtime 已绑定 artifact，不要把内部存储选择器抄进 evidence_refs。你的 durable review 动作才是裁决。Program: {}。",
-            member.agent_id, task.task_id, task.acceptance, projection.program_id,
+            "你是独立复核者 `{}`（不得复核自己）。任务 `{}`，验收判据：{}\n按序执行（勿增加步骤）：\n1) state_inspect 读取该 Task 与其已提交 artifact；\n2) 逐条检查验收判据：针对**每一条**给出“满足/不满足”，并引用你**亲自读取**到的证据（文件/行/字节或回执）；\n3) task_review 给出裁决：\n   - 当证据**确实支持**该条判据时，用 accept（不要因风格、篇幅或措辞拒绝）；\n   - 否则用 rework/challenge，且 `reason` **必须**写明：未满足的**具体条款** + 你实际读取到的**证据缺口**（例如“第(2)条要求 file:line，正文仅…，缺少…”）；禁止笼统拒绝。\n{scope_discipline}不要重做作者的工作；Runtime 已绑定 artifact，不要把内部存储选择器抄进 evidence_refs。你的 durable review 动作才是裁决。Program: {}。",
+            member.agent_id,
+            task.task_id,
+            task.acceptance,
+            projection.program_id,
+            scope_discipline = crate::agentic::order_contract::REVIEWER_SCOPE_DISCIPLINE,
         ),
     };
     if !task.acceptance_checks.is_empty() {
@@ -324,7 +334,10 @@ pub(super) fn task_objective(
         ));
     }
     if matches!(mode, DispatchMode::Execute) && task.status == AgenticTaskStatus::Rework {
-        if let Some(reason) = task.review_reason.as_deref().filter(|reason| !reason.trim().is_empty())
+        if let Some(reason) = task
+            .review_reason
+            .as_deref()
+            .filter(|reason| !reason.trim().is_empty())
         {
             objective.push_str(&format!(
                 "\n\nA previous review requested rework for this exact reason, which you must resolve before resubmitting: {reason}"
@@ -440,6 +453,10 @@ mod dispatch_mode_contract_tests {
         let mut unique = modes.to_vec();
         unique.sort_unstable();
         unique.dedup();
-        assert_eq!(unique.len(), modes.len(), "each mode must own a distinct exit");
+        assert_eq!(
+            unique.len(),
+            modes.len(),
+            "each mode must own a distinct exit"
+        );
     }
 }

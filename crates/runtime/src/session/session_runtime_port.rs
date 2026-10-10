@@ -394,6 +394,11 @@ impl SessionRuntimeQueryPort for TestSessionPortAdapter {
         session_id: &str,
         evidence_id: &str,
     ) -> Result<Option<harness_contract::context::EvidenceAccessRef>, SessionError> {
+        // Mirror the production tiers: exact id first, then the unique
+        // call-id prefix. A model that corrupts the opaque content suffix of
+        // an otherwise real call id still resolves to the one recorded
+        // receipt; an ambiguous prefix resolves to nothing, like production.
+        let mut prefix_match: Option<harness_contract::context::EvidenceAccessRef> = None;
         let mut from_sequence = 0;
         loop {
             let events = self
@@ -406,7 +411,7 @@ impl SessionRuntimeQueryPort for TestSessionPortAdapter {
                 )
                 .await?;
             if events.is_empty() {
-                return Ok(None);
+                break;
             }
             let mut next_sequence = from_sequence;
             for stored in events {
@@ -419,6 +424,23 @@ impl SessionRuntimeQueryPort for TestSessionPortAdapter {
                 ) {
                     return Ok(Some(access));
                 }
+                let Some(recorded) = event
+                    .payload
+                    .get("evidence_id")
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                if recorded.starts_with(evidence_id) {
+                    if prefix_match.is_some() {
+                        prefix_match = None;
+                        break;
+                    }
+                    prefix_match = crate::context_evidence::raw::access_from_persisted_payload(
+                        recorded,
+                        &event.payload,
+                    );
+                }
             }
             if next_sequence <= from_sequence {
                 return Err(SessionError::Store(
@@ -427,6 +449,7 @@ impl SessionRuntimeQueryPort for TestSessionPortAdapter {
             }
             from_sequence = next_sequence;
         }
+        Ok(prefix_match)
     }
 }
 

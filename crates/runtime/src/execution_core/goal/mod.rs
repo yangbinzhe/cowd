@@ -11,6 +11,7 @@ use sha2::Digest;
 
 pub mod policy;
 mod program_completion;
+pub(crate) use program_completion::delivered_result_refs;
 pub mod supervisor;
 
 pub(crate) use program_completion::PreparedProgramConclusion;
@@ -25,8 +26,8 @@ use harness_contract::goal::{
 };
 
 use crate::{
-    runtime_event_store::RuntimeTransactionEventInput, RuntimeEventInput, RuntimeEventRef,
-    RuntimeEventScope, RuntimeEventStore,
+    RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore,
+    runtime_event_store::RuntimeTransactionEventInput,
 };
 
 #[derive(Clone)]
@@ -251,6 +252,51 @@ impl GoalStore {
     /// Prepare the Goal-side half of an Agentic Objective action. The caller
     /// must commit the returned event in the same transaction as the Program
     /// action through AgentActionService::apply_with_goal_event.
+    /// Resolve an over-qualified criterion/obligation ref (`criterion:goal:<graph>:user_intent`)
+    /// to the plain id the specification knows. A model routinely emits the path
+    /// form; the specification only stores the id. Resolves only when the tail
+    /// matches a live criterion or obligation, so it can never invent a target.
+    fn normalize_criterion_ref(
+        action: &harness_contract::agent_action::AgentAction,
+        current: &harness_contract::goal::GoalContract,
+    ) -> harness_contract::agent_action::AgentAction {
+        use harness_contract::agent_action::AgentAction;
+        let known = |reference: &str| {
+            current
+                .criteria
+                .iter()
+                .any(|criterion| criterion.id == reference)
+                || current
+                    .obligations
+                    .iter()
+                    .any(|obligation| obligation.obligation_id == reference)
+        };
+        let resolve = |reference: &str| {
+            if known(reference) {
+                return reference.to_string();
+            }
+            match reference.rsplit_once(':') {
+                Some((_, tail)) if known(tail) => tail.to_string(),
+                _ => reference.to_string(),
+            }
+        };
+        match action {
+            AgentAction::ObjectiveReview(input) => {
+                let mut input = input.clone();
+                input.criterion_ref = resolve(&input.criterion_ref);
+                AgentAction::ObjectiveReview(input)
+            }
+            AgentAction::ObjectiveUpdate(input) => {
+                let mut input = input.clone();
+                if let Some(reference) = input.criterion_ref.as_deref() {
+                    input.criterion_ref = Some(resolve(reference));
+                }
+                AgentAction::ObjectiveUpdate(input)
+            }
+            other => other.clone(),
+        }
+    }
+
     pub(crate) fn prepare_agentic_objective_action(
         &self,
         envelope: &harness_contract::agent_action::AgentActionEnvelope,
@@ -271,6 +317,9 @@ impl GoalStore {
         let current = self
             .get(&goal_id)?
             .ok_or_else(|| format!("Objective action target {goal_id} not found"))?;
+        // Resolve over-qualified criterion refs before any validation or event
+        // building so both see the plain specification id.
+        let action = Self::normalize_criterion_ref(&envelope.action, &current);
         let binding = current.execution_binding.as_ref().ok_or_else(|| {
             "Objective action target has no immutable GoalExecutionBinding".to_string()
         })?;
@@ -282,9 +331,7 @@ impl GoalStore {
         {
             return Err("Objective action binding does not match the durable Goal".to_string());
         }
-        if let harness_contract::agent_action::AgentAction::ObjectiveUpdate(input) =
-            &envelope.action
-        {
+        if let harness_contract::agent_action::AgentAction::ObjectiveUpdate(input) = &action {
             if matches!(
                 input.operation,
                 harness_contract::agent_action::ObjectiveUpdateOperation::Replace
@@ -309,7 +356,7 @@ impl GoalStore {
                 }
             }
         }
-        if let AgentAction::ObjectiveReview(input) = &envelope.action {
+        if let AgentAction::ObjectiveReview(input) = &action {
             if !current
                 .criteria
                 .iter()
@@ -319,9 +366,21 @@ impl GoalStore {
                     .iter()
                     .any(|obligation| obligation.obligation_id == input.criterion_ref)
             {
-                return Err(
-                    "Objective review criterion or obligation does not exist in the current specification".into(),
-                );
+                let valid = current
+                    .criteria
+                    .iter()
+                    .map(|criterion| criterion.id.as_str())
+                    .chain(
+                        current
+                            .obligations
+                            .iter()
+                            .map(|obligation| obligation.obligation_id.as_str()),
+                    )
+                    .collect::<Vec<_>>();
+                return Err(format!(
+                    "Objective review criterion or obligation does not exist in the current specification; valid ids: [{}]",
+                    valid.join(", ")
+                ));
             }
             if input.decision == ObjectiveReviewDecision::Satisfied {
                 let proof = verification
@@ -340,7 +399,7 @@ impl GoalStore {
         let expected_goal_revision = current.revision;
         let next_sequence = current.user_sequence.saturating_add(1);
         let producer_refs = sorted_unique(producer_refs.to_vec());
-        let (updated, _, event) = match &envelope.action {
+        let (updated, _, event) = match &action {
             AgentAction::ObjectiveUpdate(input) => self.revision_event(
                 &goal_id,
                 expected_goal_revision,
@@ -482,9 +541,7 @@ impl GoalStore {
         {
             return Err("Objective review is missing reviewer identity".to_string());
         }
-        if let harness_contract::agent_action::AgentAction::ObjectiveReview(input) =
-            &envelope.action
-        {
+        if let harness_contract::agent_action::AgentAction::ObjectiveReview(input) = &action {
             let review = updated
                 .reviews
                 .iter()
@@ -514,7 +571,7 @@ impl GoalStore {
                 );
             }
         }
-        let action_entity_ref = match &envelope.action {
+        let action_entity_ref = match &action {
             AgentAction::ObjectiveUpdate(input) => match input.operation {
                 ObjectiveUpdateOperation::Add => updated
                     .criteria
@@ -1475,7 +1532,7 @@ impl GoalStore {
                 }
             }
             GoalCompletion::Open => {
-                return Err("completion cannot transition back to open".to_string())
+                return Err("completion cannot transition back to open".to_string());
             }
             GoalCompletion::Partial
             | GoalCompletion::Blocked
@@ -1492,7 +1549,7 @@ impl GoalStore {
             GoalCompletion::WaitingExternalDecision => "waiting_external".to_string(),
             GoalCompletion::Cancelled => "cancelled".to_string(),
             GoalCompletion::Open => {
-                return Err("completion cannot transition back to open".to_string())
+                return Err("completion cannot transition back to open".to_string());
             }
         };
         goal.evidence_refs = durable_evidence;
@@ -1510,7 +1567,7 @@ impl GoalStore {
                 GoalCompletion::WaitingExternalDecision => "waiting_external",
                 GoalCompletion::Cancelled => "cancelled",
                 GoalCompletion::Open => {
-                    return Err("completion cannot transition back to open".to_string())
+                    return Err("completion cannot transition back to open".to_string());
                 }
             },
             &goal,
@@ -1687,16 +1744,18 @@ impl GoalStore {
                 stream_id.to_string(),
                 expected_revision,
                 transaction_id,
-                vec![RuntimeEventInput {
-                    stream_id: stream_id.to_string(),
-                    scope: RuntimeEventScope::Goal,
-                    kind: kind.to_string(),
-                    status: Some(status.to_string()),
-                    actor: Some(actor.to_string()),
-                    refs,
-                    payload,
-                }
-                .into()],
+                vec![
+                    RuntimeEventInput {
+                        stream_id: stream_id.to_string(),
+                        scope: RuntimeEventScope::Goal,
+                        kind: kind.to_string(),
+                        status: Some(status.to_string()),
+                        actor: Some(actor.to_string()),
+                        refs,
+                        payload,
+                    }
+                    .into(),
+                ],
             )
             .map_err(|error| error.to_string())?;
         Ok(())
@@ -2353,11 +2412,13 @@ mod tests {
                 operation,
                 Some("checked".into()),
             );
-            assert!(services
-                .submit_agent_action(&rejected)
-                .await
-                .unwrap_err()
-                .contains("original user_intent"));
+            assert!(
+                services
+                    .submit_agent_action(&rejected)
+                    .await
+                    .unwrap_err()
+                    .contains("original user_intent")
+            );
             assert_eq!(
                 services
                     .event_store()
@@ -2414,11 +2475,13 @@ mod tests {
         assert_eq!(current.obligations, original.obligations);
         assert_eq!(current.source_intent_ref, original.source_intent_ref);
         assert_eq!(current.spec_revision, 4);
-        assert!(services
-            .submit_agent_action(&review("cannot-review-retired-criterion"))
-            .await
-            .unwrap_err()
-            .contains("does not exist"));
+        assert!(
+            services
+                .submit_agent_action(&review("cannot-review-retired-criterion"))
+                .await
+                .unwrap_err()
+                .contains("does not exist")
+        );
 
         let before = services
             .event_store()
@@ -2632,23 +2695,27 @@ mod tests {
             .complete("goal-test", 1, GoalCompletion::Satisfied, "done")
             .unwrap();
         let before = events.stream_revision("goal:goal-test").unwrap();
-        assert!(store
-            .complete(
-                "goal-test",
-                completed.revision,
-                GoalCompletion::Satisfied,
-                "again"
-            )
-            .is_err());
-        assert!(store
-            .complete_objective("goal-test", completed.revision, terminal_for_test())
-            .is_err());
+        assert!(
+            store
+                .complete(
+                    "goal-test",
+                    completed.revision,
+                    GoalCompletion::Satisfied,
+                    "again"
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .complete_objective("goal-test", completed.revision, terminal_for_test())
+                .is_err()
+        );
         assert_eq!(events.stream_revision("goal:goal-test").unwrap(), before);
     }
 
     #[test]
-    fn objective_terminal_fence_replays_same_result_before_revision_check_and_rejects_changed_evidence(
-    ) {
+    fn objective_terminal_fence_replays_same_result_before_revision_check_and_rejects_changed_evidence()
+     {
         let events = Arc::new(RuntimeEventStore::for_test());
         let store = GoalStore::new(Arc::clone(&events));
         let mut goal = goal();
@@ -2667,10 +2734,12 @@ mod tests {
             completed
         );
         retry.evidence_refs.push("different-evidence".into());
-        assert!(store
-            .complete_objective("goal-test", 1, retry)
-            .unwrap_err()
-            .contains("fence_conflict"));
+        assert!(
+            store
+                .complete_objective("goal-test", 1, retry)
+                .unwrap_err()
+                .contains("fence_conflict")
+        );
         assert_eq!(events.stream_revision("goal:goal-test").unwrap(), before);
     }
 
@@ -2678,9 +2747,11 @@ mod tests {
     fn goal_revision_is_monotonic_and_completion_requires_acceptance() {
         let store = GoalStore::new(Arc::new(RuntimeEventStore::for_test()));
         store.create(goal()).unwrap();
-        assert!(store
-            .complete("goal-test", 1, GoalCompletion::Satisfied, "done")
-            .is_err());
+        assert!(
+            store
+                .complete("goal-test", 1, GoalCompletion::Satisfied, "done")
+                .is_err()
+        );
         let (revised, revision) = store
             .revise("goal-test", 1, 2, "evidence checked", |goal| {
                 goal.criteria[0].status = AcceptanceStatus::Satisfied;
@@ -2838,6 +2909,85 @@ mod tests {
         assert_eq!(
             projection.intervention_traces[0].trigger_observation_keys,
             vec![trigger.idempotency_fingerprint()]
+        );
+    }
+
+    #[tokio::test]
+    async fn over_qualified_criterion_ref_resolves_to_the_plain_id() {
+        use harness_contract::agent_action::*;
+        let services = crate::RuntimeServices::in_memory().unwrap();
+        let material = services
+            .artifact_store()
+            .write_bytes(
+                harness_contract::context::ArtifactWriteDescriptor {
+                    media_type: "text/plain".into(),
+                    visibility_scope: "session:session-test".into(),
+                    expected_bytes: None,
+                    original_name: None,
+                },
+                b"review body",
+            )
+            .await
+            .unwrap();
+        let mut original = goal();
+        original.id = "goal:over-qualified-root".into();
+        original.scope = harness_contract::goal::GoalScope::UserObjective;
+        original.execution_binding = Some(harness_contract::goal::GoalExecutionBinding {
+            objective_id: "over-qualified-objective".into(),
+            session_id: original.session_id.clone(),
+            turn_id: "over-qualified-turn".into(),
+            root_execution_id: "over-qualified-root".into(),
+            agentic_program_id: "over-qualified-program".into(),
+        });
+        services.goal_store().create(original.clone()).unwrap();
+        let actor = AgentActorBinding {
+            objective_id: "over-qualified-objective".into(),
+            program_id: "over-qualified-program".into(),
+            session_id: "session-test".into(),
+            turn_id: "over-qualified-turn".into(),
+            root_execution_id: Some("over-qualified-root".into()),
+            required_team_count: 0,
+            exact_team_count: None,
+            objective_summary: original.objective.clone(),
+            model_lease: "test".into(),
+            permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
+            resource_scopes: vec![],
+            actor_id: "over-qualified-actor".into(),
+            kind: AgentActorKind::Root,
+            execution_id: None,
+            team_id: None,
+            agent_id: None,
+        };
+        // The over-qualified path a model routinely emits; the specification
+        // only knows the plain id, so the boundary must resolve the tail.
+        let applied = services
+            .submit_agent_action(&AgentActionEnvelope {
+                action_id: "over-qualified-review".into(),
+                actor: actor.clone(),
+                expected_revision: None,
+                action: AgentAction::ObjectiveReview(ObjectiveReviewInput {
+                    criterion_ref: "criterion:goal:goal:over-qualified:checked".into(),
+                    decision: ObjectiveReviewDecision::Gap,
+                    result_refs: vec![],
+                    evidence_refs: vec![material.selector.clone()],
+                    reason_ref: material.selector.clone(),
+                }),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            applied.status,
+            AgentActionStatus::Applied,
+            "an over-qualified criterion ref must resolve to the live criterion"
+        );
+        let updated = services.goal_store().get(&original.id).unwrap().unwrap();
+        assert!(
+            updated
+                .reviews
+                .iter()
+                .any(|review| review.criterion_ref == "checked"),
+            "the stored review must carry the plain criterion id: {:?}",
+            updated.reviews
         );
     }
 }

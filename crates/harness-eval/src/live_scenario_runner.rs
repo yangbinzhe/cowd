@@ -6,16 +6,16 @@ use std::{
 
 use reqwest::{
     blocking::Client,
-    header::{HeaderMap, HeaderValue, AUTHORIZATION},
+    header::{AUTHORIZATION, HeaderMap, HeaderValue},
 };
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    HarnessEvalRunnerOptions,
     live_scenario_observer::{LiveScenarioObserver, MAX_DRAIN_PAGES_PER_PROBE},
     session_actor::SessionActor,
-    HarnessEvalRunnerOptions,
 };
 
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -292,8 +292,7 @@ const GROUP_THEORY_SOURCE_PATHS: [&str; 3] = [
     "crates/runtime/src/agentic/execution.rs",
 ];
 
-const LARGE_SCALE_TERMINAL_COVERAGE_CLAUSE: &str =
-    "最终结论必须原样包含结构化覆盖声明“12/12 目标源码已完整读取到 EOF”和独立复核声明“12/12 目标源码已由两个不同 Agent 身份独立完整读取到 EOF”；只有 Runtime 的完整读取收据证明全部目标满足时才允许输出，否则必须保留 unresolved 并拒绝请求 Objective 完成。";
+const LARGE_SCALE_TERMINAL_COVERAGE_CLAUSE: &str = "最终结论必须原样包含结构化覆盖声明“12/12 目标源码已完整读取到 EOF”和独立复核声明“12/12 目标源码已由两个不同 Agent 身份独立完整读取到 EOF”；只有 Runtime 的完整读取收据证明全部目标满足时才允许输出，否则必须保留 unresolved 并拒绝请求 Objective 完成。";
 
 /// An operator may isolate named production-path scenarios without changing
 /// the default suite. This is useful for a costly, focused provider exercise
@@ -481,7 +480,7 @@ pub fn run_live_gateway_scenarios(options: &HarnessEvalRunnerOptions) -> Value {
                 "gateway_url": base_url,
                 "reason": format!("cannot build live scenario HTTP client: {error}"),
                 "scenarios": [],
-            })
+            });
         }
     };
     let runner = LiveScenarioRunner {
@@ -1198,9 +1197,12 @@ impl LiveScenarioRunner {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
         let actor = match &resume_session {
-            Some(session_id) => {
-                SessionActor::resume(&self.client, &self.base_url, session_id, "harness-eval-live")
-            }
+            Some(session_id) => SessionActor::resume(
+                &self.client,
+                &self.base_url,
+                session_id,
+                "harness-eval-live",
+            ),
             None => SessionActor::create(
                 &self.client,
                 &self.base_url,
@@ -1237,7 +1239,12 @@ impl LiveScenarioRunner {
                 }
                 Err(error) => {
                     return failed_scenario_with_session(
-                        spec, started, trace, session_id, error, Value::Null,
+                        spec,
+                        started,
+                        trace,
+                        session_id,
+                        error,
+                        Value::Null,
                     );
                 }
             }
@@ -1593,7 +1600,10 @@ impl LiveScenarioRunner {
                     "no durable execution progress before the nominal scenario wait elapsed after {}ms; nominal wait={}ms, absolute safety wait={}ms, phase={}, last_active_phase={}, message_cursor={}, timeline_cursor={}",
                     elapsed.as_millis(),
                     timeout.nominal_wait.as_millis(),
-                    timeout.absolute_wait.map(|wait| wait.as_millis()).map_or_else(|| "none".to_string(), |wait| wait.to_string()),
+                    timeout
+                        .absolute_wait
+                        .map(|wait| wait.as_millis())
+                        .map_or_else(|| "none".to_string(), |wait| wait.to_string()),
                     observer.phase(),
                     observer.last_active_phase(),
                     observer.next_message_sequence(),
@@ -1612,7 +1622,10 @@ impl LiveScenarioRunner {
                     elapsed.as_millis(),
                     timeout.inactivity_wait.as_millis(),
                     timeout.nominal_wait.as_millis(),
-                    timeout.absolute_wait.map(|wait| wait.as_millis()).map_or_else(|| "none".to_string(), |wait| wait.to_string()),
+                    timeout
+                        .absolute_wait
+                        .map(|wait| wait.as_millis())
+                        .map_or_else(|| "none".to_string(), |wait| wait.to_string()),
                     observer.phase(),
                     observer.last_active_phase(),
                     observer.progress_observations(),
@@ -1786,13 +1799,51 @@ impl LiveScenarioRunner {
 
     /// Derive the Agent-first protocol rungs reached from a collected timeline.
     fn agentic_progress_from_timeline(timeline: &Value) -> Value {
-        let serialized = serde_json::to_string(timeline).unwrap_or_default();
-        let count = |needle: &str| serialized.matches(needle).count();
-        let teams = count("\"team_create\"");
-        let published = count("\"task_publish\"");
-        let submitted = count("\"task_submit\"");
-        let reviewed = count("\"task_review\"");
-        let completion_requested = serialized.contains("objective_complete_request");
+        let mut seen = BTreeSet::new();
+        let mut teams = 0;
+        let mut published = 0;
+        let mut submitted = 0;
+        let mut reviewed = 0;
+        let mut completion_requested = false;
+        for event in timeline
+            .get("events")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if event.get("kind").and_then(Value::as_str) != Some("agentic.action_applied") {
+                continue;
+            }
+            let payload = &event["payload"];
+            let identity = payload
+                .get("action_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| {
+                    event
+                        .get("commit_cursor")
+                        .and_then(Value::as_u64)
+                        .map(|cursor| format!("cursor:{cursor}"))
+                });
+            if identity
+                .as_ref()
+                .is_some_and(|identity| !seen.insert(identity.clone()))
+            {
+                continue;
+            }
+            let action = payload
+                .pointer("/envelope/action/kind")
+                .and_then(Value::as_str)
+                .or_else(|| payload.get("action_kind").and_then(Value::as_str));
+            match action {
+                Some("team_create") => teams += 1,
+                Some("task_publish") => published += 1,
+                Some("task_submit") => submitted += 1,
+                Some("task_review") => reviewed += 1,
+                Some("objective_complete_request") => completion_requested = true,
+                _ => {}
+            }
+        }
         let mut remaining = Vec::new();
         if teams == 0 {
             remaining.push("team_create".to_string());
@@ -3053,6 +3104,7 @@ impl LiveAcceptance {
                 quality: None,
                 checks: vec![
                     json!({"name": "response_contains", "expected": expected, "passed": response.contains(expected)}),
+                    json!({"name": "durable_response", "passed": !response.trim().is_empty()}),
                 ],
             },
             Self::RequiresToolEvidence {
@@ -3348,9 +3400,28 @@ fn finalize_live_acceptance(
     root_execution_id: &str,
 ) -> LiveAcceptanceResult {
     let outcome = root_business_outcome(timeline, root_execution_id);
-    // Did the harness let this run reach a terminal state, as distinct from whether the objective was satisfied? The two were one gate, so a hung run and an unfinished run looked identical. An aborted run never reaches this function.
-    let durable = result.checks.iter().find(|c| c["name"] == "durable_response").and_then(|c| c["passed"].as_bool()).unwrap_or(false);
-    result.checks.push(json!({"name": "run_reached_terminal_state", "passed": durable && !timeline_terminal_aborted(timeline) && outcome.event_status.is_some(), "evidence": {"durable_response": durable, "root_outcome_status": outcome.event_status}}));
+    // Execution closure, durable user delivery, and business success are three
+    // independent facts. Keeping them separate makes a terminal-but-partial
+    // execution distinguishable from a missing answer or a satisfied Goal.
+    let durable = result
+        .checks
+        .iter()
+        .find(|c| c["name"] == "durable_response")
+        .and_then(|c| c["passed"].as_bool())
+        .unwrap_or(false);
+    if !result
+        .checks
+        .iter()
+        .any(|check| check["name"] == "durable_response")
+    {
+        result.checks.push(json!({
+            "name": "durable_response",
+            "passed": false,
+            "evidence": {"reason": "acceptance did not provide persisted response evidence"},
+        }));
+    }
+    let execution_terminal = !timeline_terminal_aborted(timeline) && outcome.event_status.is_some();
+    result.checks.push(json!({"name": "run_reached_terminal_state", "passed": execution_terminal, "evidence": {"root_outcome_status": outcome.event_status}}));
     result.checks.push(json!({
         "name": "root_business_outcome_succeeded",
         "execution_graph_ref": root_execution_id,
@@ -3358,7 +3429,7 @@ fn finalize_live_acceptance(
         "observed_terminal_class": outcome.terminal_class,
         "passed": outcome.passed,
     }));
-    result.passed &= outcome.passed;
+    result.passed &= durable && execution_terminal && outcome.passed;
     result
 }
 
@@ -4949,7 +5020,11 @@ mod scenario_tool_advertisement_tests {
                 continue;
             };
             let list = rest.split('。').next().unwrap_or("");
-            for name in list.split('、').map(str::trim).filter(|name| !name.is_empty()) {
+            for name in list
+                .split('、')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            {
                 assert!(
                     catalog.contains(name) || runtime_readonly.contains(&name),
                     "a scenario prompt advertises `{name}`, which the runtime does not expose"
@@ -4957,6 +5032,9 @@ mod scenario_tool_advertisement_tests {
                 checked += 1;
             }
         }
-        assert!(checked >= 7, "expected to validate the scenario tool lists, checked {checked}");
+        assert!(
+            checked >= 7,
+            "expected to validate the scenario tool lists, checked {checked}"
+        );
     }
 }

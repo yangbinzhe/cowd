@@ -322,12 +322,14 @@ mod tests {
         let store = Arc::new(RuntimeEventStore::for_test());
         let commits = crate::ExecutionCommitService::new(Arc::clone(&store));
         let (old, task) = source(&store, &commits);
-        assert!(crate::session_continuation::latest_same_session_candidate(
-            &store,
-            &old.session_id,
-            "new-turn"
-        )
-        .is_err());
+        assert!(
+            crate::session_continuation::latest_same_session_candidate(
+                &store,
+                &old.session_id,
+                "new-turn"
+            )
+            .is_err()
+        );
         stop(&commits, &store, "old-root");
         let before = crate::AgentActionService::new(Arc::clone(&store))
             .project(&old.program_id)
@@ -402,9 +404,11 @@ mod tests {
             )
             .unwrap(),
         );
-        assert!(commits
-            .register_graph_with_continuation(rival, Some(actor("rival-turn", "rival-root")))
-            .is_err());
+        assert!(
+            commits
+                .register_graph_with_continuation(rival, Some(actor("rival-turn", "rival-root")))
+                .is_err()
+        );
         assert!(store.list_stream("rival-root").unwrap().is_empty());
     }
 
@@ -420,12 +424,14 @@ mod tests {
         });
         commits.register_graph(child).unwrap();
         stop(&commits, &store, "old-root");
-        assert!(crate::session_continuation::latest_same_session_candidate(
-            &store,
-            &old.session_id,
-            "new-turn"
-        )
-        .is_err());
+        assert!(
+            crate::session_continuation::latest_same_session_candidate(
+                &store,
+                &old.session_id,
+                "new-turn"
+            )
+            .is_err()
+        );
         stop(&commits, &store, "old-child");
         let (candidate, revision) = crate::session_continuation::latest_same_session_candidate(
             &store,
@@ -456,9 +462,11 @@ mod tests {
                 payload: json!({}),
             })
             .unwrap();
-        assert!(commits
-            .register_graph_with_continuation(next, Some(actor("new-turn", "new-root")))
-            .is_err());
+        assert!(
+            commits
+                .register_graph_with_continuation(next, Some(actor("new-turn", "new-root")))
+                .is_err()
+        );
         assert!(store.list_stream("new-root").unwrap().is_empty());
     }
     #[test]
@@ -508,10 +516,12 @@ mod tests {
         assert_eq!(pending.status, AgenticTaskStatus::Blocked);
         assert_eq!(pending.claim_generation, 6);
         assert!(pending.claim_execution_id.is_none());
-        assert!(pending
-            .unresolved
-            .iter()
-            .any(|gap| gap.starts_with("continuation_effect_reconciliation:")));
+        assert!(
+            pending
+                .unresolved
+                .iter()
+                .any(|gap| gap.starts_with("continuation_effect_reconciliation:"))
+        );
     }
 
     #[tokio::test]

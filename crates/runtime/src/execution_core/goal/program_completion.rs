@@ -50,6 +50,40 @@ fn completion_reopen_count(event_store: &crate::RuntimeEventStore, program_id: &
         .unwrap_or(0)
 }
 
+/// The delivered result set: the artifacts accepted work produced. The
+/// objective reviewer's own report is evidence of review, not a result, and
+/// requiring a review to cover it is an unbounded regress - each review
+/// artifact becomes the next uncovered ref, so the Objective can never close.
+/// Agents whose Runtime-bound role marks them as the objective reviewer are
+/// identified structurally, so this holds regardless of task naming.
+pub(crate) fn delivered_result_refs(
+    program: &crate::AgenticProgramProjection,
+    request_refs: &[String],
+) -> Vec<String> {
+    let objective_reviewers = program
+        .agents
+        .values()
+        .filter(|agent| {
+            let role = agent.role.to_ascii_lowercase();
+            role.contains("objective review")
+        })
+        .map(|agent| agent.agent_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    if objective_reviewers.is_empty() {
+        return request_refs.to_vec();
+    }
+    request_refs
+        .iter()
+        .filter(|reference| {
+            !program.artifacts.values().any(|artifact| {
+                artifact.artifact_ref == **reference
+                    && objective_reviewers.contains(artifact.committed_by.as_str())
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 fn review_covers_current_goal(
     goal: &GoalContract,
     program: &AgenticProgramProjection,
@@ -268,6 +302,13 @@ impl GoalStore {
             .user_intent_criterion_id
             .clone()
             .ok_or("missing original user intent")?;
+        // The objective reviewer's own report is evidence OF review, never a
+        // delivered result. One live loop cited it in every completion
+        // request, so each new review artifact became the next uncovered ref
+        // and the collaboration could never close (14 reviews, 0 verdicts).
+        // The delivered result set is what accepted work produced; artifacts
+        // committed by the Runtime-bound objective reviewer are excluded.
+        let delivered_result_refs = delivered_result_refs(program, &request.result_refs);
         let reviewed = goal
             .reviews
             .iter()
@@ -278,7 +319,7 @@ impl GoalStore {
                     &goal,
                     program,
                     review,
-                    &request.result_refs,
+                    &delivered_result_refs,
                     &evidence,
                     policy.as_ref(),
                     review
@@ -333,7 +374,28 @@ impl GoalStore {
             }
         }
         if !reviewed {
-            gaps.push(format!("original_intent_review_required:{intent}"));
+            // Name the cited results no current review covers. A live loop had
+            // the root cite four artifacts while the recorded review covered
+            // three; without the missing refs the model re-issued the same
+            // partial review until the observation window expired.
+            let covered = goal
+                .reviews
+                .iter()
+                .rev()
+                .find(|review| review.criterion_ref == intent)
+                .map(|review| review.result_refs.clone())
+                .unwrap_or_default();
+            let mut gap = format!("original_intent_review_required:{intent}");
+            let missing = request
+                .result_refs
+                .iter()
+                .filter(|reference| !covered.contains(reference))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                gap.push_str(&format!("; uncovered_result_refs: {}", missing.join(", ")));
+            }
+            gaps.push(gap);
         }
         let stale_criteria = goal
             .criteria
@@ -490,6 +552,69 @@ impl GoalStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn the_objective_reviewers_own_report_is_not_a_delivered_result() {
+        // Requiring a review to cover its own report is an unbounded regress:
+        // every review artifact becomes the next uncovered ref, so the
+        // Objective can never close (one live loop: 14 reviews, 0 verdicts).
+        let mut program = crate::AgenticProgramProjection::empty("program", "objective");
+        for (id, role) in [
+            ("agent:producer", "source reader"),
+            ("agent:reviewer", "fresh independent objective reviewer"),
+        ] {
+            program.agents.insert(
+                id.to_string(),
+                crate::AgentMemberProjection {
+                    agent_id: id.to_string(),
+                    display_name: id.to_string(),
+                    role: role.to_string(),
+                    mission: "work".to_string(),
+                    required_capabilities: vec![],
+                    invited_by: "root".to_string(),
+                    membership_ids: vec![],
+                    definition_ref: None,
+                    model_profile_ref: None,
+                    expertise_hints: vec![],
+                    execution_requirements: vec![],
+                },
+            );
+        }
+        program.artifacts.insert(
+            "artifact:delivered".to_string(),
+            crate::AgenticArtifactProjection {
+                artifact_ref: "artifact:delivered".to_string(),
+                content_ref: "artifact://art_delivered".to_string(),
+                kind: "report".to_string(),
+                title: "delivered fact".to_string(),
+                relates_to: vec![],
+                committed_by: "agent:producer".to_string(),
+                claim_execution_id: None,
+                claim_generation: None,
+            },
+        );
+        program.artifacts.insert(
+            "artifact:review-report".to_string(),
+            crate::AgenticArtifactProjection {
+                artifact_ref: "artifact:review-report".to_string(),
+                content_ref: "artifact://art_review".to_string(),
+                kind: "report".to_string(),
+                title: "objective review report".to_string(),
+                relates_to: vec![],
+                committed_by: "agent:reviewer".to_string(),
+                claim_execution_id: None,
+                claim_generation: None,
+            },
+        );
+        let delivered = delivered_result_refs(
+            &program,
+            &[
+                "artifact:delivered".to_string(),
+                "artifact:review-report".to_string(),
+            ],
+        );
+        assert_eq!(delivered, vec!["artifact:delivered".to_string()]);
+    }
+
     use harness_contract::agent_action::{
         AgentAction, AgentActionEnvelope, AgentActionStatus, AgentActorBinding, AgentActorKind,
         MessagePublishInput, ObjectiveCompleteRequestInput, TeamCreateInput,
@@ -563,10 +688,10 @@ mod tests {
                     actor: actor.clone(),
                     expected_revision: None,
                     action: AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
-                    blocked: false,
-                    blocked_reason: None,
-                    human_review_required: false,
-                    recommended_next_actions: Vec::new(),
+                        blocked: false,
+                        blocked_reason: None,
+                        human_review_required: false,
+                        recommended_next_actions: Vec::new(),
                         result_refs: vec!["tool://result".into()],
                         evidence_refs: vec!["tool://evidence".into()],
                         unresolved: vec![],
@@ -752,19 +877,23 @@ mod tests {
                 payload: serde_json::json!({}),
             })
             .unwrap();
-        assert!(actions
-            .commit_program_conclusion(&program, conclusion)
-            .is_err());
+        assert!(
+            actions
+                .commit_program_conclusion(&program, conclusion)
+                .is_err()
+        );
         assert_eq!(
             actions.project(&actor.program_id).unwrap().revision,
             program.revision
         );
-        assert!(goals
-            .get("goal:root-completion")
-            .unwrap()
-            .unwrap()
-            .terminal
-            .is_none());
+        assert!(
+            goals
+                .get("goal:root-completion")
+                .unwrap()
+                .unwrap()
+                .terminal
+                .is_none()
+        );
     }
 
     #[test]
@@ -781,10 +910,12 @@ mod tests {
         let program = actions.project(&actor.program_id).unwrap();
         let prepared = goals.prepare_program_conclusion(&program).unwrap();
         assert!(prepared.goal.terminal.is_none());
-        assert!(prepared
-            .gaps
-            .iter()
-            .any(|gap| gap.starts_with("original_intent_review_required:")));
+        assert!(
+            prepared
+                .gaps
+                .iter()
+                .any(|gap| gap.starts_with("original_intent_review_required:"))
+        );
     }
 
     #[test]
@@ -793,10 +924,12 @@ mod tests {
         let before = actions.project(&actor.program_id).unwrap();
         let prepared = goals.prepare_program_conclusion(&before).unwrap();
         assert!(prepared.goal.terminal.is_none());
-        assert!(prepared
-            .gaps
-            .iter()
-            .any(|gap| gap.starts_with("original_intent_review_required:")));
+        assert!(
+            prepared
+                .gaps
+                .iter()
+                .any(|gap| gap.starts_with("original_intent_review_required:"))
+        );
         actions
             .commit_program_conclusion(&before, prepared)
             .unwrap();
@@ -804,12 +937,14 @@ mod tests {
         let after = restarted.project(&actor.program_id).unwrap();
         assert_eq!(after.status, crate::AgenticProgramStatus::Open);
         assert!(after.completion_request.is_none());
-        assert!(goals
-            .get("goal:root-completion")
-            .unwrap()
-            .unwrap()
-            .waiting
-            .is_some());
+        assert!(
+            goals
+                .get("goal:root-completion")
+                .unwrap()
+                .unwrap()
+                .waiting
+                .is_some()
+        );
         let new_work = restarted
             .apply(&AgentActionEnvelope {
                 action_id: "fill-gap".into(),
@@ -826,6 +961,64 @@ mod tests {
     }
 
     #[test]
+    fn reconciling_an_existing_completion_request_reopens_goal_for_missing_review() {
+        let (events, goals, actions, actor) = fixture(false);
+        let before = actions.project(&actor.program_id).unwrap();
+        assert_eq!(
+            before.status,
+            crate::AgenticProgramStatus::CompletionRequested
+        );
+        assert!(before.completion_request.is_some());
+        assert!(
+            goals
+                .get("goal:root-completion")
+                .unwrap()
+                .unwrap()
+                .waiting
+                .is_none()
+        );
+
+        let supervisor =
+            crate::execution_core::goal::ObjectiveSupervisor::new(Arc::new(GoalStore::new(events)));
+        let reconciled = crate::agentic::supervision::reconcile_completion_request(
+            &actions,
+            &supervisor,
+            &actor.program_id,
+        )
+        .unwrap()
+        .expect("existing request must be reduced");
+
+        assert_eq!(reconciled.status, crate::AgenticProgramStatus::Open);
+        assert!(reconciled.completion_request.is_none());
+        let goal = goals.get("goal:root-completion").unwrap().unwrap();
+        assert_eq!(goal.completion, GoalCompletion::Open);
+        assert_eq!(
+            goal.waiting
+                .as_ref()
+                .map(|waiting| waiting.reason_code.as_str()),
+            Some("completion_gap")
+        );
+        assert!(
+            goal.waiting
+                .as_ref()
+                .expect("waiting")
+                .required_refs
+                .iter()
+                .any(|reference| reference
+                    .starts_with("original_intent_review_required:user_intent"))
+        );
+        // The gap names the cited results no review covers, so the model can
+        // complete the review instead of re-issuing a partial one.
+        let mut goal = goal;
+        let required_refs = goal.waiting.take().expect("waiting").required_refs;
+        assert!(
+            required_refs
+                .iter()
+                .any(|reference| reference.contains("uncovered_result_refs: tool://result"))
+        );
+    }
+
+    #[test]
     fn later_gap_review_supersedes_an_earlier_satisfied_review() {
         let (_, goals, actions, actor) = fixture(true);
         goals
@@ -839,20 +1032,24 @@ mod tests {
             .unwrap();
         let program = actions.project(&actor.program_id).unwrap();
         let prepared = goals.prepare_program_conclusion(&program).unwrap();
-        assert!(prepared
-            .gaps
-            .iter()
-            .any(|gap| gap.starts_with("original_intent_review_required:")));
+        assert!(
+            prepared
+                .gaps
+                .iter()
+                .any(|gap| gap.starts_with("original_intent_review_required:"))
+        );
         let reopened = actions
             .commit_program_conclusion(&program, prepared)
             .unwrap();
         assert_eq!(reopened.status, crate::AgenticProgramStatus::Open);
-        assert!(goals
-            .get("goal:root-completion")
-            .unwrap()
-            .unwrap()
-            .terminal
-            .is_none());
+        assert!(
+            goals
+                .get("goal:root-completion")
+                .unwrap()
+                .unwrap()
+                .terminal
+                .is_none()
+        );
     }
 
     #[test]
@@ -892,10 +1089,10 @@ mod tests {
                 actor: actor.clone(),
                 expected_revision: None,
                 action: AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
-                blocked: false,
-                blocked_reason: None,
-                human_review_required: false,
-                recommended_next_actions: Vec::new(),
+                    blocked: false,
+                    blocked_reason: None,
+                    human_review_required: false,
+                    recommended_next_actions: Vec::new(),
                     result_refs: vec!["tool://result".into()],
                     evidence_refs: vec!["tool://evidence".into()],
                     unresolved: vec![],
@@ -904,12 +1101,14 @@ mod tests {
             .unwrap();
         assert_eq!(requested.status, AgentActionStatus::Applied);
         let current = actions.project(&actor.program_id).unwrap();
-        assert!(goals
-            .prepare_program_conclusion(&current)
-            .unwrap()
-            .gaps
-            .iter()
-            .any(|gap| gap.starts_with("original_intent_review_required:")));
+        assert!(
+            goals
+                .prepare_program_conclusion(&current)
+                .unwrap()
+                .gaps
+                .iter()
+                .any(|gap| gap.starts_with("original_intent_review_required:"))
+        );
     }
 
     #[test]
@@ -930,19 +1129,23 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(actions
-            .commit_program_conclusion(&before, prepared)
-            .is_err());
+        assert!(
+            actions
+                .commit_program_conclusion(&before, prepared)
+                .is_err()
+        );
         assert_eq!(
             actions.project(&actor.program_id).unwrap().revision,
             before.revision
         );
-        assert!(goals
-            .get("goal:root-completion")
-            .unwrap()
-            .unwrap()
-            .terminal
-            .is_none());
+        assert!(
+            goals
+                .get("goal:root-completion")
+                .unwrap()
+                .unwrap()
+                .terminal
+                .is_none()
+        );
     }
 
     #[test]
@@ -961,17 +1164,21 @@ mod tests {
                 payload: serde_json::json!({}),
             })
             .unwrap();
-        assert!(actions
-            .commit_program_conclusion(&before, prepared)
-            .is_err());
+        assert!(
+            actions
+                .commit_program_conclusion(&before, prepared)
+                .is_err()
+        );
         let goal = goals.get("goal:root-completion").unwrap().unwrap();
         assert_eq!(goal.revision, 1);
         assert!(goal.terminal.is_none());
-        assert!(actions
-            .project(&actor.program_id)
-            .unwrap()
-            .objective_verdict
-            .is_none());
+        assert!(
+            actions
+                .project(&actor.program_id)
+                .unwrap()
+                .objective_verdict
+                .is_none()
+        );
     }
 
     #[test]
@@ -1084,14 +1291,18 @@ mod tests {
         let program = actions.project(&actor.program_id).unwrap();
         let prepared = goals.prepare_program_conclusion(&program).unwrap();
         assert!(prepared.goal.terminal.is_none());
-        assert!(prepared
-            .gaps
-            .iter()
-            .any(|gap| gap.contains("original-verification")));
-        assert!(prepared
-            .gaps
-            .iter()
-            .any(|gap| gap.starts_with("original_intent_review_required:")));
+        assert!(
+            prepared
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("original-verification"))
+        );
+        assert!(
+            prepared
+                .gaps
+                .iter()
+                .any(|gap| gap.starts_with("original_intent_review_required:"))
+        );
         actions
             .commit_program_conclusion(&program, prepared)
             .unwrap();

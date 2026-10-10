@@ -25,8 +25,8 @@ struct DispatchStarvationState {
     next_attempt_at_ms: u64,
 }
 
-fn dispatch_starvation_ledger(
-) -> &'static std::sync::Mutex<std::collections::BTreeMap<String, DispatchStarvationState>> {
+fn dispatch_starvation_ledger()
+-> &'static std::sync::Mutex<std::collections::BTreeMap<String, DispatchStarvationState>> {
     DISPATCH_STARVATION.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
 }
 
@@ -98,11 +98,7 @@ fn dispatch_starvation_count(key: &str) -> usize {
     ledger.get(key).map_or(0, |state| state.count)
 }
 
-fn dispatch_starvation_key(
-    program_id: &str,
-    task_ref: &str,
-    mode: DispatchMode,
-) -> String {
+fn dispatch_starvation_key(program_id: &str, task_ref: &str, mode: DispatchMode) -> String {
     format!("{program_id}|{task_ref}|{}", mode.as_str())
 }
 
@@ -142,9 +138,11 @@ pub(crate) fn stranded_task_refs(projection: &crate::AgenticProgramProjection) -
 }
 
 pub(crate) fn dispatch_unplaced_for_task(program_id: &str, task_ref: &str) -> bool {
-    [DispatchMode::Execute, DispatchMode::Review].iter().any(|mode| {
-        dispatch_starvation_count(&dispatch_starvation_key(program_id, task_ref, *mode)) > 0
-    })
+    [DispatchMode::Execute, DispatchMode::Review]
+        .iter()
+        .any(|mode| {
+            dispatch_starvation_count(&dispatch_starvation_key(program_id, task_ref, *mode)) > 0
+        })
 }
 
 /// Opt-in verbose tool-contract logging (`COWD_TOOL_CONTRACT_TRACE=1`). Only
@@ -297,7 +295,10 @@ mod execution_graph_id_tests {
     /// named existed. Any id handed to that store must be a graph id.
     #[test]
     fn an_agent_run_id_is_translated_to_the_graph_it_names() {
-        assert_eq!(execution_graph_id("run:agentic-graph:abc"), "agentic-graph:abc");
+        assert_eq!(
+            execution_graph_id("run:agentic-graph:abc"),
+            "agentic-graph:abc"
+        );
         assert_eq!(
             execution_graph_id("run:session-ingress-graph:44a9b9b3fb4a4b76"),
             "session-ingress-graph:44a9b9b3fb4a4b76"
@@ -309,7 +310,10 @@ mod execution_graph_id_tests {
     #[test]
     fn a_graph_id_is_left_alone() {
         assert_eq!(execution_graph_id("agentic-graph:abc"), "agentic-graph:abc");
-        assert_eq!(execution_graph_id("session-ingress-graph:abc"), "session-ingress-graph:abc");
+        assert_eq!(
+            execution_graph_id("session-ingress-graph:abc"),
+            "session-ingress-graph:abc"
+        );
         assert_eq!(execution_graph_id(""), "");
     }
 
@@ -321,7 +325,6 @@ mod execution_graph_id_tests {
         assert_eq!(execution_graph_id("runs:abc"), "runs:abc");
     }
 }
-
 
 fn agentic_supervisor_actor(
     projection: &AgenticProgramProjection,
@@ -389,9 +392,7 @@ impl RuntimeServices {
         // ones. Stable for equal counts.
         execute_requests.sort_by_key(|(task_ref, mode)| {
             std::cmp::Reverse(dispatch_starvation_count(&dispatch_starvation_key(
-                program_id,
-                task_ref,
-                *mode,
+                program_id, task_ref, *mode,
             )))
         });
         requests.append(&mut review_requests);
@@ -815,7 +816,9 @@ impl RuntimeServices {
                         .map(|graph| agentic_graph_is_terminal(&graph))
                         .map_err(|error| error.to_string())?
                 }
-                Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => {
+                Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound {
+                    ..
+                }) => {
                     // Supervisor registration is durable before the executor
                     // can start.  No graph means no effect was admitted.
                     true
@@ -911,9 +914,7 @@ impl RuntimeServices {
     /// or model action will retrigger -- e.g. an invited member that had not
     /// started, or a Task that was `Submitted` while its independent Review
     /// graph was never admitted. `DispatchFlight` keeps it idempotent.
-    pub async fn reconcile_open_agentic_programs(
-        self: &Arc<Self>,
-    ) -> Result<usize, String> {
+    pub async fn reconcile_open_agentic_programs(self: &Arc<Self>) -> Result<usize, String> {
         let excluded_sessions = BTreeSet::new();
         let receipts = self
             .recover_agentic_programs_on_startup_excluding_sessions(&excluded_sessions)
@@ -1364,7 +1365,9 @@ impl RuntimeServices {
                             missing_tool_alternatives = %admission.missing_tool_alternatives.join(","),
                             "agent tool contract degraded: requested capability lacks a usable tool"
                         );
-                        record_tool_contract_milestone(self, projection, task, member, mode, &admission);
+                        record_tool_contract_milestone(
+                            self, projection, task, member, mode, &admission,
+                        );
                     } else if tool_contract_trace() {
                         tracing::info!(
                             program_id = %projection.program_id,
@@ -1471,11 +1474,13 @@ impl RuntimeServices {
                     // terminal graphs awaiting their normal settlement.
                     return Ok(Vec::new());
                 }
-                Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => {}
+                Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound {
+                    ..
+                }) => {}
                 Err(error) => {
                     return Err(format!(
                         "agentic_graph_admission_read_failed:{graph_id}:{error}"
-                    ))
+                    ));
                 }
             }
             let node_id = format!("{graph_id}:agent");
@@ -1899,7 +1904,10 @@ mod lane_routing_tests {
     fn lane_routing_is_opt_in_and_never_changes_the_default() {
         // Unset (or blank) lane model inherits the concrete program lease.
         assert_eq!(routed_lane_model(None, "program-model"), "program-model");
-        assert_eq!(routed_lane_model(Some("   "), "program-model"), "program-model");
+        assert_eq!(
+            routed_lane_model(Some("   "), "program-model"),
+            "program-model"
+        );
         // An explicit lane model wins for that lane only.
         assert_eq!(
             routed_lane_model(Some("deepseek-v4-flash"), "program-model"),
@@ -1910,8 +1918,8 @@ mod lane_routing_tests {
     #[test]
     fn dispatch_starvation_ledger_counts_then_clears() {
         use super::{
-            dispatch_starvation_bound, dispatch_starvation_clear, dispatch_starvation_key,
-            dispatch_starvation_record, DispatchMode,
+            DispatchMode, dispatch_starvation_bound, dispatch_starvation_clear,
+            dispatch_starvation_key, dispatch_starvation_record,
         };
         let key = dispatch_starvation_key("program-test", "task-test", DispatchMode::Execute);
         dispatch_starvation_clear(&key);

@@ -11,6 +11,7 @@ pub(crate) mod coordination;
 pub(crate) mod execution;
 mod ingress;
 pub(crate) mod issues;
+pub(crate) mod order_contract;
 mod program;
 mod read_model;
 pub(crate) mod review_evidence;
@@ -25,8 +26,8 @@ pub(crate) use action_service::{
     AgenticTopicObservationAck, AgenticWaitDisposition, TopicObservationKind,
 };
 pub(crate) use execution::start_agentic_claim_heartbeat;
-pub(crate) use ingress::agentic_program_completion_gap;
 pub use execution::{AgenticDispatchContext, AgenticDispatchReceipt};
+pub(crate) use ingress::agentic_program_completion_gap;
 pub use program::{
     AgentMemberProjection, AgenticArtifactProjection, AgenticCompletionRequestProjection,
     AgenticMembershipLifecycle, AgenticMembershipProjection, AgenticObjectiveVerdictProjection,

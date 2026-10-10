@@ -1,7 +1,7 @@
 mod policy;
 mod results;
 pub(crate) use policy::{
-    effect_review_snapshot, root_self_review_policy, RootReviewPolicySnapshot,
+    RootReviewPolicySnapshot, effect_review_snapshot, root_self_review_policy,
 };
 // Independent review reads existing Runtime receipts; it never mints effects.
 use std::collections::{BTreeMap, BTreeSet};
@@ -203,20 +203,20 @@ fn record_effect_observation(
     }
 }
 
-    /// The review path reads through the durable-verified store, not the hot cache.
-    /// Event notification precedes the writer's cache publish, so a hot read can miss
-    /// a graph that exists; a failure produced by that window is timing, not a dead
-    /// end, and must not be counted as one. This is the read the store's own comment
-    /// prescribes for a consumer acknowledging a notification.
-    async fn physical_packet(
-        services: &RuntimeServices,
-        graph_id: &str,
-    ) -> Result<AgentTaskPacket, String> {
-        let graph = services
-            .graph_state_store()
-            .load_current_async(graph_id.to_string())
-            .await
-            .map_err(|error| error.to_string())?;
+/// The review path reads through the durable-verified store, not the hot cache.
+/// Event notification precedes the writer's cache publish, so a hot read can miss
+/// a graph that exists; a failure produced by that window is timing, not a dead
+/// end, and must not be counted as one. This is the read the store's own comment
+/// prescribes for a consumer acknowledging a notification.
+async fn physical_packet(
+    services: &RuntimeServices,
+    graph_id: &str,
+) -> Result<AgentTaskPacket, String> {
+    let graph = services
+        .graph_state_store()
+        .load_current_async(graph_id.to_string())
+        .await
+        .map_err(|error| error.to_string())?;
     graph
         .nodes
         .iter()
@@ -273,7 +273,8 @@ impl RuntimeServices {
                     .execution_id
                     .as_deref()
                     .ok_or("review has no physical run")?,
-            ).await?;
+            )
+            .await?;
             let scope = packet
                 .agentic_binding
                 .as_ref()
@@ -709,7 +710,10 @@ impl RuntimeServices {
                 .collect::<Vec<_>>()
         };
         if !missing.is_empty() {
-            return Err(format!("review_requires_current_physical_reads:{}; use evidence_retrieve and follow every next_request for the current result", missing.join(",")));
+            return Err(format!(
+                "review_requires_current_physical_reads:{}; use evidence_retrieve and follow every next_request for the current result",
+                missing.join(",")
+            ));
         }
         let unobserved = coverage
             .values()
@@ -722,7 +726,10 @@ impl RuntimeServices {
             .map(|state| state.proof.result_ref.as_str())
             .collect::<Vec<_>>();
         if !unobserved.is_empty() {
-            return Err(format!("review_requires_effect_observation:{}; independently read the actual affected target after the effect", unobserved.join(",")));
+            return Err(format!(
+                "review_requires_effect_observation:{}; independently read the actual affected target after the effect",
+                unobserved.join(",")
+            ));
         }
         Ok(IndependentReview {
             producers: producers.into_iter().collect(),
@@ -862,10 +869,12 @@ mod tests {
             &[scope("other")],
             "wrong-target",
         );
-        assert!(coverage["result:1"]
-            .proof
-            .effect_observation_refs
-            .is_empty());
+        assert!(
+            coverage["result:1"]
+                .proof
+                .effect_observation_refs
+                .is_empty()
+        );
         record_effect_observation(&results, &mut coverage, 12, &[scope("a")], "read-a");
         assert_eq!(
             coverage["result:1"].effect_scopes_remaining,
@@ -964,7 +973,15 @@ mod tests {
             "run:agentic-graph:other",
             graph
         ));
-        assert!(!packet_identity_matches(graph, run, "run:agentic-graph:bf5d8374a4c8"));
-        assert!(!packet_identity_matches(graph, run, "agentic-graph:bf5d8374a4c8"));
+        assert!(!packet_identity_matches(
+            graph,
+            run,
+            "run:agentic-graph:bf5d8374a4c8"
+        ));
+        assert!(!packet_identity_matches(
+            graph,
+            run,
+            "agentic-graph:bf5d8374a4c8"
+        ));
     }
 }

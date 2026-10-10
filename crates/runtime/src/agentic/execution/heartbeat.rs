@@ -1,19 +1,16 @@
-use super::*;
 use super::dispatch::execution_graph_id;
+use super::*;
 
-/// How many times one Task's lease may be renewed before the keeper gives up.
-///
-/// Renewal exists to keep a live claim from expiring while the Agent works. It is
-/// not a way to keep a claim alive forever: an Agent that claimed a Task and then
-/// stopped making progress left this keeper renewing for minutes in one live run,
-/// while the root turn waited for a Program closure that never came. Once the cap
-/// is reached the lease is allowed to expire, which is a path Runtime already
-/// owns - the Task becomes reclaimable (`task_claim_expired`) rather than stuck.
-fn claim_heartbeat_renewal_cap() -> u32 {
-    std::env::var("COWD_AGENTIC_CLAIM_RENEWAL_CAP")
+/// Maximum time a claimed Task may make no durable execution-graph progress while
+/// its physical Agent execution remains alive. This reclaims genuinely stalled
+/// work without imposing an arbitrary total runtime on healthy long-running Tasks.
+fn claim_heartbeat_stall_timeout() -> std::time::Duration {
+    let seconds = std::env::var("COWD_AGENTIC_CLAIM_STALL_SECS")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(12)
+        .filter(|value: &u64| *value > 0)
+        .unwrap_or(12 * 60);
+    std::time::Duration::from_secs(seconds)
 }
 
 fn claim_heartbeat_interval_ms() -> u64 {
@@ -63,8 +60,32 @@ pub(super) fn agentic_graph_is_terminal(graph: &ExecutionGraph) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum AgenticClaimDriverState {
     AwaitingAgentClaim,
-    Owned,
+    Owned { graph_revision: u64 },
     Stop,
+}
+
+struct ClaimProgressWatch {
+    timeout: std::time::Duration,
+    graph_revision: Option<u64>,
+    last_progress_at: tokio::time::Instant,
+}
+
+impl ClaimProgressWatch {
+    fn new(timeout: std::time::Duration, now: tokio::time::Instant) -> Self {
+        Self {
+            timeout,
+            graph_revision: None,
+            last_progress_at: now,
+        }
+    }
+
+    fn stalled(&mut self, graph_revision: u64, now: tokio::time::Instant) -> bool {
+        if self.graph_revision != Some(graph_revision) {
+            self.graph_revision = Some(graph_revision);
+            self.last_progress_at = now;
+        }
+        now.duration_since(self.last_progress_at) >= self.timeout
+    }
 }
 
 pub(super) async fn agentic_claim_heartbeat_state(
@@ -114,7 +135,9 @@ pub(super) async fn agentic_claim_heartbeat_state(
         && task.claimant.as_deref() == actor.agent_id.as_deref()
         && task.claim_execution_id.as_deref() == Some(execution_id)
     {
-        return AgenticClaimDriverState::Owned;
+        return AgenticClaimDriverState::Owned {
+            graph_revision: graph.revision,
+        };
     }
     AgenticClaimDriverState::Stop
 }
@@ -125,9 +148,10 @@ pub(super) async fn renew_agentic_claim_if_active(
     execution_id: &str,
     actor: &harness_contract::agent_action::AgentActorBinding,
 ) -> bool {
-    if agentic_claim_heartbeat_state(services.clone(), task_ref, execution_id, actor).await
-        != AgenticClaimDriverState::Owned
-    {
+    if !matches!(
+        agentic_claim_heartbeat_state(services.clone(), task_ref, execution_id, actor).await,
+        AgenticClaimDriverState::Owned { .. }
+    ) {
         return false;
     }
     let Some(services) = services.upgrade() else {
@@ -281,7 +305,8 @@ pub(super) async fn run_agentic_claim_heartbeat(
     // `interval` ticks immediately; consume that tick so Runtime never
     // renews before the Agent has claimed.
     heartbeat.tick().await;
-    let mut renewals: u32 = 0;
+    let mut progress_watch =
+        ClaimProgressWatch::new(claim_heartbeat_stall_timeout(), tokio::time::Instant::now());
     loop {
         match agentic_claim_heartbeat_state(services.clone(), &task_ref, &execution_id, &actor)
             .await
@@ -291,17 +316,15 @@ pub(super) async fn run_agentic_claim_heartbeat(
                     return;
                 }
             }
-            AgenticClaimDriverState::Owned => {
-                // A claim that is never worked on must not be kept alive by its
-                // own keeper. Each renewal here means the Task is still `Claimed`
-                // and nothing moved it forward, so after the cap the lease is
-                // allowed to expire instead of being renewed forever.
-                renewals += 1;
-                if renewals > claim_heartbeat_renewal_cap() {
+            AgenticClaimDriverState::Owned { graph_revision } => {
+                let now = tokio::time::Instant::now();
+                if progress_watch.stalled(graph_revision, now) {
+                    let stalled_for = now.duration_since(progress_watch.last_progress_at);
                     tracing::debug!(
                         %task_ref,
-                        renewals,
-                        "agentic claim heartbeat stopped renewing; the lease is allowed to expire"
+                        graph_revision,
+                        stalled_for_ms = stalled_for.as_millis() as u64,
+                        "agentic claim heartbeat stopped renewing after graph progress stalled; the lease is allowed to expire"
                     );
                     return;
                 }
@@ -331,23 +354,30 @@ pub(super) async fn run_agentic_claim_heartbeat(
 }
 
 #[cfg(test)]
-mod renewal_cap_tests {
+mod stall_timeout_tests {
     use super::*;
 
-    /// The keeper renews while a Task stays `Claimed`, so without a finite cap it
-    /// renews forever. One live run spent twenty-three minutes after its last
-    /// real action renewing a claim nobody was working on, while the root turn
-    /// waited for a closure that never came. The cap is what makes the keeper
-    /// terminate and hands the lease back to the reclaim path Runtime already has.
     #[test]
-    fn the_renewal_cap_is_finite_and_positive() {
+    fn the_stall_timeout_is_positive() {
         assert!(
-            claim_heartbeat_renewal_cap() > 0,
-            "a zero cap would expire a lease before the Agent could work"
+            !claim_heartbeat_stall_timeout().is_zero(),
+            "a zero inactivity window would expire a lease before the Agent could work"
         );
-        assert!(
-            claim_heartbeat_renewal_cap() <= 64,
-            "a cap this large is no cap at all"
-        );
+    }
+
+    #[test]
+    fn graph_progress_resets_the_stall_window_without_a_total_runtime_cap() {
+        let start = tokio::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(12 * 60);
+        let mut watch = ClaimProgressWatch::new(timeout, start);
+
+        assert!(!watch.stalled(1, start));
+        assert!(watch.stalled(1, start + timeout));
+        assert!(!watch.stalled(2, start + timeout));
+        assert!(!watch.stalled(
+            2,
+            start + timeout + timeout - std::time::Duration::from_secs(1)
+        ));
+        assert!(watch.stalled(2, start + timeout + timeout));
     }
 }

@@ -4,10 +4,10 @@
 //! authorization, concurrency, persistence, recovery and terminal truth.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::execution_core::RuntimeExecutionDecision;
 use crate::AgentCatalogEntry;
+use crate::execution_core::RuntimeExecutionDecision;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeCapability {
@@ -196,6 +196,8 @@ pub fn runtime_capability_primer() -> String {
         "You own semantic decisions: Team purpose, roles, Tasks, dependencies, discussion, challenge, replanning, synthesis, and WHEN to close the Objective. Runtime owns actor identity, authorization, revisions, idempotency, leases, concurrent execution, durable artifacts, recovery, and terminal truth. Publish independent Tasks without artificial dependencies so Runtime can execute them concurrently. A Task is complete only after a real claimant submits durable evidence and a different Agent accepts it.",
         "## Shortest path first",
         "Decide the whole answer before the first call, then make the calls. Reach the result in the FEWEST provider round-trips: every call you can issue in this response, issue now. Batch independent work into ONE response, or into one `tool_orchestrate` program (batch / map / compute) instead of a chain of single calls.",
+        "## Text tool-call frame (only if you emit calls as text markup)",
+        "Some deployments cannot use native function calls and emit tool calls as a text frame. When you do, use exactly: <｜｜DSML｜｜tool_calls> wrapping one <｜｜DSML｜｜invoke name=\"TOOL\"> per action, each wrapping one <｜｜DSML｜｜parameter name=\"FIELD\" string=\"false\">VALUE</｜｜DSML｜｜parameter> for arrays/objects and string=\"true\" for plain text. Batch by putting SEVERAL invoke blocks in ONE frame - never nest actions inside another tool (no agent_action_batch wrapper): every parameter that the schema types as array or object must be emitted with string=\"false\" and raw JSON inside.",
         "Prefer parallelizing independent tool calls.",
         "Never move large file bodies into context: read only the range you need, and run counting/aggregation/filtering inside `tool_orchestrate` compute/collect or `execute_code`, returning only a summary plus a `tool://` ref.",
         "## Closure discipline",
@@ -394,7 +396,11 @@ mod prompt_core_tests {
     #[test]
     fn primer_is_short_and_states_ownership_and_exit_discipline() {
         let primer = runtime_capability_primer();
-        assert!(primer.len() <= 4_200, "primer must stay small: {}", primer.len());
+        assert!(
+            primer.len() <= 4_200,
+            "primer must stay small: {}",
+            primer.len()
+        );
         assert!(primer.contains("Shortest path first"));
         assert!(primer.contains("Prefer parallelizing independent tool calls."));
         assert!(primer.contains("closure.exit_ready"));
@@ -449,12 +455,20 @@ mod collaboration_rule_tests {
 
     #[test]
     fn collaboration_rules_never_prescribe_a_topology() {
-        let primer = runtime_capability_primer()
-            + &render_tool_guidance(&std::collections::BTreeSet::new());
-        for banned in ["must create", "至少", "至少 N", "at least N Team", "N 个团队"] {
+        let primer =
+            runtime_capability_primer() + &render_tool_guidance(&std::collections::BTreeSet::new());
+        for banned in [
+            "must create",
+            "至少",
+            "至少 N",
+            "at least N Team",
+            "N 个团队",
+        ] {
             assert!(!primer.contains(banned), "prescriptive topology: {banned}");
         }
-        assert!(primer.contains("For simple or straightforward work you do not need to spawn anything at all"));
+        assert!(primer.contains(
+            "For simple or straightforward work you do not need to spawn anything at all"
+        ));
     }
 }
 

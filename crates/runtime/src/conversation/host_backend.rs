@@ -121,6 +121,67 @@ where
             return Ok(precommitted_terminal_outcome(ticket));
         }
         {
+            // A weak model woken by `all_tasks_accepted` can coordinate forever
+            // without making the exit decision (Qwen v6: 162 steps, 0 requests).
+            // Once every framework-owned rung has been satisfied for several
+            // consecutive root steps, drive the completion request on the
+            // root's behalf. The drive stays behind the completion_gap gate, so
+            // an Objective that is not genuinely complete is never forced.
+            let (session_id, turn_id, owns_root) = {
+                let state = self.state.lock().await;
+                (
+                    state.session_id.clone(),
+                    state.turn_id.clone(),
+                    state.execution_role.owns_root_presentation(),
+                )
+            };
+            if owns_root {
+                if let Some(program) = super::root_agentic_program_projection(
+                    self.services.as_ref(),
+                    &session_id,
+                    &turn_id,
+                ) {
+                    let outstanding = super::outstanding_closure_steps(&program)
+                        .into_iter()
+                        .filter(|step| step != "objective_complete_request")
+                        .count();
+                    let gap = crate::agentic::agentic_program_completion_gap(
+                        self.services.as_ref(),
+                        &session_id,
+                        &turn_id,
+                    );
+                    let mut state = self.state.lock().await;
+                    if outstanding == 0 && gap.is_none() && program.completion_request.is_none() {
+                        state.closure_ready_steps = state.closure_ready_steps.saturating_add(1);
+                        if state.closure_ready_steps >= closure_drive_after_steps() {
+                            state.closure_ready_steps = 0;
+                            drop(state);
+                            match self
+                                .services
+                                .drive_agentic_objective_completion(
+                                    &session_id,
+                                    &turn_id,
+                                    &ticket.graph_id,
+                                )
+                                .await
+                            {
+                                Ok(true) => tracing::info!(
+                                    "closure-ready drive submitted the completion request on the root's behalf"
+                                ),
+                                Ok(false) => {}
+                                Err(error) => tracing::warn!(
+                                    %error,
+                                    "closure-ready drive declined"
+                                ),
+                            }
+                        }
+                    } else {
+                        state.closure_ready_steps = 0;
+                    }
+                }
+            }
+        }
+        {
             // Objective-level wall-clock budget for a required-Team turn. Checked
             // at the top of every root model step so it cannot be bypassed by the
             // clean-terminal-synthesis short circuit below. The no-progress fuse
@@ -659,7 +720,10 @@ where
                 ContextSourceKind::Task,
                 ContextRole::Instruction,
                 format!(
-                    "This Objective requires at least {required_team_count} real Team execution(s). You retain semantic control: decide the Teams, roles, Tasks, dependencies, discussion and replanning. Batch independent work into one round or one `tool_orchestrate` program. Use team_create, agent_invite, task_publish and the other small Agent actions; Runtime binds identities, leases and execution. When failed or challenged work must be replaced or split, first publish its concrete successor Task(s), then use task_supersede with durable evidence; retirement never counts as accepted work. Write plans and long results as normal content and commit references—never submit a complete graph or long JSON.{scope_note} Request completion only after committed artifacts, independent review and all required Teams are complete."
+                    "This Objective requires at least {required_team_count} real Team execution(s). You retain semantic control: decide the Teams, roles, Tasks, dependencies, discussion and replanning. Batch independent work into one round or one `tool_orchestrate` program. Use team_create, agent_invite, task_publish and the other small Agent actions; Runtime binds identities, leases and execution. When failed or challenged work must be replaced or split, first publish its concrete successor Task(s), then use task_supersede with durable evidence; retirement never counts as accepted work. Write plans and long results as normal content and commit references—never submit a complete graph or long JSON.{scope_note} Request completion only after committed artifacts, independent review and all required Teams are complete. Design Tasks so no model capability is wasted: scope each Task to a batch of related reads (not one file per Task), and instruct reviewers to verify through `evidence_retrieve` on the claimant's durable receipt instead of re-reading source files - a receipt carries the same bytes with a Runtime-bound hash. One live run re-read a single lib.rs 40 times across agents; every re-read of already-read content is avoidable spend. {task_authoring} {economy}"
+                    ,
+                    task_authoring = crate::agentic::order_contract::TASK_AUTHORING_DISCIPLINE,
+                    economy = crate::agentic::order_contract::EVIDENCE_ECONOMY,
                 ),
             );
             item.authority = ContextAuthority::System;
@@ -1060,7 +1124,14 @@ where
                 } else {
                     step.intent.clone()
                 };
-                if force_text_only_response || step.text_only_response {
+                // A zero-tool clean synthesis is text-only by construction: the
+                // request exposed no schemas, so any call the provider parsed
+                // out of the response is a contract violation, not work. One
+                // live run had a model emit `objective_complete_request`
+                // during exactly such a request and Runtime durably executed
+                // it, feeding the request/reject loop the gap guidance was
+                // trying to break.
+                if force_text_only_response || step.text_only_response || clean_terminal_synthesis {
                     intent = match intent {
                         ModelStepIntent::ToolCalls { .. } => {
                             let final_text = step
@@ -2349,6 +2420,7 @@ where
                     goal_id,
                     iteration,
                     protocol_attempt,
+                    frame_repair_attempt,
                     post_receipt_failure,
                     clean_terminal_synthesis_attempted,
                     observation_identity,
@@ -2413,11 +2485,42 @@ where
                                 state.provider_protocol_recovery_attempts.saturating_add(1);
                             state.provider_protocol_recovery_attempts
                         });
+                    // A malformed tool-call frame is a deterministic, model
+                    // repairable defect: the intended action is usually fully
+                    // visible in the rejected frame. Prior successful receipts
+                    // say nothing about whether THIS frame is repairable, so
+                    // `post_receipt_failure` must not convert one bad frame
+                    // into a zero-tool terminal that silently discards the
+                    // model's in-flight plan. One bounded repair continuation
+                    // feeds the exact validation error back and lets the model
+                    // re-emit; a second identical failure escalates as before.
+                    // A tool-input-contract error is the same class of defect as
+                    // a malformed provider frame: the model's intended action is
+                    // fully visible and one re-emission away from working. The
+                    // early dispatcher surfaces it as an ordinary step error
+                    // (not a provider protocol failure), so without this it
+                    // falls into the catch-all Synthesize and the plan is
+                    // silently dropped - the exact loop Qwen v9 died in.
+                    let repairable_tool_frame = protocol_failure
+                        || repairable_tool_input_error(&reason);
+                    let frame_repair_attempt = provider_frame_repair_attempt(
+                        repairable_tool_frame,
+                        tool_exposure_miss,
+                        post_receipt_failure,
+                        terminal_provider_route_failure,
+                        clean_terminal_synthesis,
+                        state.provider_frame_repair_attempts,
+                    );
+                    if frame_repair_attempt.is_some() {
+                        state.provider_frame_repair_attempts =
+                            state.provider_frame_repair_attempts.saturating_add(1);
+                    }
                     let identity = runtime_observation_identity(&self.services, &state, ticket);
                     (
                         state.goal_id.clone(),
                         state.iterations,
                         protocol_attempt,
+                        frame_repair_attempt,
                         post_receipt_failure,
                         state.clean_terminal_synthesis_attempted,
                         identity,
@@ -2474,6 +2577,22 @@ where
                     (pending_delegated_protocol, agentic_recovery_attempt)
                 {
                     delegation_intervention(&goal_id, ticket, &protocol, attempt)
+                } else if let Some(attempt) = frame_repair_attempt {
+                    // The rejected frame is Runtime-owned validation evidence:
+                    // hand it back verbatim so the model re-emits the same
+                    // intended action in valid schema. Synthesizing here would
+                    // silently drop a plan that was one shape error away from
+                    // closing the Objective.
+                    let kind = provider_protocol_intervention_kind(attempt);
+                    harness_contract::goal::RuntimeIntervention {
+                        goal_id: goal_id.clone(),
+                        kind,
+                        reason: format!(
+                            "the prior response carried a tool-call frame Runtime could not parse (attempt {attempt} of {PROVIDER_FRAME_REPAIR_BUDGET}); committed evidence is preserved - re-emit the same intended action(s) in the exact exposed schema"
+                        ),
+                        evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
+                        expected_graph_revision: None,
+                    }
                 } else if post_receipt_failure && !tool_exposure_miss {
                     let already_synthesizing =
                         clean_terminal_synthesis || clean_terminal_synthesis_attempted;
@@ -2625,6 +2744,14 @@ where
                                 state.force_text_only_next_model = false;
                                 state.force_tool_allowlist_next_model = None;
                                 protocol.continuation_instruction()
+                            } else if let Some(attempt) = frame_repair_attempt {
+                                let detail = protocol_failure_detail
+                                    .as_deref()
+                                    .map(|detail| format!(" Exact validation evidence: {detail}"))
+                                    .unwrap_or_default();
+                                format!(
+                                    "Runtime tool-frame repair (attempt {attempt} of {PROVIDER_FRAME_REPAIR_BUDGET}): your previous tool call was rejected by Runtime's frame parser before it could run, so nothing from it was executed.{detail} Re-emit the SAME intended action(s) now, in the exact exposed schema, with every field at its declared type (an array field must be a JSON array, never a string). Keep arguments compact and issue independent actions in one batch. Do not summarize, do not produce a final answer, and do not repeat the rejected frame unchanged."
+                                )
                             } else if protocol_failure {
                                 let detail = protocol_failure_detail
                                     .as_deref()
@@ -2839,6 +2966,103 @@ fn next_unverified_model_step_streak(current: usize, made_verified_progress: boo
     }
 }
 
+/// One bounded repair continuation for a malformed tool-call frame. A frame
+/// defect is deterministic and model-repairable, so prior successful receipts
+/// (`post_receipt_failure`) must not convert it into a zero-tool terminal that
+/// discards the model's in-flight plan. Tool-exposure misses keep their own
+/// governed path, an unavailable provider route cannot be repaired by
+/// re-emitting a frame, and a step that is already a zero-tool synthesis has
+/// no frame contract left to honor.
+/// Whether a step error is a tool-input-contract violation the model can
+/// repair by re-emitting the same intended action in the correct shape. These
+/// are Runtime-owned error strings (the governed tool contracts), never model
+/// output, so matching them cannot be gamed by the model.
+fn repairable_tool_input_error(reason: &str) -> bool {
+    const MARKERS: [&str; 6] = [
+        "requires a non-empty",
+        "unknown field",
+        "expected one of",
+        "invalid_input",
+        "input_contract",
+        "is not a $reference",
+    ];
+    MARKERS.iter().any(|marker| reason.contains(marker))
+}
+
+pub(super) fn provider_frame_repair_attempt(
+    protocol_failure: bool,
+    tool_exposure_miss: bool,
+    post_receipt_failure: bool,
+    terminal_provider_route_failure: bool,
+    clean_terminal_synthesis: bool,
+    attempts_so_far: u8,
+) -> Option<u8> {
+    (protocol_failure
+        && !tool_exposure_miss
+        && post_receipt_failure
+        && !terminal_provider_route_failure
+        && !clean_terminal_synthesis
+        && attempts_so_far < PROVIDER_FRAME_REPAIR_BUDGET)
+        .then_some(attempts_so_far.saturating_add(1))
+}
+
+#[test]
+fn a_tool_input_contract_error_is_repairable_but_a_transport_error_is_not() {
+    // The governed tool contracts' own error strings name a shape the model can
+    // re-emit; a transport/route failure cannot be repaired by re-emitting.
+    assert!(repairable_tool_input_error(
+        "agent_action_batch requires a non-empty `actions` array"
+    ));
+    assert!(
+        repairable_tool_input_error(
+            "task_publish evidence tool://x has no canonical durable receipt"
+        ) == false
+    );
+    assert!(
+        repairable_tool_input_error("provider stream attempt failed before terminal completion")
+            == false
+    );
+}
+
+#[test]
+#[cfg(test)]
+fn malformed_frame_earns_one_repair_attempt_even_after_receipts() {
+    assert_eq!(
+        provider_frame_repair_attempt(true, false, true, false, false, 0),
+        Some(1)
+    );
+    // The budget is a hard bound: a second identical defect escalates.
+    assert_eq!(
+        provider_frame_repair_attempt(true, false, true, false, false, 1),
+        None
+    );
+    // Not a frame failure at all.
+    assert_eq!(
+        provider_frame_repair_attempt(false, false, true, false, false, 0),
+        None
+    );
+    // Tool-exposure misses own their governed retry.
+    assert_eq!(
+        provider_frame_repair_attempt(true, true, true, false, false, 0),
+        None
+    );
+    // Without prior receipts the existing single protocol retry owns the case.
+    assert_eq!(
+        provider_frame_repair_attempt(true, false, false, false, false, 0),
+        None
+    );
+    // An unavailable route is not repairable by re-emitting a frame.
+    assert_eq!(
+        provider_frame_repair_attempt(true, false, true, true, false, 0),
+        None
+    );
+    // A zero-tool synthesis step has no frame contract to repair.
+    assert_eq!(
+        provider_frame_repair_attempt(true, false, true, false, true, 0),
+        None
+    );
+}
+
 /// How many consecutive identical (same tool set, canonical args and result)
 /// tool batches before a loop-breaker notice is injected into the next model
 /// request. The notice is advisory: it gives a weak model a chance to correct
@@ -2961,9 +3185,8 @@ fn stub_duplicate_result_payloads(messages: &mut [ConversationMessage]) -> usize
             let key = (tool_name.clone(), output.clone());
             match first_seen.get(&key) {
                 Some(origin) => {
-                    *output = format!(
-                        "[duplicate identical `{tool_name}` result omitted; see {origin}]"
-                    );
+                    *output =
+                        format!("[duplicate identical `{tool_name}` result omitted; see {origin}]");
                     stubbed = stubbed.saturating_add(1);
                 }
                 None => {
@@ -3006,6 +3229,28 @@ const NO_RECOVERY_ATTEMPT_CEILING: u8 = 3;
 /// that shape - a published protocol the model never responded to again - and
 /// deliberately leaves every other turn alone, because a turn that keeps
 /// answering always has attempts.
+/// Consecutive root model steps with every framework-owned closure rung
+/// satisfied before Runtime drives the completion request on the root's
+/// behalf. A weak model can be woken by `all_tasks_accepted` and then
+/// coordinate indefinitely without making the exit decision; the grace period
+/// keeps a model that is merely mid-thought from being pre-empted. The drive
+/// itself stays behind the completion_gap gate, so this can never force an
+/// incomplete Objective.
+fn closure_drive_after_steps() -> usize {
+    std::env::var("COWD_CLOSURE_DRIVE_AFTER_STEPS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(3)
+}
+
+#[test]
+fn closure_drive_grace_period_defaults_to_three_steps() {
+    // The grace period must be positive: zero would pre-empt a model that is
+    // merely mid-thought on its first ready step.
+    assert!(closure_drive_after_steps() >= 1);
+}
+
 fn zero_recovery_deadline() -> std::time::Duration {
     std::env::var("COWD_ZERO_RECOVERY_DEADLINE_SECS")
         .ok()
@@ -3045,9 +3290,9 @@ fn guarded_delegation_attempt(
         protocol.is_some(),
         elapsed,
     );
-    if let Some(protocol) = protocol.filter(|_| {
-        zero_recovery_stall(state.agentic_protocol_recovery_attempts, true, elapsed)
-    }) {
+    if let Some(protocol) = protocol
+        .filter(|_| zero_recovery_stall(state.agentic_protocol_recovery_attempts, true, elapsed))
+    {
         record_program_closure_timeout(
             services,
             &state.session_id,
@@ -3380,7 +3625,7 @@ mod safety_fuse_streak_tests {
 
     #[test]
     fn loop_guard_is_nudge_first_with_opt_in_hard_stop() {
-        use super::{evaluate_loop_guard, LoopGuardAction};
+        use super::{LoopGuardAction, evaluate_loop_guard};
         assert_eq!(
             evaluate_loop_guard(0, 3, false, 5),
             LoopGuardAction::Continue
@@ -3411,7 +3656,7 @@ mod safety_fuse_streak_tests {
 
     #[test]
     fn duplicate_result_payloads_are_stubbed_except_errors_and_small_payloads() {
-        use super::{stub_duplicate_result_payloads, ContentBlock, ConversationMessage};
+        use super::{ContentBlock, ConversationMessage, stub_duplicate_result_payloads};
         let big = "x".repeat(600);
         let small = "tiny".to_string();
         let mut messages = vec![
@@ -3808,10 +4053,7 @@ fn agentic_content_draft_text(
     services: &crate::RuntimeServices,
     draft: &AgenticContentDraft,
 ) -> Option<String> {
-    let artifact = services
-        .artifact_store()
-        .resolve(&draft.content_ref)
-        .ok()?;
+    let artifact = services.artifact_store().resolve(&draft.content_ref).ok()?;
     let bytes = services
         .artifact_store()
         .read_blocking(&artifact, &artifact.visibility_scope, None)
@@ -4024,9 +4266,7 @@ fn select_one_shot_deliverable_text(
         .iter()
         .enumerate()
         .filter_map(|(index, block)| match block {
-            ContentBlock::Text { text } if !text.trim().is_empty() => {
-                Some((index, text.as_str()))
-            }
+            ContentBlock::Text { text } if !text.trim().is_empty() => Some((index, text.as_str())),
             _ => None,
         })
         .collect();
@@ -4066,12 +4306,11 @@ pub(super) async fn resolve_explicit_agentic_content_refs(
         if is_review || is_publish {
             // A review verdict and a discussion publish carry no publishable
             // artifact body; only their evidence references needed normalizing.
-            call.input = serde_json::to_string(&value).map_err(|error| {
-                NodeExecutorError::Poll {
+            call.input =
+                serde_json::to_string(&value).map_err(|error| NodeExecutorError::Poll {
                     node_id: ticket.node_id.clone(),
                     reason: format!("encode normalized evidence: {error}"),
-                }
-            })?;
+                })?;
             continue;
         }
         // Both shapes name exactly one Text block of THIS model response:
@@ -4167,7 +4406,9 @@ pub(super) async fn resolve_explicit_agentic_content_refs(
         // Recover the body written in an earlier step of this same Task. It is kept
         // alive for the borrow below; `selected` above borrows the current response.
         let prior_text = if selected.is_none() { prior_text } else { None };
-        let selected = selected.or(prior_text.as_ref().map(|prior| (usize::MAX, prior.as_str())));
+        let selected = selected.or(prior_text
+            .as_ref()
+            .map(|prior| (usize::MAX, prior.as_str())));
         let Some((selected_index, text)) = selected else {
             continue;
         };
@@ -6134,12 +6375,20 @@ mod zero_recovery_guard_tests {
     fn the_stall_branch_is_not_the_increment_branch() {
         let past = zero_recovery_deadline() + std::time::Duration::from_secs(1);
         // Increment branch: attempts exist, so elapsed time alone is not a stall.
-        assert!(!zero_recovery_stall(NO_RECOVERY_ATTEMPT_CEILING, true, past));
+        assert!(!zero_recovery_stall(
+            NO_RECOVERY_ATTEMPT_CEILING,
+            true,
+            past
+        ));
         // Stall branch: no attempt at all past the deadline.
         assert!(zero_recovery_stall(0, true, past));
         // A protocol that reached its own end is not stalled.
         assert!(!zero_recovery_stall(0, false, past));
         // Before the deadline, no attempt is a model that is still working.
-        assert!(!zero_recovery_stall(0, true, std::time::Duration::from_secs(1)));
+        assert!(!zero_recovery_stall(
+            0,
+            true,
+            std::time::Duration::from_secs(1)
+        ));
     }
 }
