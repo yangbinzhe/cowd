@@ -3872,29 +3872,45 @@ fn canonical_outcome_covers_direct_and_parallel_tool_turns_without_graph_ref() {
 
 #[test]
 fn canonical_outcome_preserves_failure_cancel_block_and_partial_tool_terminal_classes() {
+    // (status, failed tool calls, the Objective's own verdict, expected class)
     let cases = [
         (
             crate::execution_core::TurnStrategyDecisionStatus::Failed,
             0,
+            "failed",
             "failed",
         ),
         (
             crate::execution_core::TurnStrategyDecisionStatus::Cancelled,
             0,
             "cancelled",
+            "cancelled",
         ),
         (
             crate::execution_core::TurnStrategyDecisionStatus::EarlyStopped,
             0,
+            "partial",
             "partial_failure",
         ),
         (
             crate::execution_core::TurnStrategyDecisionStatus::Completed,
             1,
             "partial_failure",
+            "partial_failure",
+        ),
+        // A satisfied Objective is a business success even when tool calls
+        // failed and were recovered from. One live run satisfied its Objective,
+        // delivered every accepted Task's result and presented the final answer,
+        // and was still classified `partial_failure` as
+        // "satisfied; 2 tool calls failed before terminal synthesis".
+        (
+            crate::execution_core::TurnStrategyDecisionStatus::Completed,
+            2,
+            "satisfied",
+            "succeeded",
         ),
     ];
-    for (status, failed_tool_calls, expected_class) in cases {
+    for (status, failed_tool_calls, objective_verdict, expected_class) in cases {
         let store = Arc::new(RuntimeEventStore::for_test());
         let runtime = ConversationRuntime::new(
             Session::new(),
@@ -3914,7 +3930,7 @@ fn canonical_outcome_preserves_failure_cancel_block_and_partial_tool_terminal_cl
                 status,
                 crate::execution_core::TurnStrategyActualOutcome {
                     failed_tool_calls,
-                    terminal_reason: expected_class.to_string(),
+                    terminal_reason: objective_verdict.to_string(),
                     ..Default::default()
                 },
             )

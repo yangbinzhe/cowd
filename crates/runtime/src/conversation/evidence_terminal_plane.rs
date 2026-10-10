@@ -1898,9 +1898,17 @@ where
             .as_ref()
             .ok_or_else(|| RuntimeError::new("canonical outcome service is unavailable"))?;
         let completed_at_ms = now_ms();
+        // A satisfied Objective is a business success. A tool call that failed
+        // and was recovered from is not a business failure: one live run
+        // satisfied its Objective, delivered every accepted Task's result and
+        // presented the final answer, and was still classified `partial_failure`
+        // with the reason "satisfied; 2 tool calls failed before terminal
+        // synthesis" - two calls the model had already retried past. The count
+        // stays in the reason so the information is not lost.
+        let objective_satisfied = outcome.terminal_reason.trim() == "satisfied";
         let terminal = match state.status {
             crate::execution_core::TurnStrategyDecisionStatus::Completed
-                if outcome.failed_tool_calls > 0 =>
+                if outcome.failed_tool_calls > 0 && !objective_satisfied =>
             {
                 harness_contract::outcome::OutcomeTerminalClass::PartialFailure(format!(
                     "{}; {} tool calls failed before terminal synthesis",
