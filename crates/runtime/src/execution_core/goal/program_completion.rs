@@ -91,6 +91,21 @@ pub(crate) fn delivered_result_refs(
         .collect()
 }
 
+/// Whether the accumulated evidence set contains a reference.
+///
+/// Runtime records a ref an Agent action changed as `agentic_changed:<ref>`, a
+/// provenance marker around the same underlying reference. A reviewer that
+/// cites the plain `message:<id>` is citing the same thing, and rejecting it
+/// taught the model nothing while keeping the Objective open.
+fn evidence_contains(evidence: &[String], reference: &str) -> bool {
+    evidence.iter().any(|candidate| {
+        candidate == reference
+            || candidate
+                .strip_prefix("agentic_changed:")
+                .is_some_and(|inner| inner == reference)
+    })
+}
+
 fn review_covers_current_goal(
     goal: &GoalContract,
     program: &AgenticProgramProjection,
@@ -170,7 +185,7 @@ fn review_covers_current_goal(
         && review
             .evidence_refs
             .iter()
-            .all(|reference| evidence.contains(reference))
+            .all(|reference| evidence_contains(evidence, reference))
 }
 
 impl GoalStore {
@@ -275,6 +290,17 @@ impl GoalStore {
         for task in program.tasks.values() {
             evidence.extend(task.evidence_refs.iter().cloned());
             evidence.extend(task.supersede_evidence_refs.iter().cloned());
+        }
+        // A review's own evidence is what proves it read the results, and it is
+        // produced BY the review: the reviewer's `evidence_retrieve` receipts
+        // live in its own Session journal and cannot already be in the
+        // Program's accumulated set. Requiring them to be there made the check
+        // circular - no review could ever be the thing that adds its own proof,
+        // so a satisfied review was rejudged as uncovered and the Objective
+        // reopened forever. Each review's evidence was already resolved and
+        // verified when the review was applied, so it is known durable here.
+        for review in &goal.reviews {
+            evidence.extend(review.evidence_refs.iter().cloned());
         }
         evidence.sort();
         evidence.dedup();
@@ -791,6 +817,78 @@ mod tests {
         };
         let refs = vec!["artifact:anything".to_string()];
         assert_eq!(delivered_result_refs(&program, &goal, &refs), refs);
+    }
+
+    /// Runtime tags a ref an Agent action changed as `agentic_changed:<ref>`.
+    /// A reviewer citing the plain ref is citing the same thing, and rejecting it
+    /// kept the Objective open while teaching the model nothing.
+    #[test]
+    fn a_provenance_tagged_ref_satisfies_the_plain_reference() {
+        let evidence = vec![
+            "agentic_changed:message:fc83095f58e63aa8cad9b887".to_string(),
+            "tool://receipt".to_string(),
+        ];
+        assert!(evidence_contains(&evidence, "message:fc83095f58e63aa8cad9b887"));
+        assert!(evidence_contains(&evidence, "tool://receipt"));
+        assert!(!evidence_contains(&evidence, "message:other"));
+    }
+
+    /// A review's own read receipts are produced BY the review, so they cannot
+    /// already be in the Program's accumulated set. They were resolved and
+    /// verified when the review was applied, so the completion gate must accept
+    /// them rather than reopen forever.
+    #[test]
+    fn a_reviews_own_evidence_counts_toward_the_completion_gate() {
+        let goal = harness_contract::goal::GoalContract {
+            id: "goal:test".to_string(),
+            session_id: "session-test".to_string(),
+            objective: "objective".to_string(),
+            criteria: Vec::new(),
+            constraints: Vec::new(),
+            phase: "execution".to_string(),
+            evidence_refs: Vec::new(),
+            unresolved: Vec::new(),
+            blockers: Vec::new(),
+            scope: Default::default(),
+            user_intent_criterion_id: None,
+            source_intent_ref: None,
+            execution_binding: None,
+            spec_revision: 1,
+            spec_digest: String::new(),
+            review_refs: Vec::new(),
+            reviews: vec![harness_contract::goal::ObjectiveReviewRecord {
+                review_id: "objective_review:1".to_string(),
+                criterion_ref: "user_intent".to_string(),
+                spec_revision: 1,
+                input_manifest_digest: String::new(),
+                result_refs: Vec::new(),
+                evidence_refs: vec!["tool://reviewer-read-receipt".to_string()],
+                reviewer_actor: "agent:reviewer".to_string(),
+                reviewer_execution_id: None,
+                producer_refs: Vec::new(),
+                decision: "satisfied".to_string(),
+                reason_ref: String::new(),
+                verification: None,
+            }],
+            waiting: None,
+            participation_requirement: None,
+            obligations: Vec::new(),
+            recovery: None,
+            terminal: None,
+            completion: harness_contract::goal::GoalCompletion::Open,
+            revision: 1,
+            user_sequence: 1,
+        };
+        // Exactly the accumulation the completion gate performs: the review's
+        // own receipts are not in the Program's set until they are added.
+        let mut evidence = goal.evidence_refs.clone();
+        for review in &goal.reviews {
+            evidence.extend(review.evidence_refs.iter().cloned());
+        }
+        assert!(
+            evidence_contains(&evidence, "tool://reviewer-read-receipt"),
+            "a review's own durable read receipt must count toward the gate"
+        );
     }
 
     use harness_contract::agent_action::{

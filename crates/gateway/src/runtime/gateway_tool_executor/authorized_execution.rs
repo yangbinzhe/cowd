@@ -158,9 +158,40 @@ impl GatewayToolExecutor {
                 access.visibility_scope,
             )
         } else {
-            store.resolve(&selector).map_err(|error| {
-                ToolError::new(format!("evidence_retrieve resolve failed: {error}"))
-            })?
+            match store.resolve(&selector) {
+                Ok(artifact) => artifact,
+                Err(store_error) => {
+                    // Runtime spells a one-shot Task deliverable `artifact:<24 hex>`
+                    // and repeats that spelling in a completion gap. A model that
+                    // adds the `://` itself gets a selector the ArtifactStore never
+                    // issued. The Program projection holds the mapping from that
+                    // logical key to the real selector, so consult it before
+                    // refusing: the read is legitimate and the identity unambiguous.
+                    let logical = format!("artifact:{}", selector.trim_start_matches("artifact://"));
+                    let mapped = services
+                        .agent_action_service()
+                        .list_programs()
+                        .ok()
+                        .and_then(|programs| {
+                            programs.iter().find_map(|program| {
+                                program
+                                    .artifacts
+                                    .get(&logical)
+                                    .map(|artifact| artifact.content_ref.clone())
+                            })
+                        });
+                    match mapped {
+                        Some(content_ref) => store.resolve(&content_ref).map_err(|error| {
+                            ToolError::new(format!("evidence_retrieve resolve failed: {error}"))
+                        })?,
+                        None => {
+                            return Err(ToolError::new(format!(
+                                "evidence_retrieve resolve failed: {store_error}"
+                            )))
+                        }
+                    }
+                }
+            }
         };
         let mut effective_scopes = authorized_scopes.to_vec();
         if let Some(session) = session_id {

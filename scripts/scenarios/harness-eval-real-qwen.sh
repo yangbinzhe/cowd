@@ -158,6 +158,15 @@ monitor_semantic_health() {
     # it hides a real freeze behind activity. Reviews, requests, reopens,
     # reworks and verdicts are the milestones.
     milestones="$(printf '%s' "$report" | jq -r '[.verdicts,.reopens,.objective_reviews,.completion_requests,.reworks] | @csv' 2>/dev/null || true)"
+    # How long since the last durable event of ANY kind. Semantic milestones are
+    # frozen for the whole work phase by design - before the first completion
+    # request there is no Objective milestone to move - so using them alone as
+    # the freeze signal stops a run that is still doing real work. One run was
+    # killed at 605s while actively publishing and reading, purely because no
+    # completion request had been issued yet. Event liveness is the honest
+    # freeze signal.
+    local last_event_age
+    last_event_age="$(printf '%s' "$report" | jq -r '.last_event_age_s // 0' 2>/dev/null || echo 0)"
     findings="$(printf '%s' "$report" | jq -c '.conclusion.findings' 2>/dev/null || echo '[]')"
     now="$(date +%s)"
     if [[ -n "$milestones" && "$milestones" != "$DEEP_MONITOR_LAST_MILESTONE" ]]; then
@@ -169,9 +178,12 @@ monitor_semantic_health() {
     if [[ "$DEEP_MONITOR_LAST_CHANGE_TS" -gt 0 ]]; then
       local stalled_for=$(( now - DEEP_MONITOR_LAST_CHANGE_TS ))
       # Stop only on CONFIRMED waste: an active finding AND semantic milestones
-      # frozen for the stall window. A single recoverable rework never trips it.
-      if [[ "$stalled_for" -ge "$DEEP_MONITOR_STALL_SECS" && "$state" == "SPINNING" ]]; then
-        printf '{"event":"harness_eval_deep_monitor_stop","reason":"confirmed spinning: findings present and semantic milestones frozen","state":"%s","stall_for_s":%d,"findings":%s}\n' \
+      # frozen for the stall window AND no durable event at all in that window.
+      # A run that is still emitting events is working, whatever the Objective
+      # milestones say. A single recoverable rework never trips it.
+      if [[ "$stalled_for" -ge "$DEEP_MONITOR_STALL_SECS" && "$state" == "SPINNING" \
+            && "${last_event_age:-0}" -ge "$DEEP_MONITOR_STALL_SECS" ]]; then
+        printf '{"event":"harness_eval_deep_monitor_stop","reason":"confirmed spinning: findings present, semantic milestones frozen and no durable event in the stall window","state":"%s","stall_for_s":%d,"findings":%s}\n' \
           "$state" "$stalled_for" "$findings" >&2
         kill "$HARNESS_PID" >/dev/null 2>&1 || true
         return 0
