@@ -267,14 +267,47 @@ impl RuntimeServices {
                 }
                 artifact
             } else if evidence_ref.starts_with("artifact://") {
-                self.artifact_store()
-                    .resolve(evidence_ref)
-                    .map_err(|error| {
-                        format!(
-                            "{} evidence {evidence_ref} points to missing durable content: {error}",
-                            action.kind()
-                        )
-                    })?
+                // Runtime spells a one-shot Task deliverable `artifact:<24 hex>`.
+                // A model that adds the separator itself produces a selector the
+                // ArtifactStore never issued, and this validation then refuses a
+                // perfectly good reference. The Program projection holds the
+                // mapping from that logical key to the real selector.
+                match self.artifact_store().resolve(evidence_ref) {
+                    Ok(artifact) => artifact,
+                    Err(store_error) => {
+                        let logical = format!(
+                            "artifact:{}",
+                            evidence_ref.trim_start_matches("artifact://")
+                        );
+                        let mapped = self
+                            .agent_action_service()
+                            .project_if_exists(&actor.program_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|program| {
+                                program
+                                    .artifacts
+                                    .get(&logical)
+                                    .map(|artifact| artifact.content_ref.clone())
+                            });
+                        match mapped {
+                            Some(content_ref) => self.artifact_store().resolve(&content_ref).map_err(
+                                |error| {
+                                    format!(
+                                        "{} evidence {evidence_ref} points to missing durable content: {error}",
+                                        action.kind()
+                                    )
+                                },
+                            )?,
+                            None => {
+                                return Err(format!(
+                                    "{} evidence {evidence_ref} points to missing durable content: {store_error}",
+                                    action.kind()
+                                ))
+                            }
+                        }
+                    }
+                }
             } else {
                 // Non-content references are validated by their individual
                 // action reducers; do not invent a second registry here.
