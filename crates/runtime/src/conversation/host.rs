@@ -773,6 +773,8 @@ where
             last_verified_progress: false,
             consecutive_unverified_model_steps: 0,
             closure_ready_steps: 0,
+            verified_answer_ready_steps: 0,
+            final_answer_observed: false,
             collaboration_convergence_replans: 0,
             completion_gap_continuations: 0,
             started_at: std::time::Instant::now(),
@@ -2252,7 +2254,12 @@ fn partition_complete_collaboration_results(
     partitions
 }
 
-fn collaboration_synthesis_layer(results: Vec<String>, level: usize) -> String {
+/// Build the carrier that hands a Program's delivered results to the root for
+/// final synthesis. `pub(crate)` so the verified-answer drive can use it: an
+/// Objective satisfied by its own closing action leaves the root without the
+/// turn that would write the user-visible answer, and this carrier is what the
+/// terminal narrator synthesizes from.
+pub(crate) fn collaboration_synthesis_layer(results: Vec<String>, level: usize) -> String {
     serde_json::json!({
         "kind": "cowd.runtime.collaboration_synthesis_layer.v1",
         "level": level,
@@ -3637,6 +3644,18 @@ struct TurnGraphState {
     /// request on the root's behalf (the drive stays behind the completion_gap
     /// gate, so an incomplete Objective is never forced).
     closure_ready_steps: usize,
+    /// Root model steps taken since the Objective reached a satisfied verdict
+    /// without the root presenting a final answer. The verdict is bound by the
+    /// action that satisfied it, so the root's own last step is routinely the
+    /// tool call that closed the Objective - it is never given the turn that
+    /// would write the user-visible answer, and the session then goes quiet
+    /// until an inactivity watchdog cancels it. Past
+    /// `verified_answer_drive_after_steps` Runtime injects the instruction to
+    /// present it.
+    verified_answer_ready_steps: usize,
+    /// Whether this turn has already produced a user-visible final answer, so
+    /// the verified-answer drive fires at most once.
+    final_answer_observed: bool,
     /// Bounded-convergence counter for the Agent-first collaboration completion
     /// gate. Each time the gate re-drives the root because the verified-Team
     /// minimum is unmet it advances; past the policy bound the turn terminates

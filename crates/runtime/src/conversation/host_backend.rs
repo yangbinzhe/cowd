@@ -182,6 +182,60 @@ where
             }
         }
         {
+            // The Objective can be satisfied by the very action that closes it,
+            // which means the root's last step is that tool call and it is never
+            // given the turn that writes the user-visible answer. One live run
+            // reached a satisfied verdict with every Task accepted and then went
+            // silent for 600s until an inactivity watchdog cancelled it: the
+            // business was finished and nothing was delivered. Once the verdict
+            // is bound, hand the root the turn it is missing.
+            let (session_id, turn_id, owns_root) = {
+                let state = self.state.lock().await;
+                (
+                    state.session_id.clone(),
+                    state.turn_id.clone(),
+                    state.execution_role.owns_root_presentation(),
+                )
+            };
+            if owns_root {
+                if let Some(program) = super::root_agentic_program_projection(
+                    self.services.as_ref(),
+                    &session_id,
+                    &turn_id,
+                ) {
+                    let mut state = self.state.lock().await;
+                    if program.status == crate::AgenticProgramStatus::Verified
+                        && program.objective_verdict.is_some()
+                        && !state.final_answer_observed
+                    {
+                        state.verified_answer_ready_steps =
+                            state.verified_answer_ready_steps.saturating_add(1);
+                        if state.verified_answer_ready_steps >= verified_answer_drive_after_steps()
+                        {
+                            state.verified_answer_ready_steps = 0;
+                            state.final_answer_observed = true;
+                            // Hand the root the turn it never got. The carrier
+                            // names every accepted Task's delivered artifact, and
+                            // the terminal path narrates it into the answer the
+                            // operator reads - the same route a collaboration
+                            // presentation takes.
+                            let results = verified_program_delivered_results(&program);
+                            if !results.is_empty() {
+                                state.terminal_override = Some((
+                                    harness_contract::goal::GoalCompletion::Satisfied,
+                                    super::collaboration_synthesis_layer(results, 0),
+                                ));
+                                drop(state);
+                                return Ok(precommitted_terminal_outcome(ticket));
+                            }
+                        }
+                    } else {
+                        state.verified_answer_ready_steps = 0;
+                    }
+                }
+            }
+        }
+        {
             // Objective-level wall-clock budget for a required-Team turn. Checked
             // at the top of every root model step so it cannot be bypassed by the
             // clean-terminal-synthesis short circuit below. The no-progress fuse
@@ -1319,6 +1373,9 @@ where
                 let next = match intent {
                     ModelStepIntent::FinalAnswer { text } => 'final_answer: {
                         let mut text = strip_trailing_simulated_tool_markup(text);
+                        // The root has chosen to answer, so the verified-answer
+                        // drive must not pre-empt it on a later step.
+                        state.final_answer_observed = true;
                         if let Some(protocol) =
                             delegated_agentic_protocol_state(self.services.as_ref(), ticket)?
                                 .filter(|protocol| !protocol.is_terminal())
@@ -3242,6 +3299,55 @@ fn closure_drive_after_steps() -> usize {
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(3)
+}
+
+/// Root model steps after a satisfied verdict with no final answer before
+/// Runtime hands the root the turn that writes it.
+///
+/// The Objective is routinely satisfied by the very action that closes it, so
+/// the root's last step is that tool call. Nothing then gives it another turn,
+/// and one live run went silent for 600s after a satisfied verdict with every
+/// Task accepted until an inactivity watchdog cancelled it. The grace period
+/// keeps a model that is about to answer on its own from being pre-empted.
+fn verified_answer_drive_after_steps() -> usize {
+    std::env::var("COWD_VERIFIED_ANSWER_DRIVE_AFTER_STEPS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(2)
+}
+
+/// Every accepted Task's delivered result, as the text the terminal narrator
+/// synthesizes the user-visible answer from.
+///
+/// Read from the Program projection rather than from a model transcript, so the
+/// carrier describes what was actually delivered and accepted.
+fn verified_program_delivered_results(program: &crate::AgenticProgramProjection) -> Vec<String> {
+    let mut results = Vec::new();
+    for task in program.tasks.values() {
+        if task.status != crate::AgenticTaskStatus::Accepted {
+            continue;
+        }
+        for artifact_ref in &task.artifact_refs {
+            let Some(artifact) = program.artifacts.get(artifact_ref) else {
+                continue;
+            };
+            results.push(format!(
+                "Task `{}` delivered `{}` ({}): {}",
+                task.task_id, artifact.title, artifact.artifact_ref, artifact.content_ref,
+            ));
+        }
+    }
+    results.sort();
+    results.dedup();
+    results
+}
+
+#[test]
+fn verified_answer_drive_grace_period_defaults_to_two_steps() {
+    // Positive, and short: the verdict is already durable, so the only thing
+    // being waited for is the root's own answer.
+    assert!(verified_answer_drive_after_steps() >= 1);
 }
 
 #[test]
@@ -6516,5 +6622,97 @@ mod zero_recovery_guard_tests {
             true,
             std::time::Duration::from_secs(1)
         ));
+    }
+
+    /// The verified-answer drive reads delivered results from the Program
+    /// projection, so an unaccepted Task and an artifact nobody claimed must not
+    /// reach the answer the operator reads.
+    #[test]
+    fn only_accepted_tasks_delivered_artifacts_reach_the_answer_carrier() {
+        let mut program = crate::AgenticProgramProjection::empty("program", "objective");
+        program.artifacts.insert(
+            "artifact:done".to_string(),
+            crate::AgenticArtifactProjection {
+                artifact_ref: "artifact:done".to_string(),
+                content_ref: "artifact://art_done".to_string(),
+                kind: "report".to_string(),
+                title: "Delivered finding".to_string(),
+                relates_to: vec![],
+                committed_by: "agent:worker".to_string(),
+                claim_execution_id: None,
+                claim_generation: None,
+            },
+        );
+        program.artifacts.insert(
+            "artifact:pending".to_string(),
+            crate::AgenticArtifactProjection {
+                artifact_ref: "artifact:pending".to_string(),
+                content_ref: "artifact://art_pending".to_string(),
+                kind: "report".to_string(),
+                title: "Still in flight".to_string(),
+                relates_to: vec![],
+                committed_by: "agent:worker".to_string(),
+                claim_execution_id: None,
+                claim_generation: None,
+            },
+        );
+        for (task_id, status, artifact) in [
+            (
+                "task:done",
+                crate::AgenticTaskStatus::Accepted,
+                "artifact:done",
+            ),
+            (
+                "task:pending",
+                crate::AgenticTaskStatus::Submitted,
+                "artifact:pending",
+            ),
+        ] {
+            program.tasks.insert(
+                task_id.to_string(),
+                crate::AgenticTaskProjection {
+                    task_id: task_id.to_string(),
+                    team_id: "team:1".to_string(),
+                    title: "work".to_string(),
+                    objective: "objective".to_string(),
+                    acceptance: "evidence".to_string(),
+                    acceptance_checks: Vec::new(),
+                    required_capabilities: Vec::new(),
+                    depends_on: Vec::new(),
+                    status,
+                    claimant: Some("agent:worker".to_string()),
+                    claim_generation: 1,
+                    claim_execution_id: None,
+                    claimed_at_ms: None,
+                    lease_expires_at_ms: None,
+                    active_attempts: Default::default(),
+                    artifact_refs: vec![artifact.to_string()],
+                    evidence_refs: Vec::new(),
+                    unresolved: Vec::new(),
+                    review_reason: None,
+                    reviewed_by: None,
+                    failed_attempts: 0,
+                    review_generation: 1,
+                    failed_review_attempts: 0,
+                    last_failure: None,
+                    replacement_task_refs: Vec::new(),
+                    supersede_evidence_refs: Vec::new(),
+                    superseded_reason: None,
+                    superseded_by: None,
+                    obligation_refs: Vec::new(),
+                    purpose: Default::default(),
+                    execution_requirements: Vec::new(),
+                    expertise_hints: Vec::new(),
+                    cancel_requested_by: None,
+                    cancel_reason_ref: None,
+                    cancel_evidence_refs: Vec::new(),
+                    pending_retirement: None,
+                },
+            );
+        }
+        let results = verified_program_delivered_results(&program);
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert!(results[0].contains("Delivered finding"), "{results:?}");
+        assert!(results[0].contains("artifact:done"), "{results:?}");
     }
 }
