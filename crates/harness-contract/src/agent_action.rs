@@ -403,10 +403,21 @@ pub struct ObjectiveReviewInput {
     /// Exact Goal criterion or obligation reference returned by state_inspect.
     pub criterion_ref: String,
     pub decision: ObjectiveReviewDecision,
+    /// The delivered result **artifact** references this review covers, in the
+    /// `artifact:<id>` form an accepted Task returned from `task_submit`. Never
+    /// `task:<id>`: a Task is work, not a result, and a review that names one
+    /// has no current result to verify and is refused with "independent review
+    /// has no current results". For a satisfied verdict, list every result ref
+    /// in the active completion request.
     #[serde(default)]
     pub result_refs: Vec<String>,
+    /// Durable evidence references produced by actually reading those results:
+    /// `tool://` receipts from `evidence_retrieve`/`read_ref`, or `artifact://`
+    /// selectors. Prose assertions are not evidence.
     #[serde(default)]
     pub evidence_refs: Vec<String>,
+    /// A durable reference to the review body itself, such as an
+    /// `artifact://` selector for the report this reviewer wrote.
     pub reason_ref: String,
 }
 
@@ -670,7 +681,9 @@ impl AgentAction {
                 // Runtime expands into exactly that canonical path. An empty
                 // submission with neither is still rejected.
                 if input.artifact_refs.is_empty() && input.deliverable.is_none() {
-                    return Err(AgentActionValidationError::Rejected(TASK_SUBMIT_RESULT_RULE));
+                    return Err(AgentActionValidationError::Rejected(
+                        TASK_SUBMIT_RESULT_RULE,
+                    ));
                 }
                 unique_nonempty("artifact_refs", &input.artifact_refs)?;
                 unique_nonempty("evidence_refs", &input.evidence_refs)?;
@@ -737,10 +750,9 @@ impl AgentAction {
                 if matches!(
                     input.operation,
                     ObjectiveUpdateOperation::Replace | ObjectiveUpdateOperation::Retire
-                )
-                    && (input.criterion_ref.is_none()
-                        || input.source_refs.is_empty()
-                        || input.reason_ref.is_none())
+                ) && (input.criterion_ref.is_none()
+                    || input.source_refs.is_empty()
+                    || input.reason_ref.is_none())
                 {
                     return Err(AgentActionValidationError::Rejected(OBJECTIVE_EVOLVE_RULE));
                 }
@@ -768,7 +780,9 @@ impl AgentAction {
             }
             Self::ObjectiveCompleteRequest(input) => {
                 if input.result_refs.is_empty() {
-                    return Err(AgentActionValidationError::Rejected(OBJECTIVE_COMPLETE_RESULT_RULE));
+                    return Err(AgentActionValidationError::Rejected(
+                        OBJECTIVE_COMPLETE_RESULT_RULE,
+                    ));
                 }
                 unique_nonempty("result_refs", &input.result_refs)?;
                 unique_nonempty("evidence_refs", &input.evidence_refs)?;
@@ -883,7 +897,8 @@ pub const TASK_SUBMIT_RESULT_RULE: &str = "a Task result is either `artifact_ref
 
 /// Objective evolution is operation-shaped: what `add` needs is not what `retire`
 /// needs, and neither set is expressible as a plain required field.
-pub const OBJECTIVE_ADD_RULE: &str = "operation `add` requires `statement_ref` plus at least one `source_refs` entry";
+pub const OBJECTIVE_ADD_RULE: &str =
+    "operation `add` requires `statement_ref` plus at least one `source_refs` entry";
 pub const OBJECTIVE_EVOLVE_RULE: &str = "operations `replace` and `retire` require `criterion_ref`, at least one `source_refs` entry, and `reason_ref`";
 
 /// A completion request is the durable statement that the Program is done, so it
@@ -892,7 +907,8 @@ pub const OBJECTIVE_COMPLETE_RESULT_RULE: &str = "`result_refs` must name at lea
 
 /// An independent verdict is supported by either a produced result or the
 /// evidence behind it; there is no field literally named for the disjunction.
-pub const OBJECTIVE_REVIEW_SUPPORT_RULE: &str = "an independent verdict needs at least one `result_refs` or `evidence_refs` entry";
+pub const OBJECTIVE_REVIEW_SUPPORT_RULE: &str =
+    "an independent verdict needs at least one `result_refs` or `evidence_refs` entry";
 
 /// A field the schema calls optional but that carries a value must carry a real
 /// one. Reporting an empty value as a missing field names a field the model did
@@ -1026,7 +1042,8 @@ mod tests {
             "a field the schema calls optional must not be reported as missing: {error}"
         );
         assert!(
-            error.to_string().contains("artifact_refs") && error.to_string().contains("deliverable"),
+            error.to_string().contains("artifact_refs")
+                && error.to_string().contains("deliverable"),
             "the rejection has to name both ways out: {error}"
         );
 
@@ -1037,7 +1054,9 @@ mod tests {
             evidence_refs: Vec::new(),
             reason_ref: "reason-1".to_string(),
         });
-        let error = review.validate().expect_err("an unsupported verdict is rejected");
+        let error = review
+            .validate()
+            .expect_err("an unsupported verdict is rejected");
         assert!(
             matches!(error, AgentActionValidationError::Rejected(_)),
             "there is no field named `result_refs_or_evidence_refs` in any schema: {error}"
@@ -1064,7 +1083,10 @@ mod tests {
             "the field the model sent must be named: {error}"
         );
         let message = error.to_string();
-        assert!(message.contains("`name`"), "the message must name the field: {message}");
+        assert!(
+            message.contains("`name`"),
+            "the message must name the field: {message}"
+        );
         assert!(
             message.contains(NON_EMPTY_VALUE_RULE),
             "the rule must stay: {message}"
@@ -1163,16 +1185,12 @@ mod tests {
         // field: the instruction has to name what the operation needs.
         assert_eq!(
             AgentAction::ObjectiveUpdate(replace.clone()).validate(),
-            Err(AgentActionValidationError::Rejected(
-                OBJECTIVE_EVOLVE_RULE
-            ))
+            Err(AgentActionValidationError::Rejected(OBJECTIVE_EVOLVE_RULE))
         );
         replace.source_refs = vec!["tool://scope-change-evidence".to_string()];
         assert_eq!(
             AgentAction::ObjectiveUpdate(replace.clone()).validate(),
-            Err(AgentActionValidationError::Rejected(
-                OBJECTIVE_EVOLVE_RULE
-            ))
+            Err(AgentActionValidationError::Rejected(OBJECTIVE_EVOLVE_RULE))
         );
         replace.reason_ref = Some("artifact://scope-change-rationale".to_string());
         assert_eq!(AgentAction::ObjectiveUpdate(replace).validate(), Ok(()));
@@ -1186,9 +1204,9 @@ mod tests {
     #[test]
     fn every_advertised_agent_action_id_is_a_known_variant() {
         for id in AGENT_ACTION_TOOL_IDS {
-            if let Err(error) = serde_json::from_value::<AgentAction>(
-                serde_json::json!({"kind": id, "input": {}}),
-            ) {
+            if let Err(error) =
+                serde_json::from_value::<AgentAction>(serde_json::json!({"kind": id, "input": {}}))
+            {
                 let message = error.to_string();
                 assert!(
                     !message.contains("unknown variant"),

@@ -98,6 +98,27 @@ pub(crate) fn compact_read_receipt(output: &str) -> String {
     .to_string()
 }
 
+/// Expand `task:<id>` entries in a review's result refs into that Task's
+/// delivered artifacts, and pass everything else through unchanged.
+///
+/// A model that has just accepted three Tasks naturally reaches for the three
+/// refs it was handed. Refusing that costs a review cycle and tells the model
+/// nothing about what a "result" is, so the boundary resolves it instead.
+/// Artifact refs are already the right shape and are returned as-is, and a task
+/// with no artifacts contributes nothing rather than an invented ref.
+fn resolve_result_refs(program: &AgenticProgramProjection, result_refs: &[String]) -> Vec<String> {
+    let mut resolved = Vec::with_capacity(result_refs.len());
+    for reference in result_refs {
+        match program.tasks.get(reference) {
+            Some(task) => resolved.extend(task.artifact_refs.iter().cloned()),
+            None => resolved.push(reference.clone()),
+        }
+    }
+    resolved.sort();
+    resolved.dedup();
+    resolved
+}
+
 pub(crate) struct IndependentReview {
     pub producers: Vec<String>,
     pub verification: ObjectiveReviewVerification,
@@ -261,6 +282,15 @@ impl RuntimeServices {
         result_refs: &[String],
         condition_ref: Option<&str>,
     ) -> Result<IndependentReview, String> {
+        // A review names the delivered results it covers, and a model routinely
+        // names the Task that produced them instead: `task:<id>` is work, not a
+        // result, so the coverage map came back empty and the review was refused
+        // with "independent review has no current results" while the work was in
+        // fact delivered and accepted. The mapping is unambiguous - a Task's
+        // `artifact_refs` are exactly its delivered results - so resolve it here
+        // rather than making the model guess the spelling.
+        let result_refs = resolve_result_refs(program, result_refs);
+        let result_refs = result_refs.as_slice();
         let root = actor
             .root_execution_id
             .as_deref()
@@ -983,5 +1013,124 @@ mod tests {
             run,
             "agentic-graph:bf5d8374a4c8"
         ));
+    }
+
+    /// A model that has just accepted three Tasks naturally names the three
+    /// refs it was handed. Those are Tasks, not results, so the coverage map came
+    /// back empty and the review was refused with "independent review has no
+    /// current results" while the work was delivered and accepted. The Task's
+    /// artifacts are exactly its delivered results, so the boundary resolves it.
+    #[test]
+    fn a_task_ref_resolves_to_the_tasks_delivered_artifacts() {
+        let mut program = crate::AgenticProgramProjection::empty("program", "objective");
+        for (task_id, artifact) in [("task:a", "artifact:a"), ("task:b", "artifact:b")] {
+            program.tasks.insert(
+                task_id.to_string(),
+                crate::AgenticTaskProjection {
+                    task_id: task_id.to_string(),
+                    team_id: "team:1".to_string(),
+                    title: "work".to_string(),
+                    objective: "objective".to_string(),
+                    acceptance: "evidence".to_string(),
+                    acceptance_checks: Vec::new(),
+                    required_capabilities: Vec::new(),
+                    depends_on: Vec::new(),
+                    status: crate::AgenticTaskStatus::Accepted,
+                    claimant: Some("agent:worker".to_string()),
+                    claim_generation: 1,
+                    claim_execution_id: None,
+                    claimed_at_ms: None,
+                    lease_expires_at_ms: None,
+                    active_attempts: Default::default(),
+                    artifact_refs: vec![artifact.to_string()],
+                    evidence_refs: Vec::new(),
+                    unresolved: Vec::new(),
+                    review_reason: None,
+                    reviewed_by: None,
+                    failed_attempts: 0,
+                    review_generation: 1,
+                    failed_review_attempts: 0,
+                    last_failure: None,
+                    replacement_task_refs: Vec::new(),
+                    supersede_evidence_refs: Vec::new(),
+                    superseded_reason: None,
+                    superseded_by: None,
+                    obligation_refs: Vec::new(),
+                    purpose: Default::default(),
+                    execution_requirements: Vec::new(),
+                    expertise_hints: Vec::new(),
+                    cancel_requested_by: None,
+                    cancel_reason_ref: None,
+                    cancel_evidence_refs: Vec::new(),
+                    pending_retirement: None,
+                },
+            );
+        }
+        assert_eq!(
+            resolve_result_refs(&program, &["task:a".to_string(), "task:b".to_string()]),
+            vec!["artifact:a".to_string(), "artifact:b".to_string()]
+        );
+    }
+
+    /// Artifact refs are already the right shape and pass through untouched, so
+    /// the coercion cannot invent or drop a result.
+    #[test]
+    fn artifact_refs_pass_through_unchanged() {
+        let program = crate::AgenticProgramProjection::empty("program", "objective");
+        assert_eq!(
+            resolve_result_refs(
+                &program,
+                &["artifact://art_1".to_string(), "tool://receipt".to_string()]
+            ),
+            vec!["artifact://art_1".to_string(), "tool://receipt".to_string()]
+        );
+    }
+
+    /// A Task with no artifacts contributes nothing rather than an invented ref.
+    #[test]
+    fn a_task_with_no_artifacts_contributes_nothing() {
+        let mut program = crate::AgenticProgramProjection::empty("program", "objective");
+        program.tasks.insert(
+            "task:empty".to_string(),
+            crate::AgenticTaskProjection {
+                task_id: "task:empty".to_string(),
+                team_id: "team:1".to_string(),
+                title: "work".to_string(),
+                objective: "objective".to_string(),
+                acceptance: "evidence".to_string(),
+                acceptance_checks: Vec::new(),
+                required_capabilities: Vec::new(),
+                depends_on: Vec::new(),
+                status: crate::AgenticTaskStatus::Published,
+                claimant: None,
+                claim_generation: 0,
+                claim_execution_id: None,
+                claimed_at_ms: None,
+                lease_expires_at_ms: None,
+                active_attempts: Default::default(),
+                artifact_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                unresolved: Vec::new(),
+                review_reason: None,
+                reviewed_by: None,
+                failed_attempts: 0,
+                review_generation: 1,
+                failed_review_attempts: 0,
+                last_failure: None,
+                replacement_task_refs: Vec::new(),
+                supersede_evidence_refs: Vec::new(),
+                superseded_reason: None,
+                superseded_by: None,
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
+                cancel_requested_by: None,
+                cancel_reason_ref: None,
+                cancel_evidence_refs: Vec::new(),
+                pending_retirement: None,
+            },
+        );
+        assert!(resolve_result_refs(&program, &["task:empty".to_string()]).is_empty());
     }
 }

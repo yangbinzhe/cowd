@@ -105,6 +105,22 @@ pub(super) async fn resolve_result(
     program: &AgenticProgramProjection,
     reference: &str,
 ) -> Result<ResolvedReviewResult, String> {
+    // Runtime spells a one-shot Task deliverable `artifact:<24 hex>` and repeats
+    // that spelling in the completion gap's `uncovered_result_refs`. That is a
+    // Program-logical key, not an ArtifactStore selector, so neither path used to
+    // reach it: refusing it told the model "no Runtime-resolved producer" about a
+    // result that was delivered and accepted, and rewriting it into a selector
+    // would ask the store for an id it never issued. Map it to the selector the
+    // Program recorded for it and keep the logical ref as the reviewed identity.
+    let logical_selector = match reference.split_once("://") {
+        Some(_) => None,
+        None => program
+            .artifacts
+            .get(reference)
+            .map(|artifact| artifact.content_ref.clone()),
+    };
+    let reference = reference.to_string();
+    let reference = reference.as_str();
     if reference.starts_with("approval:v1:") {
         let (content, approval, source) = services
             .approval_result_content(&actor.session_id, reference)
@@ -190,10 +206,14 @@ pub(super) async fn resolve_result(
             .map_err(|error| error.to_string())?
     } else if reference.starts_with("tool://") {
         tool_content(services, &actor.session_id, reference).await?
-    } else if reference.starts_with("artifact://") {
+    } else if reference.starts_with("artifact://") || logical_selector.is_some() {
+        // A Program-logical ref carries no selector of its own; resolve the one
+        // the Program recorded for it. The logical ref stays the reviewed
+        // identity so the candidate match below still finds the artifact.
+        let selector = logical_selector.as_deref().unwrap_or(reference);
         services
             .artifact_store()
-            .resolve(reference)
+            .resolve(selector)
             .map_err(|error| error.to_string())?
     } else {
         return Err(format!(

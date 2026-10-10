@@ -917,6 +917,15 @@ impl AgentActionService {
         let durable_revision = self.store.stream_revision(&stream_id)?;
         if let Some(mut cached) = self.read_model.get(program_id) {
             if cached.revision == durable_revision {
+                // The Program stream did not move, but the Goal stream may have:
+                // a satisfied ObjectiveReview lives on the Goal, and it is
+                // exactly what retires a recorded completion gap. Refresh the
+                // derived field before serving the cached projection.
+                let gaps = self.current_completion_gaps(&cached);
+                if gaps != cached.unresolved {
+                    Arc::make_mut(&mut cached).unresolved = gaps;
+                    self.remember_projection(&cached);
+                }
                 return Ok(cached);
             }
             if cached.revision < durable_revision {
@@ -932,6 +941,7 @@ impl AgentActionService {
                     .map_err(AgentActionServiceError::EventStore)?;
                 if delta.last().map(|event| event.sequence) == Some(durable_revision) {
                     apply_projection_events(Arc::make_mut(&mut cached), delta)?;
+                    self.refresh_completion_gaps(Arc::make_mut(&mut cached));
                     self.remember_projection(&cached);
                     return Ok(cached);
                 }
@@ -951,6 +961,7 @@ impl AgentActionService {
                     .map_err(AgentActionServiceError::EventStore)?;
                 if delta.last().map(|event| event.sequence) == Some(durable_revision) {
                     apply_projection_events(&mut persisted, delta)?;
+                    self.refresh_completion_gaps(&mut persisted);
                     let persisted = Arc::new(persisted);
                     self.remember_projection(&persisted);
                     return Ok(persisted);
@@ -1030,6 +1041,7 @@ impl AgentActionService {
             .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or_default();
         apply_projection_events(&mut projection, events)?;
+        self.refresh_completion_gaps(&mut projection);
         let projection = Arc::new(projection);
         self.remember_projection(&projection);
         Ok(projection)
@@ -1669,6 +1681,44 @@ impl AgentActionService {
     }
 }
 
+impl AgentActionService {
+    /// Recompute the gaps that still block completion from Goal truth.
+    ///
+    /// A reopen event records what one completion request was missing at one
+    /// revision. Treating that record as current state strands the program: the
+    /// model satisfies the criterion and records the review, and the framework
+    /// keeps repeating `criterion_unsatisfied` while suppressing the exit
+    /// action, so completion can never be requested again. Deriving the field
+    /// from the Goal keeps the projection a projection of current facts.
+    fn refresh_completion_gaps(&self, projection: &mut AgenticProgramProjection) {
+        projection.unresolved = self.current_completion_gaps(projection);
+    }
+
+    fn current_completion_gaps(&self, projection: &AgenticProgramProjection) -> Vec<String> {
+        let Some(root_execution_id) = projection.root_execution_id.as_deref() else {
+            return Vec::new();
+        };
+        let goal_store = crate::execution_core::GoalStore::new(Arc::clone(&self.store));
+        let Ok(Some(goal)) = goal_store.projection(&format!("goal:{root_execution_id}")) else {
+            return Vec::new();
+        };
+        if goal.goal.completion != harness_contract::goal::GoalCompletion::Open {
+            // The Goal already reached a terminal completion; nothing is pending.
+            return Vec::new();
+        }
+        let satisfied = crate::agentic::ingress::current_reviews_satisfy_the_goal(&goal.goal);
+        let uncovered =
+            crate::agentic::ingress::uncovered_delivered_result_refs(projection, &goal.goal);
+        crate::agentic::ingress::objective_completion_waiting_gap(
+            goal.goal.waiting.as_ref(),
+            satisfied,
+            &uncovered,
+        )
+        .map(|gap| vec![gap])
+        .unwrap_or_default()
+    }
+}
+
 fn apply_projection_events(
     projection: &mut AgenticProgramProjection,
     events: Vec<crate::DurableRuntimeEvent>,
@@ -1724,13 +1774,20 @@ fn apply_projection_events(
             projection.status = super::program::AgenticProgramStatus::Open;
             projection.completion_request = None;
             projection.final_artifact_ref = None;
-            projection.unresolved = serde_json::from_value(
+            // The reopen event records what THIS request was missing at THIS
+            // revision. That is history: the model may have closed every one of
+            // those gaps a revision later. Keep the record for audit and let the
+            // caller supply the gaps that still hold, so a satisfied review
+            // clears the blockage instead of being contradicted forever.
+            projection.last_reopen_gaps = serde_json::from_value(
                 event
                     .payload
                     .get("gaps")
                     .cloned()
                     .unwrap_or_else(|| json!([])),
             )?;
+            // Recomputed from Goal truth by the caller once the fold finishes.
+            projection.unresolved = Vec::new();
             projection.revision = event.sequence;
             continue;
         }
@@ -2452,13 +2509,31 @@ fn actionable(projection: &AgenticProgramProjection, duplicate: bool) -> Vec<Str
         super::program::AgenticProgramStatus::Open => {}
     }
     if !projection.unresolved.is_empty() {
+        // `unresolved` is recomputed from Goal truth, so this names what is
+        // still missing rather than what one reopen happened to record. The
+        // reopen event's own wording is history and is shown separately:
+        // presenting it as the current state is what once told a model to keep
+        // resolving a criterion it had already satisfied.
         actions.push(format!("The previous completion request was reopened. Resolve the recorded gaps before requesting completion again: {}", projection.unresolved.join("; ")));
+        if !projection.last_reopen_gaps.is_empty() {
+            actions.push(format!(
+                "For reference, the last reopen recorded: {}",
+                projection.last_reopen_gaps.join("; ")
+            ));
+        }
         if projection
             .unresolved
             .iter()
             .any(|gap| gap.starts_with("original_intent_review_required:"))
         {
-            actions.push("Use objective_review for the original criterion with the current delivered result and durable evidence; the reviewer must be distinct from its Runtime-resolved producer. Preserve accepted work.".into());
+            // The how-to names the tool and the shape; the scope discipline is
+            // shared with the terminal presentation and therefore comes from
+            // the order contract, so a change cannot reach one layer and miss
+            // the other.
+            actions.push(format!(
+                "Use objective_review for the original criterion with the current delivered result and durable evidence. {}",
+                crate::agentic::order_contract::OBJECTIVE_REVIEW_SCOPE_DISCIPLINE
+            ));
         }
         // A reopened Program must never also advertise the exit action in the
         // same receipt: one live run received "resolve the recorded gaps" and
@@ -2466,6 +2541,15 @@ fn actionable(projection: &AgenticProgramProjection, duplicate: bool) -> Vec<Str
         // looped until the observation window expired. While gaps remain, the
         // gap guidance above is the entire instruction.
         return actions;
+    }
+    // No gap remains. The program was reopened at least once (history is
+    // recorded), so the model needs to be told the exit is reachable again
+    // rather than left to infer it.
+    if !projection.last_reopen_gaps.is_empty() {
+        actions.push(
+            "Every gap recorded by the last reopen is now resolved; request Objective completion."
+                .into(),
+        );
     }
     // A Task no Agent will settle is a fact the root must be able to read. Runtime
     // used to keep it private in the dispatch starvation ledger, so the model had no

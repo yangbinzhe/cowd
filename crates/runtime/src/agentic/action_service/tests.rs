@@ -3973,3 +3973,241 @@ fn reopened_program_receipts_never_advertise_the_exit_action() {
         "{actions:?}"
     );
 }
+
+/// The v14 deadlock, replayed as a regression test.
+///
+/// Step 3.7 satisfied the `user_intent` criterion and recorded an
+/// `objective_review` with decision `satisfied`. The Goal said so: criteria
+/// `satisfied`, reviews `[satisfied]`, blockers `[]`. The Program projection
+/// nevertheless kept repeating the reopen event's text -
+/// `original_intent_review_required:user_intent; ... criterion_unsatisfied:
+/// user_intent` - and withheld the exit action, so the model stopped asking to
+/// finish and the run froze at 303 steps.
+///
+/// The gaps must therefore be derived from Goal truth, not frozen from the
+/// event that recorded them.
+#[test]
+fn a_satisfied_review_retires_the_gap_it_was_sent_to_close() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = AgentActionService::new(Arc::clone(&store));
+    let goals = Arc::new(crate::execution_core::goal::GoalStore::new(Arc::clone(
+        &store,
+    )));
+
+    // The Goal exactly as v14 left it: everything satisfied, but still carrying
+    // the `completion_gap` the last reopen wrote.
+    goals
+        .create(GoalContract {
+            id: "goal:root-execution-1".to_string(),
+            session_id: "session-1".to_string(),
+            objective: "test objective".to_string(),
+            criteria: vec![AcceptanceCriterion {
+                id: "user_intent".to_string(),
+                statement: "satisfy the operator".to_string(),
+                statement_ref: None,
+                source_refs: Vec::new(),
+                required_evidence: Vec::new(),
+                status: AcceptanceStatus::Satisfied,
+                waiver: None,
+            }],
+            constraints: Vec::new(),
+            phase: "waiting".to_string(),
+            evidence_refs: Vec::new(),
+            unresolved: Vec::new(),
+            blockers: Vec::new(),
+            scope: harness_contract::goal::GoalScope::UserObjective,
+            user_intent_criterion_id: Some("user_intent".to_string()),
+            source_intent_ref: Some("session_message:test".to_string()),
+            execution_binding: Some(harness_contract::goal::GoalExecutionBinding {
+                objective_id: "objective-1".to_string(),
+                session_id: "session-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                root_execution_id: "root-execution-1".to_string(),
+                agentic_program_id: "program-1".to_string(),
+            }),
+            spec_revision: 1,
+            spec_digest: "spec-digest-1".to_string(),
+            review_refs: vec!["objective_review:a26".to_string()],
+            reviews: vec![harness_contract::goal::ObjectiveReviewRecord {
+                review_id: "objective_review:a26".to_string(),
+                criterion_ref: "user_intent".to_string(),
+                spec_revision: 1,
+                input_manifest_digest: "spec-digest-1".to_string(),
+                result_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                reviewer_actor: "agent:234a74107029a33c834cfbd7".to_string(),
+                reviewer_execution_id: None,
+                producer_refs: vec!["agent:1267d62300e69e4c4e79c725".to_string()],
+                decision: "satisfied".to_string(),
+                reason_ref: String::new(),
+                verification: None,
+            }],
+            waiting: Some(harness_contract::goal::WaitDescriptor {
+                reason_code: "completion_gap".to_string(),
+                reason:
+                    "original_intent_review_required:user_intent; criterion_unsatisfied:user_intent"
+                        .to_string(),
+                required_refs: vec![
+                    "original_intent_review_required:user_intent".to_string(),
+                    "criterion_unsatisfied:user_intent".to_string(),
+                ],
+                generation: 66,
+            }),
+            participation_requirement: None,
+            obligations: Vec::new(),
+            recovery: None,
+            completion: GoalCompletion::Open,
+            terminal: None,
+            revision: 1,
+            user_sequence: 1,
+        })
+        .unwrap();
+
+    service
+        .apply(&root(
+            "open-program",
+            AgentAction::TeamCreate(TeamCreateInput {
+                name: "team".into(),
+                mission: "deliver".into(),
+                objective: None,
+            }),
+        ))
+        .unwrap();
+
+    let projection = service.project("program-1").unwrap();
+    assert!(
+        projection.unresolved.is_empty(),
+        "a satisfied review must retire the gap it closed, got: {:?}",
+        projection.unresolved
+    );
+
+    let actions = super::actionable(&projection, false);
+    assert!(
+        !actions
+            .iter()
+            .any(|action| action.contains("criterion_unsatisfied")),
+        "a satisfied criterion must not be reported as unsatisfied: {actions:?}"
+    );
+}
+
+/// A reopened program that has since closed every gap must be told the exit is
+/// reachable, and must be shown the reopen record as history rather than as the
+/// current state. v14 failed exactly here: the framework kept naming
+/// `criterion_unsatisfied:user_intent` after the criterion was satisfied, and
+/// the model stopped asking to finish.
+#[test]
+fn a_resolved_reopen_advertises_the_exit_and_labels_the_record_as_history() {
+    let mut program = crate::AgenticProgramProjection::empty("program:test", "objective:test");
+    program.artifacts.insert(
+        "artifact:final".to_string(),
+        crate::AgenticArtifactProjection {
+            artifact_ref: "artifact:final".to_string(),
+            content_ref: "artifact://art_final".to_string(),
+            kind: "report".to_string(),
+            title: "final synthesis".to_string(),
+            relates_to: Vec::new(),
+            committed_by: "agent:worker".to_string(),
+            claim_execution_id: None,
+            claim_generation: None,
+        },
+    );
+    let mut task = crate::AgenticTaskProjection {
+        task_id: "task:1".to_string(),
+        team_id: "team:1".to_string(),
+        title: "delivered".to_string(),
+        objective: "objective".to_string(),
+        acceptance: "accepted evidence".to_string(),
+        acceptance_checks: Vec::new(),
+        required_capabilities: Vec::new(),
+        depends_on: Vec::new(),
+        status: crate::AgenticTaskStatus::Accepted,
+        claimant: Some("agent:worker".to_string()),
+        claim_generation: 1,
+        claim_execution_id: None,
+        claimed_at_ms: None,
+        lease_expires_at_ms: None,
+        active_attempts: Default::default(),
+        artifact_refs: vec!["artifact:final".to_string()],
+        evidence_refs: vec!["tool://receipt".to_string()],
+        unresolved: Vec::new(),
+        review_reason: None,
+        reviewed_by: Some("agent:reviewer".to_string()),
+        failed_attempts: 0,
+        review_generation: 1,
+        failed_review_attempts: 0,
+        last_failure: None,
+        replacement_task_refs: Vec::new(),
+        supersede_evidence_refs: Vec::new(),
+        superseded_reason: None,
+        superseded_by: None,
+        obligation_refs: Vec::new(),
+        purpose: Default::default(),
+        execution_requirements: Vec::new(),
+        expertise_hints: Vec::new(),
+        cancel_requested_by: None,
+        cancel_reason_ref: None,
+        cancel_evidence_refs: Vec::new(),
+        pending_retirement: None,
+    };
+    task.status = crate::AgenticTaskStatus::Accepted;
+    program.tasks.insert("task:1".to_string(), task);
+
+    // Every gap is closed, but the reopen that recorded them is still on file.
+    program.unresolved = Vec::new();
+    program.last_reopen_gaps = vec![
+        "original_intent_review_required:user_intent; criterion_unsatisfied:user_intent"
+            .to_string(),
+    ];
+
+    let actions = super::actionable(&program, false);
+    assert!(
+        actions
+            .iter()
+            .any(|action| action.contains("request Objective completion")),
+        "the exit must be reachable once the gaps are gone: {actions:?}"
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|action| action
+                .starts_with("Every gap recorded by the last reopen is now resolved")),
+        "the program must say the reopen's gaps are resolved: {actions:?}"
+    );
+    assert!(
+        !actions
+            .iter()
+            .any(|action| action.contains("Resolve the recorded gaps")),
+        "a resolved gap must not be presented as unresolved: {actions:?}"
+    );
+
+    // When a *different* gap is still open, the receipt names the current one
+    // and keeps the reopen record as reference. Presenting the record as the
+    // current state is what once told a model to keep resolving a criterion it
+    // had already satisfied.
+    program.unresolved = vec!["criterion_unsatisfied:second_criterion".to_string()];
+    let actions = super::actionable(&program, false);
+    let current = actions
+        .iter()
+        .find(|action| action.contains("Resolve the recorded gaps"))
+        .expect("the current gap must be named");
+    assert!(
+        current.contains("second_criterion"),
+        "the current gap must be the live one: {current}"
+    );
+    assert!(
+        !current.contains("user_intent"),
+        "history must not be merged into the current gap: {current}"
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|action| action.starts_with("For reference, the last reopen recorded")),
+        "the reopen record stays visible as history: {actions:?}"
+    );
+    assert!(
+        !actions
+            .iter()
+            .any(|action| action.contains("request Objective completion")),
+        "the exit action must stay silent while a gap remains: {actions:?}"
+    );
+}

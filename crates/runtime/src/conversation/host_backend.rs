@@ -4293,7 +4293,15 @@ pub(super) async fn resolve_explicit_agentic_content_refs(
         let is_submit = call.name == harness_contract::agent_action::TASK_SUBMIT_TOOL_ID;
         let is_review = call.name == harness_contract::agent_action::TASK_REVIEW_TOOL_ID;
         let is_publish = call.name == harness_contract::agent_action::MESSAGE_PUBLISH_TOOL_ID;
-        if !is_commit && !is_submit && !is_review && !is_publish {
+        // A read names a durable reference too, and it is the one place where a
+        // spelling mistake is silent: `read_ref` on `artifact:<id>` resolves to
+        // `Bare` and is delegated to `state_inspect`, so the caller receives
+        // program guidance in place of the artifact body. The reviewers that
+        // must physically read every cited result therefore never accumulate
+        // coverage and are refused with `review_requires_current_physical_reads`.
+        // Normalize the read's reference before the delegation happens.
+        let is_read = call.name == "read_ref" || call.name == "evidence_retrieve";
+        if !is_commit && !is_submit && !is_review && !is_publish && !is_read {
             continue;
         }
         let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&call.input) else {
@@ -4303,6 +4311,28 @@ pub(super) async fn resolve_explicit_agentic_content_refs(
         // that dropped `tool://`/`artifact://` is not rejected with
         // unsupported_evidence_ref / issue_disposition_requires_durable_evidence.
         normalize_bare_evidence_refs(&mut value);
+        if is_read {
+            // A read carries nothing else to resolve: it has no message block,
+            // no deliverable and no verdict. Normalizing its reference is the
+            // whole job, so re-encode and move on.
+            if let Some(object) = value.as_object_mut() {
+                for field in ["reference", "evidence_ref"] {
+                    let Some(raw) = object.get(field).and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let normalized = normalize_bare_evidence_ref(raw);
+                    if normalized != raw {
+                        object.insert(field.to_string(), serde_json::Value::String(normalized));
+                    }
+                }
+            }
+            call.input =
+                serde_json::to_string(&value).map_err(|error| NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason: format!("encode normalized read reference: {error}"),
+                })?;
+            continue;
+        }
         if is_review || is_publish {
             // A review verdict and a discussion publish carry no publishable
             // artifact body; only their evidence references needed normalizing.
@@ -4466,10 +4496,31 @@ pub(super) async fn resolve_explicit_agentic_content_refs(
 /// Prefix a bare evidence reference with its durable scheme. A weak model may
 /// cite `tool-raw-call_...` or `art_...` without the `tool://`/`artifact://`
 /// prefix; the identity is unambiguous, so normalize it instead of rejecting.
+///
+/// The single-colon forms matter as much as the bare ones. Runtime itself
+/// hands the model `artifact:<24 hex>` from `one_shot_artifact_ref`
+/// (crates/runtime/src/agentic/work_market.rs) and repeats it verbatim in the
+/// `uncovered_result_refs` clause of a completion gap. Every durable reader
+/// requires `artifact://`, and `Address::parse` turns a reference without
+/// `://` into `Bare`, which the unified read routes to `state_inspect`. A
+/// model that copies Runtime's own spelling therefore reads the program
+/// directory instead of the artifact and is never told anything went wrong.
+/// Normalizing here keeps the spelling Runtime emits and the spelling the
+/// readers accept from drifting apart again.
 fn normalize_bare_evidence_ref(reference: &str) -> String {
     let trimmed = reference.trim();
     if trimmed.contains("://") {
         return trimmed.to_string();
+    }
+    if let Some(rest) = trimmed.strip_prefix("artifact:") {
+        if !rest.is_empty() {
+            return format!("artifact://{rest}");
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix("tool:") {
+        if !rest.is_empty() {
+            return format!("tool://{rest}");
+        }
     }
     if trimmed.starts_with("tool-") || trimmed.starts_with("tool_") {
         return format!("tool://{trimmed}");
@@ -4535,6 +4586,81 @@ fn normalize_ref_array(array: &mut [serde_json::Value]) {
         if normalized != raw {
             *entry = serde_json::Value::String(normalized);
         }
+    }
+}
+
+#[cfg(test)]
+mod reference_spelling_tests {
+    use super::normalize_bare_evidence_ref;
+
+    /// Runtime hands the model `artifact:<24 hex>` for a one-shot Task
+    /// deliverable and repeats it in the `uncovered_result_refs` clause of a
+    /// completion gap. Every durable reader wants `artifact://`, so a model that
+    /// copies Runtime's own spelling must still reach the artifact.
+    #[test]
+    fn single_colon_artifact_ref_normalizes_to_the_durable_scheme() {
+        assert_eq!(
+            normalize_bare_evidence_ref("artifact:62f88802633947c6e8de0251"),
+            "artifact://62f88802633947c6e8de0251"
+        );
+    }
+
+    #[test]
+    fn single_colon_tool_ref_normalizes_to_the_durable_scheme() {
+        assert_eq!(
+            normalize_bare_evidence_ref("tool:raw-chatcmpl-tool-94c9d8cd"),
+            "tool://raw-chatcmpl-tool-94c9d8cd"
+        );
+    }
+
+    /// Normalizing must be idempotent: an already canonical reference is
+    /// returned untouched, so a second pass cannot double the separator.
+    #[test]
+    fn already_canonical_ref_is_untouched() {
+        for canonical in [
+            "artifact://art_921fd251e9ee4288bd051be2328d2c3c",
+            "tool://tool-raw-chatcmpl-tool-94c9d8cd84c6ca7a-6fc516bc30abf659",
+            "approval:v1:abc",
+        ] {
+            assert_eq!(normalize_bare_evidence_ref(canonical), canonical);
+        }
+    }
+
+    /// The legacy bare prefixes keep working: this is the behavior the
+    /// normalizer was originally written for.
+    #[test]
+    fn legacy_bare_prefixes_still_normalize() {
+        assert_eq!(
+            normalize_bare_evidence_ref("art_921fd251e9ee4288bd051be2328d2c3c"),
+            "artifact://art_921fd251e9ee4288bd051be2328d2c3c"
+        );
+        assert_eq!(
+            normalize_bare_evidence_ref("tool-raw-chatcmpl-tool-94c9d8cd"),
+            "tool://tool-raw-chatcmpl-tool-94c9d8cd"
+        );
+    }
+
+    /// A visibility scope and a program key are not evidence references. They
+    /// must pass through untouched or a scope check would start failing.
+    #[test]
+    fn scopes_and_program_keys_are_left_alone() {
+        for untouched in [
+            "session:8a7f7d30-12e8-4ee1-8844-177d06d78015",
+            "execution:session-ingress-graph",
+            "task:1890cf27e957ec7b95501c38",
+            "goal:session-ingress-graph:96259006e758bd4b674f5a88110b734d",
+            "fact:42",
+            "matrix:7",
+        ] {
+            assert_eq!(normalize_bare_evidence_ref(untouched), untouched);
+        }
+    }
+
+    /// An empty tail carries no identity, so there is nothing to prefix.
+    #[test]
+    fn empty_tail_is_left_alone() {
+        assert_eq!(normalize_bare_evidence_ref("artifact:"), "artifact:");
+        assert_eq!(normalize_bare_evidence_ref("tool:"), "tool:");
     }
 }
 

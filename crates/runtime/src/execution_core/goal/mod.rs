@@ -248,6 +248,30 @@ pub(crate) struct PreparedGoalMutation {
     pub event: RuntimeTransactionEventInput,
 }
 
+/// Whether a recorded ObjectiveReview has retired the `completion_gap` that
+/// sent the model to review in the first place.
+///
+/// The Goal's criteria and obligations must already reflect this review (the
+/// caller applies the decision first), so this reads the post-reduction state.
+/// A `gap` or `blocked` decision never retires the descriptor: the gap it names
+/// is real, and clearing it would let an unfinished objective report itself as
+/// ready to complete.
+fn satisfied_review_retires_the_waiting_gap(
+    goal: &harness_contract::goal::GoalContract,
+    decision: &str,
+) -> bool {
+    decision == "satisfied"
+        && goal.blockers.is_empty()
+        && goal
+            .criteria
+            .iter()
+            .all(|criterion| criterion.status != harness_contract::goal::AcceptanceStatus::Open)
+        && goal.obligations.iter().all(|obligation| {
+            !obligation.required
+                || obligation.state != harness_contract::goal::ObjectiveObligationState::Open
+        })
+}
+
 impl GoalStore {
     /// Prepare the Goal-side half of an Agentic Objective action. The caller
     /// must commit the returned event in the same transaction as the Program
@@ -529,7 +553,27 @@ impl GoalStore {
                         reason_ref: input.reason_ref.clone(),
                         verification: verification.cloned(),
                     });
-                    vec!["criteria".to_string(), "obligations".to_string(), "review_refs".to_string(), "reviews".to_string()]
+                    // A satisfied review can retire the `completion_gap` that
+                    // sent the model here. `ObjectiveUpdate` already clears
+                    // `waiting`; leaving it in place after a passing review
+                    // makes the Goal describe a gap that no longer exists, and
+                    // the Program projection repeats that description while
+                    // withholding the exit action.
+                    let clears_waiting =
+                        satisfied_review_retires_the_waiting_gap(goal, decision);
+                    if clears_waiting {
+                        goal.waiting = None;
+                    }
+                    let mut fields = vec![
+                        "criteria".to_string(),
+                        "obligations".to_string(),
+                        "review_refs".to_string(),
+                        "reviews".to_string(),
+                    ];
+                    if clears_waiting {
+                        fields.push("waiting".to_string());
+                    }
+                    fields
                 },
             )?,
             _ => return Err("action is not an Objective mutation".to_string()),
@@ -2989,5 +3033,67 @@ mod tests {
             "the stored review must carry the plain criterion id: {:?}",
             updated.reviews
         );
+    }
+
+    /// A satisfied review retires the gap it was sent to close. This is the
+    /// Goal-side half of the v14 deadlock: the criterion and the review were
+    /// both satisfied, yet `waiting` still described a `completion_gap` that no
+    /// longer existed.
+    #[test]
+    fn a_satisfied_review_retires_the_completion_gap() {
+        let mut goal = goal();
+        goal.criteria[0].status = AcceptanceStatus::Satisfied;
+        assert!(super::satisfied_review_retires_the_waiting_gap(
+            &goal,
+            "satisfied"
+        ));
+    }
+
+    /// A gap or blocked decision leaves the descriptor alone: the gap it names
+    /// is real, and clearing it would let an unfinished objective look ready.
+    #[test]
+    fn a_gap_or_blocked_review_keeps_the_waiting_descriptor() {
+        let mut goal = goal();
+        goal.criteria[0].status = AcceptanceStatus::Satisfied;
+        assert!(!super::satisfied_review_retires_the_waiting_gap(
+            &goal, "gap"
+        ));
+        assert!(!super::satisfied_review_retires_the_waiting_gap(
+            &goal, "blocked"
+        ));
+    }
+
+    /// Another criterion still open means the objective is genuinely unfinished,
+    /// whatever this one review said.
+    #[test]
+    fn another_open_criterion_keeps_the_waiting_descriptor() {
+        let mut goal = goal();
+        goal.criteria[0].status = AcceptanceStatus::Satisfied;
+        goal.criteria.push(AcceptanceCriterion {
+            id: "second".to_string(),
+            statement: "still open".to_string(),
+            statement_ref: None,
+            source_refs: Vec::new(),
+            required_evidence: Vec::new(),
+            status: AcceptanceStatus::Open,
+            waiver: None,
+        });
+        assert!(!super::satisfied_review_retires_the_waiting_gap(
+            &goal,
+            "satisfied"
+        ));
+    }
+
+    /// A blocker is a fact the model cannot review away.
+    #[test]
+    fn a_blocker_keeps_the_waiting_descriptor() {
+        let mut goal = goal();
+        goal.criteria[0].status = AcceptanceStatus::Satisfied;
+        goal.blockers
+            .push("operator permission pending".to_string());
+        assert!(!super::satisfied_review_retires_the_waiting_gap(
+            &goal,
+            "satisfied"
+        ));
     }
 }

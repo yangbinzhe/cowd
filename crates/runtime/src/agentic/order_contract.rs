@@ -20,3 +20,8 @@ pub const REVIEWER_SCOPE_DISCIPLINE: &str = "Scope discipline: the criteria oper
 /// Evidence economy for every actor: reads are durable receipts, not
 /// conversations; batch independent work; prefer ranged reads.
 pub const EVIDENCE_ECONOMY: &str = "Never re-read a file an accepted Task already read: open its durable receipt with evidence_retrieve (same bytes, hash-verified). Batch every independent read/search into one response or one tool_orchestrate program; prefer ranged reads over whole files.";
+
+/// Objective-review scope discipline. An Objective review settles one criterion;
+/// it is not a second round of Task review, and it must come from someone who
+/// did not produce what is being reviewed.
+pub const OBJECTIVE_REVIEW_SCOPE_DISCIPLINE: &str = "Preserve accepted work and do not repeat Task reviews: an Objective review settles the open criterion only. The reviewer must be distinct from the Runtime-resolved producer of every result it reviews.";

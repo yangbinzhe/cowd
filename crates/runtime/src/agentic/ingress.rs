@@ -677,73 +677,8 @@ pub fn agentic_program_completion_gap(
                 && binding.root_execution_id == root_execution_id
         });
         if bound_to_turn && goal.goal.completion == harness_contract::goal::GoalCompletion::Open {
-            let current_reviews_satisfied = goal.goal.blockers.is_empty()
-                && goal.goal.unresolved.is_empty()
-                && goal.goal.obligations.iter().all(|obligation| {
-                    !obligation.required
-                        || obligation.state
-                            == harness_contract::goal::ObjectiveObligationState::Satisfied
-                })
-                && goal
-                    .goal
-                    .criteria
-                    .iter()
-                    .all(|criterion| match criterion.status {
-                        harness_contract::goal::AcceptanceStatus::Satisfied => goal
-                            .goal
-                            .reviews
-                            .iter()
-                            .rev()
-                            .find(|review| review.criterion_ref == criterion.id)
-                            .is_some_and(|review| {
-                                review.decision == "satisfied"
-                                    && review.spec_revision == goal.goal.spec_revision
-                                    && review.input_manifest_digest == goal.goal.spec_digest
-                            }),
-                        harness_contract::goal::AcceptanceStatus::Waived => true,
-                        _ => false,
-                    });
-            // Name the delivered result refs no current review covers. One
-            // live loop had the root cite four artifacts per request while the
-            // recorded review covered three; nothing told the model which ref
-            // was missing, so it re-issued the same partial review until the
-            // observation window expired.
-            let uncovered_result_refs = {
-                let intent = goal
-                    .goal
-                    .user_intent_criterion_id
-                    .clone()
-                    .unwrap_or_default();
-                let covered = goal
-                    .goal
-                    .reviews
-                    .iter()
-                    .rev()
-                    .find(|review| review.criterion_ref == intent)
-                    .map(|review| review.result_refs.clone())
-                    .unwrap_or_default();
-                // The objective reviewer's own report is evidence of review,
-                // not a delivered result: naming it as uncovered sends the
-                // model into an unbounded review-regress. Filter it out with
-                // the same delivered-set rule the conclusion gate uses.
-                let goal_artifacts = goal
-                    .goal
-                    .evidence_refs
-                    .iter()
-                    .filter(|reference| reference.starts_with("artifact:"))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let delivered =
-                    crate::execution_core::goal::delivered_result_refs(&program, &goal_artifacts);
-                goal.goal
-                    .evidence_refs
-                    .iter()
-                    .filter(|reference| reference.starts_with("artifact:"))
-                    .filter(|reference| delivered.contains(reference))
-                    .filter(|reference| !covered.contains(reference))
-                    .cloned()
-                    .collect::<Vec<_>>()
-            };
+            let current_reviews_satisfied = current_reviews_satisfy_the_goal(&goal.goal);
+            let uncovered_result_refs = uncovered_delivered_result_refs(&program, &goal.goal);
             if let Some(gap) = objective_completion_waiting_gap(
                 goal.goal.waiting.as_ref(),
                 current_reviews_satisfied,
@@ -760,7 +695,82 @@ pub fn agentic_program_completion_gap(
     crate::agentic::supervision::completion_gap(&program, &input)
 }
 
-fn objective_completion_waiting_gap(
+/// Whether the Goal's own records say every current criterion is semantically
+/// reviewed and satisfied. Extracted so the Program projection and the ingress
+/// gap path cannot disagree about what "satisfied" means.
+pub(crate) fn current_reviews_satisfy_the_goal(
+    goal: &harness_contract::goal::GoalContract,
+) -> bool {
+    goal.blockers.is_empty()
+        && goal.unresolved.is_empty()
+        && goal.obligations.iter().all(|obligation| {
+            !obligation.required
+                || obligation.state == harness_contract::goal::ObjectiveObligationState::Satisfied
+        })
+        && goal
+            .criteria
+            .iter()
+            .all(|criterion| match criterion.status {
+                harness_contract::goal::AcceptanceStatus::Satisfied => goal
+                    .reviews
+                    .iter()
+                    .rev()
+                    .find(|review| review.criterion_ref == criterion.id)
+                    .is_some_and(|review| {
+                        review.decision == "satisfied"
+                            && review.spec_revision == goal.spec_revision
+                            && review.input_manifest_digest == goal.spec_digest
+                    }),
+                harness_contract::goal::AcceptanceStatus::Waived => true,
+                _ => false,
+            })
+}
+
+/// Delivered result references no current review covers.
+///
+/// One live loop had the root cite four artifacts per request while the
+/// recorded review covered three; nothing told the model which ref was
+/// missing, so it re-issued the same partial review until the observation
+/// window expired. Extracted so the Program projection derives the same set
+/// from the same rule instead of freezing whatever the reopen event happened
+/// to say.
+pub(crate) fn uncovered_delivered_result_refs(
+    program: &crate::AgenticProgramProjection,
+    goal: &harness_contract::goal::GoalContract,
+) -> Vec<String> {
+    let intent = goal.user_intent_criterion_id.clone().unwrap_or_default();
+    let covered = goal
+        .reviews
+        .iter()
+        .rev()
+        .find(|review| review.criterion_ref == intent)
+        .map(|review| review.result_refs.clone())
+        .unwrap_or_default();
+    // The objective reviewer's own report is evidence of review, not a
+    // delivered result: naming it as uncovered sends the model into an
+    // unbounded review-regress. Filter it out with the same delivered-set rule
+    // the conclusion gate uses.
+    let goal_artifacts = goal
+        .evidence_refs
+        .iter()
+        .filter(|reference| reference.starts_with("artifact:"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let delivered =
+        crate::execution_core::goal::delivered_result_refs(program, goal, &goal_artifacts);
+    goal.evidence_refs
+        .iter()
+        .filter(|reference| reference.starts_with("artifact:"))
+        .filter(|reference| delivered.contains(reference))
+        .filter(|reference| !covered.contains(reference))
+        .cloned()
+        .collect::<Vec<_>>()
+}
+
+/// A `completion_gap` that no longer describes reality must not be reported as
+/// one. Shared with the Program projection so a satisfied review clears the
+/// gap everywhere at once instead of only on the ingress path.
+pub(crate) fn objective_completion_waiting_gap(
     waiting: Option<&harness_contract::goal::WaitDescriptor>,
     current_reviews_satisfied: bool,
     uncovered_result_refs: &[String],

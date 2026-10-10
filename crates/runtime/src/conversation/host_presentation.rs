@@ -2061,11 +2061,14 @@ where
             if gap.contains("original_intent_review_required")
                 || gap.contains("criterion_review_required")
             {
+                // The scope discipline is shared with the Program receipt's
+                // actionable guidance. Both sites read it from the order
+                // contract so a rule change cannot land on one layer only.
+                let scope = crate::agentic::order_contract::OBJECTIVE_REVIEW_SCOPE_DISCIPLINE;
                 format!(
                     "Runtime returned this turn to work because the Objective is not complete yet: {gap}. \
                      The final answer you just wrote is not being delivered. This is an Objective-review \
-                     gap, not a Task-issue classification gap: preserve accepted work and do not repeat \
-                     Task reviews. If every current Agent produced one of the delivered result artifacts, \
+                     gap, not a Task-issue classification gap: {scope}. If every current Agent produced one of the delivered result artifacts, \
                      invite a fresh reviewer Agent inside the existing Team (do not create another Team) \
                      and give it a narrowly scoped Objective-review Task. The reviewer must use read-only \
                      tools such as `read_ref` to inspect each current delivered result and its durable \
@@ -2081,8 +2084,7 @@ where
                      this review is pending unless the reviewer identifies a concrete flaw; if a review \
                      attempt is rejected, follow its exact missing refs and `next_request` instructions \
                      and use a different physical reviewer when Runtime requires one. \
-                     Runtime requires current review receipts from someone distinct from every result \
-                     producer; a prior Task review or prose assertion alone does not satisfy the original \
+                     A prior Task review or prose assertion alone does not satisfy the original \
                      user-intent criterion. Complete any acceptance review required for the new Task. \
                      After the Goal projection confirms the criterion is current and satisfied, present the \
                      final answer again."
@@ -3453,7 +3455,6 @@ pub(super) fn tool_call_coverage_keys(call: &ModelToolCall) -> Vec<String> {
             | "glob_search"
             | "tool_orchestrate"
             | "grep_search"
-            | "grep_search"
             | "lsp"
             | "toolsearch"
             | "tool_search"
@@ -3625,9 +3626,10 @@ pub(super) fn graph_metadata_effect(
     // governed compiler.
     let normalized = tool_name.trim().replace('-', "_").to_ascii_lowercase();
     let effect_kind = match normalized.as_str() {
-        "read_file" | "tool_orchestrate" | "grep_search" | "grep_search" | "glob_search"
-        | "tool_orchestrate" | "workspace_snapshot" => ToolEffectKind::Read,
-        "edit" | "edit" | "edit" | "edit" => ToolEffectKind::Write,
+        "read_file" | "tool_orchestrate" | "grep_search" | "glob_search" | "workspace_snapshot" => {
+            ToolEffectKind::Read
+        }
+        "edit" => ToolEffectKind::Write,
         _ => return None,
     };
     let mut targets = Vec::new();

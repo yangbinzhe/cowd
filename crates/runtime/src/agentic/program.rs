@@ -67,7 +67,20 @@ pub struct AgenticProgramProjection {
     pub completion_request: Option<AgenticCompletionRequestProjection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub objective_verdict: Option<AgenticObjectiveVerdictProjection>,
+    /// Gaps that still block completion, recomputed from Goal truth.
+    ///
+    /// A reopen event records what a *specific* completion request was missing
+    /// at *that* revision. That is history, not state. One live run recorded
+    /// `criterion_unsatisfied:user_intent`, the model then satisfied the
+    /// criterion and the review, and the framework kept repeating the recorded
+    /// text while suppressing the exit action - so the program could never ask
+    /// to finish again. This field is therefore derived from the current Goal
+    /// every time the projection is built.
     pub unresolved: Vec<String>,
+    /// The gaps as they were recorded, kept for audit only. Never shown as the
+    /// current state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub last_reopen_gaps: Vec<String>,
 }
 
 impl AgenticProgramProjection {
@@ -116,6 +129,7 @@ impl AgenticProgramProjection {
             completion_request: None,
             objective_verdict: None,
             unresolved: Vec::new(),
+            last_reopen_gaps: Vec::new(),
         }
     }
 

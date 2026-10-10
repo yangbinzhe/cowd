@@ -1525,9 +1525,31 @@ fn is_unified_read_tool(tool_name: &str) -> bool {
 /// Pure and total: the facade cannot invent a second data path, so a new scheme
 /// must be added here deliberately and routed through a reader that already
 /// enforces authorization, revision fences, and durability.
+///
+/// A reference spelled `<scheme>:<id>` with one colon parses as `Bare`, because
+/// `Address::parse` splits on `://`. Delegating it to `state_inspect` answers a
+/// request for an artifact body with program guidance, and the caller cannot
+/// tell the difference. Runtime emits exactly that spelling for a one-shot Task
+/// deliverable and repeats it in a completion gap, so a model copying Runtime's
+/// own text used to read the wrong thing in silence. Refuse it with the correct
+/// spelling instead: an unambiguous scheme prefix with the wrong separator is a
+/// mistake worth naming, while a legacy bare id (no colon at all) still routes
+/// through the Program directory as before.
 fn unified_read_delegation(reference: &str) -> Result<(&'static str, serde_json::Value), String> {
     use harness_contract::refs::Address;
     let address = Address::parse(reference).map_err(|error| error.to_string())?;
+    if let Address::Bare(bare) = &address {
+        const DURABLE_SCHEMES: [&str; 6] =
+            ["artifact", "tool", "session", "fact", "matrix", "memory"];
+        if let Some((scheme, _)) = bare.split_once(':') {
+            if DURABLE_SCHEMES.contains(&scheme) {
+                return Err(format!(
+                    "`{bare}` names a {scheme} reference but is missing the `://` separator; read it as `{scheme}://{}`",
+                    bare.split_once(':').map(|(_, rest)| rest).unwrap_or(bare)
+                ));
+            }
+        }
+    }
     let delegation = match address {
         Address::Tool(id) => (
             "evidence_retrieve",
@@ -1608,6 +1630,55 @@ mod unified_read_tests {
         assert!(unified_read_delegation("dir://crates").is_err());
         assert!(unified_read_delegation("node://g/n").is_err());
         assert!(unified_read_delegation("weird://x").is_err());
+    }
+
+    /// Runtime spells a one-shot Task deliverable `artifact:<24 hex>` and
+    /// repeats that spelling in a completion gap. `Address::parse` turns it into
+    /// `Bare`, which used to delegate to `state_inspect` and answer a request
+    /// for an artifact body with program guidance. Refuse it and name the
+    /// correct spelling so the mistake is visible instead of silent.
+    #[test]
+    fn a_single_colon_durable_scheme_is_refused_with_the_canonical_form() {
+        for (wrong, scheme, id) in [
+            (
+                "artifact:62f88802633947c6e8de0251",
+                "artifact",
+                "62f88802633947c6e8de0251",
+            ),
+            (
+                "tool:raw-chatcmpl-tool-94c9d8cd",
+                "tool",
+                "raw-chatcmpl-tool-94c9d8cd",
+            ),
+            ("session:sess:1", "session", "sess:1"),
+            ("fact:42", "fact", "42"),
+            ("matrix:7", "matrix", "7"),
+            ("memory:9", "memory", "9"),
+        ] {
+            let error = unified_read_delegation(wrong)
+                .expect_err("a durable scheme without `://` must not read silently");
+            assert!(
+                error.contains(&format!("{scheme}://{id}")),
+                "expected the canonical spelling in the error, got: {error}"
+            );
+        }
+    }
+
+    /// A legacy bare id carries no scheme prefix at all, so the Program
+    /// directory remains its reader. This is the behavior the guard must not
+    /// disturb.
+    #[test]
+    fn a_legacy_bare_id_still_routes_to_the_program_directory() {
+        let (reader, value) =
+            unified_read_delegation("1890cf27e957ec7b95501c38").expect("bare routes");
+        assert_eq!(reader, "state_inspect");
+        assert_eq!(value["entry_ref"], "1890cf27e957ec7b95501c38");
+
+        // A program-scoped key is not a durable evidence scheme either.
+        let (reader, value) =
+            unified_read_delegation("task:1890cf27e957ec7b95501c38").expect("task key routes");
+        assert_eq!(reader, "state_inspect");
+        assert_eq!(value["entry_ref"], "task:1890cf27e957ec7b95501c38");
     }
 
     /// The guard and the exposed name must stay one. A stale `read` sends every

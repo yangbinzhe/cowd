@@ -58,16 +58,23 @@ fn completion_reopen_count(event_store: &crate::RuntimeEventStore, program_id: &
 /// identified structurally, so this holds regardless of task naming.
 pub(crate) fn delivered_result_refs(
     program: &crate::AgenticProgramProjection,
+    goal: &GoalContract,
     request_refs: &[String],
 ) -> Vec<String> {
-    let objective_reviewers = program
-        .agents
-        .values()
-        .filter(|agent| {
-            let role = agent.role.to_ascii_lowercase();
-            role.contains("objective review")
-        })
-        .map(|agent| agent.agent_id.as_str())
+    // The reviewers are the actors Runtime recorded on the Goal's own review
+    // records. That identity is assigned by Runtime and cannot drift: the
+    // previous rule matched `agent.role` against the substring "objective
+    // review", so a reviewer the model named "independent verifier", "QA" or
+    // "事实核验者" was not recognized, its report re-entered the delivered set,
+    // and every new review artifact became the next uncovered ref. One live run
+    // spun through 14 reviews without a verdict that way.
+    //
+    // With no recorded review there is no signal, so nothing is excluded:
+    // falling back to an explicit gap is safer than silently misjudging the set.
+    let objective_reviewers = goal
+        .reviews
+        .iter()
+        .map(|review| review.reviewer_actor.as_str())
         .collect::<std::collections::BTreeSet<_>>();
     if objective_reviewers.is_empty() {
         return request_refs.to_vec();
@@ -308,7 +315,7 @@ impl GoalStore {
         // and the collaboration could never close (14 reviews, 0 verdicts).
         // The delivered result set is what accepted work produced; artifacts
         // committed by the Runtime-bound objective reviewer are excluded.
-        let delivered_result_refs = delivered_result_refs(program, &request.result_refs);
+        let delivered_result_refs = delivered_result_refs(program, &goal, &request.result_refs);
         let reviewed = goal
             .reviews
             .iter()
@@ -605,14 +612,185 @@ mod tests {
                 claim_generation: None,
             },
         );
+        let goal = harness_contract::goal::GoalContract {
+            id: "goal:test".to_string(),
+            session_id: "session-test".to_string(),
+            objective: "objective".to_string(),
+            criteria: Vec::new(),
+            constraints: Vec::new(),
+            phase: "execution".to_string(),
+            evidence_refs: Vec::new(),
+            unresolved: Vec::new(),
+            blockers: Vec::new(),
+            scope: Default::default(),
+            user_intent_criterion_id: None,
+            source_intent_ref: None,
+            execution_binding: None,
+            spec_revision: 1,
+            spec_digest: String::new(),
+            review_refs: Vec::new(),
+            reviews: vec![harness_contract::goal::ObjectiveReviewRecord {
+                review_id: "objective_review:1".to_string(),
+                criterion_ref: "user_intent".to_string(),
+                spec_revision: 1,
+                input_manifest_digest: String::new(),
+                result_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                reviewer_actor: "agent:reviewer".to_string(),
+                reviewer_execution_id: None,
+                producer_refs: Vec::new(),
+                decision: "satisfied".to_string(),
+                reason_ref: String::new(),
+                verification: None,
+            }],
+            waiting: None,
+            participation_requirement: None,
+            obligations: Vec::new(),
+            recovery: None,
+            terminal: None,
+            completion: harness_contract::goal::GoalCompletion::Open,
+            revision: 1,
+            user_sequence: 1,
+        };
         let delivered = delivered_result_refs(
             &program,
+            &goal,
             &[
                 "artifact:delivered".to_string(),
                 "artifact:review-report".to_string(),
             ],
         );
         assert_eq!(delivered, vec!["artifact:delivered".to_string()]);
+    }
+
+    /// The exclusion must not depend on what the reviewer is called. The rule
+    /// used to match `agent.role` against the substring "objective review", so
+    /// a reviewer the model named "independent verifier", "QA" or "事实核验者"
+    /// slipped through, its report re-entered the delivered set, and every new
+    /// review artifact became the next uncovered ref. The Goal's own
+    /// `reviewer_actor` is assigned by Runtime and cannot drift.
+    #[test]
+    fn the_reviewers_own_report_is_excluded_whatever_the_role_is_named() {
+        for role in [
+            "independent verifier",
+            "QA",
+            "事实核验者",
+            "fresh independent objective reviewer",
+        ] {
+            let mut program = crate::AgenticProgramProjection::empty("program", "objective");
+            program.agents.insert(
+                "agent:reviewer".to_string(),
+                crate::AgentMemberProjection {
+                    agent_id: "agent:reviewer".to_string(),
+                    display_name: "reviewer".to_string(),
+                    role: role.to_string(),
+                    mission: "review".to_string(),
+                    required_capabilities: vec![],
+                    invited_by: "root".to_string(),
+                    membership_ids: vec![],
+                    definition_ref: None,
+                    model_profile_ref: None,
+                    expertise_hints: vec![],
+                    execution_requirements: vec![],
+                },
+            );
+            program.artifacts.insert(
+                "artifact:review-report".to_string(),
+                crate::AgenticArtifactProjection {
+                    artifact_ref: "artifact:review-report".to_string(),
+                    content_ref: "artifact://art_review".to_string(),
+                    kind: "report".to_string(),
+                    title: "review".to_string(),
+                    relates_to: vec![],
+                    committed_by: "agent:reviewer".to_string(),
+                    claim_execution_id: None,
+                    claim_generation: None,
+                },
+            );
+            let goal = harness_contract::goal::GoalContract {
+                id: "goal:test".to_string(),
+                session_id: "session-test".to_string(),
+                objective: "objective".to_string(),
+                criteria: Vec::new(),
+                constraints: Vec::new(),
+                phase: "execution".to_string(),
+                evidence_refs: Vec::new(),
+                unresolved: Vec::new(),
+                blockers: Vec::new(),
+                scope: Default::default(),
+                user_intent_criterion_id: None,
+                source_intent_ref: None,
+                execution_binding: None,
+                spec_revision: 1,
+                spec_digest: String::new(),
+                review_refs: Vec::new(),
+                reviews: vec![harness_contract::goal::ObjectiveReviewRecord {
+                    review_id: "objective_review:1".to_string(),
+                    criterion_ref: "user_intent".to_string(),
+                    spec_revision: 1,
+                    input_manifest_digest: String::new(),
+                    result_refs: Vec::new(),
+                    evidence_refs: Vec::new(),
+                    reviewer_actor: "agent:reviewer".to_string(),
+                    reviewer_execution_id: None,
+                    producer_refs: Vec::new(),
+                    decision: "satisfied".to_string(),
+                    reason_ref: String::new(),
+                    verification: None,
+                }],
+                waiting: None,
+                participation_requirement: None,
+                obligations: Vec::new(),
+                recovery: None,
+                terminal: None,
+                completion: harness_contract::goal::GoalCompletion::Open,
+                revision: 1,
+                user_sequence: 1,
+            };
+            let delivered =
+                delivered_result_refs(&program, &goal, &["artifact:review-report".to_string()]);
+            assert!(
+                delivered.is_empty(),
+                "role {role:?} must not change the exclusion, got {delivered:?}"
+            );
+        }
+    }
+
+    /// With no recorded review there is no structural signal, so nothing is
+    /// excluded. Falling back to an explicit gap is safer than silently
+    /// misjudging the delivered set.
+    #[test]
+    fn without_a_recorded_review_nothing_is_excluded() {
+        let program = crate::AgenticProgramProjection::empty("program", "objective");
+        let goal = harness_contract::goal::GoalContract {
+            id: "goal:test".to_string(),
+            session_id: "session-test".to_string(),
+            objective: "objective".to_string(),
+            criteria: Vec::new(),
+            constraints: Vec::new(),
+            phase: "execution".to_string(),
+            evidence_refs: Vec::new(),
+            unresolved: Vec::new(),
+            blockers: Vec::new(),
+            scope: Default::default(),
+            user_intent_criterion_id: None,
+            source_intent_ref: None,
+            execution_binding: None,
+            spec_revision: 1,
+            spec_digest: String::new(),
+            review_refs: Vec::new(),
+            reviews: Vec::new(),
+            waiting: None,
+            participation_requirement: None,
+            obligations: Vec::new(),
+            recovery: None,
+            terminal: None,
+            completion: harness_contract::goal::GoalCompletion::Open,
+            revision: 1,
+            user_sequence: 1,
+        };
+        let refs = vec!["artifact:anything".to_string()];
+        assert_eq!(delivered_result_refs(&program, &goal, &refs), refs);
     }
 
     use harness_contract::agent_action::{

@@ -4368,10 +4368,7 @@ fn collect_checked_source_receipts(value: &Value, receipts: &mut BTreeSet<String
                 .get("tool_name")
                 .and_then(Value::as_str)
                 .is_some_and(|tool| {
-                    matches!(
-                        tool,
-                        "read_file" | "tool_orchestrate" | "grep_search" | "grep_search"
-                    )
+                    matches!(tool, "read_file" | "tool_orchestrate" | "grep_search")
                 });
             let succeeded = values.get("is_error").and_then(Value::as_bool) == Some(false);
             if source_tool && succeeded {

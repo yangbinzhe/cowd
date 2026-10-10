@@ -152,7 +152,12 @@ monitor_semantic_health() {
     report="$(python3 "$monitor" "$COWD_TEST_POSTGRES_URL" --investigate 2>/dev/null || true)"
     [[ -n "$report" ]] || { sleep "$interval"; continue; }
     state="$(printf '%s' "$report" | jq -r '.conclusion.state // ""' 2>/dev/null || true)"
-    milestones="$(printf '%s' "$report" | jq -r '[.verdicts,.reopens,.objective_reviews,.completion_requests,.reworks,.task_submits] | @csv' 2>/dev/null || true)"
+    # Only convergence toward the Objective counts as a semantic milestone.
+    # `task_submits` is work-phase churn: it rises while the program spins (one
+    # frozen run submitted three tasks and never asked to finish), so counting
+    # it hides a real freeze behind activity. Reviews, requests, reopens,
+    # reworks and verdicts are the milestones.
+    milestones="$(printf '%s' "$report" | jq -r '[.verdicts,.reopens,.objective_reviews,.completion_requests,.reworks] | @csv' 2>/dev/null || true)"
     findings="$(printf '%s' "$report" | jq -c '.conclusion.findings' 2>/dev/null || echo '[]')"
     now="$(date +%s)"
     if [[ -n "$milestones" && "$milestones" != "$DEEP_MONITOR_LAST_MILESTONE" ]]; then

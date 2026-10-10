@@ -146,12 +146,20 @@ class Monitor:
                 "action": "stop; the task acceptance criteria were inflated at authoring time",
             })
         # Time-based as well as step-based: a single-stream run burns wall
-        # clock far slower than a concurrent one, so a step threshold alone
-        # never fires for it (Qwen v11: 13 steps in 14 minutes, frozen).
+        # clock far slower than a concurrent one, so a wall-clock threshold is
+        # the one that works for both (Qwen v11: 13 steps in 14 minutes, frozen).
+        #
+        # A step count is deliberately NOT a symptom. Steps measure how much
+        # work the framework did, not whether that work converged: a healthy
+        # run of this scenario legitimately crosses 150 steps (one reached a
+        # verdict at 112, another ran 349), and three agents each reading the
+        # same file once is information gathering, not waste. Judging health by
+        # volume reported a healthy run as spinning and trained the operator to
+        # ignore the monitor. Only convergence toward the Objective counts.
         stalled_long = (
             snap.get("last_event_age_s", 0) > 600 and snap["completion_requests"] == 0
         )
-        if (snap["model_steps"] > 150 or stalled_long) and snap["completion_requests"] == 0:
+        if stalled_long:
             findings.append({
                 "root_cause": "objective never requested: work phase never converges to a completion request",
                 "evidence": [f"{snap['model_steps']} steps, 0 completion requests, recent actions {inv.get('recent_actions')}"],
@@ -164,7 +172,16 @@ class Monitor:
                 "evidence": [f"{r['input'][:60]} x{r['count']}" for r in repeats[:3]],
                 "action": "stop; the loop guard or task framing is not breaking the cycle",
             })
-        reads = [r for r in inv.get("repeated_reads", []) if r["count"] >= 4]
+        # A repeated read is only waste when the reader keeps going and the
+        # count is far past what independent agents would produce. Three agents
+        # each opening the same file once is three first reads, not a loop; the
+        # deduplication contract is keyed on session + path + content hash and
+        # deliberately does not share receipts across agents. Require both a
+        # high count and live events, so a quiet run is never called wasteful.
+        reads = [
+            r for r in inv.get("repeated_reads", [])
+            if r["count"] >= 8 and snap.get("last_event_age_s", 0) < 300
+        ]
         if reads:
             findings.append({
                 "root_cause": "redundant full reads of the same source: receipt reuse not happening",
