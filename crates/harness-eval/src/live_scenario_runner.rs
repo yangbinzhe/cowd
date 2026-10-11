@@ -20,11 +20,11 @@ use crate::{
 
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// How many extra chances the root Program projection gets to become visible
-/// after a terminal execution is observed. The backoff is 2s then 4s, so the
+/// after a terminal execution is observed. The backoff is 1s, 2s then 4s, so the
 /// total added latency is bounded at 7 seconds - negligible against a scenario
-/// measured in minutes, and enough to cover the stream lag that made a
-/// completed run report "not verified".
-const PROGRAM_EXTRACTION_RETRIES: u32 = 2;
+/// measured in minutes, and enough to cover the stream lag that made a completed
+/// run report "not verified".
+const PROGRAM_EXTRACTION_RETRIES: u32 = 3;
 const MAX_DEFAULT_SCENARIO_TIMEOUT: Duration = Duration::from_secs(600);
 const GROUP_THEORY_SCENARIO_ID: &str = "live_group_theory_ai_research_simulation";
 const LARGE_SCALE_SCENARIO_ID: &str = "live_qwen38_large_scale_collaboration";
@@ -3505,7 +3505,7 @@ where
             Ok(Some(program)) => return Ok(Some(program)),
             Ok(None) if attempt < PROGRAM_EXTRACTION_RETRIES => {
                 attempt += 1;
-                std::thread::sleep(std::time::Duration::from_secs(1 << attempt));
+                std::thread::sleep(std::time::Duration::from_secs(1 << (attempt - 1)));
             }
             other => return other,
         }
@@ -4303,10 +4303,6 @@ fn synthesized_final_artifact_findings(
         else {
             return false;
         };
-        // Relates to at least two accepted Tasks. `relates_to` is the Program's
-        // own record of what an artifact covers, so this is a structural fact
-        // rather than a guess about bytes: two artifacts sharing a content
-        // reference are the same bytes, not a synthesis of one another.
         // Relates to at least two accepted Tasks, counting the host: with two
         // Tasks a synthesis that covers both necessarily relates to both.
         // `relates_to` is the Program's own record of what an artifact covers,
