@@ -4279,8 +4279,10 @@ fn physical_failed_agent_activity_count(projections: &[Value]) -> usize {
 fn synthesized_final_artifact_findings(
     program: Option<&runtime::AgenticProgramProjection>,
 ) -> (bool, Vec<String>) {
+    // No Program means no Tasks, and no Tasks means nothing to synthesize. A
+    // no-Team scenario has no synthesis obligation either.
     let Some(program) = program else {
-        return (false, Vec::new());
+        return (true, Vec::new());
     };
     let accepted: Vec<&runtime::AgenticTaskProjection> = active_agentic_tasks(program)
         .filter(|task| task.status == runtime::AgenticTaskStatus::Accepted)
@@ -4305,11 +4307,15 @@ fn synthesized_final_artifact_findings(
         // own record of what an artifact covers, so this is a structural fact
         // rather than a guess about bytes: two artifacts sharing a content
         // reference are the same bytes, not a synthesis of one another.
+        // Relates to at least two accepted Tasks, counting the host: with two
+        // Tasks a synthesis that covers both necessarily relates to both.
+        // `relates_to` is the Program's own record of what an artifact covers,
+        // so this is a structural fact rather than a guess about bytes - two
+        // artifacts sharing a content reference are the same bytes, not a
+        // synthesis of one another.
         let related: Vec<&&runtime::AgenticTaskProjection> = accepted
             .iter()
-            .filter(|task| {
-                task.task_id != host.task_id && artifact.relates_to.contains(&task.task_id)
-            })
+            .filter(|task| artifact.relates_to.contains(&task.task_id))
             .collect();
         if related.len() < 2 {
             return false;
@@ -4318,9 +4324,10 @@ fn synthesized_final_artifact_findings(
         // summarizing their own report produces a fourth report, not a
         // synthesis. The host's author is exempt because the host is where the
         // synthesis lives, not what it synthesizes.
-        !related
-            .iter()
-            .any(|task| task.claimant.as_deref() == Some(artifact.committed_by.as_str()))
+        !related.iter().any(|task| {
+            task.task_id != host.task_id
+                && task.claimant.as_deref() == Some(artifact.committed_by.as_str())
+        })
     };
     let synthesized = program.artifacts.values().any(|artifact| covered(artifact));
     if synthesized {

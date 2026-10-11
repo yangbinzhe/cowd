@@ -208,7 +208,7 @@ fn agentic_program_projection(
     });
     let artifacts = json!({
         "artifact:a": {"artifact_ref":"artifact:a","content_ref":"content:a","kind":"research","title":"research","relates_to":["task-a"],"committed_by":"agent-a"},
-        "artifact:final": {"artifact_ref":"artifact:final","content_ref":AUTONOMOUS_DEEPSEEK_OUTPUT_PATH,"kind":"report","title":AUTONOMOUS_DEEPSEEK_OUTPUT_PATH,"relates_to":["task-b"],"committed_by":"agent-b"}
+        "artifact:final": {"artifact_ref":"artifact:final","content_ref":AUTONOMOUS_DEEPSEEK_OUTPUT_PATH,"kind":"report","title":AUTONOMOUS_DEEPSEEK_OUTPUT_PATH,"relates_to":["task-a","task-b"],"committed_by":"agent-b"}
     });
     serde_json::from_value(json!({
         "program_id": "program:test",
