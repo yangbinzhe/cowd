@@ -66,7 +66,7 @@ pub(crate) fn apply_task_publish(
             objective: input.objective.trim().to_string(),
             acceptance: input.acceptance.trim().to_string(),
             acceptance_checks: input.acceptance_checks.clone(),
-            criterion_source: input.criterion_source,
+            criterion_source: derived_criterion_source(projection, input),
             required_capabilities: input.required_capabilities.clone(),
             obligation_refs: input.obligation_refs.clone(),
             purpose: input.purpose,
@@ -106,12 +106,131 @@ pub(crate) fn apply_task_publish(
     // enforced. The waste happens at authoring time - the reviewer scans for
     // hazards nobody asked about - so the fact has to be visible to the author
     // at the moment of writing and to the reviewer at the moment of judging.
-    if input.criterion_source == harness_contract::agent_action::CriterionSource::AgentInvented {
+    //
+    // The label is derived from the operator's own objective, never declared by
+    // the author. A live run wrote "including exact file path, line reference,
+    // and quoted source text" into its own acceptance, a reviewer enforced it
+    // line by line, and the declared `criterion_source` stayed at its default
+    // for the whole run - asking an author to report that it invented a
+    // standard is asking it to incriminate itself, so the field is never set.
+    // The label fires on the derived value, which already honours an explicit
+    // declaration: a model that reports its own standard as invented is
+    // believed, and one that says nothing is judged against the operator.
+    if derived_criterion_source(projection, input)
+        == harness_contract::agent_action::CriterionSource::AgentInvented
+    {
+        let marker = invented_form_marker(projection, input)
+            .unwrap_or("a standard the model set for itself");
         projection.program_warnings.push(format!(
-            "Task `{task_id}` acceptance is model-invented, not an operator requirement; \
-             a reviewer must not rework the Task on that standard alone"
+            "Task `{task_id}` requires `{marker}`, which the operator never asked for. \
+             The operator's requirement is: {}. A reviewer must not rework the Task on \
+             that added standard alone.",
+            operator_requirement_summary(projection)
         ));
     }
+}
+
+/// Form requirements a reviewer commonly enforces that the operator rarely
+/// states. Derived from the same enumeration `order_contract` carries, so the
+/// authoring discipline and the detection cannot drift apart.
+const INVENTED_FORM_MARKERS: [&str; 8] = [
+    "line reference",
+    "quoted source",
+    "exact file path",
+    "line-level",
+    "todo",
+    "fixme",
+    "unwrap",
+    "api survey",
+];
+
+/// The provenance of a Task's acceptance statement.
+///
+/// A declared value wins: a model that reports its own standard as invented is
+/// believed. Otherwise the value is derived by comparing the acceptance against
+/// the operator's objective, because the author cannot be the source of truth
+/// about its own invention.
+fn derived_criterion_source(
+    projection: &AgenticProgramProjection,
+    input: &TaskPublishInput,
+) -> harness_contract::agent_action::CriterionSource {
+    use harness_contract::agent_action::CriterionSource;
+    if input.criterion_source == CriterionSource::AgentInvented {
+        return CriterionSource::AgentInvented;
+    }
+    if invented_form_marker(projection, input).is_some() {
+        return CriterionSource::AgentInvented;
+    }
+    CriterionSource::OperatorDerived
+}
+
+/// A form requirement in this Task's acceptance that the operator never stated,
+/// or `None` when every requirement traces back to the operator.
+///
+/// A marker counts as the operator's only when it appears in the operator's own
+/// text. Anchors are literal: source paths, counts, named deliverables, and the
+/// markers the operator itself used. Nothing here interprets meaning, so an
+/// objective that cannot be anchored yields no marker and fails open.
+fn invented_form_marker(
+    projection: &AgenticProgramProjection,
+    input: &TaskPublishInput,
+) -> Option<&'static str> {
+    let objective = projection.objective_summary.to_ascii_lowercase();
+    let acceptance = input.acceptance.to_ascii_lowercase();
+    // Nothing to compare against means nothing can be called invented. An
+    // objective with no recognisable anchor is not evidence that a requirement
+    // was added, and guessing would refuse legitimate rework.
+    if !objective_has_anchors(&objective) {
+        return None;
+    }
+    INVENTED_FORM_MARKERS
+        .into_iter()
+        .find(|marker| acceptance.contains(marker) && !objective.contains(marker))
+}
+
+/// Whether the operator's objective states anything checkable at all: a source
+/// path, a count, a named deliverable, or one of the form requirements itself.
+fn objective_has_anchors(objective: &str) -> bool {
+    if objective.trim().is_empty() {
+        return false;
+    }
+    let names_a_path = objective.contains('/') && objective.contains('.');
+    let names_a_count = [
+        "三个",
+        "至少三个",
+        "至少",
+        "1 个",
+        "2 个",
+        "3 个",
+        "one ",
+        "two ",
+        "three ",
+    ]
+    .iter()
+    .any(|count| objective.contains(count));
+    let names_a_deliverable = [".md", ".html", ".txt", ".json", ".rs"]
+        .iter()
+        .any(|extension| objective.contains(extension));
+    let states_a_form_requirement = INVENTED_FORM_MARKERS
+        .iter()
+        .any(|marker| objective.contains(marker));
+    names_a_path || names_a_count || names_a_deliverable || states_a_form_requirement
+}
+
+/// What the operator actually asked for, quoted back so the author and the
+/// reviewer read the same comparison instead of an assertion.
+fn operator_requirement_summary(projection: &AgenticProgramProjection) -> String {
+    let summary = projection.objective_summary.trim();
+    if summary.is_empty() {
+        return "not recorded on this Program".to_string();
+    }
+    const LIMIT: usize = 240;
+    if summary.chars().count() <= LIMIT {
+        return summary.to_string();
+    }
+    let mut shortened: String = summary.chars().take(LIMIT).collect();
+    shortened.push_str("...");
+    shortened
 }
 
 /// Persist executor admission before a physical graph is started.  This is
@@ -934,5 +1053,157 @@ mod tests {
             AgenticTaskStatus::Withdrawn
         );
         assert!(projection.tasks["task"].active_attempts.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod criterion_source_tests {
+    use super::*;
+    use harness_contract::agent_action::AgentAction;
+
+    fn publish_input(acceptance: &str) -> TaskPublishInput {
+        TaskPublishInput {
+            team_ref: "team:1".to_string(),
+            title: "Research".to_string(),
+            objective: "Read source".to_string(),
+            acceptance: acceptance.to_string(),
+            acceptance_checks: Vec::new(),
+            criterion_source: Default::default(),
+            required_capabilities: vec!["read".to_string()],
+            depends_on: Vec::new(),
+            obligation_refs: Vec::new(),
+            purpose: Default::default(),
+            execution_requirements: Vec::new(),
+            expertise_hints: Vec::new(),
+        }
+    }
+
+    fn program_with_objective(objective: &str) -> AgenticProgramProjection {
+        let mut program = AgenticProgramProjection::empty("program-1", "objective-1");
+        program.objective_summary = objective.to_string();
+        program
+    }
+
+    /// The operator asked for one verifiable fact per file. A Task that also
+    /// demands line references and quoted source has added a standard, and the
+    /// author will never say so - a live run proved the declared field stays at
+    /// its default while the reviewer enforces the addition line by line.
+    #[test]
+    fn an_invented_form_requirement_is_derived_as_agent_invented() {
+        let program = program_with_objective(
+            "Read crates/runtime/src/lib.rs, crates/tools/src/lib.rs and crates/memory/src/lib.rs. \
+             Give one verifiable fact per file (file path + fact).",
+        );
+        let input =
+            publish_input("must include exact file path, line reference, and quoted source text");
+        assert_eq!(
+            derived_criterion_source(&program, &input),
+            harness_contract::agent_action::CriterionSource::AgentInvented
+        );
+        assert_eq!(
+            invented_form_marker(&program, &input),
+            Some("line reference")
+        );
+    }
+
+    /// An operator who asked for the form gets it: the marker is in the
+    /// operator's own text, so requiring it is not an invention.
+    #[test]
+    fn an_operator_stated_form_requirement_stays_operator_derived() {
+        let program = program_with_objective(
+            "Read crates/runtime/src/lib.rs. Give one verifiable fact per file, \
+             including exact file path, line reference, and quoted source text.",
+        );
+        let input =
+            publish_input("must include exact file path, line reference, and quoted source text");
+        assert_eq!(
+            derived_criterion_source(&program, &input),
+            harness_contract::agent_action::CriterionSource::OperatorDerived
+        );
+        assert_eq!(invented_form_marker(&program, &input), None);
+    }
+
+    /// An objective that cannot be anchored must not be second-guessed: with no
+    /// anchors there is no basis for calling anything invented.
+    #[test]
+    fn an_objective_without_anchors_fails_open() {
+        let program = program_with_objective("");
+        let input = publish_input("must include exact file path, line reference");
+        assert_eq!(
+            derived_criterion_source(&program, &input),
+            harness_contract::agent_action::CriterionSource::OperatorDerived
+        );
+        assert_eq!(invented_form_marker(&program, &input), None);
+    }
+
+    /// A declared value is still believed: a model that reports its own standard
+    /// as invented is not overridden by the derivation.
+    #[test]
+    fn a_declared_invented_source_is_respected() {
+        let program = program_with_objective("Read crates/runtime/src/lib.rs.");
+        let mut input = publish_input("one verifiable fact");
+        input.criterion_source = harness_contract::agent_action::CriterionSource::AgentInvented;
+        assert_eq!(
+            derived_criterion_source(&program, &input),
+            harness_contract::agent_action::CriterionSource::AgentInvented
+        );
+    }
+
+    /// The T2b dead case, pinned: the operator asked for a fact per file, the
+    /// Task added a form requirement, and the reviewer enforced it into a rework
+    /// loop that the deep monitor had to stop.
+    #[test]
+    fn the_t2b_rework_loop_would_now_be_labelled() {
+        let program = program_with_objective(
+            "Read crates/runtime/src/lib.rs, crates/tools/src/lib.rs and crates/memory/src/lib.rs. \
+             Give one verifiable fact per file (file path + fact), and list at least three \
+             complete crates/.../*.rs paths actually read.",
+        );
+        let input = publish_input(
+            "Each finding must include exact file path, line reference, and quoted source text.",
+        );
+        let mut program = program;
+        let task_id = "task:t2b".to_string();
+        apply_task_publish(&mut program, &envelope(), &input, Some(&task_id));
+        let task = program.tasks.get(&task_id).expect("durable Task");
+        assert_eq!(
+            task.criterion_source,
+            harness_contract::agent_action::CriterionSource::AgentInvented,
+            "the added form requirement must be derived, not declared"
+        );
+        assert!(
+            program
+                .program_warnings
+                .iter()
+                .any(|warning| warning.contains("line reference") && warning.contains("operator")),
+            "the label must quote the operator's requirement for both sides: {:?}",
+            program.program_warnings
+        );
+    }
+
+    fn envelope() -> AgentActionEnvelope {
+        AgentActionEnvelope {
+            action_id: "publish".to_string(),
+            actor: harness_contract::agent_action::AgentActorBinding {
+                objective_id: "objective-1".to_string(),
+                program_id: "program-1".to_string(),
+                session_id: "session-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                root_execution_id: Some("root-1".to_string()),
+                required_team_count: 0,
+                exact_team_count: None,
+                objective_summary: String::new(),
+                model_lease: "test".to_string(),
+                permission_ceiling: None,
+                resource_scopes: Vec::new(),
+                actor_id: "root".to_string(),
+                kind: harness_contract::agent_action::AgentActorKind::Root,
+                execution_id: None,
+                team_id: None,
+                agent_id: None,
+            },
+            expected_revision: None,
+            action: AgentAction::TaskPublish(publish_input("one verifiable fact")),
+        }
     }
 }

@@ -4411,9 +4411,11 @@ fn invented_criterion_is_durably_labeled_for_author_and_reviewer() {
         .expect("task");
     let program = service.project("program-1").expect("program");
     assert!(
-        program.program_warnings.iter().any(
-            |warning| warning.contains("model-invented") && warning.contains("must not rework")
-        ),
+        program
+            .program_warnings
+            .iter()
+            .any(|warning| warning.contains("operator never asked for")
+                && warning.contains("must not rework")),
         "the invented standard must be labelled where it was written: {:?}",
         program.program_warnings
     );
@@ -4421,7 +4423,7 @@ fn invented_criterion_is_durably_labeled_for_author_and_reviewer() {
     assert!(
         actions
             .iter()
-            .any(|action| action.contains("model-invented")),
+            .any(|action| action.contains("operator never asked for")),
         "the author must see the label on its own receipt: {actions:?}"
     );
 }
