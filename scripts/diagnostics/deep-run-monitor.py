@@ -96,17 +96,6 @@ class Monitor:
             "GROUP BY 1 ORDER BY 2 DESC LIMIT 6")
         inv["repeated_tool_inputs"] = [
             {"input": t, "count": int(n)} for t, n in rows if int(n) >= 3]
-        # An `artifact_commit` on `current_message_block:<i>` names a block of
-        # the response being written right now, so the input is identical every
-        # time while the content is different each time. Counting those as
-        # re-issued calls reported a healthy run as spinning. The signature has
-        # no content, so it cannot distinguish them; exclude them rather than
-        # guess.
-        inv["repeated_tool_inputs"] = [
-            entry for entry in inv["repeated_tool_inputs"]
-            if "current_message_block:" not in entry["input"]
-        ]
-
         # 3. Redundant full reads of the same path.
         rows = self.q(
             "SELECT payload->>'content', count(*) FROM runtime_events "
@@ -175,7 +164,17 @@ class Monitor:
                 "evidence": [f"{snap['model_steps']} steps, 0 completion requests, recent actions {inv.get('recent_actions')}"],
                 "action": "stop; inspect task authoring and rework pressure",
             })
-        repeats = [r for r in inv.get("repeated_tool_inputs", []) if r["count"] >= 5]
+        # An `artifact_commit` on `current_message_block:<i>` names a block of
+        # the response being written right now, so its input is identical every
+        # time while the content is different each time. Counting those as
+        # re-issued calls reported a healthy run as spinning. The signature
+        # carries no content, so it cannot tell them apart; exclude them rather
+        # than guess. The filter belongs with the judgment, not the collection,
+        # so every caller of `conclude` gets the same answer.
+        repeats = [
+            r for r in inv.get("repeated_tool_inputs", [])
+            if r["count"] >= 5 and "current_message_block:" not in r["input"]
+        ]
         if repeats:
             findings.append({
                 "root_cause": "identical tool inputs repeated: the model is re-issuing the same call",
