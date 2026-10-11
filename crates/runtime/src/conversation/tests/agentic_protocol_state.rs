@@ -1,7 +1,7 @@
 use super::agentic_program_owns_root_terminal;
 use super::host_backend::{
-    delegated_agentic_protocol_state, pending_delegated_action_is_ready,
-    DelegatedAgenticProtocolState,
+    DelegatedAgenticProtocolState, delegated_agentic_protocol_state,
+    pending_delegated_action_is_ready,
 };
 use harness_contract::agent::{AgentTaskPacket, AgenticExecutionBinding, AgenticExecutionFocus};
 use harness_contract::agent_action::{
@@ -55,13 +55,15 @@ fn bound_agentic_program_exclusively_owns_the_root_goal_terminal() {
         })
         .expect("bind Agent-first Program");
 
-    assert!(agentic_program_owns_root_terminal(
-        services.as_ref(),
-        session_id,
-        turn_id,
-        root_execution_id,
-    )
-    .expect("terminal owner"));
+    assert!(
+        agentic_program_owns_root_terminal(
+            services.as_ref(),
+            session_id,
+            turn_id,
+            root_execution_id,
+        )
+        .expect("terminal owner")
+    );
     assert!(
         super::host_presentation::root_terminal_owned_elsewhere(
             services.as_ref(),
@@ -88,13 +90,15 @@ fn bound_agentic_program_exclusively_owns_the_root_goal_terminal() {
         .unwrap(),
         "failure presentation preserves Program terminal ownership"
     );
-    assert!(!agentic_program_owns_root_terminal(
-        services.as_ref(),
-        "session-direct",
-        "turn-direct",
-        "root-direct",
-    )
-    .expect("direct turn retains presentation writer"));
+    assert!(
+        !agentic_program_owns_root_terminal(
+            services.as_ref(),
+            "session-direct",
+            "turn-direct",
+            "root-direct",
+        )
+        .expect("direct turn retains presentation writer")
+    );
 }
 
 struct AgenticProtocolFixture {
@@ -228,6 +232,7 @@ fn protocol_fixture_for_root(root: AgentActorBinding) -> AgenticProtocolFixture 
                 title: "Protocol result".to_string(),
                 objective: "produce one durable result".to_string(),
                 acceptance: "an independent reviewer accepts the submitted artifact".to_string(),
+                criterion_source: Default::default(),
                 acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
@@ -658,12 +663,14 @@ async fn rework_attempt_cannot_reuse_artifacts_from_an_earlier_claim() {
         .expect("Agent-first protocol");
     assert!(state.owns_active_attempt);
     assert!(state.artifact_refs.is_empty());
-    assert_eq!(
-        state.closure_tool_ids(),
-        std::collections::BTreeSet::from([
-            harness_contract::agent_action::ARTIFACT_COMMIT_TOOL_ID.to_string()
-        ])
+    // A reworked attempt still commits, and it may still read the target it has
+    // to fix: the closure set is the action plus the read-only evidence tools.
+    let ids = state.closure_tool_ids();
+    assert!(
+        ids.contains(harness_contract::agent_action::ARTIFACT_COMMIT_TOOL_ID),
+        "{ids:?}"
     );
+    assert!(ids.contains("read_file"), "{ids:?}");
 }
 
 #[test]
@@ -756,7 +763,7 @@ fn saturated_delegated_work_commits_its_next_action_without_text_only_detour() {
 }
 
 #[test]
-fn active_delegated_protocol_exposes_only_its_irreducible_closure_action() {
+fn active_delegated_protocol_exposes_its_closure_action_and_the_reads_it_needs() {
     let state = |mode: &str, artifact_refs: Vec<String>| DelegatedAgenticProtocolState {
         program_id: "program".to_string(),
         task_id: "task".to_string(),
@@ -768,24 +775,47 @@ fn active_delegated_protocol_exposes_only_its_irreducible_closure_action() {
         review_reason: None,
     };
 
-    assert_eq!(
-        state("execute", Vec::new()).closure_tool_ids(),
-        std::collections::BTreeSet::from([
-            harness_contract::agent_action::ARTIFACT_COMMIT_TOOL_ID.to_string()
-        ])
-    );
-    assert_eq!(
-        state("execute", vec!["artifact:ready".to_string()]).closure_tool_ids(),
-        std::collections::BTreeSet::from([
-            harness_contract::agent_action::TASK_SUBMIT_TOOL_ID.to_string()
-        ])
-    );
-    assert_eq!(
-        state("review", vec!["artifact:submitted".to_string()]).closure_tool_ids(),
-        std::collections::BTreeSet::from([
-            harness_contract::agent_action::TASK_REVIEW_TOOL_ID.to_string()
-        ])
-    );
+    // The closing action is always there.
+    for (mode, artifacts, action_tool) in [
+        (
+            "execute",
+            Vec::new(),
+            harness_contract::agent_action::ARTIFACT_COMMIT_TOOL_ID,
+        ),
+        (
+            "execute",
+            vec!["artifact:ready".to_string()],
+            harness_contract::agent_action::TASK_SUBMIT_TOOL_ID,
+        ),
+        (
+            "review",
+            Vec::new(),
+            harness_contract::agent_action::TASK_REVIEW_TOOL_ID,
+        ),
+    ] {
+        let ids = state(mode, artifacts).closure_tool_ids();
+        assert!(
+            ids.contains(action_tool),
+            "{mode} must still close with {action_tool}: {ids:?}"
+        );
+        // And the read-only tools the closing Agent still owes evidence to. A
+        // set of exactly one action tool used to block a live run with
+        // `tool_protocol_violation: ... [grep_search]`: the Agent could not read
+        // the file its own objective named.
+        for read_only in [
+            "read_file",
+            "read_ref",
+            "evidence_retrieve",
+            "grep_search",
+            "glob_search",
+            "state_inspect",
+        ] {
+            assert!(
+                ids.contains(read_only),
+                "{mode} must keep the read-only tool {read_only}: {ids:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -988,20 +1018,24 @@ fn topic_transport_preserves_unacknowledged_pages_and_rechecks_private_scope() {
         first,
         "a new event cannot replace the unacknowledged page"
     );
-    assert!(transport
-        .acknowledge(&actions, "topic-delivery:forged")
-        .is_err());
-    assert!(actions
-        .topic_observations(
-            &fixture.root.program_id,
-            &fixture.author_ref,
-            &packet.agentic_binding.as_ref().unwrap().team_id,
-            packet.graph_id(),
-            16,
-            48 * 1024
-        )
-        .unwrap()
-        .is_some());
+    assert!(
+        transport
+            .acknowledge(&actions, "topic-delivery:forged")
+            .is_err()
+    );
+    assert!(
+        actions
+            .topic_observations(
+                &fixture.root.program_id,
+                &fixture.author_ref,
+                &packet.agentic_binding.as_ref().unwrap().team_id,
+                packet.graph_id(),
+                16,
+                48 * 1024
+            )
+            .unwrap()
+            .is_some()
+    );
     transport.acknowledge(&actions, id).unwrap();
     transport.acknowledge(&actions, id).unwrap();
     let cursor_events = fixture
@@ -1030,9 +1064,11 @@ fn topic_transport_preserves_unacknowledged_pages_and_rechecks_private_scope() {
         .unwrap();
     publish("reviewer-private", vec![fixture.reviewer_ref.clone()]);
     assert!(transport.issue(&actions, &packet).unwrap().is_none());
-    assert!(crate::agentic::topic_delivery::prepare(&actions, &packet)
-        .unwrap()
-        .is_none());
+    assert!(
+        crate::agentic::topic_delivery::prepare(&actions, &packet)
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(ticket.graph_id, "topic-port-conversation");
 }
 
@@ -1427,21 +1463,25 @@ async fn accepted_root_work_does_not_force_a_terminal_tool_or_promote_its_checkp
         !captured.is_empty(),
         "missing real root request: {result:?}"
     );
-    assert!(captured[0]
-        .prompt
-        .contextual_packets
-        .iter()
-        .any(|p| p.content.contains("agentic_program_checkpoint")));
-    assert!(!captured[0]
-        .prompt
-        .trusted_system
-        .iter()
-        .any(|p| p.contains("agentic_program_checkpoint")));
-    assert!(captured[0].prompt.contextual_packets.iter().any(|p| p
-        .content
-        .contains("runtime.working_context")
-        && p.content
-            .contains("new counterexamples still require research")));
+    assert!(
+        captured[0]
+            .prompt
+            .contextual_packets
+            .iter()
+            .any(|p| p.content.contains("agentic_program_checkpoint"))
+    );
+    assert!(
+        !captured[0]
+            .prompt
+            .trusted_system
+            .iter()
+            .any(|p| p.contains("agentic_program_checkpoint"))
+    );
+    assert!(captured[0].prompt.contextual_packets.iter().any(|p| {
+        p.content.contains("runtime.working_context")
+            && p.content
+                .contains("new counterexamples still require research")
+    }));
     let choices = choices.lock().unwrap();
     assert!(!choices.is_empty());
     assert!(

@@ -773,6 +773,7 @@ where
             last_verified_progress: false,
             consecutive_unverified_model_steps: 0,
             closure_ready_steps: 0,
+            previous_objective_milestones: Default::default(),
             verified_answer_ready_steps: 0,
             final_answer_observed: false,
             collaboration_convergence_replans: 0,
@@ -3017,6 +3018,7 @@ fn closure_view_opens_the_exit_when_only_the_request_remains() {
         objective: "objective".to_string(),
         acceptance: "accepted evidence".to_string(),
         acceptance_checks: Vec::new(),
+        criterion_source: Default::default(),
         required_capabilities: Vec::new(),
         depends_on: Vec::new(),
         status: crate::AgenticTaskStatus::Accepted,
@@ -3644,6 +3646,9 @@ struct TurnGraphState {
     /// request on the root's behalf (the drive stays behind the completion_gap
     /// gate, so an incomplete Objective is never forced).
     closure_ready_steps: usize,
+    /// The Objective milestones as of the previous batch. The no-progress fuse
+    /// compares against this, so it has to survive across model steps.
+    previous_objective_milestones: host_backend::ObjectiveMilestones,
     /// Root model steps taken since the Objective reached a satisfied verdict
     /// without the root presenting a final answer. The verdict is bound by the
     /// action that satisfied it, so the root's own last step is routinely the

@@ -1007,6 +1007,7 @@ mod tests {
             objective: "o".into(),
             acceptance: "a".into(),
             acceptance_checks: Vec::new(),
+            criterion_source: Default::default(),
             required_capabilities: Vec::new(),
             obligation_refs: Vec::new(),
             purpose: Default::default(),
@@ -1251,4 +1252,45 @@ mod tests {
             "{attempt_error}"
         );
     }
+}
+
+/// The logical-key fallback must not launder an unknown reference. A model
+/// that cites `artifact://<24 hex>` for an artifact no Program holds is still
+/// refused with the store's own reason, so its mistake stays visible instead
+/// of becoming an unexplained read failure.
+#[tokio::test]
+async fn action_evidence_validation_still_refuses_an_unmapped_logical_key() {
+    let services = crate::RuntimeServices::in_memory().expect("runtime");
+    let actor = AgentActorBinding {
+        objective_id: "objective-1".into(),
+        program_id: "program-1".into(),
+        session_id: "session-1".into(),
+        turn_id: "turn-1".into(),
+        root_execution_id: Some("root-1".into()),
+        required_team_count: 0,
+        exact_team_count: None,
+        objective_summary: "test objective".into(),
+        model_lease: "test".into(),
+        permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
+        resource_scopes: vec![],
+        actor_id: "agent:1".into(),
+        kind: AgentActorKind::Agent,
+        execution_id: None,
+        team_id: None,
+        agent_id: Some("agent:1".into()),
+    };
+    let action = AgentAction::TaskReview(harness_contract::agent_action::TaskReviewInput {
+        task_ref: "task:1".into(),
+        decision: harness_contract::agent_action::TaskReviewDecision::Accept,
+        reason: "checked".into(),
+        evidence_refs: vec!["artifact://0123456789abcdef01234567".into()],
+    });
+    let error = services
+        .validate_agent_action_evidence(&actor, &action)
+        .await
+        .expect_err("an unmapped logical key must never resolve");
+    assert!(
+        error.contains("points to missing durable content"),
+        "the store's own reason must survive: {error}"
+    );
 }

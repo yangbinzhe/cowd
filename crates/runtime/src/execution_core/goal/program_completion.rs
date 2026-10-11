@@ -828,7 +828,10 @@ mod tests {
             "agentic_changed:message:fc83095f58e63aa8cad9b887".to_string(),
             "tool://receipt".to_string(),
         ];
-        assert!(evidence_contains(&evidence, "message:fc83095f58e63aa8cad9b887"));
+        assert!(evidence_contains(
+            &evidence,
+            "message:fc83095f58e63aa8cad9b887"
+        ));
         assert!(evidence_contains(&evidence, "tool://receipt"));
         assert!(!evidence_contains(&evidence, "message:other"));
     }

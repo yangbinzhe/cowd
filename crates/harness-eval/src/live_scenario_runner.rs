@@ -19,6 +19,12 @@ use crate::{
 };
 
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// How many extra chances the root Program projection gets to become visible
+/// after a terminal execution is observed. The backoff is 2s then 4s, so the
+/// total added latency is bounded at 7 seconds - negligible against a scenario
+/// measured in minutes, and enough to cover the stream lag that made a
+/// completed run report "not verified".
+const PROGRAM_EXTRACTION_RETRIES: u32 = 2;
 const MAX_DEFAULT_SCENARIO_TIMEOUT: Duration = Duration::from_secs(600);
 const GROUP_THEORY_SCENARIO_ID: &str = "live_group_theory_ai_research_simulation";
 const LARGE_SCALE_SCENARIO_ID: &str = "live_qwen38_large_scale_collaboration";
@@ -1960,7 +1966,12 @@ impl LiveScenarioRunner {
             let projections =
                 self.execution_lineage_projections(root_execution_id, trace, &mut projection_cache);
             let agentic_program = if acceptance.requires_descendant_team_closure() {
-                self.root_agentic_program(session_id, turn_id, trace).ok()
+                extract_root_program_with_retry(|| {
+                    self.root_agentic_program(session_id, turn_id, trace)
+                        .map(Some)
+                })
+                .ok()
+                .flatten()
             } else {
                 None
             };
@@ -3201,6 +3212,8 @@ impl LiveAcceptance {
                 let physical_terminal = no_active_agent_waits(projections);
                 let physical_failed_agents = physical_failed_agent_activity_count(projections);
                 let physical_success = physical_failed_agents == 0;
+                let (synthesis_present, unsynthesized_tasks) =
+                    synthesized_final_artifact_findings(agentic_program);
                 let presentation_checks = match evidence_profile {
                     ArchitectureEvidenceProfile::LargeScaleIndependentReview => {
                         large_scale_presentation_checks(response)
@@ -3271,6 +3284,7 @@ impl LiveAcceptance {
                     json!({"name": "durable_response", "passed": !response.trim().is_empty()}),
                     json!({"name": "architecture_quality", "passed": quality.score >= quality.required, "score": quality.score, "required": quality.required, "criteria": quality.criteria}),
                     json!({"name": "agentic_program_verified", "passed": program_verified}),
+                    json!({"name": "synthesized_final_artifact_present", "passed": synthesis_present, "unsynthesized_tasks": unsynthesized_tasks}),
                     json!({"name": "accepted_agent_first_teams", "required": minimum_teams, "passed": team_projection, "engaged_agents": team_health.agent_count, "accepted_agents": team_health.completed_agents, "failed_agents": team_health.failed_agents, "teams": team_health.team_count, "accepted_teams": team_health.completed_teams, "failed_teams": team_health.failed_teams}),
                     json!({"name": "durable_task_artifact_evidence", "required": minimum_teams > 0, "accepted_tasks": evidence_integrity.accepted_tasks, "missing_claimants": evidence_integrity.missing_claimants, "missing_independent_reviews": evidence_integrity.missing_independent_reviews, "missing_artifacts": evidence_integrity.missing_artifacts, "missing_evidence": evidence_integrity.missing_evidence, "dangling_artifact_refs": evidence_integrity.dangling_artifact_refs, "passed": evidence_satisfied}),
                     json!({"name": "accepted_cross_team_dependencies", "required": minimum_claimed_cross_team_edges, "observed": accepted_cross_team_dependencies, "passed": edges_satisfied}),
@@ -3287,6 +3301,11 @@ impl LiveAcceptance {
                         && quality.score >= quality.required
                         && team_projection
                         && program_verified
+                        // The operator asked for a final artifact that
+                        // synthesizes the Tasks' findings. Nothing checked it,
+                        // so a run that delivered three per-Task reports and no
+                        // synthesis passed on a non-empty answer alone.
+                        && synthesis_present
                         && evidence_satisfied
                         && edges_satisfied
                         && parallel_satisfied
@@ -3430,7 +3449,67 @@ fn finalize_live_acceptance(
         "passed": outcome.passed,
     }));
     result.passed &= durable && execution_terminal && outcome.passed;
+    // A terminal run is three independent facts, and a report that shows only
+    // the aggregate forces a reader to work out which one is missing. Name
+    // them. This is a record, not a second gate: the three checks above already
+    // decide `passed`, and folding them in again would count one condition
+    // twice.
+    let goal_verified = result
+        .checks
+        .iter()
+        .find(|c| c["name"] == "agentic_program_verified")
+        .and_then(|c| c["passed"].as_bool())
+        .unwrap_or(false);
+    let mut missing = Vec::new();
+    if !goal_verified {
+        missing.push("goal_verified");
+    }
+    if !durable {
+        missing.push("user_visible_delivery");
+    }
+    if !outcome.passed {
+        missing.push("business_outcome");
+    }
+    result.checks.push(json!({
+        "name": "terminal_three_piece_complete",
+        "passed": missing.is_empty(),
+        "pieces": {
+            "goal_verified": goal_verified,
+            "user_visible_delivery": durable,
+            "business_outcome": outcome.passed,
+        },
+        "missing": missing,
+    }));
     result
+}
+
+/// Read the root Program projection, allowing for the lag between a terminal
+/// execution and its projection becoming visible.
+///
+/// The Program is written by a different stream than the one the scenario loop
+/// just finished reading, so a completed run can be observed before its
+/// projection is. Retrying turns "we could not read it" back into a read instead
+/// of letting it masquerade as "the Objective was not verified" - which is the
+/// difference between a failed scenario and a confusing one. A hard error is a
+/// real fault rather than a timing gap, so it is returned on the first attempt
+/// and never retried.
+fn extract_root_program_with_retry<E, F>(
+    mut extract: F,
+) -> Result<Option<runtime::AgenticProgramProjection>, E>
+where
+    F: FnMut() -> Result<Option<runtime::AgenticProgramProjection>, E>,
+{
+    let mut attempt = 0_u32;
+    loop {
+        match extract() {
+            Ok(Some(program)) => return Ok(Some(program)),
+            Ok(None) if attempt < PROGRAM_EXTRACTION_RETRIES => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_secs(1 << attempt));
+            }
+            other => return other,
+        }
+    }
 }
 
 fn group_theory_presentation_checks(response: &str) -> Vec<Value> {
@@ -4185,6 +4264,73 @@ fn physical_failed_agent_activity_count(projections: &[Value]) -> usize {
                 )
         })
         .count()
+}
+
+/// Whether the Program holds a final artifact that synthesizes its accepted
+/// Tasks' deliverables, and which Tasks it fails to cover.
+///
+/// The scenario prompt asks for "a final artifact that synthesizes the three
+/// facts". Nothing verified it, so a run that delivered three per-Task reports
+/// and no synthesis passed on a non-empty answer alone - the operator's
+/// requirement was never checked. Coverage, not a filename, is the test: the
+/// artifact must draw on more than one Task's work, must hang off an accepted
+/// Task, and must not be written by the author of any Task it synthesizes
+/// (which would make it a fourth report rather than a synthesis).
+fn synthesized_final_artifact_findings(
+    program: Option<&runtime::AgenticProgramProjection>,
+) -> (bool, Vec<String>) {
+    let Some(program) = program else {
+        return (false, Vec::new());
+    };
+    let accepted: Vec<&runtime::AgenticTaskProjection> = active_agentic_tasks(program)
+        .filter(|task| task.status == runtime::AgenticTaskStatus::Accepted)
+        .collect();
+    // One Task has nothing to synthesize, so there is no obligation. The
+    // obligation follows from the work that actually happened, not from a
+    // configured floor, so it holds for every scenario that produced several
+    // accepted Tasks.
+    if accepted.len() <= 1 {
+        return (true, Vec::new());
+    }
+    let covered = |artifact: &runtime::AgenticArtifactProjection| -> bool {
+        // Hangs off an accepted Task, so the Program can point at it. That Task
+        // is the synthesis's host, not one of the things it synthesizes.
+        let Some(host) = accepted
+            .iter()
+            .find(|task| task.artifact_refs.contains(&artifact.artifact_ref))
+        else {
+            return false;
+        };
+        // Relates to at least two accepted Tasks. `relates_to` is the Program's
+        // own record of what an artifact covers, so this is a structural fact
+        // rather than a guess about bytes: two artifacts sharing a content
+        // reference are the same bytes, not a synthesis of one another.
+        let related: Vec<&&runtime::AgenticTaskProjection> = accepted
+            .iter()
+            .filter(|task| {
+                task.task_id != host.task_id && artifact.relates_to.contains(&task.task_id)
+            })
+            .collect();
+        if related.len() < 2 {
+            return false;
+        }
+        // Not written by the author of any Task it synthesizes: an author
+        // summarizing their own report produces a fourth report, not a
+        // synthesis. The host's author is exempt because the host is where the
+        // synthesis lives, not what it synthesizes.
+        !related
+            .iter()
+            .any(|task| task.claimant.as_deref() == Some(artifact.committed_by.as_str()))
+    };
+    let synthesized = program.artifacts.values().any(|artifact| covered(artifact));
+    if synthesized {
+        return (true, Vec::new());
+    }
+    let unsynthesized = accepted
+        .iter()
+        .map(|task| task.task_id.clone())
+        .collect::<Vec<_>>();
+    (false, unsynthesized)
 }
 
 #[derive(Default)]

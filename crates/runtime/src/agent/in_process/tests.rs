@@ -233,20 +233,24 @@ async fn native_coordination_wire(supplement: bool, fail_input_request: bool) {
             harness_contract::agent_action::AgentActionStatus::Applied
         );
     }
-    assert!(fixture
-        .services
-        .dispatch_ready_agentic_work("coord-program")
-        .await
-        .unwrap()
-        .is_empty());
-    assert!(fixture
-        .services
-        .agent_runtime()
-        .execute_task(fixture.packet.clone())
-        .await
-        .unwrap()
-        .failure
-        .is_none());
+    assert!(
+        fixture
+            .services
+            .dispatch_ready_agentic_work("coord-program")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        fixture
+            .services
+            .agent_runtime()
+            .execute_task(fixture.packet.clone())
+            .await
+            .unwrap()
+            .failure
+            .is_none()
+    );
     assert_eq!(
         requests.lock().unwrap().len(),
         2 + 2 * usize::from(supplement) + usize::from(fail_input_request)
@@ -1133,12 +1137,14 @@ async fn runtime_artifact_materialization_uses_registered_write_classification()
             .unwrap(),
         "authorized:artifact_materialize"
     );
-    assert!(executor
-        .execute_delegated_runtime_tool("unregistered", input, authorization.clone())
-        .await
-        .unwrap_err()
-        .to_string()
-        .contains("no registered effect descriptor"));
+    assert!(
+        executor
+            .execute_delegated_runtime_tool("unregistered", input, authorization.clone())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("no registered effect descriptor")
+    );
     let services = RuntimeServices::in_memory().unwrap();
     executor.tool_batch = Some(
         crate::execution_core::graph::executors::agent_tool::AgentToolBatchDispatcher::new(
@@ -1151,10 +1157,12 @@ async fn runtime_artifact_materialization_uses_registered_write_classification()
     assert!(!executor.owns_tool_resource_admission("checkpoint"));
     // With a production dispatcher, an absent parent fails admission. The
     // compatibility Echo host must no longer return a successful direct call.
-    assert!(executor
-        .execute_delegated_runtime_tool("artifact_materialize", input, authorization)
-        .await
-        .is_err());
+    assert!(
+        executor
+            .execute_delegated_runtime_tool("artifact_materialize", input, authorization)
+            .await
+            .is_err()
+    );
 }
 
 #[test]
@@ -1328,9 +1336,11 @@ fn workspace_internal_absolute_resource_path_is_normalized_once() {
             .expect("normalize internal absolute path");
     let normalized: serde_json::Value = serde_json::from_str(&normalized).expect("json");
     assert_eq!(normalized["path"], "fixtures/target.txt");
-    assert!(normalized["content"]
-        .as_str()
-        .is_some_and(|content| content.contains(&root.path().display().to_string())));
+    assert!(
+        normalized["content"]
+            .as_str()
+            .is_some_and(|content| content.contains(&root.path().display().to_string()))
+    );
 }
 
 #[test]
@@ -1623,9 +1633,11 @@ fn sandboxed_process_requires_and_accepts_only_a_whole_workspace_read_lease() {
     whole_workspace
         .enforce_resource_ceiling("execute_code", input)
         .expect("whole-workspace read lease admits the read-only sandbox");
-    assert!(build(vec!["read:src".to_string()])
-        .enforce_resource_ceiling("execute_code", input)
-        .is_err());
+    assert!(
+        build(vec!["read:src".to_string()])
+            .enforce_resource_ceiling("execute_code", input)
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -1669,15 +1681,21 @@ async fn team_tool_boundary_enforces_the_exact_focus_scope() {
     executor
         .enforce_resource_ceiling("read_file", r#"{"path":"crates/runtime/src/lib.rs"}"#)
         .expect("in-scope read");
-    assert!(executor
-        .enforce_resource_ceiling("read_file", r#"{"path":"crates/gateway/src/lib.rs"}"#,)
-        .is_err());
-    assert!(executor
-        .enforce_resource_ceiling("read_file", r#"{"path":"../secret"}"#)
-        .is_err());
-    assert!(executor
-        .enforce_resource_ceiling("grep_search", r#"{"pattern":"unsafe"}"#)
-        .is_err());
+    assert!(
+        executor
+            .enforce_resource_ceiling("read_file", r#"{"path":"crates/gateway/src/lib.rs"}"#,)
+            .is_err()
+    );
+    assert!(
+        executor
+            .enforce_resource_ceiling("read_file", r#"{"path":"../secret"}"#)
+            .is_err()
+    );
+    assert!(
+        executor
+            .enforce_resource_ceiling("grep_search", r#"{"pattern":"unsafe"}"#)
+            .is_err()
+    );
     executor
         .enforce_resource_ceiling(
             "context_retrieve",
@@ -1709,9 +1727,11 @@ async fn team_tool_boundary_enforces_the_exact_focus_scope() {
         executor.resource_scopes.as_deref(),
     )
     .expect("outside glob stays representable");
-    assert!(executor
-        .enforce_resource_ceiling("glob_search", &outside_glob)
-        .is_err());
+    assert!(
+        executor
+            .enforce_resource_ceiling("glob_search", &outside_glob)
+            .is_err()
+    );
 
     let descriptor = test_tool_descriptor_for_input(
         "read_file",
@@ -1759,9 +1779,9 @@ async fn team_tool_boundary_enforces_the_exact_focus_scope() {
     assert_eq!(receipts.len(), 1);
     assert_eq!(receipts[0].paths, ["crates/runtime/src/lib.rs"]);
     assert!(
-            receipts[0].observed_evidence.is_empty(),
-            "a successful delegated read with unstructured adapter output must not be promoted into exact-content evidence"
-        );
+        receipts[0].observed_evidence.is_empty(),
+        "a successful delegated read with unstructured adapter output must not be promoted into exact-content evidence"
+    );
 }
 
 #[tokio::test]
@@ -1869,18 +1889,22 @@ fn team_tool_boundary_rejects_symlink_escape_for_existing_and_new_targets() {
         provider_model_obligations: Vec::new(),
     };
 
-    assert!(executor
-        .enforce_resource_ceiling(
-            "read_file",
-            r#"{"path":"crates/runtime/escape/secret.txt"}"#,
-        )
-        .is_err());
-    assert!(executor
-        .enforce_resource_ceiling(
-            "edit",
-            r#"{"path":"crates/runtime/escape/new.txt","content":"denied"}"#,
-        )
-        .is_err());
+    assert!(
+        executor
+            .enforce_resource_ceiling(
+                "read_file",
+                r#"{"path":"crates/runtime/escape/secret.txt"}"#,
+            )
+            .is_err()
+    );
+    assert!(
+        executor
+            .enforce_resource_ceiling(
+                "edit",
+                r#"{"path":"crates/runtime/escape/new.txt","content":"denied"}"#,
+            )
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -1939,13 +1963,17 @@ async fn scoped_executor_advertises_only_packet_authorized_tools() {
         vec!["grep_search", "read_file"]
     );
     assert!(executor.has_tool("checkpoint"));
-    assert!(!executor
-        .available_tool_names()
-        .contains(&"checkpoint".to_string()));
-    assert!(executor
-        .execute_output("checkpoint", r#"{"label":"model"}"#)
-        .await
-        .is_err());
+    assert!(
+        !executor
+            .available_tool_names()
+            .contains(&"checkpoint".to_string())
+    );
+    assert!(
+        executor
+            .execute_output("checkpoint", r#"{"label":"model"}"#)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -2005,16 +2033,22 @@ async fn scoped_executor_routes_hidden_checkpoint_for_runtime_guard_only() {
 
     assert_eq!(
         executor
-            .execute_authorized_output(&authorization, "checkpoint", r#"{"action":"create","label":"guard"}"#,)
+            .execute_authorized_output(
+                &authorization,
+                "checkpoint",
+                r#"{"action":"create","label":"guard"}"#,
+            )
             .await
             .expect("hidden checkpoint should reach the pinned Runtime host"),
         harness_contract::context::ToolOutputDraft::bounded_inline("authorized:checkpoint")
     );
-    assert!(executor
-        .receipts
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .is_empty());
+    assert!(
+        executor
+            .receipts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    );
     assert_eq!(
         executor
             .internal_checkpoint_input(serde_json::json!({
@@ -2168,9 +2202,11 @@ fn explicit_terminal_sections_outrank_embedded_contract_examples() {
         "Independent review completed with no contradiction."
     );
     assert_eq!(output["unresolved"], "[]");
-    assert!(output["findings"]
-        .as_str()
-        .is_some_and(|value| value.contains("embedded source example")));
+    assert!(
+        output["findings"]
+            .as_str()
+            .is_some_and(|value| value.contains("embedded source example"))
+    );
     assert_ne!(output["evidence"], "embedded source example");
 }
 
@@ -2212,9 +2248,11 @@ fn declared_custom_artifact_accepts_exact_json_or_markdown_only() {
     );
     let output = structured_agent_output_for_fields(markdown, &required)
         .expect("declared custom Markdown artifact");
-    assert!(output["applications_survey"]
-        .as_str()
-        .is_some_and(|value| value.contains("### Vision / 3D")));
+    assert!(
+        output["applications_survey"]
+            .as_str()
+            .is_some_and(|value| value.contains("### Vision / 3D"))
+    );
     assert_eq!(output["evidence"], "tool://read-1");
     assert_eq!(output["summary"], "Survey complete.");
 
@@ -2270,19 +2308,25 @@ fn verified_narrative_terminal_accepts_prose_without_accepting_tool_markup() {
         StructuredOutputField::Unresolved,
         mixed_output.get("unresolved"),
     ));
-    assert!(mixed_output["review"]
-        .as_str()
-        .is_some_and(|review| review.contains("Terminal review completed")));
-    assert!(normalized_narrative_terminal_body(
-        "<synthesized_terminal evidence_committed=1 />",
-        &[StructuredOutputField::Findings],
-    )
-    .is_none());
-    assert!(normalized_narrative_terminal_body(
-        "<tool_call>read_file</tool_call>",
-        &[StructuredOutputField::Findings],
-    )
-    .is_none());
+    assert!(
+        mixed_output["review"]
+            .as_str()
+            .is_some_and(|review| review.contains("Terminal review completed"))
+    );
+    assert!(
+        normalized_narrative_terminal_body(
+            "<synthesized_terminal evidence_committed=1 />",
+            &[StructuredOutputField::Findings],
+        )
+        .is_none()
+    );
+    assert!(
+        normalized_narrative_terminal_body(
+            "<tool_call>read_file</tool_call>",
+            &[StructuredOutputField::Findings],
+        )
+        .is_none()
+    );
     assert!(
         normalized_narrative_terminal_body("reviewed", &[StructuredOutputField::Review],).is_some(),
         "a verified review may use ordinary terminal prose"
@@ -2414,14 +2458,18 @@ async fn scoped_executor_propagates_runtime_authorization_for_normal_agent_tools
             .expect("authorized tool should execute"),
         harness_contract::context::ToolOutputDraft::bounded_inline("authorized:read_file")
     );
-    assert!(executor
-        .execute_output("read_file", r#"{"path":"README.md"}"#)
-        .await
-        .is_err());
-    assert!(executor
-        .execute_authorized_output(&authorization, "edit", r#"{"path":"README.md"}"#)
-        .await
-        .is_err());
+    assert!(
+        executor
+            .execute_output("read_file", r#"{"path":"README.md"}"#)
+            .await
+            .is_err()
+    );
+    assert!(
+        executor
+            .execute_authorized_output(&authorization, "edit", r#"{"path":"README.md"}"#)
+            .await
+            .is_err()
+    );
 }
 
 #[test]
@@ -2687,16 +2735,20 @@ async fn cancel_acknowledges_delivery_before_cleanup_and_tombstones_are_race_saf
         .expect("cancel acknowledges without waiting for cleanup")
         .expect("cancel task joins")
         .expect("cancel is accepted");
-    assert!(worker
-        .active_runs
-        .lock()
-        .unwrap()
-        .contains_key("run-cancel"));
-    assert!(worker
-        .pending_cancellations
-        .lock()
-        .unwrap()
-        .contains("run-cancel"));
+    assert!(
+        worker
+            .active_runs
+            .lock()
+            .unwrap()
+            .contains_key("run-cancel")
+    );
+    assert!(
+        worker
+            .pending_cancellations
+            .lock()
+            .unwrap()
+            .contains("run-cancel")
+    );
     drop(cleanup);
     assert!(worker.active_runs.lock().unwrap().is_empty());
     assert!(worker.pending_cancellations.lock().unwrap().is_empty());
@@ -3053,15 +3105,19 @@ async fn native_checkpoint_closes_only_after_its_typed_decline() {
     assert_eq!(apply("prose", &actor, AgentAction::MessagePublish(serde_json::from_value(serde_json::json!({
         "topic_ref":"topic:decline-program", "summary":"DECLINE: narrative only", "refs":[task]
     })).unwrap())).status, AgentActionStatus::Applied);
-    assert!(agent_autonomy_checkpoint(&services, &packet)
-        .unwrap()
-        .is_some());
+    assert!(
+        agent_autonomy_checkpoint(&services, &packet)
+            .unwrap()
+            .is_some()
+    );
     assert_eq!(apply("typed", &actor, AgentAction::MessagePublish(serde_json::from_value(serde_json::json!({
         "topic_ref":"topic:decline-program", "summary":"I lack the required expertise", "intent":{"kind":"decline","task_ref":task}
     })).unwrap())).status, AgentActionStatus::Applied);
-    assert!(agent_autonomy_checkpoint(&services, &packet)
-        .unwrap()
-        .is_none());
+    assert!(
+        agent_autonomy_checkpoint(&services, &packet)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -3139,9 +3195,11 @@ async fn generalized_coalesced_coordination_wake() {
     // immutable packet, then calls the shared authorized runtime tool path.
     // No fixture writes its response into the Program on its behalf.
     let worker = tokio::spawn(async move {
-        assert!(checkpoint
-            .prompt
-            .contains("Check the boundary condition in source A"));
+        assert!(
+            checkpoint
+                .prompt
+                .contains("Check the boundary condition in source A")
+        );
         let binding = packet.agentic_binding.as_ref().unwrap();
         let AgenticExecutionFocus::Coordination { wake_ref } = &binding.focus else {
             panic!("expected coordination")
@@ -3161,9 +3219,11 @@ async fn generalized_coalesced_coordination_wake() {
         }).to_string()).await.unwrap();
         let observation: serde_json::Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(observation["status"], "applied");
-        assert!(agent_autonomy_checkpoint(&services, &packet)
-            .unwrap()
-            .is_none());
+        assert!(
+            agent_autonomy_checkpoint(&services, &packet)
+                .unwrap()
+                .is_none()
+        );
         services
             .settle_abandoned_agentic_attempt(&packet, "deterministic worker exit")
             .await
@@ -3187,12 +3247,14 @@ async fn generalized_coalesced_coordination_wake() {
         1
     );
     for _ in 0..3 {
-        assert!(fixture
-            .services
-            .dispatch_ready_agentic_work("coord-program")
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            fixture
+                .services
+                .dispatch_ready_agentic_work("coord-program")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
     let mut novel = fixture.request.clone();
     novel.action_id = "model-new-source".into();
@@ -3305,6 +3367,7 @@ async fn cross_team_review_checkpoint_is_valid_but_cross_team_execution_is_fence
             title: "Cross-Team review target".to_string(),
             objective: "produce durable evidence".to_string(),
             acceptance: "independent review".to_string(),
+            criterion_source: Default::default(),
             acceptance_checks: Vec::new(),
             required_capabilities: vec!["read".to_string()],
             depends_on: Vec::new(),

@@ -139,6 +139,17 @@ pub struct TaskPublishInput {
     pub title: String,
     pub objective: String,
     pub acceptance: String,
+    /// Where this Task's acceptance statement came from.
+    ///
+    /// An operator-derived statement restates what the operator asked for. An
+    /// agent-invented one adds a rung the operator never named, and the two cost
+    /// very differently: one live run invented three extra criteria, a reviewer
+    /// enforced them line by line, and the run burned 300+ steps without a
+    /// completion request. Recording provenance at authoring time lets the
+    /// reviewer refuse a rework that rests only on an invented standard without
+    /// ever second-guessing the operator's own requirement.
+    #[serde(default)]
+    pub criterion_source: CriterionSource,
     /// Optional machine-checkable acceptance hints (advisory). Prose
     /// `acceptance` stays authoritative; checks guide worker self-check and
     /// reviewer evidence citation.
@@ -165,6 +176,23 @@ pub struct TaskPublishInput {
     /// empty and Runtime ranks by independence and load alone.
     #[serde(default)]
     pub expertise_hints: Vec<String>,
+}
+
+/// Provenance of a Task's acceptance statement.
+///
+/// Defaults to `OperatorDerived` so an older payload that says nothing is
+/// treated as the operator's own requirement rather than silently demoted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CriterionSource {
+    OperatorDerived,
+    AgentInvented,
+}
+
+impl Default for CriterionSource {
+    fn default() -> Self {
+        Self::OperatorDerived
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

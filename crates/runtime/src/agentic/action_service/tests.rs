@@ -1337,6 +1337,7 @@ fn legacy_goal_terminal_recovery_is_durable_and_idempotent() {
                 title: "Research".to_string(),
                 objective: "Read source".to_string(),
                 acceptance: "artifact and evidence".to_string(),
+                criterion_source: Default::default(),
                 acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
@@ -1651,6 +1652,7 @@ async fn production_artifact_authority_closes_submit_review_and_completion_chain
                 title: "Verified report".to_string(),
                 objective: "produce a grounded report".to_string(),
                 acceptance: "durable report and independent review".to_string(),
+                criterion_source: Default::default(),
                 acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
@@ -1941,6 +1943,7 @@ fn task_claim_requires_a_roster_agent_and_expired_lease_is_reclaimable() {
                 title: "Recover".to_string(),
                 objective: "complete even after a worker crash".to_string(),
                 acceptance: "durable result".to_string(),
+                criterion_source: Default::default(),
                 acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
@@ -2047,6 +2050,7 @@ fn one_physical_agent_execution_cannot_claim_two_active_tasks() {
                 title: "Task A".to_string(),
                 objective: "Task A".to_string(),
                 acceptance: "reviewed artifact".to_string(),
+                criterion_source: Default::default(),
                 acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
@@ -2068,6 +2072,7 @@ fn one_physical_agent_execution_cannot_claim_two_active_tasks() {
                 title: "Task B".to_string(),
                 objective: "Task B".to_string(),
                 acceptance: "reviewed artifact".to_string(),
+                criterion_source: Default::default(),
                 acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
@@ -2151,6 +2156,7 @@ fn repeated_identical_physical_failure_blocks_for_explicit_replan() {
                 title: "Bounded attempt".to_string(),
                 objective: "never loop forever".to_string(),
                 acceptance: "durable completion or blocker".to_string(),
+                criterion_source: Default::default(),
                 acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
@@ -2234,6 +2240,7 @@ fn repeated_identical_review_failure_blocks_for_explicit_replan() {
                 title: "Review retry".to_string(),
                 objective: "prove review recovery".to_string(),
                 acceptance: "bounded independent review".to_string(),
+                criterion_source: Default::default(),
                 acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
@@ -2492,6 +2499,7 @@ fn published_task_supersedes_across_teams_without_failure_and_rejects_invalid_re
                     title: id.into(),
                     objective: "produce verifiable evidence".into(),
                     acceptance: "independently checked result".into(),
+                    criterion_source: Default::default(),
                     acceptance_checks: Vec::new(),
                     required_capabilities: vec![],
                     depends_on: dependencies,
@@ -2622,6 +2630,7 @@ fn failed_task_supersede_is_cas_idempotent_recoverable_and_not_fake_completion()
                 title: "Disproved approach".to_string(),
                 objective: "test the original hypothesis".to_string(),
                 acceptance: "reproducible evidence".to_string(),
+                criterion_source: Default::default(),
                 acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
@@ -2644,6 +2653,7 @@ fn failed_task_supersede_is_cas_idempotent_recoverable_and_not_fake_completion()
                     title: title.to_string(),
                     objective: "replace the failed hypothesis with bounded evidence".to_string(),
                     acceptance: "independently reviewable artifact".to_string(),
+                    criterion_source: Default::default(),
                     acceptance_checks: Vec::new(),
                     required_capabilities: vec!["read".to_string()],
                     depends_on,
@@ -3177,6 +3187,7 @@ async fn an_accepted_task_rejects_re_review_and_re_submit_but_allows_supersede()
             title: title.to_string(),
             objective: "produce a grounded report".to_string(),
             acceptance: "durable report and independent review".to_string(),
+            criterion_source: Default::default(),
             acceptance_checks: Vec::new(),
             required_capabilities: vec!["read".to_string()],
             depends_on: Vec::new(),
@@ -3291,6 +3302,7 @@ async fn an_accepted_task_rejects_re_review_and_re_submit_but_allows_supersede()
                 title: "Revised report".to_string(),
                 objective: "produce a grounded report under a changed criterion".to_string(),
                 acceptance: "durable report and independent review".to_string(),
+                criterion_source: Default::default(),
                 acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
@@ -3413,6 +3425,7 @@ async fn blocked_exit_is_rejected_while_work_is_still_in_flight() {
                 title: "Open work".to_string(),
                 objective: "still doable".to_string(),
                 acceptance: "durable evidence".to_string(),
+                criterion_source: Default::default(),
                 acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
@@ -3472,6 +3485,7 @@ async fn blocked_exit_is_accepted_once_every_task_is_terminal() {
                 title: "Attempted work".to_string(),
                 objective: "unreachable in practice".to_string(),
                 acceptance: "durable evidence".to_string(),
+                criterion_source: Default::default(),
                 acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
@@ -3594,6 +3608,7 @@ fn a_task_action_reports_the_task_it_settled_as_the_entity_it_changed() {
                 title: "One fact".into(),
                 objective: "extract one verifiable fact".into(),
                 acceptance: "artifact plus evidence".into(),
+                criterion_source: Default::default(),
                 acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".into()],
                 depends_on: Vec::new(),
@@ -3769,6 +3784,7 @@ fn a_rework_round_must_be_reviewable_again_in_its_own_graph() {
                 title: "One fact".into(),
                 objective: "extract one verifiable fact".into(),
                 acceptance: "artifact plus evidence".into(),
+                criterion_source: Default::default(),
                 acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".into()],
                 depends_on: Vec::new(),
@@ -3909,6 +3925,7 @@ fn reopened_program_receipts_never_advertise_the_exit_action() {
         objective: "objective".to_string(),
         acceptance: "accepted evidence".to_string(),
         acceptance_checks: Vec::new(),
+        criterion_source: Default::default(),
         required_capabilities: Vec::new(),
         depends_on: Vec::new(),
         status: crate::AgenticTaskStatus::Accepted,
@@ -4118,6 +4135,7 @@ fn a_resolved_reopen_advertises_the_exit_and_labels_the_record_as_history() {
         objective: "objective".to_string(),
         acceptance: "accepted evidence".to_string(),
         acceptance_checks: Vec::new(),
+        criterion_source: Default::default(),
         required_capabilities: Vec::new(),
         depends_on: Vec::new(),
         status: crate::AgenticTaskStatus::Accepted,
@@ -4209,5 +4227,271 @@ fn a_resolved_reopen_advertises_the_exit_and_labels_the_record_as_history() {
             .iter()
             .any(|action| action.contains("request Objective completion")),
         "the exit action must stay silent while a gap remains: {actions:?}"
+    );
+}
+
+/// A Team with a worker and a distinct reviewer, plus a published Task. Returns
+/// `(team_id, worker_id, reviewer_id, task_id)`.
+fn team_with_reviewer_and_task(
+    service: &AgentActionService,
+    tag: &str,
+    acceptance: &str,
+    criterion_source: harness_contract::agent_action::CriterionSource,
+) -> (String, String, String, String) {
+    let team = service
+        .apply(&root(
+            &format!("{tag}-team"),
+            AgentAction::TeamCreate(TeamCreateInput {
+                name: "Delivery".to_string(),
+                mission: "produce and independently verify evidence".to_string(),
+                objective: None,
+            }),
+        ))
+        .expect("team")
+        .changed_refs[0]
+        .clone();
+    let worker = service
+        .apply(&root(
+            &format!("{tag}-worker"),
+            AgentAction::AgentInvite(AgentInviteInput {
+                team_ref: team.clone(),
+                role: "implementer".to_string(),
+                mission: "produce the report".to_string(),
+                required_capabilities: vec!["read".to_string()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
+            }),
+        ))
+        .expect("worker")
+        .changed_refs[0]
+        .clone();
+    let reviewer = service
+        .apply(&root(
+            &format!("{tag}-reviewer"),
+            AgentAction::AgentInvite(AgentInviteInput {
+                team_ref: team.clone(),
+                role: "reviewer".to_string(),
+                mission: "verify evidence independently".to_string(),
+                required_capabilities: vec!["read".to_string()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
+            }),
+        ))
+        .expect("reviewer")
+        .changed_refs[0]
+        .clone();
+    let task = service
+        .apply(&root(
+            &format!("{tag}-task"),
+            AgentAction::TaskPublish(TaskPublishInput {
+                team_ref: team.clone(),
+                title: "Research".to_string(),
+                objective: "Read source".to_string(),
+                acceptance: acceptance.to_string(),
+                acceptance_checks: Vec::new(),
+                criterion_source,
+                required_capabilities: vec!["read".to_string()],
+                depends_on: Vec::new(),
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
+            }),
+        ))
+        .expect("task")
+        .changed_refs[0]
+        .clone();
+    (team, worker, reviewer, task)
+}
+
+/// A payload that says nothing about provenance is the operator's own
+/// requirement, not a silently demoted one. Without this default every legacy
+/// Task would look model-invented and no rework could ever be justified.
+#[test]
+fn criterion_source_defaults_to_operator_derived_for_legacy_payloads() {
+    let json = serde_json::json!({
+        "team_ref": "team:1",
+        "title": "Research",
+        "objective": "Read source",
+        "acceptance": "artifact and evidence"
+    });
+    let input: TaskPublishInput = serde_json::from_value(json).expect("legacy payload");
+    assert_eq!(
+        input.criterion_source,
+        harness_contract::agent_action::CriterionSource::OperatorDerived
+    );
+}
+
+#[test]
+fn task_publish_records_criterion_source_and_projection_exposes_it() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = AgentActionService::new(Arc::clone(&store));
+    let team = service
+        .apply(&root(
+            "create-team",
+            AgentAction::TeamCreate(TeamCreateInput {
+                name: "Gamma".into(),
+                mission: "coerced lane".into(),
+                objective: None,
+            }),
+        ))
+        .expect("team");
+    let team_id = team.changed_refs[0].clone();
+    let receipt = service
+        .apply(&root(
+            "publish-invented",
+            AgentAction::TaskPublish(TaskPublishInput {
+                team_ref: team_id.clone(),
+                title: "Research".to_string(),
+                objective: "Read source".to_string(),
+                acceptance: "must also list every TODO/FIXME/unwrap hazard".to_string(),
+                acceptance_checks: Vec::new(),
+                criterion_source: harness_contract::agent_action::CriterionSource::AgentInvented,
+                required_capabilities: vec!["read".to_string()],
+                depends_on: Vec::new(),
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
+            }),
+        ))
+        .expect("task");
+    let task_id = receipt.changed_refs[0].clone();
+    let program = service.project("program-1").expect("program");
+    let task = program.tasks.get(&task_id).expect("durable Task");
+    assert_eq!(
+        task.criterion_source,
+        harness_contract::agent_action::CriterionSource::AgentInvented,
+        "the projection must expose the recorded provenance"
+    );
+}
+
+/// The notice is written where the standard was authored, so the author sees it
+/// named as its own on every subsequent receipt. The cost is paid at authoring
+/// time, so the correction loop belongs there too.
+#[test]
+fn invented_criterion_is_durably_labeled_for_author_and_reviewer() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = AgentActionService::new(Arc::clone(&store));
+    let team = service
+        .apply(&root(
+            "create-team",
+            AgentAction::TeamCreate(TeamCreateInput {
+                name: "Gamma".into(),
+                mission: "coerced lane".into(),
+                objective: None,
+            }),
+        ))
+        .expect("team");
+    let team_id = team.changed_refs[0].clone();
+    service
+        .apply(&root(
+            "publish-invented",
+            AgentAction::TaskPublish(TaskPublishInput {
+                team_ref: team_id.clone(),
+                title: "Research".to_string(),
+                objective: "Read source".to_string(),
+                acceptance: "must also survey the public API".to_string(),
+                acceptance_checks: Vec::new(),
+                criterion_source: harness_contract::agent_action::CriterionSource::AgentInvented,
+                required_capabilities: vec!["read".to_string()],
+                depends_on: Vec::new(),
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
+            }),
+        ))
+        .expect("task");
+    let program = service.project("program-1").expect("program");
+    assert!(
+        program.program_warnings.iter().any(
+            |warning| warning.contains("model-invented") && warning.contains("must not rework")
+        ),
+        "the invented standard must be labelled where it was written: {:?}",
+        program.program_warnings
+    );
+    let actions = super::actionable(&program, false);
+    assert!(
+        actions
+            .iter()
+            .any(|action| action.contains("model-invented")),
+        "the author must see the label on its own receipt: {actions:?}"
+    );
+}
+
+/// The v5 dead case: three invented criteria, a reviewer enforcing them line by
+/// line, 300+ steps without a completion request. The rework is now refused at
+/// the action boundary instead of being accepted and paid for.
+#[test]
+fn rework_on_an_invented_criterion_is_refused() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = AgentActionService::new(Arc::clone(&store));
+    let (team, _worker, reviewer, task) = team_with_reviewer_and_task(
+        &service,
+        "invented",
+        "must identify every TODO/FIXME/unwrap",
+        harness_contract::agent_action::CriterionSource::AgentInvented,
+    );
+    let refused = service
+        .apply(&managed(
+            "rework-invented",
+            &team,
+            &reviewer,
+            AgentAction::TaskReview(TaskReviewInput {
+                task_ref: task.clone(),
+                decision: TaskReviewDecision::Rework,
+                reason: "did not list every TODO/FIXME/unwrap".to_string(),
+                evidence_refs: Vec::new(),
+            }),
+        ))
+        .expect("review receipt");
+    assert_eq!(refused.status, AgentActionStatus::Rejected);
+    assert_eq!(
+        refused.error.as_ref().map(|error| error.code.as_str()),
+        Some("rework_on_invented_criterion"),
+        "{refused:?}"
+    );
+}
+
+/// An operator-derived acceptance is exactly what a rework is for. Refusing the
+/// invented standard must not make a legitimate rework impossible.
+#[test]
+fn rework_on_an_operator_criterion_is_allowed() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = AgentActionService::new(Arc::clone(&store));
+    let (team, _worker, reviewer, task) = team_with_reviewer_and_task(
+        &service,
+        "operator",
+        "one verifiable fact per file",
+        harness_contract::agent_action::CriterionSource::OperatorDerived,
+    );
+    let receipt = service
+        .apply(&managed(
+            "rework-operator",
+            &team,
+            &reviewer,
+            AgentAction::TaskReview(TaskReviewInput {
+                task_ref: task.clone(),
+                decision: TaskReviewDecision::Rework,
+                reason: "the required fact is absent".to_string(),
+                evidence_refs: Vec::new(),
+            }),
+        ))
+        .expect("review receipt");
+    // The Task is not submitted yet, so a pre-existing admission rule refuses
+    // the review for that reason. What matters for this boundary is that the
+    // operator-derived standard is NOT refused as invented: the same call on an
+    // invented standard is rejected with `rework_on_invented_criterion`.
+    assert_ne!(
+        receipt.error.as_ref().map(|error| error.code.as_str()),
+        Some("rework_on_invented_criterion"),
+        "a rework on the operator's own standard must never be refused as invented: {receipt:?}"
     );
 }

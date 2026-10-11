@@ -146,6 +146,7 @@ mod tests {
                 objective: "o".to_string(),
                 acceptance: "a".to_string(),
                 acceptance_checks: Vec::new(),
+                criterion_source: Default::default(),
                 required_capabilities: Vec::new(),
                 obligation_refs: Vec::new(),
                 purpose: Default::default(),

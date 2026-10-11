@@ -2369,6 +2369,7 @@ mod tests {
                 title: id.into(),
                 objective: "Check source".into(),
                 acceptance: "source-backed evidence".into(),
+                criterion_source: Default::default(),
                 acceptance_checks: Vec::new(),
                 required_capabilities: vec![],
                 depends_on: vec![],

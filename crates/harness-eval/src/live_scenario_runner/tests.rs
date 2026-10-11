@@ -1724,3 +1724,294 @@ fn an_unresolved_agent_activity_is_named_in_the_evidence() {
     assert_eq!(unresolved[0]["execution_id"], "exec-2");
     assert_eq!(unresolved[0]["status"], "running");
 }
+
+/// A terminal run whose Program projection is not visible yet must still be read
+/// once it appears, rather than reported as "the Objective was not verified".
+/// The distinction between "did not achieve it" and "could not read it" is the
+/// whole point of the retry.
+#[test]
+fn terminal_verdict_survives_an_empty_program_extraction() {
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = extract_root_program_with_retry(|| {
+        let attempts = std::sync::Arc::clone(&attempts);
+        let call = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if call < 2 {
+            Ok::<_, String>(None)
+        } else {
+            Ok(Some(runtime::AgenticProgramProjection::empty(
+                "program-1",
+                "objective-1",
+            )))
+        }
+    })
+    .expect("extraction");
+    assert!(
+        seen.is_some(),
+        "the projection must be read once it appears"
+    );
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "two retries then a successful read"
+    );
+}
+
+/// A projection that never appears must not be retried forever: the harness has
+/// to keep its own wall clock. After the bound it gives up and reports `None`,
+/// which is exactly the old behaviour.
+#[test]
+fn a_missing_program_extraction_is_bounded() {
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = extract_root_program_with_retry(|| {
+        let attempts = std::sync::Arc::clone(&attempts);
+        attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok::<_, String>(None)
+    })
+    .expect("extraction");
+    assert!(seen.is_none());
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        PROGRAM_EXTRACTION_RETRIES as usize + 1,
+        "the retry budget is a hard bound"
+    );
+}
+
+/// A hard error is a real fault, not a timing gap, so it is returned on the
+/// first attempt and never retried.
+#[test]
+fn a_failed_program_extraction_is_not_retried() {
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let result = extract_root_program_with_retry(|| {
+        let attempts = std::sync::Arc::clone(&attempts);
+        attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err::<Option<runtime::AgenticProgramProjection>, _>("gateway unreachable".to_string())
+    });
+    assert_eq!(result.unwrap_err(), "gateway unreachable");
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a fault must not be retried"
+    );
+}
+
+/// The three-piece record names which piece is missing, so a reader never has to
+/// reconstruct it from the aggregate. It records; it does not decide, because the
+/// three checks above already do.
+#[test]
+fn terminal_three_piece_complete_names_the_missing_piece() {
+    let timeline = successful_root_outcome_timeline(json!({}));
+    let acceptance = LiveAcceptanceResult {
+        passed: false,
+        // A verdict with no user-visible delivery: exactly the state one live run
+        // reached, where the business was finished and nothing was delivered.
+        checks: vec![
+            json!({"name": "agentic_program_verified", "passed": true}),
+            json!({"name": "durable_response", "passed": false}),
+        ],
+        quality: None,
+    };
+    let finalized = finalize_live_acceptance(acceptance, &timeline, "root");
+    let record = finalized
+        .checks
+        .iter()
+        .find(|check| check["name"] == "terminal_three_piece_complete")
+        .expect("three-piece record");
+    assert_eq!(record["passed"], false);
+    assert_eq!(record["pieces"]["goal_verified"], true);
+    assert_eq!(record["pieces"]["user_visible_delivery"], false);
+    assert_eq!(record["missing"][0], "user_visible_delivery");
+}
+
+/// With all three pieces present the record passes and names nothing missing.
+#[test]
+fn terminal_three_piece_complete_is_silent_when_nothing_is_missing() {
+    let timeline = successful_root_outcome_timeline(json!({}));
+    let acceptance = LiveAcceptanceResult {
+        passed: true,
+        checks: vec![
+            json!({"name": "agentic_program_verified", "passed": true}),
+            json!({"name": "durable_response", "passed": true}),
+        ],
+        quality: None,
+    };
+    let finalized = finalize_live_acceptance(acceptance, &timeline, "root");
+    let record = finalized
+        .checks
+        .iter()
+        .find(|check| check["name"] == "terminal_three_piece_complete")
+        .expect("three-piece record");
+    assert_eq!(record["passed"], true);
+    assert_eq!(record["missing"].as_array().map(Vec::len), Some(0));
+}
+
+/// Build a minimal Program with `task_count` accepted Tasks and, optionally, one
+/// synthesis artifact written by `synthesis_author`.
+fn program_with_tasks(
+    task_count: usize,
+    synthesis: Option<(&str, &str)>,
+) -> runtime::AgenticProgramProjection {
+    let mut tasks = serde_json::Map::new();
+    let mut artifacts = serde_json::Map::new();
+    for index in 0..task_count {
+        let task_id = format!("task-{index}");
+        let artifact_ref = format!("artifact:report-{index}");
+        let author = format!("agent-{index}");
+        tasks.insert(
+            task_id.clone(),
+            json!({
+                "task_id": task_id,
+                "team_id": "team-1",
+                "title": format!("report {index}"),
+                "objective": "verify one fact",
+                "acceptance": "one verifiable fact",
+                "required_capabilities": ["read"],
+                "depends_on": [],
+                "status": "accepted",
+                "claimant": author,
+                "claim_generation": 1,
+                "claim_execution_id": format!("execution-{index}"),
+                "claimed_at_ms": 1,
+                "lease_expires_at_ms": 2,
+                "artifact_refs": [artifact_ref],
+                "evidence_refs": ["evidence:read"],
+                "unresolved": [],
+                "review_reason": "accepted",
+                "reviewed_by": "agent-review",
+                "failed_attempts": 0,
+                "review_generation": 1,
+                "failed_review_attempts": 0,
+                "last_failure": null,
+                "replacement_task_refs": [],
+                "supersede_evidence_refs": [],
+                "superseded_reason": null,
+                "superseded_by": null
+            }),
+        );
+        artifacts.insert(
+            artifact_ref,
+            json!({
+                "artifact_ref": format!("artifact:report-{index}"),
+                "content_ref": format!("content:{index}"),
+                "kind": "report",
+                "title": format!("report {index}"),
+                "relates_to": [task_id],
+                "committed_by": format!("agent-{index}")
+            }),
+        );
+    }
+    let mut extra_task = None;
+    if let Some((artifact_ref, author)) = synthesis {
+        // The synthesis hangs off its own accepted Task and is written by
+        // `author`, who is not the author of any Task it covers.
+        extra_task = Some(format!("task-synthesis"));
+        tasks.insert(
+            "task-synthesis".to_string(),
+            json!({
+                "task_id": "task-synthesis",
+                "team_id": "team-1",
+                "title": "synthesis",
+                "objective": "synthesize the reports",
+                "acceptance": "one synthesis",
+                "required_capabilities": ["read"],
+                "depends_on": [],
+                "status": "accepted",
+                "claimant": author,
+                "claim_generation": 1,
+                "claim_execution_id": "execution-synthesis",
+                "claimed_at_ms": 1,
+                "lease_expires_at_ms": 2,
+                "artifact_refs": [artifact_ref],
+                "evidence_refs": ["evidence:read"],
+                "unresolved": [],
+                "review_reason": "accepted",
+                "reviewed_by": "agent-review",
+                "failed_attempts": 0,
+                "review_generation": 1,
+                "failed_review_attempts": 0,
+                "last_failure": null,
+                "replacement_task_refs": [],
+                "supersede_evidence_refs": [],
+                "superseded_reason": null,
+                "superseded_by": null
+            }),
+        );
+        // It relates to every report it synthesizes, which is how a synthesis is
+        // told apart from a fourth report.
+        let relates_to: Vec<String> = (0..task_count)
+            .map(|index| format!("task-{index}"))
+            .chain(std::iter::once("task-synthesis".to_string()))
+            .collect();
+        artifacts.insert(
+            artifact_ref.to_string(),
+            json!({
+                "artifact_ref": artifact_ref,
+                "content_ref": "content:synthesis",
+                "kind": "report",
+                "title": "synthesis",
+                "relates_to": relates_to,
+                "committed_by": author
+            }),
+        );
+    }
+    serde_json::from_value(json!({
+        "program_id": "program:test",
+        "objective_id": "objective:test",
+        "session_id": "session-test",
+        "turn_id": "turn-test",
+        "root_execution_id": "root",
+        "required_team_count": 1,
+        "objective_summary": "synthesize the reports",
+        "model_lease": "model:test",
+        "permission_ceiling": "read-only",
+        "resource_scopes": [],
+        "revision": 9,
+        "status": "verified",
+        "teams": {},
+        "agents": {},
+        "tasks": Value::Object(tasks),
+        "topics": {},
+        "artifacts": Value::Object(artifacts),
+        "final_artifact_ref": extra_task.as_ref().map(|_| "artifact:synthesis"),
+        "completion_request": null,
+        "objective_verdict": {"goal_id":"objective:test","goal_revision":1,"terminal_fence":"fence","authority_revision":9,"kind":"satisfied"},
+        "unresolved": []
+    }))
+    .expect("program fixture")
+}
+
+/// A synthesis that draws on two Tasks, hangs off an accepted Task, and is
+/// written by someone who authored neither, satisfies the operator's "final
+/// artifact synthesizes the facts" requirement.
+#[test]
+fn a_synthesized_artifact_covering_two_tasks_passes() {
+    let program = program_with_tasks(2, Some(("artifact:synthesis", "agent-synth")));
+    let (present, unsynthesized) = synthesized_final_artifact_findings(Some(&program));
+    assert!(present, "a real synthesis must pass: {unsynthesized:?}");
+}
+
+/// Three per-Task reports and no synthesis is exactly the state one live run
+/// reached, and it used to pass on a non-empty answer alone.
+#[test]
+fn per_task_reports_without_a_synthesis_fail() {
+    let program = program_with_tasks(3, None);
+    let (present, unsynthesized) = synthesized_final_artifact_findings(Some(&program));
+    assert!(!present, "per-Task reports are not a synthesis");
+    assert_eq!(unsynthesized.len(), 3, "{unsynthesized:?}");
+}
+
+/// A "synthesis" written by the author of a Task it covers is a fourth report,
+/// not a synthesis, so it does not satisfy the requirement.
+#[test]
+fn a_synthesis_by_one_of_the_authors_is_refused() {
+    let program = program_with_tasks(2, Some(("artifact:synthesis", "agent-0")));
+    let (present, _) = synthesized_final_artifact_findings(Some(&program));
+    assert!(!present, "an author may not synthesize their own work");
+}
+
+/// One Task has nothing to synthesize, so there is no obligation.
+#[test]
+fn a_single_task_scenario_needs_no_synthesis() {
+    let program = program_with_tasks(1, None);
+    let (present, unsynthesized) = synthesized_final_artifact_findings(Some(&program));
+    assert!(present, "{unsynthesized:?}");
+}

@@ -3301,6 +3301,78 @@ fn closure_drive_after_steps() -> usize {
         .unwrap_or(3)
 }
 
+/// The Objective milestones the no-progress fuse measures.
+///
+/// These are the only facts that mean the run moved toward finishing. Every
+/// other Program mutation - publishing, claiming, submitting, reviewing a Task -
+/// is work, and a run can do that work forever without approaching the
+/// Objective: one live run spent 304 steps submitting and re-reviewing Tasks
+/// without ever requesting completion, and under the previous definition every
+/// one of those steps counted as verified progress, so the fuse never fired.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct ObjectiveMilestones {
+    /// A completion request is durable - the model asked to finish.
+    pub(super) completion_requested: bool,
+    /// Runtime bound an Objective verdict, satisfied or blocked.
+    pub(super) verdict_bound: bool,
+    /// How many Objective reviews are recorded on the Goal.
+    pub(super) objective_reviews: usize,
+    /// How many closure rungs the root still has to climb. Fewer is closer.
+    pub(super) outstanding_closure_rungs: usize,
+}
+
+/// The Objective milestones as they stand right now.
+///
+/// Read from the Program projection and the Goal's own review records, both of
+/// which are durable facts, so two observations of the same run always agree. A
+/// turn with no Program yet reports the zero milestones, which makes the first
+/// real milestone register as progress.
+fn objective_milestones(
+    services: &crate::RuntimeServices,
+    session_id: &str,
+    turn_id: &str,
+) -> ObjectiveMilestones {
+    let Some(program) = super::root_agentic_program_projection(services, session_id, turn_id)
+    else {
+        return ObjectiveMilestones::default();
+    };
+    let goal_reviews = program
+        .root_execution_id
+        .as_deref()
+        .and_then(|root| {
+            services
+                .goal_store()
+                .projection(&format!("goal:{root}"))
+                .ok()
+                .flatten()
+        })
+        .map(|goal| goal.goal.reviews.len())
+        .unwrap_or(0);
+    ObjectiveMilestones {
+        completion_requested: program.completion_request.is_some(),
+        verdict_bound: program.objective_verdict.is_some(),
+        objective_reviews: goal_reviews,
+        outstanding_closure_rungs: super::outstanding_closure_steps(&program).len(),
+    }
+}
+
+/// Whether the Objective moved closer between two observations.
+///
+/// Only convergence counts: a request landing, a verdict binding, a review
+/// landing, or the closure ladder shrinking. Once the ladder is at its floor
+/// and the model keeps churning Tasks, nothing here advances and the
+/// no-progress fuse is free to fire - which is exactly the run the old
+/// definition let through.
+pub(super) fn objective_milestone_advanced(
+    before: &ObjectiveMilestones,
+    after: &ObjectiveMilestones,
+) -> bool {
+    (after.completion_requested && !before.completion_requested)
+        || (after.verdict_bound && !before.verdict_bound)
+        || after.objective_reviews > before.objective_reviews
+        || after.outstanding_closure_rungs < before.outstanding_closure_rungs
+}
+
 /// Root model steps after a satisfied verdict with no final answer before
 /// Runtime hands the root the turn that writes it.
 ///
@@ -3350,11 +3422,178 @@ fn verified_answer_drive_grace_period_defaults_to_two_steps() {
     assert!(verified_answer_drive_after_steps() >= 1);
 }
 
+/// Task churn is work, not convergence. One live run spent 304 steps publishing,
+/// submitting and re-reviewing Tasks without ever requesting completion, and the
+/// old definition counted every one of those steps as verified progress.
+#[test]
+fn task_churn_alone_is_not_semantic_progress() {
+    let before = ObjectiveMilestones {
+        outstanding_closure_rungs: 3,
+        ..Default::default()
+    };
+    // The same rungs, the same requests, the same reviews: only Tasks moved.
+    let after = before.clone();
+    assert!(
+        !objective_milestone_advanced(&before, &after),
+        "identical milestones cannot be progress"
+    );
+}
+
+/// A completion request landing is the clearest convergence signal there is.
+#[test]
+fn a_completion_request_is_semantic_progress() {
+    let before = ObjectiveMilestones::default();
+    let after = ObjectiveMilestones {
+        completion_requested: true,
+        ..Default::default()
+    };
+    assert!(objective_milestone_advanced(&before, &after));
+}
+
+/// The closure ladder shrinking means the root has fewer rungs left to climb,
+/// even when nothing else changed.
+#[test]
+fn a_reduced_closure_rung_is_semantic_progress() {
+    let before = ObjectiveMilestones {
+        outstanding_closure_rungs: 4,
+        ..Default::default()
+    };
+    let after = ObjectiveMilestones {
+        outstanding_closure_rungs: 3,
+        ..before.clone()
+    };
+    assert!(objective_milestone_advanced(&before, &after));
+}
+
+/// Once the ladder is at its floor, further Task churn registers nothing, so the
+/// no-progress fuse is free to fire. That is the run the old definition let
+/// through indefinitely.
+#[test]
+fn a_floored_ladder_stops_reporting_progress() {
+    let floored = ObjectiveMilestones {
+        outstanding_closure_rungs: 0,
+        ..Default::default()
+    };
+    assert!(
+        !objective_milestone_advanced(&floored, &floored),
+        "a run at its closure floor with no new milestone is not progressing"
+    );
+}
+
+/// A verdict binding is terminal progress even though it ends the turn.
+#[test]
+fn a_bound_verdict_is_semantic_progress() {
+    let before = ObjectiveMilestones::default();
+    let after = ObjectiveMilestones {
+        verdict_bound: true,
+        ..Default::default()
+    };
+    assert!(objective_milestone_advanced(&before, &after));
+}
+
 #[test]
 fn closure_drive_grace_period_defaults_to_three_steps() {
     // The grace period must be positive: zero would pre-empt a model that is
     // merely mid-thought on its first ready step.
     assert!(closure_drive_after_steps() >= 1);
+}
+
+fn protocol_state(mode: &str, artifact_refs: Vec<&str>) -> DelegatedAgenticProtocolState {
+    DelegatedAgenticProtocolState {
+        program_id: "program-1".to_string(),
+        task_id: "task-1".to_string(),
+        mode: mode.to_string(),
+        status: crate::AgenticTaskStatus::Submitted,
+        artifact_refs: artifact_refs.into_iter().map(str::to_string).collect(),
+        artifact_evidence_refs: Vec::new(),
+        owns_active_attempt: true,
+        review_reason: None,
+    }
+}
+
+/// The closure set becomes the next request's activation ceiling, so it has to
+/// carry the read-only tools the closing Agent still needs. One live run was
+/// blocked with `tool_protocol_violation: ... [grep_search]` because the set
+/// held exactly one action tool and the Agent could not read the file its own
+/// objective named.
+#[test]
+fn closure_tool_ids_includes_the_read_only_evidence_tools() {
+    for (mode, artifacts, action_tool) in [
+        (
+            "review",
+            vec![],
+            harness_contract::agent_action::TASK_REVIEW_TOOL_ID,
+        ),
+        (
+            "execute",
+            vec![],
+            harness_contract::agent_action::ARTIFACT_COMMIT_TOOL_ID,
+        ),
+        (
+            "execute",
+            vec!["artifact:a"],
+            harness_contract::agent_action::TASK_SUBMIT_TOOL_ID,
+        ),
+    ] {
+        let ids = protocol_state(mode, artifacts).closure_tool_ids();
+        assert!(
+            ids.contains(action_tool),
+            "{mode} must still close with {action_tool}: {ids:?}"
+        );
+        for read_only in CLOSURE_READ_ONLY_EVIDENCE_TOOLS {
+            assert!(
+                ids.contains(read_only),
+                "{mode} must keep the read-only tool {read_only}: {ids:?}"
+            );
+        }
+    }
+}
+
+/// Closure narrows the request to force a commit. Admitting a write tool or an
+/// Agent Action would let the Agent keep opening work instead of closing it.
+#[test]
+fn closure_tool_ids_never_admits_a_write_or_agent_action_tool() {
+    let ids = protocol_state("execute", vec!["artifact:a"]).closure_tool_ids();
+    // `task_submit` is this mode's own closing action, so it is expected; every
+    // other Agent Action and every write tool is not.
+    for forbidden in [
+        "write_file",
+        "edit",
+        "bash",
+        "task_publish",
+        "task_claim",
+        "task_supersede",
+        "task_withdraw",
+        "agent_invite",
+        "team_create",
+        "artifact_commit",
+        "artifact_publish",
+        "message_publish",
+        "objective_review",
+        "objective_complete_request",
+        "objective_update",
+    ] {
+        assert!(
+            !ids.contains(forbidden),
+            "closure must not admit {forbidden}: {ids:?}"
+        );
+    }
+}
+
+/// The reviewer mode closes with `task_review`, and it must not also admit the
+/// worker's `task_submit` - otherwise a reviewer could commit new work.
+#[test]
+fn the_reviewer_mode_does_not_admit_the_workers_submit() {
+    let ids = protocol_state("review", vec![]).closure_tool_ids();
+    assert!(ids.contains(harness_contract::agent_action::TASK_REVIEW_TOOL_ID));
+    assert!(
+        !ids.contains(harness_contract::agent_action::TASK_SUBMIT_TOOL_ID),
+        "a reviewer must not be able to submit new work: {ids:?}"
+    );
+    assert!(
+        !ids.contains(harness_contract::agent_action::ARTIFACT_COMMIT_TOOL_ID),
+        "a reviewer must not be able to commit a new artifact: {ids:?}"
+    );
 }
 
 fn zero_recovery_deadline() -> std::time::Duration {
@@ -3909,12 +4148,18 @@ impl DelegatedAgenticProtocolState {
         }
     }
 
-    /// The one durable protocol action that can close the current Agent
-    /// boundary. Runtime uses this only after the model itself has exhausted
-    /// its evidence work or attempted a text terminal; it never narrows the
-    /// Agent's ordinary research/planning tool surface. That split preserves
-    /// semantic autonomy while preventing a generic presentation synthesis
-    /// from orphaning a claimed Task between its artifact and submission.
+    /// The durable protocol action that closes the current Agent boundary, plus
+    /// the read-only tools that boundary still needs.
+    ///
+    /// This set becomes the next request's tool-activation ceiling, so it must
+    /// not be narrower than the work the Agent still owes. One live run was
+    /// blocked with `tool_protocol_violation: ... [grep_search]` because the
+    /// set held exactly one action tool: the Agent could neither search nor
+    /// read the file its own objective named, and after the single governed
+    /// retry the whole Agent graph was declared blocked. Closure narrows the
+    /// request to force a commit; it must not forbid verifying the object the
+    /// Agent has to report on. Everything added here is a read, so further
+    /// exploration commits remain closed.
     pub(super) fn closure_tool_ids(&self) -> BTreeSet<String> {
         let tool = match self.mode.as_str() {
             "review" => harness_contract::agent_action::TASK_REVIEW_TOOL_ID,
@@ -3923,9 +4168,30 @@ impl DelegatedAgenticProtocolState {
             }
             _ => harness_contract::agent_action::TASK_SUBMIT_TOOL_ID,
         };
-        [tool.to_string()].into_iter().collect()
+        std::iter::once(tool.to_string())
+            .chain(
+                CLOSURE_READ_ONLY_EVIDENCE_TOOLS
+                    .iter()
+                    .map(|name| name.to_string()),
+            )
+            .collect()
     }
 }
+
+/// Read-only tools a closure-phase Agent may still call. Each of these reads
+/// durable state or bytes and writes nothing, so admitting them cannot reopen
+/// exploration: the Agent still cannot publish, claim, invite or submit a new
+/// piece of work. They are here because the closure action's own evidence
+/// obligation frequently requires reading the object under review, and a
+/// ceiling of one action tool made that impossible.
+const CLOSURE_READ_ONLY_EVIDENCE_TOOLS: [&str; 6] = [
+    "read_file",
+    "read_ref",
+    "evidence_retrieve",
+    "grep_search",
+    "glob_search",
+    "state_inspect",
+];
 
 pub(super) fn pending_delegated_action_is_ready(
     protocol: Option<&DelegatedAgenticProtocolState>,
@@ -5924,12 +6190,25 @@ where
             state.clean_terminal_synthesis_attempted = true;
             state.clean_terminal_synthesis_next = true;
         }
-        // "Verified progress" means a durable Program-level change was applied
-        // this batch (an Agent action that is Applied, not duplicate, and did
-        // change refs). Reading a *new file* is not progress: a model that opens
-        // one new path per round would otherwise be exempt from every bound,
-        // which is exactly the unbounded-70-rounds failure this guards against.
-        state.last_verified_progress = !agentic_progress_refs.is_empty();
+        // "Verified progress" means the Objective moved closer: a completion
+        // request landed, a verdict bound, a review landed, or the closure
+        // ladder shrank. Publishing, claiming, submitting and reviewing a Task
+        // are work, and one live run did that work for 304 steps without ever
+        // approaching the Objective - under the previous definition each of
+        // those steps counted as progress, so the no-progress fuse never fired.
+        // Reading a *new file* is not progress either: a model that opens one
+        // new path per round would otherwise be exempt from every bound, which
+        // is exactly the unbounded-70-rounds failure this guards against.
+        let current_objective_milestones = objective_milestones(
+            self.services.as_ref(),
+            &state.session_id.clone(),
+            &state.turn_id.clone(),
+        );
+        state.last_verified_progress = objective_milestone_advanced(
+            &state.previous_objective_milestones,
+            &current_objective_milestones,
+        );
+        state.previous_objective_milestones = current_objective_milestones;
         let verified_evidence_refs = if state.last_verified_progress {
             new_observed_fingerprints
                 .iter()
@@ -6677,6 +6956,7 @@ mod zero_recovery_guard_tests {
                     objective: "objective".to_string(),
                     acceptance: "evidence".to_string(),
                     acceptance_checks: Vec::new(),
+                    criterion_source: Default::default(),
                     required_capabilities: Vec::new(),
                     depends_on: Vec::new(),
                     status,

@@ -1757,3 +1757,161 @@ async fn string_typed_actions_array_is_coerced_at_the_boundary() {
         "the coerced action must have committed"
     );
 }
+
+/// A pure `oneOf` schema has no top-level `properties`, and the coercion used to
+/// return early in that case - so `artifact_publish.block_index` was refused
+/// with `invalid type: string "0", expected usize` while the model had sent an
+/// unambiguous value. The variant union is now merged before coercing.
+#[test]
+fn a_pure_one_of_schema_still_coerces_its_variant_fields() {
+    let registry = GatewayToolRegistry::builtin()
+        .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
+        .expect("runtime tools");
+    let executor = GatewayToolExecutor::new(None, false, registry);
+    let mut value = serde_json::json!({
+        "source": "message_block",
+        "message_id": "session-1",
+        "block_index": "0",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "media_type": "text/plain"
+    });
+    let repaired = executor.coerce_string_typed_structured_fields("artifact_publish", &mut value);
+    assert_eq!(repaired, vec!["block_index".to_string()], "{repaired:?}");
+    assert_eq!(
+        value["block_index"],
+        serde_json::json!(0),
+        "a quoted integer must be coerced, not left for the schema to refuse"
+    );
+}
+
+/// The schema is the authority: a field it types as `string` is never coerced,
+/// so a code fragment that happens to be valid JSON text survives untouched.
+#[test]
+fn a_schema_string_field_is_never_coerced() {
+    let registry = GatewayToolRegistry::builtin()
+        .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
+        .expect("runtime tools");
+    let executor = GatewayToolExecutor::new(None, false, registry);
+    let mut value = serde_json::json!({
+        "source": "message_block",
+        "message_id": "session-1",
+        "block_index": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "media_type": "text/plain"
+    });
+    let repaired = executor.coerce_string_typed_structured_fields("artifact_publish", &mut value);
+    assert!(
+        repaired.is_empty(),
+        "a correctly typed request must not be rewritten: {repaired:?}"
+    );
+    assert_eq!(value["media_type"], serde_json::json!("text/plain"));
+}
+
+/// Coercion only fixes the container shape; a value that is not a number is
+/// still left for the schema to refuse, so a malformed request is not laundered
+/// into a valid one.
+#[test]
+fn an_invalid_number_string_is_not_coerced() {
+    let registry = GatewayToolRegistry::builtin()
+        .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
+        .expect("runtime tools");
+    let executor = GatewayToolExecutor::new(None, false, registry);
+    let mut value = serde_json::json!({
+        "source": "message_block",
+        "message_id": "session-1",
+        "block_index": "not-a-number",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "media_type": "text/plain"
+    });
+    let repaired = executor.coerce_string_typed_structured_fields("artifact_publish", &mut value);
+    assert!(repaired.is_empty(), "{repaired:?}");
+    assert_eq!(value["block_index"], serde_json::json!("not-a-number"));
+}
+
+/// The restructure must not break the original container coercion that
+/// `agent_action_batch` depends on.
+#[test]
+fn the_container_coercion_still_works_after_the_restructure() {
+    let registry = GatewayToolRegistry::builtin()
+        .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
+        .expect("runtime tools");
+    let executor = GatewayToolExecutor::new(None, false, registry);
+    let mut value = serde_json::json!({
+        "actions": serde_json::json!([
+            {"tool": "team_create", "input": {"name": "Gamma", "mission": "coerced lane"}}
+        ])
+        .to_string()
+    });
+    let repaired = executor.coerce_string_typed_structured_fields("agent_action_batch", &mut value);
+    assert_eq!(repaired, vec!["actions".to_string()], "{repaired:?}");
+    assert!(
+        value["actions"].is_array(),
+        "the JSON-encoded array must be coerced back into an array"
+    );
+}
+
+/// A logical artifact key that no Program maps must still fail with the store's
+/// own error. The mapping is a fallback for a real reference, not a way to make
+/// an unknown id resolve: laundering "this does not exist" into "read failed"
+/// would hide the model's mistake instead of naming it.
+#[tokio::test]
+async fn evidence_retrieve_still_fails_when_no_program_maps_the_key() {
+    let services = runtime::RuntimeServices::in_memory().expect("runtime services");
+    let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
+    executor
+        .bind_runtime_services(Arc::clone(&services))
+        .unwrap();
+    // The spelling a model produces when it copies Runtime's `artifact:<24 hex>`
+    // and adds the separator itself. No Program holds this key.
+    let request = serde_json::from_value::<EvidenceRetrieveToolRequest>(
+        serde_json::json!({"evidence_ref": "artifact://0123456789abcdef01234567"}),
+    )
+    .unwrap();
+    let error = executor
+        .execute_evidence_retrieve(request, Some("session-none"), &[])
+        .await
+        .expect_err("an unmapped logical key must not resolve");
+    assert!(
+        error.to_string().contains("artifact does not exist"),
+        "the store's own error must survive: {error}"
+    );
+}
+
+/// A real store selector must keep resolving. The logical-key fallback is only
+/// consulted after the store refuses, so it cannot disturb the normal path.
+#[tokio::test]
+async fn a_valid_artifact_selector_still_resolves() {
+    let services = runtime::RuntimeServices::in_memory().expect("runtime services");
+    let artifact = services
+        .artifact_store()
+        .write_bytes(
+            harness_contract::context::ArtifactWriteDescriptor {
+                media_type: "text/plain".into(),
+                visibility_scope: "session:session-direct".into(),
+                expected_bytes: None,
+                original_name: None,
+            },
+            b"the reviewed body",
+        )
+        .await
+        .unwrap();
+    let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
+    executor
+        .bind_runtime_services(Arc::clone(&services))
+        .unwrap();
+    let request = serde_json::from_value::<EvidenceRetrieveToolRequest>(
+        serde_json::json!({"evidence_ref": artifact.selector}),
+    )
+    .unwrap();
+    let output = executor
+        .execute_evidence_retrieve(
+            request,
+            Some("session-direct"),
+            &["session:session-direct".to_string()],
+        )
+        .await
+        .expect("a real selector must still resolve");
+    let value: serde_json::Value = serde_json::from_str(&output).expect("json");
+    assert_eq!(value["available"], true);
+    assert!(value["bytes"].as_u64().unwrap() > 0, "{value}");
+}

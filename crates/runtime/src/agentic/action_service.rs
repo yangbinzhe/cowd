@@ -391,6 +391,36 @@ impl AgentActionService {
                 "the Program is bound to a different Objective",
             ));
         }
+        // A rework may only rest on a standard the operator stated. One live run
+        // invented three acceptance criteria, a reviewer enforced them line by
+        // line, and the collaboration burned 300+ steps without a completion
+        // request. `accept` and any rework that cites operator-derived work are
+        // untouched: only the invented standard is refused.
+        if let AgentAction::TaskReview(input) = &envelope.action {
+            if matches!(
+                input.decision,
+                harness_contract::agent_action::TaskReviewDecision::Rework
+                    | harness_contract::agent_action::TaskReviewDecision::Challenge
+            ) {
+                if let Some(task) = projection.tasks.get(&input.task_ref) {
+                    if task.criterion_source
+                        == harness_contract::agent_action::CriterionSource::AgentInvented
+                    {
+                        return Ok(rejected(
+                            envelope,
+                            projection.revision,
+                            "rework_on_invented_criterion",
+                            &format!(
+                                "Task `{}` acceptance is model-invented, not an operator requirement. \
+                                 A reviewer must not send it back on that standard alone; \
+                                 accept it, or name a deliverable the operator's own objective requires.",
+                                input.task_ref
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
         if projection.session_id != envelope.actor.session_id
             || projection.turn_id != envelope.actor.turn_id
             || projection.root_execution_id != envelope.actor.root_execution_id
@@ -2565,6 +2595,13 @@ fn actionable(projection: &AgenticProgramProjection, duplicate: bool) -> Vec<Str
     }
     if projection.teams.is_empty() {
         actions.push("create a Team or complete directly with a committed artifact".to_string());
+    }
+    // Authoring facts recorded when they were created. A model that invented an
+    // acceptance standard sees it named as its own on every subsequent receipt,
+    // which is the shortest correction loop available: the cost was paid at
+    // authoring time, so the notice belongs there too.
+    for warning in &projection.program_warnings {
+        actions.push(warning.clone());
     }
     if projection
         .teams

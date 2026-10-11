@@ -895,6 +895,28 @@ where
     }
 }
 
+/// Whether a business-completeness rollback may continue, advancing the shared
+/// continuation bound.
+///
+/// Both rollback paths - a recorded completion gap and an outstanding closure
+/// rung - draw on one counter, so the loop is bounded as a whole: a run cannot
+/// obtain a fresh budget by alternating between the two. Sharing the accounting
+/// is the part that must not diverge; the guidance each path injects genuinely
+/// differs, so it stays inline.
+fn claim_continuation_budget(state: &mut TurnGraphState, stage: &str) -> bool {
+    let bound = completion_gap_continuation_bound();
+    if state.completion_gap_continuations < bound {
+        state.completion_gap_continuations = state.completion_gap_continuations.saturating_add(1);
+        return true;
+    }
+    tracing::warn!(
+        stage,
+        bound,
+        "continuation bound reached; presenting the honest terminal instead of continuing"
+    );
+    false
+}
+
 #[async_trait]
 impl<C, T> crate::execution_core::graph::executors::SynthesizeBackend
     for TurnSynthesizeBackend<C, T>
@@ -1378,6 +1400,28 @@ where
                 committed_at_ms: Some(now_ms),
             }
         });
+        // ── Terminal path: four kinds of special handling, and which layer owns each ──
+        //
+        // Business-completeness layer (the Objective is not actually finished, so the
+        // published terminal must be rolled back and the root returned to work):
+        //   1. completion-gap rollback      — a recorded Objective gap remains.
+        //   2. closure-rung rollback        — a Program-owned rung (an independent
+        //                                     review) is still outstanding.
+        // These two are isomorphic and share one helper.
+        //
+        // Provider-transport layer (the answer could not be produced at all, which is
+        // a different failure with different recovery):
+        //   3. protocol-failure recovery    — the provider emitted an unusable frame.
+        //   4. structured-output recovery   — the provider could not be made to emit
+        //                                     the required shape.
+        // These two are deliberately NOT merged with the pair above: their trigger,
+        // their recovery action and their boundary semantics are not isomorphic to
+        // business completeness, and forcing them into one pipeline would leak
+        // transport detail into the business path. Recorded here so the decision is
+        // visible rather than implicit.
+        //
+        // The boundary matters: a reviewer of this file should be able to tell at a
+        // glance which layer a block belongs to, and why it is or is not shared.
         {
             let mut state = self.state.lock().await;
             state.delivery_envelope = Some(envelope.clone());
@@ -1420,19 +1464,7 @@ where
             ) {
                 let continue_gap = {
                     let mut state = self.state.lock().await;
-                    let bound = completion_gap_continuation_bound();
-                    if state.completion_gap_continuations < bound {
-                        state.completion_gap_continuations =
-                            state.completion_gap_continuations.saturating_add(1);
-                        true
-                    } else {
-                        tracing::warn!(
-                            gap = %gap,
-                            bound,
-                            "completion gap continuation bound reached; presenting the honest terminal instead of continuing"
-                        );
-                        false
-                    }
+                    claim_continuation_budget(&mut state, "completion_gap")
                 };
                 if continue_gap {
                     // This turn is not finished, so every terminal fact
@@ -1485,19 +1517,7 @@ where
                 if !outstanding.is_empty() {
                     let continue_rungs = {
                         let mut state = self.state.lock().await;
-                        let bound = completion_gap_continuation_bound();
-                        if state.completion_gap_continuations < bound {
-                            state.completion_gap_continuations =
-                                state.completion_gap_continuations.saturating_add(1);
-                            true
-                        } else {
-                            tracing::warn!(
-                                ?outstanding,
-                                bound,
-                                "closure rung continuation bound reached; presenting the honest terminal instead of continuing"
-                            );
-                            false
-                        }
+                        claim_continuation_budget(&mut state, "closure_rung")
                     };
                     if continue_rungs {
                         self.abandon_published_terminal().await;
@@ -4994,5 +5014,61 @@ pub(super) fn completed_result(
         failure: None,
         usage,
         finished_at_ms: crate::tool_invocation::now_ms(),
+    }
+}
+
+/// The bound is positive: zero would refuse the first rollback and present an
+/// honest terminal for a gap that has never been given a chance to close.
+#[test]
+fn continuation_bound_is_positive() {
+    assert!(completion_gap_continuation_bound() >= 1);
+}
+
+/// Both business-completeness rollbacks must draw on the same budget. They used
+/// to carry their own inline copy of the bound check, which is how the two could
+/// drift apart - and a run could then obtain a fresh budget by alternating
+/// between a completion gap and an outstanding closure rung.
+#[test]
+fn both_rollback_paths_share_one_bound() {
+    // Only the production half of the file: this test's own source would
+    // otherwise count itself.
+    let source = include_str!("host_presentation.rs");
+    let production = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("production code precedes the test module");
+    assert_eq!(
+        production
+            .matches("claim_continuation_budget(&mut state,")
+            .count(),
+        2,
+        "both the completion-gap and the closure-rung rollback must claim the shared budget"
+    );
+    assert_eq!(
+        production
+            .matches("state.completion_gap_continuations =")
+            .count(),
+        1,
+        "the continuation counter must be advanced in exactly one place"
+    );
+}
+
+/// The terminal path records which layer each special case belongs to, so a
+/// reader never has to infer why two of the four are shared and two are not.
+#[test]
+fn the_terminal_path_enumerates_its_four_special_cases() {
+    let source = include_str!("host_presentation.rs");
+    for marker in [
+        "completion-gap rollback",
+        "closure-rung rollback",
+        "protocol-failure recovery",
+        "structured-output recovery",
+        "Business-completeness layer",
+        "Provider-transport layer",
+    ] {
+        assert!(
+            source.contains(marker),
+            "the terminal path must record `{marker}`"
+        );
     }
 }

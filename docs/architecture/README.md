@@ -123,3 +123,23 @@ credential/api_key/access_key/private_key/auth 等）与 `COWD_*` 控制变量�
 - embedding 默认 batch 20 + 400 自动降半；搜索 publisher 公共后缀感知；bash/并行阈值支持 env 覆盖。
 - terminal ack 幂等收敛；L0 身份可通过 `/api/memory` 的 `layers_l0` 查看；doctor 报告 PostgreSQL 存储与迁移目录状态。
 - 沙箱测试支持 `COWD_SANDBOX_LAUNCHER_BINARY` 注入，CI 增加真实 bwrap 门禁。
+
+## 秩序契约与语义进展（v0.9.790）
+
+Agent-first 协作里，同一句秩序规则过去在五处各自改写，于是加在一层的规则到不了另一层：一次线上运行把"每个文件一个可核验事实"放大成三条自设验收标准，评审者逐行扫描找危害，304 步空转没有一次完成请求。规则现在只有一个来源——`crates/runtime/src/agentic/order_contract.rs`——六个注入点全部从它取值：
+
+| 注入点 | 常量 |
+|---|---|
+| `conversation/host_backend.rs` | `TASK_AUTHORING_DISCIPLINE`、`EVIDENCE_ECONOMY` |
+| `conversation/host.rs` | `EVIDENCE_ECONOMY` |
+| `agentic/execution/helpers.rs` | `REVIEWER_SCOPE_DISCIPLINE` |
+| `agentic/action_service.rs` | `OBJECTIVE_REVIEW_SCOPE_DISCIPLINE` |
+| `conversation/host_presentation.rs` | `OBJECTIVE_REVIEW_SCOPE_DISCIPLINE` |
+
+薄提示词、厚契约：提示词只负责让模型知道有这条规则，判定与边界一律在代码里。
+
+**语义进展**。无进展保险丝过去把任何 Program durable 变更算作进展，于是一个不停提交/复审 Task 的运行每一步都"有进展"，保险丝永不动作。现在只有向 Objective 收敛的量算进展——完成请求落地、裁决绑定、objective_review 落地、closure 阶梯缩减（`conversation/host_backend.rs` 的 `objective_milestone_advanced`）。
+
+**终局路径的四类特殊处理**（`conversation/host_presentation.rs` 头部注释）：
+业务完成度层两类——completion-gap 回滚、closure-rung 回滚——同构，共用同一个续跑预算（`claim_continuation_budget`），因此循环作为整体有界，运行无法靠在两类之间交替换取新预算；
+provider 传输层两类——protocol failure 恢复、structured output 恢复——不合并，因为触发条件、恢复动作与边界语义和业务完成度不同构，强行合并会把传输细节漏进业务路径。

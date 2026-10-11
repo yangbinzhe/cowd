@@ -66,6 +66,7 @@ pub(crate) fn apply_task_publish(
             objective: input.objective.trim().to_string(),
             acceptance: input.acceptance.trim().to_string(),
             acceptance_checks: input.acceptance_checks.clone(),
+            criterion_source: input.criterion_source,
             required_capabilities: input.required_capabilities.clone(),
             obligation_refs: input.obligation_refs.clone(),
             purpose: input.purpose,
@@ -100,6 +101,16 @@ pub(crate) fn apply_task_publish(
     );
     if let Some(team) = projection.teams.get_mut(&input.team_ref) {
         team.task_ids.push(task_id.to_string());
+    }
+    // An invented standard is labelled where it is written, not where it is
+    // enforced. The waste happens at authoring time - the reviewer scans for
+    // hazards nobody asked about - so the fact has to be visible to the author
+    // at the moment of writing and to the reviewer at the moment of judging.
+    if input.criterion_source == harness_contract::agent_action::CriterionSource::AgentInvented {
+        projection.program_warnings.push(format!(
+            "Task `{task_id}` acceptance is model-invented, not an operator requirement; \
+             a reviewer must not rework the Task on that standard alone"
+        ));
     }
 }
 
@@ -642,6 +653,7 @@ mod tests {
                 objective: "finish without an arbitrary wall timeout".to_string(),
                 acceptance: "durable evidence".to_string(),
                 acceptance_checks: Vec::new(),
+                criterion_source: Default::default(),
                 required_capabilities: Vec::new(),
                 depends_on: Vec::new(),
                 status: AgenticTaskStatus::Published,
@@ -702,6 +714,7 @@ mod tests {
                 objective: "objective".to_string(),
                 acceptance: "durable evidence".to_string(),
                 acceptance_checks: Vec::new(),
+                criterion_source: Default::default(),
                 required_capabilities: Vec::new(),
                 depends_on: Vec::new(),
                 status: AgenticTaskStatus::Rework,
@@ -765,6 +778,7 @@ mod tests {
             objective: "objective".to_string(),
             acceptance: "accepted evidence".to_string(),
             acceptance_checks: Vec::new(),
+            criterion_source: Default::default(),
             required_capabilities: Vec::new(),
             depends_on: Vec::new(),
             status: AgenticTaskStatus::Superseded,
@@ -826,6 +840,7 @@ mod tests {
             objective: "prove effect fencing".to_string(),
             acceptance: "no orphaned execution".to_string(),
             acceptance_checks: Vec::new(),
+            criterion_source: Default::default(),
             required_capabilities: Vec::new(),
             obligation_refs: Vec::new(),
             purpose: Default::default(),

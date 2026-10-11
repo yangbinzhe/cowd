@@ -47,10 +47,14 @@ impl AgenticProgramWaitRequest {
         {
             return Ok(None);
         }
-        let dispatched =
-            !active_agentic_child_graphs(root_execution_id, &program.program_id, program, state_store)
-                .await?
-                .is_empty();
+        let dispatched = !active_agentic_child_graphs(
+            root_execution_id,
+            &program.program_id,
+            program,
+            state_store,
+        )
+        .await?
+        .is_empty();
         Ok(dispatched.then(|| Self {
             program_id: program.program_id.clone(),
             root_execution_id: root_execution_id.to_string(),
@@ -451,7 +455,9 @@ pub async fn resolve_agentic_program_wait(
         return Ok(first);
     }
     let head = actions.program_revision(program_id).unwrap_or(0);
-    let read = actions.project(program_id).map_err(|error| error.to_string())?;
+    let read = actions
+        .project(program_id)
+        .map_err(|error| error.to_string())?;
     if head <= read.revision {
         return Ok(0);
     }
@@ -566,11 +572,33 @@ async fn resolve_wait_once(
     let mut barrier_rejections = serde_json::Value::Null;
     const MAX_GRAPH_CAS_ATTEMPTS: usize = 8;
     if strand_exhausted {
-        record(actions, &projection, program_id, root_execution_id, disposition, reason, 0, 0, 0, &serde_json::Value::Null);
+        record(
+            actions,
+            &projection,
+            program_id,
+            root_execution_id,
+            disposition,
+            reason,
+            0,
+            0,
+            0,
+            &serde_json::Value::Null,
+        );
         return Ok(0);
     }
     if disposition == "wait" {
-        record(actions, &projection, program_id, root_execution_id, disposition, reason, 0, 0, 0, &serde_json::Value::Null);
+        record(
+            actions,
+            &projection,
+            program_id,
+            root_execution_id,
+            disposition,
+            reason,
+            0,
+            0,
+            0,
+            &serde_json::Value::Null,
+        );
         return Ok(0);
     }
     for attempt in 0..MAX_GRAPH_CAS_ATTEMPTS {
@@ -735,7 +763,9 @@ pub async fn reconcile_agentic_program_wait_for_settled_graph(
 ) -> Result<usize, String> {
     let graph = match state_store.load_current_async(graph_id.to_string()).await {
         Ok(graph) => graph,
-        Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => return Ok(0),
+        Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => {
+            return Ok(0);
+        }
         Err(error) => return Err(error.to_string()),
     };
     let mut program_ids = agentic_program_ids(&graph);
@@ -777,9 +807,7 @@ async fn stored_barrier_deadline(
                 && node.executor_kind == AgenticProgramWaitExecutor::KIND
                 && graph.node_statuses.get(&node.id) == Some(&ExecutionNodeStatus::WaitingExternal)
         })
-        .and_then(|node| {
-            serde_json::from_str::<AgenticProgramWaitRequest>(&node.payload_ref).ok()
-        })
+        .and_then(|node| serde_json::from_str::<AgenticProgramWaitRequest>(&node.payload_ref).ok())
         .filter(|request| {
             request.program_id == program_id && request.root_execution_id == root_execution_id
         })
@@ -835,14 +863,13 @@ async fn wait_disposition(
             reason: "all_tasks_accepted",
         });
     }
-    let active_graphs =
-        active_agentic_child_graphs(
-            &request.root_execution_id,
-            &request.program_id,
-            projection,
-            state_store,
-        )
-            .await?;
+    let active_graphs = active_agentic_child_graphs(
+        &request.root_execution_id,
+        &request.program_id,
+        projection,
+        state_store,
+    )
+    .await?;
     if active_graphs.is_empty() {
         // "No active child graph" is not the same as "every dispatched task
         // settled": a child link may not be durable yet. Never read a missing
@@ -852,8 +879,7 @@ async fn wait_disposition(
             // declared undispatched past its own bound. Parking on it forever is
             // the starvation the fuse later reports, and the root can still
             // replan, withdraw, or retire it.
-            return if crate::agentic::execution::dispatch::stranded_task_refs(projection)
-                .is_empty()
+            return if crate::agentic::execution::dispatch::stranded_task_refs(projection).is_empty()
             {
                 Ok(WaitDisposition::Wait {
                     revision: projection.revision,
@@ -902,8 +928,9 @@ async fn strand_resume_count(
         .filter_map(|node| graph.node_results.get(&node.id))
         .filter_map(|result| result.result_ref.as_deref())
         .filter(|result_ref| {
-            result_ref.starts_with(&format!("agentic-program-checkpoint:{program_id}:revision:"))
-                && result_ref.ends_with(":task_stranded")
+            result_ref.starts_with(&format!(
+                "agentic-program-checkpoint:{program_id}:revision:"
+            )) && result_ref.ends_with(":task_stranded")
         })
         .count())
 }
@@ -915,8 +942,6 @@ fn all_tasks_accepted(projection: &AgenticProgramProjection) -> bool {
             .values()
             .all(|task| task.status == AgenticTaskStatus::Accepted)
 }
-
-
 
 /// Tasks that were dispatched into the Program but have not settled yet.
 ///
@@ -954,7 +979,9 @@ async fn active_agentic_child_graphs(
             .await
         {
             Ok(graph) => graph,
-            Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => continue,
+            Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => {
+                continue;
+            }
             Err(error) => return Err(error.to_string()),
         };
         if graph_belongs_to_program(&graph, program_id)
@@ -987,16 +1014,17 @@ fn child_graph_task_is_live(
         .iter()
         .filter(|node| node.kind == ExecutionNodeKind::AgentTask)
         .filter_map(|node| {
-            serde_json::from_str::<harness_contract::agent::AgentTaskPacket>(&node.payload_ref)
-                .ok()
+            serde_json::from_str::<harness_contract::agent::AgentTaskPacket>(&node.payload_ref).ok()
         })
-        .filter_map(|packet| match packet.agentic_binding.map(|binding| binding.focus) {
-            Some(harness_contract::agent::AgenticExecutionFocus::TaskExecute { task_ref })
-            | Some(harness_contract::agent::AgenticExecutionFocus::TaskReview { task_ref }) => {
-                Some(task_ref)
-            }
-            _ => None,
-        })
+        .filter_map(
+            |packet| match packet.agentic_binding.map(|binding| binding.focus) {
+                Some(harness_contract::agent::AgenticExecutionFocus::TaskExecute { task_ref })
+                | Some(harness_contract::agent::AgenticExecutionFocus::TaskReview { task_ref }) => {
+                    Some(task_ref)
+                }
+                _ => None,
+            },
+        )
         .collect::<Vec<_>>();
     task_refs.sort();
     task_refs.dedup();
@@ -1077,11 +1105,11 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        reconcile_agentic_program_wait_for_settled_graph, resolve_agentic_program_wait,
         AgenticProgramWaitExecutor, AgenticProgramWaitRequest,
+        reconcile_agentic_program_wait_for_settled_graph, resolve_agentic_program_wait,
     };
-    use crate::execution_core::graph::executors::AgentTaskExecutor;
     use crate::RuntimeServices;
+    use crate::execution_core::graph::executors::AgentTaskExecutor;
 
     fn root_actor(program_id: &str, root_execution_id: &str) -> AgentActorBinding {
         AgentActorBinding {
@@ -1159,6 +1187,7 @@ mod tests {
                 title: "Delayed dispatch".to_string(),
                 objective: "prove post-action wait eligibility".to_string(),
                 acceptance: "the claimed child eventually submits evidence".to_string(),
+                criterion_source: Default::default(),
                 acceptance_checks: Vec::new(),
                 required_capabilities: vec!["read".to_string()],
                 depends_on: Vec::new(),
@@ -1175,16 +1204,18 @@ mod tests {
             .agent_action_service()
             .project(program_id)
             .expect("published projection");
-        assert!(AgenticProgramWaitRequest::for_active_root(
-            &published,
-            root_execution_id,
-            services.graph_state_store(),
-            true,
-            None,
-        )
-        .await
-        .expect("derive pre-dispatch wait")
-        .is_none());
+        assert!(
+            AgenticProgramWaitRequest::for_active_root(
+                &published,
+                root_execution_id,
+                services.graph_state_store(),
+                true,
+                None,
+            )
+            .await
+            .expect("derive pre-dispatch wait")
+            .is_none()
+        );
 
         apply_root(
             "staff-after-publish",
@@ -1212,16 +1243,18 @@ mod tests {
             .agent_action_service()
             .project(program_id)
             .expect("dispatched projection");
-        assert!(AgenticProgramWaitRequest::for_active_root(
-            &dispatched,
-            root_execution_id,
-            services.graph_state_store(),
-            false,
-            None,
-        )
-        .await
-        .expect("continue publishing while a child is active")
-        .is_none());
+        assert!(
+            AgenticProgramWaitRequest::for_active_root(
+                &dispatched,
+                root_execution_id,
+                services.graph_state_store(),
+                false,
+                None,
+            )
+            .await
+            .expect("continue publishing while a child is active")
+            .is_none()
+        );
         let downstream = apply_root(
             "publish-dependent-work-while-child-runs",
             AgentAction::TaskPublish(TaskPublishInput {
@@ -1229,6 +1262,7 @@ mod tests {
                 title: "Consume the first result".into(),
                 objective: "plan downstream without waiting for the first execution".into(),
                 acceptance: "consume predecessor evidence".into(),
+                criterion_source: Default::default(),
                 acceptance_checks: Vec::new(),
                 required_capabilities: Vec::new(),
                 depends_on: vec![first_task_ref.clone()],
@@ -1545,9 +1579,7 @@ mod tests {
         open_program(&services, program_id, root_id);
         let actions = services.agent_action_service();
         let root = root_actor(program_id, root_id);
-        let apply = |action_id: &str,
-                     actor: &AgentActorBinding,
-                     action: AgentAction| {
+        let apply = |action_id: &str, actor: &AgentActorBinding, action: AgentAction| {
             actions
                 .apply(&AgentActionEnvelope {
                     action_id: action_id.to_string(),
@@ -1557,18 +1589,26 @@ mod tests {
                 })
                 .expect("apply Program action")
         };
-        let team = apply("settle-team", &root, AgentAction::TeamCreate(TeamCreateInput {
-            name: "Evidence".into(),
-            mission: "produce and verify one fact".into(),
-            objective: None,
-        }));
-        let team = apply("settle-team", &root, AgentAction::TeamCreate(TeamCreateInput {
-            name: "Evidence".into(),
-            mission: "produce and verify one fact".into(),
-            objective: None,
-        }))
+        let team = apply(
+            "settle-team",
+            &root,
+            AgentAction::TeamCreate(TeamCreateInput {
+                name: "Evidence".into(),
+                mission: "produce and verify one fact".into(),
+                objective: None,
+            }),
+        );
+        let team = apply(
+            "settle-team",
+            &root,
+            AgentAction::TeamCreate(TeamCreateInput {
+                name: "Evidence".into(),
+                mission: "produce and verify one fact".into(),
+                objective: None,
+            }),
+        )
         .changed_refs[0]
-        .clone();
+            .clone();
         let invite = |role: &str, mission: &str| {
             apply(
                 &format!("settle-invite-{role}"),
@@ -1584,7 +1624,7 @@ mod tests {
                 ),
             )
             .changed_refs[0]
-            .clone()
+                .clone()
         };
         let executor = invite("Executor", "produce one verifiable fact");
         let reviewer = invite("Reviewer", "verify the fact independently");
@@ -1606,19 +1646,29 @@ mod tests {
             actor.execution_id = Some("agent-child-last-settle-review".to_string());
             actor
         };
-        let task = apply("settle-task", &root, AgentAction::TaskPublish(
-            serde_json::from_value(serde_json::json!({
-                "team_ref": team,
-                "title": "One fact",
-                "objective": "extract one verifiable fact",
-                "acceptance": "artifact plus evidence",
-                "required_capabilities": ["read"]
-            }))
-            .unwrap(),
-        ))
+        let task = apply(
+            "settle-task",
+            &root,
+            AgentAction::TaskPublish(
+                serde_json::from_value(serde_json::json!({
+                    "team_ref": team,
+                    "title": "One fact",
+                    "objective": "extract one verifiable fact",
+                    "acceptance": "artifact plus evidence",
+                    "required_capabilities": ["read"]
+                }))
+                .unwrap(),
+            ),
+        )
         .changed_refs[0]
-        .clone();
-        register_agent_child(&services, root_id, &wait_node, program_id, "agent-child-last-settle");
+            .clone();
+        register_agent_child(
+            &services,
+            root_id,
+            &wait_node,
+            program_id,
+            "agent-child-last-settle",
+        );
         services
             .execution_supervisor()
             .drive_registered(root_id)
@@ -1634,9 +1684,13 @@ mod tests {
             "the barrier parks while the Task is unsettled"
         );
 
-        apply("settle-claim", &agent_actor, AgentAction::TaskClaim(
-            serde_json::from_value(serde_json::json!({"task_ref": task})).unwrap(),
-        ));
+        apply(
+            "settle-claim",
+            &agent_actor,
+            AgentAction::TaskClaim(
+                serde_json::from_value(serde_json::json!({"task_ref": task})).unwrap(),
+            ),
+        );
         let content = services
             .artifact_store()
             .write_bytes(
@@ -1650,38 +1704,53 @@ mod tests {
             )
             .await
             .expect("artifact content");
-        let artifact = apply("settle-artifact", &agent_actor, AgentAction::ArtifactCommit(
-            serde_json::from_value(serde_json::json!({
-                "content_ref": content.selector,
-                "kind": "report",
-                "title": "One fact",
-                "relates_to": [task]
-            }))
-            .unwrap(),
-        ))
+        let artifact = apply(
+            "settle-artifact",
+            &agent_actor,
+            AgentAction::ArtifactCommit(
+                serde_json::from_value(serde_json::json!({
+                    "content_ref": content.selector,
+                    "kind": "report",
+                    "title": "One fact",
+                    "relates_to": [task]
+                }))
+                .unwrap(),
+            ),
+        )
         .changed_refs[0]
-        .clone();
-        apply("settle-submit", &agent_actor, AgentAction::TaskSubmit(
-            serde_json::from_value(serde_json::json!({
-                "task_ref": task,
-                "artifact_refs": [artifact],
-                "evidence_refs": ["tool://settle-observation"]
-            }))
-            .unwrap(),
-        ));
+            .clone();
+        apply(
+            "settle-submit",
+            &agent_actor,
+            AgentAction::TaskSubmit(
+                serde_json::from_value(serde_json::json!({
+                    "task_ref": task,
+                    "artifact_refs": [artifact],
+                    "evidence_refs": ["tool://settle-observation"]
+                }))
+                .unwrap(),
+            ),
+        );
         // The last Program event is the one that settles the Task. It must be read as
         // the state it produces, otherwise the barrier is evaluated against a Program
         // that still has live work and the root stays parked forever.
-        let review = apply("settle-review", &reviewer_actor, AgentAction::TaskReview(
-            serde_json::from_value(serde_json::json!({
-                "task_ref": task,
-                "decision": "accept",
-                "reason": "verified",
-                "evidence_refs": ["tool://settle-review"]
-            }))
-            .unwrap(),
-        ));
-        assert_eq!(review.status, harness_contract::agent_action::AgentActionStatus::Applied);
+        let review = apply(
+            "settle-review",
+            &reviewer_actor,
+            AgentAction::TaskReview(
+                serde_json::from_value(serde_json::json!({
+                    "task_ref": task,
+                    "decision": "accept",
+                    "reason": "verified",
+                    "evidence_refs": ["tool://settle-review"]
+                }))
+                .unwrap(),
+            ),
+        );
+        assert_eq!(
+            review.status,
+            harness_contract::agent_action::AgentActionStatus::Applied
+        );
 
         let resolved = resolve_agentic_program_wait(
             program_id,
@@ -1754,6 +1823,7 @@ mod tests {
                         title: title.to_string(),
                         objective: "prove post-action wait eligibility".to_string(),
                         acceptance: "the claimed child eventually submits evidence".to_string(),
+                        criterion_source: Default::default(),
                         acceptance_checks: Vec::new(),
                         required_capabilities: vec!["read".to_string()],
                         depends_on: Vec::new(),
@@ -1817,20 +1887,20 @@ mod tests {
         for attempt in 0..4 {
             let receipt = services
                 .dispatch_agentic_followups(
-                &AgentActionEnvelope {
-                    action_id: format!("stranded-release-{attempt}"),
-                    actor: root.clone(),
-                    expected_revision: None,
-                    action: AgentAction::TaskRelease(
-                        harness_contract::agent_action::TaskReleaseInput {
-                            task_ref: unreachable.clone(),
-                            reason: String::new(),
-                        },
-                    ),
-                },
-                context.clone(),
-            )
-            .await;
+                    &AgentActionEnvelope {
+                        action_id: format!("stranded-release-{attempt}"),
+                        actor: root.clone(),
+                        expected_revision: None,
+                        action: AgentAction::TaskRelease(
+                            harness_contract::agent_action::TaskReleaseInput {
+                                task_ref: unreachable.clone(),
+                                reason: String::new(),
+                            },
+                        ),
+                    },
+                    context.clone(),
+                )
+                .await;
         }
 
         let resolved = resolve_agentic_program_wait(
@@ -1943,6 +2013,7 @@ mod tests {
                     title: "One verifiable fact".to_string(),
                     objective: "extract one verifiable fact".to_string(),
                     acceptance: "artifact plus evidence".to_string(),
+                    criterion_source: Default::default(),
                     acceptance_checks: Vec::new(),
                     required_capabilities: vec!["read".to_string()],
                     depends_on: Vec::new(),
@@ -1956,7 +2027,13 @@ mod tests {
             .expect("publish Task")
             .changed_refs[0]
             .clone();
-        register_agent_child(&services, root_id, &wait_node, program_id, "child-all-accepted");
+        register_agent_child(
+            &services,
+            root_id,
+            &wait_node,
+            program_id,
+            "child-all-accepted",
+        );
         services
             .execution_supervisor()
             .drive_registered(root_id)
@@ -2039,9 +2116,15 @@ mod tests {
             })
             .expect("submit");
 
-        let projection = actions.project(program_id).expect("projection before review");
+        let projection = actions
+            .project(program_id)
+            .expect("projection before review");
         assert_eq!(
-            projection.tasks.values().map(|task| task.status.clone()).collect::<Vec<_>>(),
+            projection
+                .tasks
+                .values()
+                .map(|task| task.status.clone())
+                .collect::<Vec<_>>(),
             vec![crate::AgenticTaskStatus::Submitted],
             "the Task is Submitted, so the barrier is legitimately parked"
         );
@@ -2090,10 +2173,7 @@ mod tests {
                     && event.get("reason").and_then(Value::as_str) == Some("all_tasks_accepted")
                     && event.get("released").and_then(Value::as_u64) == Some(1)
                     && event.get("barrier_candidates").and_then(Value::as_u64) == Some(1)
-                    && event
-                        .get("all_tasks_accepted")
-                        .and_then(Value::as_bool)
-                        == Some(true)
+                    && event.get("all_tasks_accepted").and_then(Value::as_bool) == Some(true)
             }),
             "a releasing decision must be durable and must name its reason: {dispositions:?}"
         );
@@ -2155,6 +2235,7 @@ mod tests {
                     title: "One verifiable fact".to_string(),
                     objective: "extract one verifiable fact".to_string(),
                     acceptance: "artifact plus evidence".to_string(),
+                    criterion_source: Default::default(),
                     acceptance_checks: Vec::new(),
                     required_capabilities: vec!["read".to_string()],
                     depends_on: Vec::new(),
@@ -2351,6 +2432,7 @@ mod tests {
                     title: "One verifiable fact".to_string(),
                     objective: "extract one verifiable fact".to_string(),
                     acceptance: "artifact plus evidence".to_string(),
+                    criterion_source: Default::default(),
                     acceptance_checks: Vec::new(),
                     required_capabilities: vec!["read".to_string()],
                     depends_on: Vec::new(),
@@ -2471,24 +2553,21 @@ mod tests {
 
         // Nothing else is invoked from here on: no lane, no observer, no second call.
         // The only thing that can release the barrier is the barrier itself.
-        let released_itself = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            async {
-                loop {
-                    let still_parked = services
-                        .graph_state_store()
-                        .load_current_async(root_id.to_string())
-                        .await
-                        .ok()
-                        .and_then(|graph| graph.node_statuses.get(&wait_node).copied())
-                        == Some(ExecutionNodeStatus::WaitingExternal);
-                    if !still_parked {
-                        return true;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let released_itself = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                let still_parked = services
+                    .graph_state_store()
+                    .load_current_async(root_id.to_string())
+                    .await
+                    .ok()
+                    .and_then(|graph| graph.node_statuses.get(&wait_node).copied())
+                    == Some(ExecutionNodeStatus::WaitingExternal);
+                if !still_parked {
+                    return true;
                 }
-            },
-        )
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
         .await
         .unwrap_or(false);
         assert!(

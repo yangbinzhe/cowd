@@ -81,6 +81,12 @@ pub struct AgenticProgramProjection {
     /// current state.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub last_reopen_gaps: Vec<String>,
+    /// Durable authoring facts the root and its reviewers must see, recorded
+    /// when the fact was created rather than when it was enforced. Currently
+    /// carries the notice that a Task's acceptance standard was invented by the
+    /// model rather than stated by the operator.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub program_warnings: Vec<String>,
 }
 
 impl AgenticProgramProjection {
@@ -130,6 +136,7 @@ impl AgenticProgramProjection {
             objective_verdict: None,
             unresolved: Vec::new(),
             last_reopen_gaps: Vec::new(),
+            program_warnings: Vec::new(),
         }
     }
 
@@ -408,6 +415,12 @@ pub struct AgenticTaskProjection {
     /// reviewer cite concrete evidence instead of a subjective reading.
     #[serde(default)]
     pub acceptance_checks: Vec<String>,
+    /// Provenance of the `acceptance` statement. A reviewer may not rework a
+    /// Task whose acceptance the author invented: that standard never came from
+    /// the operator, so enforcing it burns the collaboration without serving
+    /// the objective.
+    #[serde(default)]
+    pub criterion_source: harness_contract::agent_action::CriterionSource,
     pub required_capabilities: Vec<String>,
     #[serde(default)]
     pub obligation_refs: Vec<String>,

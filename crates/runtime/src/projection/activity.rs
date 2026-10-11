@@ -5,9 +5,10 @@ use harness_contract::execution_graph::{
     ExecutionNodeProjection, ExecutionNodeStatus,
 };
 use harness_contract::projection::{
-    AcceptanceSummaryProjection, ActivityRelationKind, ActivityVisibility, EffectSummaryProjection,
-    ExecutionActivityKind, ExecutionActivityProjection, ExecutionActivityRelation,
-    ExecutionScopeProjection, ExecutionStatusReasonKind, EXECUTION_ACTIVITY_SCHEMA_VERSION,
+    AcceptanceSummaryProjection, ActivityRelationKind, ActivityVisibility,
+    EXECUTION_ACTIVITY_SCHEMA_VERSION, EffectSummaryProjection, ExecutionActivityKind,
+    ExecutionActivityProjection, ExecutionActivityRelation, ExecutionScopeProjection,
+    ExecutionStatusReasonKind,
 };
 
 use super::reducer_support::ExecutionProjectionScope;
@@ -3538,8 +3539,10 @@ mod tests {
             !artifact_visibility("session-ingress-graph:execution:tool-results:2")
                 .contains(&ActivityVisibility::Narrative)
         );
-        assert!(artifact_visibility("workspace://reports/result.md")
-            .contains(&ActivityVisibility::Narrative));
+        assert!(
+            artifact_visibility("workspace://reports/result.md")
+                .contains(&ActivityVisibility::Narrative)
+        );
     }
 
     #[test]

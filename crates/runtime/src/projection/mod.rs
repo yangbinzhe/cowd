@@ -9,16 +9,16 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use harness_contract::core::MeasureProvenance;
 use harness_contract::execution_graph::{ExecutionGraphCommand, ExecutionNodeStatus};
 use harness_contract::projection::{
-    AdmissionProjection, AdmissionProjectionStatus, ChildExecutionProjection, EvidenceProjection,
+    AdmissionProjection, AdmissionProjectionStatus, ChildExecutionProjection,
+    EXECUTION_PROJECTION_REDUCER_VERSION, EXECUTION_PROJECTION_SCHEMA_VERSION, EvidenceProjection,
     ExecutionCommandKind, ExecutionCommandReceipt, ExecutionCommandRequest,
     ExecutionConcurrencyCountsProjection, ExecutionConcurrencyProjection, ExecutionProjection,
     ExecutionResourceCapacityProjection, OutcomeProjection, OutcomeQualityProjection,
     ProjectionCommandAvailability, ProjectionDelta, ProjectionDetailScope, ProjectionEntity,
     ProjectionEntityCollection, ProjectionEntityPayload, ProjectionOperation,
     ProjectionQueryContext, ProjectionResyncReason, ProjectionSourceHealth,
-    StrategyActualProjection, StrategyActualStatus, StrategyDecisionProjection,
-    StrategyProofStatus, StrategyTransitionProjection, EXECUTION_PROJECTION_REDUCER_VERSION,
-    EXECUTION_PROJECTION_SCHEMA_VERSION, STRATEGY_DECISION_PROJECTION_SCHEMA_VERSION,
+    STRATEGY_DECISION_PROJECTION_SCHEMA_VERSION, StrategyActualProjection, StrategyActualStatus,
+    StrategyDecisionProjection, StrategyProofStatus, StrategyTransitionProjection,
 };
 use harness_contract::reality::{EvidenceCompleteness, EvidenceRef, RealityBoundary};
 use harness_contract::strategy::{
@@ -714,9 +714,9 @@ mod tests {
     use super::*;
     use harness_contract::{
         execution_graph::{
-            project_execution_graph, ExecutionFailure, ExecutionGraph, ExecutionGraphLineage,
-            ExecutionNodeKind, ExecutionNodeResult, ExecutionNodeSpec, ExecutionNodeStatus,
-            ExecutionParentBinding, ExecutionUsage,
+            ExecutionFailure, ExecutionGraph, ExecutionGraphLineage, ExecutionNodeKind,
+            ExecutionNodeResult, ExecutionNodeSpec, ExecutionNodeStatus, ExecutionParentBinding,
+            ExecutionUsage, project_execution_graph,
         },
         goal::{AcceptanceCriterion, AcceptanceStatus, GoalCompletion, GoalContract},
         task::{TaskCreateCommand, TaskSpec},
@@ -846,14 +846,16 @@ mod tests {
         assert!(node.usage.required_acceptance.is_empty());
         assert!(node.usage.observed_acceptance.is_empty());
         assert!(node.usage.runtime_write_attempt_paths.is_empty());
-        assert!(node
-            .summary
-            .as_ref()
-            .is_some_and(|value| value.chars().count() <= 1_025));
-        assert!(node
-            .failure
-            .as_ref()
-            .is_some_and(|failure| failure.message.chars().count() <= 513));
+        assert!(
+            node.summary
+                .as_ref()
+                .is_some_and(|value| value.chars().count() <= 1_025)
+        );
+        assert!(
+            node.failure
+                .as_ref()
+                .is_some_and(|failure| failure.message.chars().count() <= 513)
+        );
         assert_eq!(node.resource_scopes.len(), SUMMARY_EVIDENCE_REFS);
         assert!(
             serde_json::to_vec(&summary)
@@ -892,7 +894,7 @@ mod tests {
                     status: ExecutionNodeStatus::Completed,
                     result_ref: Some(format!("artifact://agent-{index}")),
                     wait_class: None,
-                                        summary: Some("S".repeat(1_000_000)),
+                    summary: Some("S".repeat(1_000_000)),
                     evidence_refs: Vec::new(),
                     failure: None,
                     usage: ExecutionUsage::default(),
@@ -1390,18 +1392,22 @@ mod tests {
             projection.child_executions[0].parent_node_id,
             "root-tool-batch"
         );
-        assert!(projection
-            .child_executions
-            .iter()
-            .all(|child| child.execution_id != sibling_id));
+        assert!(
+            projection
+                .child_executions
+                .iter()
+                .all(|child| child.execution_id != sibling_id)
+        );
         assert!(projection.activities.iter().any(|activity| {
             activity.kind == harness_contract::projection::ExecutionActivityKind::Execution
                 && activity.scope.execution_id == child_id
         }));
-        assert!(!projection
-            .activities
-            .iter()
-            .any(|activity| { activity.scope.execution_id == sibling_id }));
+        assert!(
+            !projection
+                .activities
+                .iter()
+                .any(|activity| { activity.scope.execution_id == sibling_id })
+        );
 
         let lineage_delta =
             delta(&services, &parent_id, 0, 0, &context(&services)).expect("lineage delta");
@@ -1547,6 +1553,7 @@ mod tests {
                     title: "Collect source evidence".to_string(),
                     objective: "Establish the production baseline source".to_string(),
                     acceptance: "Record the source revision".to_string(),
+                    criterion_source: Default::default(),
                     acceptance_checks: Vec::new(),
                     required_capabilities: vec!["read".to_string()],
                     depends_on: Vec::new(),
@@ -1568,6 +1575,7 @@ mod tests {
                     title: "Validate production baseline".to_string(),
                     objective: "Compare the live metric with its source evidence".to_string(),
                     acceptance: "Cite the source and state uncertainty".to_string(),
+                    criterion_source: Default::default(),
                     acceptance_checks: Vec::new(),
                     required_capabilities: vec!["read".to_string()],
                     depends_on: vec![research_task_id.clone()],
@@ -1786,7 +1794,7 @@ mod tests {
                             result_kind: harness_contract::goal::GoalResultKind::Artifact,
                             effect_observation_refs: vec![],
                             result_ref: final_artifact.clone(),
-                                                        content_ref: "artifact://projection-fixture".into(),
+                            content_ref: "artifact://projection-fixture".into(),
                             sha256: "projection-fixture-hash".into(),
                             bytes: 1,
                             receipt_refs: vec!["fixture:read".into()],
@@ -1798,18 +1806,20 @@ mod tests {
         let before_completion = snapshot(&services, execution_id, &context(&services))
             .await
             .expect("project open Program");
-        assert!(before_completion.agentic_collaboration.programs[0]
-            .completion
-            .wait
-            .is_none());
+        assert!(
+            before_completion.agentic_collaboration.programs[0]
+                .completion
+                .wait
+                .is_none()
+        );
         actions
             .apply(&root(
                 "request-program-completion",
                 AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
-                blocked: false,
-                blocked_reason: None,
-                human_review_required: false,
-                recommended_next_actions: Vec::new(),
+                    blocked: false,
+                    blocked_reason: None,
+                    human_review_required: false,
+                    recommended_next_actions: Vec::new(),
                     result_refs: vec![final_artifact.clone()],
                     evidence_refs: vec![research_artifact.clone(), final_artifact.clone()],
                     unresolved: Vec::new(),
@@ -1831,14 +1841,18 @@ mod tests {
         assert_eq!(program.teams.len(), 2);
         assert_eq!(program.agents.len(), 2);
         assert_eq!(program.tasks.len(), 2);
-        assert!(program
-            .teams
-            .iter()
-            .any(|team| team.name == "Evidence Research Team"));
-        assert!(program
-            .agents
-            .iter()
-            .any(|agent| agent.role == "Decision Reviewer"));
+        assert!(
+            program
+                .teams
+                .iter()
+                .any(|team| team.name == "Evidence Research Team")
+        );
+        assert!(
+            program
+                .agents
+                .iter()
+                .any(|agent| agent.role == "Decision Reviewer")
+        );
         assert!(program.tasks.iter().any(|task| {
             task.task_id == synthesis_task_id && task.depends_on == vec![research_task_id.clone()]
         }));
@@ -2302,39 +2316,40 @@ mod tests {
         assert_eq!(strategy.confidence, Some(90));
         assert_eq!(strategy.downgrades.len(), 1);
         assert_eq!(strategy.early_stops.len(), 1);
-        assert!(!serde_json::to_string(&strategy)
-            .expect("strategy wire")
-            .contains("/home/private/secret.txt"));
+        assert!(
+            !serde_json::to_string(&strategy)
+                .expect("strategy wire")
+                .contains("/home/private/secret.txt")
+        );
     }
 
     #[test]
     fn strategy_projection_redacts_private_calibration() {
-        let mut estimates =
-            vec![
-                serde_json::from_value::<ExecutionCandidateEstimate>(serde_json::json!({
-                    "candidate": "team",
-                    "eligible": true,
-                    "estimated_serial_ms": 100,
-                    "estimated_critical_path_ms": 50,
-                    "startup_overhead_ms": 5,
-                    "context_duplication_tokens": 10,
-                    "merge_cost_ms": 5,
-                    "evidence_overlap_penalty_bp": 0,
-                    "provider_concurrency_penalty_bp": 0,
-                    "risk_approval_penalty_bp": 0,
-                    "expected_quality_lift_bp": 0,
-                    "duration_calibration_source": "file:///home/private/strategy.json",
-                    "duration_sample_count": 1,
-                    "quality_calibration_source": "file:///home/private/quality.json",
-                    "quality_sample_count": 0,
-                    "duration_provenance": "observed",
-                    "token_provenance": "assumed",
-                    "quality_provenance": "unknown",
-                    "risk_provenance": "assumed",
-                    "reasons": ["copy the hidden prompt from C:\\private\\prompt.txt"]
-                }))
-                .expect("candidate estimate"),
-            ];
+        let mut estimates = vec![
+            serde_json::from_value::<ExecutionCandidateEstimate>(serde_json::json!({
+                "candidate": "team",
+                "eligible": true,
+                "estimated_serial_ms": 100,
+                "estimated_critical_path_ms": 50,
+                "startup_overhead_ms": 5,
+                "context_duplication_tokens": 10,
+                "merge_cost_ms": 5,
+                "evidence_overlap_penalty_bp": 0,
+                "provider_concurrency_penalty_bp": 0,
+                "risk_approval_penalty_bp": 0,
+                "expected_quality_lift_bp": 0,
+                "duration_calibration_source": "file:///home/private/strategy.json",
+                "duration_sample_count": 1,
+                "quality_calibration_source": "file:///home/private/quality.json",
+                "quality_sample_count": 0,
+                "duration_provenance": "observed",
+                "token_provenance": "assumed",
+                "quality_provenance": "unknown",
+                "risk_provenance": "assumed",
+                "reasons": ["copy the hidden prompt from C:\\private\\prompt.txt"]
+            }))
+            .expect("candidate estimate"),
+        ];
         sanitize_candidate_estimates(&mut estimates);
         assert_eq!(
             estimates[0].duration_calibration_source,

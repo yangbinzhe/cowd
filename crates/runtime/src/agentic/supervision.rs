@@ -270,6 +270,7 @@ mod tests {
             objective: task_id.to_string(),
             acceptance: "reviewed".to_string(),
             acceptance_checks: Vec::new(),
+            criterion_source: Default::default(),
             required_capabilities: Vec::new(),
             depends_on: depends_on.into_iter().map(str::to_string).collect(),
             status: AgenticTaskStatus::Accepted,

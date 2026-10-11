@@ -7,7 +7,8 @@ use harness_contract::context::{
 use harness_contract::reality::EvidenceRef;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,7 +74,7 @@ pub enum RawEvidenceError {
 #[async_trait]
 pub trait RawEvidenceStore: Send + Sync {
     async fn persist(&self, write: RawEvidenceWrite)
-        -> Result<EvidenceAccessRef, RawEvidenceError>;
+    -> Result<EvidenceAccessRef, RawEvidenceError>;
     async fn retrieve(&self, access: &EvidenceAccessRef) -> Result<Vec<u8>, RawEvidenceError>;
 }
 
@@ -245,6 +246,19 @@ impl RawEvidenceStore for SessionPortRawEvidenceStore {
 
 pub struct RawEvidenceFacade<S> {
     store: S,
+    /// Durable receipts already written for an identical read, keyed by
+    /// `(session, tool input, content hash)`.
+    ///
+    /// A whole-file read of a path the same Session already read returns the
+    /// receipt it already has instead of writing the same bytes again: one live
+    /// run performed four full reads of `crates/tools/src/lib.rs`, and each one
+    /// cost a provider round-trip and a fresh artifact. The key deliberately
+    /// includes the tool input, so a ranged read (whose input names `limit` and
+    /// `offset`) never collides with a whole-file read, and it includes the
+    /// content hash, so a file that changed is read again. The index is
+    /// in-memory only: deduplication is a within-session economy, not a new
+    /// durability contract, and a restart simply re-reads once.
+    read_receipts: Mutex<HashMap<(String, String, String), EvidenceAccessRef>>,
 }
 
 impl<S> RawEvidenceFacade<S>
@@ -252,8 +266,11 @@ where
     S: RawEvidenceStore,
 {
     #[must_use]
-    pub const fn new(store: S) -> Self {
-        Self { store }
+    pub fn new(store: S) -> Self {
+        Self {
+            store,
+            read_receipts: Mutex::new(HashMap::new()),
+        }
     }
 
     pub async fn persist(
@@ -265,7 +282,39 @@ where
         let expected_bytes = write.payload.len() as u64;
         let expected_media_type = write.media_type.clone();
         let expected_visibility_scope = write.visibility_scope.clone();
+        // A whole-file read of an unchanged path in the same Session is the one
+        // case where writing again adds bytes and no information.
+        let dedup_key = Self::read_dedup_key(&write, &expected_hash);
+        if let Some(key) = &dedup_key {
+            if let Some(existing) = self
+                .read_receipts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(key)
+                .cloned()
+            {
+                // The index is a cache, not a source of truth, so the cached
+                // receipt still has to satisfy the same validation a fresh write
+                // would - otherwise a stale entry could hand back bytes that no
+                // longer match what the caller asked for.
+                validate_access(
+                    &existing,
+                    &expected_ref,
+                    &expected_hash,
+                    expected_bytes,
+                    Some(&expected_media_type),
+                    Some(&expected_visibility_scope),
+                )?;
+                return Ok(existing);
+            }
+        }
         let access = self.store.persist(write).await?;
+        if let Some(key) = dedup_key {
+            self.read_receipts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(key, access.clone());
+        }
         validate_access(
             &access,
             &expected_ref,
@@ -275,6 +324,33 @@ where
             Some(&expected_visibility_scope),
         )?;
         Ok(access)
+    }
+
+    /// The deduplication key for a write, or `None` when the write is not a
+    /// repeatable whole-file read.
+    ///
+    /// `None` covers everything that is not a read at all (compaction windows,
+    /// review bodies) and every read whose input is not stable: a ranged read
+    /// names `limit`/`offset`, so its input hash already differs from a
+    /// whole-file read of the same path.
+    fn read_dedup_key(
+        write: &RawEvidenceWrite,
+        payload_hash: &str,
+    ) -> Option<(String, String, String)> {
+        let tool_name = write.metadata.get("tool_name").and_then(Value::as_str)?;
+        if !matches!(tool_name, "read_file" | "read_ref") {
+            return None;
+        }
+        let input_hash = write
+            .metadata
+            .get("input_hash")
+            .and_then(Value::as_str)?
+            .to_string();
+        Some((
+            write.session_id.clone(),
+            input_hash,
+            payload_hash.to_string(),
+        ))
     }
 
     pub async fn retrieve(
@@ -563,5 +639,170 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(true)
         );
+    }
+    /// A whole-file read of a path the same Session already read must reuse the
+    /// receipt it already has. One live run performed four full reads of
+    /// `crates/tools/src/lib.rs`; each cost a provider round-trip and a fresh
+    /// artifact, and none of them added information.
+    #[tokio::test]
+    async fn redundant_full_read_returns_the_existing_receipt() {
+        let facade = RawEvidenceFacade::new(CountingStore::default());
+        let read = || RawEvidenceWrite {
+            metadata: serde_json::json!({
+                "tool_name": "read_file",
+                "input_hash": "input-whole-file",
+            }),
+            ..write()
+        };
+        let first = facade.persist(read()).await.unwrap();
+        let second = facade.persist(read()).await.unwrap();
+        assert_eq!(
+            first.retrieval_selector, second.retrieval_selector,
+            "the second identical read must reuse the first receipt"
+        );
+        assert_eq!(
+            facade.persist_calls(),
+            1,
+            "the second identical read must not write bytes again"
+        );
+    }
+
+    /// A ranged read names `limit`/`offset`, so its input hash differs and it
+    /// never collides with a whole-file read. Paging through a file is not
+    /// redundant reading.
+    #[tokio::test]
+    async fn ranged_reads_are_not_deduped() {
+        let facade = RawEvidenceFacade::new(CountingStore::default());
+        let whole = facade
+            .persist(RawEvidenceWrite {
+                metadata: serde_json::json!({"tool_name": "read_file", "input_hash": "whole"}),
+                ..write()
+            })
+            .await
+            .unwrap();
+        let ranged = facade
+            .persist(RawEvidenceWrite {
+                metadata: serde_json::json!({"tool_name": "read_file", "input_hash": "limit-20"}),
+                ..write()
+            })
+            .await
+            .unwrap();
+        assert_ne!(whole.retrieval_selector, ranged.retrieval_selector);
+        assert_eq!(facade.persist_calls(), 2, "a ranged read must be persisted");
+    }
+
+    /// The content hash is part of the key, so a file that changed between two
+    /// reads is read again. Deduplication must never serve stale bytes.
+    #[tokio::test]
+    async fn a_changed_file_is_read_again() {
+        let facade = RawEvidenceFacade::new(CountingStore::default());
+        facade
+            .persist(RawEvidenceWrite {
+                metadata: serde_json::json!({"tool_name": "read_file", "input_hash": "same"}),
+                ..write()
+            })
+            .await
+            .unwrap();
+        facade
+            .persist(RawEvidenceWrite {
+                payload: "the file changed".to_string(),
+                metadata: serde_json::json!({"tool_name": "read_file", "input_hash": "same"}),
+                ..write()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            facade.persist_calls(),
+            2,
+            "a changed file must be read again, not served from the cache"
+        );
+    }
+
+    /// Deduplication is scoped to one Session. A different Agent reading the
+    /// same file is acquiring information it does not have, which is exactly the
+    /// mistake an earlier monitor revision made when it called three agents'
+    /// three first reads a loop.
+    #[tokio::test]
+    async fn a_different_session_reads_the_same_file_again() {
+        let facade = RawEvidenceFacade::new(CountingStore::default());
+        facade
+            .persist(RawEvidenceWrite {
+                metadata: serde_json::json!({"tool_name": "read_file", "input_hash": "same"}),
+                ..write()
+            })
+            .await
+            .unwrap();
+        facade
+            .persist(RawEvidenceWrite {
+                session_id: "s2".to_string(),
+                visibility_scope: "session:s2".to_string(),
+                metadata: serde_json::json!({"tool_name": "read_file", "input_hash": "same"}),
+                ..write()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            facade.persist_calls(),
+            2,
+            "another Session's first read is information, not waste"
+        );
+    }
+
+    /// A write that is not a read at all must never be deduplicated: review
+    /// bodies and compaction windows are distinct durable facts even when their
+    /// bytes coincide.
+    #[tokio::test]
+    async fn a_non_read_write_is_never_deduped() {
+        let facade = RawEvidenceFacade::new(CountingStore::default());
+        for _ in 0..2 {
+            facade
+                .persist(RawEvidenceWrite {
+                    evidence_ref: EvidenceRef::observed("tool", "raw-review"),
+                    metadata: serde_json::json!({"tool_name": "objective_review"}),
+                    ..write()
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(facade.persist_calls(), 2, "only reads are deduplicated");
+    }
+
+    #[derive(Default)]
+    struct CountingStore {
+        persists: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RawEvidenceStore for CountingStore {
+        async fn persist(
+            &self,
+            write: RawEvidenceWrite,
+        ) -> Result<EvidenceAccessRef, RawEvidenceError> {
+            self.persists
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // A distinct selector per physical write, so a test can tell a
+            // reused receipt from a freshly written one.
+            let writes = self.persists.load(std::sync::atomic::Ordering::SeqCst);
+            Ok(EvidenceAccessRef::durable(
+                write.evidence_ref,
+                sha256(write.payload.as_bytes()),
+                write.payload.len() as u64,
+                write.media_type,
+                format!("artifact://art_echo_{writes}"),
+                write.visibility_scope,
+            ))
+        }
+
+        async fn retrieve(&self, _access: &EvidenceAccessRef) -> Result<Vec<u8>, RawEvidenceError> {
+            Ok(b"full raw output".to_vec())
+        }
+    }
+
+    impl RawEvidenceFacade<CountingStore> {
+        fn persist_calls(&self) -> usize {
+            self.store
+                .persists
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
     }
 }

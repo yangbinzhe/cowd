@@ -42,16 +42,59 @@ impl GatewayToolExecutor {
         else {
             return Vec::new();
         };
-        let Some(properties) = definition
+        // A tagged enum declares its property set per variant and puts nothing
+        // at the top level, so starting from the top level alone answers `[]`
+        // for exactly the tools whose input is hardest to construct: one live
+        // run was refused `invalid type: string "0", expected usize` for
+        // `artifact_publish.block_index` while this function returned before it
+        // ever looked at a variant. Start empty and merge the union.
+        let mut properties = definition
             .input_schema
             .get("properties")
             .and_then(serde_json::Value::as_object)
-        else {
-            return Vec::new();
-        };
+            .cloned()
+            .unwrap_or_default();
+        for variant in definition
+            .input_schema
+            .get("oneOf")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(variant_properties) = variant
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+            {
+                for (field, schema) in variant_properties {
+                    properties
+                        .entry(field.clone())
+                        .or_insert_with(|| schema.clone());
+                }
+            }
+        }
         let mut repaired = Vec::new();
-        for (field, schema) in properties {
+        for (field, schema) in &properties {
             let expected = schema.get("type").and_then(serde_json::Value::as_str);
+            // A number quoted as a string is the same one-shot corruption as a
+            // container quoted as a string. The schema is the authority on what
+            // the field wants, so coerce rather than making the model guess the
+            // JSON type.
+            if matches!(expected, Some("integer") | Some("number")) {
+                let Some(serde_json::Value::String(text)) = object.get(field) else {
+                    continue;
+                };
+                let trimmed = text.trim();
+                let parsed = trimmed
+                    .parse::<u64>()
+                    .ok()
+                    .map(serde_json::Value::from)
+                    .or_else(|| trimmed.parse::<f64>().ok().map(serde_json::Value::from));
+                if let Some(parsed) = parsed {
+                    object.insert(field.clone(), parsed);
+                    repaired.push(field.clone());
+                }
+                continue;
+            }
             if !matches!(expected, Some("array") | Some("object")) {
                 continue;
             }
