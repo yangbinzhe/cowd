@@ -1,4 +1,4 @@
-use harness_contract::execution_graph::{project_work_graph, ExecutionGraph};
+use harness_contract::execution_graph::{ExecutionGraph, project_work_graph};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

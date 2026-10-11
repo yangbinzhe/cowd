@@ -188,10 +188,12 @@ mod tests {
             })
             .unwrap();
         assert_eq!(stored.revision.manifest.lifecycle, RevisionLifecycle::Draft);
-        assert!(store
-            .release_assignments(&stored.revision.revision_ref.definition_id)
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .release_assignments(&stored.revision.revision_ref.definition_id)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -220,17 +222,22 @@ mod tests {
             stored.revision.manifest.model_policy.allowed_models,
             vec!["fast"]
         );
-        assert!(store
-            .release_assignments(&stored.revision.revision_ref.definition_id)
-            .unwrap()
-            .is_empty());
-        assert!(ExplicitTomlAgentImport {
-            definition_id: AgentDefinitionId::new(DefinitionScope::Builtin, "forbidden").unwrap(),
-            revision: 1,
-            source_label: "manual".to_string(),
-            toml: "name = 'forbidden'".to_string(),
-        }
-        .into_draft()
-        .is_err());
+        assert!(
+            store
+                .release_assignments(&stored.revision.revision_ref.definition_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            ExplicitTomlAgentImport {
+                definition_id: AgentDefinitionId::new(DefinitionScope::Builtin, "forbidden")
+                    .unwrap(),
+                revision: 1,
+                source_label: "manual".to_string(),
+                toml: "name = 'forbidden'".to_string(),
+            }
+            .into_draft()
+            .is_err()
+        );
     }
 }

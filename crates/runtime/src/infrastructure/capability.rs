@@ -403,19 +403,23 @@ mod tests {
         assert_eq!(structured_data.layer, CowdCapabilityLayer::Kernel);
         assert_eq!(structured_data.kind, CowdCapabilityKind::StructuredData);
         assert_eq!(structured_data.owner_module, "runtime::structured_data");
-        assert!(structured_data
-            .description
-            .contains("Source, mapping, fact"));
+        assert!(
+            structured_data
+                .description
+                .contains("Source, mapping, fact")
+        );
     }
 
     #[test]
     fn core_registry_does_not_register_an_application_capability() {
         let registry = CowdCapabilityRegistry::core();
 
-        assert!(registry
-            .capabilities
-            .iter()
-            .all(|capability| capability.layer != CowdCapabilityLayer::Application));
+        assert!(
+            registry
+                .capabilities
+                .iter()
+                .all(|capability| capability.layer != CowdCapabilityLayer::Application)
+        );
     }
 
     #[test]
@@ -429,10 +433,12 @@ mod tests {
         assert_eq!(matrix.kind, CowdCapabilityKind::StructuredData);
         assert_eq!(matrix.owner_module, "matrix");
         assert!(matrix.description.contains("Structured facts"));
-        assert!(registry
-            .capabilities
-            .iter()
-            .all(|capability| { capability.layer != CowdCapabilityLayer::Application }));
+        assert!(
+            registry
+                .capabilities
+                .iter()
+                .all(|capability| { capability.layer != CowdCapabilityLayer::Application })
+        );
     }
 
     #[test]
@@ -455,9 +461,11 @@ mod tests {
         assert_eq!(application.layer, CowdCapabilityLayer::Application);
         assert_eq!(application.kind, CowdCapabilityKind::Application);
         assert_eq!(application.owner_module, "app:fulfillment");
-        assert!(application
-            .required_permissions
-            .contains(&"fulfillment.review".to_string()));
+        assert!(
+            application
+                .required_permissions
+                .contains(&"fulfillment.review".to_string())
+        );
         assert_eq!(
             registry.by_surface(CowdSurface::Webui).len(),
             registry.capabilities.len()
@@ -477,10 +485,10 @@ mod tests {
 
         assert_eq!(webui.len(), tui.len());
         assert_eq!(cli.len(), webui.len());
-        assert!(cli.iter().all(|capability| capability
-            .surfaces
-            .iter()
-            .any(|surface| surface.surface == CowdSurface::Cli
-                && surface.mode == CowdSurfaceMode::Minimal)));
+        assert!(cli.iter().all(|capability| {
+            capability.surfaces.iter().any(|surface| {
+                surface.surface == CowdSurface::Cli && surface.mode == CowdSurfaceMode::Minimal
+            })
+        }));
     }
 }

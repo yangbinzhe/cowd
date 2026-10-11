@@ -234,8 +234,7 @@ impl PromptAssembly {
         let dynamic_system_bytes = self.runtime_context.iter().map(String::len).sum();
         let cache_cohort_user_prefix_bytes =
             self.cache_cohort_user_prefix.iter().map(String::len).sum();
-        let immutable_user_prefix_bytes =
-            self.immutable_user_prefix.iter().map(String::len).sum();
+        let immutable_user_prefix_bytes = self.immutable_user_prefix.iter().map(String::len).sum();
         let mut contextual_packet_bytes = std::collections::BTreeMap::new();
         let mut contextual_packets_total = 0_usize;
         for packet in &self.contextual_packets {
@@ -703,7 +702,9 @@ mod tests {
     fn hard_capacity_accounts_for_the_volatile_tail_too() {
         let mut assembly = PromptAssembly::new(vec!["stable system".to_string()]);
         assembly.push_runtime_context("turn-local attested segment");
-        assembly.push_volatile_tail("## Runtime clock\n - Current local time: 2026-10-02T00:00:00+08:00");
+        assembly.push_volatile_tail(
+            "## Runtime clock\n - Current local time: 2026-10-02T00:00:00+08:00",
+        );
 
         // The allowance covers the attested block and nothing else.
         let allowance = assembly.runtime_context_token_estimate();
@@ -948,10 +949,12 @@ mod tests {
             clock.clone(),
         ]);
 
-        assert!(!assembly
-            .stable_system_text()
-            .expect("stable prefix")
-            .contains("Runtime clock"));
+        assert!(
+            !assembly
+                .stable_system_text()
+                .expect("stable prefix")
+                .contains("Runtime clock")
+        );
         assert_eq!(assembly.runtime_system_segments(), [clock]);
     }
 }
@@ -985,10 +988,7 @@ mod composition_tests {
             composition.cache_cohort_user_prefix_bytes,
             "cohort-user".len()
         );
-        assert_eq!(
-            composition.immutable_user_prefix_bytes,
-            "role-brief".len()
-        );
+        assert_eq!(composition.immutable_user_prefix_bytes, "role-brief".len());
         assert_eq!(
             composition.total_bytes(),
             "stable-head".len()
@@ -1027,9 +1027,7 @@ mod composition_tests {
             "a packed packet must be measured"
         );
         assert!(
-            composition
-                .contextual_packet_bytes
-                .contains_key("Memory"),
+            composition.contextual_packet_bytes.contains_key("Memory"),
             "memory bytes must be attributable: {:?}",
             composition.contextual_packet_bytes
         );

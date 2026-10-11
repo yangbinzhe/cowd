@@ -5,18 +5,19 @@
 //! authoritative usage event.
 
 use std::sync::{
+    Arc,
     atomic::{AtomicU64, Ordering},
-    mpsc, Arc,
+    mpsc,
 };
 
 use harness_contract::skill::{
-    SkillUsageKind, SkillUsageReceipt, SKILL_USAGE_RECEIPT_SCHEMA_VERSION,
+    SKILL_USAGE_RECEIPT_SCHEMA_VERSION, SkillUsageKind, SkillUsageReceipt,
 };
 use sha2::{Digest, Sha256};
 
 use super::{
-    governance::SkillRevisionPointerCache, RuntimeSkillUsageContext, RuntimeSkillUsageSink,
-    RuntimeSkillUsageSinkHealth, SkillInvocation,
+    RuntimeSkillUsageContext, RuntimeSkillUsageSink, RuntimeSkillUsageSinkHealth, SkillInvocation,
+    governance::SkillRevisionPointerCache,
 };
 use crate::{
     RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore,
@@ -314,13 +315,17 @@ mod tests {
         let recorder = RuntimeSkillUsageRecorder::new(Arc::clone(&store));
         let mut invalid = context();
         invalid.execution_id.clear();
-        assert!(recorder
-            .observe(&invocation(), "1.0.0", &invalid, SkillUsageKind::Failure)
-            .is_none());
+        assert!(
+            recorder
+                .observe(&invocation(), "1.0.0", &invalid, SkillUsageKind::Failure)
+                .is_none()
+        );
         assert_eq!(recorder.health().dropped, 1);
-        assert!(store
-            .list_scope(RuntimeEventScope::Skill, 10)
-            .expect("events")
-            .is_empty());
+        assert!(
+            store
+                .list_scope(RuntimeEventScope::Skill, 10)
+                .expect("events")
+                .is_empty()
+        );
     }
 }

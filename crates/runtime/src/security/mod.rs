@@ -2,11 +2,11 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use harness_contract::security::{
     DecisionLeaseClaims, PrincipalClaims, SignedDecisionLease, SignedPrincipalEnvelope,
 };
-use ring::signature::{UnparsedPublicKey, ED25519};
+use ring::signature::{ED25519, UnparsedPublicKey};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -476,9 +476,11 @@ mod tests {
             "evolution.candidate:c-1",
             "sha256:evidence",
         );
-        assert!(verifier
-            .verify_decision_lease(&lease, &principal, &expected)
-            .is_ok());
+        assert!(
+            verifier
+                .verify_decision_lease(&lease, &principal, &expected)
+                .is_ok()
+        );
         let mismatched = DecisionLeaseExpectation::new(
             "candidate:c-1",
             "rollback",

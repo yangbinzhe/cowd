@@ -21,4 +21,4 @@ pub use store::{
     StoredAgentDefinitionRevision,
 };
 
-pub(crate) use bootstrap::{bootstrap_builtin_agents, BuiltinAgentTrust};
+pub(crate) use bootstrap::{BuiltinAgentTrust, bootstrap_builtin_agents};

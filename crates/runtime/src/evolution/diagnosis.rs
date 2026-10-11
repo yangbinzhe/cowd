@@ -334,16 +334,20 @@ mod tests {
             EvolutionRootCauseKind::MemoryGovernanceGap
         );
         assert_eq!(diagnosis.affected_owner, "reality_core");
-        assert!(diagnosis
-            .acceptance_gates
-            .iter()
-            .any(|gate| gate.contains("memory recall contamination")));
+        assert!(
+            diagnosis
+                .acceptance_gates
+                .iter()
+                .any(|gate| gate.contains("memory recall contamination"))
+        );
         assert_eq!(diagnosis.recurrence, 1);
         assert_eq!(diagnosis.competing_hypotheses.len(), 2);
-        assert!(diagnosis
-            .competing_hypotheses
-            .iter()
-            .all(|hypothesis| !hypothesis.falsification_experiment.is_empty()));
+        assert!(
+            diagnosis
+                .competing_hypotheses
+                .iter()
+                .all(|hypothesis| !hypothesis.falsification_experiment.is_empty())
+        );
     }
 
     #[test]

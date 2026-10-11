@@ -736,15 +736,19 @@ mod tests {
             )
             .expect("knowledge should activate");
 
-        assert!(activation
-            .items
-            .iter()
-            .all(|item| item.source == ContextSourceKind::Knowledge));
+        assert!(
+            activation
+                .items
+                .iter()
+                .all(|item| item.source == ContextSourceKind::Knowledge)
+        );
         assert!(activation.debug_fragment.contains("### Context: Knowledge"));
-        assert!(activation
-            .items
-            .iter()
-            .any(|item| item.content.contains("full policy body")));
+        assert!(
+            activation
+                .items
+                .iter()
+                .any(|item| item.content.contains("full policy body"))
+        );
         assert!(!activation.report.active_pack_ids.is_empty());
         assert!(!activation.report.evidence_refs.is_empty());
     }
@@ -763,9 +767,11 @@ mod tests {
             recall_report: RecallReport::default(),
         };
 
-        assert!(KnowledgeActivationRuntime::new()
-            .activate_from_packet("s1", "architecture evidence review", "MainTurn", &packet)
-            .is_none());
+        assert!(
+            KnowledgeActivationRuntime::new()
+                .activate_from_packet("s1", "architecture evidence review", "MainTurn", &packet)
+                .is_none()
+        );
     }
 
     #[test]
@@ -782,9 +788,11 @@ mod tests {
             recall_report: RecallReport::default(),
         };
 
-        assert!(KnowledgeActivationRuntime::new()
-            .activate_from_packet("s1", "分析记忆架构", "DeepInvestigation", &packet)
-            .is_none());
+        assert!(
+            KnowledgeActivationRuntime::new()
+                .activate_from_packet("s1", "分析记忆架构", "DeepInvestigation", &packet)
+                .is_none()
+        );
     }
 
     #[test]
@@ -876,9 +884,11 @@ mod tests {
             "Architecture policy must retain evidence"
         );
         assert_eq!(filtered.omitted.len(), 1);
-        assert!(filtered.omitted[0]
-            .reason
-            .contains("explicit user request requires tools"));
+        assert!(
+            filtered.omitted[0]
+                .reason
+                .contains("explicit user request requires tools")
+        );
     }
 
     #[test]
@@ -898,9 +908,11 @@ mod tests {
         let filtered = filter_packet_for_turn_intent(&packet, "不要使用工具，纯文字回答");
 
         assert!(filtered.selected.is_empty());
-        assert!(filtered.omitted[0]
-            .reason
-            .contains("explicit user request forbids tools"));
+        assert!(
+            filtered.omitted[0]
+                .reason
+                .contains("explicit user request forbids tools")
+        );
     }
 
     #[test]
@@ -917,14 +929,16 @@ mod tests {
             recall_report: RecallReport::default(),
         };
 
-        assert!(KnowledgeActivationRuntime::new()
-            .activate_from_packet(
-                "s1",
-                "请最多两个关键代码点说明问题",
-                "DeepInvestigation",
-                &packet,
-            )
-            .is_none());
+        assert!(
+            KnowledgeActivationRuntime::new()
+                .activate_from_packet(
+                    "s1",
+                    "请最多两个关键代码点说明问题",
+                    "DeepInvestigation",
+                    &packet,
+                )
+                .is_none()
+        );
     }
 
     #[test]
@@ -944,9 +958,11 @@ mod tests {
         let filtered = filter_packet_for_turn_intent(&packet, "Use at most three code references.");
 
         assert!(filtered.selected.is_empty());
-        assert!(filtered.omitted[0]
-            .reason
-            .contains("current instruction caps code evidence to 3"));
+        assert!(
+            filtered.omitted[0]
+                .reason
+                .contains("current instruction caps code evidence to 3")
+        );
         assert!(filtered.omitted[0].reason.contains("requires at least 5"));
     }
 
@@ -967,8 +983,10 @@ mod tests {
         let filtered = filter_packet_for_turn_intent(&packet, "不要往后推，一次性全部解决");
 
         assert!(filtered.selected.is_empty());
-        assert!(filtered.omitted[0]
-            .reason
-            .contains("forbids deferring the work"));
+        assert!(
+            filtered.omitted[0]
+                .reason
+                .contains("forbids deferring the work")
+        );
     }
 }

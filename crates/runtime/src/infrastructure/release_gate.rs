@@ -182,14 +182,18 @@ mod tests {
 
         assert_eq!(report.gate_id, "cowd.release_gate.v1");
         assert_eq!(report.status, "pass");
-        assert!(report
-            .checks
-            .iter()
-            .any(|check| check.check_id == "structured_data.core.registered"));
-        assert!(!report
-            .checks
-            .iter()
-            .any(|check| check.check_id == "matrix.kernel.registered"));
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.check_id == "structured_data.core.registered")
+        );
+        assert!(
+            !report
+                .checks
+                .iter()
+                .any(|check| check.check_id == "matrix.kernel.registered")
+        );
         assert!(report.checks.iter().all(|check| check.status == "pass"));
     }
 
@@ -213,9 +217,10 @@ mod tests {
         assert!(report.checks.iter().any(|check| check.check_id
             == "execution_outcome.timeline.available"
             && check.status == "fail"));
-        assert!(report
-            .checks
-            .iter()
-            .any(|check| check.check_id == "frontend.api_matrix.ready" && check.status == "fail"));
+        assert!(
+            report.checks.iter().any(
+                |check| check.check_id == "frontend.api_matrix.ready" && check.status == "fail"
+            )
+        );
     }
 }

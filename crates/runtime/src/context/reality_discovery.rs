@@ -206,16 +206,18 @@ mod tests {
             .unwrap();
         let first = page.next_cursor.clone().unwrap();
         let mut seen = std::collections::BTreeSet::new();
-        assert!(port
-            .discover_facts(&lease, "different", Some(&first), 7)
-            .await
-            .is_err());
+        assert!(
+            port.discover_facts(&lease, "different", Some(&first), 7)
+                .await
+                .is_err()
+        );
         let mut changed = lease.clone();
         changed.task_id = "other".into();
-        assert!(port
-            .discover_facts(&changed, "needle", Some(&first), 7)
-            .await
-            .is_err());
+        assert!(
+            port.discover_facts(&changed, "needle", Some(&first), 7)
+                .await
+                .is_err()
+        );
         assert!(port.read_fact(&lease, "fact:hidden", None).await.is_err());
         loop {
             for fact in page.records {
@@ -245,30 +247,34 @@ mod tests {
         let mut exact_grant = lease.clone();
         exact_grant.fact_boundaries.clear();
         exact_grant.fact_refs = vec!["fact:hidden".into()];
-        assert!(port
-            .read_fact(&exact_grant, "fact:hidden", None)
-            .await
-            .is_ok());
-        assert!(port
-            .read_fact(&exact_grant, "fact:fact-000", None)
-            .await
-            .is_err());
+        assert!(
+            port.read_fact(&exact_grant, "fact:hidden", None)
+                .await
+                .is_ok()
+        );
+        assert!(
+            port.read_fact(&exact_grant, "fact:fact-000", None)
+                .await
+                .is_err()
+        );
         let mut fact = ledger.get_fact("fact-000").unwrap().unwrap();
         fact.statement = "changed source".into();
         ledger.upsert_fact(fact).unwrap();
-        assert!(port
-            .discover_facts(&lease, "needle", Some(&first), 7)
-            .await
-            .unwrap_err()
-            .contains("source changed"));
+        assert!(
+            port.discover_facts(&lease, "needle", Some(&first), 7)
+                .await
+                .unwrap_err()
+                .contains("source changed")
+        );
         let mut empty = lease;
         empty.fact_boundaries.clear();
-        assert!(port
-            .discover_facts(&empty, "", None, 7)
-            .await
-            .unwrap()
-            .records
-            .is_empty());
+        assert!(
+            port.discover_facts(&empty, "", None, 7)
+                .await
+                .unwrap()
+                .records
+                .is_empty()
+        );
     }
 }
 

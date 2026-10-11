@@ -1,9 +1,9 @@
 //! First-turn context fanout planning.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::intent_planner::{classify_intent, TaskIntent};
+use crate::intent_planner::{TaskIntent, classify_intent};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FanoutToolCall {
@@ -137,9 +137,10 @@ mod tests {
     fn release_plan_uses_batch_readonly() {
         let plan = plan_context_fanout("发布前验收");
         assert_eq!(plan.intent, TaskIntent::Release);
-        assert!(plan
-            .calls
-            .iter()
-            .any(|call| call.name == "tool_orchestrate"));
+        assert!(
+            plan.calls
+                .iter()
+                .any(|call| call.name == "tool_orchestrate")
+        );
     }
 }

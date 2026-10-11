@@ -67,9 +67,11 @@ mod tests {
         );
 
         assert_eq!(dependency.skill_id, "structured:supply-risk-analyst");
-        assert!(dependency
-            .required_fact_types
-            .contains(&"structured-fact-type:supply.material_shortage".to_string()));
+        assert!(
+            dependency
+                .required_fact_types
+                .contains(&"structured-fact-type:supply.material_shortage".to_string())
+        );
         assert_eq!(dependency.quality_gate, "evidence_quality_gate_required");
     }
 }

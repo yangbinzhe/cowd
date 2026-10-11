@@ -4869,6 +4869,12 @@ pub(super) async fn resolve_explicit_agentic_content_refs(
 /// cite `tool-raw-call_...` or `art_...` without the `tool://`/`artifact://`
 /// prefix; the identity is unambiguous, so normalize it instead of rejecting.
 ///
+/// Public because the reference arrives through more than one door: a direct
+/// tool call, and each action inside an `agent_action_batch`, which the Gateway
+/// expands on its own. A reference Runtime itself spells `artifact:<24 hex>` and
+/// repeats in a completion gap reaches the batch path too, and a batch that did
+/// not normalize it refused a review the model had already done the reading for.
+///
 /// The single-colon forms matter as much as the bare ones. Runtime itself
 /// hands the model `artifact:<24 hex>` from `one_shot_artifact_ref`
 /// (crates/runtime/src/agentic/work_market.rs) and repeats it verbatim in the
@@ -4879,7 +4885,7 @@ pub(super) async fn resolve_explicit_agentic_content_refs(
 /// directory instead of the artifact and is never told anything went wrong.
 /// Normalizing here keeps the spelling Runtime emits and the spelling the
 /// readers accept from drifting apart again.
-fn normalize_bare_evidence_ref(reference: &str) -> String {
+pub fn normalize_bare_evidence_ref(reference: &str) -> String {
     let trimmed = reference.trim();
     if trimmed.contains("://") {
         return trimmed.to_string();

@@ -246,19 +246,6 @@ impl RawEvidenceStore for SessionPortRawEvidenceStore {
 
 pub struct RawEvidenceFacade<S> {
     store: S,
-    /// Durable receipts already written for an identical read, keyed by
-    /// `(session, tool input, content hash)`.
-    ///
-    /// A whole-file read of a path the same Session already read returns the
-    /// receipt it already has instead of writing the same bytes again: one live
-    /// run performed four full reads of `crates/tools/src/lib.rs`, and each one
-    /// cost a provider round-trip and a fresh artifact. The key deliberately
-    /// includes the tool input, so a ranged read (whose input names `limit` and
-    /// `offset`) never collides with a whole-file read, and it includes the
-    /// content hash, so a file that changed is read again. The index is
-    /// in-memory only: deduplication is a within-session economy, not a new
-    /// durability contract, and a restart simply re-reads once.
-    read_receipts: Mutex<HashMap<(String, String, String), EvidenceAccessRef>>,
 }
 
 impl<S> RawEvidenceFacade<S>
@@ -266,11 +253,8 @@ where
     S: RawEvidenceStore,
 {
     #[must_use]
-    pub fn new(store: S) -> Self {
-        Self {
-            store,
-            read_receipts: Mutex::new(HashMap::new()),
-        }
+    pub const fn new(store: S) -> Self {
+        Self { store }
     }
 
     pub async fn persist(
@@ -286,8 +270,7 @@ where
         // case where writing again adds bytes and no information.
         let dedup_key = Self::read_dedup_key(&write, &expected_hash);
         if let Some(key) = &dedup_key {
-            if let Some(existing) = self
-                .read_receipts
+            if let Some(existing) = Self::read_receipt_index()
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(key)
@@ -310,7 +293,7 @@ where
         }
         let access = self.store.persist(write).await?;
         if let Some(key) = dedup_key {
-            self.read_receipts
+            Self::read_receipt_index()
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(key, access.clone());
@@ -324,6 +307,38 @@ where
             Some(&expected_visibility_scope),
         )?;
         Ok(access)
+    }
+
+    /// Durable receipts already written for an identical read, keyed by
+    /// `(session, tool input, content hash)`.
+    ///
+    /// A whole-file read of a path the same Session already read returns the
+    /// receipt it already has instead of writing the same bytes again: one live
+    /// run performed four full reads of `crates/tools/src/lib.rs`, and each one
+    /// cost a provider round-trip and a fresh artifact. The key deliberately
+    /// includes the tool input, so a ranged read (whose input names `limit` and
+    /// `offset`) never collides with a whole-file read, and it includes the
+    /// content hash, so a file that changed is read again.
+    ///
+    /// The index is process-wide rather than per-facade because every governed
+    /// tool result builds a fresh facade at its call site, so a per-facade index
+    /// would be empty on every call and the dedup would never fire. It is still
+    /// in-memory only: deduplication is a within-session economy, not a new
+    /// durability contract, and a restart simply re-reads once.
+    #[cfg(test)]
+    fn clear_read_receipt_index() {
+        Self::read_receipt_index()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
+    fn read_receipt_index() -> &'static Mutex<HashMap<(String, String, String), EvidenceAccessRef>>
+    {
+        static INDEX: std::sync::OnceLock<
+            Mutex<HashMap<(String, String, String), EvidenceAccessRef>>,
+        > = std::sync::OnceLock::new();
+        INDEX.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
     /// The deduplication key for a write, or `None` when the write is not a
@@ -646,6 +661,7 @@ mod tests {
     /// artifact, and none of them added information.
     #[tokio::test]
     async fn redundant_full_read_returns_the_existing_receipt() {
+        RawEvidenceFacade::<CountingStore>::clear_read_receipt_index();
         let facade = RawEvidenceFacade::new(CountingStore::default());
         let read = || RawEvidenceWrite {
             metadata: serde_json::json!({
@@ -667,11 +683,43 @@ mod tests {
         );
     }
 
+    /// The production shape: every governed tool result builds a FRESH facade at
+    /// its call site, so the index has to survive across instances. A per-facade
+    /// index passes the unit test above and never fires in a real run - which is
+    /// exactly what happened, and a live run still wrote the same file three
+    /// times.
+    #[tokio::test]
+    async fn a_fresh_facade_per_call_still_reuses_the_receipt() {
+        RawEvidenceFacade::<CountingStore>::clear_read_receipt_index();
+        let read = || RawEvidenceWrite {
+            metadata: serde_json::json!({
+                "tool_name": "read_file",
+                "input_hash": "input-fresh-facade",
+            }),
+            ..write()
+        };
+        // A new store AND a new facade for every call, exactly as the tool
+        // executor does.
+        let first = RawEvidenceFacade::new(CountingStore::default())
+            .persist(read())
+            .await
+            .unwrap();
+        let second = RawEvidenceFacade::new(CountingStore::default())
+            .persist(read())
+            .await
+            .unwrap();
+        assert_eq!(
+            first.retrieval_selector, second.retrieval_selector,
+            "a fresh facade must still reuse the receipt the Session already has"
+        );
+    }
+
     /// A ranged read names `limit`/`offset`, so its input hash differs and it
     /// never collides with a whole-file read. Paging through a file is not
     /// redundant reading.
     #[tokio::test]
     async fn ranged_reads_are_not_deduped() {
+        RawEvidenceFacade::<CountingStore>::clear_read_receipt_index();
         let facade = RawEvidenceFacade::new(CountingStore::default());
         let whole = facade
             .persist(RawEvidenceWrite {
@@ -695,6 +743,7 @@ mod tests {
     /// reads is read again. Deduplication must never serve stale bytes.
     #[tokio::test]
     async fn a_changed_file_is_read_again() {
+        RawEvidenceFacade::<CountingStore>::clear_read_receipt_index();
         let facade = RawEvidenceFacade::new(CountingStore::default());
         facade
             .persist(RawEvidenceWrite {
@@ -724,6 +773,7 @@ mod tests {
     /// three first reads a loop.
     #[tokio::test]
     async fn a_different_session_reads_the_same_file_again() {
+        RawEvidenceFacade::<CountingStore>::clear_read_receipt_index();
         let facade = RawEvidenceFacade::new(CountingStore::default());
         facade
             .persist(RawEvidenceWrite {
@@ -753,6 +803,7 @@ mod tests {
     /// bytes coincide.
     #[tokio::test]
     async fn a_non_read_write_is_never_deduped() {
+        RawEvidenceFacade::<CountingStore>::clear_read_receipt_index();
         let facade = RawEvidenceFacade::new(CountingStore::default());
         for _ in 0..2 {
             facade

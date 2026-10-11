@@ -137,7 +137,7 @@ impl AgentRuntime {
                     snapshot.status,
                     AgentCommandRejectReason::InvalidInput,
                     error.to_string(),
-                )
+                );
             }
         };
         if let Some(existing) = existing {
@@ -160,12 +160,26 @@ impl AgentRuntime {
             if input.receipt.accepted {
                 return input.receipt;
             }
-            return match self.event_store.latest_for_stream_kind(&stream, "agent.input_delivered") {
+            return match self
+                .event_store
+                .latest_for_stream_kind(&stream, "agent.input_delivered")
+            {
                 Ok(Some(event)) => serde_json::from_value::<DurableAgentInput>(event.payload)
                     .map(|input| input.receipt)
-                    .unwrap_or_else(|_| rejected(&request, snapshot.status, AgentCommandRejectReason::InvalidInput, "invalid delivery receipt")),
-                _ => rejected(&request, snapshot.status, AgentCommandRejectReason::UnsupportedByBackend,
-                    "input delivery is unresolved; reconcile the original process command, do not resend"),
+                    .unwrap_or_else(|_| {
+                        rejected(
+                            &request,
+                            snapshot.status,
+                            AgentCommandRejectReason::InvalidInput,
+                            "invalid delivery receipt",
+                        )
+                    }),
+                _ => rejected(
+                    &request,
+                    snapshot.status,
+                    AgentCommandRejectReason::UnsupportedByBackend,
+                    "input delivery is unresolved; reconcile the original process command, do not resend",
+                ),
             };
         }
         if snapshot.revision != request.expected_revision {
@@ -217,7 +231,7 @@ impl AgentRuntime {
                     snapshot.status,
                     AgentCommandRejectReason::InvalidInput,
                     "agent durable input backlog is full",
-                )
+                );
             }
             Err(error) => {
                 return rejected(
@@ -225,7 +239,7 @@ impl AgentRuntime {
                     snapshot.status,
                     AgentCommandRejectReason::InvalidInput,
                     error,
-                )
+                );
             }
         }
         let backend = self

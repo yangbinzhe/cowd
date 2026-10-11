@@ -118,10 +118,12 @@ fn writer_requires_independent_turns_and_is_atomic_and_replay_safe() {
     );
     let mut conflict = last;
     conflict.latency_ms += 1;
-    assert!(writer
-        .record_episode(&conflict, "source")
-        .unwrap_err()
-        .contains("identity conflict"));
+    assert!(
+        writer
+            .record_episode(&conflict, "source")
+            .unwrap_err()
+            .contains("identity conflict")
+    );
 }
 
 #[test]
@@ -151,10 +153,12 @@ fn failed_and_incomplete_episodes_are_durable_but_never_advisory_support() {
         4
     );
     assert!(patterns(&store).is_empty());
-    assert!(store
-        .replay_scope_kind(RuntimeEventScope::Evolution, SUPPORT_KIND)
-        .unwrap()
-        .is_empty());
+    assert!(
+        store
+            .replay_scope_kind(RuntimeEventScope::Evolution, SUPPORT_KIND)
+            .unwrap()
+            .is_empty()
+    );
     let encoded = serde_json::to_value(input.resource_summary).unwrap();
     assert!(encoded["context_reservation_tokens"].is_null());
     assert!(encoded["output_reservation_tokens"].is_null());
@@ -218,10 +222,12 @@ fn unrelated_events_do_not_produce_experience_and_cursor_survives_restart() {
         })
         .unwrap();
     projector(&store).project_available(64).unwrap();
-    assert!(store
-        .replay_scope_kind(RuntimeEventScope::Evolution, EPISODE_KIND)
-        .unwrap()
-        .is_empty());
+    assert!(
+        store
+            .replay_scope_kind(RuntimeEventScope::Evolution, EPISODE_KIND)
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
         projector(&store)
             .project_available(64)
@@ -247,10 +253,12 @@ fn invalid_terminal_source_keeps_cursor_and_does_not_manufacture_an_episode() {
         .unwrap();
     assert!(projector(&store).project_available(64).is_err());
     assert!(store.projection_checkpoint(PROJECTOR_ID).unwrap().is_none());
-    assert!(store
-        .replay_scope_kind(RuntimeEventScope::Evolution, EPISODE_KIND)
-        .unwrap()
-        .is_empty());
+    assert!(
+        store
+            .replay_scope_kind(RuntimeEventScope::Evolution, EPISODE_KIND)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -339,8 +347,10 @@ fn model_can_read_advice_without_mutating_program_or_gaining_permissions() {
         cursor,
         "advice cannot open Program, grant tools, or mutate definitions"
     );
-    assert!(store
-        .list_stream("agentic-program:new-program")
-        .unwrap()
-        .is_empty());
+    assert!(
+        store
+            .list_stream("agentic-program:new-program")
+            .unwrap()
+            .is_empty()
+    );
 }

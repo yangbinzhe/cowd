@@ -224,14 +224,20 @@ mod tests {
             ),
         ];
         assert_eq!(signals.len(), 3);
-        assert!(signals
-            .iter()
-            .any(|signal| signal.signal_type == EvolutionSignalType::LowNoveltyToolLoop));
-        assert!(signals
-            .iter()
-            .any(|signal| signal.signal_type == EvolutionSignalType::MemoryNoise));
-        assert!(signals
-            .iter()
-            .any(|signal| signal.signal_type == EvolutionSignalType::EvalFailure));
+        assert!(
+            signals
+                .iter()
+                .any(|signal| signal.signal_type == EvolutionSignalType::LowNoveltyToolLoop)
+        );
+        assert!(
+            signals
+                .iter()
+                .any(|signal| signal.signal_type == EvolutionSignalType::MemoryNoise)
+        );
+        assert!(
+            signals
+                .iter()
+                .any(|signal| signal.signal_type == EvolutionSignalType::EvalFailure)
+        );
     }
 }

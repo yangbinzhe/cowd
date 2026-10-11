@@ -10,10 +10,10 @@ mod verify;
 
 pub use agent::{AgentTaskBackend, AgentTaskBackendResolver, AgentTaskExecutor};
 pub use agentic_program_wait::{
-    reconcile_agentic_program_wait_for_settled_graph, resolve_agentic_program_wait,
     AgenticProgramWaitExecutor, AgenticProgramWaitRequest,
+    reconcile_agentic_program_wait_for_settled_graph, resolve_agentic_program_wait,
 };
-pub use approval::{graph_approval_id, parse_graph_approval_id, ApprovalNodeExecutor};
+pub use approval::{ApprovalNodeExecutor, graph_approval_id, parse_graph_approval_id};
 pub use materialize::MaterializeNodeExecutor;
 pub use scoped::{ScopedNodeBackend, ScopedNodeBackendResolver, ScopedNodeExecutor};
 pub use synthesize::{SynthesizeBackend, SynthesizeBackendResolver, SynthesizeNodeExecutor};

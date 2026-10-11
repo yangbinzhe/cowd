@@ -578,10 +578,12 @@ mod tests {
             r#"{"action":"keep_default","candidate_task_ids":[],"reason":"no match","extra":true}"#,
         )
         .is_err());
-        assert!(parse_provider_proposal(
-            r#"{"action":"keep_default","candidate_task_ids":[],"reason":""}"#,
-        )
-        .is_err());
+        assert!(
+            parse_provider_proposal(
+                r#"{"action":"keep_default","candidate_task_ids":[],"reason":""}"#,
+            )
+            .is_err()
+        );
     }
 
     #[test]

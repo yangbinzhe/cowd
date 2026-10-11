@@ -231,8 +231,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        evaluate, DiffScope, GreenLevel, LaneBlocker, LaneContext, PolicyAction, PolicyCondition,
-        PolicyEngine, PolicyRule, ReconcileReason, ReviewStatus, STALE_BRANCH_THRESHOLD,
+        DiffScope, GreenLevel, LaneBlocker, LaneContext, PolicyAction, PolicyCondition,
+        PolicyEngine, PolicyRule, ReconcileReason, ReviewStatus, STALE_BRANCH_THRESHOLD, evaluate,
     };
 
     fn default_context() -> LaneContext {

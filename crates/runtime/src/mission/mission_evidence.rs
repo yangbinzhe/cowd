@@ -559,19 +559,23 @@ mod tests {
 
         let restarted = MissionEvidenceBus::new(store);
         assert_eq!(restarted.list_all(), bus.list_all());
-        assert!(restarted
-            .event_store
-            .replay_scope_kind(
-                RuntimeEventScope::Recovery,
-                "mission_evidence.projector.checkpoint.v1"
-            )
-            .unwrap()
-            .is_empty());
-        assert!(restarted
-            .event_store
-            .projection_checkpoint(PROJECTOR_ID)
-            .unwrap()
-            .is_some());
+        assert!(
+            restarted
+                .event_store
+                .replay_scope_kind(
+                    RuntimeEventScope::Recovery,
+                    "mission_evidence.projector.checkpoint.v1"
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            restarted
+                .event_store
+                .projection_checkpoint(PROJECTOR_ID)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

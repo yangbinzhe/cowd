@@ -303,10 +303,12 @@ mod tests {
             EvolutionProposalKind::MemoryGovernanceAdjustment
         );
         assert!(proposal.risk.approval_required);
-        assert!(proposal
-            .acceptance_gates
-            .iter()
-            .any(|gate| gate.contains("candidate artifact")));
+        assert!(
+            proposal
+                .acceptance_gates
+                .iter()
+                .any(|gate| gate.contains("candidate artifact"))
+        );
         assert!(proposal.diagnosis_id.is_some());
         assert_eq!(proposal.target_owner, "reality_core");
 

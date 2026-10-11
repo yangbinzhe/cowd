@@ -139,10 +139,8 @@ mod tests {
 
     #[test]
     fn generic_complexity_keeps_business_topology_model_directed() {
-        let decision = build_runtime_execution_decision(
-            "全面审查两个模块，分别取得工具证据并综合",
-            None,
-        );
+        let decision =
+            build_runtime_execution_decision("全面审查两个模块，分别取得工具证据并综合", None);
         let prompt = runtime_execution_guidance_prompt(&decision);
 
         assert!(decision.collaboration_obligation.is_none());

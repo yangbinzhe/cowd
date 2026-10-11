@@ -1944,8 +1944,10 @@ mod tests {
         )
         .expect("restart recovery");
         assert_eq!(open, vec![record.clone()]);
-        assert!(restarted
-            .restore_controlled_recovery_claim(&open[0].fingerprint, &open[0].recovery_scope));
+        assert!(
+            restarted
+                .restore_controlled_recovery_claim(&open[0].fingerprint, &open[0].recovery_scope)
+        );
         assert_eq!(hot_state_counts(&restarted).3, 1);
 
         // Building a terminal or returning from an attempt is not an ACK.
@@ -1985,14 +1987,16 @@ mod tests {
                 events: vec![terminal_event],
             })
             .expect("graph terminal commit");
-        assert!(load_open_controlled_recovery_claims(
-            &store,
-            &record.session_id,
-            &record.turn_id,
-            &record.execution_id,
-        )
-        .expect("settled recovery stream")
-        .is_empty());
+        assert!(
+            load_open_controlled_recovery_claims(
+                &store,
+                &record.session_id,
+                &record.turn_id,
+                &record.execution_id,
+            )
+            .expect("settled recovery stream")
+            .is_empty()
+        );
         assert!(persist_controlled_recovery_claim(&store, &record).is_err());
         assert_eq!(hot_state_counts(&restarted).3, 1);
         assert_eq!(
@@ -2307,13 +2311,15 @@ mod tests {
             PermissionMode::WorkspaceWrite,
             EffectExternality::Workspace,
         ));
-        assert!(negotiator
-            .assess(
-                &PermissionPolicy::new(PermissionMode::WorkspaceWrite),
-                &request,
-            )
-            .lease
-            .is_some());
+        assert!(
+            negotiator
+                .assess(
+                    &PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+                    &request,
+                )
+                .lease
+                .is_some()
+        );
         let stale_transition_ids = negotiator
             .take_transitions_for_persistence()
             .into_iter()

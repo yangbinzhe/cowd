@@ -1,5 +1,5 @@
 use harness_contract::execution_graph::{
-    project_work_graph, ExecutionGraph, ExecutionWorkGraphProjection,
+    ExecutionGraph, ExecutionWorkGraphProjection, project_work_graph,
 };
 
 #[must_use]

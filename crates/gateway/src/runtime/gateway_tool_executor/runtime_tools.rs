@@ -412,10 +412,37 @@ impl GatewayToolExecutor {
                     "agent_action_batch dispatches Agent actions only; `{inner_tool}` is not one"
                 )));
             }
-            let inner_input = entry
+            let mut inner_input = entry
                 .get("input")
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({}));
+            // Every reference field in this action goes through the same
+            // normalization a direct call gets. Runtime spells a one-shot Task
+            // deliverable `artifact:<24 hex>` and repeats it in a completion
+            // gap; without this a batch that cites it is refused for a review
+            // whose reading the model already did.
+            if let Some(object) = inner_input.as_object_mut() {
+                for field in ["reference", "evidence_ref"] {
+                    if let Some(raw) = object.get(field).and_then(|v| v.as_str()) {
+                        let normalized = runtime::normalize_bare_evidence_ref(raw);
+                        if normalized != raw {
+                            object.insert(field.to_string(), serde_json::Value::String(normalized));
+                        }
+                    }
+                }
+                for field in ["evidence_refs", "result_refs", "artifact_refs"] {
+                    if let Some(array) = object.get_mut(field).and_then(|v| v.as_array_mut()) {
+                        for entry in array.iter_mut() {
+                            if let Some(raw) = entry.as_str() {
+                                let normalized = runtime::normalize_bare_evidence_ref(raw);
+                                if normalized != raw {
+                                    *entry = serde_json::Value::String(normalized);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             // Each action gets its own durable identity derived from this call,
             // so retrying the whole batch is idempotent per action.
             let action_id = format!("{parent_action_id}:{index}");

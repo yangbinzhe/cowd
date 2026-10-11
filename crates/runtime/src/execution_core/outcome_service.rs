@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use harness_contract::outcome::{ExecutionOutcome, RuntimeBuildIdentity, OUTCOME_SCHEMA_REVISION};
+use harness_contract::outcome::{ExecutionOutcome, OUTCOME_SCHEMA_REVISION, RuntimeBuildIdentity};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -646,10 +646,12 @@ mod tests {
         service.record_terminal(&original).unwrap();
         let mut conflicting = original;
         conflicting.terminal = OutcomeTerminalClass::Failed("different".to_string());
-        assert!(service
-            .record_terminal(&conflicting)
-            .expect_err("identity conflict must fail")
-            .contains("idempotency conflict"));
+        assert!(
+            service
+                .record_terminal(&conflicting)
+                .expect_err("identity conflict must fail")
+                .contains("idempotency conflict")
+        );
     }
 
     #[test]
@@ -719,10 +721,12 @@ mod tests {
             ),
         );
         invalid.strategy_feedback.evaluation_environment = "unknown".to_string();
-        assert!(service
-            .record_terminal(&invalid)
-            .expect_err("invalid environment")
-            .contains("environment"));
+        assert!(
+            service
+                .record_terminal(&invalid)
+                .expect_err("invalid environment")
+                .contains("environment")
+        );
 
         invalid.strategy_feedback.evaluation_environment = "production".to_string();
         invalid
@@ -731,10 +735,12 @@ mod tests {
             .as_mut()
             .unwrap()
             .tool_dag_shape = "arbitrary".to_string();
-        assert!(service
-            .record_terminal(&invalid)
-            .expect_err("invalid workload")
-            .contains("fingerprint"));
+        assert!(
+            service
+                .record_terminal(&invalid)
+                .expect_err("invalid workload")
+                .contains("fingerprint")
+        );
     }
 
     #[test]
@@ -744,16 +750,20 @@ mod tests {
         let mut team_without_id = outcome(ExecutionCandidateKind::Direct);
         team_without_id.identity.execution_scope =
             harness_contract::outcome::OutcomeExecutionScope::Team;
-        assert!(service
-            .record_terminal(&team_without_id)
-            .expect_err("team scope must be bound")
-            .contains("team_id"));
+        assert!(
+            service
+                .record_terminal(&team_without_id)
+                .expect_err("team scope must be bound")
+                .contains("team_id")
+        );
 
         let mut legacy = outcome(ExecutionCandidateKind::Direct);
         legacy.identity.execution_scope = harness_contract::outcome::OutcomeExecutionScope::Unknown;
-        assert!(service
-            .record_terminal(&legacy)
-            .expect_err("unknown scope must not enter canonical writer")
-            .contains("scope is unknown"));
+        assert!(
+            service
+                .record_terminal(&legacy)
+                .expect_err("unknown scope must not enter canonical writer")
+                .contains("scope is unknown")
+        );
     }
 }

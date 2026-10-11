@@ -905,10 +905,10 @@ mod tests {
         .expect("parse provider route");
         assert!(matches!(parsed.action, ProviderRouteAction::CreateCompound));
         assert_eq!(parsed.additional_objectives, vec!["B"]);
-        assert!(parse_route_proposal(
-            "{\"action\":\"create_root\",\"reason\":\"ok\",\"unknown\":true}"
-        )
-        .is_err());
+        assert!(
+            parse_route_proposal("{\"action\":\"create_root\",\"reason\":\"ok\",\"unknown\":true}")
+                .is_err()
+        );
     }
 
     #[tokio::test]

@@ -15,9 +15,9 @@ use harness_contract::agent::{
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::agent::definition::ResolvedAgentDefinition;
 use crate::AgentCatalogEntry;
 use crate::RuntimeDefinitionRegistry;
+use crate::agent::definition::ResolvedAgentDefinition;
 
 /// Caller-supplied restrictions. Every value is a ceiling; the compiler never
 /// expands a Definition's declared capability, Skill or cognitive scope.

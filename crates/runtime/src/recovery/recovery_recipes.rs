@@ -410,10 +410,11 @@ mod tests {
             "second attempt should require escalation, got: {second:?}"
         );
         assert_eq!(ctx.attempt_count(&scenario), 1);
-        assert!(ctx
-            .events()
-            .iter()
-            .any(|e| matches!(e, RecoveryEvent::Escalated)));
+        assert!(
+            ctx.events()
+                .iter()
+                .any(|e| matches!(e, RecoveryEvent::Escalated))
+        );
     }
 
     #[test]
@@ -441,10 +442,11 @@ mod tests {
             }
             other => panic!("expected PartialRecovery, got {other:?}"),
         }
-        assert!(ctx
-            .events()
-            .iter()
-            .any(|e| matches!(e, RecoveryEvent::RecoveryFailed)));
+        assert!(
+            ctx.events()
+                .iter()
+                .any(|e| matches!(e, RecoveryEvent::RecoveryFailed))
+        );
     }
 
     #[test]
@@ -465,10 +467,11 @@ mod tests {
             ),
             "zero-step failure should escalate, got: {result:?}"
         );
-        assert!(ctx
-            .events()
-            .iter()
-            .any(|e| matches!(e, RecoveryEvent::Escalated)));
+        assert!(
+            ctx.events()
+                .iter()
+                .any(|e| matches!(e, RecoveryEvent::Escalated))
+        );
     }
 
     #[test]
@@ -652,9 +655,10 @@ mod tests {
         // when — second attempt should escalate (max_attempts=1)
         let second = attempt_recovery(&scenario, &mut ctx);
         assert!(matches!(second, RecoveryResult::EscalationRequired { .. }));
-        assert!(ctx
-            .events()
-            .iter()
-            .any(|e| matches!(e, RecoveryEvent::Escalated)));
+        assert!(
+            ctx.events()
+                .iter()
+                .any(|e| matches!(e, RecoveryEvent::Escalated))
+        );
     }
 }

@@ -388,17 +388,19 @@ mod tests {
         assert!(catalog.get(AutonomyProfileId::Autonomous).is_some());
         assert!(catalog.get(AutonomyProfileId::Yolo).is_some());
         assert!(catalog.get(AutonomyProfileId::Stewarded).is_some());
-        assert!(catalog
-            .decide(AutonomyDecisionInput {
-                profile_id: AutonomyProfileId::Yolo,
-                requested_risk: TaskRisk::Low,
-                requested_tool: None,
-                requires_write: false,
-                is_critical_operation: false,
-            })
-            .policy_basis
-            .iter()
-            .any(|basis| basis == "execution_budget=runtime_parent_contract"));
+        assert!(
+            catalog
+                .decide(AutonomyDecisionInput {
+                    profile_id: AutonomyProfileId::Yolo,
+                    requested_risk: TaskRisk::Low,
+                    requested_tool: None,
+                    requires_write: false,
+                    is_critical_operation: false,
+                })
+                .policy_basis
+                .iter()
+                .any(|basis| basis == "execution_budget=runtime_parent_contract")
+        );
         assert_eq!(
             catalog
                 .get(AutonomyProfileId::Autonomous)
@@ -483,10 +485,12 @@ mod tests {
         });
 
         assert_eq!(decision.decision, AutonomyDecisionKind::Allow);
-        assert!(decision
-            .evidence
-            .iter()
-            .any(|item| item == "tool=read_file"));
+        assert!(
+            decision
+                .evidence
+                .iter()
+                .any(|item| item == "tool=read_file")
+        );
     }
 
     #[test]

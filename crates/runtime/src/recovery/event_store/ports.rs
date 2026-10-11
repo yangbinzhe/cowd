@@ -127,9 +127,7 @@ pub enum RuntimeEventStoreError {
     Corrupt(String),
     #[error("runtime event transaction `{transaction_id}` conflicts with its committed hash")]
     TransactionConflict { transaction_id: String },
-    #[error(
-        "runtime stream `{stream_id}` revision mismatch: expected {expected}, actual {actual}"
-    )]
+    #[error("runtime stream `{stream_id}` revision mismatch: expected {expected}, actual {actual}")]
     StaleRevision {
         stream_id: String,
         expected: u64,

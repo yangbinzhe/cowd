@@ -54,7 +54,7 @@ impl AgentModelSelector {
             Some(model) => {
                 return Err(AgentModelSelectionError::RequestedModelUnavailable(
                     model.into(),
-                ))
+                ));
             }
             None => snapshot
                 .all_models()

@@ -446,8 +446,8 @@ mod tests {
 
 #[cfg(test)]
 mod determinism_tests {
-    use super::{deduplicate, ContextItem};
     use super::super::{ContextAuthority, ContextRole, ContextSourceKind};
+    use super::{ContextItem, deduplicate};
 
     fn item(id: &str, source_id: &str, score: f32) -> ContextItem {
         let mut built = ContextItem::new(

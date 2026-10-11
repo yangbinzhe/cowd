@@ -19,9 +19,9 @@ use crate::runtime_event_store::{
     RuntimeEventScope,
 };
 use crate::{
-    project_self_models, AgentLifecyclePhase, AgentRunEvaluation, AgentSelfModel, CowdEvent,
-    CowdExecutionContext, CowdExecutionLineage, ProviderRegistry, RuntimeEventStore,
-    RuntimeServices,
+    AgentLifecyclePhase, AgentRunEvaluation, AgentSelfModel, CowdEvent, CowdExecutionContext,
+    CowdExecutionLineage, ProviderRegistry, RuntimeEventStore, RuntimeServices,
+    project_self_models,
 };
 use sha2::{Digest, Sha256};
 
@@ -965,7 +965,9 @@ impl AgentRuntime {
             },
             None => blocked_return(
                 &packet,
-                format!("agent backend {backend_kind:?} is not installed for this RuntimeServices instance"),
+                format!(
+                    "agent backend {backend_kind:?} is not installed for this RuntimeServices instance"
+                ),
             ),
         };
         drop(claim_heartbeat);
@@ -2820,16 +2822,24 @@ mod tests {
                 }
                 let before = actions.project("lifetime-program").unwrap();
                 let logical_member = &packet.agentic_binding.as_ref().unwrap().agent_id;
-                assert!(runtime
-                    .running_agentic_members("lifetime-program")
-                    .contains(logical_member));
-                assert!(runtime
-                    .running_agentic_members("foreign-program")
-                    .is_empty());
+                assert!(
+                    runtime
+                        .running_agentic_members("lifetime-program")
+                        .contains(logical_member)
+                );
+                assert!(
+                    runtime
+                        .running_agentic_members("foreign-program")
+                        .is_empty()
+                );
                 let recovered =
                     AgentRuntime::new(services.event_store().clone(), configured_registry());
-                assert!(recovered.running_agentic_members("lifetime-program").contains(logical_member),
-                    "typed busy identity survives cold journal reconstruction without display metadata");
+                assert!(
+                    recovered
+                        .running_agentic_members("lifetime-program")
+                        .contains(logical_member),
+                    "typed busy identity survives cold journal reconstruction without display metadata"
+                );
                 let mut commits = services.event_store().subscribe_commits();
                 // The heartbeat reads the graph on a blocking worker. A
                 // fixed number of yields is not evidence that it finished,
@@ -2871,13 +2881,17 @@ mod tests {
                 }
                 release.notify_one();
                 worker.await.unwrap().unwrap();
-                assert!(runtime
-                    .running_agentic_members("lifetime-program")
-                    .is_empty());
+                assert!(
+                    runtime
+                        .running_agentic_members("lifetime-program")
+                        .is_empty()
+                );
                 let after = actions.project("lifetime-program").unwrap();
-                assert!(!after.tasks[&work]
-                    .active_attempts
-                    .contains_key(packet.graph_id()));
+                assert!(
+                    !after.tasks[&work]
+                        .active_attempts
+                        .contains_key(packet.graph_id())
+                );
                 assert_eq!(after.tasks[&work].failed_attempts, 1);
                 assert_eq!(after.tasks[&work].claim_generation, 1);
                 tokio::time::advance(std::time::Duration::from_secs(60)).await;
@@ -3122,9 +3136,11 @@ mod tests {
             ),
         ] {
             packet.binding.as_mut().expect("binding").executor = executor;
-            assert!(backend_from_packet(&packet)
-                .expect_err("unsupported definition must not start an AgentTask backend")
-                .contains(expected));
+            assert!(
+                backend_from_packet(&packet)
+                    .expect_err("unsupported definition must not start an AgentTask backend")
+                    .contains(expected)
+            );
         }
     }
 
@@ -3154,10 +3170,12 @@ mod tests {
         );
         assert_eq!(returned.model, "external-model-profile");
         assert_eq!(returned.provider, "external_process");
-        assert!(returned
-            .failure
-            .as_deref()
-            .is_some_and(|failure| failure.contains("non-satisfied Runtime acceptance")));
+        assert!(
+            returned
+                .failure
+                .as_deref()
+                .is_some_and(|failure| failure.contains("non-satisfied Runtime acceptance"))
+        );
         assert_eq!(
             runtime.get(packet.agent_id()).expect("projection").status,
             AgentStatus::Failed
@@ -3189,10 +3207,12 @@ mod tests {
                 .status,
             AgentStatus::Cancelled
         );
-        assert!(runtime
-            .events(packet.agent_id())
-            .iter()
-            .any(|event| event.status == AgentStatus::Cancelled));
+        assert!(
+            runtime
+                .events(packet.agent_id())
+                .iter()
+                .any(|event| event.status == AgentStatus::Cancelled)
+        );
     }
 
     #[tokio::test]
@@ -3236,10 +3256,12 @@ mod tests {
             .expect("validation failure is a terminal Agent result");
 
         assert_eq!(returned.status, AgentTerminalStatus::Failed);
-        assert!(returned
-            .failure
-            .as_deref()
-            .is_some_and(|failure| failure.contains("Runtime rejected Agent terminal result")));
+        assert!(
+            returned
+                .failure
+                .as_deref()
+                .is_some_and(|failure| failure.contains("Runtime rejected Agent terminal result"))
+        );
         assert_eq!(returned.input_tokens, 3);
         assert_eq!(returned.output_tokens, 2);
         assert_eq!(
@@ -3262,10 +3284,12 @@ mod tests {
                 .status,
             AgentStatus::Failed
         );
-        assert!(runtime
-            .events(packet.agent_id())
-            .iter()
-            .any(|event| event.status == AgentStatus::Failed));
+        assert!(
+            runtime
+                .events(packet.agent_id())
+                .iter()
+                .any(|event| event.status == AgentStatus::Failed)
+        );
     }
 
     #[test]
@@ -3286,9 +3310,11 @@ mod tests {
 
         let mut stale_running = stale_prepared;
         stale_running.status = AgentStatus::Running;
-        assert!(runtime
-            .persist_snapshot(stale_running, "agent.running", "running", None, None)
-            .is_err());
+        assert!(
+            runtime
+                .persist_snapshot(stale_running, "agent.running", "running", None, None)
+                .is_err()
+        );
         assert_eq!(
             runtime.get(packet.agent_id()).expect("terminal").status,
             AgentStatus::Cancelled
@@ -3337,9 +3363,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![packet.agent_id()],
         );
-        assert!(runtime
-            .list_for_graphs(&BTreeSet::from(["graph-other".to_string()]))
-            .is_empty());
+        assert!(
+            runtime
+                .list_for_graphs(&BTreeSet::from(["graph-other".to_string()]))
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -3432,10 +3460,12 @@ mod tests {
             )
             .expect_err("unbound records are rejected");
         assert!(runtime.get(valid.agent_id()).is_none());
-        assert!(store
-            .list_stream(&legacy_import_stream_id("bad-upgrade-manifest"))
-            .expect("marker stream")
-            .is_empty());
+        assert!(
+            store
+                .list_stream(&legacy_import_stream_id("bad-upgrade-manifest"))
+                .expect("marker stream")
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -3529,9 +3559,10 @@ mod tests {
         let packet = team_task("team-lineage", "team-run-1");
         let snapshot = legacy_snapshot(&packet, AgentStatus::Running);
         let refs = snapshot_identity_refs(&snapshot);
-        assert!(refs
-            .iter()
-            .any(|reference| reference.kind == "team_run" && reference.id == "team-run-1"));
+        assert!(
+            refs.iter()
+                .any(|reference| reference.kind == "team_run" && reference.id == "team-run-1")
+        );
         assert!(refs.iter().any(|reference| {
             reference.kind == "agent_instance" && reference.id == packet.agent_id()
         }));
@@ -3646,15 +3677,17 @@ mod tests {
         assert!(!runtime.command(different_command).await.accepted);
         let mut premature_terminal = runtime.get(packet.agent_id()).unwrap();
         premature_terminal.status = AgentStatus::Completed;
-        assert!(runtime
-            .persist_snapshot(
-                premature_terminal,
-                "agent.terminal",
-                "must not lose input",
-                None,
-                None
-            )
-            .is_err());
+        assert!(
+            runtime
+                .persist_snapshot(
+                    premature_terminal,
+                    "agent.terminal",
+                    "must not lose input",
+                    None,
+                    None
+                )
+                .is_err()
+        );
         let mut conflicting = request.clone();
         conflicting.input = Some(harness_contract::agent::AgentInput::UserSupplement(
             "other payload".into(),
@@ -3668,10 +3701,12 @@ mod tests {
                 .unwrap(),
             vec![request.clone()]
         );
-        assert!(restored
-            .pending_agent_inputs(packet.agent_id(), "different-run")
-            .unwrap()
-            .is_empty());
+        assert!(
+            restored
+                .pending_agent_inputs(packet.agent_id(), "different-run")
+                .unwrap()
+                .is_empty()
+        );
         let inbox = crate::SessionInputStream::new(packet.session_id());
         let turn = TurnId::from_string("input-checkpoint");
         inbox.set_active_turn(Some(turn.clone()));
@@ -3690,29 +3725,33 @@ mod tests {
         assert_eq!(records.len(), 1);
         let mut forged = records.clone();
         forged[0].envelope.content = "forged".into();
-        assert!(restored
-            .agent_input_consumption_events(&packet, &forged)
-            .is_err());
+        assert!(
+            restored
+                .agent_input_consumption_events(&packet, &forged)
+                .is_err()
+        );
         let events = restored
             .agent_input_consumption_events(&packet, &records)
             .unwrap();
         assert_eq!(events.len(), 1);
-        assert!(store
-            .append_transaction(AppendTransactionRequest {
-                transaction_id: "input-consumption-fault".into(),
-                expected_streams: vec![
-                    ExpectedStreamRevision {
-                        stream_id: "test-model-node".into(),
-                        expected_revision: 1
-                    },
-                    ExpectedStreamRevision {
-                        stream_id: events[0].event.stream_id.clone(),
-                        expected_revision: 1
-                    }
-                ],
-                events: events.clone(),
-            })
-            .is_err());
+        assert!(
+            store
+                .append_transaction(AppendTransactionRequest {
+                    transaction_id: "input-consumption-fault".into(),
+                    expected_streams: vec![
+                        ExpectedStreamRevision {
+                            stream_id: "test-model-node".into(),
+                            expected_revision: 1
+                        },
+                        ExpectedStreamRevision {
+                            stream_id: events[0].event.stream_id.clone(),
+                            expected_revision: 1
+                        }
+                    ],
+                    events: events.clone(),
+                })
+                .is_err()
+        );
         assert_eq!(
             restored
                 .pending_agent_inputs(packet.agent_id(), packet.run_id())
@@ -3732,10 +3771,12 @@ mod tests {
             .unwrap();
         drop(restored);
         let recovered = AgentRuntime::new(store, configured_registry());
-        assert!(recovered
-            .pending_agent_inputs(packet.agent_id(), packet.run_id())
-            .unwrap()
-            .is_empty());
+        assert!(
+            recovered
+                .pending_agent_inputs(packet.agent_id(), packet.run_id())
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(recovered.command(request).await, receipt);
     }
 
@@ -3951,11 +3992,13 @@ mod tests {
         );
         let snapshot = runtime.get(packet.agent_id()).expect("blocked run");
         assert_eq!(snapshot.status, AgentStatus::Blocked);
-        assert!(snapshot
-            .failure
-            .as_deref()
-            .unwrap_or_default()
-            .contains("backend handle"));
+        assert!(
+            snapshot
+                .failure
+                .as_deref()
+                .unwrap_or_default()
+                .contains("backend handle")
+        );
     }
 
     #[test]
@@ -3990,10 +4033,12 @@ mod tests {
             })
             .expect("restore");
 
-        assert!(runtime
-            .block_unrecoverable_replayed_runs()
-            .expect("recovery sweep")
-            .is_empty());
+        assert!(
+            runtime
+                .block_unrecoverable_replayed_runs()
+                .expect("recovery sweep")
+                .is_empty()
+        );
         assert_eq!(
             runtime.get(packet.agent_id()).expect("prepared run").status,
             AgentStatus::Prepared
@@ -4032,10 +4077,12 @@ mod tests {
             })
             .expect("restore");
 
-        assert!(runtime
-            .block_unrecoverable_replayed_runs()
-            .expect("recovery sweep")
-            .is_empty());
+        assert!(
+            runtime
+                .block_unrecoverable_replayed_runs()
+                .expect("recovery sweep")
+                .is_empty()
+        );
         let snapshot = runtime.get(packet.agent_id()).expect("requeued run");
         assert_eq!(snapshot.status, AgentStatus::Prepared);
         assert_eq!(snapshot.failure, None);

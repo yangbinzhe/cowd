@@ -429,9 +429,11 @@ mod tests {
 
         assert_eq!(reopened.active_id(), "enterprise_ops");
         let profiles = reopened.list_profiles();
-        assert!(profiles
-            .iter()
-            .any(|p| p.id == "enterprise_ops" && p.name == "Enterprise Ops" && p.is_active));
+        assert!(
+            profiles
+                .iter()
+                .any(|p| p.id == "enterprise_ops" && p.name == "Enterprise Ops" && p.is_active)
+        );
     }
 
     #[test]

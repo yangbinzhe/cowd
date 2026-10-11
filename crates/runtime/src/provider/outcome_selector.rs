@@ -413,9 +413,11 @@ mod tests {
             1_000,
         );
         assert!(!receipt.eligible);
-        assert!(receipt
-            .exclusion_reasons
-            .iter()
-            .any(|reason| reason.contains("ambiguous provider identities")));
+        assert!(
+            receipt
+                .exclusion_reasons
+                .iter()
+                .any(|reason| reason.contains("ambiguous provider identities"))
+        );
     }
 }

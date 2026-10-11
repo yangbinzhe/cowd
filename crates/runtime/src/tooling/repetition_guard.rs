@@ -68,7 +68,10 @@ fn repetition_ledger() -> &'static std::sync::Mutex<BTreeMap<String, RepetitionS
 /// denial is deterministic but actionable, so it is reported rather than
 /// blocked.
 fn counts_toward_breaker(kind: ToolFailureKind) -> bool {
-    matches!(kind, ToolFailureKind::ExecutionError | ToolFailureKind::Unknown)
+    matches!(
+        kind,
+        ToolFailureKind::ExecutionError | ToolFailureKind::Unknown
+    )
 }
 
 /// Normalize an error message into a signature.
@@ -435,11 +438,22 @@ mod repetition_guard_tests {
         let turn = turn!();
         // First failure: advice, not a verdict. The model has not yet seen that
         // retrying changes nothing.
-        assert!(err(turn, ToolFailureKind::ExecutionError, "execution graph `run:abc123` does not exist").is_none());
+        assert!(
+            err(
+                turn,
+                ToolFailureKind::ExecutionError,
+                "execution graph `run:abc123` does not exist"
+            )
+            .is_none()
+        );
         // Second: the graph id differs - a replan minted a new one - but the
         // message normalizes identifiers, so the cause is recognized.
-        let tripped = err(turn, ToolFailureKind::ExecutionError, "execution graph `run:9f8e7d` does not exist")
-            .expect("the second identical failure must trip the breaker");
+        let tripped = err(
+            turn,
+            ToolFailureKind::ExecutionError,
+            "execution graph `run:9f8e7d` does not exist",
+        )
+        .expect("the second identical failure must trip the breaker");
         assert!(tripped.contains("cannot produce a different result"));
         assert!(tripped.contains("objective_complete_request"));
     }
@@ -449,9 +463,18 @@ mod repetition_guard_tests {
     #[test]
     fn a_new_identifier_does_not_reset_the_breaker() {
         let turn = turn!();
-        err(turn, ToolFailureKind::ExecutionError, "graph `run:4f9a2b` does not exist");
+        err(
+            turn,
+            ToolFailureKind::ExecutionError,
+            "graph `run:4f9a2b` does not exist",
+        );
         assert!(
-            err(turn, ToolFailureKind::ExecutionError, "graph `run:7c1e08` does not exist").is_some(),
+            err(
+                turn,
+                ToolFailureKind::ExecutionError,
+                "graph `run:7c1e08` does not exist"
+            )
+            .is_some(),
             "identifier changes must not buy the loop a fresh budget"
         );
     }
@@ -558,7 +581,14 @@ mod repetition_guard_tests {
         let message = "execution graph `run:abc123` does not exist";
         for turn_index in 0..19 {
             let turn = format!("turn-cross-{turn_index}");
-            record_tool_failure(&turn, tool, input, &[], ToolFailureKind::ExecutionError, message);
+            record_tool_failure(
+                &turn,
+                tool,
+                input,
+                &[],
+                ToolFailureKind::ExecutionError,
+                message,
+            );
             assert!(
                 !is_dispatch_blocked(&turn, tool, input),
                 "characterized: turn {turn_index} sees only its own failure"
@@ -582,8 +612,8 @@ mod repetition_guard_tests {
                 "graph `run:4f9a2b` does not exist",
             );
         }
-        let refusal = refusal_for(turn, "task_review", "hash-r")
-            .expect("the refusal must be reportable");
+        let refusal =
+            refusal_for(turn, "task_review", "hash-r").expect("the refusal must be reportable");
         assert_eq!(refusal.count, repetition_bound());
         assert!(
             refusal.cause_signature.contains('#'),
@@ -601,7 +631,14 @@ mod repetition_guard_tests {
     fn a_transient_failures_never_refuse_a_call() {
         let turn = turn!();
         for _ in 0..16 {
-            record_tool_failure(turn, "task_review", "hash-t", &[], ToolFailureKind::Timeout, "request timed out");
+            record_tool_failure(
+                turn,
+                "task_review",
+                "hash-t",
+                &[],
+                ToolFailureKind::Timeout,
+                "request timed out",
+            );
         }
         assert!(!is_dispatch_blocked(turn, "task_review", "hash-t"));
     }
@@ -713,7 +750,14 @@ mod repetition_guard_tests {
     fn a_delegated_graph_turn_does_not_clear_the_root_turns_breaker() {
         const ROOT: &str = "turn-delegated-clear";
         let fail = |msg: &str| {
-            record_tool_failure(ROOT, "task_review", "h-delegated", &[], ToolFailureKind::ExecutionError, msg)
+            record_tool_failure(
+                ROOT,
+                "task_review",
+                "h-delegated",
+                &[],
+                ToolFailureKind::ExecutionError,
+                msg,
+            )
         };
         fail("graph `run:4f9a2b` does not exist");
         assert!(fail("graph `run:7c1e08` does not exist").is_some());
@@ -725,7 +769,10 @@ mod repetition_guard_tests {
             is_dispatch_blocked(ROOT, "task_review", "h-delegated"),
             "the breaker the delegated turn could not clear must still refuse"
         );
-        assert!(clear_breakers_for_role(ROOT, true), "the root turn owns the clear");
+        assert!(
+            clear_breakers_for_role(ROOT, true),
+            "the root turn owns the clear"
+        );
         assert!(
             !is_dispatch_blocked(ROOT, "task_review", "h-delegated"),
             "at the boundary the breaker is stale and must be released"
@@ -738,7 +785,14 @@ mod repetition_guard_tests {
         // clears - and clearing is scoped to a turn.
         const TURN: &str = "turn-clearing-case";
         let fail = |msg: &str| {
-            record_tool_failure(TURN, "task_review", "h1", &[], ToolFailureKind::ExecutionError, msg)
+            record_tool_failure(
+                TURN,
+                "task_review",
+                "h1",
+                &[],
+                ToolFailureKind::ExecutionError,
+                msg,
+            )
         };
         // Real ids always contain a digit, which is what marks them as ids.
         fail("graph `run:4f9a2b` does not exist");
@@ -754,9 +808,24 @@ mod repetition_guard_tests {
     /// one plan says nothing about the next turn, which replans anyway.
     #[test]
     fn different_turns_do_not_share_a_budget() {
-        record_tool_failure(turn!(), "task_review", "h1", &[], ToolFailureKind::ExecutionError, "graph `run:4f9a2b` gone");
+        record_tool_failure(
+            turn!(),
+            "task_review",
+            "h1",
+            &[],
+            ToolFailureKind::ExecutionError,
+            "graph `run:4f9a2b` gone",
+        );
         assert!(
-            record_tool_failure("turn-other", "task_review", "h1", &[], ToolFailureKind::ExecutionError, "graph `run:7c1e08` gone").is_none(),
+            record_tool_failure(
+                "turn-other",
+                "task_review",
+                "h1",
+                &[],
+                ToolFailureKind::ExecutionError,
+                "graph `run:7c1e08` gone"
+            )
+            .is_none(),
             "a later turn must not inherit an earlier turn's failures"
         );
     }
@@ -764,9 +833,24 @@ mod repetition_guard_tests {
     /// Two different tools failing must not share one budget.
     #[test]
     fn different_tools_do_not_share_a_budget() {
-        record_tool_failure(turn!(), "read_ref", "h", &[], ToolFailureKind::ExecutionError, "bad id");
+        record_tool_failure(
+            turn!(),
+            "read_ref",
+            "h",
+            &[],
+            ToolFailureKind::ExecutionError,
+            "bad id",
+        );
         assert!(
-            record_tool_failure(turn!(), "task_review", "h", &[], ToolFailureKind::ExecutionError, "bad id").is_none(),
+            record_tool_failure(
+                turn!(),
+                "task_review",
+                "h",
+                &[],
+                ToolFailureKind::ExecutionError,
+                "bad id"
+            )
+            .is_none(),
             "one tool's failures must not block another's"
         );
     }

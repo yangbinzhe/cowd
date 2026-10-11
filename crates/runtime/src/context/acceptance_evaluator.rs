@@ -10,8 +10,8 @@ use harness_contract::context::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::path_identity::observed_evidence_collection_satisfies;
 use crate::path_identity::WorkspacePathIdentityResolver;
+use crate::path_identity::observed_evidence_collection_satisfies;
 
 /// The single acceptance evaluator.
 #[derive(Debug, Clone, Copy, Default)]

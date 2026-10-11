@@ -357,8 +357,13 @@ pub(super) fn agent_autonomy_checkpoint(
             return Err("coordination_checkpoint_scope_unavailable".into());
         }
         return Ok(Some(AgentAutonomyCheckpoint {
-            prompt: format!("Respond to the authorized coordination request through message_publish. Read relevant evidence and give a useful answer, challenge or actionable proposal; do not invent a reply or claim the original Task. Publish on `{topic}`, include `{wake_ref}` in refs, and ensure requester `{}` is a recipient (or use a public reply on this same authorized Topic). A durable response from your actual execution closes this opportunity; final prose alone does not.\n\n{}", wake.actor_id, serde_json::json!({"kind":"runtime_agent_autonomy_checkpoint", "attempt_mode":"coordination", "wake_ref":wake_ref, "request":wake})),
-            tool_ids: autonomy_checkpoint_tool_plan(packet, true, true), requires_tool_action: true,
+            prompt: format!(
+                "Respond to the authorized coordination request through message_publish. Read relevant evidence and give a useful answer, challenge or actionable proposal; do not invent a reply or claim the original Task. Publish on `{topic}`, include `{wake_ref}` in refs, and ensure requester `{}` is a recipient (or use a public reply on this same authorized Topic). A durable response from your actual execution closes this opportunity; final prose alone does not.\n\n{}",
+                wake.actor_id,
+                serde_json::json!({"kind":"runtime_agent_autonomy_checkpoint", "attempt_mode":"coordination", "wake_ref":wake_ref, "request":wake})
+            ),
+            tool_ids: autonomy_checkpoint_tool_plan(packet, true, true),
+            requires_tool_action: true,
         }));
     }
     let (task_id, mode) = match &agentic.focus {
@@ -475,7 +480,7 @@ pub(super) fn agent_autonomy_checkpoint(
         _ => {
             return Err(format!(
                 "Agent-first packet has unsupported attempt mode `{mode}`"
-            ))
+            ));
         }
     }
 
@@ -771,7 +776,9 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
             // Pointer-based tools (working_context / evidence_retrieve /
             // artifact_publish) already hand the model a ref, so the generic
             // retrieval hint is correct for them.
-            return self.execute_authorized_output(authorization, tool_name, input).await;
+            return self
+                .execute_authorized_output(authorization, tool_name, input)
+                .await;
         }
         if authorization.tool_id != tool_name || !self.allowed_tools.contains(tool_name) {
             return Err(ToolError::new(
@@ -868,12 +875,14 @@ mod tests {
         })
         .to_string();
 
-        assert!(reject_orchestrated_tools_outside_allow_list(
-            &allowed(&["glob_search", "read_file"]),
-            "tool_orchestrate",
-            &input
-        )
-        .is_ok());
+        assert!(
+            reject_orchestrated_tools_outside_allow_list(
+                &allowed(&["glob_search", "read_file"]),
+                "tool_orchestrate",
+                &input
+            )
+            .is_ok()
+        );
 
         let error = reject_orchestrated_tools_outside_allow_list(
             &allowed(&["glob_search"]),
@@ -883,12 +892,14 @@ mod tests {
         .expect_err("read_file is not allowed");
         assert!(error.to_string().contains("read_file"), "got: {error}");
 
-        assert!(reject_orchestrated_tools_outside_allow_list(
-            &allowed(&[]),
-            "read_file",
-            "{\"path\":\"x\"}"
-        )
-        .is_ok());
+        assert!(
+            reject_orchestrated_tools_outside_allow_list(
+                &allowed(&[]),
+                "read_file",
+                "{\"path\":\"x\"}"
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -897,28 +908,30 @@ mod tests {
             "steps": [{"id": "c", "op": "compute", "language": "python", "code": "print(1)", "input": []}]
         })
         .to_string();
-        assert!(reject_orchestrated_tools_outside_allow_list(
-            &allowed(&["execute_code"]),
-            "tool_orchestrate",
-            &input
-        )
-        .is_ok());
-        assert!(reject_orchestrated_tools_outside_allow_list(
-            &allowed(&[]),
-            "tool_orchestrate",
-            &input
-        )
-        .is_err());
+        assert!(
+            reject_orchestrated_tools_outside_allow_list(
+                &allowed(&["execute_code"]),
+                "tool_orchestrate",
+                &input
+            )
+            .is_ok()
+        );
+        assert!(
+            reject_orchestrated_tools_outside_allow_list(&allowed(&[]), "tool_orchestrate", &input)
+                .is_err()
+        );
     }
 
     #[test]
     fn invalid_orchestration_input_fails_closed() {
-        assert!(reject_orchestrated_tools_outside_allow_list(
-            &allowed(&["read_file"]),
-            "tool_orchestrate",
-            "not json"
-        )
-        .is_err());
+        assert!(
+            reject_orchestrated_tools_outside_allow_list(
+                &allowed(&["read_file"]),
+                "tool_orchestrate",
+                "not json"
+            )
+            .is_err()
+        );
     }
 }
 
@@ -963,7 +976,7 @@ fn delegated_tool_draft(
 
 #[cfg(test)]
 mod delegated_draft_tests {
-    use super::{delegated_tool_draft, DELEGATED_TOOL_INLINE_TOKEN_BUDGET};
+    use super::{DELEGATED_TOOL_INLINE_TOKEN_BUDGET, delegated_tool_draft};
 
     #[test]
     fn a_whole_file_stays_inline() {

@@ -516,10 +516,12 @@ mod tests {
         let projector =
             KnowledgeCandidateProjector::new(Arc::clone(&events), Arc::clone(&promotion));
         assert_eq!(projector.run_once(1).await.expect("first pass"), 1);
-        assert!(promotion
-            .get(&candidate.candidate_id)
-            .expect("projection")
-            .is_none());
+        assert!(
+            promotion
+                .get(&candidate.candidate_id)
+                .expect("projection")
+                .is_none()
+        );
         projector.run_once(8).await.expect("candidate pass");
         assert_eq!(
             promotion
@@ -609,10 +611,12 @@ mod tests {
                 .source_cursor,
             commit_cursor
         );
-        assert!(events
-            .list_stream(PROJECTOR_STREAM)
-            .expect("projector stream")
-            .is_empty());
+        assert!(
+            events
+                .list_stream(PROJECTOR_STREAM)
+                .expect("projector stream")
+                .is_empty()
+        );
         assert_eq!(projector.run_once(64).await.expect("idempotent pass"), 0);
     }
 

@@ -4,8 +4,8 @@ use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -74,8 +74,8 @@ use harness_contract::{
     knowledge::KnowledgeTurnReport,
     skill::{AgentSkillProfile, SkillCapabilityProfile},
     strategy::{
-        understand, ExecutionCandidateKind, StrategyCandidateCostSummary, StrategyExperienceRecord,
-        StrategyExperienceSummary, StrategyInput, StrategyWorkloadFingerprint,
+        ExecutionCandidateKind, StrategyCandidateCostSummary, StrategyExperienceRecord,
+        StrategyExperienceSummary, StrategyInput, StrategyWorkloadFingerprint, understand,
     },
     turn::{
         SessionInputEnvelope, SessionInputProjection, SessionInputReceipt, TurnId,
@@ -98,8 +98,8 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::budget_policy::{
-    clamp_context_budget_ratio_bp, ProviderOutputBudget, ProviderOutputBudgetInputs,
-    RuntimeBudgetInputs, RuntimeBudgetPlan,
+    ProviderOutputBudget, ProviderOutputBudgetInputs, RuntimeBudgetInputs, RuntimeBudgetPlan,
+    clamp_context_budget_ratio_bp,
 };
 
 const fn provider_retry_is_fenced(
@@ -516,16 +516,17 @@ impl ProviderTokenReservationSet {
         Ok(())
     }
 }
+use crate::PromptAssembly;
 use crate::compact::{
-    apply_compaction_summary, estimate_session_tokens, plan_session_compaction, CompactionConfig,
+    CompactionConfig, apply_compaction_summary, estimate_session_tokens, plan_session_compaction,
 };
 use crate::config::{RuntimeFeatureConfig, SessionCompactConfig as RuntimeSessionCompactConfig};
 use crate::context_runtime::{
-    ContextAuthority, ContextEnvelope, ContextEnvelopeRequest, ContextIdentity, ContextItem,
-    ContextOmission, ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind,
-    ContextVisibility, PersistedContextEnvelope, ResumeContextPacket, RuntimeContextFactDecision,
-    RuntimeContextGovernanceReport, ToolTracePacket, ToolTraceStatus,
-    CONTEXT_RENDER_FORMATTER_VERSION, PERSISTED_CONTEXT_ENVELOPE_SCHEMA_VERSION,
+    CONTEXT_RENDER_FORMATTER_VERSION, ContextAuthority, ContextEnvelope, ContextEnvelopeRequest,
+    ContextIdentity, ContextItem, ContextOmission, ContextProfile, ContextRole,
+    ContextRuntimeKernel, ContextSourceKind, ContextVisibility,
+    PERSISTED_CONTEXT_ENVELOPE_SCHEMA_VERSION, PersistedContextEnvelope, ResumeContextPacket,
+    RuntimeContextFactDecision, RuntimeContextGovernanceReport, ToolTracePacket, ToolTraceStatus,
 };
 use crate::context_tool_exposure::{ToolExposurePlanner, ToolExposurePolicy, ToolExposureState};
 use crate::fact_extraction::{
@@ -547,14 +548,13 @@ use crate::runtime_control::RuntimeControlPolicy;
 use crate::runtime_harness::{RuntimeAiKernel, RuntimeAiKernelTrace};
 use crate::session::{ContentBlock, ConversationMessage, MessageEvent, Session, SessionEventLog};
 use crate::skill::{
-    memory_candidate_from_skill_activation, skill_memory_candidate_session_event,
     RuntimeSkillPromptAsset, SkillActivationEngine, SkillActivationInput, SkillMemoryPolicy,
+    memory_candidate_from_skill_activation, skill_memory_candidate_session_event,
 };
 use crate::tool_invocation::{
-    now_ms, ToolFailureKind, ToolInvocationRecord, DEFAULT_OUTPUT_REF_MIN_LINES,
+    DEFAULT_OUTPUT_REF_MIN_LINES, ToolFailureKind, ToolInvocationRecord, now_ms,
 };
 use crate::usage::UsageTracker;
-use crate::PromptAssembly;
 use crate::{
     HistoryView, RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore,
 };
@@ -2270,9 +2270,11 @@ mod tool_exposure_contract_tests {
             ToolPermissionMode::WorkspaceWrite,
         ] {
             let tools = bootstrap_tool_ids(ceiling);
-            assert!(harness_contract::agent_action::AGENT_ACTION_TOOL_IDS
-                .iter()
-                .all(|required| tools.iter().any(|tool| tool == required)));
+            assert!(
+                harness_contract::agent_action::AGENT_ACTION_TOOL_IDS
+                    .iter()
+                    .all(|required| tools.iter().any(|tool| tool == required))
+            );
             assert!(tools.iter().any(|tool| tool == "runtime_capabilities"));
             assert!(tools.iter().any(|tool| tool == "context_retrieve"));
         }
@@ -3900,8 +3902,7 @@ pub struct ConversationRuntime<C, T> {
     last_reality_recall_report: std::sync::Mutex<Option<crate::RealityRecallReport>>,
     /// Context sources that failed for the current request. Rendered as an
     /// explicit prompt marker so the model can tell a degradation from absence.
-    degraded_context_sources:
-        std::sync::Mutex<Vec<crate::context_runtime::ContextSourceKind>>,
+    degraded_context_sources: std::sync::Mutex<Vec<crate::context_runtime::ContextSourceKind>>,
     /// Optional tool callback for real-time visualization (P0-2).
     tool_callback: Option<Arc<dyn ToolCallback>>,
     /// Optional Gateway-owned Session application port for durable Runtime
@@ -4378,8 +4379,8 @@ fn initialize_automatic_memory_manager(
                 match runtime.block_on(open_automatic_memory_manager(mem_cfg, llm_summarizer)) {
                     Ok(manager) => {
                         tracing::debug!(
-                        "memory: standalone CognitiveContextManager initialised with explicit per-turn identity"
-                    );
+                            "memory: standalone CognitiveContextManager initialised with explicit per-turn identity"
+                        );
                         (Some(Arc::new(manager)), None)
                     }
                     Err(error) => automatic_memory_initialization_failure(error.to_string()),

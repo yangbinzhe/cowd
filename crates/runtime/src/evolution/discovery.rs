@@ -10,10 +10,10 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 
 use super::{
-    candidate_kinds_from_root_cause, EvolutionCapabilityGoal, EvolutionCase,
+    EVOLUTION_CASE_CATALOG_PAGE_SIZE, EvolutionCapabilityGoal, EvolutionCase,
     EvolutionCaseCatalogPage, EvolutionCaseIndex, EvolutionCasePage, EvolutionCaseState,
     EvolutionDiagnosis, EvolutionDiagnosisEngine, EvolutionLifecycleDraft, EvolutionMission,
-    EvolutionProposal, EvolutionSignal, EVOLUTION_CASE_CATALOG_PAGE_SIZE,
+    EvolutionProposal, EvolutionSignal, candidate_kinds_from_root_cause,
 };
 use crate::{
     AppendTransactionRequest, ExpectedStreamRevision, RuntimeEventInput, RuntimeEventRef,

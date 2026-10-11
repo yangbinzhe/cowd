@@ -554,11 +554,13 @@ mod tests {
             serde_json::from_str(outcome.result.summary.as_deref().unwrap()).unwrap();
         assert!(receipt.reread_verified);
         assert_eq!(receipt.sha256, sha256(&bytes));
-        assert!(outcome
-            .result
-            .evidence_refs
-            .iter()
-            .any(|reference| reference.evidence_ref.ref_type == "runtime_change"));
+        assert!(
+            outcome
+                .result
+                .evidence_refs
+                .iter()
+                .any(|reference| reference.evidence_ref.ref_type == "runtime_change")
+        );
     }
 
     #[tokio::test]
@@ -588,12 +590,14 @@ mod tests {
             outcome.result.result_ref.as_deref(),
             Some("assistant_json:{\"report\":\"hello materializer\"}")
         );
-        assert!(outcome
-            .result
-            .failure
-            .unwrap()
-            .kind
-            .starts_with("materialization_"));
+        assert!(
+            outcome
+                .result
+                .failure
+                .unwrap()
+                .kind
+                .starts_with("materialization_")
+        );
     }
 
     #[tokio::test]

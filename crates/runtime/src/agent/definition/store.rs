@@ -10,13 +10,13 @@ use harness_contract::agent::{
     AgentDefinitionRevisionRef, DefaultPointer, DefinitionScope, ReleaseAssignment,
     ReleaseAssignmentStatus, ReleaseChannel, RevisionLifecycle, RevisionSelector, ValidationError,
 };
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use thiserror::Error;
 
 use super::validation::{
-    build_revision, ensure_same_revision_ref, manifest_yaml, verify_read_revision,
-    INSTRUCTIONS_FILE_NAME, MANIFEST_FILE_NAME,
+    INSTRUCTIONS_FILE_NAME, MANIFEST_FILE_NAME, build_revision, ensure_same_revision_ref,
+    manifest_yaml, verify_read_revision,
 };
 
 const AGENTS_DIRECTORY: &str = "agents";

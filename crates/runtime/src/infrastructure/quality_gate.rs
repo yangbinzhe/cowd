@@ -97,11 +97,13 @@ mod tests {
 
         assert_eq!(gate.target_ref, "structured-evidence:packet-1");
         assert_eq!(gate.decision, "pass");
-        assert!(gate
-            .structured_refs
-            .contains(&"structured-fact:fact-1".to_string()));
-        assert!(gate
-            .reasons
-            .contains(&"metric_evidence_present".to_string()));
+        assert!(
+            gate.structured_refs
+                .contains(&"structured-fact:fact-1".to_string())
+        );
+        assert!(
+            gate.reasons
+                .contains(&"metric_evidence_present".to_string())
+        );
     }
 }

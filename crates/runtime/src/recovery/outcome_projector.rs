@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use harness_contract::outcome::{
-    ExecutionOutcome, OutcomeSegmentKey, StrategyExperienceKey, OUTCOME_SCHEMA_REVISION,
+    ExecutionOutcome, OUTCOME_SCHEMA_REVISION, OutcomeSegmentKey, StrategyExperienceKey,
 };
 use harness_contract::strategy::ExecutionCandidateKind;
 use serde::{Deserialize, Serialize};
@@ -849,9 +849,9 @@ mod tests {
     use super::*;
     use harness_contract::{
         outcome::{
-            OutcomeIdentity, OutcomeObservation, OutcomeQuality, OutcomeTerminalClass,
-            OutcomeTiming, OutcomeUsage, ProviderIdentity, RuntimeIdentity, StrategyIdentity,
-            OUTCOME_SCHEMA_REVISION,
+            OUTCOME_SCHEMA_REVISION, OutcomeIdentity, OutcomeObservation, OutcomeQuality,
+            OutcomeTerminalClass, OutcomeTiming, OutcomeUsage, ProviderIdentity, RuntimeIdentity,
+            StrategyIdentity,
         },
         reality::{EvidenceCompleteness, EvidenceRef},
         strategy::ExecutionCandidateKind,

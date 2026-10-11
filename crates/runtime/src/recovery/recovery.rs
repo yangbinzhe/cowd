@@ -3,9 +3,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    candidate_from_action, RuntimeEventInput, RuntimeEventRef, RuntimeEventReplayer,
-    RuntimeEventScope, RuntimeRecoveryAction, RuntimeRecoveryActionKind, RuntimeRecoveryCandidate,
-    RuntimeReplayReport, RuntimeServices,
+    RuntimeEventInput, RuntimeEventRef, RuntimeEventReplayer, RuntimeEventScope,
+    RuntimeRecoveryAction, RuntimeRecoveryActionKind, RuntimeRecoveryCandidate,
+    RuntimeReplayReport, RuntimeServices, candidate_from_action,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

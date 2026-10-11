@@ -10,18 +10,19 @@ use std::{
 use harness_contract::{
     outcome::ExecutionOutcome,
     skill::{
+        SKILL_MAINTENANCE_DRAFT_SCHEMA_VERSION, SKILL_USAGE_RECEIPT_SCHEMA_VERSION,
         SkillMaintenanceDraft, SkillMaintenanceRecommendation, SkillMaintenanceValidation,
-        SkillUsageCounts, SkillUsageReceipt, SKILL_MAINTENANCE_DRAFT_SCHEMA_VERSION,
-        SKILL_USAGE_RECEIPT_SCHEMA_VERSION,
+        SkillUsageCounts, SkillUsageReceipt,
     },
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    execution_core::outcome_service::OUTCOME_EVENT_KIND, RuntimeEventScope, RuntimeEventStore,
-    RuntimeProjectionDescriptor, RuntimeProjectionEventInterest, RuntimeProjectionInterest,
-    RuntimeProjectionLane, RuntimeProjectionLatencyClass, RuntimeProjectionPass,
+    RuntimeEventScope, RuntimeEventStore, RuntimeProjectionDescriptor,
+    RuntimeProjectionEventInterest, RuntimeProjectionInterest, RuntimeProjectionLane,
+    RuntimeProjectionLatencyClass, RuntimeProjectionPass,
+    execution_core::outcome_service::OUTCOME_EVENT_KIND,
 };
 
 use super::usage::SKILL_USAGE_RECEIPT_EVENT_KIND;
@@ -624,9 +625,9 @@ mod tests {
     };
     use harness_contract::{
         outcome::{
-            OutcomeIdentity, OutcomeObservation, OutcomeQuality, OutcomeStrategyFeedback,
-            OutcomeTerminalClass, OutcomeTiming, OutcomeUsage, RuntimeIdentity, StrategyIdentity,
-            OUTCOME_SCHEMA_REVISION,
+            OUTCOME_SCHEMA_REVISION, OutcomeIdentity, OutcomeObservation, OutcomeQuality,
+            OutcomeStrategyFeedback, OutcomeTerminalClass, OutcomeTiming, OutcomeUsage,
+            RuntimeIdentity, StrategyIdentity,
         },
         reality::EvidenceCompleteness,
         skill::{SkillAdapterKind, SkillUsageKind},

@@ -31,8 +31,8 @@ pub use cross_plane::{CrossPlaneRuntimeError, CrossPlaneRuntimeService};
 pub use evidence::RuntimeEvidenceSummary;
 pub use evidence_writer::ResourceEvidenceWriterHealth;
 pub use goal::{
-    policy::InterventionPolicy, supervisor::ObjectiveReconcileDecision,
-    supervisor::ObjectiveSupervisor, GoalProgressReducer, GoalProjection, GoalStore,
+    GoalProgressReducer, GoalProjection, GoalStore, policy::InterventionPolicy,
+    supervisor::ObjectiveReconcileDecision, supervisor::ObjectiveSupervisor,
 };
 pub use graph::{
     ExecutionCommitService, ExecutionCompileError, ExecutionCompileRequest, ExecutionGraphCompiler,
@@ -59,15 +59,17 @@ pub use orchestration_binding::{
     runtime_orchestration_action_guidance, runtime_orchestration_actions,
 };
 pub use outcome_service::{
-    CalibrationOutcomeImportReceipt, LegacyOutcomeImportReceipt, OutcomeRecordReceipt,
-    OutcomeService, OUTCOME_EVENT_KIND, OUTCOME_IMPORT_EVENT_KIND,
+    CalibrationOutcomeImportReceipt, LegacyOutcomeImportReceipt, OUTCOME_EVENT_KIND,
+    OUTCOME_IMPORT_EVENT_KIND, OutcomeRecordReceipt, OutcomeService,
 };
 pub use pattern_catalog::{
-    execution_pattern_catalog_response, ExecutionPatternCatalog, RuntimeCompileTarget,
-    RuntimeExecutionPatternSpec,
+    ExecutionPatternCatalog, RuntimeCompileTarget, RuntimeExecutionPatternSpec,
+    execution_pattern_catalog_response,
 };
 pub use report::RuntimeExecutionReportSpec;
-pub use safety_fuse::{ComplexityBudget, ExecutionBudgetLease, SafetyFuseDecision, SafetyFusePolicy};
+pub use safety_fuse::{
+    ComplexityBudget, ExecutionBudgetLease, SafetyFuseDecision, SafetyFusePolicy,
+};
 #[cfg(feature = "test-fixtures")]
 pub use services::RuntimeFixtureEventPort;
 pub use services::{
@@ -76,9 +78,9 @@ pub use services::{
     SessionTerminalDeliveryPort,
 };
 pub use strategy_decision::{
-    build_runtime_execution_decision, RuntimeExecutionDecision, RuntimeExecutionPatternCandidate,
-    StrategyDecisionEngine, StrategyLease, StrategyResourceHealth, TurnStrategyActualOutcome,
-    TurnStrategyDecisionState, TurnStrategyDecisionStatus,
+    RuntimeExecutionDecision, RuntimeExecutionPatternCandidate, StrategyDecisionEngine,
+    StrategyLease, StrategyResourceHealth, TurnStrategyActualOutcome, TurnStrategyDecisionState,
+    TurnStrategyDecisionStatus, build_runtime_execution_decision,
 };
 pub use supervisor::{
     RuntimeExecutionHealth, RuntimeExecutionOwnerReport, RuntimeExecutionShutdownReport,

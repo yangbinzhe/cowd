@@ -655,11 +655,7 @@ mod tests {
             );
         }
         assert!(
-            crate::repetition_guard::is_dispatch_blocked(
-                turn,
-                "task_review",
-                &stable_hash(input)
-            ),
+            crate::repetition_guard::is_dispatch_blocked(turn, "task_review", &stable_hash(input)),
             "the key the refusal derives must be the key the recorder wrote"
         );
     }
@@ -717,19 +713,24 @@ mod tests {
         assert_eq!(event.status.as_deref(), Some("completed"));
         assert_eq!(event.payload["contract_version"], TOOL_CONTRACT_VERSION);
         assert_eq!(event.payload["stale_registration"], false);
-        assert!(event.payload["advertised_registration_id"]
-            .as_str()
-            .unwrap()
-            .starts_with("tool-reg:v3:read_only:read"));
+        assert!(
+            event.payload["advertised_registration_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("tool-reg:v3:read_only:read")
+        );
         assert_eq!(event.payload["duration_ms"], 25);
-        assert!(event
-            .refs
-            .iter()
-            .any(|reference| { reference.ref_type == "tool_call" && reference.id == "toolu-1" }));
-        assert!(event
-            .refs
-            .iter()
-            .any(|reference| { reference.ref_type == "tool" && reference.id == "read" }));
+        assert!(
+            event.refs.iter().any(|reference| {
+                reference.ref_type == "tool_call" && reference.id == "toolu-1"
+            })
+        );
+        assert!(
+            event
+                .refs
+                .iter()
+                .any(|reference| { reference.ref_type == "tool" && reference.id == "read" })
+        );
     }
 
     #[test]
@@ -814,10 +815,12 @@ mod tests {
         assert!(event.payload["preview_tokens"].as_u64().unwrap() > 0);
         assert!(event.payload["context_saved_tokens"].as_u64().unwrap() > 0);
         assert!(event.payload["context_saved_ratio"].as_u64().unwrap() > 0);
-        assert!(event.payload["full_output_ref"]
-            .as_str()
-            .unwrap()
-            .starts_with("tool-output:toolu-large"));
+        assert!(
+            event.payload["full_output_ref"]
+                .as_str()
+                .unwrap()
+                .starts_with("tool-output:toolu-large")
+        );
         assert_eq!(
             event.payload["output_ref"]["search_hint"],
             "Tool output `toolu-large` will receive an evidence reference."
@@ -845,10 +848,12 @@ mod tests {
             record.evidence_reference(),
             "tool://tool-raw-toolu-large-deadbeef"
         );
-        assert!(record
-            .output_ref
-            .as_ref()
-            .is_some_and(|reference| reference.search_hint.contains("evidence_retrieve")));
+        assert!(
+            record
+                .output_ref
+                .as_ref()
+                .is_some_and(|reference| reference.search_hint.contains("evidence_retrieve"))
+        );
     }
 
     #[test]

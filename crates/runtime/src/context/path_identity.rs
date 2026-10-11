@@ -299,7 +299,7 @@ impl WorkspacePathIdentityResolver {
             _ => {
                 return Err(WorkspacePathIdentityError::InvalidScope(
                     raw_scope.to_string(),
-                ))
+                ));
             }
         };
         let identity = if allow_missing {
@@ -1287,18 +1287,24 @@ mod tests {
         truncated["truncated"] = serde_json::Value::Bool(true);
         truncated["file"]["content"] = serde_json::Value::String("one\n".to_string());
         truncated["file"]["numLines"] = serde_json::json!(1);
-        assert!(resolver
-            .observe_complete_read_tool_output("read_file", &truncated, 8)
-            .is_err());
+        assert!(
+            resolver
+                .observe_complete_read_tool_output("read_file", &truncated, 8)
+                .is_err()
+        );
 
         let mut invalid_digest = complete.clone();
         invalid_digest["file"]["sha256"] = serde_json::json!("not-a-digest");
-        assert!(resolver
-            .observe_complete_read_tool_output("read_file", &invalid_digest, 9)
-            .is_err());
-        assert!(resolver
-            .observe_complete_read_tool_output("grep_search", &complete, 10)
-            .is_err());
+        assert!(
+            resolver
+                .observe_complete_read_tool_output("read_file", &invalid_digest, 9)
+                .is_err()
+        );
+        assert!(
+            resolver
+                .observe_complete_read_tool_output("grep_search", &complete, 10)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1457,11 +1463,13 @@ mod tests {
         retained_changed_digest.provenance =
             harness_contract::context::ObservedEvidenceProvenance::RetainedReplay;
 
-        assert!(fresh_novel_observed_evidence_fingerprints(
-            std::slice::from_ref(&prior),
-            std::slice::from_ref(&same_fact_new_sequence),
-        )
-        .is_empty());
+        assert!(
+            fresh_novel_observed_evidence_fingerprints(
+                std::slice::from_ref(&prior),
+                std::slice::from_ref(&same_fact_new_sequence),
+            )
+            .is_empty()
+        );
         assert_eq!(
             fresh_novel_observed_evidence_fingerprints(
                 std::slice::from_ref(&prior),
@@ -1469,11 +1477,13 @@ mod tests {
             ),
             BTreeSet::from([observed_evidence_fingerprint(&changed_digest)])
         );
-        assert!(fresh_novel_observed_evidence_fingerprints(
-            std::slice::from_ref(&prior),
-            std::slice::from_ref(&retained_changed_digest),
-        )
-        .is_empty());
+        assert!(
+            fresh_novel_observed_evidence_fingerprints(
+                std::slice::from_ref(&prior),
+                std::slice::from_ref(&retained_changed_digest),
+            )
+            .is_empty()
+        );
         assert_eq!(
             observed_evidence_fingerprint(&changed_digest),
             observed_evidence_fingerprint(&retained_changed_digest),

@@ -21,10 +21,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    runtime_event_store::{AppendTransactionRequest, ExpectedStreamRevision},
     ApprovalQueue, ApprovalSource, ApprovalSourceKind, ApprovalTimeoutPolicy,
     GlobalApprovalRequest, GlobalApprovalStatus, RuntimeEventInput, RuntimeEventRef,
     RuntimeEventScope, RuntimeEventStore, VerifiedDecisionLease, VerifiedPrincipal,
+    runtime_event_store::{AppendTransactionRequest, ExpectedStreamRevision},
 };
 
 const REVIEW_STREAM_PREFIX: &str = "skill-revision-review:";
@@ -567,7 +567,7 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use harness_contract::skill::{
-        SkillMaintenanceValidation, SkillUsageCounts, SKILL_MAINTENANCE_DRAFT_SCHEMA_VERSION,
+        SKILL_MAINTENANCE_DRAFT_SCHEMA_VERSION, SkillMaintenanceValidation, SkillUsageCounts,
     };
 
     fn service() -> SkillRevisionGovernanceService {

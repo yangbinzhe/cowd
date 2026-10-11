@@ -120,13 +120,17 @@ mod tests {
 
         assert!(contract.cli_is_minimal_control);
         assert_eq!(contract.cli.role, "minimal_core_control");
-        assert!(contract
-            .cli
-            .constraints
-            .contains(&"no_complex_state_management".to_string()));
-        assert!(!contract
-            .cli
-            .primary_actions
-            .contains(&"batch_manage".to_string()));
+        assert!(
+            contract
+                .cli
+                .constraints
+                .contains(&"no_complex_state_management".to_string())
+        );
+        assert!(
+            !contract
+                .cli
+                .primary_actions
+                .contains(&"batch_manage".to_string())
+        );
     }
 }

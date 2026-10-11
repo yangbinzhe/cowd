@@ -200,13 +200,17 @@ mod tests {
 
         assert!(report.ok, "{report:#?}");
         assert!(report.repair_plan.is_empty());
-        assert!(report
-            .checks
-            .iter()
-            .any(|check| check.id == "runtime.no_surface_sdk_dependency"));
-        assert!(report
-            .checks
-            .iter()
-            .any(|check| check.id == "harness_eval.repair_hints"));
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.id == "runtime.no_surface_sdk_dependency")
+        );
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.id == "harness_eval.repair_hints")
+        );
     }
 }

@@ -1,8 +1,8 @@
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
-        atomic::{AtomicU64, Ordering},
         Mutex,
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -482,7 +482,9 @@ impl ProviderTransportPool {
                 (candidate, lcp)
             })
             .max_by_key(|(_, lcp)| *lcp);
-        let best_bytes = best.map(|(candidate, _)| candidate.bytes.clone()).unwrap_or_default();
+        let best_bytes = best
+            .map(|(candidate, _)| candidate.bytes.clone())
+            .unwrap_or_default();
         let predecessor_request_id = best.map(|(candidate, _)| candidate.request_id.clone());
         let reusable_prefix_bytes = best.map_or(0, |(_, lcp)| lcp);
         let exact_extension = best.is_some_and(|(candidate, lcp)| lcp == candidate.bytes.len());
@@ -715,7 +717,7 @@ fn encode_messages(items: &[&str]) -> Vec<u8> {
 
 #[cfg(test)]
 mod prefix_wiring_tests {
-    use super::{encode_messages, ProviderTransportPool};
+    use super::{ProviderTransportPool, encode_messages};
 
     /// A history that only GROWS is a pure append: reuse is total and there is no
     /// divergence to attribute. That is the healthy case.
@@ -724,13 +726,21 @@ mod prefix_wiring_tests {
         let pool = ProviderTransportPool::new(4);
         let stable = 13_usize; // "10:system_msg\n"
         let first = encode_messages(&["system_msg", "history_msg"]);
-        pool.observe_prompt_prefix("sha256:id".to_string(), "r1".to_string(), first.clone(), stable);
+        pool.observe_prompt_prefix(
+            "sha256:id".to_string(),
+            "r1".to_string(),
+            first.clone(),
+            stable,
+        );
 
         let second = encode_messages(&["system_msg", "history_msg", "history_msg2"]);
         let observation =
             pool.observe_prompt_prefix("sha256:id".to_string(), "r2".to_string(), second, stable);
 
-        assert!(observation.exact_extension, "the first prompt is a prefix of the second");
+        assert!(
+            observation.exact_extension,
+            "the first prompt is a prefix of the second"
+        );
         assert_eq!(
             observation.divergence_segment, None,
             "a pure append is not a divergence"
@@ -781,7 +791,10 @@ mod prefix_wiring_tests {
             13,
         );
         assert_eq!(observation.divergence_segment, None);
-        assert_eq!(observation.invalidation_reason.as_deref(), Some("cold_identity"));
+        assert_eq!(
+            observation.invalidation_reason.as_deref(),
+            Some("cold_identity")
+        );
     }
 
     #[test]

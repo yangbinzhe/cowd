@@ -16,8 +16,8 @@ pub use reducer::{ModelWorkReducer, ModelWorkReductionInput, ReducedModelWork};
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use harness_contract::execution_graph::{
         ExecutionDependencyPolicy, ExecutionNodeKind, ExecutionWorkRole,
@@ -167,10 +167,12 @@ mod tests {
             },
         );
         assert_eq!(automatic.topology, ModelWorkTopology::Downgraded);
-        assert!(automatic
-            .reasons
-            .iter()
-            .any(|reason| reason == "token_amplification_above_threshold"));
+        assert!(
+            automatic
+                .reasons
+                .iter()
+                .any(|reason| reason == "token_amplification_above_threshold")
+        );
 
         let explicit = ModelWorkGraphEstimator.estimate(
             &graph,
@@ -184,10 +186,12 @@ mod tests {
             },
         );
         assert_eq!(explicit.topology, ModelWorkTopology::Pipelined);
-        assert!(explicit
-            .reasons
-            .iter()
-            .any(|reason| reason == "user_mandated_topology_retained_with_cost_warning"));
+        assert!(
+            explicit
+                .reasons
+                .iter()
+                .any(|reason| reason == "user_mandated_topology_retained_with_cost_warning")
+        );
     }
 
     #[test]

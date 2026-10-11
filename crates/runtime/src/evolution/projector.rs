@@ -1276,8 +1276,8 @@ mod tests {
     use super::*;
     use harness_contract::{
         outcome::{
-            OutcomeIdentity, OutcomeObservation, OutcomeQuality, OutcomeTiming, OutcomeUsage,
-            RuntimeIdentity, StrategyIdentity, OUTCOME_SCHEMA_REVISION,
+            OUTCOME_SCHEMA_REVISION, OutcomeIdentity, OutcomeObservation, OutcomeQuality,
+            OutcomeTiming, OutcomeUsage, RuntimeIdentity, StrategyIdentity,
         },
         reality::EvidenceCompleteness,
         strategy::ExecutionCandidateKind,
@@ -1885,10 +1885,12 @@ mod tests {
                 .source_cursor,
             commit_cursor
         );
-        assert!(events
-            .list_stream(PROJECTOR_STREAM)
-            .expect("projector stream")
-            .is_empty());
+        assert!(
+            events
+                .list_stream(PROJECTOR_STREAM)
+                .expect("projector stream")
+                .is_empty()
+        );
         assert_eq!(projector.run_once(64).expect("idempotent pass"), 0);
     }
 
@@ -1917,10 +1919,12 @@ mod tests {
 
         assert_eq!(projector.run_once(64).expect("bootstrap"), 0);
         assert_eq!(discovery.list_cases(25).expect("cases").len(), 1);
-        assert!(events
-            .projection_checkpoint(LEGACY_BOOTSTRAP_ID)
-            .expect("checkpoint")
-            .is_some());
+        assert!(
+            events
+                .projection_checkpoint(LEGACY_BOOTSTRAP_ID)
+                .expect("checkpoint")
+                .is_some()
+        );
         assert_eq!(projector.run_once(64).expect("idempotent restart"), 0);
         assert_eq!(discovery.case_index().expect("case index").total_cases, 1);
     }
@@ -1960,10 +1964,12 @@ mod tests {
             .expect("valid legacy signal");
 
         projector.run_once(64).expect("bounded bootstrap");
-        assert!(discovery
-            .signal("valid-after-malformed")
-            .expect("canonical signal lookup")
-            .is_some());
+        assert!(
+            discovery
+                .signal("valid-after-malformed")
+                .expect("canonical signal lookup")
+                .is_some()
+        );
         let checkpoint = events
             .projection_checkpoint(LEGACY_BOOTSTRAP_ID)
             .expect("checkpoint read")
@@ -1986,11 +1992,13 @@ mod tests {
         let cases = discovery.list_cases(25).expect("cases");
         assert_eq!(cases.len(), 1);
         assert_eq!(cases[0].state, crate::EvolutionCaseState::Ready);
-        assert!(events
-            .list_scope(RuntimeEventScope::Evolution, 1_000)
-            .expect("events")
-            .iter()
-            .all(|event| !event.kind.contains("stable")));
+        assert!(
+            events
+                .list_scope(RuntimeEventScope::Evolution, 1_000)
+                .expect("events")
+                .iter()
+                .all(|event| !event.kind.contains("stable"))
+        );
     }
 
     #[test]

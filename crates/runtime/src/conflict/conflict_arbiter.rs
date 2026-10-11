@@ -218,9 +218,11 @@ mod tests {
 
         assert_eq!(receipt.decision, ConflictDecisionKind::PauseAffectedScope);
         assert_eq!(receipt.mission_evidence.kind, "conflict");
-        assert!(arbiter
-            .receipts()
-            .iter()
-            .any(|item| item.conflict_id == receipt.conflict_id));
+        assert!(
+            arbiter
+                .receipts()
+                .iter()
+                .any(|item| item.conflict_id == receipt.conflict_id)
+        );
     }
 }

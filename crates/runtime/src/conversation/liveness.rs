@@ -336,7 +336,10 @@ mod tests {
             "a wall clock must never be able to terminate a turn (PLAN I1)"
         );
         assert!(contract.inactivity_window > Duration::ZERO);
-        assert!(contract.escalation_budget > 0, "an escalation ladder is required");
+        assert!(
+            contract.escalation_budget > 0,
+            "an escalation ladder is required"
+        );
         assert_eq!(
             action_for_step(contract.escalation_budget, contract.escalation_budget),
             LivenessAction::Ask,
@@ -475,10 +478,9 @@ mod guard_tests {
             },
             |verdict| unreachable!("a productive stream must never be stalled: {verdict:?}"),
         );
-        let collected =
-            tokio::time::timeout(Duration::from_secs(10), guarded.collect::<Vec<_>>())
-                .await
-                .expect("a productive stream must run to completion");
+        let collected = tokio::time::timeout(Duration::from_secs(10), guarded.collect::<Vec<_>>())
+            .await
+            .expect("a productive stream must run to completion");
         assert_eq!(collected.len(), items as usize);
         assert!(collected.iter().all(Result::is_ok));
     }
@@ -655,7 +657,9 @@ impl TerminalTracker {
         }
         let since = since_satisfied.unwrap_or(Duration::ZERO);
         if since < self.obligation.commit_window {
-            return TerminalVerdict::WithinWindow { since_satisfied: since };
+            return TerminalVerdict::WithinWindow {
+                since_satisfied: since,
+            };
         }
         if self.requests_issued >= self.obligation.commit_budget {
             return TerminalVerdict::NonCommitting {
@@ -766,7 +770,10 @@ mod terminal_tests {
             saw_terminal_marker: false,
             committed_terminal: true,
         };
-        assert_eq!(tracker.evaluate(&progress, None), TerminalVerdict::Committed);
+        assert_eq!(
+            tracker.evaluate(&progress, None),
+            TerminalVerdict::Committed
+        );
     }
 
     #[test]
@@ -843,7 +850,7 @@ mod terminal_tests {
                     TerminalVerdict::Committed
                 } else {
                     TerminalVerdict::WithinWindow {
-                        since_satisfied: Duration::from_secs(1)
+                        since_satisfied: Duration::from_secs(1),
                     }
                 },
                 "a prompt commit must never be asked for"

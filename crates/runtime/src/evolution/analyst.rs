@@ -9,8 +9,8 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use harness_contract::evolution::{
-    evolution_analysis_contract_digest, EvolutionAnalysisDraft, EvolutionAnalysisHypothesis,
-    EvolutionAnalysisModelOutput, EvolutionAnalysisUsage,
+    EvolutionAnalysisDraft, EvolutionAnalysisHypothesis, EvolutionAnalysisModelOutput,
+    EvolutionAnalysisUsage, evolution_analysis_contract_digest,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -747,10 +747,12 @@ mod tests {
         open_signal.scope.affected_subject = "open-case".to_string();
         discovery.record_signal(open_signal).expect("open signal");
         let case = discovery.list_cases(1).expect("open case").remove(0);
-        assert!(analyst
-            .prepare(&case.case_id)
-            .unwrap_err()
-            .contains("not_ready"));
+        assert!(
+            analyst
+                .prepare(&case.case_id)
+                .unwrap_err()
+                .contains("not_ready")
+        );
 
         for index in 0..3 {
             let mut signal = crate::EvolutionSignal::new(crate::EvolutionSignalInput {
@@ -787,16 +789,20 @@ mod tests {
             .find(|case| case.key.affected_subject == "recovery")
             .expect("ready case");
         let prepared = analyst.prepare(&ready_case.case_id).expect("prepared");
-        assert!(prepared
-            .packet
-            .evidence
-            .iter()
-            .any(|evidence| evidence.observation.contains("[REDACTED]")));
-        assert!(prepared
-            .packet
-            .evidence
-            .iter()
-            .all(|evidence| !evidence.observation.contains("live-credential")));
+        assert!(
+            prepared
+                .packet
+                .evidence
+                .iter()
+                .any(|evidence| evidence.observation.contains("[REDACTED]"))
+        );
+        assert!(
+            prepared
+                .packet
+                .evidence
+                .iter()
+                .all(|evidence| !evidence.observation.contains("live-credential"))
+        );
     }
 
     #[test]
@@ -880,9 +886,11 @@ mod tests {
                 .expect("existing"),
             EvolutionAnalysisClaim::Existing(_)
         ));
-        assert!(events
-            .replay_scope_stream_prefix(RuntimeEventScope::Evolution, "evolution:candidate:")
-            .expect("candidates")
-            .is_empty());
+        assert!(
+            events
+                .replay_scope_stream_prefix(RuntimeEventScope::Evolution, "evolution:candidate:")
+                .expect("candidates")
+                .is_empty()
+        );
     }
 }

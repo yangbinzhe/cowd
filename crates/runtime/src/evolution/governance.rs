@@ -3482,12 +3482,16 @@ mod tests {
         let assignments = reopened
             .release_assignments()
             .expect("recovered assignments");
-        assert!(assignments
-            .iter()
-            .any(|assignment| assignment.action == ReleaseChangeAction::PromoteCanary));
-        assert!(assignments
-            .iter()
-            .any(|assignment| assignment.action == ReleaseChangeAction::PromoteStable));
+        assert!(
+            assignments
+                .iter()
+                .any(|assignment| assignment.action == ReleaseChangeAction::PromoteCanary)
+        );
+        assert!(
+            assignments
+                .iter()
+                .any(|assignment| assignment.action == ReleaseChangeAction::PromoteStable)
+        );
         assert_eq!(
             reopened
                 .review(
@@ -3532,14 +3536,16 @@ mod tests {
             Arc::clone(&store),
             Arc::new(ApprovalQueue::new(store)),
         );
-        assert!(final_service
-            .release_assignments()
-            .expect("final recovered assignments")
-            .iter()
-            .any(|assignment| {
-                assignment.action == ReleaseChangeAction::Rollback
-                    && assignment.selector
-                        == Some(RevisionSelector::ExactApprovedRevision { revision: 1 })
-            }));
+        assert!(
+            final_service
+                .release_assignments()
+                .expect("final recovered assignments")
+                .iter()
+                .any(|assignment| {
+                    assignment.action == ReleaseChangeAction::Rollback
+                        && assignment.selector
+                            == Some(RevisionSelector::ExactApprovedRevision { revision: 1 })
+                })
+        );
     }
 }

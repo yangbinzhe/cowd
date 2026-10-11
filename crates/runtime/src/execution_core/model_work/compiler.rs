@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
 use harness_contract::execution_graph::{
-    validate_execution_graph, ExecutionEdge, ExecutionEdgeKind, ExecutionGraph,
-    ExecutionGraphValidationError, ExecutionNodeSpec, ExecutionWorkContract,
+    ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionGraphValidationError,
+    ExecutionNodeSpec, ExecutionWorkContract, validate_execution_graph,
 };
 use thiserror::Error;
 

@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -12,7 +12,7 @@ use harness_contract::execution_graph::{
     ExecutionGraph, ExecutionGraphCommand, ExecutionGraphProjection,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, Notify, Semaphore};
+use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 
 use super::graph::{
@@ -1897,9 +1897,7 @@ mod completion_pump_tests {
                 return Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
                     status: ExecutionNodeStatus::WaitingExternal,
                     result_ref: Some("agentic-program-wait:external-wait:revision:1".to_string()),
-                    wait_class: Some(
-                        harness_contract::execution_graph::ExternalWaitClass::Barrier,
-                    ),
+                    wait_class: Some(harness_contract::execution_graph::ExternalWaitClass::Barrier),
                     summary: None,
                     evidence_refs: Vec::new(),
                     failure: None,
@@ -2064,12 +2062,16 @@ mod completion_pump_tests {
             let supervisor = supervisor.clone();
             tokio::spawn(async move { supervisor.shutdown().await })
         };
-        assert!(tokio::time::timeout(Duration::from_millis(20), &mut second)
-            .await
-            .is_err());
-        assert!(tokio::time::timeout(Duration::from_millis(20), &mut third)
-            .await
-            .is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut second)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut third)
+                .await
+                .is_err()
+        );
         assert_eq!(supervisor.health().lifecycle, "closing");
         release.notify_one();
         let second = tokio::time::timeout(Duration::from_secs(1), second)

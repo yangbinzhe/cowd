@@ -6,12 +6,12 @@
 use std::collections::BTreeMap;
 
 use harness_contract::mission::{
-    MissionControlActionReadiness, MissionControlAgentNode, MissionControlApprovalNode,
-    MissionControlEventDigest, MissionControlEventLine, MissionControlGraphEdge,
-    MissionControlGraphNode, MissionControlGraphProjection, MissionControlMissionSummary,
-    MissionControlProjection, MissionControlReadiness, MissionControlSessionNode,
-    MissionControlSummary, MissionControlTaskNode, MissionControlTeamNode,
-    MissionWorkspaceProjection, MISSION_CONTROL_SCHEMA_VERSION,
+    MISSION_CONTROL_SCHEMA_VERSION, MissionControlActionReadiness, MissionControlAgentNode,
+    MissionControlApprovalNode, MissionControlEventDigest, MissionControlEventLine,
+    MissionControlGraphEdge, MissionControlGraphNode, MissionControlGraphProjection,
+    MissionControlMissionSummary, MissionControlProjection, MissionControlReadiness,
+    MissionControlSessionNode, MissionControlSummary, MissionControlTaskNode,
+    MissionControlTeamNode, MissionWorkspaceProjection,
 };
 use sha2::{Digest, Sha256};
 
@@ -1676,10 +1676,12 @@ mod tests {
             researcher.display_provenance.as_deref(),
             Some("runtime.agentic_program_projection")
         );
-        assert!(researcher
-            .display_digest
-            .as_deref()
-            .is_some_and(|digest| digest.starts_with("sha256:")));
+        assert!(
+            researcher
+                .display_digest
+                .as_deref()
+                .is_some_and(|digest| digest.starts_with("sha256:"))
+        );
     }
 
     #[test]
@@ -1700,12 +1702,14 @@ mod tests {
     fn agentic_team_without_canonical_task_graph_binding_is_not_assigned_to_a_mission() {
         let programs = vec![agentic_program_fixture()];
         assert!(team_nodes(&programs, &BTreeMap::new()).is_empty());
-        assert!(agent_nodes(
-            &serde_json::json!({ "agents": [] }),
-            &programs,
-            &BTreeMap::new(),
-        )
-        .is_empty());
+        assert!(
+            agent_nodes(
+                &serde_json::json!({ "agents": [] }),
+                &programs,
+                &BTreeMap::new(),
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -1792,11 +1796,13 @@ mod tests {
         assert!(team_create.available);
         assert_eq!(team_create.target_count, 1);
         assert!(!team_create.reason.is_empty());
-        assert!(projection
-            .mission_graph
-            .nodes
-            .iter()
-            .any(|node| node.node_id == "session:session-a"));
+        assert!(
+            projection
+                .mission_graph
+                .nodes
+                .iter()
+                .any(|node| node.node_id == "session:session-a")
+        );
     }
 
     #[test]
@@ -1852,18 +1858,24 @@ mod tests {
             &digest,
             true,
         );
-        assert!(graph
-            .nodes
-            .iter()
-            .any(|node| node.node_id == "schedule:schedule-1"));
-        assert!(graph
-            .nodes
-            .iter()
-            .any(|node| node.kind == "conflict" && node.status == "attention"));
-        assert!(graph
-            .nodes
-            .iter()
-            .any(|node| node.kind == "recovery" && node.status == "attention"));
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.node_id == "schedule:schedule-1")
+        );
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.kind == "conflict" && node.status == "attention")
+        );
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.kind == "recovery" && node.status == "attention")
+        );
     }
 
     #[test]

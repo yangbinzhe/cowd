@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use harness_contract::agent::AgentTaskPacket;
 use harness_contract::execution_graph::{
-    apply_node_transition, validate_execution_graph, ExecutionEdge, ExecutionGraph,
-    ExecutionGraphCommand, ExecutionNodeKind, ExecutionNodeResult, ExecutionNodeSpec,
-    ExecutionNodeStatus, ExecutionTransitionError,
+    ExecutionEdge, ExecutionGraph, ExecutionGraphCommand, ExecutionNodeKind, ExecutionNodeResult,
+    ExecutionNodeSpec, ExecutionNodeStatus, ExecutionTransitionError, apply_node_transition,
+    validate_execution_graph,
 };
 use harness_contract::tool::{ToolEffectDescriptor, ToolEffectKind, ToolIdempotency};
 use serde_json::json;
@@ -83,9 +83,7 @@ pub enum ExecutionCommitError {
     Transition(#[from] ExecutionTransitionError),
     #[error("execution graph commit serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
-    #[error(
-        "execution graph `{graph_id}` revision mismatch: expected {expected}, actual {actual}"
-    )]
+    #[error("execution graph `{graph_id}` revision mismatch: expected {expected}, actual {actual}")]
     StaleRevision {
         graph_id: String,
         expected: u64,
@@ -241,9 +239,9 @@ impl ExecutionCommitService {
             attempt += 1;
             match self.commit_readonly_tool_receipts_once(receipts) {
                 Ok(()) => return Ok(()),
-                Err(ExecutionCommitError::EventStore(
-                    RuntimeEventStoreError::StaleRevision { .. },
-                )) if attempt < MAX_ATTEMPTS => continue,
+                Err(ExecutionCommitError::EventStore(RuntimeEventStoreError::StaleRevision {
+                    ..
+                })) if attempt < MAX_ATTEMPTS => continue,
                 Err(error) => return Err(error),
             }
         }
@@ -509,9 +507,9 @@ impl ExecutionCommitService {
             attempt += 1;
             match self.commit_tool_effect_once(request, effect, outcome) {
                 Ok(()) => return Ok(()),
-                Err(ExecutionCommitError::EventStore(
-                    RuntimeEventStoreError::StaleRevision { .. },
-                )) if attempt < MAX_ATTEMPTS => continue,
+                Err(ExecutionCommitError::EventStore(RuntimeEventStoreError::StaleRevision {
+                    ..
+                })) if attempt < MAX_ATTEMPTS => continue,
                 Err(error) => return Err(error),
             }
         }
@@ -1523,8 +1521,8 @@ impl ExecutionCommitService {
                     || parked.is_none()
                     || wait_class.is_none_or(|class| {
                         class != harness_contract::execution_graph::ExternalWaitClass::Barrier
-                            && class
-                                != harness_contract::execution_graph::ExternalWaitClass::Authoritative
+                        && class
+                            != harness_contract::execution_graph::ExternalWaitClass::Authoritative
                     })
                 {
                     return Err(ExecutionCommitError::InvalidCommand(format!(
@@ -1545,14 +1543,15 @@ impl ExecutionCommitService {
                 // parts; requiring four refused every release as unanchored.
                 let anchored = match parked.as_deref() {
                     Some(parked_ref) if parked_ref.starts_with("agentic-program-wait:") => {
-                        parked_ref.rsplit_once(":revision:").is_some_and(|(subject, rev)| {
-                            correlation_id.starts_with(&format!("{subject}:"))
-                                && correlation_id.ends_with(&format!(":{rev}"))
-                        })
+                        parked_ref
+                            .rsplit_once(":revision:")
+                            .is_some_and(|(subject, rev)| {
+                                correlation_id.starts_with(&format!("{subject}:"))
+                                    && correlation_id.ends_with(&format!(":{rev}"))
+                            })
                     }
-                    Some(parked_ref) => parked_ref.starts_with(&format!(
-                        "session_handoff_accepted:{correlation_id}:"
-                    )),
+                    Some(parked_ref) => parked_ref
+                        .starts_with(&format!("session_handoff_accepted:{correlation_id}:")),
                     None => false,
                 };
                 if !anchored {

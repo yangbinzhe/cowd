@@ -179,10 +179,12 @@ pub(crate) fn stopped_source_revisions(
     source: &crate::AgenticProgramProjection,
 ) -> Result<std::collections::BTreeMap<String, u64>, String> {
     let graphs = crate::ExecutionGraphStateStore::new(Arc::clone(store));
-    let mut pending = vec![source
-        .root_execution_id
-        .clone()
-        .ok_or("source root missing")?];
+    let mut pending = vec![
+        source
+            .root_execution_id
+            .clone()
+            .ok_or("source root missing")?,
+    ];
     for task in source.tasks.values() {
         pending.extend(task.active_attempts.keys().cloned());
         pending.extend(task.claim_execution_id.iter().cloned());
@@ -628,9 +630,11 @@ mod tests {
         assert_eq!(candidate.source_root_id, "root-old");
         assert_eq!(candidate.team_set_ref, "agentic_program:program-old");
         assert!(revision > 0);
-        assert!(candidate
-            .result_refs
-            .contains(&"agentic_program:program-old".to_string()));
+        assert!(
+            candidate
+                .result_refs
+                .contains(&"agentic_program:program-old".to_string())
+        );
     }
 
     #[test]
@@ -646,11 +650,13 @@ mod tests {
         let event = graph_continuation_claim_event(&binding, "root-new").expect("event");
         assert_eq!(event.event.stream_id, CONTINUATION_CAS_STREAM);
         assert_eq!(event.event.kind, "team.continuation.root_claimed.v2");
-        assert!(event
-            .event
-            .refs
-            .iter()
-            .any(|reference| reference.kind == "execution_graph" && reference.id == "root-new"));
+        assert!(
+            event
+                .event
+                .refs
+                .iter()
+                .any(|reference| reference.kind == "execution_graph" && reference.id == "root-new")
+        );
 
         let mut tampered = binding;
         tampered.result_refs.push("unverified:ref".to_string());

@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::execution_core::graph::{ExecutionResourceKind, ResourceQuota};
 use crate::ProviderRegistrySnapshot;
+use crate::execution_core::graph::{ExecutionResourceKind, ResourceQuota};
 
 const TOKEN_PRESSURE_QUANTUM: u64 = 4_096;
 const TOKEN_PRESSURE_PER_REQUEST: usize = 256;

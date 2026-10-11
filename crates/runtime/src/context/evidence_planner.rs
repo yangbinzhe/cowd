@@ -5,12 +5,12 @@
 //! in the conversation runtime.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use harness_contract::strategy::TaskUnderstanding;
 
-use crate::context_fanout::{plan_context_fanout_for_intent, FanoutToolCall};
-use crate::intent_planner::{classify_intent, classify_understanding, TaskIntent};
+use crate::context_fanout::{FanoutToolCall, plan_context_fanout_for_intent};
+use crate::intent_planner::{TaskIntent, classify_intent, classify_understanding};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -307,14 +307,16 @@ mod tests {
         let plan = plan_evidence("我已经更新，看是否最新的readme还有问题");
 
         assert_eq!(plan.mode, EvidenceAcquisitionMode::SmallEvidence);
-        assert!(plan
-            .recommended_calls
-            .iter()
-            .any(|call| call.name == "tool_orchestrate"));
-        assert!(plan
-            .avoid_patterns
-            .iter()
-            .any(|item| item.contains("README/docs")));
+        assert!(
+            plan.recommended_calls
+                .iter()
+                .any(|call| call.name == "tool_orchestrate")
+        );
+        assert!(
+            plan.avoid_patterns
+                .iter()
+                .any(|item| item.contains("README/docs"))
+        );
     }
 
     #[test]
@@ -323,10 +325,11 @@ mod tests {
             plan_evidence("全盘分析 runtime gateway surface 架构并行协同能力，给出深度实施方案");
 
         assert_eq!(plan.mode, EvidenceAcquisitionMode::ComplexEvidence);
-        assert!(plan
-            .use_subagents_when
-            .iter()
-            .any(|item| item.contains("subagent") || item.contains("team")));
+        assert!(
+            plan.use_subagents_when
+                .iter()
+                .any(|item| item.contains("subagent") || item.contains("team"))
+        );
     }
 
     #[test]
@@ -334,18 +337,21 @@ mod tests {
         let plan = plan_evidence("审查 README、代码架构调用链和 runtime supervisor 接线是否一致");
 
         assert_eq!(plan.mode, EvidenceAcquisitionMode::ComplexEvidence);
-        assert!(plan
-            .recommended_calls
-            .iter()
-            .any(|call| call.name == "tool_orchestrate"));
-        assert!(plan
-            .recommended_calls
-            .iter()
-            .any(|call| call.name == "grep_search" || call.name == "workspace_snapshot"));
-        assert!(plan
-            .use_subagents_when
-            .iter()
-            .any(|item| item.contains("subagent") || item.contains("team")));
+        assert!(
+            plan.recommended_calls
+                .iter()
+                .any(|call| call.name == "tool_orchestrate")
+        );
+        assert!(
+            plan.recommended_calls
+                .iter()
+                .any(|call| call.name == "grep_search" || call.name == "workspace_snapshot")
+        );
+        assert!(
+            plan.use_subagents_when
+                .iter()
+                .any(|item| item.contains("subagent") || item.contains("team"))
+        );
     }
 
     #[test]
@@ -353,14 +359,16 @@ mod tests {
         let plan = plan_evidence("审查 README 与架构是否一致");
 
         assert_eq!(plan.mode, EvidenceAcquisitionMode::ComplexEvidence);
-        assert!(plan
-            .recommended_calls
-            .iter()
-            .any(|call| call.name == "tool_orchestrate"));
-        assert!(plan
-            .recommended_calls
-            .iter()
-            .any(|call| call.name == "grep_search" || call.name == "workspace_snapshot"));
+        assert!(
+            plan.recommended_calls
+                .iter()
+                .any(|call| call.name == "tool_orchestrate")
+        );
+        assert!(
+            plan.recommended_calls
+                .iter()
+                .any(|call| call.name == "grep_search" || call.name == "workspace_snapshot")
+        );
     }
 
     #[test]

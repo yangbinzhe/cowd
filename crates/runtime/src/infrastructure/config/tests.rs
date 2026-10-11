@@ -1,12 +1,13 @@
 use super::{
-    deep_merge_objects, parse_optional_compression_config, parse_optional_context_budget_config,
+    AppActivationPolicyV1, AppsConfig, COWD_SETTINGS_SCHEMA_NAME, ConfigLoader, ConfigSource,
+    DomainProfile, GatewayConfig, McpServerConfig, McpTransport, PathBuf, ProviderProtocol,
+    ResolvedPermissionMode, RoutingMode, RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig,
+    RuntimePluginConfig, SessionCompactConfig, StorageBackendSelection, deep_merge_objects,
+    parse_optional_compression_config, parse_optional_context_budget_config,
     parse_optional_gateway_config, parse_optional_hot_state_config,
     parse_optional_model_context_windows, parse_optional_session_history_config,
     parse_optional_storage_config, parse_permission_mode_label, parse_routing_mode,
-    redact_serde_json, AppActivationPolicyV1, AppsConfig, ConfigLoader, ConfigSource,
-    DomainProfile, GatewayConfig, McpServerConfig, McpTransport, PathBuf, ProviderProtocol,
-    ResolvedPermissionMode, RoutingMode, RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig,
-    RuntimePluginConfig, SessionCompactConfig, StorageBackendSelection, COWD_SETTINGS_SCHEMA_NAME,
+    redact_serde_json,
 };
 use crate::json::JsonValue;
 use crate::sandbox::FilesystemIsolationMode;
@@ -67,9 +68,11 @@ fn rejects_non_object_settings_files() {
     let error = ConfigLoader::new(&cwd, &home)
         .load()
         .expect_err("config should fail");
-    assert!(error
-        .to_string()
-        .contains("top-level config value must be an object"));
+    assert!(
+        error
+            .to_string()
+            .contains("top-level config value must be an object")
+    );
 
     if root.exists() {
         fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -179,16 +182,20 @@ fn loads_and_merges_claude_code_config_files_by_precedence() {
             .len(),
         3
     );
-    assert!(loaded
-        .get("hooks")
-        .and_then(JsonValue::as_object)
-        .expect("hooks object")
-        .contains_key("PreToolUse"));
-    assert!(loaded
-        .get("hooks")
-        .and_then(JsonValue::as_object)
-        .expect("hooks object")
-        .contains_key("PostToolUse"));
+    assert!(
+        loaded
+            .get("hooks")
+            .and_then(JsonValue::as_object)
+            .expect("hooks object")
+            .contains_key("PreToolUse")
+    );
+    assert!(
+        loaded
+            .get("hooks")
+            .and_then(JsonValue::as_object)
+            .expect("hooks object")
+            .contains_key("PostToolUse")
+    );
     assert_eq!(loaded.hooks().pre_tool_use(), &["base".to_string()]);
     assert_eq!(loaded.hooks().post_tool_use(), &["project".to_string()]);
     assert_eq!(
@@ -858,9 +865,11 @@ fn rejects_invalid_mcp_server_shapes() {
         .expect_err("config should fail");
 
     // then
-    assert!(error
-        .to_string()
-        .contains("mcpServers.broken: missing string field url"));
+    assert!(
+        error
+            .to_string()
+            .contains("mcpServers.broken: missing string field url")
+    );
 
     fs::remove_dir_all(root).expect("cleanup temp dir");
 }
@@ -1548,7 +1557,7 @@ agent_executor_commands:
 
 #[test]
 fn process_transport_limits_are_operator_owned_validated_and_manifest_bound() {
-    use super::{parse_trusted_agent_executor_commands, AgentProcessTransportLimits};
+    use super::{AgentProcessTransportLimits, parse_trusted_agent_executor_commands};
     let parse = |limits: serde_json::Value, source| {
         let value = JsonValue::parse(
             &serde_json::json!({"agent_executor_commands": {
@@ -1920,10 +1929,12 @@ fn parses_model_context_window_override_and_rejects_invalid_small_value() {
 
     let invalid = JsonValue::parse(r#"{"model_context_windows":{"broken":1023}}"#)
         .expect("json should parse");
-    assert!(parse_optional_model_context_windows(&invalid)
-        .expect_err("sub-1024 context window must fail validation")
-        .to_string()
-        .contains("at least 1024"));
+    assert!(
+        parse_optional_model_context_windows(&invalid)
+            .expect_err("sub-1024 context window must fail validation")
+            .to_string()
+            .contains("at least 1024")
+    );
 }
 
 #[test]

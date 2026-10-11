@@ -14,7 +14,7 @@ pub mod usage;
 pub use activation::{RuntimeSkillCandidate, RuntimeSkillCandidateSource, SkillActivationRecord};
 pub use dependency::CowdSkillStructuredDependency;
 pub use memory::{
-    memory_candidate_from_skill_activation, skill_memory_candidate_session_event, SkillMemoryPolicy,
+    SkillMemoryPolicy, memory_candidate_from_skill_activation, skill_memory_candidate_session_event,
 };
 
 use std::{collections::BTreeMap, fmt, sync::Arc};
@@ -680,10 +680,12 @@ mod tests {
             event.payload["invocation_evidence"]["outcome"],
             "selected_for_runtime"
         );
-        assert!(event
-            .refs
-            .iter()
-            .any(|reference| reference.ref_type == "skill_invocation"));
+        assert!(
+            event
+                .refs
+                .iter()
+                .any(|reference| reference.ref_type == "skill_invocation")
+        );
     }
 
     #[test]
@@ -723,10 +725,12 @@ mod tests {
             event.payload["structured_dependencies"][0]["domain"],
             "supply_chain"
         );
-        assert!(event
-            .refs
-            .iter()
-            .any(|reference| reference.ref_type == "skill_dependency"));
+        assert!(
+            event
+                .refs
+                .iter()
+                .any(|reference| reference.ref_type == "skill_dependency")
+        );
     }
 
     #[test]
@@ -754,10 +758,12 @@ mod tests {
             .activation
             .to_runtime_session_event(2);
         assert!(event.payload.get("invocation_evidence").is_some());
-        assert!(!event
-            .refs
-            .iter()
-            .any(|reference| reference.ref_type == "skill"));
+        assert!(
+            !event
+                .refs
+                .iter()
+                .any(|reference| reference.ref_type == "skill")
+        );
     }
 
     #[test]
@@ -833,14 +839,18 @@ mod tests {
         });
 
         assert!(result.selected.is_empty());
-        assert!(result.candidates[0]
-            .reasons
-            .iter()
-            .any(|reason| reason == "name_term:agent"));
-        assert!(!result.candidates[0]
-            .reasons
-            .iter()
-            .any(|reason| reason.starts_with("identity:")));
+        assert!(
+            result.candidates[0]
+                .reasons
+                .iter()
+                .any(|reason| reason == "name_term:agent")
+        );
+        assert!(
+            !result.candidates[0]
+                .reasons
+                .iter()
+                .any(|reason| reason.starts_with("identity:"))
+        );
     }
 
     #[test]
@@ -863,13 +873,15 @@ mod tests {
         assert!(decision.selection.selected.is_empty());
         assert!(decision.activations[0].selected_invocation.is_none());
         assert!(decision.activations[0].activation.selected.is_none());
-        assert!(decision.activations[0]
-            .activation
-            .candidates
-            .iter()
-            .any(|candidate| {
-                candidate.name == "agent-reach"
-                    && candidate.source == RuntimeSkillCandidateSource::Profile
-            }));
+        assert!(
+            decision.activations[0]
+                .activation
+                .candidates
+                .iter()
+                .any(|candidate| {
+                    candidate.name == "agent-reach"
+                        && candidate.source == RuntimeSkillCandidateSource::Profile
+                })
+        );
     }
 }

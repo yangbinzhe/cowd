@@ -3,8 +3,8 @@ use harness_contract::core::{
     TaskRisk,
 };
 use harness_contract::strategy::{
-    decide_strategy, CollaborationExecutionObligation, CollaborationLiftEstimate,
-    ExecutionCandidateKind, StrategyDecision, StrategyInput, StrategyResourceSnapshot,
+    CollaborationExecutionObligation, CollaborationLiftEstimate, ExecutionCandidateKind,
+    StrategyDecision, StrategyInput, StrategyResourceSnapshot, decide_strategy,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -110,7 +110,10 @@ pub fn complexity_reasons(
             understanding.independent_workstreams
         ));
     }
-    reasons.push(format!("complexity resolved: {:?}", understanding.complexity));
+    reasons.push(format!(
+        "complexity resolved: {:?}",
+        understanding.complexity
+    ));
     reasons
 }
 
@@ -788,10 +791,12 @@ mod tests {
         assert_eq!(decision.pattern(), ExecutionPattern::Collaborate);
         assert!(!decision.executable);
         assert!(decision.collaboration_obligation.is_some());
-        assert!(decision
-            .blocked_reasons
-            .iter()
-            .any(|reason| reason.contains("explicit Team execution requirement")));
+        assert!(
+            decision
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("explicit Team execution requirement"))
+        );
     }
 
     #[test]
@@ -862,10 +867,12 @@ mod tests {
         assert!(decision.gates().contains(&ExecutionPolicyGate::Permission));
         assert!(decision.gates().contains(&ExecutionPolicyGate::Risk));
         assert!(decision.gates().contains(&ExecutionPolicyGate::Approval));
-        assert!(decision
-            .blocked_reasons
-            .iter()
-            .any(|reason| reason.contains("tool runtime unavailable")));
+        assert!(
+            decision
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("tool runtime unavailable"))
+        );
     }
 
     #[test]
@@ -902,11 +909,13 @@ mod tests {
 
         assert!(decision.executable);
         assert_eq!(decision.pattern(), ExecutionPattern::Execute);
-        assert!(decision
-            .strategy
-            .reasons
-            .iter()
-            .any(|reason| reason.contains("intentionally prohibited")));
+        assert!(
+            decision
+                .strategy
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("intentionally prohibited"))
+        );
     }
 
     #[test]
@@ -968,12 +977,7 @@ mod tests {
         );
         // No obligation, strategic work delegates.
         assert_eq!(
-            derive_execution_mode(
-                TaskComplexity::Strategic,
-                ExecutionPattern::Execute,
-                0,
-                0
-            ),
+            derive_execution_mode(TaskComplexity::Strategic, ExecutionPattern::Execute, 0, 0),
             ExecutionMode::DelegatedSubagent
         );
         // No obligation, moderate single-workstream execute stays single agent.
@@ -983,12 +987,7 @@ mod tests {
         );
         // Deliberate asks for deliberation; the runtime prescribes no topology.
         assert_eq!(
-            derive_execution_mode(
-                TaskComplexity::Moderate,
-                ExecutionPattern::Deliberate,
-                0,
-                0
-            ),
+            derive_execution_mode(TaskComplexity::Moderate, ExecutionPattern::Deliberate, 0, 0),
             ExecutionMode::Deliberation
         );
     }
@@ -1000,10 +999,11 @@ mod tests {
             None,
         );
         assert_eq!(team.execution_mode(), ExecutionMode::MultiTeamCollaboration);
-        assert!(team
-            .reasons
-            .iter()
-            .any(|reason| reason.starts_with("complexity resolved:")));
+        assert!(
+            team.reasons
+                .iter()
+                .any(|reason| reason.starts_with("complexity resolved:"))
+        );
     }
 
     #[test]
@@ -1014,9 +1014,11 @@ mod tests {
         );
         let reasons = complexity_reasons(&decision.strategy.understanding);
         assert!(reasons.iter().any(|r| r.contains("multi-agent requested")));
-        assert!(reasons
-            .iter()
-            .any(|r| r.starts_with("complexity resolved:")));
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.starts_with("complexity resolved:"))
+        );
     }
 
     #[test]

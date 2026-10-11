@@ -74,9 +74,10 @@ mod tests {
         assert_eq!(path.path_type, "metric_dependency");
         assert_eq!(path.nodes.len(), 2);
         assert_eq!(path.edges[0].relation, "drives");
-        assert!(path
-            .structured_refs
-            .contains(&"structured-fact-type:inventory_balance".to_string()));
+        assert!(
+            path.structured_refs
+                .contains(&"structured-fact-type:inventory_balance".to_string())
+        );
         assert_eq!(path.confidence, 0.82);
     }
 }

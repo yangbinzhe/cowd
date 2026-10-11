@@ -11,6 +11,6 @@ pub use inventory::{
     UpgradeDispositionReceipt, UpgradeInventory,
 };
 pub use legacy_execution::{
-    LegacyExecutionImportError, LegacyExecutionImportReceipt, LegacyExecutionImporter,
-    LEGACY_EXECUTION_IMPORTED, UPGRADE_RECOVERY_REQUIRED,
+    LEGACY_EXECUTION_IMPORTED, LegacyExecutionImportError, LegacyExecutionImportReceipt,
+    LegacyExecutionImporter, UPGRADE_RECOVERY_REQUIRED,
 };

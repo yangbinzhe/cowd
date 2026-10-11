@@ -2539,10 +2539,12 @@ mod tests {
                 .candidate_count,
             1
         );
-        assert!(report
-            .contamination_notes
-            .iter()
-            .any(|note| note.contains("suppressed_for_current_turn")));
+        assert!(
+            report
+                .contamination_notes
+                .iter()
+                .any(|note| note.contains("suppressed_for_current_turn"))
+        );
         assert_eq!(
             report
                 .compression_checkpoint
@@ -2616,10 +2618,12 @@ mod tests {
         assert_eq!(decision.fact_plan.candidate_count, 1);
         assert_eq!(decision.fact_plan.promoted_count, 1);
         assert!(decision.context_budget_plan.checkpoint_required);
-        assert!(decision
-            .resume_pointers
-            .iter()
-            .any(|pointer| pointer == "checkpoint:checkpoint-a"));
+        assert!(
+            decision
+                .resume_pointers
+                .iter()
+                .any(|pointer| pointer == "checkpoint:checkpoint-a")
+        );
     }
 
     #[test]
@@ -2684,10 +2688,12 @@ mod tests {
             total_budget_tokens: 500,
         });
         assert!(envelope.selected.iter().any(|item| item.id == "task-high"));
-        assert!(envelope
-            .omitted
-            .iter()
-            .any(|item| item.source == ContextSourceKind::Memory));
+        assert!(
+            envelope
+                .omitted
+                .iter()
+                .any(|item| item.source == ContextSourceKind::Memory)
+        );
         assert!(envelope.budget.leases.is_empty());
     }
 
@@ -2734,16 +2740,20 @@ mod tests {
         );
 
         assert_eq!(view.envelope.identity.agent_id, "reviewer");
-        assert!(view
-            .inherited_item_ids
-            .contains(&"workspace-fact".to_string()));
-        assert!(!view
-            .inherited_item_ids
-            .contains(&"peer-private".to_string()));
-        assert!(view
-            .isolated_omissions
-            .iter()
-            .any(|item| item.reason.contains("private agent context")));
+        assert!(
+            view.inherited_item_ids
+                .contains(&"workspace-fact".to_string())
+        );
+        assert!(
+            !view
+                .inherited_item_ids
+                .contains(&"peer-private".to_string())
+        );
+        assert!(
+            view.isolated_omissions
+                .iter()
+                .any(|item| item.reason.contains("private agent context"))
+        );
         assert_eq!(
             view.envelope.diagnostics.stable_head_hash,
             parent.diagnostics.stable_head_hash
@@ -2833,16 +2843,20 @@ mod tests {
         );
         assert!(report.all_profiles_covered);
         assert!(report.all_stable_heads_reusable);
-        assert!(report
-            .entries
-            .iter()
-            .any(|entry| entry.profile == ContextProfile::YoloGoal
-                && entry.mode == ContextMode::YoloGoal));
-        assert!(report
-            .entries
-            .iter()
-            .any(|entry| entry.profile == ContextProfile::SubAgent
-                && entry.mode == ContextMode::SubAgent));
+        assert!(
+            report
+                .entries
+                .iter()
+                .any(|entry| entry.profile == ContextProfile::YoloGoal
+                    && entry.mode == ContextMode::YoloGoal)
+        );
+        assert!(
+            report
+                .entries
+                .iter()
+                .any(|entry| entry.profile == ContextProfile::SubAgent
+                    && entry.mode == ContextMode::SubAgent)
+        );
     }
 
     #[test]
@@ -3089,24 +3103,30 @@ mod tests {
 
         let envelope = ContextRuntimeKernel::build_envelope(request);
 
-        assert!(envelope
-            .omitted
-            .iter()
-            .any(|item| item.reason.contains("provider-safe capacity")));
-        assert!(envelope
-            .diagnostics
-            .recommendations
-            .iter()
-            .any(|item| item.contains("omitted")));
+        assert!(
+            envelope
+                .omitted
+                .iter()
+                .any(|item| item.reason.contains("provider-safe capacity"))
+        );
+        assert!(
+            envelope
+                .diagnostics
+                .recommendations
+                .iter()
+                .any(|item| item.contains("omitted"))
+        );
     }
 
     #[test]
     fn high_pressure_recommendations_suggest_handoff() {
         let recommendations = context_recommendations(9_500, 3, 0);
 
-        assert!(recommendations
-            .iter()
-            .any(|recommendation| recommendation.contains("handoff")));
+        assert!(
+            recommendations
+                .iter()
+                .any(|recommendation| recommendation.contains("handoff"))
+        );
     }
 
     #[test]
@@ -3197,9 +3217,11 @@ mod tests {
             selected.iter().map(|item| item.token_estimate).sum::<u64>(),
             6
         );
-        assert!(omitted
-            .iter()
-            .any(|item| item.reason == "global dynamic context budget exhausted"));
+        assert!(
+            omitted
+                .iter()
+                .any(|item| item.reason == "global dynamic context budget exhausted")
+        );
     }
 
     #[test]
@@ -3300,9 +3322,11 @@ mod tests {
         assert_eq!(trace_item.token_estimate, 12);
         assert!(trace_item.content.contains("parser"));
         assert!(trace_item.evidence.contains(&"tool://event-9".to_string()));
-        assert!(trace_item
-            .evidence
-            .contains(&"workspace://changed-file/src/parser.rs".to_string()));
+        assert!(
+            trace_item
+                .evidence
+                .contains(&"workspace://changed-file/src/parser.rs".to_string())
+        );
 
         let resume = ResumeContextPacket {
             session_id: "session-1".to_string(),
@@ -3315,9 +3339,11 @@ mod tests {
         let resume_item = ContextRuntimeKernel::resume_item(&resume);
         assert_eq!(resume_item.source, ContextSourceKind::Handoff);
         assert!(resume_item.content.contains("phase 6"));
-        assert!(resume_item
-            .evidence
-            .contains(&"session://session-1/resume/Mixed".to_string()));
+        assert!(
+            resume_item
+                .evidence
+                .contains(&"session://session-1/resume/Mixed".to_string())
+        );
 
         let mut task_resume = resume.clone();
         task_resume.source = ResumeContextSource::ExecutionGraph;
@@ -3481,9 +3507,10 @@ mod tests {
         assert!(item.evidence.contains(
             &"workspace://changed-file/crates/runtime/src/context_runtime.rs".to_string()
         ));
-        assert!(item
-            .evidence
-            .contains(&"workspace://symbol/ContextRuntimeKernel".to_string()));
+        assert!(
+            item.evidence
+                .contains(&"workspace://symbol/ContextRuntimeKernel".to_string())
+        );
     }
 
     #[test]

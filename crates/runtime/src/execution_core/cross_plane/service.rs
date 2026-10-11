@@ -521,19 +521,21 @@ impl CrossPlaneRuntimeService {
             STREAM_ID,
             revision,
             format!("cross-plane:{kind}:{}", uuid::Uuid::new_v4()),
-            vec![RuntimeEventInput {
-                stream_id: STREAM_ID.to_string(),
-                scope: RuntimeEventScope::CrossPlane,
-                kind: kind.to_string(),
-                status: Some("committed".to_string()),
-                actor: Some("cross_plane_runtime".to_string()),
-                refs: vec![RuntimeEventRef {
-                    kind: "workspace".to_string(),
-                    id: STREAM_ID.to_string(),
-                }],
-                payload,
-            }
-            .into()],
+            vec![
+                RuntimeEventInput {
+                    stream_id: STREAM_ID.to_string(),
+                    scope: RuntimeEventScope::CrossPlane,
+                    kind: kind.to_string(),
+                    status: Some("committed".to_string()),
+                    actor: Some("cross_plane_runtime".to_string()),
+                    refs: vec![RuntimeEventRef {
+                        kind: "workspace".to_string(),
+                        id: STREAM_ID.to_string(),
+                    }],
+                    payload,
+                }
+                .into(),
+            ],
         );
         if let Err(error) = append {
             self.control.replace_snapshot(before);
@@ -741,10 +743,12 @@ mod tests {
                 generation: 1,
             },
         );
-        assert!(graph
-            .nodes
-            .iter()
-            .any(|node| node.kind == ExecutionNodeKind::ToolBatch));
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.kind == ExecutionNodeKind::ToolBatch)
+        );
     }
 
     #[test]

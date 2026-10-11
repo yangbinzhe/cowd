@@ -413,13 +413,13 @@ impl TaskStoreBackend for EphemeralTaskStore {
                 return Err(format!(
                     "organization decision `{}` revision conflict at {}",
                     decision.decision_id, current.revision
-                ))
+                ));
             }
             (None, Some(_)) => {
                 return Err(format!(
                     "organization decision `{}` does not exist",
                     decision.decision_id
-                ))
+                ));
             }
         }
         state

@@ -390,10 +390,12 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         // Both Cargo's crate cwd and direct binary execution at repository
         // root have this manifest. Never mutate the process-global cwd.
-        assert!(std::env::current_dir()
-            .unwrap()
-            .join("Cargo.toml")
-            .is_file());
+        assert!(
+            std::env::current_dir()
+                .unwrap()
+                .join("Cargo.toml")
+                .is_file()
+        );
         std::fs::write(workspace.path().join("Cargo.toml"), "session manifest").unwrap();
         assert_eq!(
             explicit_workspace_resource_scopes(workspace.path(), "read ./Cargo.toml", false),
@@ -409,12 +411,14 @@ mod tests {
             vec!["write:Cargo.toml"]
         );
         let outside = std::env::current_dir().unwrap().join("Cargo.toml");
-        assert!(explicit_workspace_resource_scopes(
-            workspace.path(),
-            &format!("read {}", outside.display()),
-            false
-        )
-        .is_empty());
+        assert!(
+            explicit_workspace_resource_scopes(
+                workspace.path(),
+                &format!("read {}", outside.display()),
+                false
+            )
+            .is_empty()
+        );
     }
 
     #[test]

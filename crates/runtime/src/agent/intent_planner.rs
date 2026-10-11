@@ -1,6 +1,6 @@
 //! Lightweight intent and dependency planning for tool execution.
 
-use harness_contract::strategy::{understand, StrategyInput, TaskDomain, TaskUnderstanding};
+use harness_contract::strategy::{StrategyInput, TaskDomain, TaskUnderstanding, understand};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -128,10 +128,7 @@ struct MutationKind {
 
 fn mutation_kind(tool_name: &str) -> MutationKind {
     MutationKind {
-        needs_dependency: matches!(
-            tool_name,
-            "edit" | "edit" | "edit" | "checkpoint"
-        ),
+        needs_dependency: matches!(tool_name, "edit" | "edit" | "edit" | "checkpoint"),
     }
 }
 
@@ -207,11 +204,7 @@ mod tests {
     fn infers_write_dependency_on_prior_same_path_read() {
         let mut requests = vec![
             request("read-1", "read_file", r#"{"path":"src/lib.rs"}"#),
-            request(
-                "write-1",
-                "edit",
-                r#"{"path":"src/lib.rs","content":"x"}"#,
-            ),
+            request("write-1", "edit", r#"{"path":"src/lib.rs","content":"x"}"#),
         ];
 
         assert_eq!(infer_tool_dependencies(&mut requests), 1);

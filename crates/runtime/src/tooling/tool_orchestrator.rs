@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::bash_validation::{classify_command, CommandIntent};
+use crate::bash_validation::{CommandIntent, classify_command};
 
 // ---------------------------------------------------------------------------
 // ToolSafetyCategory
@@ -119,12 +119,11 @@ impl ToolSafetyCategory {
 
             "web_search" | "web_fetch" | "http_request" => Self::Network,
 
-            "bash" | "powershell" | "execute_code" | "remote_trigger" | "agent"
-            | "task_create" | "run_task_packet" | "task_stop" | "task_update" | "worker_create"
+            "bash" | "powershell" | "execute_code" | "remote_trigger" | "agent" | "task_create"
+            | "run_task_packet" | "task_stop" | "task_update" | "worker_create"
             | "worker_send_prompt" | "worker_restart" | "worker_terminate" | "team_create"
-            | "team_delete" | "cron_create" | "cron_delete" | "config"
-            | "structured_output" | "execute_code" | "rm" | "kill" | "sudo" | "truncate"
-            | "drop" => Self::Destructive,
+            | "team_delete" | "cron_create" | "cron_delete" | "config" | "structured_output"
+            | "execute_code" | "rm" | "kill" | "sudo" | "truncate" | "drop" => Self::Destructive,
 
             _ if normalized.starts_with("read")
                 || normalized.starts_with("grep")

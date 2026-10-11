@@ -18,9 +18,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::agent::definition::{
-    bootstrap_builtin_agents, AgentDefinitionResolver, AgentDefinitionStore, BuiltinAgentTrust,
-    DefinitionStoreError, ExplicitTomlAgentImport, RegisteredAgentDefinitionLayout,
-    ResolvedAgentDefinition,
+    AgentDefinitionResolver, AgentDefinitionStore, BuiltinAgentTrust, DefinitionStoreError,
+    ExplicitTomlAgentImport, RegisteredAgentDefinitionLayout, ResolvedAgentDefinition,
+    bootstrap_builtin_agents,
 };
 use crate::{
     AgentCatalogEntry, EvolutionCandidateSubject, EvolutionReleaseAssignment, ReleaseChangeAction,
@@ -486,9 +486,11 @@ mod tests {
             .runnable_agent_catalog()
             .expect("catalog after stop");
         assert_eq!(catalog_after_stop.len(), catalog_len - 1);
-        assert!(catalog_after_stop
-            .iter()
-            .all(|entry| entry.agent_id != reviewer.as_str()));
+        assert!(
+            catalog_after_stop
+                .iter()
+                .all(|entry| entry.agent_id != reviewer.as_str())
+        );
     }
 
     #[test]
@@ -512,10 +514,12 @@ mod tests {
         );
         registry.invalidate_definition_caches();
 
-        assert!(registry
-            .exact_agent_cache
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty());
+        assert!(
+            registry
+                .exact_agent_cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        );
     }
 }

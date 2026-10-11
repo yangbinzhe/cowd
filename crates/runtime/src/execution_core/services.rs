@@ -25,24 +25,24 @@ use thiserror::Error;
 use super::cross_plane::{CrossPlaneRuntimeError, CrossPlaneRuntimeService};
 use super::goal::{GoalStore, ObjectiveSupervisor};
 use super::graph::{
-    executors::{
-        AgentTaskExecutor, AgenticProgramWaitExecutor, ApprovalNodeExecutor,
-        CompileTargetGuardExecutor, MaterializeNodeExecutor, ScopedNodeExecutor,
-        SynthesizeNodeExecutor, VerifyNodeExecutor,
-    },
     ExecutionCommitService, ExecutionGraphRunner, ExecutionGraphStateStore, ExecutionRecoveryError,
     ExecutionResourceKind, ExecutionResourceManager, ExecutionRunnerError, ExecutionServiceClass,
     ExecutionStateStoreError, NodeExecutor, NodeExecutorError, NodeExecutorRegistry,
     ResourceAdmissionDecision, ResourceAdmissionRequest, ResourceObservation, ResourceQuota,
     ResourceResultClass, ScopeLockError, ScopeLockManager, WorktreeLeaseError,
     WorktreeLeaseManager,
+    executors::{
+        AgentTaskExecutor, AgenticProgramWaitExecutor, ApprovalNodeExecutor,
+        CompileTargetGuardExecutor, MaterializeNodeExecutor, ScopedNodeExecutor,
+        SynthesizeNodeExecutor, VerifyNodeExecutor,
+    },
 };
+#[cfg(feature = "test-fixtures")]
+use crate::RuntimeEventInput;
 use crate::agent::binding::request_for_intent;
 use crate::agent::definition::ExplicitTomlAgentImport;
 use crate::managed_agent::ManagedAgentRestartDisposition;
 use crate::runtime_event_store::RuntimeEventStoreError;
-#[cfg(feature = "test-fixtures")]
-use crate::RuntimeEventInput;
 use crate::{
     AgentBindingCompiler, AgentBindingRequest, AgentDefinitionDraftReceipt, AgentRuntime,
     AgentRuntimeResolver, ApprovalConfig, ApprovalCoordinator, ApprovalQueue, CompiledAgentBinding,
@@ -1591,9 +1591,7 @@ impl RuntimeServices {
     pub async fn release_recovered_producers(
         self: &Arc<Self>,
     ) -> Result<usize, RuntimeServicesError> {
-        let deferred = self
-            .execution_supervisor
-            .take_deferred_recovered_graphs();
+        let deferred = self.execution_supervisor.take_deferred_recovered_graphs();
         self.start_background_reactors()?;
         let mut released = 0usize;
         for graph_id in deferred {
@@ -3456,10 +3454,7 @@ impl RuntimeServices {
     /// pass was ten minutes after that, one second after the evaluator had cancelled
     /// the barrier. The barrier now also re-arms itself, but a synchronous call in the
     /// same path as the mutation removes the race entirely for the common case.
-    pub async fn resolve_agentic_program_barrier(
-        &self,
-        program_id: &str,
-    ) -> Result<usize, String> {
+    pub async fn resolve_agentic_program_barrier(&self, program_id: &str) -> Result<usize, String> {
         crate::execution_core::graph::executors::resolve_agentic_program_wait(
             program_id,
             &self.agent_action_service(),
@@ -4682,11 +4677,7 @@ async fn project_managed_invocation_terminal(
                 .into_iter()
                 .find(|current| current.invocation_id == invocation.invocation_id)
                 .is_some_and(|current| !current.status.is_active());
-            if already_terminal {
-                Ok(())
-            } else {
-                Err(error)
-            }
+            if already_terminal { Ok(()) } else { Err(error) }
         }
     }
 }

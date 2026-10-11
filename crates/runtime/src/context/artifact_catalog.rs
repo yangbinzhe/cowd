@@ -148,19 +148,23 @@ mod tests {
             .await
             .unwrap();
         let first_cursor = page.next_cursor.clone().unwrap();
-        assert!(store
-            .discover_page(
-                &["session:private".into()],
-                "text/plain",
-                Some(&first_cursor),
-                7
-            )
-            .await
-            .is_err());
-        assert!(store
-            .discover_page(&scopes, "different", Some(&first_cursor), 7)
-            .await
-            .is_err());
+        assert!(
+            store
+                .discover_page(
+                    &["session:private".into()],
+                    "text/plain",
+                    Some(&first_cursor),
+                    7
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .discover_page(&scopes, "different", Some(&first_cursor), 7)
+                .await
+                .is_err()
+        );
         let mut actual = std::collections::BTreeSet::new();
         let mut pages = 0;
         loop {
@@ -196,11 +200,13 @@ mod tests {
             .unwrap();
         let removed = store.resolve(expected.first().unwrap()).unwrap();
         store.delete(&removed, &scopes[0]).unwrap();
-        assert!(store
-            .discover_page(&scopes, "text/plain", Some(&first_cursor), 7)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("source changed"));
+        assert!(
+            store
+                .discover_page(&scopes, "text/plain", Some(&first_cursor), 7)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("source changed")
+        );
     }
 }

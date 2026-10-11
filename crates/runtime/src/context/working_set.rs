@@ -5,7 +5,7 @@ use crate::{
     RuntimeEventStore, RuntimeServices,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -479,7 +479,9 @@ impl RuntimeServices {
                 entry["omission"] =
                     json!("Runtime binding changed; explicitly repin under the current lease");
             } else if used.saturating_add(PAGE_BYTES as usize * 2) > WINDOW_BYTES {
-                entry["omission"]=json!("working window capacity; use read_request or expand after unpinning inactive materials");
+                entry["omission"] = json!(
+                    "working window capacity; use read_request or expand after unpinning inactive materials"
+                );
             } else {
                 match self
                     .working_source_page(context, &pin.source, pin.offset)
@@ -617,30 +619,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page["revision"], repeated["revision"]);
-        assert!(services
-            .working_context_command(
-                &context,
-                "pin-1",
-                WorkingContextInput::Unpin {
-                    source: source.clone()
-                }
-            )
-            .await
-            .unwrap_err()
-            .contains("different input"));
-        assert!(services
-            .working_context_command(
-                &context,
-                "bad-hash",
-                WorkingContextInput::Expand {
-                    source: source.clone(),
-                    source_hash: "wrong".into(),
-                    offset: 0
-                }
-            )
-            .await
-            .unwrap_err()
-            .contains("source changed"));
+        assert!(
+            services
+                .working_context_command(
+                    &context,
+                    "pin-1",
+                    WorkingContextInput::Unpin {
+                        source: source.clone()
+                    }
+                )
+                .await
+                .unwrap_err()
+                .contains("different input")
+        );
+        assert!(
+            services
+                .working_context_command(
+                    &context,
+                    "bad-hash",
+                    WorkingContextInput::Expand {
+                        source: source.clone(),
+                        source_hash: "wrong".into(),
+                        offset: 0
+                    }
+                )
+                .await
+                .unwrap_err()
+                .contains("source changed")
+        );
         let mut restored = Vec::new();
         let mut index = 0;
         loop {
@@ -668,20 +674,24 @@ mod tests {
         let changed = context.clone().with_task_id(Some("changed-lease".into()));
         let denied = services.working_context_window(&changed).await.unwrap();
         assert!(denied["entries"][0]["content"].is_null());
-        assert!(denied["entries"][0]["omission"]
-            .as_str()
-            .unwrap()
-            .contains("binding changed"));
+        assert!(
+            denied["entries"][0]["omission"]
+                .as_str()
+                .unwrap()
+                .contains("binding changed")
+        );
         let unpinned = services
             .working_context_command(&context, "unpin", WorkingContextInput::Unpin { source })
             .await
             .unwrap();
         assert_eq!(unpinned["coverage"]["active_references"], 0);
-        assert!(services
-            .working_context_item(&context)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            services
+                .working_context_item(&context)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             services
                 .artifact_store()
@@ -727,11 +737,13 @@ mod tests {
             .unwrap();
         let window = services.working_context_window(&context).await.unwrap();
         assert!(!window.to_string().contains("first source"));
-        assert!(window["entries"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|entry| entry["omission"].is_string()));
+        assert!(
+            window["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["omission"].is_string())
+        );
         let item = services
             .working_context_item(&context)
             .await
@@ -772,7 +784,9 @@ mod tests {
         let mut actual = std::collections::BTreeSet::new();
         loop {
             for entry in page["entries"].as_array().unwrap() {
-                assert!(actual.insert(entry["source"]["content_ref"].as_str().unwrap().to_string()));
+                assert!(
+                    actual.insert(entry["source"]["content_ref"].as_str().unwrap().to_string())
+                );
             }
             let next = page["next_request"]["input"].clone();
             if next.is_null() {
@@ -800,14 +814,16 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(services
-            .working_context_command(
-                &context,
-                "old-page",
-                serde_json::from_value(saved_next).unwrap()
-            )
-            .await
-            .unwrap_err()
-            .contains("cursor source or binding changed"));
+        assert!(
+            services
+                .working_context_command(
+                    &context,
+                    "old-page",
+                    serde_json::from_value(saved_next).unwrap()
+                )
+                .await
+                .unwrap_err()
+                .contains("cursor source or binding changed")
+        );
     }
 }

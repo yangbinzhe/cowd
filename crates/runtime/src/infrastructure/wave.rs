@@ -11,7 +11,7 @@
 //! - `WaveExecutor`: Trait for executing tasks (implement by application)
 
 use crate::tool_orchestrator::ToolSafetyCategory;
-use futures::{future::join_all, FutureExt};
+use futures::{FutureExt, future::join_all};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -1353,10 +1353,12 @@ mod tests {
             .find(|result| result.task_id == TaskId::new("panic"))
             .expect("panic result");
         assert!(!panic_result.success);
-        assert!(panic_result
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("Task worker panicked")));
+        assert!(
+            panic_result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Task worker panicked"))
+        );
     }
 
     #[test]

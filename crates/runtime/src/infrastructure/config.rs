@@ -920,7 +920,7 @@ pub(super) fn parse_trusted_agent_executor_commands(
             value => {
                 return Err(ConfigError::Parse(format!(
                     "{context}.sandbox_profile `{value}` is unsupported"
-                )))
+                )));
             }
         };
         let transport_limits: AgentProcessTransportLimits = command
@@ -2374,7 +2374,7 @@ fn parse_optional_apps_config(root: &JsonValue) -> Result<AppsConfig, ConfigErro
                 resources,
                 supervisor,
                 entries,
-            })
+            });
         }
     };
     for (app_id, value) in configured_entries {
@@ -2396,7 +2396,7 @@ fn parse_optional_apps_config(root: &JsonValue) -> Result<AppsConfig, ConfigErro
             value => {
                 return Err(ConfigError::Parse(format!(
                     "{context}.activation must be lazy or resident, got {value}"
-                )))
+                )));
             }
         };
         let config_file = optional_string(entry, "config_file", &context)?.map(PathBuf::from);
@@ -2485,7 +2485,7 @@ fn parse_optional_storage_config(root: &JsonValue) -> Result<StorageTopologyConf
         other => {
             return Err(ConfigError::Parse(format!(
                 "merged settings.storage.backend must be postgres; {other} is not supported"
-            )))
+            )));
         }
     };
     for retired in ["preferred", "fallback", "fallbackProbeTimeoutMs"] {

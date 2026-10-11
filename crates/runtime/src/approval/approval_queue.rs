@@ -321,23 +321,25 @@ impl ApprovalQueue {
                 stream_id.clone(),
                 revision,
                 format!("approval-submit:{}", approval.approval_id),
-                vec![RuntimeEventInput {
-                    stream_id,
-                    scope: RuntimeEventScope::Approval,
-                    kind: "approval.submitted".to_string(),
-                    status: Some(approval.status.as_str().to_string()),
-                    actor: Some("approval_queue".to_string()),
-                    refs: approval_source_refs(&approval.source),
-                    payload: serde_json::json!({
-                        "schema_version": 2,
-                        "request": approval,
-                        "action": approval.action,
-                        "summary": approval.summary,
-                        "risk": approval.risk,
-                        "timeout_policy": approval.timeout_policy,
-                    }),
-                }
-                .into()],
+                vec![
+                    RuntimeEventInput {
+                        stream_id,
+                        scope: RuntimeEventScope::Approval,
+                        kind: "approval.submitted".to_string(),
+                        status: Some(approval.status.as_str().to_string()),
+                        actor: Some("approval_queue".to_string()),
+                        refs: approval_source_refs(&approval.source),
+                        payload: serde_json::json!({
+                            "schema_version": 2,
+                            "request": approval,
+                            "action": approval.action,
+                            "summary": approval.summary,
+                            "risk": approval.risk,
+                            "timeout_policy": approval.timeout_policy,
+                        }),
+                    }
+                    .into(),
+                ],
             )
             .map_err(|e| e.to_string())?;
         self.requests
@@ -797,27 +799,29 @@ impl ApprovalQueue {
                     "application-approval-decision:{}:{review_ref}:{decision}",
                     application.app_id
                 ),
-                vec![RuntimeEventInput {
-                    stream_id,
-                    scope: RuntimeEventScope::Approval,
-                    kind: "approval.decided.application".to_string(),
-                    status: Some(next_status.as_str().to_string()),
-                    actor: Some(decided_by.to_string()),
-                    refs: approval_source_refs(&request.source),
-                    payload: serde_json::json!({
-                        "schema_version": 2,
-                        "decision_record": canonical_decision,
-                        "approved": approved,
-                        "decision": decision,
-                        "reason": reason,
-                        "review_ref": review_ref,
-                        "decision_lease_ref": decision_lease_ref,
-                        "application": application,
-                        "message": receipt.message,
-                        "resolved_at_ms": resolved_at_ms,
-                    }),
-                }
-                .into()],
+                vec![
+                    RuntimeEventInput {
+                        stream_id,
+                        scope: RuntimeEventScope::Approval,
+                        kind: "approval.decided.application".to_string(),
+                        status: Some(next_status.as_str().to_string()),
+                        actor: Some(decided_by.to_string()),
+                        refs: approval_source_refs(&request.source),
+                        payload: serde_json::json!({
+                            "schema_version": 2,
+                            "decision_record": canonical_decision,
+                            "approved": approved,
+                            "decision": decision,
+                            "reason": reason,
+                            "review_ref": review_ref,
+                            "decision_lease_ref": decision_lease_ref,
+                            "application": application,
+                            "message": receipt.message,
+                            "resolved_at_ms": resolved_at_ms,
+                        }),
+                    }
+                    .into(),
+                ],
             )
             .map_err(|error| error.to_string())?;
         request.status = next_status;
@@ -1155,23 +1159,25 @@ impl ApprovalQueue {
                 stream_id.clone(),
                 revision,
                 format!("approval-grant-consume:{grant_id}"),
-                vec![RuntimeEventInput {
-                    stream_id,
-                    scope: RuntimeEventScope::Approval,
-                    kind: "approval.grant_consumed".to_string(),
-                    status: Some("expired".to_string()),
-                    actor: Some("approval_coordinator".to_string()),
-                    refs: vec![RuntimeEventRef {
-                        kind: "approval_grant".to_string(),
-                        id: grant_id.to_string(),
-                    }],
-                    payload: serde_json::json!({
-                        "schema_version": 2,
-                        "grant_id": grant_id,
-                        "consumed_at_ms": consumed_at_ms,
-                    }),
-                }
-                .into()],
+                vec![
+                    RuntimeEventInput {
+                        stream_id,
+                        scope: RuntimeEventScope::Approval,
+                        kind: "approval.grant_consumed".to_string(),
+                        status: Some("expired".to_string()),
+                        actor: Some("approval_coordinator".to_string()),
+                        refs: vec![RuntimeEventRef {
+                            kind: "approval_grant".to_string(),
+                            id: grant_id.to_string(),
+                        }],
+                        payload: serde_json::json!({
+                            "schema_version": 2,
+                            "grant_id": grant_id,
+                            "consumed_at_ms": consumed_at_ms,
+                        }),
+                    }
+                    .into(),
+                ],
             )
             .map_err(|error| error.to_string())?;
         grant.status = ApprovalGrantStatus::Expired;
@@ -1210,24 +1216,26 @@ impl ApprovalQueue {
                 stream_id.clone(),
                 revision,
                 format!("approval-grant-revoke:{grant_id}"),
-                vec![RuntimeEventInput {
-                    stream_id,
-                    scope: RuntimeEventScope::Approval,
-                    kind: "approval.grant_revoked".to_string(),
-                    status: Some("revoked".to_string()),
-                    actor: Some(principal.claims().principal_id.clone()),
-                    refs: vec![RuntimeEventRef {
-                        kind: "approval_grant".to_string(),
-                        id: grant_id.to_string(),
-                    }],
-                    payload: serde_json::json!({
-                        "schema_version": 2,
-                        "grant_id": grant_id,
-                        "reason": reason,
-                        "revoked_at_ms": revoked_at_ms,
-                    }),
-                }
-                .into()],
+                vec![
+                    RuntimeEventInput {
+                        stream_id,
+                        scope: RuntimeEventScope::Approval,
+                        kind: "approval.grant_revoked".to_string(),
+                        status: Some("revoked".to_string()),
+                        actor: Some(principal.claims().principal_id.clone()),
+                        refs: vec![RuntimeEventRef {
+                            kind: "approval_grant".to_string(),
+                            id: grant_id.to_string(),
+                        }],
+                        payload: serde_json::json!({
+                            "schema_version": 2,
+                            "grant_id": grant_id,
+                            "reason": reason,
+                            "revoked_at_ms": revoked_at_ms,
+                        }),
+                    }
+                    .into(),
+                ],
             )
             .map_err(|error| error.to_string())?;
         grant.status = ApprovalGrantStatus::Revoked;
@@ -1295,25 +1303,27 @@ impl ApprovalQueue {
                 stream_id.clone(),
                 revision,
                 format!("approval-cancel:{}", request.approval_id),
-                vec![RuntimeEventInput {
-                    stream_id,
-                    scope: RuntimeEventScope::Approval,
-                    kind: if superseded {
-                        "approval.superseded".to_string()
-                    } else {
-                        "approval.cancelled".to_string()
-                    },
-                    status: Some(status.as_str().to_string()),
-                    actor: Some(actor.actor_id),
-                    refs: approval_source_refs(&request.source),
-                    payload: serde_json::json!({
-                        "schema_version": 2,
-                        "decision": decision,
-                        "reason": reason,
-                        "resolved_at_ms": resolved_at_ms,
-                    }),
-                }
-                .into()],
+                vec![
+                    RuntimeEventInput {
+                        stream_id,
+                        scope: RuntimeEventScope::Approval,
+                        kind: if superseded {
+                            "approval.superseded".to_string()
+                        } else {
+                            "approval.cancelled".to_string()
+                        },
+                        status: Some(status.as_str().to_string()),
+                        actor: Some(actor.actor_id),
+                        refs: approval_source_refs(&request.source),
+                        payload: serde_json::json!({
+                            "schema_version": 2,
+                            "decision": decision,
+                            "reason": reason,
+                            "resolved_at_ms": resolved_at_ms,
+                        }),
+                    }
+                    .into(),
+                ],
             )
             .map_err(|error| error.to_string())?;
         request.status = status;
@@ -2021,9 +2031,11 @@ mod tests {
         queue
             .submit_scoped(id, pending_request("decide proposed work"))
             .unwrap();
-        assert!(queue
-            .decision_result_snapshot("session-approval", id)
-            .is_err());
+        assert!(
+            queue
+                .decision_result_snapshot("session-approval", id)
+                .is_err()
+        );
         let cold = ApprovalQueue::new(Arc::clone(&queue.event_store));
         queue
             .decide_surface_human("operator:verified", human_decision(id, false, "do not run"))
@@ -2045,9 +2057,10 @@ mod tests {
                 .stream_revision(&source.stream_id)
                 .unwrap()
         );
-        assert!(cold
-            .decision_result_snapshot("foreign-session", id)
-            .is_err());
+        assert!(
+            cold.decision_result_snapshot("foreign-session", id)
+                .is_err()
+        );
         let restarted = ApprovalQueue::new(Arc::clone(&queue.event_store));
         assert_eq!(
             restarted
@@ -2733,9 +2746,11 @@ mod tests {
             .matching_grant(&approval_context(), TaskRisk::Low)
             .expect("once grant matches exact invocation");
         queue.consume_once_grant(&once.grant_id).unwrap();
-        assert!(queue
-            .matching_grant(&approval_context(), TaskRisk::Low)
-            .is_none());
+        assert!(
+            queue
+                .matching_grant(&approval_context(), TaskRisk::Low)
+                .is_none()
+        );
 
         let session_request = queue
             .submit(SubmitGlobalApprovalRequest {
@@ -2767,9 +2782,11 @@ mod tests {
             .expect("session grant matches within the same session");
         let mut other_session = approval_context();
         other_session.session_id = Some("session-other".to_string());
-        assert!(queue
-            .matching_grant(&other_session, TaskRisk::Low)
-            .is_none());
+        assert!(
+            queue
+                .matching_grant(&other_session, TaskRisk::Low)
+                .is_none()
+        );
         queue
             .revoke_grant(
                 &crate::security::test_human_interactive_principal(),
@@ -2777,9 +2794,11 @@ mod tests {
                 "no longer needed",
             )
             .unwrap();
-        assert!(queue
-            .matching_grant(&approval_context(), TaskRisk::Low)
-            .is_none());
+        assert!(
+            queue
+                .matching_grant(&approval_context(), TaskRisk::Low)
+                .is_none()
+        );
     }
 
     #[test]
@@ -2807,14 +2826,18 @@ mod tests {
             )
             .unwrap();
 
-        assert!(queue
-            .matching_grant(&approval_context(), TaskRisk::Low)
-            .is_some());
+        assert!(
+            queue
+                .matching_grant(&approval_context(), TaskRisk::Low)
+                .is_some()
+        );
         let mut changed_policy = approval_context();
         changed_policy.policy_revision += 1;
-        assert!(queue
-            .matching_grant(&changed_policy, TaskRisk::Low)
-            .is_none());
+        assert!(
+            queue
+                .matching_grant(&changed_policy, TaskRisk::Low)
+                .is_none()
+        );
     }
 
     #[test]
@@ -2893,31 +2916,41 @@ mod tests {
 
             match scope {
                 ApprovalGrantScope::Turn => {
-                    assert!(queue
-                        .matching_grant(&changed_session, TaskRisk::Low)
-                        .is_none());
+                    assert!(
+                        queue
+                            .matching_grant(&changed_session, TaskRisk::Low)
+                            .is_none()
+                    );
                     assert!(queue.matching_grant(&changed_turn, TaskRisk::Low).is_none());
                 }
                 ApprovalGrantScope::Task => {
-                    assert!(queue
-                        .matching_grant(&changed_session, TaskRisk::Low)
-                        .is_none());
+                    assert!(
+                        queue
+                            .matching_grant(&changed_session, TaskRisk::Low)
+                            .is_none()
+                    );
                     assert!(queue.matching_grant(&changed_task, TaskRisk::Low).is_none());
                 }
                 ApprovalGrantScope::Global => {
-                    assert!(queue
-                        .matching_grant(&changed_session, TaskRisk::Low)
-                        .is_some());
+                    assert!(
+                        queue
+                            .matching_grant(&changed_session, TaskRisk::Low)
+                            .is_some()
+                    );
                     let mut changed_workspace = approval_context();
                     changed_workspace.workspace_key = "workspace:other".to_string();
-                    assert!(queue
-                        .matching_grant(&changed_workspace, TaskRisk::Low)
-                        .is_none());
+                    assert!(
+                        queue
+                            .matching_grant(&changed_workspace, TaskRisk::Low)
+                            .is_none()
+                    );
                     let mut changed_principal = approval_context();
                     changed_principal.principal_id = "principal:other".to_string();
-                    assert!(queue
-                        .matching_grant(&changed_principal, TaskRisk::Low)
-                        .is_none());
+                    assert!(
+                        queue
+                            .matching_grant(&changed_principal, TaskRisk::Low)
+                            .is_none()
+                    );
                 }
                 ApprovalGrantScope::Once | ApprovalGrantScope::Session => unreachable!(),
             }
@@ -2960,8 +2993,10 @@ mod tests {
             Some(ApprovalGrantScope::Global)
         );
         other_session.workspace_key = "workspace:other".to_string();
-        assert!(restarted
-            .matching_grant(&other_session, TaskRisk::Low)
-            .is_none());
+        assert!(
+            restarted
+                .matching_grant(&other_session, TaskRisk::Low)
+                .is_none()
+        );
     }
 }

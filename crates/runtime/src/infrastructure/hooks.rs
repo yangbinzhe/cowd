@@ -2,13 +2,13 @@ use std::ffi::OsStr;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::thread;
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
 use crate::permissions::PermissionOverride;
@@ -749,8 +749,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        format_hook_output, HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter,
-        HookRunResult, HookRunner, HOOK_PREVIEW_CHAR_LIMIT,
+        HOOK_PREVIEW_CHAR_LIMIT, HookAbortSignal, HookEvent, HookProgressEvent,
+        HookProgressReporter, HookRunResult, HookRunner, format_hook_output,
     };
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
     use crate::permissions::PermissionOverride;
@@ -808,10 +808,12 @@ mod tests {
 
         // then
         assert!(result.is_failed());
-        assert!(result
-            .messages()
-            .iter()
-            .any(|message| message.contains("warning hook")));
+        assert!(
+            result
+                .messages()
+                .iter()
+                .any(|message| message.contains("warning hook"))
+        );
     }
 
     #[test]
@@ -871,14 +873,18 @@ mod tests {
 
         // then
         assert!(result.is_failed());
-        assert!(result
-            .messages()
-            .iter()
-            .any(|message| message.contains("broken failure hook")));
-        assert!(!result
-            .messages()
-            .iter()
-            .any(|message| message == "later failure hook"));
+        assert!(
+            result
+                .messages()
+                .iter()
+                .any(|message| message.contains("broken failure hook"))
+        );
+        assert!(
+            !result
+                .messages()
+                .iter()
+                .any(|message| message == "later failure hook")
+        );
     }
 
     #[test]
@@ -959,10 +965,12 @@ mod tests {
 
         // then
         assert!(result.is_failed());
-        assert!(result
-            .messages()
-            .iter()
-            .any(|message| message.contains("broken")));
+        assert!(
+            result
+                .messages()
+                .iter()
+                .any(|message| message.contains("broken"))
+        );
         assert!(!result.messages().iter().any(|message| message == "later"));
     }
 

@@ -130,17 +130,23 @@ mod tests {
         let projection = CowdProjection::for_surface(&registry, CowdSurface::Webui);
 
         assert_eq!(projection.capability_count, registry.capabilities.len());
-        assert!(projection
-            .capabilities
-            .iter()
-            .any(|capability| capability.id == "cowd.structured_data.core"));
-        assert!(!projection
-            .capabilities
-            .iter()
-            .any(|capability| capability.id == "cowd.matrix.runtime"));
-        assert!(projection.capabilities.iter().all(|capability| capability
-            .management_fields
-            .contains(&"bulk_actions".to_string())));
+        assert!(
+            projection
+                .capabilities
+                .iter()
+                .any(|capability| capability.id == "cowd.structured_data.core")
+        );
+        assert!(
+            !projection
+                .capabilities
+                .iter()
+                .any(|capability| capability.id == "cowd.matrix.runtime")
+        );
+        assert!(projection.capabilities.iter().all(|capability| {
+            capability
+                .management_fields
+                .contains(&"bulk_actions".to_string())
+        }));
     }
 
     #[test]
@@ -160,9 +166,11 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(webui_ids, tui_ids);
-        assert!(tui.capabilities.iter().all(|capability| capability
-            .management_fields
-            .contains(&"console_actions".to_string())));
+        assert!(tui.capabilities.iter().all(|capability| {
+            capability
+                .management_fields
+                .contains(&"console_actions".to_string())
+        }));
     }
 
     #[test]
@@ -171,10 +179,12 @@ mod tests {
         let projection = CowdProjection::for_surface(&registry, CowdSurface::Cli);
 
         assert_eq!(projection.capability_count, registry.capabilities.len());
-        assert!(!projection
-            .capabilities
-            .iter()
-            .any(|capability| capability.id == "cowd.matrix.runtime"));
+        assert!(
+            !projection
+                .capabilities
+                .iter()
+                .any(|capability| capability.id == "cowd.matrix.runtime")
+        );
         assert!(projection.capabilities.iter().all(|capability| {
             capability.surface_mode == CowdSurfaceMode::Minimal
                 && capability.management_fields

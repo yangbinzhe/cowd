@@ -4495,3 +4495,36 @@ fn rework_on_an_operator_criterion_is_allowed() {
         "a rework on the operator's own standard must never be refused as invented: {receipt:?}"
     );
 }
+
+/// The gap a reopen produces is assembled with an `objective_completion_gap:`
+/// prefix. Matching the bare `original_intent_review_required:` prefix never
+/// fired, so the one sentence naming the tool the model must call was dropped
+/// and a live run cycled seven completion requests without ever reviewing.
+#[test]
+fn the_review_guidance_fires_on_the_prefixed_gap_the_runtime_actually_emits() {
+    let mut program = crate::AgenticProgramProjection::empty("program:test", "objective:test");
+    program.status = crate::AgenticProgramStatus::Open;
+    // Exactly the shape `objective_completion_waiting_gap` builds.
+    program.unresolved = vec![
+        "objective_completion_gap:original_intent_review_required:user_intent; uncovered_result_refs: artifact:a, artifact:b; criterion_unsatisfied:user_intent".to_string(),
+    ];
+    let actions = super::actionable(&program, false);
+    assert!(
+        actions
+            .iter()
+            .any(|action| action.contains("Use objective_review for the original criterion")),
+        "the review how-to must fire on the prefixed gap: {actions:?}"
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|action| action.contains("artifact:a") && action.contains("artifact:b")),
+        "the uncovered refs must be named so the model need not parse them out: {actions:?}"
+    );
+    assert!(
+        !actions
+            .iter()
+            .any(|action| action.contains("request Objective completion")),
+        "the exit action must stay silent while a gap remains: {actions:?}"
+    );
+}

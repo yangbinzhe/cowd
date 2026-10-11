@@ -92,17 +92,19 @@ impl Fixture {
                 }
                 if *round == 3 {
                     let wire: serde_json::Value = serde_json::from_str(&request).unwrap();
-                    assert!(wire["input"].as_array().unwrap().iter().any(|item| {
-                        item["type"] == "function_call_output" && item["call_id"] == "paired-call-2"
-                            && item["output"].to_string().contains(&format!("verified Skill output {scope}"))
-                    }), "verification must consume the physical predecessor read, not a fabricated Skill success: {request}");
+                    assert!(
+                        wire["input"].as_array().unwrap().iter().any(|item| {
+                            item["type"] == "function_call_output"
+                                && item["call_id"] == "paired-call-2"
+                                && item["output"]
+                                    .to_string()
+                                    .contains(&format!("verified Skill output {scope}"))
+                        }),
+                        "verification must consume the physical predecessor read, not a fabricated Skill success: {request}"
+                    );
                 }
                 let events = if *round < 4 {
-                    let name = if *round < 2 {
-                        "edit"
-                    } else {
-                        "read_file"
-                    };
+                    let name = if *round < 2 { "edit" } else { "read_file" };
                     let baseline_scope = format!(
                         ".cowd/evaluation/{:x}",
                         Sha256::digest(
@@ -140,7 +142,9 @@ impl Fixture {
                     ]
                 } else {
                     assert!(*round < 5, "paired fixture did not converge: {request}");
-                    let text = format!("Summary: completed. Created and independently reread {scope}/proof.txt.\nImplementation: created isolated proof file and reread it.\nValidation: actual write_file and read_file receipts.\nRisks: none observed in this local fixture.\nUnresolved: none.");
+                    let text = format!(
+                        "Summary: completed. Created and independently reread {scope}/proof.txt.\nImplementation: created isolated proof file and reread it.\nValidation: actual write_file and read_file receipts.\nRisks: none observed in this local fixture.\nUnresolved: none."
+                    );
                     vec![
                         serde_json::json!({"type":"response.created","response":{"id":"pair-final","model":"fast"}}),
                         serde_json::json!({"type":"response.output_text.delta","delta":text}),
@@ -262,10 +266,7 @@ impl Fixture {
     pub async fn verify(self, services: &Arc<RuntimeServices>) {
         let calls = self.host.calls.lock().unwrap().clone();
         assert_eq!(
-            calls
-                .iter()
-                .filter(|call| call.tool_name == "edit")
-                .count(),
+            calls.iter().filter(|call| call.tool_name == "edit").count(),
             2,
             "{calls:?}"
         );
@@ -291,10 +292,12 @@ impl Fixture {
                 .graph_state_store()
                 .load(&parent.execution_id)
                 .unwrap();
-            assert!(graph
-                .node_results
-                .values()
-                .any(|result| result.status == ExecutionNodeStatus::Completed));
+            assert!(
+                graph
+                    .node_results
+                    .values()
+                    .any(|result| result.status == ExecutionNodeStatus::Completed)
+            );
             let receipts = services
                 .event_store()
                 .list_stream(&format!(
@@ -330,12 +333,14 @@ impl Fixture {
                 ("paired-evidence", "1.0.0"),
                 ("paired-verification", "2.0.0"),
             ] {
-                assert!(events
-                    .events
-                    .iter()
-                    .any(|event| event.kind == "skill_candidates"
-                        && event.payload["selected"] == skill
-                        && event.payload["invocation_evidence"]["skill_version"] == version));
+                assert!(
+                    events
+                        .events
+                        .iter()
+                        .any(|event| event.kind == "skill_candidates"
+                            && event.payload["selected"] == skill
+                            && event.payload["invocation_evidence"]["skill_version"] == version)
+                );
             }
         }
         assert_eq!(

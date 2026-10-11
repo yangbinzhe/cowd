@@ -297,7 +297,7 @@ impl RealityRecallPort {
                 return (
                     Vec::new(),
                     degraded_status(ContextSourceKind::Fact, error.to_string()),
-                )
+                );
             }
         };
         let mut items = facts.into_iter().map(fact_context_item).collect::<Vec<_>>();
@@ -347,7 +347,7 @@ impl RealityRecallPort {
                 return (
                     Vec::new(),
                     degraded_status(ContextSourceKind::Matrix, error.to_string()),
-                )
+                );
             }
         };
         let recall_query =
@@ -358,7 +358,7 @@ impl RealityRecallPort {
                 return (
                     Vec::new(),
                     degraded_status(ContextSourceKind::Matrix, error.to_string()),
-                )
+                );
             }
         };
         let mut items = facts
@@ -840,30 +840,38 @@ mod tests {
             repository,
         );
         let report = port.recall_for_binding(&leased, "east shortage allocation", 12);
-        assert!(report
-            .items
-            .iter()
-            .any(|item| item.source == ContextSourceKind::Fact));
-        assert!(report
-            .items
-            .iter()
-            .any(|item| item.source == ContextSourceKind::Matrix));
+        assert!(
+            report
+                .items
+                .iter()
+                .any(|item| item.source == ContextSourceKind::Fact)
+        );
+        assert!(
+            report
+                .items
+                .iter()
+                .any(|item| item.source == ContextSourceKind::Matrix)
+        );
 
         leased.data_lease.fact_refs.clear();
         leased.data_lease.matrix_snapshot_refs.clear();
         let denied = port.recall_for_binding(&leased, "east shortage allocation", 12);
         assert!(denied.items.is_empty());
-        assert!(denied
-            .sources
-            .iter()
-            .all(|source| source.status == "disabled_by_binding"));
+        assert!(
+            denied
+                .sources
+                .iter()
+                .all(|source| source.status == "disabled_by_binding")
+        );
 
         leased.data_lease.fact_refs = vec!["not-a-fact-reference".to_string()];
         let invalid = port.recall_for_binding(&leased, "east shortage allocation", 12);
         assert!(invalid.items.is_empty());
-        assert!(invalid
-            .sources
-            .iter()
-            .all(|source| source.status == "degraded"));
+        assert!(
+            invalid
+                .sources
+                .iter()
+                .all(|source| source.status == "degraded")
+        );
     }
 }

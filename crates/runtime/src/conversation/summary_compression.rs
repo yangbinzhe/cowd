@@ -308,8 +308,8 @@ fn contains_any_case_insensitive(text: &str, needles: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        compress_summary, compress_summary_text, SummaryCompressionBudget,
-        SummaryCompressionCheckpoint,
+        SummaryCompressionBudget, SummaryCompressionCheckpoint, compress_summary,
+        compress_summary_text,
     };
 
     #[test]
@@ -322,9 +322,11 @@ mod tests {
 
         // then
         assert_eq!(result.removed_duplicate_lines, 1);
-        assert!(result
-            .summary
-            .contains("- Scope: compact earlier messages."));
+        assert!(
+            result
+                .summary
+                .contains("- Scope: compact earlier messages.")
+        );
         assert!(!result.summary.contains("  compact   earlier"));
     }
 
@@ -354,12 +356,16 @@ mod tests {
 
         // then
         assert!(result.summary.contains("Conversation summary:"));
-        assert!(result
-            .summary
-            .contains("- Scope: 18 earlier messages compacted."));
-        assert!(result
-            .summary
-            .contains("- Current work: finish summary compression."));
+        assert!(
+            result
+                .summary
+                .contains("- Scope: 18 earlier messages compacted.")
+        );
+        assert!(
+            result
+                .summary
+                .contains("- Current work: finish summary compression.")
+        );
         assert!(result.omitted_lines > 0);
     }
 
@@ -395,11 +401,13 @@ mod tests {
             vec!["context-envelope-1".to_string()],
         );
 
-        assert!(checkpoint
-            .current_goal
-            .as_deref()
-            .unwrap_or_default()
-            .contains("Current work"));
+        assert!(
+            checkpoint
+                .current_goal
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Current work")
+        );
         assert_eq!(checkpoint.key_user_rules.len(), 1);
         assert_eq!(checkpoint.pending_work.len(), 1);
         assert_eq!(checkpoint.evidence_refs, vec!["context-envelope-1"]);

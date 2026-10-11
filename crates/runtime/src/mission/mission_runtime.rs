@@ -447,21 +447,23 @@ fn append_aggregate_event(
                 "mission:{}:revision:{}",
                 aggregate.mission_id, aggregate.revision
             ),
-            vec![RuntimeEventInput {
-                stream_id: mission_stream_id(&aggregate.mission_id),
-                scope: RuntimeEventScope::Mission,
-                kind: format!("{event_kind}.v1"),
-                status: Some(aggregate.status.as_str().to_string()),
-                actor: Some("mission_runtime".to_string()),
-                refs,
-                payload: serde_json::to_value(MissionAggregateEvent {
-                    event_kind: event_kind.to_string(),
-                    aggregate: aggregate.clone(),
-                    evidence_refs: evidence_refs.to_vec(),
-                })
-                .map_err(|error| error.to_string())?,
-            }
-            .into()],
+            vec![
+                RuntimeEventInput {
+                    stream_id: mission_stream_id(&aggregate.mission_id),
+                    scope: RuntimeEventScope::Mission,
+                    kind: format!("{event_kind}.v1"),
+                    status: Some(aggregate.status.as_str().to_string()),
+                    actor: Some("mission_runtime".to_string()),
+                    refs,
+                    payload: serde_json::to_value(MissionAggregateEvent {
+                        event_kind: event_kind.to_string(),
+                        aggregate: aggregate.clone(),
+                        evidence_refs: evidence_refs.to_vec(),
+                    })
+                    .map_err(|error| error.to_string())?,
+                }
+                .into(),
+            ],
         )
         .map(|_| ())
         .map_err(|error| error.to_string())
@@ -700,14 +702,16 @@ mod tests {
     fn mission_revision_cas_and_terminal_evidence_are_enforced() {
         let runtime = MissionRuntime::new();
         let mission = runtime.ensure_default_mission().expect("mission");
-        assert!(runtime
-            .transition(
-                runtime.default_mission_id(),
-                mission.revision + 1,
-                MissionStatus::Active,
-                Vec::new()
-            )
-            .is_err());
+        assert!(
+            runtime
+                .transition(
+                    runtime.default_mission_id(),
+                    mission.revision + 1,
+                    MissionStatus::Active,
+                    Vec::new()
+                )
+                .is_err()
+        );
         let activated = runtime
             .transition(
                 runtime.default_mission_id(),
@@ -716,13 +720,15 @@ mod tests {
                 Vec::new(),
             )
             .expect("activate");
-        assert!(runtime
-            .transition(
-                runtime.default_mission_id(),
-                activated.accepted_revision,
-                MissionStatus::Completed,
-                Vec::new()
-            )
-            .is_err());
+        assert!(
+            runtime
+                .transition(
+                    runtime.default_mission_id(),
+                    activated.accepted_revision,
+                    MissionStatus::Completed,
+                    Vec::new()
+                )
+                .is_err()
+        );
     }
 }

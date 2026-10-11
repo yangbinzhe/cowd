@@ -633,16 +633,18 @@ mod tests {
                 .await,
             Err(ScopeLockError::TimedOut { .. })
         ));
-        assert!(manager
-            .acquire(
-                [request(
-                    workspace_object_in("other-repo", "src/lib.rs"),
-                    ScopeLockMode::Write,
-                )],
-                Some(Duration::from_millis(10)),
-            )
-            .await
-            .is_ok());
+        assert!(
+            manager
+                .acquire(
+                    [request(
+                        workspace_object_in("other-repo", "src/lib.rs"),
+                        ScopeLockMode::Write,
+                    )],
+                    Some(Duration::from_millis(10)),
+                )
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -728,16 +730,18 @@ mod tests {
             Err(ScopeLockError::TimedOut { .. })
         ));
         drop(held);
-        assert!(second
-            .acquire(
-                [request(
-                    ScopedResource::workspace("workspace").unwrap(),
-                    ScopeLockMode::Read,
-                )],
-                Some(Duration::from_millis(50)),
-            )
-            .await
-            .is_ok());
+        assert!(
+            second
+                .acquire(
+                    [request(
+                        ScopedResource::workspace("workspace").unwrap(),
+                        ScopeLockMode::Read,
+                    )],
+                    Some(Duration::from_millis(50)),
+                )
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -755,16 +759,18 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(second
-            .acquire(
-                [request(
-                    ScopedResource::workspace("right").unwrap(),
-                    ScopeLockMode::Write,
-                )],
-                Some(Duration::from_millis(25)),
-            )
-            .await
-            .is_ok());
+        assert!(
+            second
+                .acquire(
+                    [request(
+                        ScopedResource::workspace("right").unwrap(),
+                        ScopeLockMode::Write,
+                    )],
+                    Some(Duration::from_millis(25)),
+                )
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -783,16 +789,18 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(second
-            .acquire(
-                [request(
-                    workspace_object("tests/e2e.rs"),
-                    ScopeLockMode::Write,
-                )],
-                Some(Duration::from_millis(25)),
-            )
-            .await
-            .is_ok());
+        assert!(
+            second
+                .acquire(
+                    [request(
+                        workspace_object("tests/e2e.rs"),
+                        ScopeLockMode::Write,
+                    )],
+                    Some(Duration::from_millis(25)),
+                )
+                .await
+                .is_ok()
+        );
         assert!(matches!(
             second
                 .acquire(

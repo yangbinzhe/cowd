@@ -33,7 +33,9 @@ pub enum ToolExecutionPlaneError {
     Panicked,
     #[error("tool execution worker failed: {0}")]
     Worker(String),
-    #[error("tool execution exceeded the waiter timeout of {0:?}; the started operation continues under its resource lease")]
+    #[error(
+        "tool execution exceeded the waiter timeout of {0:?}; the started operation continues under its resource lease"
+    )]
     TimedOut(Duration),
 }
 
@@ -269,7 +271,7 @@ impl ToolExecutionPlane {
                 return (
                     Err(ToolExecutionPlaneError::Worker(error.to_string())),
                     None,
-                )
+                );
             }
         };
         let result_class = if soft_timed_out {
@@ -509,8 +511,8 @@ mod tests {
     use super::*;
     use crate::execution_core::graph::ResourceQuota;
     use harness_contract::tool::ResourceScopeDemand;
-    use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
 
     fn plane(limit: usize) -> ToolExecutionPlane {
         ToolExecutionPlane::new(
@@ -786,9 +788,11 @@ mod tests {
         );
         let observed = observed.lock().unwrap();
         assert!(!observed.is_empty());
-        assert!(observed
-            .iter()
-            .all(|observation| observation.fairness_key == "session:session-a"));
+        assert!(
+            observed
+                .iter()
+                .all(|observation| observation.fairness_key == "session:session-a")
+        );
     }
 
     #[tokio::test]

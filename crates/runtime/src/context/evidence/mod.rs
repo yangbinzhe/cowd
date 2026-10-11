@@ -40,7 +40,14 @@ pub fn build_tool_receipt(
     let prefix_tokens = estimate_text_tokens(&fixed_prefix);
     let body_budget = token_budget.saturating_sub(prefix_tokens).max(1);
     let raw_lines = output.lines().count();
-    let body = summarize_body(tool_name, output, content_kind, body_budget, raw_tokens, raw_lines);
+    let body = summarize_body(
+        tool_name,
+        output,
+        content_kind,
+        body_budget,
+        raw_tokens,
+        raw_lines,
+    );
     let summary = format!("{fixed_prefix}{body}");
     let receipt_tokens = estimate_text_tokens(&summary);
     ModelReceipt {

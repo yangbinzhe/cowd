@@ -7,8 +7,8 @@ mod registry;
 mod session;
 
 pub use budget::{HotMemoryBudget, HotStateConfig, HotStateMemoryConfig, LiveCheckpointConfig};
-pub(crate) use graph::estimate_graph_bytes;
 pub use graph::HotExecutionGraphRegistry;
+pub(crate) use graph::estimate_graph_bytes;
 pub use materializer::{DerivedMaterialization, DerivedMaterializer, DerivedMaterializerHealth};
 pub use metrics::{HotStateMetrics, HotStateMetricsSnapshot};
 pub use recovery::RecoveryPermit;

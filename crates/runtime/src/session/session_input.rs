@@ -10,7 +10,7 @@ use harness_contract::turn::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
-use crate::input_classifier::{classify_session_input, propose_input_relation, RuntimeInputState};
+use crate::input_classifier::{RuntimeInputState, classify_session_input, propose_input_relation};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionInputRecord {
@@ -1115,9 +1115,11 @@ mod tests {
             outcome => panic!("expected Bound, got {outcome:?}"),
         };
         assert_eq!(bound.status, SessionInputStatus::AttachedToTurn);
-        assert!(stream
-            .consume_for_checkpoint(&turn_id, TurnInputCheckpoint::BeforeProviderRequest, 8)
-            .is_empty());
+        assert!(
+            stream
+                .consume_for_checkpoint(&turn_id, TurnInputCheckpoint::BeforeProviderRequest, 8)
+                .is_empty()
+        );
         assert_eq!(stream.projection().pending_count, 1);
 
         let settled = stream

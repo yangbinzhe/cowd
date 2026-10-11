@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use harness_contract::core::TaskRisk;
 use harness_contract::execution_graph::{
     ExecutionFailure, ExecutionNodeResult, ExecutionNodeSpec, ExecutionNodeStatus, ExecutionUsage,
@@ -388,10 +388,12 @@ mod tests {
         let waiting = executor.poll_or_await(&ticket).await.unwrap().result;
         assert_eq!(waiting.status, ExecutionNodeStatus::WaitingApproval);
         let approval_id = waiting.result_ref.unwrap();
-        assert!(queue
-            .get(&approval_id)
-            .and_then(|request| request.expires_at_ms)
-            .is_some_and(|deadline| deadline > now_ms()));
+        assert!(
+            queue
+                .get(&approval_id)
+                .and_then(|request| request.expires_at_ms)
+                .is_some_and(|deadline| deadline > now_ms())
+        );
         queue
             .decide(
                 &crate::security::test_human_interactive_principal(),
@@ -456,10 +458,12 @@ mod tests {
             .unwrap();
         let completed = executor.poll_or_await(&ticket).await.unwrap().result;
         assert_eq!(completed.status, ExecutionNodeStatus::Completed);
-        assert!(completed
-            .summary
-            .as_deref()
-            .is_some_and(|summary| summary.contains("skipped")));
+        assert!(
+            completed
+                .summary
+                .as_deref()
+                .is_some_and(|summary| summary.contains("skipped"))
+        );
     }
 
     #[tokio::test]

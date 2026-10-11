@@ -893,10 +893,12 @@ mod tests {
 
         assert_eq!(outcome, PermissionOutcome::Allow);
         assert_eq!(prompter.seen.len(), 1);
-        assert!(prompter.seen[0]
-            .reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("ask rule")));
+        assert!(
+            prompter.seen[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("ask rule"))
+        );
     }
 
     #[test]

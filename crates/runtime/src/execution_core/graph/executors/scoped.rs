@@ -1,6 +1,6 @@
 use futures::{
-    future::{BoxFuture, Shared},
     FutureExt,
+    future::{BoxFuture, Shared},
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, RwLock};

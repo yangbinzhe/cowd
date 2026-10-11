@@ -1,7 +1,7 @@
 use super::{
-    candidate_kind::candidate_kinds_from_root_cause, diagnosis::EvolutionDiagnosisEngine,
-    mission::EvolutionMission, planner::EvolutionProposal, signal::EvolutionSignal,
-    triage::EvolutionTriageService, EvolutionCapabilityGoal,
+    EvolutionCapabilityGoal, candidate_kind::candidate_kinds_from_root_cause,
+    diagnosis::EvolutionDiagnosisEngine, mission::EvolutionMission, planner::EvolutionProposal,
+    signal::EvolutionSignal, triage::EvolutionTriageService,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

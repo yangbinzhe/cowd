@@ -725,9 +725,9 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 mod tests {
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use super::*;
@@ -1262,10 +1262,12 @@ mod tests {
         let report = GovernedToolExecutor.execute(&dag, context.as_ref()).await;
 
         assert!(context.starts.lock().expect("starts lock").is_empty());
-        assert!(report
-            .outcomes
-            .iter()
-            .all(|outcome| matches!(outcome.terminal, GovernedToolTaskTerminal::Cancelled { .. })));
+        assert!(
+            report.outcomes.iter().all(|outcome| matches!(
+                outcome.terminal,
+                GovernedToolTaskTerminal::Cancelled { .. }
+            ))
+        );
     }
 
     #[tokio::test]

@@ -21,10 +21,7 @@ pub enum ExecutionStateStoreError {
     /// location every investigation starts by grepping for call sites instead of
     /// reading one line.
     #[error("execution graph `{graph_id}` does not exist (looked up at {location})")]
-    NotFound {
-        graph_id: String,
-        location: String,
-    },
+    NotFound { graph_id: String, location: String },
     #[error("execution graph `{graph_id}` stream is corrupt: {reason}")]
     Corrupt { graph_id: String, reason: String },
     #[error("execution state blocking task failed: {0}")]
@@ -149,10 +146,14 @@ impl ExecutionGraphStateStore {
         graph_id: &str,
         location: &str,
     ) -> Result<ExecutionGraph, ExecutionStateStoreError> {
-        self.load_snapshot(graph_id).map(|graph| graph.as_ref().clone())
+        self.load_snapshot(graph_id)
+            .map(|graph| graph.as_ref().clone())
             .or_else(|error| match error {
                 ExecutionStateStoreError::NotFound { graph_id, .. } => {
-                    Err(ExecutionStateStoreError::NotFound { graph_id, location: location.to_string() })
+                    Err(ExecutionStateStoreError::NotFound {
+                        graph_id,
+                        location: location.to_string(),
+                    })
                 }
                 other => Err(other),
             })
@@ -380,9 +381,9 @@ fn project_graph_events(
         projected = Some(graph);
     }
     projected.ok_or_else(|| ExecutionStateStoreError::NotFound {
-            graph_id: graph_id.to_string(),
-            location: "<unspecified>".to_string(),
-        })
+        graph_id: graph_id.to_string(),
+        location: "<unspecified>".to_string(),
+    })
 }
 
 fn is_legacy_full_graph_snapshot(record: &crate::DurableRuntimeEvent) -> bool {
@@ -437,9 +438,9 @@ mod tests {
     use harness_contract::execution_graph::{ExecutionNodeKind, ExecutionNodeSpec};
 
     use super::*;
+    use crate::RuntimeEventInput;
     use crate::execution_core::graph::ExecutionCommitService;
     use crate::execution_core::hot_state::RuntimeHotStatePlane;
-    use crate::RuntimeEventInput;
 
     #[test]
     fn shared_hot_plane_recovers_once_then_serves_memory() {
@@ -588,9 +589,11 @@ mod tests {
             projection.nodes[0].payload_ref,
             "execution-payload:opaque-node"
         );
-        assert!(!serde_json::to_string(&projection)
-            .expect("serialize public projection")
-            .contains("private-prompt-and-runtime-binding"));
+        assert!(
+            !serde_json::to_string(&projection)
+                .expect("serialize public projection")
+                .contains("private-prompt-and-runtime-binding")
+        );
     }
 }
 
@@ -677,9 +680,15 @@ mod not_found_location_tests {
     /// would merge three different identity spaces into one.
     #[test]
     fn runner_and_runs_are_not_run_ids() {
-        assert_eq!(graph_id_for_lookup("run:agentic-graph:abc"), "agentic-graph:abc");
+        assert_eq!(
+            graph_id_for_lookup("run:agentic-graph:abc"),
+            "agentic-graph:abc"
+        );
         assert_eq!(graph_id_for_lookup("runner:abc"), "runner:abc");
         assert_eq!(graph_id_for_lookup("runs:abc"), "runs:abc");
-        assert_eq!(graph_id_for_lookup("agentic-graph:abc"), "agentic-graph:abc");
+        assert_eq!(
+            graph_id_for_lookup("agentic-graph:abc"),
+            "agentic-graph:abc"
+        );
     }
 }

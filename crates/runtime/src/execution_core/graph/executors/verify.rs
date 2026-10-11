@@ -491,8 +491,8 @@ fn retained_runtime_attached_upstream_evidence(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution_core::graph::ExecutionCommitService;
     use crate::RuntimeEventStore;
+    use crate::execution_core::graph::ExecutionCommitService;
     use harness_contract::execution_graph::{ExecutionEdge, ExecutionGraph, ExecutionNodeKind};
     use harness_contract::reality::EvidenceRef;
     use std::sync::Arc;
@@ -698,21 +698,25 @@ mod tests {
         let result = executor.poll_or_await(&ticket).await.unwrap().result;
 
         assert_eq!(result.status, ExecutionNodeStatus::Blocked);
-        assert!(result
-            .result_ref
-            .as_deref()
-            .is_some_and(|reference| reference.ends_with(":not_satisfied")));
+        assert!(
+            result
+                .result_ref
+                .as_deref()
+                .is_some_and(|reference| reference.ends_with(":not_satisfied"))
+        );
         assert_eq!(result.evidence_refs.len(), 1);
         assert!(!result.failure.as_ref().unwrap().retryable);
         let receipt = commit
             .transition_node(&graph, &verify.id, result.status, Some(result), Vec::new())
             .unwrap();
-        assert!(receipt
-            .graph
-            .node_results
-            .get(&verify.id)
-            .and_then(|result| result.result_ref.as_deref())
-            .is_some_and(|reference| reference.ends_with(":not_satisfied")));
+        assert!(
+            receipt
+                .graph
+                .node_results
+                .get(&verify.id)
+                .and_then(|result| result.result_ref.as_deref())
+                .is_some_and(|reference| reference.ends_with(":not_satisfied"))
+        );
     }
 
     #[test]

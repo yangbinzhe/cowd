@@ -14,13 +14,13 @@ pub mod signal;
 pub mod triage;
 
 pub use candidate_kind::{
-    candidate_kind_from_proposal, candidate_kinds_from_root_cause, EvolutionCandidateKind,
-    EvolutionPromotionRoute,
+    EvolutionCandidateKind, EvolutionPromotionRoute, candidate_kind_from_proposal,
+    candidate_kinds_from_root_cause,
 };
 pub use capability_goal::EvolutionCapabilityGoal;
 pub use case::{
-    EvolutionCase, EvolutionCaseCatalogPage, EvolutionCaseIndex, EvolutionCaseKey,
-    EvolutionCasePage, EvolutionCaseState, EvolutionCaseSummary, EVOLUTION_CASE_CATALOG_PAGE_SIZE,
+    EVOLUTION_CASE_CATALOG_PAGE_SIZE, EvolutionCase, EvolutionCaseCatalogPage, EvolutionCaseIndex,
+    EvolutionCaseKey, EvolutionCasePage, EvolutionCaseState, EvolutionCaseSummary,
 };
 pub use diagnosis::{
     EvolutionDiagnosis, EvolutionDiagnosisEngine, EvolutionHypothesis, EvolutionRootCauseKind,

@@ -2551,11 +2551,20 @@ fn actionable(projection: &AgenticProgramProjection, duplicate: bool) -> Vec<Str
                 projection.last_reopen_gaps.join("; ")
             ));
         }
-        if projection
-            .unresolved
-            .iter()
-            .any(|gap| gap.starts_with("original_intent_review_required:"))
-        {
+        // The gap a completion request is reopened with is assembled by
+        // `objective_completion_waiting_gap`, which prefixes the recorded
+        // reason: `objective_completion_gap:original_intent_review_required:
+        // user_intent; ...`. Matching the bare prefix therefore never fired,
+        // and the one sentence that names the tool the model must call was
+        // silently dropped - a live run cycled seven completion requests
+        // without ever issuing a review, because the only instruction it got
+        // was a gap string it could not act on. Match the marker wherever it
+        // appears in the assembled gap.
+        let review_required = projection.unresolved.iter().any(|gap| {
+            gap.contains("original_intent_review_required:")
+                || gap.contains("criterion_review_required:")
+        });
+        if review_required {
             // The how-to names the tool and the shape; the scope discipline is
             // shared with the terminal presentation and therefore comes from
             // the order contract, so a change cannot reach one layer and miss
@@ -2564,6 +2573,22 @@ fn actionable(projection: &AgenticProgramProjection, duplicate: bool) -> Vec<Str
                 "Use objective_review for the original criterion with the current delivered result and durable evidence. {}",
                 crate::agentic::order_contract::OBJECTIVE_REVIEW_SCOPE_DISCIPLINE
             ));
+            // Name the exact refs that still have no review, so the model does
+            // not have to parse them out of the gap string itself.
+            let uncovered = projection
+                .unresolved
+                .iter()
+                .filter_map(|gap| gap.split("uncovered_result_refs:").nth(1))
+                .flat_map(|tail| tail.split(';').next().unwrap_or("").split(','))
+                .map(|reference| reference.trim().to_string())
+                .filter(|reference| !reference.is_empty())
+                .collect::<Vec<_>>();
+            if !uncovered.is_empty() {
+                actions.push(format!(
+                    "These delivered results have no review yet: {}. Read each one, then submit exactly one objective_review whose result_refs cover all of them.",
+                    uncovered.join(", ")
+                ));
+            }
         }
         // A reopened Program must never also advertise the exit action in the
         // same receipt: one live run received "resolve the recorded gaps" and

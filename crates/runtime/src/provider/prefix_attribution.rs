@@ -179,7 +179,10 @@ pub fn canonical_prompt_layout(stable_head_bytes: usize, total_bytes: usize) -> 
     PromptLayout {
         spans: [
             (PromptSegment::System, SegmentSpan::new(0, boundary)),
-            (PromptSegment::Messages, SegmentSpan::new(boundary, total_bytes)),
+            (
+                PromptSegment::Messages,
+                SegmentSpan::new(boundary, total_bytes),
+            ),
         ]
         .into_iter()
         .collect(),
@@ -376,7 +379,10 @@ mod tests {
         let attribution = attribute_divergence(b"", current, &layout);
         assert_eq!(attribution.reusable_bytes, 0);
         assert_eq!(attribution.first_diff_offset, 0);
-        assert_eq!(attribution.segment, None, "no predecessor means cold, not diverged");
+        assert_eq!(
+            attribution.segment, None,
+            "no predecessor means cold, not diverged"
+        );
         assert_eq!(attribution.reuse_bp(), 0);
     }
 

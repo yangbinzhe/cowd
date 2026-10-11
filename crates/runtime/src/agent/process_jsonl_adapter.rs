@@ -3,7 +3,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -14,7 +14,7 @@ use harness_contract::agent::{
     AgentCommand, AgentCommandRejectReason, AgentCommandRequest, AgentReturnPacket, AgentTaskPacket,
 };
 use harness_contract::context::ArtifactWriteDescriptor;
-use sandbox_launcher::{program_command_with_args, SandboxLaunchSpec, SandboxWorkspaceAccess};
+use sandbox_launcher::{SandboxLaunchSpec, SandboxWorkspaceAccess, program_command_with_args};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -22,7 +22,7 @@ use crate::agent_model_selector::AgentModelSelection;
 use crate::agent_run_handle::{AgentBackendCapabilities, AgentBackendKind, AgentRunHandle};
 use crate::agent_runtime::AgentRuntimeBackend;
 use crate::config::AgentProcessTransportLimits;
-use crate::{agent_in_process_worker::ProcessJsonlToolSession, RuntimeServices};
+use crate::{RuntimeServices, agent_in_process_worker::ProcessJsonlToolSession};
 
 /// V2 permits arbitrarily large business content only through the content
 /// plane. Control/action JSONL frames stay bounded so one broken worker cannot
@@ -1304,7 +1304,10 @@ fn read_process_exchange(
                     return Err("ProcessJsonl content upload must start at offset zero".to_string());
                 }
                 if content_uploads.len() >= limits.pending_uploads {
-                    return Err(format!("ProcessJsonl exceeds the {} pending content uploads transport limit; commit an upload before opening another", limits.pending_uploads));
+                    return Err(format!(
+                        "ProcessJsonl exceeds the {} pending content uploads transport limit; commit an upload before opening another",
+                        limits.pending_uploads
+                    ));
                 }
                 let session = tool_session.ok_or_else(|| {
                     "ProcessJsonl worker requested content storage without a Runtime artifact bridge"
@@ -1596,7 +1599,10 @@ fn write_process_message(
     let payload = serde_json::to_string(&message)
         .map_err(|error| format!("encode ProcessJsonl Runtime message: {error}"))?;
     if payload.len().saturating_add(1) > active.limits.frame_bytes {
-        return Err(format!("ProcessJsonl Runtime control frame exceeds {} bytes; publish long content through the content plane", active.limits.frame_bytes));
+        return Err(format!(
+            "ProcessJsonl Runtime control frame exceeds {} bytes; publish long content through the content plane",
+            active.limits.frame_bytes
+        ));
     }
     *sequence = sequence.saturating_add(1);
     stdin
@@ -1874,13 +1880,17 @@ mod tests {
             "agent_id": packet.agent_id(),
             "result": completed_return(&packet),
         });
-        assert!(read_process_result(format!("{v1}\n").as_bytes(), &packet)
-            .expect_err("V1 is not accepted")
-            .contains("V2"));
+        assert!(
+            read_process_result(format!("{v1}\n").as_bytes(), &packet)
+                .expect_err("V1 is not accepted")
+                .contains("V2")
+        );
         let oversized = format!("{}\n", "x".repeat(MAX_PROCESS_FRAME_BYTES));
-        assert!(read_process_result(oversized.as_bytes(), &packet)
-            .expect_err("oversized frame is rejected")
-            .contains("transport limit"));
+        assert!(
+            read_process_result(oversized.as_bytes(), &packet)
+                .expect_err("oversized frame is rejected")
+                .contains("transport limit")
+        );
     }
 
     #[test]
@@ -2028,12 +2038,14 @@ mod tests {
                     let _ = terminate_process_tree(&mut watchdog_active.child.lock().unwrap());
                 }
             });
-            assert!(write_process_message(
-                &active,
-                &serde_json::json!({"kind":"agent_command",
+            assert!(
+                write_process_message(
+                    &active,
+                    &serde_json::json!({"kind":"agent_command",
             "input":"x".repeat(MAX_PROCESS_FRAME_BYTES + 1)})
-            )
-            .is_err());
+                )
+                .is_err()
+            );
             assert_eq!(
                 *active.next_runtime_sequence.lock().unwrap(),
                 1,
@@ -2197,13 +2209,15 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .active
             .remove(packet.run_id());
-        assert!(adapter
-            .registry
-            .lifecycle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .active
-            .is_empty());
+        assert!(
+            adapter
+                .registry
+                .lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .active
+                .is_empty()
+        );
     }
 
     #[cfg(unix)]
@@ -2298,12 +2312,16 @@ mod tests {
             let mut missing = ack("ack-test", 17, true);
             missing.accepted = None;
             assert!(active.acknowledge_command(&missing).is_err());
-            assert!(active
-                .acknowledge_command(&ack("unknown", 17, true))
-                .is_err());
-            assert!(active
-                .acknowledge_command(&ack("ack-test", 18, true))
-                .is_err());
+            assert!(
+                active
+                    .acknowledge_command(&ack("unknown", 17, true))
+                    .is_err()
+            );
+            assert!(
+                active
+                    .acknowledge_command(&ack("ack-test", 18, true))
+                    .is_err()
+            );
             assert_eq!(active.command_slots.available_permits(), 1);
             active
                 .acknowledge_command(&ack("ack-test", 17, accepted))
@@ -2465,13 +2483,15 @@ mod tests {
             )
             .await;
         assert!(receipt.is_ok());
-        assert!(adapter
-            .registry
-            .lifecycle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pending_cancellation
-            .contains(packet.run_id()));
+        assert!(
+            adapter
+                .registry
+                .lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending_cancellation
+                .contains(packet.run_id())
+        );
     }
 
     #[cfg(unix)]
@@ -2519,9 +2539,11 @@ mod tests {
         .expect("malformed worker must be terminated instead of waiting for sleep")
         .expect("worker thread");
 
-        assert!(result
-            .expect_err("malformed worker cannot complete")
-            .contains("malformed ProcessJsonl V2 envelope"));
+        assert!(
+            result
+                .expect_err("malformed worker cannot complete")
+                .contains("malformed ProcessJsonl V2 envelope")
+        );
     }
 
     #[cfg(unix)]
@@ -2630,9 +2652,11 @@ mod tests {
         .expect("handshake timeout must reap a silent worker")
         .expect("worker thread");
 
-        assert!(result
-            .expect_err("a worker without ready cannot run")
-            .contains("ready handshake"));
+        assert!(
+            result
+                .expect_err("a worker without ready cannot run")
+                .contains("ready handshake")
+        );
     }
 
     #[cfg(unix)]
@@ -2814,8 +2838,8 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn real_process_topic_bridge_delivers_start_and_tool_deltas_without_replaying_cached_tool(
-    ) {
+    async fn real_process_topic_bridge_delivers_start_and_tool_deltas_without_replaying_cached_tool()
+     {
         exercise_real_process_topic_bridge(false, None).await;
     }
 
@@ -2887,8 +2911,8 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn real_process_pending_transport_request_requires_effect_reconciliation_without_reexecution(
-    ) {
+    async fn real_process_pending_transport_request_requires_effect_reconciliation_without_reexecution()
+     {
         exercise_real_process_topic_bridge(false, Some("pending-request")).await;
     }
 
@@ -3128,10 +3152,12 @@ mod tests {
         )
         .unwrap();
         if content_case == Some("pending-request") {
-            assert!(bridge
-                .replay_or_begin_transport_request("pending-crash", &read_fingerprint)
-                .unwrap()
-                .is_none());
+            assert!(
+                bridge
+                    .replay_or_begin_transport_request("pending-crash", &read_fingerprint)
+                    .unwrap()
+                    .is_none()
+            );
         }
         let binding = packet.binding.as_ref().unwrap();
         let context = memory::MemoryTurnContext::new(
@@ -3316,11 +3342,13 @@ else:
                     .unwrap(),
                 expected
             );
-            assert!(services
-                .artifact_store()
-                .read(&artifact, "session:unrelated", None)
-                .await
-                .is_err());
+            assert!(
+                services
+                    .artifact_store()
+                    .read(&artifact, "session:unrelated", None)
+                    .await
+                    .is_err()
+            );
         } else if content_case == Some("sequential") {
             let artifacts: Vec<harness_contract::context::ArtifactRef> =
                 serde_json::from_str(&received.unwrap().outcome).unwrap();
@@ -3341,9 +3369,11 @@ else:
                 );
             }
         } else if content_case == Some("pending-request") {
-            assert!(received
-                .unwrap_err()
-                .contains("unresolved transport completion"));
+            assert!(
+                received
+                    .unwrap_err()
+                    .contains("unresolved transport completion")
+            );
         } else if content_case == Some("offset") {
             assert!(received.unwrap_err().contains("offset"));
         } else if content_case == Some("digest") {
@@ -3351,9 +3381,11 @@ else:
         } else if content_case == Some("eof") {
             assert!(received.is_err(), "EOF cannot commit or complete an upload");
         } else if content_case == Some("capacity") {
-            assert!(received
-                .unwrap_err()
-                .contains("pending content uploads transport limit"));
+            assert!(
+                received
+                    .unwrap_err()
+                    .contains("pending content uploads transport limit")
+            );
         } else if changed_retry {
             assert!(received.unwrap_err().contains("request_id was reused"));
         } else {
@@ -3407,24 +3439,32 @@ else:
             .replay_or_begin_transport_request("read-1", &read_fingerprint)
             .unwrap()
             .expect("the real response survives cache eviction and bridge reconstruction");
-        assert!(replay["output"]
-            .as_str()
-            .unwrap()
-            .contains("actual-source-body"));
-        assert!(rebuilt_bridge
-            .replay_or_begin_transport_request("read-1", "different-fingerprint")
-            .unwrap_err()
-            .contains("request_id was reused"));
-        assert!(rebuilt_bridge
-            .replay_or_begin_transport_request("unresolved-read", &read_fingerprint)
-            .unwrap()
-            .is_none());
+        assert!(
+            replay["output"]
+                .as_str()
+                .unwrap()
+                .contains("actual-source-body")
+        );
+        assert!(
+            rebuilt_bridge
+                .replay_or_begin_transport_request("read-1", "different-fingerprint")
+                .unwrap_err()
+                .contains("request_id was reused")
+        );
+        assert!(
+            rebuilt_bridge
+                .replay_or_begin_transport_request("unresolved-read", &read_fingerprint)
+                .unwrap()
+                .is_none()
+        );
         let another_bridge =
             ProcessJsonlToolSession::prepare(&services, &packet, &selection).unwrap();
-        assert!(another_bridge
-            .replay_or_begin_transport_request("unresolved-read", &read_fingerprint)
-            .unwrap_err()
-            .contains("unresolved transport completion"));
+        assert!(
+            another_bridge
+                .replay_or_begin_transport_request("unresolved-read", &read_fingerprint)
+                .unwrap_err()
+                .contains("unresolved transport completion")
+        );
         let mut another_run = packet.clone();
         another_run.assignment.run_id = "different-physical-run".into();
         let isolated =
@@ -3442,23 +3482,27 @@ else:
         let mut updated = control.snapshot();
         updated.revision += 1;
         control.replace(updated).unwrap();
-        assert!(bridge
-            .execute_tool("stale-policy", "read_file", r#"{"path":"source.txt"}"#)
-            .await
-            .unwrap_err()
-            .contains("policy revision is stale"));
+        assert!(
+            bridge
+                .execute_tool("stale-policy", "read_file", r#"{"path":"source.txt"}"#)
+                .await
+                .unwrap_err()
+                .contains("policy revision is stale")
+        );
         assert_eq!(host.reads.load(Ordering::SeqCst), 1);
-        assert!(actions
-            .topic_observations(
-                &root.program_id,
-                &agent,
-                &packet.agentic_binding.as_ref().unwrap().team_id,
-                packet.graph_id(),
-                16,
-                48 * 1024
-            )
-            .unwrap()
-            .is_none());
+        assert!(
+            actions
+                .topic_observations(
+                    &root.program_id,
+                    &agent,
+                    &packet.agentic_binding.as_ref().unwrap().team_id,
+                    packet.graph_id(),
+                    16,
+                    48 * 1024
+                )
+                .unwrap()
+                .is_none()
+        );
     }
 }
 #[cfg(all(test, unix))]
@@ -3531,14 +3575,16 @@ send('result',result=json.loads(RESULT_JSON))
                 .settled
         );
         let revision = projection.revision;
-        assert!(fixture
-            .services
-            .agent_runtime()
-            .execute_task(fixture.packet.clone())
-            .await
-            .unwrap()
-            .failure
-            .is_none());
+        assert!(
+            fixture
+                .services
+                .agent_runtime()
+                .execute_task(fixture.packet.clone())
+                .await
+                .unwrap()
+                .failure
+                .is_none()
+        );
         let projection = fixture
             .services
             .agent_action_service()
@@ -3551,12 +3597,14 @@ send('result',result=json.loads(RESULT_JSON))
                 .as_deref(),
             Some("primary-execution")
         );
-        assert!(fixture
-            .services
-            .dispatch_ready_agentic_work("coord-program")
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            fixture
+                .services
+                .dispatch_ready_agentic_work("coord-program")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // G29 WIP: real child + host write/read + TaskExecute fixture are wired, but

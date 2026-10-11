@@ -1277,8 +1277,10 @@ impl RuntimeServices {
                     .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
                 original.deadline_at_ms
             }
-            Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => now_ms()
-                .saturating_add(harness_contract::agent::DEFAULT_DELEGATED_EXECUTION_TIMEOUT_MS),
+            Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => {
+                now_ms()
+                    .saturating_add(harness_contract::agent::DEFAULT_DELEGATED_EXECUTION_TIMEOUT_MS)
+            }
             Err(error) => return Err(error.into()),
         };
         let isolation_digest = format!(

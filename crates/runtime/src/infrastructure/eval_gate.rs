@@ -937,9 +937,11 @@ mod tests {
             report.verdicts[0].failed_checks[0].owner,
             "ai-verification/runtime-conversation"
         );
-        assert!(report.verdicts[0].failed_checks[0]
-            .repair_hint
-            .contains("finalization gate"));
+        assert!(
+            report.verdicts[0].failed_checks[0]
+                .repair_hint
+                .contains("finalization gate")
+        );
     }
 
     #[test]
@@ -977,9 +979,11 @@ mod tests {
         let suite = CowdBenchSmokeSuite::default();
         let report = suite.evaluate_agentic_gate(&[], RegressionGate::strict());
 
-        assert!(report
-            .covered_capabilities
-            .contains(&"behavior".to_string()));
+        assert!(
+            report
+                .covered_capabilities
+                .contains(&"behavior".to_string())
+        );
         assert!(report.required_capabilities.contains(&"policy".to_string()));
     }
 }

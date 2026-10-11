@@ -7,8 +7,8 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
     Arc, Mutex as StdMutex, OnceLock,
+    atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
 

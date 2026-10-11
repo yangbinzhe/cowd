@@ -197,8 +197,8 @@ impl RuntimeBudgetPlan {
         // (`READ_TOOL_RESULT_FLOOR_TOKENS`) keeps an exhausted lease from
         // starving a later read into a stub. Anything longer stays reachable
         // through the `tool://` full-output reference.
-        let tool_single = scaled_budget(tool_total as u64, 0.5, 12_000, 12_000)
-            .min(tool_total as u64) as usize;
+        let tool_single =
+            scaled_budget(tool_total as u64, 0.5, 12_000, 12_000).min(tool_total as u64) as usize;
         let subagent_default_budget =
             scaled_budget(subsystem_budget_tokens, profile_multiplier, 512, 160_000);
         let predicted_branch_tokens =

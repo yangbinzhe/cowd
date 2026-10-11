@@ -832,10 +832,11 @@ fn get_actions_section() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        collapse_blank_lines, discover_project_context_items_for_profile, display_context_path,
+        COWD_IDENTITY_CONTRACT_VERSION, ContextFile, ProjectContext,
+        SYSTEM_PROMPT_DYNAMIC_BOUNDARY, SystemPromptBuilder, collapse_blank_lines,
+        discover_project_context_items_for_profile, display_context_path,
         normalize_instruction_content, project_context_items, runtime_clock_section,
-        truncate_instruction_content, ContextFile, ProjectContext, SystemPromptBuilder,
-        COWD_IDENTITY_CONTRACT_VERSION, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        truncate_instruction_content,
     };
     use crate::config::ConfigLoader;
     use std::fs;
@@ -1073,8 +1074,10 @@ mod tests {
             "the contradictory incremental-step rule must stay deleted"
         );
         assert!(rendered.contains("independent Tasks"));
-        assert!(!rendered
-            .contains("Each declared result artifact is a required terminal structured field"));
+        assert!(
+            !rendered
+                .contains("Each declared result artifact is a required terminal structured field")
+        );
         assert!(
             crate::context_ledger::estimate_text_tokens(&rendered) < 8_000,
             "capacity-safe stable prompt must leave room for history, tools and output"
@@ -1097,8 +1100,10 @@ mod tests {
         assert!(!rendered.contains("Active model:"));
         assert!(!rendered.contains("Platform: unknown unknown"));
         assert!(rendered.contains("Agent-first collaboration contract"));
-        assert!(!rendered
-            .contains("Each declared result artifact is a required terminal structured field"));
+        assert!(
+            !rendered
+                .contains("Each declared result artifact is a required terminal structured field")
+        );
     }
 
     #[test]
@@ -1238,9 +1243,11 @@ mod tests {
         assert!(status.contains("## main"));
         assert!(status.contains("A  d.txt"));
 
-        assert!(items
-            .iter()
-            .any(|item| item.content.contains("first commit")));
+        assert!(
+            items
+                .iter()
+                .any(|item| item.content.contains("first commit"))
+        );
         assert!(items.iter().any(|item| item.content.contains("## main")));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -1284,12 +1291,16 @@ mod tests {
             ProjectContext::discover_with_git(&root, "2026-03-31").expect("context should load");
 
         let items = project_context_items(&context);
-        assert!(items
-            .iter()
-            .any(|item| item.content.contains("tracked.txt")));
-        assert!(!items
-            .iter()
-            .any(|item| item.content.contains("hello\nworld")));
+        assert!(
+            items
+                .iter()
+                .any(|item| item.content.contains("tracked.txt"))
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.content.contains("hello\nworld"))
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -1317,9 +1328,11 @@ mod tests {
         );
 
         assert!(main.iter().any(|item| item.id == "workspace:git-status"));
-        assert!(child
-            .iter()
-            .all(|item| !item.id.starts_with("workspace:git-")));
+        assert!(
+            child
+                .iter()
+                .all(|item| !item.id.starts_with("workspace:git-"))
+        );
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
@@ -1423,13 +1436,17 @@ mod tests {
         .expect("write instructions.md");
 
         let context = ProjectContext::discover(&nested, "2026-03-31").expect("context should load");
-        assert!(context
-            .instruction_files
-            .iter()
-            .any(|file| file.path.ends_with(".cowd/instructions.md")));
-        assert!(project_context_items(&context)
-            .iter()
-            .any(|item| item.content.contains("instruction markdown")));
+        assert!(
+            context
+                .instruction_files
+                .iter()
+                .any(|file| file.path.ends_with(".cowd/instructions.md"))
+        );
+        assert!(
+            project_context_items(&context)
+                .iter()
+                .any(|item| item.content.contains("instruction markdown"))
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -1448,17 +1465,19 @@ mod tests {
         };
         let items = project_context_items(&context);
         assert_eq!(items.len(), 1);
-        assert!(items[0]
-            .source_id
-            .as_deref()
-            .is_some_and(|path| path.contains("CLAUDE.md")));
+        assert!(
+            items[0]
+                .source_id
+                .as_deref()
+                .is_some_and(|path| path.contains("CLAUDE.md"))
+        );
         assert!(items[0].content.contains("Project rules"));
     }
 }
 
 #[cfg(test)]
 mod clock_stamp_tests {
-    use super::{runtime_clock_section_at, RuntimeClockStamp};
+    use super::{RuntimeClockStamp, runtime_clock_section_at};
     use crate::prompt_assembly::PromptAssembly;
 
     #[test]
@@ -1492,9 +1511,11 @@ mod clock_stamp_tests {
             crate::SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string(),
             runtime_clock_section_at(&stamp),
         ]);
-        assert!(!assembly
-            .stable_system_text()
-            .expect("stable prefix")
-            .contains("Runtime clock"));
+        assert!(
+            !assembly
+                .stable_system_text()
+                .expect("stable prefix")
+                .contains("Runtime clock")
+        );
     }
 }

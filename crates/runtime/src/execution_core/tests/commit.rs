@@ -233,10 +233,12 @@ fn planned_graph_and_continuation_claim_commit_in_one_transaction() {
         error,
         ExecutionCommitError::AlreadyAppliedSame { ref graph_id } if graph_id == "root-current"
     ));
-    assert!(store
-        .list_stream("root-retry-must-not-exist")
-        .expect("retry graph stream")
-        .is_empty());
+    assert!(
+        store
+            .list_stream("root-retry-must-not-exist")
+            .expect("retry graph stream")
+            .is_empty()
+    );
 }
 
 #[test]
@@ -684,10 +686,12 @@ fn delegated_effect_intent_is_atomic_with_index_and_current_graph_authority() {
         )
     };
     assert!(snapshot().err().unwrap().contains("effect_review_pending"));
-    assert!(service
-        .load_delegated_agent_tool_receipts(&graph.id, &graph.nodes[0].id, 1)
-        .unwrap()
-        .is_empty());
+    assert!(
+        service
+            .load_delegated_agent_tool_receipts(&graph.id, &graph.nodes[0].id, 1)
+            .unwrap()
+            .is_empty()
+    );
     service
         .commit_tool_effect(&request, &effect, &outcome("indexed-write", "written"))
         .unwrap();
@@ -710,25 +714,27 @@ fn delegated_effect_intent_is_atomic_with_index_and_current_graph_authority() {
     assert!(snapshot().err().unwrap().contains("effect_review_pending"));
     // A conclusion prepared before the second write cannot commit even its
     // unrelated terminal stream if the original receipt source changed.
-    assert!(store
-        .append_transaction(AppendTransactionRequest {
-            transaction_id: "negative-stale-effect-conclusion".into(),
-            expected_streams: before.additional_sources,
-            events: vec![RuntimeTransactionEventInput {
-                event: RuntimeEventInput {
-                    stream_id: "negative-terminal".into(),
-                    scope: RuntimeEventScope::ExecutionNode,
-                    kind: "test.negative_terminal".into(),
-                    status: None,
-                    actor: None,
-                    refs: vec![],
-                    payload: json!({}),
-                },
-                idempotency_key: Some("negative-terminal".into()),
-                schema_version: 1,
-            }],
-        })
-        .is_err());
+    assert!(
+        store
+            .append_transaction(AppendTransactionRequest {
+                transaction_id: "negative-stale-effect-conclusion".into(),
+                expected_streams: before.additional_sources,
+                events: vec![RuntimeTransactionEventInput {
+                    event: RuntimeEventInput {
+                        stream_id: "negative-terminal".into(),
+                        scope: RuntimeEventScope::ExecutionNode,
+                        kind: "test.negative_terminal".into(),
+                        status: None,
+                        actor: None,
+                        refs: vec![],
+                        payload: json!({}),
+                    },
+                    idempotency_key: Some("negative-terminal".into()),
+                    schema_version: 1,
+                }],
+            })
+            .is_err()
+    );
     assert_eq!(store.stream_revision("negative-terminal").unwrap(), 0);
     service
         .apply_command(
@@ -786,9 +792,11 @@ fn root_effect_fences_lineage_cancellation_and_replay_without_losing_admitted_re
     let mut write = request("root-write");
     write.session_id = Some(context.session_id.clone());
     let effect = mutation_effect(ToolIdempotency::Idempotent);
-    assert!(service
-        .begin_root_tool_effect(&write, &effect, &context)
-        .is_err());
+    assert!(
+        service
+            .begin_root_tool_effect(&write, &effect, &context)
+            .is_err()
+    );
     for status in [ExecutionNodeStatus::Ready, ExecutionNodeStatus::Running] {
         graph = service
             .transition_node(&graph, &node, status, None, vec![])
@@ -797,9 +805,11 @@ fn root_effect_fences_lineage_cancellation_and_replay_without_losing_admitted_re
     }
     let mut stale = context.clone();
     stale.turn_id = "old-turn".into();
-    assert!(service
-        .begin_root_tool_effect(&write, &effect, &stale)
-        .is_err());
+    assert!(
+        service
+            .begin_root_tool_effect(&write, &effect, &stale)
+            .is_err()
+    );
     assert_eq!(
         store
             .stream_revision("execution-effect:idem-root-write")
@@ -842,14 +852,18 @@ fn root_effect_fences_lineage_cancellation_and_replay_without_losing_admitted_re
             },
         )
         .unwrap();
-    assert!(service
-        .begin_root_tool_effect(&pending, &effect, &context)
-        .is_err());
+    assert!(
+        service
+            .begin_root_tool_effect(&pending, &effect, &context)
+            .is_err()
+    );
     let mut late = request("root-late");
     late.session_id = write.session_id.clone();
-    assert!(service
-        .begin_root_tool_effect(&late, &effect, &context)
-        .is_err());
+    assert!(
+        service
+            .begin_root_tool_effect(&late, &effect, &context)
+            .is_err()
+    );
     assert_eq!(
         store
             .stream_revision("execution-effect:idem-root-late")
@@ -913,25 +927,27 @@ fn root_effect_goal_states_and_absent_source_revisions_are_enforced() {
             "root_execution_id":context.execution_id, "agentic_program_id":"root-admission-program"
         }
     })).unwrap()).unwrap();
-    assert!(store
-        .append_transaction(AppendTransactionRequest {
-            transaction_id: "stale-absent-goal".into(),
-            expected_streams: absent,
-            events: vec![RuntimeTransactionEventInput {
-                event: RuntimeEventInput {
-                    stream_id: "stale-root-effect".into(),
-                    scope: RuntimeEventScope::ExecutionNode,
-                    kind: "test.stale_effect".into(),
-                    status: None,
-                    actor: None,
-                    refs: vec![],
-                    payload: json!({}),
-                },
-                idempotency_key: Some("stale-root-effect".into()),
-                schema_version: 1,
-            }],
-        })
-        .is_err());
+    assert!(
+        store
+            .append_transaction(AppendTransactionRequest {
+                transaction_id: "stale-absent-goal".into(),
+                expected_streams: absent,
+                events: vec![RuntimeTransactionEventInput {
+                    event: RuntimeEventInput {
+                        stream_id: "stale-root-effect".into(),
+                        scope: RuntimeEventScope::ExecutionNode,
+                        kind: "test.stale_effect".into(),
+                        status: None,
+                        actor: None,
+                        refs: vec![],
+                        payload: json!({}),
+                    },
+                    idempotency_key: Some("stale-root-effect".into()),
+                    schema_version: 1,
+                }],
+            })
+            .is_err()
+    );
     assert_eq!(store.stream_revision("stale-root-effect").unwrap(), 0);
     let mut write = request("goal-state-write");
     write.session_id = Some(context.session_id.clone());

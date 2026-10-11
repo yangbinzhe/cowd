@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::{cowd_dirs, ArtifactStore};
+use crate::{ArtifactStore, cowd_dirs};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -210,9 +210,7 @@ impl ResourceCapabilitySnapshot {
             ],
             skills: Vec::new(),
             plugins: Vec::new(),
-            mcp_resources: vec![
-                "mcp".to_string(),
-            ],
+            mcp_resources: vec!["mcp".to_string()],
             local_commands: Vec::new(),
             provider_native: vec!["image_input_when_supported".to_string()],
         }
@@ -1341,13 +1339,16 @@ mod tests {
         assert_eq!(envelope.kind, ResourceKind::Audio);
         assert_eq!(envelope.source_message_id.as_deref(), Some("msg-1"));
         assert!(envelope.artifact.selector.starts_with("artifact://"));
-        assert!(!serde_json::to_string(&envelope)
-            .expect("resource projection serializes")
-            .contains(temp.path().to_string_lossy().as_ref()));
-        assert!(hint
-            .missing_capabilities
-            .iter()
-            .any(|value| value.contains("transcription")));
+        assert!(
+            !serde_json::to_string(&envelope)
+                .expect("resource projection serializes")
+                .contains(temp.path().to_string_lossy().as_ref())
+        );
+        assert!(
+            hint.missing_capabilities
+                .iter()
+                .any(|value| value.contains("transcription"))
+        );
         assert!(!temp.path().join("workspace").exists());
     }
 
@@ -1435,9 +1436,11 @@ mod tests {
         let encoded = fs::read_to_string(&metadata_path).unwrap();
         assert!(!encoded.contains("storage_path"));
         assert!(!encoded.contains("/private/source"));
-        assert!(!fs::read_to_string(evidence_path)
-            .unwrap()
-            .contains("artifact_path"));
+        assert!(
+            !fs::read_to_string(evidence_path)
+                .unwrap()
+                .contains("artifact_path")
+        );
 
         let repeated = store.migrate_legacy_resources(ResourceMigrationOptions::default());
         assert!(repeated.complete);

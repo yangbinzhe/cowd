@@ -693,12 +693,14 @@ async fn episode_set_pair(real_skill: bool) {
         assert_eq!(repeated.1, candidate_observation);
         assert!(repeated.0.succeeded && repeated.1.succeeded);
         local.verify(&services).await;
-        assert!(services
-            .execution_supervisor()
-            .shutdown()
-            .await
-            .errors
-            .is_empty());
+        assert!(
+            services
+                .execution_supervisor()
+                .shutdown()
+                .await
+                .errors
+                .is_empty()
+        );
         return;
     }
     let packets = captured_packets
@@ -828,11 +830,13 @@ fn startup_recovers_task_outbox_without_mutating_mission_membership() {
             )],
         })
         .expect("commit Task without running its Runtime port");
-    assert!(first
-        .event_reader()
-        .list_stream("task:task-startup-recovery")
-        .expect("task event stream")
-        .is_empty());
+    assert!(
+        first
+            .event_reader()
+            .list_stream("task:task-startup-recovery")
+            .expect("task event stream")
+            .is_empty()
+    );
     assert_eq!(
         first
             .task_aggregate_service()
@@ -988,10 +992,12 @@ async fn maintenance_supervisor_backpressures_instead_of_growing_owner_queue() {
     );
 
     release.notify_one();
-    assert!(tokio::time::timeout(Duration::from_secs(1), overflow)
-        .await
-        .expect("capacity is released")
-        .expect("overflow submitter joins"));
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), overflow)
+            .await
+            .expect("capacity is released")
+            .expect("overflow submitter joins")
+    );
     supervisor.shutdown_and_drain().await;
     assert_eq!(supervisor.tracked_task_count(), 0);
 }
@@ -1222,9 +1228,11 @@ fn concurrent_task_terminal_observation_replays_the_committed_receipt() {
         .map(|worker| worker.join().expect("worker join").expect("observation"))
         .collect::<Vec<_>>();
     let first_event_id = receipts[0].event_id.clone();
-    assert!(receipts
-        .iter()
-        .all(|receipt| receipt.event_id == first_event_id));
+    assert!(
+        receipts
+            .iter()
+            .all(|receipt| receipt.event_id == first_event_id)
+    );
     assert_eq!(
         services
             .event_store
@@ -1642,22 +1650,26 @@ fn workspace_instances_isolate_provider_tool_and_registry_ownership() {
         left.executor_registry().available_kinds(),
         right.executor_registry().available_kinds()
     );
-    assert!(left
-        .executor_registry()
-        .available_kinds()
-        .contains("inline_model"));
-    assert!(left
-        .executor_registry()
-        .available_kinds()
-        .contains("tool_batch"));
-    assert!(left
-        .executor_registry()
-        .available_kinds()
-        .contains("session_dispatch"));
-    assert!(left
-        .executor_registry()
-        .available_kinds()
-        .contains("cross_plane_connector"));
+    assert!(
+        left.executor_registry()
+            .available_kinds()
+            .contains("inline_model")
+    );
+    assert!(
+        left.executor_registry()
+            .available_kinds()
+            .contains("tool_batch")
+    );
+    assert!(
+        left.executor_registry()
+            .available_kinds()
+            .contains("session_dispatch")
+    );
+    assert!(
+        left.executor_registry()
+            .available_kinds()
+            .contains("cross_plane_connector")
+    );
     assert!(!Arc::ptr_eq(
         left.cross_plane_connector_executor(),
         right.cross_plane_connector_executor()
@@ -1757,11 +1769,13 @@ fn definition_catalog_refresh_only_exposes_active_stable_revisions() {
     services
         .refresh_definition_catalog()
         .expect("catalog refresh");
-    assert!(services
-        .agent_runtime()
-        .catalog()
-        .get(definition_id.as_str())
-        .is_none());
+    assert!(
+        services
+            .agent_runtime()
+            .catalog()
+            .get(definition_id.as_str())
+            .is_none()
+    );
 }
 
 #[test]
@@ -2068,11 +2082,13 @@ fn explicit_toml_import_is_runtime_owned_and_never_enters_runnable_catalog() {
     services
         .refresh_definition_catalog()
         .expect("catalog refresh");
-    assert!(services
-        .agent_runtime()
-        .catalog()
-        .get("workspace/external/reviewer")
-        .is_none());
+    assert!(
+        services
+            .agent_runtime()
+            .catalog()
+            .get("workspace/external/reviewer")
+            .is_none()
+    );
 }
 
 #[test]
@@ -2380,10 +2396,12 @@ async fn due_schedule_submits_one_durable_handoff_graph_and_never_duplicates_it(
         .await
         .unwrap();
     let graph = services.graph_state_store().load(&graph_id).unwrap();
-    assert!(graph
-        .node_statuses
-        .values()
-        .all(|status| *status == ExecutionNodeStatus::WaitingExternal));
+    assert!(
+        graph
+            .node_statuses
+            .values()
+            .all(|status| *status == ExecutionNodeStatus::WaitingExternal)
+    );
 
     let target_outbox = store
         .claim_session_runtime_outbox("schedule-test", due_at_ms.saturating_add(5_000), 1_000, 8)
@@ -2522,9 +2540,11 @@ async fn recovery_marker_blocks_runner_start_run_and_command_entries() {
         services.workspace_root(),
         "0.9.472",
     );
-    assert!(importer
-        .import_receipt_file(temp.path().join("missing-receipt.json"))
-        .is_err());
+    assert!(
+        importer
+            .import_receipt_file(temp.path().join("missing-receipt.json"))
+            .is_err()
+    );
 
     let graph = harness_contract::execution_graph::ExecutionGraph::new("blocked");
     let graph_id = graph.id.clone();
@@ -3454,11 +3474,13 @@ async fn policy_drain_tracks_and_terminalizes_an_admitted_pre_graph_task() {
             .expect("exact cancellation"),
         1
     );
-    assert!(services
-        .active_tasks_for_session_policy_revision("policy-drain-session", 1)
-        .await
-        .expect("drained")
-        .is_empty());
+    assert!(
+        services
+            .active_tasks_for_session_policy_revision("policy-drain-session", 1)
+            .await
+            .expect("drained")
+            .is_empty()
+    );
     assert_eq!(
         services
             .task_aggregate_service()
@@ -3551,10 +3573,12 @@ async fn policy_drain_terminalizes_graph_and_its_owning_task_from_one_snapshot()
         .graph_state_store()
         .load(&graph.id)
         .expect("cancelled graph");
-    assert!(cancelled_graph
-        .node_statuses
-        .values()
-        .all(|status| *status == ExecutionNodeStatus::Cancelled));
+    assert!(
+        cancelled_graph
+            .node_statuses
+            .values()
+            .all(|status| *status == ExecutionNodeStatus::Cancelled)
+    );
     assert_eq!(
         services
             .task_aggregate_service()
@@ -3615,26 +3639,30 @@ async fn session_cancellation_terminalizes_descendants_of_an_already_terminal_ro
         )
         .await
         .expect("cancel root");
-    assert!(services
-        .graph_state_store()
-        .load(&child.id)
-        .expect("child before propagation")
-        .node_statuses
-        .values()
-        .any(|status| !status.is_terminal()));
+    assert!(
+        services
+            .graph_state_store()
+            .load(&child.id)
+            .expect("child before propagation")
+            .node_statuses
+            .values()
+            .any(|status| !status.is_terminal())
+    );
 
     let cancelled = services
         .cancel_execution_tree(&parent.id, "user cancelled Session")
         .await
         .expect("cancel execution tree");
     assert_eq!(cancelled, vec![child.id.clone()]);
-    assert!(services
-        .graph_state_store()
-        .load(&child.id)
-        .expect("child after propagation")
-        .node_statuses
-        .values()
-        .all(|status| *status == ExecutionNodeStatus::Cancelled));
+    assert!(
+        services
+            .graph_state_store()
+            .load(&child.id)
+            .expect("child after propagation")
+            .node_statuses
+            .values()
+            .all(|status| *status == ExecutionNodeStatus::Cancelled)
+    );
 }
 
 #[test]
@@ -3959,15 +3987,19 @@ fn prepared_session_terminal_defers_cancellation_until_terminal_winner_commits()
             projection_revision: 0,
         })
         .unwrap();
-    assert!(services
-        .resolve_requested_cancellation("completion-wins-cancellation")
-        .unwrap()
-        .is_none());
-    assert!(!services
-        .execution_live(execution_id)
-        .unwrap()
-        .status
-        .is_terminal());
+    assert!(
+        services
+            .resolve_requested_cancellation("completion-wins-cancellation")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !services
+            .execution_live(execution_id)
+            .unwrap()
+            .status
+            .is_terminal()
+    );
 
     assert_eq!(
         services

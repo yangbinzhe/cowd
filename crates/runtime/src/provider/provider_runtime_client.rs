@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -381,11 +381,13 @@ fn provider_tool_choice_for_required_tool(
             Ok(None)
         }
         (true, false, CapabilityState::Unsupported) => Ok(None),
-        (true, true, CapabilityState::Supported) => Ok(Some(
-            required_tool_name.map_or(ToolChoice::Any, |name| ToolChoice::Tool {
-                name: name.to_string(),
-            }),
-        )),
+        (true, true, CapabilityState::Supported) => {
+            Ok(Some(required_tool_name.map_or(ToolChoice::Any, |name| {
+                ToolChoice::Tool {
+                    name: name.to_string(),
+                }
+            })))
+        }
         (true, false, CapabilityState::Supported) => Ok(Some(ToolChoice::Auto)),
     }
 }
@@ -947,11 +949,15 @@ impl ProviderRuntimeClient {
         // without a new value being threaded through Runtime construction; the
         // optional `liveness_stall_sink` remains for callers that want an
         // immediate out-of-band reaction.
-        Box::pin(crate::liveness::guard_liveness(events, contract, move |verdict| {
-            if let Ok(mut recorded) = recorded_stalls.lock() {
-                recorded.push(verdict);
-            }
-        }))
+        Box::pin(crate::liveness::guard_liveness(
+            events,
+            contract,
+            move |verdict| {
+                if let Ok(mut recorded) = recorded_stalls.lock() {
+                    recorded.push(verdict);
+                }
+            },
+        ))
     }
 
     fn stream_with_activity_and_provider_snapshot(
@@ -2197,12 +2203,12 @@ fn response_to_events(response: MessageResponse) -> Vec<AssistantEvent> {
 #[cfg(test)]
 mod tests {
     use super::{
+        ProviderPromptHistory, ProviderRequestContext, ResolvedProviderProfile,
         build_provider_entry, commit_provider_cache_before_terminal,
         compile_provider_input_messages, forward_text_delta, merge_provider_usage_max,
         provider_attempt, provider_cache_material, provider_tool_choice,
         provider_tool_choice_for_required_tool, push_provider_output_block,
         request_reasoning_effort, response_to_events, tool_definitions_for_exposure,
-        ProviderPromptHistory, ProviderRequestContext, ResolvedProviderProfile,
     };
     use crate::config::{ProviderConfig, ProvidersConfig};
     use crate::{
@@ -2218,8 +2224,8 @@ mod tests {
     use serde_json::json;
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -2240,12 +2246,16 @@ mod tests {
             cache_dimensions_observed: false,
             request_id: None,
         });
-        assert!(events
-            .iter()
-            .all(|event| !matches!(event, AssistantEvent::Usage(_))));
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, AssistantEvent::MessageStop)));
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, AssistantEvent::Usage(_)))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AssistantEvent::MessageStop))
+        );
     }
 
     #[test]
@@ -2487,35 +2497,52 @@ mod tests {
         let immutable = vec![provider::InputMessage::user_text("COHORT-MARKER")];
         let mut state = ProviderPromptHistory::default();
 
-        let messages =
-            compile_provider_input_messages(&mut state, immutable.clone(), history.clone(), context.clone());
+        let messages = compile_provider_input_messages(
+            &mut state,
+            immutable.clone(),
+            history.clone(),
+            context.clone(),
+        );
 
         assert_eq!(messages.len(), 3, "immutable + history + context");
-        assert!(matches!(
-            messages[0].content.as_slice(),
-            [InputContentBlock::Text { text }] if text == "COHORT-MARKER"
-        ), "the cohort prefix must be the very first message");
-        assert!(matches!(
-            messages[1].content.as_slice(),
-            [InputContentBlock::Text { text }] if text == "history-entry"
-        ), "history must follow the immutable prefix");
-        assert!(matches!(
-            messages[2].content.as_slice(),
-            [InputContentBlock::Text { text }] if text == "turn-local-tail"
-        ), "request-local context must stay last");
+        assert!(
+            matches!(
+                messages[0].content.as_slice(),
+                [InputContentBlock::Text { text }] if text == "COHORT-MARKER"
+            ),
+            "the cohort prefix must be the very first message"
+        );
+        assert!(
+            matches!(
+                messages[1].content.as_slice(),
+                [InputContentBlock::Text { text }] if text == "history-entry"
+            ),
+            "history must follow the immutable prefix"
+        );
+        assert!(
+            matches!(
+                messages[2].content.as_slice(),
+                [InputContentBlock::Text { text }] if text == "turn-local-tail"
+            ),
+            "request-local context must stay last"
+        );
 
         // GroW history must not splice anything in front of the immutable prefix.
         let mut grown = history;
         grown.push(provider::InputMessage {
             role: "assistant".to_string(),
-            content: vec![InputContentBlock::Text { text: "provider-output".to_string() }],
+            content: vec![InputContentBlock::Text {
+                text: "provider-output".to_string(),
+            }],
         });
-        let regrown =
-            compile_provider_input_messages(&mut state, immutable, grown, context);
-        assert!(matches!(
-            regrown[0].content.as_slice(),
-            [InputContentBlock::Text { text }] if text == "COHORT-MARKER"
-        ), "a longer history must not push the cohort prefix back");
+        let regrown = compile_provider_input_messages(&mut state, immutable, grown, context);
+        assert!(
+            matches!(
+                regrown[0].content.as_slice(),
+                [InputContentBlock::Text { text }] if text == "COHORT-MARKER"
+            ),
+            "a longer history must not push the cohort prefix back"
+        );
     }
 
     fn request_local_context_is_appended_after_exact_history() {
@@ -2679,9 +2706,11 @@ mod tests {
             ),
         };
 
-        assert!(error
-            .to_string()
-            .contains("provider stream ended before terminal message_stop"));
+        assert!(
+            error
+                .to_string()
+                .contains("provider stream ended before terminal message_stop")
+        );
     }
 
     #[tokio::test]

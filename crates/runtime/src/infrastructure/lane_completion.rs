@@ -12,8 +12,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use crate::{
-    check_freshness, evaluate, BranchFreshness, GreenLevel, LaneBlocker, LaneContext, PolicyAction,
-    PolicyCondition, PolicyEngine, PolicyRule, ReviewStatus,
+    BranchFreshness, GreenLevel, LaneBlocker, LaneContext, PolicyAction, PolicyCondition,
+    PolicyEngine, PolicyRule, ReviewStatus, check_freshness, evaluate,
 };
 
 type AgentOutput = crate::AgentRunSnapshot;

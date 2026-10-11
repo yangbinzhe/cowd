@@ -43,6 +43,12 @@ use sha2::{Digest, Sha256};
 
 #[path = "host_backend.rs"]
 mod host_backend;
+
+/// Re-exported so the Gateway can normalize a reference inside an
+/// `agent_action_batch` exactly as it does for a direct call. The batch expands
+/// its own actions, so without this a reference Runtime spells `artifact:<24 hex>`
+/// is refused inside a batch while the same reference works when sent directly.
+pub use host_backend::normalize_bare_evidence_ref;
 #[path = "host_presentation.rs"]
 mod host_presentation;
 use host_presentation::*;

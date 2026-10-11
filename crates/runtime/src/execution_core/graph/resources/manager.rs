@@ -2328,9 +2328,11 @@ mod tests {
                 ResourceAdmissionObservationStatus::Granted,
             ]
         );
-        assert!(observations
-            .iter()
-            .all(|observation| observation.request_id == request_id));
+        assert!(
+            observations
+                .iter()
+                .all(|observation| observation.request_id == request_id)
+        );
         assert_eq!(
             observations[1].wait_reason,
             Some(ResourceWaitReason::Capacity)
@@ -2867,9 +2869,11 @@ mod tests {
         }
         let snapshot = manager.snapshot(&ExecutionResourceKind::Provider).unwrap();
         assert_eq!(snapshot.effective_limit, 3);
-        assert!(snapshot
-            .failure_timeout_upper_bound_basis_points
-            .is_some_and(|value| value >= FAILURE_TIMEOUT_UCB_THRESHOLD_BP));
+        assert!(
+            snapshot
+                .failure_timeout_upper_bound_basis_points
+                .is_some_and(|value| value >= FAILURE_TIMEOUT_UCB_THRESHOLD_BP)
+        );
     }
 
     #[test]

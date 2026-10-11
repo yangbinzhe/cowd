@@ -1,7 +1,7 @@
 //! Skill activation signals that can be reviewed by the memory layer.
 
-use super::activation::RuntimeSkillCandidateSource;
 use super::SkillActivationRecord;
+use super::activation::RuntimeSkillCandidateSource;
 use chrono::Utc;
 use memory::{MaintenanceCandidate, MaintenanceCandidateAction, MaintenanceCandidateStatus};
 use uuid::Uuid;
@@ -266,13 +266,17 @@ mod tests {
             "conversation_runtime.skill_memory_candidate"
         );
         assert_eq!(event.payload["selected"], "release");
-        assert!(event.payload["candidate"]["content"]
-            .as_str()
-            .expect("candidate content")
-            .contains("source=runtime_skill"));
-        assert!(event
-            .refs
-            .iter()
-            .any(|reference| reference.ref_type == "skill" && reference.id == "release"));
+        assert!(
+            event.payload["candidate"]["content"]
+                .as_str()
+                .expect("candidate content")
+                .contains("source=runtime_skill")
+        );
+        assert!(
+            event
+                .refs
+                .iter()
+                .any(|reference| reference.ref_type == "skill" && reference.id == "release")
+        );
     }
 }

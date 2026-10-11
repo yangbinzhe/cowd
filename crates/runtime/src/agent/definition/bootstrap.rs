@@ -286,19 +286,23 @@ mod tests {
             .resolve(&explore, RevisionSelector::LatestApprovedStable)
             .expect("resolved latest explore");
         assert_eq!(explore.revision.revision_ref.revision, 2);
-        assert!(explore
-            .revision
-            .manifest
-            .capability_contract
-            .capability_ceiling
-            .contains(&AgentCapability::Network));
+        assert!(
+            explore
+                .revision
+                .manifest
+                .capability_contract
+                .capability_ceiling
+                .contains(&AgentCapability::Network)
+        );
 
         let manifest = temp
             .path()
             .join("builtin/agents/cowd/direct/revisions/1/agent.yaml");
         std::fs::write(&manifest, "api_version: cowd.agent/v1\n").expect("tamper manifest");
-        assert!(AgentDefinitionResolver::new(&store)
-            .resolve(&direct, RevisionSelector::LatestApprovedStable)
-            .is_err());
+        assert!(
+            AgentDefinitionResolver::new(&store)
+                .resolve(&direct, RevisionSelector::LatestApprovedStable)
+                .is_err()
+        );
     }
 }

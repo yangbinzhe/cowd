@@ -233,9 +233,7 @@ pub enum GovernedToolCompileError {
         scope: String,
         reason: String,
     },
-    #[error(
-        "tool task `{task_id}` depends on rejected task `{dependency_id}`: {rejection_reason}"
-    )]
+    #[error("tool task `{task_id}` depends on rejected task `{dependency_id}`: {rejection_reason}")]
     DependencyReferencesRejectedTask {
         task_id: String,
         dependency_id: String,
@@ -1128,10 +1126,7 @@ fn analyze_request(
         ToolPurity::Unknown => "unknown",
     }
     .to_string();
-    let output_budget_class = if request
-        .tool_name
-        .eq_ignore_ascii_case("tool_orchestrate")
-    {
+    let output_budget_class = if request.tool_name.eq_ignore_ascii_case("tool_orchestrate") {
         "batch"
     } else if effect.effect_kind == ToolEffectKind::Read {
         "normal"
@@ -1850,10 +1845,12 @@ mod tests {
         assert_eq!(plan.tasks[0].tool_call_id, "independent");
         assert_eq!(plan.tasks[0].original_call_index, 2);
         assert_eq!(compilation.rejected.len(), 2);
-        assert!(compilation
-            .rejected
-            .iter()
-            .all(|rejection| rejection.reason.contains("cycle")));
+        assert!(
+            compilation
+                .rejected
+                .iter()
+                .all(|rejection| rejection.reason.contains("cycle"))
+        );
     }
 
     #[test]
@@ -1958,9 +1955,11 @@ mod tests {
             plan.tasks[0].contract_version,
             GOVERNED_TOOL_PLAN_CONTRACT_VERSION
         );
-        assert!(plan.tasks[0]
-            .idempotency_key
-            .starts_with("tool-plan-task:v4:"));
+        assert!(
+            plan.tasks[0]
+                .idempotency_key
+                .starts_with("tool-plan-task:v4:")
+        );
         assert_eq!(plan.tasks[0].model_visible_name, "read");
         assert!(plan.tasks[0].can_parallelize);
         assert_eq!(
@@ -1991,10 +1990,11 @@ mod tests {
         ]);
 
         assert!(plan.tasks.iter().all(|task| task.can_parallelize));
-        assert!(plan
-            .tasks
-            .iter()
-            .all(|task| task.contract_version == GOVERNED_TOOL_PLAN_CONTRACT_VERSION));
+        assert!(
+            plan.tasks
+                .iter()
+                .all(|task| task.contract_version == GOVERNED_TOOL_PLAN_CONTRACT_VERSION)
+        );
     }
 
     #[test]
@@ -2017,10 +2017,12 @@ mod tests {
             event.payload["tasks"][0]["contract_version"],
             GOVERNED_TOOL_PLAN_CONTRACT_VERSION
         );
-        assert!(event.payload["tasks"][0]["idempotency_key"]
-            .as_str()
-            .unwrap()
-            .starts_with("tool-plan-task:v4:"));
+        assert!(
+            event.payload["tasks"][0]["idempotency_key"]
+                .as_str()
+                .unwrap()
+                .starts_with("tool-plan-task:v4:")
+        );
     }
 
     #[test]
@@ -2574,10 +2576,11 @@ mod tests {
 
         assert_eq!(plan.tasks[0].resource_scope.kind, "runtime");
         assert_eq!(plan.tasks[1].resource_scope.kind, "internal_transaction");
-        assert!(plan
-            .tasks
-            .iter()
-            .all(|task| task.resource_scope.paths.is_empty()));
+        assert!(
+            plan.tasks
+                .iter()
+                .all(|task| task.resource_scope.paths.is_empty())
+        );
     }
 
     #[test]

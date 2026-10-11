@@ -837,9 +837,11 @@ mod tests {
         assert!(changes.iter().any(|change| {
             change.path == "src/report.rs" && change.after_sha256 == terminal_digest
         }));
-        assert!(!changes
-            .iter()
-            .any(|change| change.after_sha256 == intermediate));
+        assert!(
+            !changes
+                .iter()
+                .any(|change| change.after_sha256 == intermediate)
+        );
     }
 
     #[test]

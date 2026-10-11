@@ -952,11 +952,13 @@ mod tests {
         let first = schedules.claim_due(1_100, 10_000).expect("claim");
         assert_eq!(first.claimed.len(), 1);
         assert_eq!(first.claimed[0].schedule_id, schedule.schedule_id);
-        assert!(schedules
-            .claim_due(1_100, 10_000)
-            .expect("dedupe")
-            .claimed
-            .is_empty());
+        assert!(
+            schedules
+                .claim_due(1_100, 10_000)
+                .expect("dedupe")
+                .claimed
+                .is_empty()
+        );
 
         let rebuilt =
             MissionScheduleStore::event_sourced(event_store, "workspace-a").expect("rebuilt store");
@@ -1029,15 +1031,17 @@ mod tests {
         let event_store = Arc::new(RuntimeEventStore::for_test());
         let schedules = MissionScheduleStore::event_sourced(event_store, "workspace-a")
             .expect("schedule store");
-        assert!(schedules
-            .create(
-                create_request(ScheduleTrigger::Cron {
-                    expression: "not cron".to_string(),
-                    timezone: "Mars/Olympus".to_string(),
-                }),
-                1_000,
-            )
-            .is_err());
+        assert!(
+            schedules
+                .create(
+                    create_request(ScheduleTrigger::Cron {
+                        expression: "not cron".to_string(),
+                        timezone: "Mars/Olympus".to_string(),
+                    }),
+                    1_000,
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -1052,18 +1056,20 @@ mod tests {
             )
             .expect("schedule");
 
-        assert!(schedules
-            .update(
-                &schedule.schedule_id,
-                UpdateMissionScheduleRequest {
-                    expected_revision: 0,
-                    objective: Some("stale".to_string()),
-                    trigger: None,
-                    priority: None,
-                },
-                1_500,
-            )
-            .is_err());
+        assert!(
+            schedules
+                .update(
+                    &schedule.schedule_id,
+                    UpdateMissionScheduleRequest {
+                        expected_revision: 0,
+                        objective: Some("stale".to_string()),
+                        trigger: None,
+                        priority: None,
+                    },
+                    1_500,
+                )
+                .is_err()
+        );
         let updated = schedules
             .update(
                 &schedule.schedule_id,
@@ -1097,9 +1103,11 @@ mod tests {
         let fire = schedules
             .trigger_now(&schedule.schedule_id, 1_100)
             .expect("fire");
-        assert!(schedules
-            .mark_submitted(&fire.fire_id, "graph-unbound".to_string())
-            .is_err());
+        assert!(
+            schedules
+                .mark_submitted(&fire.fire_id, "graph-unbound".to_string())
+                .is_err()
+        );
         let binding = target_binding(PermissionMode::ReadOnly);
         let bound = schedules
             .bind_target_policy(&fire.fire_id, binding.clone())

@@ -1829,9 +1829,11 @@ mod tests {
             .expect("dispatchable capability still produces diagnostics");
 
         assert!(!target.ready);
-        assert!(target
-            .blockers
-            .contains(&"dispatch:target_ref_missing".to_string()));
+        assert!(
+            target
+                .blockers
+                .contains(&"dispatch:target_ref_missing".to_string())
+        );
         assert!(target.outbound_message.is_none());
     }
 

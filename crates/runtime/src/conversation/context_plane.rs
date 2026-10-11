@@ -1453,9 +1453,12 @@ where
             // one result" case that makes every later round re-send it.
             const EXACT_EVIDENCE_PER_RESULT_CEILING: usize = 16_000;
             plan.tool_result_budget.max_total_tokens = exact_total;
-            plan.tool_result_budget.per_tool_max_tokens = exact_total
-                .min(EXACT_EVIDENCE_PER_RESULT_CEILING)
-                .max(plan.tool_result_budget.per_tool_max_tokens.min(EXACT_EVIDENCE_PER_RESULT_CEILING));
+            plan.tool_result_budget.per_tool_max_tokens =
+                exact_total.min(EXACT_EVIDENCE_PER_RESULT_CEILING).max(
+                    plan.tool_result_budget
+                        .per_tool_max_tokens
+                        .min(EXACT_EVIDENCE_PER_RESULT_CEILING),
+                );
         }
         plan
     }
@@ -1654,11 +1657,7 @@ where
         // (Fact/Matrix recall degradation, session page-in failure) also deserve
         // the model-visible marker.
         for source in self.take_degraded_context_sources() {
-            if !envelope
-                .diagnostics
-                .degraded_sources
-                .contains(&source)
-            {
+            if !envelope.diagnostics.degraded_sources.contains(&source) {
                 envelope.diagnostics.degraded_sources.push(source);
             }
         }
@@ -1740,8 +1739,8 @@ where
             // evict, and moving an evictable item out of that path would take it
             // out of admission control.
             if item.id.starts_with(GOAL_STATE_PACKET_PREFIX) {
-                let rendered = crate::PromptContextPacket::from_item(item)
-                    .render_for_user_context();
+                let rendered =
+                    crate::PromptContextPacket::from_item(item).render_for_user_context();
                 prompt.push_volatile_tail(rendered);
             } else {
                 prompt.push_context_item(item);
@@ -1798,8 +1797,7 @@ where
         if !output_budget.executable {
             return Err(RuntimeError::new(format!(
                 "provider candidate `{model}` cannot fit fixed and required request components with a viable continuation: fixed={fixed_input_tokens} required={required_input_tokens} window={context_window_tokens} available_output={} output_floor={}",
-                output_budget.available_output_tokens,
-                output_budget.floor_output_tokens,
+                output_budget.available_output_tokens, output_budget.floor_output_tokens,
             )));
         }
         let mut budget = crate::context_ledger::RequestBudgetReport::for_attempt(
@@ -1885,7 +1883,6 @@ where
         clock_stamp: &crate::prompt::RuntimeClockStamp,
     ) -> PromptAssembly {
         let _perf_start = std::time::Instant::now();
-
 
         let Some(mgr) = self.memory_manager.as_ref() else {
             let (runtime_reality_context_items, session_context_items) = tokio::join!(
@@ -2435,7 +2432,7 @@ mod omitted_marker_tests {
 
 #[cfg(test)]
 mod degraded_source_marker_tests {
-    use super::{degraded_source_marker_tests_marker, ContextSourceKind};
+    use super::{ContextSourceKind, degraded_source_marker_tests_marker};
 
     #[test]
     fn a_degraded_fact_and_matrix_source_are_marked_separately() {

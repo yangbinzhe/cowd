@@ -2214,10 +2214,7 @@ impl ExecutionLiveStore {
 }
 
 fn file_touch_path(tool_name: &str, preview: &str) -> Option<String> {
-    if !matches!(
-        tool_name,
-        "edit" | "edit" | "apply_patch" | "edit"
-    ) {
+    if !matches!(tool_name, "edit" | "edit" | "apply_patch" | "edit") {
         return None;
     }
     let input = serde_json::from_str::<serde_json::Value>(preview).ok()?;
@@ -3590,9 +3587,11 @@ mod tests {
 
         let records = store.all_records();
         assert!(records.len() < 65);
-        assert!(records
-            .iter()
-            .any(|record| record.execution_id == "active-execution"));
+        assert!(
+            records
+                .iter()
+                .any(|record| record.execution_id == "active-execution")
+        );
     }
 
     #[test]
@@ -3619,9 +3618,11 @@ mod tests {
             "cancel-wins".to_string(),
             "turn-cancel-wins".to_string(),
         );
-        assert!(store
-            .cancel("cancel-wins", "user cancelled".to_string())
-            .unwrap());
+        assert!(
+            store
+                .cancel("cancel-wins", "user cancelled".to_string())
+                .unwrap()
+        );
         assert_eq!(
             store
                 .claim_terminal(
@@ -3653,14 +3654,18 @@ mod tests {
                 .unwrap(),
             TerminalFenceClaim::Claimed
         );
-        assert!(!store
-            .cancel("terminal-wins", "late cancel".to_string())
-            .unwrap());
-        assert!(!store
-            .execution_live("terminal-wins")
-            .unwrap()
-            .status
-            .is_terminal());
+        assert!(
+            !store
+                .cancel("terminal-wins", "late cancel".to_string())
+                .unwrap()
+        );
+        assert!(
+            !store
+                .execution_live("terminal-wins")
+                .unwrap()
+                .status
+                .is_terminal()
+        );
         assert_eq!(
             store
                 .finalize_terminal(
@@ -3764,9 +3769,11 @@ mod tests {
         );
         recovered.release_terminal_checkpoint("execution-restart");
         drop(recovered);
-        assert!(ExecutionLiveStore::new(event_store)
-            .execution_live("execution-restart")
-            .is_none());
+        assert!(
+            ExecutionLiveStore::new(event_store)
+                .execution_live("execution-restart")
+                .is_none()
+        );
     }
 
     #[test]
@@ -3790,18 +3797,24 @@ mod tests {
                 .unwrap(),
             TerminalFenceClaim::Claimed
         );
-        assert!(!store
-            .cancel(
-                execution_id,
-                "cancel waits for prepared delivery".to_string()
-            )
-            .unwrap());
-        assert!(store
-            .abort_terminal_claim(execution_id, "terminal-stale", 3)
-            .unwrap());
-        assert!(store
-            .cancel(execution_id, "cancel after deterministic abort".to_string())
-            .unwrap());
+        assert!(
+            !store
+                .cancel(
+                    execution_id,
+                    "cancel waits for prepared delivery".to_string()
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .abort_terminal_claim(execution_id, "terminal-stale", 3)
+                .unwrap()
+        );
+        assert!(
+            store
+                .cancel(execution_id, "cancel after deterministic abort".to_string())
+                .unwrap()
+        );
         assert_eq!(
             store.execution_live(execution_id).unwrap().status,
             ExecutionLiveStatus::Cancelled
@@ -3846,11 +3859,13 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.contains("enrichment rejected"));
-        assert!(!store
-            .execution_live(execution_id)
-            .unwrap()
-            .status
-            .is_terminal());
+        assert!(
+            !store
+                .execution_live(execution_id)
+                .unwrap()
+                .status
+                .is_terminal()
+        );
         assert_eq!(
             store
                 .claim_terminal(
@@ -3863,14 +3878,18 @@ mod tests {
             TerminalFenceClaim::SamePending,
             "foreground enrichment must not remove the delivery winner"
         );
-        assert!(store
-            .abort_terminal_claim(execution_id, terminal_ref, 11)
-            .unwrap());
-        assert!(!store
-            .execution_live(execution_id)
-            .unwrap()
-            .status
-            .is_terminal());
+        assert!(
+            store
+                .abort_terminal_claim(execution_id, terminal_ref, 11)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .execution_live(execution_id)
+                .unwrap()
+                .status
+                .is_terminal()
+        );
     }
 
     #[test]
@@ -3883,12 +3902,14 @@ mod tests {
                 "execution-cancel-restart".to_string(),
                 "turn-cancel-restart".to_string(),
             );
-            assert!(store
-                .cancel(
-                    "execution-cancel-restart",
-                    "user cancellation won".to_string(),
-                )
-                .unwrap());
+            assert!(
+                store
+                    .cancel(
+                        "execution-cancel-restart",
+                        "user cancellation won".to_string(),
+                    )
+                    .unwrap()
+            );
         }
         assert_eq!(
             ExecutionLiveStore::new(event_store)
@@ -3932,10 +3953,12 @@ mod tests {
             store.persist(&stale).is_ok(),
             "released checkpoint rejects resurrection"
         );
-        assert!(event_store
-            .projection_checkpoint(&live_projection_id(execution_id))
-            .unwrap()
-            .is_none());
+        assert!(
+            event_store
+                .projection_checkpoint(&live_projection_id(execution_id))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -4251,10 +4274,12 @@ mod tests {
         let rehydrated = ExecutionLiveStore::new(Arc::clone(&event_store));
         assert_blocked(rehydrated.execution_live(execution_id).unwrap());
         rehydrated.release_terminal_checkpoint(execution_id);
-        assert!(event_store
-            .projection_checkpoint(&live_projection_id(execution_id))
-            .unwrap()
-            .is_none());
+        assert!(
+            event_store
+                .projection_checkpoint(&live_projection_id(execution_id))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

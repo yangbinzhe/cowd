@@ -1005,18 +1005,20 @@ async fn prefetch_review_bodies(
             )),
             schema_version: 1,
         };
-        let _ = services.event_store().append_transaction(crate::AppendTransactionRequest {
-            transaction_id: format!(
-                "review-body-prefetched:{}:{}",
-                agentic.program_id,
-                packet.graph_id()
-            ),
-            expected_streams: vec![crate::ExpectedStreamRevision {
-                stream_id,
-                expected_revision: revision,
-            }],
-            events: vec![event],
-        });
+        let _ = services
+            .event_store()
+            .append_transaction(crate::AppendTransactionRequest {
+                transaction_id: format!(
+                    "review-body-prefetched:{}:{}",
+                    agentic.program_id,
+                    packet.graph_id()
+                ),
+                expected_streams: vec![crate::ExpectedStreamRevision {
+                    stream_id,
+                    expected_revision: revision,
+                }],
+                events: vec![event],
+            });
     }
     Some(format!(
         "\n\n## Submitted artifact bodies for this review\nJudge from these exact submitted contents, not from metadata:\n{}",

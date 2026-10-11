@@ -3,8 +3,8 @@ use std::fmt::{Display, Formatter};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
@@ -688,7 +688,7 @@ impl Session {
                     return Err(SessionError::Format(format!(
                         "unsupported JSONL record type at line {}: {other}",
                         line_number + 1
-                    )))
+                    )));
                 }
             }
         }
@@ -981,7 +981,7 @@ impl ConversationMessage {
             other => {
                 return Err(SessionError::Format(format!(
                     "unsupported message role: {other}"
-                )))
+                )));
             }
         };
         let blocks = object
@@ -1571,8 +1571,8 @@ fn ensure_legacy_jsonl_session_persistence_enabled(path: &Path) -> Result<(), Se
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_rotated_logs, rotate_session_file_if_needed, ContentBlock, ConversationMessage,
-        MessageRole, Session, SessionFork,
+        ContentBlock, ConversationMessage, MessageRole, Session, SessionFork, cleanup_rotated_logs,
+        rotate_session_file_if_needed,
     };
     use crate::json::JsonValue;
     use model_protocol::usage::TokenUsage;

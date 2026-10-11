@@ -1,6 +1,6 @@
 use harness_contract::core::{ExecutionModifier, ExecutionPattern, ExecutionPolicyGate};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -214,11 +214,15 @@ mod tests {
             RuntimeCompileTarget::ExecutionGraph,
             "implementation-plus-review collaboration must admit bounded mutation work"
         );
-        assert!(ExecutionPattern::Collaborate
-            .supported_gates()
-            .contains(&harness_contract::core::ExecutionPolicyGate::Permission));
-        assert!(ExecutionPattern::Collaborate
-            .supported_modifiers()
-            .contains(&harness_contract::core::ExecutionModifier::WithGuardrails));
+        assert!(
+            ExecutionPattern::Collaborate
+                .supported_gates()
+                .contains(&harness_contract::core::ExecutionPolicyGate::Permission)
+        );
+        assert!(
+            ExecutionPattern::Collaborate
+                .supported_modifiers()
+                .contains(&harness_contract::core::ExecutionModifier::WithGuardrails)
+        );
     }
 }

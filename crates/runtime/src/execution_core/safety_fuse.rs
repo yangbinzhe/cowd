@@ -136,9 +136,11 @@ mod tests {
     fn stall_streak_threshold_is_fixed_for_the_lifetime_of_the_lease() {
         let lease = SafetyFusePolicy::derive(1_000_000, TaskComplexity::Moderate, Some(20));
         assert_eq!(lease.max_model_steps, 14);
-        assert!(lease
-            .reason
-            .contains("total model steps are telemetry only"));
+        assert!(
+            lease
+                .reason
+                .contains("total model steps are telemetry only")
+        );
     }
 
     #[test]

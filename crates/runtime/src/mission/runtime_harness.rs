@@ -1,10 +1,10 @@
 //! Runtime integration facade for the Cowd AI work kernel crates.
 
 use crate::eval_gate::{
-    score_case, score_report, BenchCaseKind, BenchCaseResult, CowdBenchCase, RegressionGate,
-    RegressionGateVerdict, Trajectory,
+    BenchCaseKind, BenchCaseResult, CowdBenchCase, RegressionGate, RegressionGateVerdict,
+    Trajectory, score_case, score_report,
 };
-use harness_contract::behavior::{decide_behavior_policy, BehaviorPolicyDecision};
+use harness_contract::behavior::{BehaviorPolicyDecision, decide_behavior_policy};
 use harness_contract::context::{
     ContextAlignmentReport, ContextAuthority, ContextBudget, ContextEpoch, ContextEpochBuilder,
     ContextIdentity, ContextItem, ContextMode, ContextRole, ContextSourceKind, PromptAssemblyPlan,
@@ -18,8 +18,8 @@ use harness_contract::harness::{
     CowdNativeHarness, HarnessAdapter, HarnessTurnInput, HarnessTurnReceipt,
 };
 use harness_contract::policy::{
-    agent_spec_policy_receipts, behavior_policy_receipt, governed_tool_policy_receipts,
-    PolicyReceipt,
+    PolicyReceipt, agent_spec_policy_receipts, behavior_policy_receipt,
+    governed_tool_policy_receipts,
 };
 use harness_contract::strategy::{StrategyDecision, StrategyInput};
 use harness_contract::tool::{GovernedToolPlanProjection, ToolApprovalClass, ToolEffectKind};
@@ -595,9 +595,11 @@ mod tests {
             assert_eq!(decision.compile_target, target, "prompt: {prompt}");
             if prompt.contains("多 Agent") {
                 assert!(!decision.strategy.understanding.requires_write);
-                assert!(!decision
-                    .modifiers()
-                    .contains(&harness_contract::core::ExecutionModifier::WithGuardrails));
+                assert!(
+                    !decision
+                        .modifiers()
+                        .contains(&harness_contract::core::ExecutionModifier::WithGuardrails)
+                );
             }
             let lease_id = decision.lease.lease_id.clone();
             decision.execution_graph_ref = Some("execution-graph-authoritative".to_string());
