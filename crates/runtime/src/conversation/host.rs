@@ -799,6 +799,7 @@ where
                 || (recovered_tool_receipt_count > 0
                     && recovered_tool_receipts_require_text_only),
             force_tool_allowlist_next_model: None,
+            force_tool_call_next_model: false,
             force_reasoning_effort_next_model: None,
             terminal_recovery_attempts: 0,
             provider_protocol_recovery_attempts: 0,
@@ -4089,6 +4090,10 @@ struct TurnGraphState {
     reasoning_only_attempts: u8,
     force_text_only_next_model: bool,
     force_tool_allowlist_next_model: Option<BTreeSet<String>>,
+    /// Require a tool call without restricting which tool. Set by the escalation
+    /// path when the model keeps concluding instead of acting; consumed at the
+    /// model-step boundary exactly once, like the allowlist beside it.
+    force_tool_call_next_model: bool,
     /// Request-local cognitive budget selected by a governed checkpoint.
     /// It is consumed once and never changes the session/provider default.
     force_reasoning_effort_next_model: Option<String>,

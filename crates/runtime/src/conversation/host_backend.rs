@@ -1193,10 +1193,18 @@ where
                     }
                 }
             }
-            if force_text_only_response && !mandatory_action_outstanding {
+            let force_tool_call = {
+                let mut state = self.state.lock().await;
+                std::mem::take(&mut state.force_tool_call_next_model)
+            };
+            if force_text_only_response && !mandatory_action_outstanding && !force_tool_call {
                 runtime.require_next_model_final_response();
             } else if let Some(tool_ids) = force_tool_allowlist {
                 runtime.require_next_model_tool_action(tool_ids);
+            } else if force_tool_call {
+                // The model concluded again instead of acting. Require a tool call
+                // and leave the tool set alone.
+                runtime.require_next_model_tool_call();
             } else if mandatory_action_outstanding {
                 // Something is owed, so this step must produce a tool call rather
                 // than a prose answer. Force the call and leave the tool set alone.

@@ -1431,15 +1431,28 @@ where
             state.committed_terminal_answer = Some(final_answer.clone());
             state.committed_terminal_completion = Some(completion);
             // The observer for "the model stopped acting and started restating".
-            // A terminal answer that recurs with no intervening successful tool
-            // call is not a new conclusion, and counting it is what turns a
-            // silent loop into a visible, actable one.
-            if state.last_terminal_answer_digest == answer_digest {
-                state.repeated_terminal_answers =
-                    state.repeated_terminal_answers.saturating_add(1);
-            } else {
-                state.last_terminal_answer_digest = answer_digest.clone();
-                state.repeated_terminal_answers = 0;
+            //
+            // Every terminal answer counts, whether or not the words changed. The
+            // first version incremented only when the digest matched, so a model
+            // that rewrote its conclusion - same substance, fresh phrasing - reset
+            // the counter every time and the escalation never fired. Run one27
+            // wrote five different final answers after the synthesis Task was
+            // accepted, all twelve of its text answers had distinct digests, and
+            // the exit rung had been advertised fifty-four times.
+            //
+            // A successful tool call resets the count, which is what makes this a
+            // count of *consecutive* answers rather than a total: work in between
+            // is progress, and progress is not a loop.
+            let rewrote_previous = state.last_terminal_answer_digest != answer_digest;
+            state.last_terminal_answer_digest = answer_digest.clone();
+            state.repeated_terminal_answers =
+                state.repeated_terminal_answers.saturating_add(1);
+            if rewrote_previous && state.repeated_terminal_answers > 1 {
+                tracing::warn!(
+                    target: "cowd::repeated_final_answer",
+                    count = state.repeated_terminal_answers,
+                    "the model is concluding again with reworded text and no intervening tool call"
+                );
             }
         }
         let digest = format!("{:x}", Sha256::digest(final_answer.as_bytes()));
@@ -2198,12 +2211,11 @@ where
             // delivered; from the third it stops asking and pins the tool.
             let escalation = if repeated_answer >= 2 {
                 format!(
-                    "ESCALATION (attempt {attempt}, identical answer #{repeated}): this exact gap was already \
-                     shown to you {attempt} time(s) and you have now returned the same final answer {repeated} \
-                     time(s) without calling a single tool. Runtime does not deliver a restated answer. The only \
-                     action that clears this gap is `{tool}`. Your next response MUST be that tool call and \
-                     nothing else; Runtime has restricted this step to it. Read the required references first if \
-                     you have not, then call it.",
+                    "ESCALATION (attempt {attempt}, consecutive answer #{repeated}): this exact gap was already \
+                     shown to you {attempt} time(s) and you have now concluded {repeated} time(s) in a row \
+                     without a tool call. Runtime does not deliver another conclusion. The action that clears this \
+                     gap is `{tool}`. Your next response MUST be a tool call - read the references you still need, \
+                     then call it. Runtime has restricted this step to tool calls.",
                     attempt = attempt,
                     repeated = repeated_answer,
                     tool = kind.closing_tool()
@@ -2238,16 +2250,16 @@ where
         // the one response shape that has already failed repeatedly, so the next
         // step has to be the action that closes the gap.
         if repeated_answer >= 2 {
-            let mut allow = std::collections::BTreeSet::new();
-            allow.insert(kind.closing_tool().to_string());
-            // `state_inspect` and `evidence_retrieve` stay available because the
-            // closing action legitimately needs references read first, and the
-            // gap text names them.
-            allow.insert("state_inspect".to_string());
-            allow.insert("evidence_retrieve".to_string());
+            // Force a tool call and leave the tool set alone - the same correction
+            // the model-step boundary needed. Pinning the gap's closing tool here
+            // refused `objective_complete_request` in run one27, which is the one
+            // action that would have closed the Objective the model kept concluding
+            // about. Withdrawing a tool is a framework defect; choosing the model's
+            // tool is not the framework's call at all.
             let mut state = self.state.lock().await;
-            state.force_tool_allowlist_next_model = Some(allow);
+            state.force_tool_allowlist_next_model = None;
             state.force_text_only_next_model = false;
+            state.force_tool_call_next_model = true;
             tracing::warn!(
                 target: "cowd::completion_gap",
                 graph_id = %ticket.graph_id,
