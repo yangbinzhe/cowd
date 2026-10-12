@@ -1215,19 +1215,54 @@ where
         // keeps a long exploratory transcript out of the reduction request; it
         // is not a reason to withdraw the tools that close the Objective. Only
         // "nothing is owed" earns a tool-less terminal.
+        // The capability axis, decided independently of the prompt-isolation
+        // axis that `clean_terminal_synthesis` represents. Isolating the prompt
+        // keeps a long exploratory transcript out of the reduction request; it
+        // is not a reason to withdraw the tools that close the Objective. Only
+        // "nothing is owed" earns a tool-less terminal.
+        //
+        // The obligation is read from the Program projection, not only from the
+        // two flags the continuation paths set. Those flags exist once a
+        // completion gap or a closure rung has been *detected*, which is late:
+        // run one23 asked for a tool-less synthesis while three Teams existed and
+        // no Task had been published, so neither flag was set and the model was
+        // handed a request with an empty `tools` array and told to summarise. It
+        // summarised - and concluded the hard constraint was met because the
+        // Teams existed.
         let terminal_required_tools = if clean_terminal_synthesis {
-            let owed = {
+            let (gap_outstanding, rungs, session_id, turn_id) = {
                 let state = self.state.lock().await;
-                if state.completion_gap_outstanding || !state.outstanding_closure_rungs.is_empty() {
-                    Some(mandatory_action_tool_ids(
-                        true,
-                        &state.outstanding_closure_rungs,
-                    ))
-                } else {
-                    None
-                }
+                (
+                    state.completion_gap_outstanding,
+                    state.outstanding_closure_rungs.clone(),
+                    state.session_id.clone(),
+                    state.turn_id.clone(),
+                )
             };
-            owed.filter(|tools| !tools.is_empty())
+            // `publish_integration_task` and the rungs below `objective_complete_request`
+            // are work the Objective still needs; the request step itself is the
+            // model's own exit and is not a reason to keep tools.
+            let projected = super::root_agentic_program_projection(
+                self.services.as_ref(),
+                &session_id,
+                &turn_id,
+            )
+            .map(|program| {
+                super::outstanding_closure_steps(&program)
+                    .into_iter()
+                    .filter(|step| step != "objective_complete_request")
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+            let owed = gap_outstanding || !rungs.is_empty() || !projected.is_empty();
+            let mut all_rungs = rungs;
+            for step in projected {
+                if !all_rungs.contains(&step) {
+                    all_rungs.push(step);
+                }
+            }
+            owed.then(|| mandatory_action_tool_ids(true, &all_rungs))
+                .filter(|tools| !tools.is_empty())
         } else {
             None
         };

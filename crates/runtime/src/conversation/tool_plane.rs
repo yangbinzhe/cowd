@@ -1379,9 +1379,31 @@ where
     ) -> Option<ConversationMessage> {
         let turn_id = self.active_turn_id();
         let input_hash = crate::tool_invocation::stable_hash(input);
+        // A call that keeps succeeding is still a call that keeps producing the
+        // same bytes. The failure ledger cannot see it, and the cumulative counter
+        // only diagnoses - run one23 was diagnosed eight times and issued the same
+        // `read_ref` twenty-one times. Past the block bound the call is not
+        // dispatched at all, which is the only mechanism here that has ever
+        // actually stopped a loop.
+        let repeated = crate::repetition_guard::repeated_call_count(&turn_id, tool_name, &input_hash);
+        let repeated_refusal = repeated >= crate::repetition_guard::repeated_call_block_bound();
         let Some(refusal) = crate::repetition_guard::refusal_for(&turn_id, tool_name, &input_hash)
         else {
-            return None;
+            if !repeated_refusal {
+                return None;
+            }
+            tracing::warn!(
+                %tool_name, %turn_id, repeated,
+                "dispatch refused for a repeatedly identical successful call"
+            );
+            let reason = format!(
+                "Runtime refused to dispatch this call again: the identical call has already been \
+                 issued {repeated} times in this turn and each time returned the same result, so \
+                 issuing it again cannot advance the objective. The bytes you want are already \
+                 committed: open the durable receipt with `evidence_retrieve`, take a different \
+                 action, or report the objective as blocked through objective_complete_request."
+            );
+            return Some(self.repeated_call_refusal_message(tool_use_id, &reason));
         };
         tracing::warn!(%tool_name, %turn_id, "dispatch refused for a repeatedly failing call");
         let reason = format!(
@@ -1436,6 +1458,52 @@ where
             reason,
             true,
         ))
+    }
+
+    /// Refuse a repeatedly identical *successful* call, recording the refusal the
+    /// same way the failure ledger does.
+    ///
+    /// The event and the tool result both matter. The event is what lets an
+    /// operator see afterwards that Runtime stopped a loop and why; the tool
+    /// result is what the model reads, and it has to name the durable receipt
+    /// rather than only saying "do not repeat" - a model told to change its input
+    /// without being told where the bytes already are has nowhere to go.
+    fn repeated_call_refusal_message(&self, tool_use_id: &str, reason: &str) -> ConversationMessage {
+        let turn_id = self.active_turn_id();
+        let record = self
+            .start_tool_invocation_record(tool_use_id, "repeated_call", "", 0)
+            .refused(reason, now_ms());
+        let refs = vec![
+            RuntimeEventRef {
+                kind: "tool_invocation".to_string(),
+                id: record.invocation_id.clone(),
+            },
+            RuntimeEventRef {
+                kind: "tool_call".to_string(),
+                id: record.tool_call_id.clone(),
+            },
+        ];
+        self.append_execution_runtime_event(
+            RuntimeEventScope::Tool,
+            "tool.invocation.refused",
+            Some(record.status.as_str().to_string()),
+            refs,
+            serde_json::json!({
+                "status": record.status.as_str().to_string(),
+                "invocation_id": record.invocation_id,
+                "tool_call_id": record.tool_call_id,
+                "tool_name": record.tool_name,
+                "turn_id": turn_id,
+                "input_hash": record.input_hash,
+                "cause_signature": "repeated_identical_call",
+            }),
+        );
+        ConversationMessage::tool_result(
+            tool_use_id.to_string(),
+            record.tool_name.clone(),
+            reason.to_string(),
+            true,
+        )
     }
 
     pub(crate) fn append_repetition_diagnosis(

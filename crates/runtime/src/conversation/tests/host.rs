@@ -419,3 +419,52 @@ fn the_repeat_count_survives_a_re_dispatch_that_opens_a_new_graph() {
     );
     crate::repetition_guard::clear_turn(turn);
 }
+
+/// The signal V23-1 now reads. A Program with Teams but no Tasks owes
+/// `publish_task`, and that fact has to be visible in `outstanding_closure_steps`
+/// - the two flags the continuation paths set are both false at that moment,
+/// which is exactly why a tool-less synthesis was handed to a model that still
+/// had to publish its Tasks.
+#[test]
+fn a_program_with_teams_but_no_tasks_still_owes_publish_task() {
+    use crate::{AgenticProgramProjection, AgenticTeamProjection};
+
+    let mut program = AgenticProgramProjection::empty("program", "objective");
+    program.required_team_count = 3;
+    for index in 0..3 {
+        program.teams.insert(
+            format!("team:{index}"),
+            AgenticTeamProjection {
+                team_id: format!("team:{index}"),
+                name: format!("Team {index}"),
+                mission: "m".into(),
+                objective: None,
+                topic_ref: format!("topic:team:{index}"),
+                created_by: "root".into(),
+                member_ids: vec![format!("agent:{index}")],
+                task_ids: Vec::new(),
+                lifecycle: Default::default(),
+            },
+        );
+    }
+    let steps = super::outstanding_closure_steps(&program);
+    assert!(
+        steps.iter().any(|step| step == "publish_task"),
+        "three Teams and no Tasks must still owe publish_task: {steps:?}"
+    );
+    // The raw view also names the exit request, because with no completion request
+    // on file that is the only remaining step. It is the model's own decision
+    // rather than an obligation, so the terminal-request site filters it out
+    // before deciding whether tools are owed - otherwise every unfinished Program
+    // would look like it owed the exit action and never get a tool-less terminal.
+    assert!(
+        steps.iter().any(|step| step == "objective_complete_request"),
+        "the view names the exit request while none exists: {steps:?}"
+    );
+    let owed = steps
+        .iter()
+        .filter(|step| step.as_str() != "objective_complete_request")
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(owed, vec!["publish_task".to_string()], "{owed:?}");
+}

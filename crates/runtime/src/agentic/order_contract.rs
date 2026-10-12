@@ -64,17 +64,16 @@ pub const OPERATOR_READING_DISCIPLINES: &[(&str, &str)] = &[
         "complete file read",
         "the operator prefers ranged reads over whole files",
     ),
+    // `整文件` is kept because it is unambiguous: it names a whole file. The two
+    // Chinese phrases that used to sit here - `未完整读取` and `非完整读取` - were
+    // removed after they produced a live false positive. Both mean "did not read
+    // in full", which covers a coverage complaint ("did not read all three
+    // artifacts") exactly as well as a truncation complaint ("did not read the
+    // whole file"). A reviewer saying the first was refused as if it had said the
+    // second, and the Task's review never completed.
     (
         "整文件",
         "the operator prefers ranged reads over whole files",
-    ),
-    (
-        "未完整读取",
-        "the operator states tool output may be truncated and that truncation is normal, not a defect",
-    ),
-    (
-        "非完整读取",
-        "the operator states tool output may be truncated and that truncation is normal, not a defect",
     ),
 ];
 
@@ -84,20 +83,123 @@ pub const OPERATOR_READING_DISCIPLINES: &[(&str, &str)] = &[
 /// reading the operator ruled out, and the pattern survives rewording and
 /// translation because it is arithmetic, not prose.
 fn contradicted_by_partial_read_arithmetic(reason: &str) -> bool {
-    // Two numbers with a separator between them, where the second is larger and
-    // both are line counts. Anchored on a line-count word so a ratio like "3/5
-    // tasks" is not mistaken for a read.
+    // A read range compared against a total: "lines 1-1000 of 3084",
+    // "前1000行（共3084行）", "read 1000 of 3084 lines". Every number attached to a
+    // line-count word - on either side of it - is a line count; numbers joined by a
+    // connector ("of" / "共" / "total") next to a line word count too. A conflict is
+    // two of those numbers, in text order, where the first is smaller.
+    //
+    // Proximity is the whole point, and it is what the first version lacked. That
+    // rule required only that a line word appear somewhere in the text and then
+    // compared any two numbers it contained. A live reviewer wrote a reason about a
+    // missing `objective_review` call whose evidence refs included an artifact id,
+    // and that id's digits supplied the increasing pair - so a legitimate review was
+    // refused and the Task was never reviewed. Digits that merely share a paragraph
+    // with the word "line" are not arithmetic about lines.
+    //
+    // Documented limit, accepted deliberately: "the file is 3084 lines and only 1000
+    // were read" puts the two numbers in separate clauses with no connector, so it
+    // is not caught. Failing open costs a return to today's behaviour, which is the
+    // right direction for a check that refuses a refusal.
     let lowered = reason.to_ascii_lowercase();
-    let line_word = ["行", "line"];
-    if !line_word.iter().any(|word| lowered.contains(word)) {
-        return false;
+    let chars: Vec<char> = lowered.chars().collect();
+    let is_separator =
+        |ch: char| ch.is_whitespace() || matches!(ch, '(' | '（' | ',' | '，' | '/' | '-' | '–' | ':' | '=');
+
+    /// The digit run ending at `from` (exclusive), walking back over separators.
+    let digits_before = |from: usize| -> Option<u64> {
+        let mut end = from;
+        while end > 0 && is_separator(chars[end - 1]) {
+            end -= 1;
+        }
+        let mut begin = end;
+        while begin > 0 && chars[begin - 1].is_ascii_digit() && end - begin < 12 {
+            begin -= 1;
+        }
+        if begin == end {
+            return None;
+        }
+        chars[begin..end].iter().collect::<String>().parse::<u64>().ok()
+    };
+
+    /// The digit run starting at or after `from`, skipping up to three separators.
+    let digits_after = |from: usize| -> Option<u64> {
+        let mut begin = from;
+        let mut separators = 0;
+        while begin < chars.len() && separators <= 3 && is_separator(chars[begin]) {
+            begin += 1;
+            separators += 1;
+        }
+        let mut end = begin;
+        while end < chars.len() && chars[end].is_ascii_digit() && end - begin < 12 {
+            end += 1;
+        }
+        if begin == end {
+            return None;
+        }
+        chars[begin..end].iter().collect::<String>().parse::<u64>().ok()
+    };
+
+    let slice = |from: usize, to: usize| -> String {
+        chars[from.clamp(0, chars.len())..to.clamp(0, chars.len())]
+            .iter()
+            .collect()
+    };
+    let has_line_word = |from: usize, to: usize| slice(from, to).contains('行') || slice(from, to).contains("line");
+
+    // (position, value), sorted by position so a range reads in the order written.
+    let mut found: Vec<(usize, u64)> = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        let word_end = if chars[index] == '行' {
+            Some(index + 1)
+        } else if slice(index, index + 4) == "line" {
+            // Consume the plural 's', or "lines 1" reads the word as "line" and the
+            // trailing 's' blocks the number that follows it.
+            Some(if chars.get(index + 4) == Some(&'s') {
+                index + 5
+            } else {
+                index + 4
+            })
+        } else {
+            None
+        };
+        let Some(word_end) = word_end else {
+            index += 1;
+            continue;
+        };
+        if let Some(value) = digits_after(word_end) {
+            found.push((word_end, value));
+        }
+        if let Some(value) = digits_before(index) {
+            found.push((index, value));
+        }
+        index = word_end;
     }
-    let numbers = lowered
-        .split(|ch: char| !ch.is_ascii_digit())
-        .filter_map(|part| part.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .collect::<Vec<_>>();
-    numbers.windows(2).any(|pair| pair[0] < pair[1])
+    if found.len() < 2 {
+        // A connector next to a line word ties the numbers on both sides of it into
+        // one comparison: "read 1000 of 3084 lines", "lines 1-1000 of 3084".
+        for connector in ["of", "共", "total"] {
+            let mut cursor = 0;
+            while let Some(offset) = lowered[cursor..].find(connector) {
+                let at = cursor + offset;
+                cursor = at + connector.len();
+                let near_a_line_word =
+                    has_line_word(at.saturating_sub(14), at) || has_line_word(at + connector.len(), at + connector.len() + 14);
+                if !near_a_line_word {
+                    continue;
+                }
+                if let Some(value) = digits_before(at) {
+                    found.push((at, value));
+                }
+                if let Some(value) = digits_after(at + connector.len()) {
+                    found.push((at + connector.len(), value));
+                }
+            }
+        }
+    }
+    found.sort_by_key(|(position, _)| *position);
+    found.windows(2).any(|pair| pair[0].1 < pair[1].1)
 }
 
 /// The operator reading discipline a reviewer's rework reason contradicts, if any.
@@ -150,6 +252,45 @@ mod tests {
     /// The check refuses a refusal, so it must fail open. A rework that names a
     /// deliverable the operator actually required is untouched, and so is any
     /// reason that happens to use none of the enumerated readings.
+    /// The live false positive, verbatim. A reviewer reported that a Task's
+    /// `evidence_refs` held three read receipts and one report artifact but no
+    /// record of the required `objective_review` call - a coverage complaint about
+    /// evidence, with nothing to do with how any file was read. The gate refused it
+    /// and the Task was never reviewed.
+    ///
+    /// It matched because the artifact id's digits (`art_eae84979dc9649e8a514605ced41684a`)
+    /// supplied an increasing pair and the text happened to contain a line word, so
+    /// the old arithmetic rule read it as "read 8 of 514605 lines". Proximity is
+    /// what separates arithmetic about lines from digits sharing a paragraph.
+    #[test]
+    fn an_evidence_coverage_complaint_is_not_a_reading_discipline_conflict() {
+        let reason = "未满足的具体条款是 acceptance 第(2)条：submits one objective_review call \
+                      covering all three artifacts with decision=satisfied。我实际读取到的证据缺口：该 \
+                      Task 的 evidence_refs 仅包含三份 read_ref 回执与一份报告 artifact\
+                      （artifact://art_eae84979dc9649e8a514605ced41684a），未记录任何 objective_review 调用。";
+        assert_eq!(
+            contradicted_reading_discipline(reason),
+            None,
+            "a complaint about missing evidence must not be refused as a reading conflict"
+        );
+    }
+
+    /// The real one20 reason, which the gate exists to catch: a read range
+    /// compared against a total and called a defect.
+    #[test]
+    fn a_read_range_compared_to_a_total_is_still_caught() {
+        for reason in [
+            "capability_contract.rs 仅读取了前1000行（共3084行），未达到 complete 要求",
+            "the report only covers lines 1-1000 of 3084, so the read is incomplete",
+            "read 1000 of 3084 lines and therefore missed the acceptance logic",
+        ] {
+            assert!(
+                contradicted_reading_discipline(reason).is_some(),
+                "a read-range-versus-total complaint must still be caught: {reason}"
+            );
+        }
+    }
+
     #[test]
     fn a_legitimate_rework_reason_is_untouched() {
         for reason in [
@@ -157,6 +298,8 @@ mod tests {
             "Missing the required artifact reference.",
             "结论与工具证据矛盾：receipt 显示未读取该文件。",
             "only partially verified the recovery path", // 'partially verified' is not a read marker
+            "未完整读取全部三个 artifact 的 evidence_refs", // 'did not read all three' is coverage, not truncation
+            "the artifact cites only 1 of the 3 required source paths",
         ] {
             assert_eq!(
                 contradicted_reading_discipline(reason),

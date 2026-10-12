@@ -1486,7 +1486,12 @@ impl AgentActionService {
                     "task_ref": task_ref,
                     "review_action_id": envelope.action_id,
                     "discipline": discipline,
-                    "reviewer_reason": reviewer_reason.chars().take(240).collect::<String>(),
+                    // The reason is recorded in full, not truncated. The first
+                    // version kept 240 characters, and when the gate produced a
+                    // false positive the truncated copy was all the journal held -
+                    // the marker that fired was past the cut, so the misfire could
+                    // not be diagnosed from the durable record at all.
+                    "reviewer_reason": reviewer_reason,
                 }),
             },
             idempotency_key: Some(format!("review-discipline-conflict:{}", envelope.action_id)),

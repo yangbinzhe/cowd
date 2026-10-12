@@ -92,6 +92,32 @@ pub(crate) fn repeated_call_bound() -> usize {
 /// Returns `None` below the bound. The key is the same `(turn, tool, input_hash)`
 /// the failure ledger uses, so the two ledgers can never disagree about what
 /// "the same call" means.
+/// The cumulative count at which an identical call stops being dispatched.
+///
+/// Deliberately above `repeated_call_bound`, so the model is told first and
+/// refused second. Run one23 was diagnosed eight times and issued the same
+/// `read_ref` twenty-one times anyway: a diagnosis the model can ignore is not a
+/// bound. The refusal path is the one this module already uses for deterministic
+/// failures, and it is the only thing in the framework that has ever actually
+/// stopped a loop.
+pub(crate) fn repeated_call_block_bound() -> usize {
+    std::env::var("COWD_TOOL_REPEAT_BLOCK_LIMIT")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(repeated_call_bound().saturating_mul(2))
+}
+
+/// The cumulative count so far, without recording a new call.
+pub fn repeated_call_count(turn_id: &str, tool_name: &str, input_hash: &str) -> usize {
+    let key = format!("repeat:{turn_id}:{tool_name}:{input_hash}");
+    repetition_ledger()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .map_or(0, |entry| entry.count)
+}
+
 pub fn record_repeated_call(turn_id: &str, tool_name: &str, input_hash: &str) -> Option<usize> {
     let key = format!("repeat:{turn_id}:{tool_name}:{input_hash}");
     let mut ledger = repetition_ledger()
@@ -995,5 +1021,39 @@ mod repetition_guard_tests {
         assert!(record_repeated_call(second, "read_file", "hash").is_none());
         clear_turn(first);
         clear_turn(second);
+    }
+
+    /// Diagnosing is not bounding. Run one23 was told eight times that its
+    /// `read_ref` was repeating and issued it twenty-one times anyway, so the
+    /// block bound has to sit above the diagnostic bound and the dispatch has to
+    /// actually stop.
+    #[test]
+    fn the_block_bound_sits_above_the_diagnostic_bound() {
+        assert!(
+            repeated_call_block_bound() > repeated_call_bound(),
+            "the model must be told before it is refused: {} vs {}",
+            repeated_call_block_bound(),
+            repeated_call_bound()
+        );
+    }
+
+    #[test]
+    fn the_cumulative_count_is_readable_without_recording_a_call() {
+        let turn = "v22-repeat-count-read";
+        clear_turn(turn);
+        assert_eq!(repeated_call_count(turn, "read_ref", "hash"), 0);
+        for _ in 1..repeated_call_bound() {
+            record_repeated_call(turn, "read_ref", "hash");
+        }
+        assert_eq!(
+            repeated_call_count(turn, "read_ref", "hash"),
+            repeated_call_bound() - 1
+        );
+        // Reading must not itself count.
+        assert_eq!(
+            repeated_call_count(turn, "read_ref", "hash"),
+            repeated_call_bound() - 1
+        );
+        clear_turn(turn);
     }
 }
