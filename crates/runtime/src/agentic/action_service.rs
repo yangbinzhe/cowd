@@ -419,6 +419,35 @@ impl AgentActionService {
                         ));
                     }
                 }
+                // The criterion's provenance is not the only way a rework can be
+                // unfounded. A criterion the operator really did state can still be
+                // read in a way that contradicts the operator's own discipline, and
+                // `criterion_source` cannot see that: it answers "did the model
+                // invent this?", never "is this reading consistent with what else the
+                // operator said?". Run one20's criterion was operator-derived and
+                // correctly passed both gates, yet its rework demanded whole-file
+                // reads that the same objective had explicitly forbidden.
+                if let Some(discipline) =
+                    crate::agentic::order_contract::contradicted_reading_discipline(&input.reason)
+                {
+                    // The conflict is durable in the rejection receipt itself - its
+                    // code and its message name the discipline - because that is the
+                    // artifact the journal keeps. An earlier version also pushed a
+                    // `program_warnings` entry here; it was dead code, since this
+                    // validation path returns the receipt without committing the
+                    // projection it mutated, so the warning never reached anyone.
+                    return Ok(rejected(
+                        envelope,
+                        projection.revision,
+                        "rework_contradicts_operator_discipline",
+                        &format!(
+                            "Task `{}` was sent back on a reading the operator explicitly ruled out: \
+                             {discipline}. Accept the Task, or name a deliverable the operator's own \
+                             objective requires - not a stricter reading of one it already stated.",
+                            input.task_ref
+                        ),
+                    ));
+                }
             }
         }
         if projection.session_id != envelope.actor.session_id

@@ -26,6 +26,21 @@ def psql(url, sql):
     return [line.split("\u0001") for line in out.stdout.splitlines() if line.strip()]
 
 
+def repeated_tool_call_ratio_bp(tool_calls, distinct_inputs):
+    """Share of this run's tool calls that carried no new information, in basis points.
+
+    Pure so it can be checked without a database. An earlier version broke the
+    assignment across two lines, which Python reads as `ratio_bp = 10_000` followed
+    by a discarded negation - the metric was pinned at 100% forever. A metric that
+    is wrong in a stable direction is worse than a missing one, because it looks
+    like a finding.
+    """
+    if tool_calls <= 0:
+        return 0
+    repeated = max(0, tool_calls - distinct_inputs)
+    return min(10_000, 10_000 * repeated // tool_calls)
+
+
 def pairs(rows):
     """Yield only the rows that really are (value, count) pairs.
 
@@ -53,6 +68,14 @@ class Monitor:
     def snapshot(self):
         s = {}
         s["model_steps"] = self.scalar("SELECT count(*) FROM runtime_events WHERE kind='model.item_completed'")
+        # Repeat ratio: how much of the tool work carried no new information. It is
+        # a first-class projection rather than a post-mortem statistic because the
+        # waste is invisible while it happens - run one20 finished with 458 tool
+        # calls of which 179 were distinct, and nothing in the run said so.
+        s["tool_calls_distinct_inputs"] = self.scalar(
+            "SELECT count(DISTINCT payload->>'content') FROM runtime_events "
+            "WHERE kind='model.item_completed' AND payload->>'kind'='tool_call'"
+        )
         s["tool_calls"] = self.scalar("SELECT count(*) FROM runtime_events WHERE kind='tool.invocation.started'")
         s["tool_failures"] = self.scalar("SELECT count(*) FROM runtime_events WHERE kind='tool.invocation.failed'")
         s["completion_requests"] = self.scalar(
@@ -136,6 +159,9 @@ class Monitor:
             "chr(13), ' '),1,120), count(*) FROM runtime_events "
             "WHERE kind='model.item_completed' AND payload->>'kind'='text' "
             "GROUP BY 1 ORDER BY 2 DESC LIMIT 4")
+        inv["repeated_tool_call_ratio_bp"] = repeated_tool_call_ratio_bp(
+            snap["tool_calls"], snap["tool_calls_distinct_inputs"]
+        )
         inv["repeated_text_answers"] = [
             {"text": r[0], "count": int(r[1])}
             for r in rows

@@ -21,6 +21,7 @@ _module = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_module)
 Monitor = _module.Monitor
 pairs = _module.pairs
+repeated_tool_call_ratio_bp = _module.repeated_tool_call_ratio_bp
 
 
 def snap(**overrides):
@@ -194,6 +195,26 @@ def _():
     assert all(isinstance(count, int) for _, count in parsed), parsed
     # Malformed rows are dropped, not fatal.
     assert len(parsed) == 2, parsed
+
+
+@case("the repeat ratio measures waste, not volume")
+def _():
+    # one20 finished with 443 tool calls of which 179 were distinct: 59.6% of the
+    # tool work carried no new information, and nothing in the run said so. one21,
+    # which reached a satisfied verdict, ran 50 calls with 47 distinct: 6%. The
+    # ratio has to separate those two, or it is just another counter.
+    ratio = repeated_tool_call_ratio_bp
+    # one20: 443 calls, 179 distinct.
+    assert 5800 <= ratio(443, 179) <= 6100, ratio(443, 179)
+    # one21, which reached a satisfied verdict: 50 calls, 47 distinct.
+    assert ratio(50, 47) <= 1000, ratio(50, 47)
+    # No calls yet is not 100% waste.
+    assert ratio(0, 0) == 0
+    # Every call distinct is no waste at all.
+    assert ratio(10, 10) == 0
+    # Every call a repeat is total waste, and never over 100%.
+    assert ratio(10, 0) == 10_000
+    assert ratio(3, 9) == 0, "a nonsensical snapshot must not read as negative waste"
 
 
 def main():

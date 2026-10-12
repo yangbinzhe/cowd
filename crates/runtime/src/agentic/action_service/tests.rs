@@ -4530,3 +4530,84 @@ fn the_review_guidance_fires_on_the_prefixed_gap_the_runtime_actually_emits() {
         "the exit action must stay silent while a gap remains: {actions:?}"
     );
 }
+
+/// The provenance gate is not the only way a rework can be unfounded. Run one20's
+/// criterion was operator-derived and correctly passed `rework_on_invented_criterion`,
+/// yet the reviewer sent the work back because one of three cited paths was read as
+/// lines 1-1000 of 3084 - a reading the same objective had explicitly ruled out.
+/// Both gates have to exist, because they answer different questions: one asks
+/// whether the model invented the standard, the other whether the reading of a
+/// real standard contradicts the operator.
+#[test]
+fn rework_on_a_reading_the_operator_ruled_out_is_refused() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = AgentActionService::new(Arc::clone(&store));
+    let (team, _worker, reviewer, task) = team_with_reviewer_and_task(
+        &service,
+        "reading",
+        "cites at least 3 complete crates/.../*.rs source paths actually read",
+        harness_contract::agent_action::CriterionSource::OperatorDerived,
+    );
+    let refused = service
+        .apply(&managed(
+            "rework-reading",
+            &team,
+            &reviewer,
+            AgentAction::TaskReview(TaskReviewInput {
+                task_ref: task.clone(),
+                decision: TaskReviewDecision::Rework,
+                reason: "第(1)条未满足：仅读取了前1000行（共3084行），未达到 complete 要求"
+                    .to_string(),
+                evidence_refs: Vec::new(),
+            }),
+        ))
+        .expect("review receipt");
+    assert_eq!(
+        refused.error.as_ref().map(|error| error.code.as_str()),
+        Some("rework_contradicts_operator_discipline"),
+        "{refused:?}"
+    );
+    // The conflict is durable in the receipt, which is what the journal keeps:
+    // the code names the class and the message names the discipline, so a reader
+    // can see a reviewer attempted a reading the operator ruled out.
+    let error = refused.error.expect("rejection error");
+    assert!(
+        error.message.contains("truncated"),
+        "the receipt must name the operator discipline it protects: {}",
+        error.message
+    );
+    assert!(error.message.contains(&task), "{}", error.message);
+}
+
+/// The new gate refuses a refusal, so it must fail open on everything it does not
+/// recognise. A rework naming a deliverable the operator required is untouched.
+#[test]
+fn a_rework_naming_a_real_deliverable_is_not_refused_as_a_discipline_conflict() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = AgentActionService::new(Arc::clone(&store));
+    let (team, _worker, reviewer, task) = team_with_reviewer_and_task(
+        &service,
+        "deliverable",
+        "cites at least 3 complete crates/.../*.rs source paths actually read",
+        harness_contract::agent_action::CriterionSource::OperatorDerived,
+    );
+    let receipt = service
+        .apply(&managed(
+            "rework-deliverable",
+            &team,
+            &reviewer,
+            AgentAction::TaskReview(TaskReviewInput {
+                task_ref: task.clone(),
+                decision: TaskReviewDecision::Rework,
+                reason: "the report never cites any source path, which the objective requires"
+                    .to_string(),
+                evidence_refs: Vec::new(),
+            }),
+        ))
+        .expect("review receipt");
+    assert_ne!(
+        receipt.error.as_ref().map(|error| error.code.as_str()),
+        Some("rework_contradicts_operator_discipline"),
+        "a rework naming a real operator deliverable must not be refused: {receipt:?}"
+    );
+}

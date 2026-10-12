@@ -63,6 +63,46 @@ fn repetition_ledger() -> &'static std::sync::Mutex<BTreeMap<String, RepetitionS
     LEDGER.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
 
+/// Consecutive identical **successful** calls tolerated before the model is told
+/// the call is not producing new information.
+///
+/// The existing ledgers answer two questions - "the same call again" and "the
+/// same dead end again" - and both key on *consecutive* evidence. Neither can see
+/// the shape a real loop takes inside an Agentic Program: the same call repeated
+/// across attempts. Run one20 issued 458 tool calls of which only 179 were
+/// distinct, and 31 byte-identical `state_inspect` point queries spread over five
+/// agent graphs, because every re-dispatch opens a new graph and resets every
+/// streak counter. Nothing refused, nothing nudged, nothing even measured it.
+///
+/// This is a total count within the turn, not a streak. The default matches
+/// `loop_nudge_after` so the two guards speak with one voice.
+pub(crate) fn repeated_call_bound() -> usize {
+    std::env::var("COWD_TOOL_REPEAT_LIMIT")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(3)
+}
+
+/// Count one successful call and return the running total once it reaches the
+/// bound.
+///
+/// Returns `Some(count)` on the call that reaches the bound and on every call
+/// after it, so the caller can decide whether to say it once or every time.
+/// Returns `None` below the bound. The key is the same `(turn, tool, input_hash)`
+/// the failure ledger uses, so the two ledgers can never disagree about what
+/// "the same call" means.
+pub fn record_repeated_call(turn_id: &str, tool_name: &str, input_hash: &str) -> Option<usize> {
+    let key = format!("repeat:{turn_id}:{tool_name}:{input_hash}");
+    let mut ledger = repetition_ledger()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = ledger.entry(key).or_default();
+    entry.count = entry.count.saturating_add(1);
+    let count = entry.count;
+    (count >= repeated_call_bound()).then_some(count)
+}
+
 /// A retryable failure is not a repetition. Timeouts and panics describe a
 /// transient condition, so they never count toward the breaker; a permission
 /// denial is deterministic but actionable, so it is reported rather than
@@ -894,5 +934,66 @@ mod repetition_guard_tests {
         assert!(!cause_blocked_for_tool(&turn, "read_file"));
         // The closure tools are the model's exit and are never blocked.
         assert!(!cause_blocked_for_tool(&turn, "objective_complete_request"));
+    }
+
+    /// The cumulative counter exists because the streak counters cannot see the
+    /// shape a real loop takes. Run one20 issued 31 byte-identical `state_inspect`
+    /// point queries spread over five agent graphs: every re-dispatch opens a new
+    /// graph and resets every streak, and within one graph the calls were
+    /// interleaved so nothing was ever consecutive. A total count sees all of it.
+    #[test]
+    fn a_repeated_call_is_counted_in_total_not_as_a_streak() {
+        let turn = "v22-repeat-cumulative";
+        clear_turn(turn);
+        let bound = repeated_call_bound();
+        // Below the bound: silent. The first repeat is not yet evidence.
+        for _ in 1..bound {
+            assert!(record_repeated_call(turn, "state_inspect", "hash-task").is_none());
+        }
+        // At the bound: the caller is told, and keeps being told.
+        assert_eq!(
+            record_repeated_call(turn, "state_inspect", "hash-task"),
+            Some(bound)
+        );
+        assert_eq!(
+            record_repeated_call(turn, "state_inspect", "hash-task"),
+            Some(bound + 1)
+        );
+        clear_turn(turn);
+    }
+
+    #[test]
+    fn a_different_input_is_a_different_call() {
+        let turn = "v22-repeat-distinct-inputs";
+        clear_turn(turn);
+        // One below the bound stays silent; the bound-th call is the one that speaks.
+        for _ in 1..repeated_call_bound() {
+            assert!(record_repeated_call(turn, "read_file", "hash-a").is_none());
+        }
+        // A different argument is a different question, even for the same tool.
+        assert!(record_repeated_call(turn, "read_file", "hash-b").is_none());
+        // The bound-th call of THIS input is the one that speaks.
+        assert_eq!(
+            record_repeated_call(turn, "read_file", "hash-a"),
+            Some(repeated_call_bound())
+        );
+        clear_turn(turn);
+    }
+
+    #[test]
+    fn the_cumulative_count_does_not_cross_turns() {
+        // Cross-turn repetition can be the operator retrying with the same input,
+        // which is not a loop. The counter dies with the turn, like every other
+        // guard here.
+        let first = "v22-repeat-first";
+        let second = "v22-repeat-second";
+        clear_turn(first);
+        clear_turn(second);
+        for _ in 1..repeated_call_bound() {
+            assert!(record_repeated_call(first, "read_file", "hash").is_none());
+        }
+        assert!(record_repeated_call(second, "read_file", "hash").is_none());
+        clear_turn(first);
+        clear_turn(second);
     }
 }

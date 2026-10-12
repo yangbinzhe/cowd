@@ -6444,6 +6444,64 @@ where
             }
         }
         state.identical_action_result_digest = batch_result_digest;
+        // Cumulative repeat detection, deliberately separate from the streak
+        // guard above. The streak counts consecutive identical batches and is
+        // reset by every re-dispatch and by every interleaved call; a real loop
+        // inside an Agentic Program is neither consecutive nor confined to one
+        // graph. Run one20 made 458 tool calls with 179 distinct inputs and 31
+        // byte-identical `state_inspect` queries across five agent graphs, and
+        // the streak guard saw none of it because nothing was ever consecutive.
+        //
+        // Diagnose only. The model keeps the decision; it is told the one fact it
+        // was missing - that the call has been made before and produced this
+        // result - and where the same bytes can be had without another call.
+        let repeat_turn = state.turn_id.clone();
+        let mut repeated_calls: Vec<(String, usize)> = Vec::new();
+        for call in &calls {
+            if !successful_call_ids.contains(&call.id) {
+                continue;
+            }
+            // A wait is not a repeat: parking on `wait_for_workers` until a
+            // worker moves is the documented contract, and an unchanged answer
+            // is its normal result. Same exemption the streak guard uses.
+            if is_loop_nudge_repeatable_tool(call) {
+                continue;
+            }
+            let input_hash = crate::tool_invocation::stable_hash(&call.input);
+            if let Some(count) =
+                crate::repetition_guard::record_repeated_call(&repeat_turn, &call.name, &input_hash)
+            {
+                repeated_calls.push((call.name.clone(), count));
+            }
+        }
+        if let Some((tool, count)) = repeated_calls.first() {
+            let repeated_tools = repeated_calls
+                .iter()
+                .map(|(name, count)| format!("{name} x{count}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            tracing::warn!(
+                target: "cowd::repeated_call",
+                %repeat_turn,
+                repeated = %repeated_tools,
+                "the same call has been issued repeatedly in this turn with no new information"
+            );
+            let mut item = ContextItem::new(
+                format!("repeated-call:{}:{}", ticket.node_id, count),
+                ContextSourceKind::ToolTrace,
+                ContextRole::Instruction,
+                format!(
+                    "This turn has now issued the same call {count} times with no new information: {repeated_tools}. \
+                     An identical call returns an identical result, so repeating it cannot advance the objective. \
+                     If you need the content again, open its durable receipt with `evidence_retrieve` (same bytes, \
+                     Runtime-bound hash) instead of issuing the call again; otherwise take a different action, or \
+                     proceed with the evidence you already hold."
+                ),
+            );
+            item.authority = ContextAuthority::System;
+            item.visibility = ContextVisibility::Private;
+            state.pending_next_model_context.push(item);
+        }
         match evaluate_loop_guard(
             state.identical_action_streak,
             loop_nudge_after(),
