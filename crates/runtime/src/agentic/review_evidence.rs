@@ -132,6 +132,41 @@ struct ReadCoverage {
     unscoped_effect: bool,
 }
 
+/// Whether a tool result counts as a physical read of a delivered result.
+///
+/// `read_ref` is the unified facade the primer names as the canonical reader
+/// ("Read Runtime facts through one canonical reference with `read_ref`"), and
+/// it resolves the same durable receipt as `evidence_retrieve` with the same
+/// payload shape, so both count. `"read"` used to sit in this list and is not a
+/// tool name at all, so that arm could never match - which left the facade the
+/// primer advertises as the one reader that does not count.
+fn counts_as_physical_read(tool_name: &str) -> bool {
+    matches!(tool_name, "evidence_retrieve" | "read_ref")
+}
+
+/// Whether two references name the same object under either spelling.
+///
+/// Runtime records a one-shot Task deliverable as `artifact:<24 hex>` - the
+/// Program-logical key it repeats in the completion gap and in the citable-refs
+/// projection - while `read_ref` resolves and echoes it back as
+/// `artifact://<24 hex>`. The two are the same object, but a byte comparison of
+/// the strings never matches, so a reviewer that read exactly the results it was
+/// told to read was refused with `review_requires_current_physical_reads`.
+/// `resolve_review_result` already normalises this spelling when it maps the
+/// logical key to its selector; the coverage check must use the same rule.
+fn same_reference_spelling(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    let normalize = |value: &str| {
+        value
+            .replacen("://", ":", 1)
+            .trim_end_matches('/')
+            .to_string()
+    };
+    normalize(left) == normalize(right)
+}
+
 impl ReadCoverage {
     fn observe(&mut self, output: &str, receipt_ref: &str) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(output) else {
@@ -143,7 +178,7 @@ impl ReadCoverage {
             || value["bytes"].as_u64() != Some(self.proof.bytes)
             || !value["evidence_ref"].as_str().is_some_and(|reference| {
                 reference == self.proof.content_ref
-                    || (reference == self.proof.result_ref
+                    || (same_reference_spelling(reference, &self.proof.result_ref)
                         && (reference.starts_with("tool://")
                             || reference.starts_with("artifact://")
                             || reference.starts_with("approval:v1:")))
@@ -274,6 +309,83 @@ fn packet_identity_matches(
     }
 }
 
+/// Why a TaskReview-scoped physical attempt cannot validate this review.
+///
+/// Returns the specific reason, or `Ok(())` when every condition holds. The
+/// three conditions used to collapse into one sentence - "review physical
+/// attempt is stale or owns different results" - which named neither the
+/// generation, the attempt, nor the refs, so a reviewer that had done everything
+/// right could not act on it and cycled until Runtime settled the attempt.
+///
+/// The third condition is Task-review-only. An Objective review is
+/// criterion-scoped and legitimately cites the delivered results of several
+/// Tasks at once: with two or more accepted Tasks the criterion's result set
+/// necessarily spans them, so applying the single-Task rule to an objective
+/// review made every objective review of real multi-Task work impossible.
+fn task_review_attempt_rejection(
+    task: &crate::agentic::program::AgenticTaskProjection,
+    graph_id: &str,
+    attempt: u32,
+    agent_id: &str,
+    membership_id: &str,
+    result_refs: &[String],
+    condition_ref: Option<&str>,
+) -> Result<(), String> {
+    if task.review_generation.saturating_add(1) != u64::from(attempt) {
+        return Err(format!(
+            "review attempt generation is stale: Task {} is at review generation {} and this \
+             physical run is attempt {}; inspect the Task and continue from its current revision",
+            task.task_id, task.review_generation, attempt
+        ));
+    }
+    let active = task.active_attempts.get(graph_id).is_some_and(|candidate| {
+        candidate.mode == harness_contract::agent_action::AgentAttemptMode::Review
+            && candidate.generation.saturating_add(1) == u64::from(attempt)
+            && candidate.agent_id == agent_id
+            && candidate.membership_id == membership_id
+    });
+    if !active {
+        return Err(format!(
+            "review attempt is not the active Review attempt for Task {}: Runtime has no Review \
+             attempt at generation {} bound to this graph, agent and membership; re-read the \
+             Task and let Runtime dispatch the current attempt",
+            task.task_id, attempt
+        ));
+    }
+    if condition_ref.is_none()
+        && !result_refs
+            .iter()
+            .all(|reference| task.artifact_refs.contains(reference))
+    {
+        return Err(format!(
+            "task review cites results outside Task {}: a Task review covers only that Task's \
+             delivered artifacts; cite this Task's artifact refs, or settle the criterion with \
+             objective_review",
+            task.task_id
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a tool read belongs to the root actor itself.
+///
+/// The root's own reads are owned by the root execution and Runtime carries them
+/// under whichever agentic-graph run happens to be executing the root's step at
+/// that moment - one live run's 125 root tool calls were attributed to eight
+/// different graphs, interleaved in time. Ownership, not the presence of a run
+/// id, is therefore what identifies the root's own read: a delegated Agent's read
+/// is not owned by the root execution and must stay invisible to it.
+fn binding_is_owned_by_root(
+    binding: &harness_contract::projection::RuntimeActivityBinding,
+    root_execution_id: Option<&str>,
+) -> bool {
+    root_execution_id.is_some_and(|root| {
+        binding
+            .activity_id
+            .starts_with(&format!("activity:execution:{root}:owner:"))
+    })
+}
+
 impl RuntimeServices {
     pub(crate) async fn independent_result_review(
         &self,
@@ -333,22 +445,15 @@ impl RuntimeServices {
                     .tasks
                     .get(task_ref)
                     .ok_or("review Task disappeared")?;
-                if task.review_generation.saturating_add(1) != u64::from(packet.attempt)
-                    || !task
-                        .active_attempts
-                        .get(packet.graph_id())
-                        .is_some_and(|attempt| {
-                            attempt.mode == harness_contract::agent_action::AgentAttemptMode::Review
-                                && attempt.generation.saturating_add(1) == u64::from(packet.attempt)
-                                && attempt.agent_id == scope.agent_id
-                                && attempt.membership_id == scope.membership_id
-                        })
-                    || !result_refs
-                        .iter()
-                        .all(|reference| task.artifact_refs.contains(reference))
-                {
-                    return Err("review physical attempt is stale or owns different results".into());
-                }
+                task_review_attempt_rejection(
+                    task,
+                    packet.graph_id(),
+                    packet.attempt,
+                    &scope.agent_id,
+                    &scope.membership_id,
+                    result_refs,
+                    condition_ref,
+                )?;
             }
 
             if actor.agent_id.as_deref() != Some(actor.actor_id.as_str())
@@ -585,9 +690,16 @@ impl RuntimeServices {
             return Err("independent review has no current results".into());
         }
         if let Some(packet) = packet {
+                // A read is a fact about this Agent node, not about one dispatch of it.
+                // The per-attempt stream made a re-dispatched reviewer start from zero
+                // reads, so it was refused for "not having read" bodies it had already
+                // read, and each refusal burned the retry budget until the attempt
+                // settled. Union the node attempts; observe still verifies every payload
+                // sha256 and bytes, so a stale body cannot pass, and receipts from any
+                // other Agent node are still excluded.
             for receipt in self
                 .commit_service()
-                .load_delegated_agent_tool_receipts(
+                .load_delegated_agent_tool_receipts_all_attempts(
                     packet.graph_id(),
                     packet.node_id(),
                     packet.attempt,
@@ -614,7 +726,16 @@ impl RuntimeServices {
                         );
                     }
                 }
-                if receipt.outcome.tool_name != "evidence_retrieve"
+                // `read_ref` is the unified facade the primer names as THE
+                // canonical reader, and it resolves the same durable receipt as
+                // `evidence_retrieve` with the same payload shape. Refusing it
+                // here told a reviewer to read the delivered results and then
+                // refused the review that followed those reads: one live run
+                // cycled `read_ref` -> `objective_review` ->
+                // `review_requires_current_physical_reads` until the window
+                // expired, while the identical read through `evidence_retrieve`
+                // would have closed the coverage.
+                if !counts_as_physical_read(&receipt.outcome.tool_name)
                     || receipt.outcome.status != crate::RuntimeToolExecutionStatus::Executed
                 {
                     continue;
@@ -651,9 +772,22 @@ impl RuntimeServices {
                     };
                     if binding.session_id != actor.session_id
                         || binding.turn_id != actor.turn_id
-                        || binding.agent_run_id.is_some()
                         || event.payload["status"] != "completed"
                     {
+                        continue;
+                    }
+                    // The root's own reads are owned by the root execution, and
+                    // Runtime carries them under whichever agentic-graph run is
+                    // executing the root's step at that moment. One live run's
+                    // 125 root tool calls were attributed to eight different
+                    // graphs, interleaved in time, so the old blanket skip for
+                    // "any agent_run_id" discarded every one of them and the
+                    // root could never satisfy its own read coverage.
+                    //
+                    // What must still be excluded is another Agent's read. Those
+                    // are not owned by the root execution, so ownership is the
+                    // discriminator - not the presence of a run id.
+                    if !binding_is_owned_by_root(&binding, actor.root_execution_id.as_deref()) {
                         continue;
                     }
                     // `read_ref` is the unified facade; a tool:// or artifact:// read
@@ -661,10 +795,17 @@ impl RuntimeServices {
                     // `evidence_retrieve`, so it must count as a physical read.
                     // Non-evidence `read_ref` calls simply have no full_output_ref
                     // and are skipped below.
-                    if !matches!(
-                        event.payload["tool_name"].as_str(),
-                        Some("evidence_retrieve" | "read")
-                    ) {
+                    // `read_ref` is the unified facade; a tool:// or artifact:// read
+                    // through it resolves the same durable receipt as
+                    // `evidence_retrieve`, so it must count as a physical read.
+                    // Non-evidence `read_ref` calls simply have no full_output_ref
+                    // and are skipped below. (`"read"` was never a tool name; the
+                    // facade is `read_ref`, so that arm could not match anything.)
+                    if !event
+                        .payload["tool_name"]
+                        .as_str()
+                        .is_some_and(counts_as_physical_read)
+                    {
                         if let Some(effect) = results::tool_effect(self, &event)? {
                             if effect.effect_kind == harness_contract::tool::ToolEffectKind::Read {
                                 record_effect_observation(
@@ -740,8 +881,18 @@ impl RuntimeServices {
                 .collect::<Vec<_>>()
         };
         if !missing.is_empty() {
+            // Name WHO must read. The old text said only "use evidence_retrieve",
+            // which a model satisfied by having some other Agent - or itself in an
+            // earlier attempt - read the results, then submitted the review from a
+            // different execution and was refused again. One live run cycled this
+            // five times across three Agents. Coverage is scoped to the reviewing
+            // execution, so the instruction has to say so.
             return Err(format!(
-                "review_requires_current_physical_reads:{}; use evidence_retrieve and follow every next_request for the current result",
+                "review_requires_current_physical_reads:{}; the Agent that submits this \
+                 objective_review must itself read each of these results in THIS execution \
+                 (evidence_retrieve or read_ref, following every next_request to the end). \
+                 A read by another Agent, by the root, or by an earlier attempt of this \
+                 Agent does not count.",
                 missing.join(",")
             ));
         }
@@ -844,6 +995,258 @@ mod tests {
         serde_json::json!({"kind":"evidence_retrieve", "available":true,
             "evidence_ref":"artifact://current", "sha256":"current-hash", "bytes":3001,
             "total_chunks":3, "chunks":[{"index":index,"content":"actual page"}]})
+    }
+
+    /// A Task with two delivered artifacts and one active Review attempt at
+    /// generation 1 bound to `graph` / `agent:1` / `membership:1`.
+    fn reviewed_task() -> crate::agentic::program::AgenticTaskProjection {
+        let mut task = crate::agentic::program::AgenticTaskProjection {
+
+                task_id: "task".to_string(),
+                team_id: "team".to_string(),
+                title: "long task".to_string(),
+                objective: "finish without an arbitrary wall timeout".to_string(),
+                acceptance: "durable evidence".to_string(),
+                acceptance_checks: Vec::new(),
+                criterion_source: Default::default(),
+                required_capabilities: Vec::new(),
+                depends_on: Vec::new(),
+                status: crate::agentic::program::AgenticTaskStatus::Published,
+                claimant: None,
+                claim_generation: 0,
+                claim_execution_id: None,
+                claimed_at_ms: None,
+                lease_expires_at_ms: None,
+                active_attempts: Default::default(),
+                artifact_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                unresolved: Vec::new(),
+                review_reason: None,
+                reviewed_by: None,
+                failed_attempts: 0,
+                review_generation: 0,
+                failed_review_attempts: 0,
+                last_failure: None,
+                replacement_task_refs: Vec::new(),
+                supersede_evidence_refs: Vec::new(),
+                superseded_reason: None,
+                superseded_by: None,
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
+                cancel_requested_by: None,
+                cancel_reason_ref: None,
+                cancel_evidence_refs: Vec::new(),
+                pending_retirement: None,
+        };
+        task.review_generation = 1;
+        task.artifact_refs = vec!["artifact:a".to_string(), "artifact:b".to_string()];
+        task.active_attempts.insert(
+            "graph".to_string(),
+            crate::agentic::program::AgenticTaskAttemptProjection {
+                execution_id: "execution:1".to_string(),
+                agent_id: "agent:1".to_string(),
+                membership_id: "membership:1".to_string(),
+                mode: harness_contract::agent_action::AgentAttemptMode::Review,
+                generation: 1,
+            },
+        );
+        task
+    }
+
+    #[test]
+    fn an_objective_review_may_cite_results_across_tasks() {
+        let task = reviewed_task();
+        // The fix this pins: the single-Task artifact rule used to apply to every
+        // review, so an objective review of real multi-Task work was refused with
+        // "stale or owns different results" while generation, attempt and reads
+        // were all correct. A criterion-scoped review legitimately cites the
+        // delivered results of several Tasks.
+        assert!(
+            task_review_attempt_rejection(
+                &task,
+                "graph",
+                2,
+                "agent:1",
+                "membership:1",
+                &["artifact:a".to_string(), "artifact:z".to_string()],
+                Some("user_intent"),
+            )
+            .is_ok(),
+            "an Objective review is criterion-scoped, not Task-scoped"
+        );
+        // The same refs under a Task review are still refused, with a reason that
+        // names the rule instead of collapsing three conditions into one sentence.
+        let refusal = task_review_attempt_rejection(
+            &task,
+            "graph",
+            2,
+            "agent:1",
+            "membership:1",
+            &["artifact:a".to_string(), "artifact:z".to_string()],
+            None,
+        )
+        .expect_err("a Task review covers only its own Task's artifacts");
+        assert!(
+            refusal.contains("covers only that Task's"),
+            "the refusal must name the rule: {refusal}"
+        );
+    }
+
+    #[test]
+    fn a_stale_review_attempt_is_refused_with_its_own_reason() {
+        let task = reviewed_task();
+        let stale_generation = task_review_attempt_rejection(
+            &task,
+            "graph",
+            5,
+            "agent:1",
+            "membership:1",
+            &["artifact:a".to_string()],
+            None,
+        )
+        .expect_err("generation 5 cannot review a Task at review generation 1");
+        assert!(
+            stale_generation.contains("generation is stale"),
+            "the refusal must name the generation: {stale_generation}"
+        );
+
+        let wrong_agent = task_review_attempt_rejection(
+            &task,
+            "graph",
+            2,
+            "agent:9",
+            "membership:1",
+            &["artifact:a".to_string()],
+            None,
+        )
+        .expect_err("another agent's attempt is not this attempt");
+        assert!(
+            wrong_agent.contains("not the active Review attempt"),
+            "the refusal must name the attempt: {wrong_agent}"
+        );
+
+        assert!(task_review_attempt_rejection(
+            &task,
+            "graph",
+            2,
+            "agent:1",
+            "membership:1",
+            &["artifact:a".to_string()],
+            None,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_read_of_the_logical_key_counts_as_a_read_of_the_result() {
+        // Runtime records a one-shot Task deliverable as `artifact:<24 hex>` and
+        // repeats that spelling in the completion gap and the citable-refs
+        // projection, while `read_ref` resolves and echoes it back as
+        // `artifact://<24 hex>`. A byte comparison never matched, so a reviewer
+        // that read exactly the results it was told to read was refused.
+        assert!(same_reference_spelling(
+            "artifact://4541b02b47dc2bca34a7f0f7",
+            "artifact:4541b02b47dc2bca34a7f0f7"
+        ));
+        assert!(same_reference_spelling(
+            "artifact:4541b02b47dc2bca34a7f0f7",
+            "artifact://4541b02b47dc2bca34a7f0f7"
+        ));
+        assert!(same_reference_spelling(
+            "tool://tool-raw-chatcmpl-tool-abc",
+            "tool:tool-raw-chatcmpl-tool-abc"
+        ));
+        // Different objects stay different: the normalisation must not become a
+        // wildcard that lets any read satisfy any result.
+        assert!(!same_reference_spelling(
+            "artifact://4541b02b47dc2bca34a7f0f7",
+            "artifact:64506e38bc17f2a2ae97c06e"
+        ));
+        assert!(!same_reference_spelling(
+            "tool://tool-raw-chatcmpl-tool-abc",
+            "artifact://art_2387b74c32b348d9b3d2b17e69f8718a"
+        ));
+        // An exact match still passes, and a trailing slash is not a difference.
+        assert!(same_reference_spelling("artifact://x", "artifact://x"));
+        assert!(same_reference_spelling("artifact://x/", "artifact://x"));
+    }
+
+    #[test]
+    fn the_roots_own_reads_count_whatever_graph_carried_them() {
+        // Runtime attributes the root's tool calls to whichever agentic-graph run
+        // is executing the root's step. One live run's 125 root tool calls were
+        // spread over eight different graphs, interleaved in time, so a filter
+        // keyed on the run id discarded every one of them and the root could
+        // never satisfy its own read coverage.
+        let root = "session-ingress-graph:root-1";
+        let binding = |activity_id: &str| harness_contract::projection::RuntimeActivityBinding {
+            activity_id: activity_id.to_string(),
+            parent_activity_id: None,
+            initiator_activity_id: None,
+            agent_run_id: Some("run:agentic-graph:whatever".to_string()),
+            agent_instance_id: None,
+            root_execution_id: root.to_string(),
+            root_task_id: "task:root:1".to_string(),
+            task_id: "task:1".to_string(),
+            session_id: "session-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            node_id: None,
+            team_run_id: None,
+            skill_id: None,
+            skill_revision: None,
+            skill_activation_id: None,
+            tool_contract_id: None,
+            tool_call_id: None,
+            approval_id: None,
+            parallel_group_id: None,
+            revision: 1,
+            fence: 1,
+            generation: 1,
+        };
+        for graph in ["aaa", "bbb", "ccc"] {
+            assert!(
+                binding_is_owned_by_root(
+                    &binding(&format!("activity:execution:{root}:owner:run:agentic-graph:{graph}:tool:x")),
+                    Some(root)
+                ),
+                "the root's own read counts under any graph: {graph}"
+            );
+        }
+        // A delegated Agent's read is not owned by the root execution and must
+        // stay invisible: independence is about who read it.
+        assert!(
+            !binding_is_owned_by_root(
+                &binding("activity:execution:agentic-graph:delegated:node:agent"),
+                Some(root)
+            ),
+            "another Agent's read must not count for the root"
+        );
+        // An actor with no root execution has nothing to match against.
+        assert!(!binding_is_owned_by_root(
+            &binding(&format!("activity:execution:{root}:owner:run:agentic-graph:aaa")),
+            None
+        ));
+    }
+
+    #[test]
+    fn the_facade_the_primer_advertises_counts_as_a_physical_read() {
+        // The primer names `read_ref` as THE canonical reader. It used to be
+        // absent from this predicate (the list held `"read"`, which is not a
+        // tool name), so a reviewer that followed the primer and then reviewed
+        // was told its reads did not count. One live run cycled
+        // `read_ref` -> `objective_review` -> `review_requires_current_physical_reads`
+        // until the window expired; the identical read through
+        // `evidence_retrieve` closed the coverage.
+        assert!(counts_as_physical_read("read_ref"));
+        assert!(counts_as_physical_read("evidence_retrieve"));
+        // A capability label is not a tool name and must never satisfy the gate.
+        assert!(!counts_as_physical_read("read"));
+        // Ordinary workspace reads are not reads of a delivered result.
+        assert!(!counts_as_physical_read("read_file"));
+        assert!(!counts_as_physical_read("grep_search"));
+        assert!(!counts_as_physical_read("state_inspect"));
     }
 
     #[test]

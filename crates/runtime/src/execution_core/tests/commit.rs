@@ -363,6 +363,54 @@ fn delegated_agent_receipts_are_indexed_atomically_and_reload_without_scanning_e
 }
 
 #[test]
+fn a_nodes_reads_are_visible_across_its_own_attempts_but_never_across_nodes() {
+    // A read is a fact about the Agent node, not about one dispatch of it. The
+    // per-attempt stream made a re-dispatched reviewer start from zero reads, so
+    // it was refused for "not having read" bodies it had already read, and each
+    // refusal burned the retry budget until the attempt settled.
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = ExecutionCommitService::new(Arc::clone(&store));
+    for (attempt, id) in [(1u32, "first-read"), (2, "second-read")] {
+        let mut request = request_with_parent(attempt as u64, id);
+        request.parent_execution_attempt = Some(attempt);
+        service
+            .commit_readonly_tool_receipts(&[(request, outcome(id, &format!("{id}-durable")))])
+            .expect("commit attempt receipt");
+    }
+    // A different node reading the same body must stay invisible: independence
+    // is about who read it, not merely that somebody did.
+    let mut other_node = request_with_parent(1, "other-node-read");
+    other_node.parent_execution = Some(harness_contract::execution_graph::ExecutionParentBinding {
+        execution_id: "order-graph".to_string(),
+        node_id: "other-node".to_string(),
+    });
+    other_node.parent_execution_attempt = Some(1);
+    service
+        .commit_readonly_tool_receipts(&[(other_node, outcome("other-node-read", "other-durable"))])
+        .expect("commit the other node receipt");
+
+    let unioned = service
+        .load_delegated_agent_tool_receipts_all_attempts("order-graph", "order-node", 2)
+        .expect("union this node's attempts");
+    assert_eq!(
+        unioned.len(),
+        2,
+        "both attempts of this node count: {:?}",
+        unioned
+            .iter()
+            .map(|receipt| receipt.outcome.tool_use_id.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(unioned.iter().all(|receipt| receipt.outcome.tool_use_id != "other-node-read"));
+    // The per-attempt loader is unchanged: attempt-exact callers still see one.
+    let exact = service
+        .load_delegated_agent_tool_receipts("order-graph", "order-node", 1)
+        .expect("exact attempt");
+    assert_eq!(exact.len(), 1);
+    assert_eq!(exact[0].outcome.tool_use_id, "first-read");
+}
+
+#[test]
 fn delegated_agent_receipts_reload_restores_causal_order_when_indexed_writes_are_out_of_sequence() {
     let store = Arc::new(RuntimeEventStore::for_test());
     let service = ExecutionCommitService::new(Arc::clone(&store));

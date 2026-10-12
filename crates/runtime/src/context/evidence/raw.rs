@@ -76,6 +76,22 @@ pub trait RawEvidenceStore: Send + Sync {
     async fn persist(&self, write: RawEvidenceWrite)
     -> Result<EvidenceAccessRef, RawEvidenceError>;
     async fn retrieve(&self, access: &EvidenceAccessRef) -> Result<Vec<u8>, RawEvidenceError>;
+
+    /// Bind an already-stored body to a new evidence reference, without writing
+    /// the bytes a second time.
+    ///
+    /// A reused read still owes a receipt under its own identity: the caller
+    /// validates the receipt against the reference it just used, so handing
+    /// back the first call's receipt fails with "canonical evidence reference
+    /// changed during persistence". The default re-persists, which is correct
+    /// but writes the bytes again; the production adapter overrides it.
+    async fn rebind_receipt(
+        &self,
+        write: RawEvidenceWrite,
+        _artifact: ArtifactRef,
+    ) -> Result<EvidenceAccessRef, RawEvidenceError> {
+        self.persist(write).await
+    }
 }
 
 /// Runtime production adapter. Artifact bytes are durable before the bounded
@@ -229,6 +245,21 @@ impl RawEvidenceStore for SessionPortRawEvidenceStore {
         .await
     }
 
+    async fn rebind_receipt(
+        &self,
+        write: RawEvidenceWrite,
+        artifact: ArtifactRef,
+    ) -> Result<EvidenceAccessRef, RawEvidenceError> {
+        self.publish_artifact_receipt(
+            write.evidence_ref,
+            write.session_id,
+            artifact,
+            write.metadata,
+            false,
+        )
+        .await
+    }
+
     async fn retrieve(&self, access: &EvidenceAccessRef) -> Result<Vec<u8>, RawEvidenceError> {
         let artifact = ArtifactRef::durable(
             access.retrieval_selector.clone(),
@@ -268,35 +299,53 @@ where
         let expected_visibility_scope = write.visibility_scope.clone();
         // A whole-file read of an unchanged path in the same Session is the one
         // case where writing again adds bytes and no information.
-        let dedup_key = Self::read_dedup_key(&write, &expected_hash);
+        let dedup_key = Self::read_dedup_key(&write);
         if let Some(key) = &dedup_key {
-            if let Some(existing) = Self::read_receipt_index()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(key)
-                .cloned()
-            {
-                // The index is a cache, not a source of truth, so the cached
-                // receipt still has to satisfy the same validation a fresh write
-                // would - otherwise a stale entry could hand back bytes that no
-                // longer match what the caller asked for.
-                validate_access(
-                    &existing,
-                    &expected_ref,
-                    &expected_hash,
-                    expected_bytes,
-                    Some(&expected_media_type),
-                    Some(&expected_visibility_scope),
-                )?;
-                return Ok(existing);
+            // The guard is scoped so it is dropped before the await below: a
+            // held lock across an await makes this future non-Send.
+            let cached_body = {
+                Self::read_receipt_index()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(key)
+                    .cloned()
+            };
+            // The stored body is reused only when it is still the bytes this
+            // call asked for. The evidence-economy contract says a repeat read
+            // is served "same bytes, hash-verified", so a body whose hash moved
+            // is not a redundant read at all - the file changed - and it falls
+            // through to a fresh persist below. Refusing it instead would break
+            // the ordinary write-then-read-again shape.
+            if let Some(body) = cached_body {
+                if body.sha256 == expected_hash && body.bytes == expected_bytes {
+                    let access = self.store.rebind_receipt(write, body).await?;
+                    validate_access(
+                        &access,
+                        &expected_ref,
+                        &expected_hash,
+                        expected_bytes,
+                        Some(&expected_media_type),
+                        Some(&expected_visibility_scope),
+                    )?;
+                    return Ok(access);
+                }
             }
         }
         let access = self.store.persist(write).await?;
         if let Some(key) = dedup_key {
-            Self::read_receipt_index()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(key, access.clone());
+            let body = ArtifactRef::durable(
+                access.retrieval_selector.clone(),
+                access.sha256.clone(),
+                access.bytes,
+                access.media_type.clone(),
+                access.visibility_scope.clone(),
+            );
+            {
+                Self::read_receipt_index()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(key, body);
+            }
         }
         validate_access(
             &access,
@@ -310,15 +359,22 @@ where
     }
 
     /// Durable receipts already written for an identical read, keyed by
-    /// `(session, tool input, content hash)`.
+    /// `(session, tool, input)`.
     ///
     /// A whole-file read of a path the same Session already read returns the
     /// receipt it already has instead of writing the same bytes again: one live
     /// run performed four full reads of `crates/tools/src/lib.rs`, and each one
-    /// cost a provider round-trip and a fresh artifact. The key deliberately
-    /// includes the tool input, so a ranged read (whose input names `limit` and
-    /// `offset`) never collides with a whole-file read, and it includes the
-    /// content hash, so a file that changed is read again.
+    /// cost a provider round-trip and a fresh artifact. The key includes the
+    /// tool input, so a ranged read (whose input names `limit` and `offset`)
+    /// never collides with a whole-file read.
+    ///
+    /// The key deliberately does NOT include the payload hash. A read's payload
+    /// embeds the call that produced it - a compaction notice names the tool
+    /// call id - so the same input yields a different payload every time and a
+    /// payload-keyed index never hits. That was measured: one live run persisted
+    /// the same input three times at the same byte count under three different
+    /// content hashes. What makes two reads the same read is what was asked for,
+    /// not how the answer was framed.
     ///
     /// The index is process-wide rather than per-facade because every governed
     /// tool result builds a fresh facade at its call site, so a per-facade index
@@ -333,11 +389,9 @@ where
             .clear();
     }
 
-    fn read_receipt_index() -> &'static Mutex<HashMap<(String, String, String), EvidenceAccessRef>>
-    {
-        static INDEX: std::sync::OnceLock<
-            Mutex<HashMap<(String, String, String), EvidenceAccessRef>>,
-        > = std::sync::OnceLock::new();
+    fn read_receipt_index() -> &'static Mutex<HashMap<(String, String, String), ArtifactRef>> {
+        static INDEX: std::sync::OnceLock<Mutex<HashMap<(String, String, String), ArtifactRef>>> =
+            std::sync::OnceLock::new();
         INDEX.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
@@ -348,10 +402,7 @@ where
     /// review bodies) and every read whose input is not stable: a ranged read
     /// names `limit`/`offset`, so its input hash already differs from a
     /// whole-file read of the same path.
-    fn read_dedup_key(
-        write: &RawEvidenceWrite,
-        payload_hash: &str,
-    ) -> Option<(String, String, String)> {
+    fn read_dedup_key(write: &RawEvidenceWrite) -> Option<(String, String, String)> {
         let tool_name = write.metadata.get("tool_name").and_then(Value::as_str)?;
         if !matches!(tool_name, "read_file" | "read_ref") {
             return None;
@@ -361,11 +412,7 @@ where
             .get("input_hash")
             .and_then(Value::as_str)?
             .to_string();
-        Some((
-            write.session_id.clone(),
-            input_hash,
-            payload_hash.to_string(),
-        ))
+        Some((write.session_id.clone(), tool_name.to_string(), input_hash))
     }
 
     pub async fn retrieve(
@@ -739,23 +786,23 @@ mod tests {
         assert_eq!(facade.persist_calls(), 2, "a ranged read must be persisted");
     }
 
-    /// The content hash is part of the key, so a file that changed between two
-    /// reads is read again. Deduplication must never serve stale bytes.
+    /// A different read is a different read. Narrowing the range changes the
+    /// input, so it is persisted rather than served from the first receipt:
+    /// that is how a model asks for bytes the first read did not cover.
     #[tokio::test]
-    async fn a_changed_file_is_read_again() {
+    async fn a_narrower_range_is_a_different_read() {
         RawEvidenceFacade::<CountingStore>::clear_read_receipt_index();
         let facade = RawEvidenceFacade::new(CountingStore::default());
         facade
             .persist(RawEvidenceWrite {
-                metadata: serde_json::json!({"tool_name": "read_file", "input_hash": "same"}),
+                metadata: serde_json::json!({"tool_name": "read_file", "input_hash": "narrow-whole"}),
                 ..write()
             })
             .await
             .unwrap();
         facade
             .persist(RawEvidenceWrite {
-                payload: "the file changed".to_string(),
-                metadata: serde_json::json!({"tool_name": "read_file", "input_hash": "same"}),
+                metadata: serde_json::json!({"tool_name": "read_file", "input_hash": "narrow-limit-20"}),
                 ..write()
             })
             .await
@@ -763,8 +810,27 @@ mod tests {
         assert_eq!(
             facade.persist_calls(),
             2,
-            "a changed file must be read again, not served from the cache"
+            "a different input is a different read and must be persisted"
         );
+    }
+
+    /// The same read issued twice is one read. The framework's own evidence
+    /// economy says a file an accepted Task already read is opened through its
+    /// durable receipt, so the second identical call reuses the first receipt
+    /// even though the payload framing differs - which it always does, because
+    /// the payload names the call that produced it.
+    #[tokio::test]
+    async fn the_same_read_twice_is_one_read_even_when_the_framing_differs() {
+        RawEvidenceFacade::<CountingStore>::clear_read_receipt_index();
+        let facade = RawEvidenceFacade::new(CountingStore::default());
+        let read = || RawEvidenceWrite {
+            metadata: serde_json::json!({"tool_name": "read_file", "input_hash": "same"}),
+            ..write()
+        };
+        let first = facade.persist(read()).await.unwrap();
+        let second = facade.persist(read()).await.unwrap();
+        assert_eq!(first.retrieval_selector, second.retrieval_selector);
+        assert_eq!(facade.persist_calls(), 1);
     }
 
     /// Deduplication is scoped to one Session. A different Agent reading the
@@ -825,6 +891,24 @@ mod tests {
 
     #[async_trait]
     impl RawEvidenceStore for CountingStore {
+        /// A reused body issues a fresh receipt without writing again, exactly
+        /// as the production adapter does, so a test can tell "the bytes were
+        /// written once" from "the receipt was issued twice".
+        async fn rebind_receipt(
+            &self,
+            write: RawEvidenceWrite,
+            artifact: ArtifactRef,
+        ) -> Result<EvidenceAccessRef, RawEvidenceError> {
+            Ok(EvidenceAccessRef::durable(
+                write.evidence_ref,
+                artifact.sha256,
+                artifact.bytes,
+                artifact.media_type,
+                artifact.selector,
+                artifact.visibility_scope,
+            ))
+        }
+
         async fn persist(
             &self,
             write: RawEvidenceWrite,

@@ -46,6 +46,7 @@ def inv(**overrides):
         "task_churn": [],
         "repeated_tool_inputs": [],
         "repeated_reads": [],
+        "repeated_text_answers": [],
         "rework_reasons": [],
         "steps_by_actor": {},
         "recent_actions": [],
@@ -141,6 +142,31 @@ def _():
         ]),
     )
     assert conclusion["state"] == "WORKING", conclusion
+
+
+@case("a model repeating its own final answer is spinning")
+def _():
+    # Events keep flowing while the answer is copied, so the silence signal
+    # cannot see it. One live run emitted the same summary seven times over
+    # fourteen minutes and the monitor reported WORKING throughout.
+    conclusion = Monitor("").conclude(
+        snap(model_steps=200, completion_requests=1, last_event_age_s=4),
+        inv(repeated_text_answers=[
+            {"text": "Source Verification Team 执行结果 ...", "count": 7}
+        ]),
+    )
+    assert conclusion["state"] == "SPINNING", conclusion
+    assert any("repeating the same final answer" in f["root_cause"]
+               for f in conclusion["findings"]), conclusion
+
+
+@case("a repeated answer after the verdict is terminal, not spinning")
+def _():
+    conclusion = Monitor("").conclude(
+        snap(model_steps=200, verdicts=1, last_event_age_s=4),
+        inv(repeated_text_answers=[{"text": "done", "count": 9}]),
+    )
+    assert conclusion["state"] == "TERMINAL", conclusion
 
 
 def main():

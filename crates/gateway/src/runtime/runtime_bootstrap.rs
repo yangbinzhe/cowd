@@ -420,31 +420,131 @@ pub(crate) fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition
             "Apply several Agent actions in ONE provider round. Each entry is {tool, input}, where tool is any Agent action (team_create, agent_invite, task_publish, task_claim, task_release, task_supersede, task_withdraw, task_submit, task_review, message_publish, artifact_commit, objective_update, objective_review, objective_complete_request, membership_update, team_update). Every entry is validated, authorized, committed and physically dispatched EXACTLY as if it had been its own call - the batch grants no extra permission, and each action gets its own durable identity derived from this call. Use it to publish several independent Tasks, or to advance a multi-step program, without one round per action. state_inspect is accepted but never waits here; inspect separately when you need results. Bounds: at most 25 actions per call, applied in order. Boundary: it dispatches Agent actions only, never workspace/shell/network tools; a rejected action fails the whole batch with its own reason. To mix workspace tools with these actions in the same round, emit them as separate parallel tool calls in one response; tool_orchestrate serves dependency-chain programs of workspace calls."
                 .to_string(),
         ),
-        input_schema: json!({
-            "type": "object",
-            "properties": {
-                "actions": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": 25,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "tool": { "type": "string" },
-                            "input": { "type": "object" }
-                        },
-                        "required": ["tool"]
-                    }
-                }
-            },
-            "required": ["actions"],
-            "additionalProperties": false
-        }),
+        input_schema: agent_action_batch_schema(),
         required_permission: ToolPermissionMode::ReadOnly,
         effect_resolver: runtime_effect_resolver("runtime.agent_action"),
     });
     definitions.extend(agent_action_tool_definitions());
     definitions
+}
+
+/// The batch tool's schema, with one contract line per dispatchable action.
+///
+/// The entry used to be `{tool: string, input: object}` with no per-action
+/// shape, so a model that batched had to author seventeen different inputs blind
+/// while the same actions called one-per-round each carried their own contract.
+/// One live run was refused four times inside a single batch for exactly that.
+/// The names and the required fields are derived from the same schemas the
+/// single-call tools advertise, so the two surfaces cannot drift.
+fn agent_action_batch_schema() -> serde_json::Value {
+    use harness_contract::agent_action as action;
+    let mut lines = Vec::new();
+    for (name, schema) in [
+        (
+            action::TEAM_CREATE_TOOL_ID,
+            model_object_input_schema::<action::TeamCreateInput>(),
+        ),
+        (
+            action::AGENT_INVITE_TOOL_ID,
+            model_object_input_schema::<action::AgentInviteInput>(),
+        ),
+        (
+            action::TASK_PUBLISH_TOOL_ID,
+            model_object_input_schema::<action::TaskPublishInput>(),
+        ),
+        (
+            action::TASK_CLAIM_TOOL_ID,
+            model_object_input_schema::<action::TaskClaimInput>(),
+        ),
+        (
+            action::TASK_SUBMIT_TOOL_ID,
+            model_object_input_schema::<action::TaskSubmitInput>(),
+        ),
+        (
+            action::TASK_REVIEW_TOOL_ID,
+            model_object_input_schema::<action::TaskReviewInput>(),
+        ),
+        (
+            action::MESSAGE_PUBLISH_TOOL_ID,
+            model_object_input_schema::<action::MessagePublishInput>(),
+        ),
+        (
+            action::ARTIFACT_COMMIT_TOOL_ID,
+            model_object_input_schema::<action::ArtifactCommitInput>(),
+        ),
+        (
+            action::OBJECTIVE_REVIEW_TOOL_ID,
+            model_object_input_schema::<action::ObjectiveReviewInput>(),
+        ),
+        (
+            action::OBJECTIVE_COMPLETE_REQUEST_TOOL_ID,
+            model_object_input_schema::<action::ObjectiveCompleteRequestInput>(),
+        ),
+    ] {
+        let required = schema
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        lines.push(if required.is_empty() {
+            format!("- {name}: no required fields")
+        } else {
+            format!("- {name}: requires {required}")
+        });
+    }
+    json!({
+        "type": "object",
+        "properties": {
+            "actions": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 25,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "tool": {
+                            "type": "string",
+                            "enum": [
+                                action::TEAM_CREATE_TOOL_ID,
+                                action::AGENT_INVITE_TOOL_ID,
+                                action::TASK_PUBLISH_TOOL_ID,
+                                action::TASK_CLAIM_TOOL_ID,
+                                action::TASK_RELEASE_TOOL_ID,
+                                action::TASK_SUPERSEDE_TOOL_ID,
+                                action::TASK_WITHDRAW_TOOL_ID,
+                                action::TASK_SUBMIT_TOOL_ID,
+                                action::TASK_REVIEW_TOOL_ID,
+                                action::MESSAGE_PUBLISH_TOOL_ID,
+                                action::ARTIFACT_COMMIT_TOOL_ID,
+                                action::OBJECTIVE_UPDATE_TOOL_ID,
+                                action::OBJECTIVE_REVIEW_TOOL_ID,
+                                action::OBJECTIVE_COMPLETE_REQUEST_TOOL_ID,
+                                action::MEMBERSHIP_UPDATE_TOOL_ID,
+                                action::TEAM_UPDATE_TOOL_ID,
+                            ],
+                            "description": "The Agent action to apply. Each one's input shape is listed on `input`."
+                        },
+                        "input": {
+                            "type": "object",
+                            "description": format!(
+                                "The chosen action's input. Required fields per action:\n{}",
+                                lines.join("\n")
+                            )
+                        }
+                    },
+                    "required": ["tool"]
+                }
+            }
+        },
+        "required": ["actions"],
+        "additionalProperties": false
+    })
 }
 
 fn agent_action_tool_definitions() -> Vec<RuntimeToolDefinition> {
@@ -882,6 +982,33 @@ mod tests {
         assert!(description.contains("sha256: string (required)"), "{description}");
         // The phrase that taught a model to send `{}`.
         assert!(!description.contains("No body in JSON"), "{description}");
+
+        // A batched action carries the same contract it carries on its own.
+        // The entry used to be `{tool: string, input: object}` with no per-action
+        // shape, so a model that batched authored seventeen inputs blind while
+        // the same actions one-per-round each had a contract: one live run was
+        // refused four times inside a single batch for exactly that.
+        let batch = rendered
+            .iter()
+            .find(|tool| tool.name == "agent_action_batch")
+            .expect("batch tool");
+        let entry = &batch.input_schema["properties"]["actions"]["items"];
+        let names = entry["properties"]["tool"]["enum"]
+            .as_array()
+            .expect("tool enum");
+        assert!(
+            names.len() >= 16,
+            "every dispatchable action must be named: {names:?}"
+        );
+        let input_contract = entry["properties"]["input"]["description"]
+            .as_str()
+            .expect("input contract");
+        for action in ["team_create", "task_submit", "objective_review"] {
+            assert!(
+                input_contract.contains(action),
+                "the batch contract must state {action}'s required fields: {input_contract}"
+            );
+        }
 
         // Generic: every injected tool that requires a field names it.
         for tool in &rendered {

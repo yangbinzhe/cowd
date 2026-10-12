@@ -3,6 +3,62 @@ use std::collections::BTreeSet;
 use model_protocol::fingerprint::stable_hash_bytes;
 use serde::{Deserialize, Serialize};
 
+/// Payloads smaller than this are not worth stubbing: the stub itself plus the
+/// lost locality would outweigh the savings. Error results are never stubbed.
+pub const IDENTICAL_RESULT_STUB_MIN_CHARS: usize = 512;
+
+/// Replace byte-identical duplicate tool-result payloads with a short reference
+/// stub, and return how many were stubbed.
+///
+/// A model that cannot find what it already read reads it again, and each
+/// re-read puts the whole payload back into its context. One live delegated
+/// Agent issued the same `read_file` sixteen times in a row over three and a
+/// half minutes, with a 145k-token context peak, because the thing it needed was
+/// in that context and it could not locate it. Stubbing the repeats breaks that
+/// loop without touching the durable evidence: the bytes stay keyed by
+/// `tool_call` id and `evidence_retrieve` still returns them in full.
+///
+/// This is deliberately **not** a compression of live context in general. Only a
+/// payload that is byte-identical to one already present in the same execution
+/// is replaced, so a file that genuinely changed is never stubbed.
+pub fn stub_duplicate_result_payloads(
+    messages: &mut [crate::ConversationMessage],
+) -> usize {
+    use crate::ContentBlock;
+    let mut first_seen: std::collections::HashMap<(String, String), String> =
+        std::collections::HashMap::new();
+    let mut stubbed = 0usize;
+    for message in messages.iter_mut() {
+        for block in message.blocks.iter_mut() {
+            let ContentBlock::ToolResult {
+                tool_use_id,
+                tool_name,
+                output,
+                is_error,
+            } = block
+            else {
+                continue;
+            };
+            if *is_error || output.len() < IDENTICAL_RESULT_STUB_MIN_CHARS {
+                continue;
+            }
+            let key = (tool_name.clone(), output.clone());
+            match first_seen.get(&key) {
+                Some(origin) => {
+                    *output =
+                        format!("[duplicate identical `{tool_name}` result omitted; see {origin}]");
+                    stubbed = stubbed.saturating_add(1);
+                }
+                None => {
+                    first_seen.insert(key, format!("tool_call:{tool_use_id}"));
+                }
+            }
+        }
+    }
+    stubbed
+}
+
+
 const DEFAULT_MAX_CHARS: usize = 1_200;
 const DEFAULT_MAX_LINES: usize = 24;
 const DEFAULT_MAX_LINE_CHARS: usize = 160;
@@ -307,6 +363,77 @@ fn contains_any_case_insensitive(text: &str, needles: &[&str]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_repeat_in_a_later_round_is_stubbed_against_the_whole_transcript() {
+        use super::stub_duplicate_result_payloads;
+        use crate::{ContentBlock, ConversationMessage};
+        // The caller seeds the dedup from the turn transcript, so a repeat that
+        // arrives in its OWN round is still recognised. One live delegated Agent
+        // re-read the same file sixteen times, each read in a separate batch; a
+        // per-batch map saw no repeat at all and stubbed nothing.
+        let big = "y".repeat(700);
+        let mut transcript = vec![ConversationMessage::tool_result(
+            "call-1",
+            "read_file",
+            big.clone(),
+            false,
+        )];
+        // Round two returns the identical payload under a new tool_call id.
+        transcript.extend([ConversationMessage::tool_result(
+            "call-2",
+            "read_file",
+            big.clone(),
+            false,
+        )]);
+        let stubbed = stub_duplicate_result_payloads(&mut transcript);
+        assert_eq!(stubbed, 1, "the second round's identical payload must be stubbed");
+        let second = match &transcript[1].blocks[0] {
+            ContentBlock::ToolResult { output, .. } => output.clone(),
+            _ => unreachable!(),
+        };
+        assert!(
+            second.contains("[duplicate identical `read_file` result omitted; see tool_call:call-1]"),
+            "the stub must point at the first occurrence: {second}"
+        );
+        // The first occurrence keeps its full payload: evidence is never lost.
+        let first = match &transcript[0].blocks[0] {
+            ContentBlock::ToolResult { output, .. } => output.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(first, big);
+    }
+
+    #[test]
+    fn duplicate_result_payloads_are_stubbed_except_errors_and_small_payloads() {
+        use super::stub_duplicate_result_payloads;
+        use crate::{ContentBlock, ConversationMessage};
+        let big = "x".repeat(600);
+        let small = "tiny".to_string();
+        let mut messages = vec![
+            ConversationMessage::tool_result("call-1", "read_file", big.clone(), false),
+            ConversationMessage::tool_result("call-2", "read_file", big.clone(), false),
+            ConversationMessage::tool_result("call-3", "read_file", small.clone(), false),
+            ConversationMessage::tool_result("call-4", "read_file", small.clone(), false),
+            ConversationMessage::tool_result("call-5", "read_file", big.clone(), true),
+        ];
+        let stubbed = stub_duplicate_result_payloads(&mut messages);
+        // Only the second large successful payload is a stub candidate: small
+        // payloads are left alone and error payloads are never stubbed.
+        assert_eq!(stubbed, 1);
+        let outputs = messages
+            .iter()
+            .map(|message| match message.blocks.first() {
+                Some(ContentBlock::ToolResult { output, .. }) => output.clone(),
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(outputs[0], big);
+        assert!(outputs[1].contains("duplicate identical"));
+        assert_eq!(outputs[2], small);
+        assert_eq!(outputs[3], small);
+        assert_eq!(outputs[4], big);
+    }
+
     use super::{
         SummaryCompressionBudget, SummaryCompressionCheckpoint, compress_summary,
         compress_summary_text,

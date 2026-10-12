@@ -428,6 +428,31 @@ impl GoalStore {
             if !missing.is_empty() {
                 gap.push_str(&format!("; uncovered_result_refs: {}", missing.join(", ")));
             }
+            // A satisfied review that later work invalidated must say so. Naming
+            // only "review required" showed the model the same gap string it had
+            // already answered once, so it repeated the same action: one live run
+            // satisfied the review, had a Task reworked, and then re-issued the
+            // identical request four times because nothing told it the earlier
+            // satisfaction no longer held.
+            let prior_satisfied = goal.reviews.iter().rev().find(|review| {
+                review.criterion_ref == intent && review.decision == "satisfied"
+            });
+            if let Some(prior) = prior_satisfied {
+                if !request
+                    .result_refs
+                    .iter()
+                    .all(|reference| prior.result_refs.contains(reference))
+                {
+                    gap.push_str(&format!(
+                        "; previous_satisfied_review_invalidated: it covered [{}] but the \
+                         current delivered set is [{}]; read the new results yourself in this \
+                         execution and submit one fresh objective_review covering the full \
+                         current set",
+                        prior.result_refs.join(", "),
+                        request.result_refs.join(", ")
+                    ));
+                }
+            }
             gaps.push(gap);
         }
         let stale_criteria = goal
@@ -1172,6 +1197,139 @@ mod tests {
                 .unwrap()
                 .terminal
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn a_satisfied_review_that_later_work_invalidated_says_so_in_the_gap() {
+        // Naming only "review required" showed the model the same gap string it
+        // had already answered once, so it repeated the same action: one live run
+        // satisfied the review, had a Task reworked, and then re-issued the
+        // identical completion request four times.
+        let events = Arc::new(RuntimeEventStore::for_test());
+        let goals = GoalStore::new(Arc::clone(&events));
+        let actions = crate::AgentActionService::new(Arc::clone(&events));
+        let actor = AgentActorBinding {
+            objective_id: "objective-completion".into(),
+            program_id: "program-completion".into(),
+            session_id: "session-completion".into(),
+            turn_id: "turn-completion".into(),
+            root_execution_id: Some("root-completion".into()),
+            required_team_count: 0,
+            exact_team_count: None,
+            objective_summary: "Preserve original acceptance".into(),
+            model_lease: "test".into(),
+            permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
+            resource_scopes: vec![],
+            actor_id: "root-completion-actor".into(),
+            kind: AgentActorKind::Root,
+            execution_id: None,
+            team_id: None,
+            agent_id: None,
+        };
+        actions
+            .apply(&AgentActionEnvelope {
+                action_id: "open".into(),
+                actor: actor.clone(),
+                expected_revision: None,
+                action: AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
+                    result_refs: vec!["tool://result".into()],
+                    evidence_refs: vec!["tool://evidence".into()],
+                    unresolved: vec![],
+                    blocked: false,
+                    blocked_reason: None,
+                    human_review_required: false,
+                    recommended_next_actions: vec![],
+                }),
+            })
+            .unwrap();
+        goals
+            .create(GoalContract {
+                id: "goal:root-completion".into(),
+                session_id: actor.session_id.clone(),
+                objective: actor.objective_summary.clone(),
+                criteria: vec![AcceptanceCriterion {
+                    id: "user_intent".into(),
+                    statement: actor.objective_summary.clone(),
+                    statement_ref: None,
+                    source_refs: vec!["session_message:original".into()],
+                    required_evidence: vec!["execution_graph:root-completion".into()],
+                    status: AcceptanceStatus::Open,
+                    waiver: None,
+                }],
+                constraints: vec![],
+                phase: "execution".into(),
+                evidence_refs: vec![],
+                unresolved: vec![],
+                blockers: vec![],
+                scope: GoalScope::UserObjective,
+                user_intent_criterion_id: Some("user_intent".into()),
+                source_intent_ref: Some("session_message:original".into()),
+                execution_binding: Some(GoalExecutionBinding {
+                    objective_id: actor.objective_id.clone(),
+                    session_id: actor.session_id.clone(),
+                    turn_id: actor.turn_id.clone(),
+                    root_execution_id: "root-completion".into(),
+                    agentic_program_id: actor.program_id.clone(),
+                }),
+                spec_revision: 1,
+                spec_digest: "original-spec".into(),
+                review_refs: vec![],
+                waiting: None,
+                participation_requirement: None,
+                obligations: vec![],
+                recovery: None,
+                terminal: None,
+                completion: GoalCompletion::Open,
+                revision: 1,
+                user_sequence: 1,
+                // The prior satisfaction covered a different delivered set than the
+                // one the active request now cites: later work invalidated it.
+                reviews: vec![ObjectiveReviewRecord {
+                    review_id: "prior".into(),
+                    criterion_ref: "user_intent".into(),
+                    spec_revision: 1,
+                    input_manifest_digest: "original-spec".into(),
+                    result_refs: vec!["tool://superseded".into()],
+                    evidence_refs: vec!["tool://evidence".into()],
+                    reviewer_actor: "reviewer".into(),
+                    reviewer_execution_id: None,
+                    producer_refs: vec!["agent:producer".into()],
+                    decision: "satisfied".into(),
+                    reason_ref: "artifact://prior-report".into(),
+                    verification: None,
+                }],
+            })
+            .unwrap();
+        let program = actions.project(&actor.program_id).unwrap();
+        let prepared = goals.prepare_program_conclusion(&program).unwrap();
+        assert!(prepared.goal.terminal.is_none());
+        let gap = prepared
+            .gaps
+            .iter()
+            .find(|gap| gap.starts_with("original_intent_review_required:"))
+            .expect("the intent gap");
+        assert!(
+            gap.contains("previous_satisfied_review_invalidated"),
+            "the gap must announce that the earlier satisfaction no longer holds: {gap}"
+        );
+        assert!(
+            gap.contains("tool://superseded") && gap.contains("tool://result"),
+            "it must name both the old and the current set: {gap}"
+        );
+        // A satisfaction that still covers the request is not called invalidated.
+        let (_, goals_current, actions_current, actor_current) = fixture(true);
+        let program_current = actions_current.project(&actor_current.program_id).unwrap();
+        let prepared_current = goals_current
+            .prepare_program_conclusion(&program_current)
+            .unwrap();
+        assert!(
+            prepared_current
+                .gaps
+                .iter()
+                .all(|gap| !gap.contains("previous_satisfied_review_invalidated")),
+            "a still-current satisfaction is not invalidated: {:?}",
+            prepared_current.gaps
         );
     }
 

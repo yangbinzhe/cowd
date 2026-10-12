@@ -50,6 +50,22 @@ const DSML_INVOKE_OPEN: &str = "<｜｜DSML｜｜invoke ";
 const DSML_INVOKE_CLOSE: &str = "</｜｜DSML｜｜invoke>";
 const DSML_PARAMETER_OPEN: &str = "<｜｜DSML｜｜parameter ";
 const DSML_PARAMETER_CLOSE: &str = "</｜｜DSML｜｜parameter>";
+// The XML tool-call dialect most instruction-tuned models reach for by
+// default. A model emitting it has already made the semantic decision, so
+// the frame is executed instead of demoted to prose. The structural gate in
+// `parse_legacy_tool_calls` keeps ordinary XML-shaped text out of the command
+// channel: only a frame that opens with the marker, closes with it and parses
+// every interior unit is admitted.
+const LEGACY_TOOL_CALLS_OPEN: &str = "<tool_call>";
+const LEGACY_TOOL_CALLS_CLOSE: &str = "</tool_call>";
+const LEGACY_FUNCTION_OPEN: &str = "<function=";
+const LEGACY_FUNCTION_CLOSE: &str = "</function>";
+const LEGACY_PARAMETER_OPEN: &str = "<parameter";
+const LEGACY_PARAMETER_CLOSE: &str = "</parameter>";
+const LEGACY_TOOL_NAME_OPEN: &str = "<tool_name>";
+const LEGACY_TOOL_NAME_CLOSE: &str = "</tool_name>";
+/// Every opening marker a compatibility frame may start with.
+const COMPAT_TOOL_OPEN_MARKERS: [&str; 2] = [DSML_TOOL_CALLS_OPEN, LEGACY_TOOL_CALLS_OPEN];
 const COMPAT_TOOL_FRAME_MAX_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2664,8 +2680,170 @@ fn parse_compat_tool_calls(
     let trimmed = text.trim();
     if trimmed.starts_with(DSML_TOOL_CALLS_OPEN) {
         parse_dsml_tool_calls(trimmed, exposed_tool_names)
+    } else if trimmed.starts_with(LEGACY_TOOL_CALLS_OPEN) {
+        parse_legacy_tool_calls(trimmed, exposed_tool_names)
     } else {
         Err(CompatToolFrameError::UnrecognizedMarker)
+    }
+}
+
+/// Attribute source of a legacy parameter tag. Two shapes occur in the
+/// wild: the bare form that names the key after the tag name, and the
+/// typed form that declares the key and whether the value is a string.
+fn parse_legacy_parameter_attributes(source: &str) -> Result<(String, bool), CompatToolFrameError> {
+    let source = source.trim();
+    if let Some(rest) = source.strip_prefix('=') {
+        let name = rest.trim();
+        if name.is_empty() || name.contains('"') || name.contains('=') || name.contains('<') {
+            return Err(CompatToolFrameError::InvalidAttributes);
+        }
+        return Ok((name.to_string(), false));
+    }
+    let attributes = parse_dsml_attributes(source)?;
+    let name = attributes
+        .get("name")
+        .ok_or(CompatToolFrameError::InvalidAttributes)?
+        .clone();
+    let is_string = match attributes.get("string").map(String::as_str) {
+        Some("true") => true,
+        Some("false") | None => false,
+        _ => return Err(CompatToolFrameError::InvalidAttributes),
+    };
+    Ok((name, is_string))
+}
+
+/// One legacy parameter value. A declared string stays literal; otherwise
+/// a value that opens an object or array is decoded as JSON so a batch of
+/// actions survives the frame, and anything else stays a plain string.
+fn decode_legacy_parameter_value(raw: &str, is_string: bool) -> serde_json::Value {
+    if is_string {
+        return serde_json::Value::String(raw.to_string());
+    }
+    let trimmed = raw.trim();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        if let Ok(value) = serde_json::from_str(trimmed) {
+            return value;
+        }
+    }
+    serde_json::Value::String(raw.to_string())
+}
+
+/// The single JSON object body some models emit inside the legacy envelope.
+/// Returns None when the body is not one object so the caller can fall
+/// through to the element form.
+fn legacy_json_body_call(body: &str) -> Option<DsmlToolCall> {
+    let value: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+    let object = value.as_object()?;
+    let name = object
+        .get("name")
+        .or_else(|| object.get("tool"))
+        .and_then(serde_json::Value::as_str)?
+        .to_string();
+    let input = object
+        .get("arguments")
+        .or_else(|| object.get("input"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    Some(DsmlToolCall {
+        id: "legacy-tool-0".to_string(),
+        name,
+        input,
+    })
+}
+
+/// Parse the legacy XML tool-call dialect.
+///
+/// A model that emits this shape has already decided what to do, so the
+/// frame is executed instead of demoted to prose. One live run lost its
+/// whole Objective review this way: the root emitted a correct batch that
+/// invited an Objective reviewer and published the review Task, the frame
+/// went unrecognised, and the run ended unresolved after burning 56M tokens.
+///
+/// The gate is structural completeness, not a substring search. The frame
+/// must open with the marker, close with it, and parse every interior unit,
+/// so prose that merely mentions the marker is never executed.
+fn parse_legacy_tool_calls(
+    text: &str,
+    _exposed_tool_names: &BTreeSet<String>,
+) -> Result<Vec<DsmlToolCall>, CompatToolFrameError> {
+    let body = text
+        .trim()
+        .strip_prefix(LEGACY_TOOL_CALLS_OPEN)
+        .ok_or(CompatToolFrameError::UnrecognizedMarker)?
+        .strip_suffix(LEGACY_TOOL_CALLS_CLOSE)
+        .ok_or(CompatToolFrameError::Unterminated)?;
+    let trimmed_body = body.trim();
+    if trimmed_body.starts_with('{') {
+        return legacy_json_body_call(trimmed_body)
+            .map(|call| vec![call])
+            .ok_or(CompatToolFrameError::InvalidArguments);
+    }
+    let mut remaining = trimmed_body;
+    let mut calls: Vec<DsmlToolCall> = Vec::new();
+    while !remaining.is_empty() {
+        if let Some(after_open) = remaining.strip_prefix(LEGACY_FUNCTION_OPEN) {
+            let tag_end = after_open
+                .find('>')
+                .ok_or(CompatToolFrameError::Unterminated)?;
+            let name = after_open[..tag_end].trim().to_string();
+            if name.is_empty() || name.contains('<') {
+                return Err(CompatToolFrameError::InvalidAttributes);
+            }
+            let after_tag = &after_open[tag_end + 1..];
+            let (parameters, after_close) = after_tag
+                .split_once(LEGACY_FUNCTION_CLOSE)
+                .ok_or(CompatToolFrameError::Unterminated)?;
+            let mut parameter_source = parameters.trim();
+            let mut input = serde_json::Map::new();
+            while !parameter_source.is_empty() {
+                let after_parameter_open = parameter_source
+                    .strip_prefix(LEGACY_PARAMETER_OPEN)
+                    .ok_or(CompatToolFrameError::UnsupportedShape)?;
+                let parameter_tag_end = after_parameter_open
+                    .find('>')
+                    .ok_or(CompatToolFrameError::Unterminated)?;
+                let (parameter_name, is_string) =
+                    parse_legacy_parameter_attributes(&after_parameter_open[..parameter_tag_end])?;
+                let parameter_after_tag = &after_parameter_open[parameter_tag_end + 1..];
+                let (value, after_parameter_close) = parameter_after_tag
+                    .split_once(LEGACY_PARAMETER_CLOSE)
+                    .ok_or(CompatToolFrameError::Unterminated)?;
+                if input
+                    .insert(parameter_name, decode_legacy_parameter_value(value, is_string))
+                    .is_some()
+                {
+                    return Err(CompatToolFrameError::DuplicateParameter);
+                }
+                parameter_source = after_parameter_close.trim();
+            }
+            calls.push(DsmlToolCall {
+                id: format!("legacy-tool-{}", calls.len()),
+                name,
+                input: serde_json::Value::Object(input),
+            });
+            remaining = after_close.trim();
+        } else if let Some(after_open) = remaining.strip_prefix(LEGACY_TOOL_NAME_OPEN) {
+            let (name, after_close) = after_open
+                .split_once(LEGACY_TOOL_NAME_CLOSE)
+                .ok_or(CompatToolFrameError::Unterminated)?;
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                return Err(CompatToolFrameError::InvalidAttributes);
+            }
+            calls.push(DsmlToolCall {
+                id: format!("legacy-tool-{}", calls.len()),
+                name,
+                input: serde_json::Value::Object(serde_json::Map::new()),
+            });
+            remaining = after_close.trim();
+        } else {
+            return Err(CompatToolFrameError::UnsupportedShape);
+        }
+    }
+    if calls.is_empty() {
+        Err(CompatToolFrameError::EmptyCalls)
+    } else {
+        Ok(calls)
     }
 }
 
@@ -2697,18 +2875,28 @@ fn parse_dsml_attributes(source: &str) -> Result<BTreeMap<String, String>, Compa
 }
 
 fn first_compat_tool_marker(text: &str) -> Option<usize> {
-    text.find(DSML_TOOL_CALLS_OPEN)
+    COMPAT_TOOL_OPEN_MARKERS
+        .iter()
+        .filter_map(|marker| text.find(marker))
+        .min()
 }
 
 fn longest_compat_tool_prefix_suffix(text: &str) -> String {
-    let max_marker_prefix = DSML_TOOL_CALLS_OPEN.len().saturating_sub(1);
+    let max_marker_prefix = COMPAT_TOOL_OPEN_MARKERS
+        .iter()
+        .map(|marker| marker.len().saturating_sub(1))
+        .max()
+        .unwrap_or(0);
     let max_len = text.len().min(max_marker_prefix);
     for length in (1..=max_len).rev() {
         if !text.is_char_boundary(text.len() - length) {
             continue;
         }
         let suffix = &text[text.len() - length..];
-        if DSML_TOOL_CALLS_OPEN.starts_with(suffix) {
+        if COMPAT_TOOL_OPEN_MARKERS
+            .iter()
+            .any(|marker| marker.starts_with(suffix))
+        {
             return suffix.to_string();
         }
     }
@@ -4202,7 +4390,7 @@ mod tests {
     }
 
     #[test]
-    fn unverified_xml_tool_shape_remains_ordinary_text() {
+    fn legacy_xml_tool_shape_becomes_tool_use() {
         use super::{ChatCompletionChunk, ChunkChoice, ChunkDelta, StreamState};
         use crate::types::{ContentBlockDelta, StreamEvent};
 
@@ -4228,13 +4416,41 @@ mod tests {
                 usage: None,
             })
             .expect("stream chunk");
-        assert!(initial.iter().any(|event| matches!(
+        assert!(
+            !initial.iter().any(|event| matches!(
+                event,
+                StreamEvent::ContentBlockDelta(delta)
+                    if matches!(&delta.delta, ContentBlockDelta::TextDelta { text }
+                        if text.contains("tool_call"))
+            )),
+            "a complete legacy frame must not leak into visible text"
+        );
+        use crate::types::OutputContentBlock;
+        let finished = state.finish().expect("a complete legacy frame parses");
+        let mut names = Vec::new();
+        let mut streamed = String::new();
+        for event in &finished {
+            match event {
+                StreamEvent::ContentBlockStart(start) => {
+                    if let OutputContentBlock::ToolUse { name, .. } = &start.content_block {
+                        names.push(name.clone());
+                    }
+                }
+                StreamEvent::ContentBlockDelta(delta) => {
+                    if let ContentBlockDelta::InputJsonDelta { partial_json } = &delta.delta {
+                        streamed.push_str(partial_json);
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(names, vec!["read_file".to_string()]);
+        let input: serde_json::Value = serde_json::from_str(&streamed).expect("streamed input");
+        assert_eq!(input["path"], "crates/runtime/src/lib.rs");
+        assert!(finished.iter().any(|event| matches!(
             event,
-            StreamEvent::ContentBlockDelta(delta)
-                if matches!(&delta.delta, ContentBlockDelta::TextDelta { text }
-                    if text.contains("<tool_call>"))
+            StreamEvent::MessageDelta(delta) if delta.delta.stop_reason.as_deref() == Some("tool_use")
         )));
-        state.finish().expect("unverified XML remains text");
     }
 
     #[test]
@@ -4278,10 +4494,69 @@ mod tests {
         for unverified in [
             "```json\n{\"tool\":\"tool_search\",\"arguments\":{}}\n```",
             "```tool_use\ntool_search\n{}\n```",
-            "<tool_call><tool_name>workspace_snapshot</tool_name></tool_call>",
+            "the model mentioned <tool_name>workspace_snapshot</tool_name> inside a sentence",
         ] {
             assert!(parse_compat_tool_calls(unverified, &exposed).is_err());
         }
+    }
+
+    #[test]
+    fn legacy_parser_reads_bare_typed_batch_and_json_bodies() {
+        let exposed = std::collections::BTreeSet::from([
+            "agent_action_batch".to_string(),
+            "read_file".to_string(),
+            "tool_search".to_string(),
+            "workspace_snapshot".to_string(),
+        ]);
+        let batch = parse_compat_tool_calls(
+            "<tool_call><function=agent_action_batch><parameter=actions>[{\"tool\":\"agent_invite\",\"input\":{\"team_ref\":\"team:a\"}}]</parameter></function></tool_call>",
+            &exposed,
+        )
+        .expect("batch frame");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].name, "agent_action_batch");
+        assert_eq!(batch[0].input["actions"][0]["tool"], "agent_invite");
+        assert_eq!(batch[0].input["actions"][0]["input"]["team_ref"], "team:a");
+
+        let bare = parse_compat_tool_calls("<tool_call><function=read_file><parameter=path>crates/runtime/src/lib.rs</parameter></function></tool_call>", &exposed).expect("bare frame");
+        assert_eq!(bare[0].input["path"], "crates/runtime/src/lib.rs");
+
+        let typed = parse_compat_tool_calls("<tool_call><function=read_file><parameter name=\"path\" string=\"true\">crates/runtime/src/lib.rs</parameter><parameter name=\"complete\" string=\"true\">true</parameter></function></tool_call>", &exposed).expect("typed frame");
+        assert_eq!(typed[0].input["path"], "crates/runtime/src/lib.rs");
+        assert_eq!(typed[0].input["complete"], "true");
+
+        let named = parse_compat_tool_calls("<tool_call><tool_name>workspace_snapshot</tool_name></tool_call>", &exposed).expect("tool_name frame");
+        assert_eq!(named[0].name, "workspace_snapshot");
+        assert_eq!(named[0].input, serde_json::json!({}));
+
+        let json_body = parse_compat_tool_calls("<tool_call>{\"name\":\"tool_search\",\"arguments\":{\"query\":\"read_file\"}}</tool_call>", &exposed).expect("json body");
+        assert_eq!(json_body[0].name, "tool_search");
+        assert_eq!(json_body[0].input["query"], "read_file");
+    }
+
+    #[test]
+    fn legacy_parser_rejects_an_incomplete_frame_instead_of_degrading_to_text() {
+        let exposed = std::collections::BTreeSet::from(["read_file".to_string()]);
+        for malformed in [
+            "<tool_call><function=read_file><parameter=path>a.rs</parameter></function>",
+            "<tool_call><function=read_file></function>",
+            "<tool_call>prose that never closes",
+            "<tool_call><function=></function></tool_call>",
+            "<tool_call><function=read_file><parameter=path>a</parameter><parameter=path>b</parameter></function></tool_call>",
+            "<function=read_file></function></tool_call>",
+        ] {
+            assert!(
+                parse_compat_tool_calls(malformed, &exposed).is_err(),
+                "an incomplete frame must fail loudly rather than degrade to text"
+            );
+        }
+    }
+
+    #[test]
+    fn prose_that_mentions_the_marker_is_not_a_tool_call() {
+        let exposed = std::collections::BTreeSet::from(["read_file".to_string()]);
+        let prose = "I would write <tool_call> here if I had to.";
+        assert!(parse_compat_tool_calls(prose, &exposed).is_err());
     }
 
     #[test]

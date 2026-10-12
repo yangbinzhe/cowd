@@ -24,6 +24,11 @@ const MAX_REF_DEPTH: usize = 5;
 /// only honest guidance is where the value comes from - never a made-up format.
 const REF_SUFFIX: &str = "_ref";
 
+/// Longest description fragment carried into one contract line. Long enough for
+/// the operative sentence, short enough that a wide struct cannot flood the
+/// prompt. A truncation is always announced.
+const DESCRIPTION_MAX_CHARS: usize = 200;
+
 const REF_HINT: &str = "canonical Runtime ref; the receipt that returned the object \
                          carries the exact value; verify one with `read_ref`";
 
@@ -197,7 +202,42 @@ fn field_line(
     } else {
         line.push_str(" (optional)");
     }
+    // The schema's own description is the only place that says what the field
+    // MEANS, and therefore what the model has to do to obtain a legal value.
+    // Dropping it left the model with types and constraints alone: one live run
+    // omitted a required `reason_ref` twice because its description ("a durable
+    // reference to the review body itself") never reached it, and another
+    // published a sha256 that was the digest of the empty string although the
+    // description said it must come from a real read. schemars carries the
+    // struct's doc comments here, so this is already-written guidance, not new
+    // prompt text.
+    if let Some(summary) = description_summary(resolved.get("description")) {
+        line.push_str(" — ");
+        line.push_str(&summary);
+    }
     line
+}
+
+/// A field description reduced to what fits one line.
+///
+/// The first sentence carries the operative statement in almost every doc
+/// comment. Everything after the cap is dropped, and the drop is announced with
+/// an ellipsis so a silent truncation is never mistaken for the whole rule.
+fn description_summary(description: Option<&Value>) -> Option<String> {
+    let raw = description.and_then(Value::as_str)?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let flattened = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let first_sentence = match flattened.find(". ") {
+        Some(index) if index + 2 <= DESCRIPTION_MAX_CHARS => &flattened[..index + 1],
+        _ => &flattened[..flattened.len().min(DESCRIPTION_MAX_CHARS)],
+    };
+    let mut summary = first_sentence.to_string();
+    if summary.len() < flattened.len() {
+        summary.push('…');
+    }
+    Some(summary)
 }
 
 /// A field's shape in the fewest words. A schema omits `type` exactly when the
@@ -236,6 +276,15 @@ fn states_a_legal_input(schema: &Value) -> bool {
     ]
     .iter()
     .any(|key| schema.get(key).is_some())
+        // A description is a statement of what the field is for, which is the
+        // only guidance an optional field may carry. Requiring a numeric
+        // constraint here silently dropped every such field from the contract:
+        // `objective_complete_request` has seven fields and rendered zero
+        // characters, so the model was told nothing about its input at all.
+        || schema
+            .get("description")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty())
 }
 
 fn required_of(obj: &Map<String, Value>) -> Vec<&str> {
@@ -306,6 +355,80 @@ pub fn admissible_field_names(schema: &Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_contract_carries_what_each_field_means() {
+        // The summary used to render types and constraints only, dropping the
+        // schema's own descriptions. One live run omitted a required `reason_ref`
+        // twice because its description ("a durable reference to the review body
+        // itself") never reached the model, and another published a sha256 that
+        // was the digest of the empty string although the description said it
+        // must come from a real read.
+        let schema = serde_json::to_value(schemars::schema_for!(
+            crate::agent_action::ObjectiveReviewInput
+        ))
+        .expect("schema");
+        let summary = input_contract_summary(&schema).expect("summary");
+        assert!(
+            summary.contains("review body itself"),
+            "reason_ref's meaning must reach the model: {summary}"
+        );
+        assert!(
+            summary.contains("returned by state_inspect"),
+            "criterion_ref's origin must reach the model: {summary}"
+        );
+        assert!(
+            summary.contains("result_refs: array (optional)"),
+            "an optional field with a description must appear: {summary}"
+        );
+        assert!(
+            summary.contains("evidence_refs: array (optional)"),
+            "evidence_refs must appear: {summary}"
+        );
+    }
+
+    #[test]
+    fn a_tool_with_no_constraints_still_gets_a_contract() {
+        // `objective_complete_request` has seven fields and used to render zero
+        // characters, so the model was told nothing about its input.
+        let schema = serde_json::to_value(schemars::schema_for!(
+            crate::agent_action::ObjectiveCompleteRequestInput
+        ))
+        .expect("schema");
+        let summary = input_contract_summary(&schema).expect("summary");
+        assert!(
+            !summary.trim().is_empty(),
+            "a tool whose fields carry only descriptions must still have a contract"
+        );
+        assert!(
+            summary.contains("result_refs"),
+            "its fields must be named: {summary}"
+        );
+    }
+
+    #[test]
+    fn a_long_description_is_truncated_with_an_announced_ellipsis() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "body": {
+                    "type": "string",
+                    "description": "x".repeat(600).as_str()
+                }
+            },
+            "required": ["body"]
+        });
+        let summary = input_contract_summary(&schema).expect("summary");
+        assert!(
+            summary.contains('…'),
+            "a truncation must be announced, never silent: {summary}"
+        );
+        assert!(
+            summary.len() < 600,
+            "the cap must bound the line: {} chars",
+            summary.len()
+        );
+    }
     use super::*;
     use serde_json::json;
 

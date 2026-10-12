@@ -164,6 +164,31 @@ impl ExecutionCommitService {
     /// The stream name is a durable parent graph/node/attempt key, so restart
     /// never scans unrelated effect streams or reconstructs facts from the
     /// live filesystem.
+    /// Every delegated Agent tool receipt for one physical node, across all of
+    /// its attempts.
+    ///
+    /// Attempts are sequential from 1, so the union is bounded by the node's own
+    /// history. The per-attempt loader stays the authority for anything that
+    /// needs attempt-exact facts; this one exists because a read is a fact about
+    /// the Agent, not about one dispatch of it. One live reviewer was settled
+    /// twice for "not having read" artifacts it had read in an earlier attempt of
+    /// the same node, and each settlement forced a fresh attempt that started
+    /// from zero reads.
+    pub fn load_delegated_agent_tool_receipts_all_attempts(
+        &self,
+        graph_id: &str,
+        node_id: &str,
+        max_attempt: u32,
+    ) -> Result<Vec<DurableAgentToolReceipt>, ExecutionCommitError> {
+        let mut merged = Vec::new();
+        for attempt in 1..=max_attempt.max(1) {
+            let mut receipts =
+                self.load_delegated_agent_tool_receipts(graph_id, node_id, attempt)?;
+            merged.append(&mut receipts);
+        }
+        Ok(merged)
+    }
+
     pub fn load_delegated_agent_tool_receipts(
         &self,
         graph_id: &str,

@@ -124,6 +124,98 @@ pub(crate) fn completion_gap(projection: &AgenticProgramProjection) -> Option<St
     None
 }
 
+/// The single classifier every layer must use to decide what a completion gap
+/// asks for.
+///
+/// It used to be re-derived by string matching at each call site: the closure
+/// view looked for `original_intent_review_required`/`criterion_review_required`
+/// and otherwise assumed an issue-classification gap, while the presentation
+/// layer made its own substring choice. Run one19 proved the cost of that
+/// duplication - one `issue_requires_classification` gap was rendered as
+/// `objective_review` by the closure view and as `message_publish` by the
+/// completion-gap guidance, in the same context envelope, so the model was told
+/// to do two different things and did neither. One function, one answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompletionGapKind {
+    /// A Task-recorded issue still carries no disposition.
+    IssueRequiresClassification,
+    /// A Task-recorded issue is classified `must_resolve` and still blocks.
+    IssueMustResolve,
+    /// The Goal verifier wants an Objective review before it can certify.
+    ObjectiveReview,
+    /// Anything else: still an Objective review, because that is the action that
+    /// produces the verdict the Goal gate reads.
+    Unknown,
+}
+
+impl CompletionGapKind {
+    /// The rung name the closure view advertises for this gap. A gap whose rung
+    /// names an action that cannot close it is worse than no rung at all.
+    pub(crate) fn closure_step(self) -> &'static str {
+        match self {
+            CompletionGapKind::IssueRequiresClassification => "classify_issues",
+            CompletionGapKind::IssueMustResolve => "resolve_issue",
+            CompletionGapKind::ObjectiveReview | CompletionGapKind::Unknown => "objective_review",
+        }
+    }
+
+    /// The tool that closes this gap, named for the tool allowlist the
+    /// escalation path forces once prose answers stop making progress.
+    pub(crate) fn closing_tool(self) -> &'static str {
+        match self {
+            CompletionGapKind::IssueRequiresClassification
+            | CompletionGapKind::IssueMustResolve => "message_publish",
+            CompletionGapKind::ObjectiveReview | CompletionGapKind::Unknown => "objective_review",
+        }
+    }
+
+    pub(crate) fn is_issue_gap(self) -> bool {
+        matches!(
+            self,
+            CompletionGapKind::IssueRequiresClassification | CompletionGapKind::IssueMustResolve
+        )
+    }
+}
+
+/// Classify a gap string once, for every layer that has to act on it.
+pub(crate) fn completion_gap_kind(gap: &str) -> CompletionGapKind {
+    if gap.starts_with("issue_requires_classification") {
+        CompletionGapKind::IssueRequiresClassification
+    } else if gap.starts_with("issue_must_resolve") {
+        CompletionGapKind::IssueMustResolve
+    } else if gap.starts_with("original_intent_review_required")
+        || gap.starts_with("criterion_review_required")
+    {
+        CompletionGapKind::ObjectiveReview
+    } else {
+        CompletionGapKind::Unknown
+    }
+}
+
+/// Every Task-recorded issue that still blocks completion, with the reason it
+/// blocks. This is the one source for "are there unclassified issues", and it
+/// reads the same per-Task descriptions `completion_gap` reads - never
+/// `AgenticProgramProjection::unresolved`, which is derived from Goal-level
+/// gaps and disagrees with it. Run one19 carried both at once: `satisfied`
+/// claimed `classify_issues` was done while the same object reported
+/// `completion_gap: issue_requires_classification`.
+pub(crate) fn open_issue_blockers(
+    projection: &AgenticProgramProjection,
+) -> Vec<(String, CompletionGapKind)> {
+    issues(projection)
+        .into_iter()
+        .filter_map(|issue| {
+            let kind = match issue.disposition.as_ref().map(|item| item.disposition) {
+                None => CompletionGapKind::IssueRequiresClassification,
+                Some(IssueDispositionKind::MustResolve) => CompletionGapKind::IssueMustResolve,
+                Some(IssueDispositionKind::Disclose | IssueDispositionKind::Resolved) => return None,
+            };
+            Some((issue.issue_ref, kind))
+        })
+        .collect()
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,5 +378,127 @@ mod tests {
             evidence_refs: vec!["task:1".into()],
         }]);
         assert!(validate_dispositions(&projection, &root_envelope(), &input).is_some());
+    }
+
+    /// The one19 counterfactual, asserted directly. `AgenticProgramProjection::
+    /// unresolved` is Goal-derived and was empty, while a Task carried two
+    /// unclassified issue descriptions. The closure view used to read the Goal
+    /// field, so it advertised `classify_issues` as satisfied while the same
+    /// object reported `completion_gap: issue_requires_classification`. One
+    /// source has to answer both, and it is the Task-recorded one.
+    #[test]
+    fn open_issue_blockers_reads_the_task_recorded_issues_not_the_goal_field() {
+        let (mut projection, _) = projection_with_issue();
+        // Goal-level gaps: empty. This is exactly the one19 state.
+        projection.unresolved = Vec::new();
+
+        let blockers = open_issue_blockers(&projection);
+        assert_eq!(blockers.len(), 1);
+        assert_eq!(blockers[0].1, CompletionGapKind::IssueRequiresClassification);
+        assert_eq!(
+            completion_gap(&projection).as_deref(),
+            Some(format!("issue_requires_classification:{}", blockers[0].0).as_str())
+        );
+    }
+
+    #[test]
+    fn a_disclosed_or_resolved_issue_is_not_a_blocker() {
+        let (projection, issue_ref) = projection_with_issue();
+        let mut projection = projection;
+        projection.topics.insert(
+            "topic".to_string(),
+            vec![crate::agentic::program::AgenticTopicEntryProjection {
+                entry_id: "entry".into(),
+                revision: 1,
+                actor_id: "root".into(),
+                source_execution_id: None,
+                intent_generation: None,
+                coordination: None,
+                summary: None,
+                content_ref: None,
+                refs: Vec::new(),
+                recipients: Vec::new(),
+                intent: None,
+                issue_dispositions: vec![IssueDisposition {
+                    issue_ref,
+                    disposition: IssueDispositionKind::Disclose,
+                    reason_ref: "tool://receipt".into(),
+                    evidence_refs: vec!["task:1".into()],
+                }],
+            }],
+        );
+        assert!(open_issue_blockers(&projection).is_empty());
+        assert!(completion_gap(&projection).is_none());
+    }
+
+    #[test]
+    fn a_must_resolve_issue_still_blocks_and_names_its_own_step() {
+        let (projection, issue_ref) = projection_with_issue();
+        let mut projection = projection;
+        projection.topics.insert(
+            "topic".to_string(),
+            vec![crate::agentic::program::AgenticTopicEntryProjection {
+                entry_id: "entry".into(),
+                revision: 1,
+                actor_id: "root".into(),
+                source_execution_id: None,
+                intent_generation: None,
+                coordination: None,
+                summary: None,
+                content_ref: None,
+                refs: Vec::new(),
+                recipients: Vec::new(),
+                intent: None,
+                issue_dispositions: vec![IssueDisposition {
+                    issue_ref,
+                    disposition: IssueDispositionKind::MustResolve,
+                    reason_ref: "tool://receipt".into(),
+                    evidence_refs: vec!["task:1".into()],
+                }],
+            }],
+        );
+        let blockers = open_issue_blockers(&projection);
+        assert_eq!(blockers.len(), 1);
+        assert_eq!(blockers[0].1, CompletionGapKind::IssueMustResolve);
+        assert_eq!(blockers[0].1.closure_step(), "resolve_issue");
+        assert_eq!(blockers[0].1.closing_tool(), "message_publish");
+    }
+
+    #[test]
+    fn every_gap_kind_names_the_step_and_tool_that_actually_close_it() {
+        // A gap whose rung names an action that cannot close it is worse than no
+        // rung: one19 was told to run `objective_review` and `message_publish`
+        // for the same `issue_requires_classification` gap.
+        for (gap, step, tool) in [
+            (
+                "issue_requires_classification:issue:abc",
+                "classify_issues",
+                "message_publish",
+            ),
+            ("issue_must_resolve:issue:abc", "resolve_issue", "message_publish"),
+            (
+                "criterion_review_required:user_intent",
+                "objective_review",
+                "objective_review",
+            ),
+            (
+                "original_intent_review_required:user_intent",
+                "objective_review",
+                "objective_review",
+            ),
+            ("some_unknown_gap", "objective_review", "objective_review"),
+        ] {
+            let kind = completion_gap_kind(gap);
+            assert_eq!(kind.closure_step(), step, "step for {gap}");
+            assert_eq!(kind.closing_tool(), tool, "tool for {gap}");
+        }
+    }
+
+    #[test]
+    fn an_issue_gap_is_distinguished_from_an_objective_review_gap() {
+        assert!(completion_gap_kind("issue_requires_classification:x").is_issue_gap());
+        assert!(completion_gap_kind("issue_must_resolve:x").is_issue_gap());
+        assert!(!completion_gap_kind("criterion_review_required:user_intent").is_issue_gap());
+        assert!(!completion_gap_kind("anything_else").is_issue_gap());
     }
 }

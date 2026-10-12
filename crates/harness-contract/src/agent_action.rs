@@ -446,7 +446,24 @@ pub struct ObjectiveReviewInput {
     pub evidence_refs: Vec<String>,
     /// A durable reference to the review body itself, such as an
     /// `artifact://` selector for the report this reviewer wrote.
+    ///
+    /// Optional. Runtime derives one from this review's own durable Goal record
+    /// when the model does not supply it, because requiring it forced a
+    /// multi-step workflow (write a report, commit it, cite it) that a reviewer
+    /// could not complete: one live run was refused for the missing field three
+    /// times and then failed to publish the report it was told to write. The
+    /// field carries no verification weight - the verdict, `reason`,
+    /// `result_refs` and `evidence_refs` are what the gate reads.
+    #[serde(default)]
     pub reason_ref: String,
+    /// What is missing, in prose. Required for a `gap` or `blocked` verdict:
+    /// a negative verdict that states nothing blocks completion without telling
+    /// the root model what to do next. The field did not exist before, so a
+    /// reviewer that wanted to explain itself had nowhere to put it - one live
+    /// run returned `gap` with an empty reason and a bare `reason_ref`, and the
+    /// Objective stayed open with nothing actionable recorded.
+    #[serde(default)]
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -787,12 +804,25 @@ impl AgentAction {
             }
             Self::ObjectiveReview(input) => {
                 required("criterion_ref", &input.criterion_ref)?;
-                required("reason_ref", &input.reason_ref)?;
                 unique_nonempty("result_refs", &input.result_refs)?;
                 unique_nonempty("evidence_refs", &input.evidence_refs)?;
                 if input.result_refs.is_empty() && input.evidence_refs.is_empty() {
                     return Err(AgentActionValidationError::Rejected(
                         OBJECTIVE_REVIEW_SUPPORT_RULE,
+                    ));
+                }
+                if matches!(
+                    input.decision,
+                    ObjectiveReviewDecision::Gap | ObjectiveReviewDecision::Blocked
+                ) && input
+                    .reason
+                    .trim()
+                    .chars()
+                    .count()
+                    < MIN_NEGATIVE_OBJECTIVE_REVIEW_REASON_CHARS
+                {
+                    return Err(AgentActionValidationError::Rejected(
+                        OBJECTIVE_REVIEW_REASON_RULE,
                     ));
                 }
             }
@@ -927,6 +957,13 @@ pub const TASK_SUBMIT_RESULT_RULE: &str = "a Task result is either `artifact_ref
 /// needs, and neither set is expressible as a plain required field.
 pub const OBJECTIVE_ADD_RULE: &str =
     "operation `add` requires `statement_ref` plus at least one `source_refs` entry";
+/// A negative Objective review must say what is missing.
+pub const OBJECTIVE_REVIEW_REASON_RULE: &str = "a `gap` or `blocked` objective_review must state what is missing in `reason` (at least 20 characters); a `reason_ref` alone leaves the root model with no action to take";
+
+/// Shortest prose a negative Objective review may carry. Long enough to name a
+/// missing deliverable, short enough not to become an essay requirement.
+pub const MIN_NEGATIVE_OBJECTIVE_REVIEW_REASON_CHARS: usize = 20;
+
 pub const OBJECTIVE_EVOLVE_RULE: &str = "operations `replace` and `retire` require `criterion_ref`, at least one `source_refs` entry, and `reason_ref`";
 
 /// A completion request is the durable statement that the Program is done, so it
@@ -989,6 +1026,92 @@ fn unique_nonempty(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn objective_review(decision: ObjectiveReviewDecision, reason: &str) -> AgentAction {
+        AgentAction::ObjectiveReview(ObjectiveReviewInput {
+            criterion_ref: "user_intent".to_string(),
+            decision,
+            result_refs: vec!["artifact:a".to_string()],
+            evidence_refs: vec!["tool://receipt".to_string()],
+            reason_ref: "artifact://report".to_string(),
+            reason: reason.to_string(),
+        })
+    }
+
+    #[test]
+    fn an_objective_review_needs_no_separate_report_reference() {
+        // Requiring `reason_ref` forced a multi-step workflow (write a report,
+        // commit it, cite it) that a reviewer could not complete: one live run
+        // was refused for the missing field three times and then failed to
+        // publish the report it was told to write. The field carries no
+        // verification weight - Runtime derives one from the review's own Goal
+        // record - so the verdict, reason, result_refs and evidence_refs are
+        // what the model must supply.
+        let review = AgentAction::ObjectiveReview(ObjectiveReviewInput {
+            criterion_ref: "user_intent".to_string(),
+            decision: ObjectiveReviewDecision::Satisfied,
+            result_refs: vec!["artifact:a".to_string()],
+            evidence_refs: vec!["tool://receipt".to_string()],
+            reason_ref: String::new(),
+            reason: String::new(),
+        });
+        assert!(
+            review.validate().is_ok(),
+            "a satisfied review without a report reference must be accepted: {:?}",
+            review.validate()
+        );
+        // A supplied reference is still honoured.
+        let AgentAction::ObjectiveReview(mut base) = review else {
+            unreachable!("constructed above")
+        };
+        base.reason_ref = "artifact://my-report".to_string();
+        let with_ref = AgentAction::ObjectiveReview(base);
+        assert!(with_ref.validate().is_ok());
+    }
+
+    #[test]
+    fn a_negative_objective_review_must_state_what_is_missing() {
+        // A `gap` that states nothing blocks completion without telling the root
+        // model what to do. One live run returned `gap` with an empty reason and
+        // a bare `reason_ref`; the Objective stayed open and nothing downstream
+        // could act on it. The field did not exist before, so the reviewer had
+        // nowhere to say it in prose.
+        let bare = objective_review(ObjectiveReviewDecision::Gap, "");
+        assert!(
+            matches!(
+                bare.validate(),
+                Err(AgentActionValidationError::Rejected(rule)) if rule == OBJECTIVE_REVIEW_REASON_RULE
+            ),
+            "an empty reason must be refused"
+        );
+        let vague = objective_review(ObjectiveReviewDecision::Gap, "not good");
+        assert!(
+            vague.validate().is_err(),
+            "a reason too short to name a deliverable must be refused"
+        );
+        let stated = objective_review(
+            ObjectiveReviewDecision::Gap,
+            "artifact:a cites no crates/ source path",
+        );
+        assert!(
+            stated.validate().is_ok(),
+            "a reason that names the missing thing must pass: {:?}",
+            stated.validate()
+        );
+        let blocked = objective_review(
+            ObjectiveReviewDecision::Blocked,
+            "the third responsibility domain has no readable source",
+        );
+        assert!(blocked.validate().is_ok(), "`blocked` follows the same rule");
+        // A satisfied verdict is not asked for prose it does not need.
+        let satisfied = objective_review(ObjectiveReviewDecision::Satisfied, "");
+        assert!(
+            satisfied.validate().is_ok(),
+            "a satisfied review needs no reason: {:?}",
+            satisfied.validate()
+        );
+    }
     use super::*;
 
     #[test]
@@ -1081,6 +1204,7 @@ mod tests {
             result_refs: Vec::new(),
             evidence_refs: Vec::new(),
             reason_ref: "reason-1".to_string(),
+            reason: String::new(),
         });
         let error = review
             .validate()

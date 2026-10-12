@@ -30,6 +30,19 @@ use crate::RuntimeServices;
 /// `MAX_TASK_REVIEW_ATTEMPTS` bound turns into `Blocked` and lets the root
 /// converge with an explicit terminal instead of waiting forever.
 const MAX_REVIEW_SOURCE_CHANGED_RETRIES: u32 = 3;
+/// Budget for a refusal whose cause is a step the reviewer has not taken yet.
+///
+/// A precondition is not a failure: "you have not read the body" is a step that
+/// was never executed, not an attempt that went wrong. Counting it against the
+/// failure budget punished a reviewer for the framework's own silence about what
+/// to read - one live reviewer was settled twice, and each settlement forced a
+/// fresh attempt that started from zero reads again, which made the loop longer
+/// the tighter the budget was.
+///
+/// The bound stays because the original concern is real: an artifact whose body
+/// genuinely cannot be read must not loop forever. Twelve is enough to read
+/// every delivered result of a normal request and then submit.
+const MAX_REVIEW_PRECONDITION_RETRIES: u32 = 12;
 
 static REVIEW_SOURCE_CHANGED_STREAK: LazyLock<Mutex<HashMap<String, u32>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -37,24 +50,30 @@ static REVIEW_SOURCE_CHANGED_STREAK: LazyLock<Mutex<HashMap<String, u32>>> =
 /// Retry-class review rejection caused by a concurrently-changing source. These
 /// strings are authored by Runtime (`review_evidence/policy.rs`), never by a
 /// provider or model.
-fn is_review_source_changed_retry(error: &str) -> bool {
-    // A reviewer that has not opened the submitted body is a retry class too.
-    // Bounding it prevents an artifact whose body cannot be read from looping
-    // forever; after the bound the attempt settles and the Task can be
-    // reworked or reassigned to a reviewer that reads it.
-    if error.contains("review_requires_current_physical_reads") {
-        return true;
-    }
+/// A refusal whose cause is a step the caller has not taken yet.
+///
+/// "You have not read the delivered results" is not a failed attempt; it is an
+/// unexecuted step. It carries its own, larger budget so a reviewer is never
+/// settled for the framework's own silence about what to read.
+fn is_review_precondition_refusal(error: &str) -> bool {
+    error.contains("review_requires_current_physical_reads")
+}
+
+/// A refusal whose cause is the content or the attempt itself. These are real
+/// failures and keep the tight budget.
+fn is_review_content_refusal(error: &str) -> bool {
     // A review attempt whose generation no longer matches an already-reviewed or
-    // reworked Task is stale; bound it the same way so it settles instead of
-    // looping, and a fresh attempt can be dispatched.
-    if error.contains("review physical attempt is stale") {
-        return true;
-    }
-    (error.contains("review policy source changed")
-        || error.contains("effect review source changed")
-        || error.contains("delegated effect source changed"))
-        && error.contains("retry")
+    // reworked Task is stale; bound it so it settles instead of looping, and a
+    // fresh attempt can be dispatched.
+    error.contains("review physical attempt is stale")
+        || ((error.contains("review policy source changed")
+            || error.contains("effect review source changed")
+            || error.contains("delegated effect source changed"))
+            && error.contains("retry"))
+}
+
+fn is_review_source_changed_retry(error: &str) -> bool {
+    is_review_precondition_refusal(error) || is_review_content_refusal(error)
 }
 
 fn review_attempt_key(envelope: &AgentActionEnvelope) -> String {
@@ -440,8 +459,16 @@ impl RuntimeServices {
                 }
                 Err(error) => {
                     if is_review_source_changed_retry(&error) {
+                        // A precondition the caller has not satisfied yet is not
+                        // a failed attempt, so it draws on its own budget. Both
+                        // classes still settle: neither may loop forever.
+                        let bound = if is_review_precondition_refusal(&error) {
+                            MAX_REVIEW_PRECONDITION_RETRIES
+                        } else {
+                            MAX_REVIEW_SOURCE_CHANGED_RETRIES
+                        };
                         let streak = bump_review_streak(&key);
-                        if streak >= MAX_REVIEW_SOURCE_CHANGED_RETRIES {
+                        if streak >= bound {
                             clear_review_streak(&key);
                             // The active review graph is wedged on a retry-class
                             // rejection that never becomes a durable failure.
@@ -543,6 +570,24 @@ impl RuntimeServices {
         if program.completion_request.is_some() {
             self.reconcile_agentic_completion_request(&program_id)?;
             return Ok(true);
+        }
+        // The Goal's own gate is stricter than the Program's rung gate. A Goal
+        // that still requires an Objective review reopens every request the
+        // Program considers closed, so submitting one here produces a
+        // framework-authored request the Supervisor immediately reopens while
+        // the root never receives the turn that would close the gap. One live
+        // run burned three such requests (`objective-complete-request:runtime:*`)
+        // and 56M tokens this way, with the model making no tool call after the
+        // first reopen. Decline instead, so control stays with the only actor
+        // that can publish the missing review.
+        if let Some(gap) = crate::agentic::agentic_program_completion_gap(self, session_id, turn_id)
+        {
+            tracing::info!(
+                program_id = %program_id,
+                gap = %gap,
+                "drive_agentic_objective_completion declined: the Goal still records a completion gap"
+            );
+            return Ok(false);
         }
         // Cite exactly the accepted work; an empty result set is not completable.
         let Some(input) = completion_objective_input(&program) else {
@@ -1106,6 +1151,35 @@ mod tests {
             Some("artifact:final"),
             "the cross-Team synthesis artifact must lead result_refs"
         );
+    }
+
+    #[test]
+    fn a_precondition_refusal_draws_on_its_own_budget() {
+        // "You have not read the body" is an unexecuted step, not a failed
+        // attempt. One live reviewer was settled twice for it, and each
+        // settlement forced a fresh attempt that started from zero reads again -
+        // the tighter the budget, the longer the loop.
+        assert!(is_review_precondition_refusal(
+            "review_requires_current_physical_reads:artifact:a"
+        ));
+        assert!(
+            !is_review_content_refusal("review_requires_current_physical_reads:artifact:a"),
+            "a precondition must not be counted as a content failure"
+        );
+        // Content failures keep the tight budget.
+        assert!(is_review_content_refusal(
+            "review physical attempt is stale or owns different results"
+        ));
+        assert!(
+            !is_review_precondition_refusal(
+                "review physical attempt is stale or owns different results"
+            )
+        );
+        assert!(is_review_source_changed_retry(
+            "review_requires_current_physical_reads:artifact:a"
+        ));
+        // Both classes stay bounded: neither may loop forever.
+        const _: () = assert!(MAX_REVIEW_PRECONDITION_RETRIES > MAX_REVIEW_SOURCE_CHANGED_RETRIES);
     }
 
     #[tokio::test]

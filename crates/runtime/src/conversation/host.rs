@@ -67,12 +67,22 @@ const PROVIDER_FRAME_REPAIR_BUDGET: u8 = 1;
 /// whole multi-Team Program when one provider response omits schema labels,
 /// while the small hard bound still prevents an open-ended model loop.
 const STRUCTURED_OUTPUT_RECOVERY_BUDGET: u8 = 2;
-/// A delegated leaf may change its tool approach once after consecutive local
-/// failures with no retained evidence. This is intentionally independent from
+/// Any turn may change its tool approach once after consecutive local failures
+/// with no retained evidence. This is intentionally independent from
 /// provider-protocol recovery: the latter repairs malformed provider frames,
-/// while this one repairs a valid-but-unproductive delegated work path.
-const DELEGATED_TOOL_FAILURE_REPLAN_BUDGET: u8 = 1;
-const DELEGATED_TOOL_FAILURE_REPLAN_MARKER: &str = "delegated_tool_failure_replan:v1";
+/// while this one repairs a valid-but-unproductive work path.
+///
+/// The role gate used to require a delegated leaf. That left the root turn -
+/// the actor that must drive a multi-Team collaboration - with no lease at all,
+/// so two cold-start mistakes ended the whole mission. One live run lost a
+/// 3-Team scenario this way: the root called a write tool the task prohibited,
+/// then sent a `tool_orchestrate` whose `return` named a step that did not
+/// exist, and the turn was blocked with `GoalCompletion::Partial` before the
+/// model ever saw a successful tool result. A cold start is not a spin: the
+/// model is still learning the environment and has not yet had the feedback
+/// that would let it converge.
+const COLD_START_TOOL_FAILURE_REPLAN_BUDGET: u8 = 1;
+const COLD_START_TOOL_FAILURE_REPLAN_MARKER: &str = "cold_start_tool_failure_replan:v1";
 
 fn next_consecutive_tool_failure_batches(
     current: usize,
@@ -142,14 +152,11 @@ fn protocol_closure_can_be_required(
         .all(|tool| !crate::repetition_guard::cause_blocked_for_tool(turn_id, tool))
 }
 
-fn delegated_tool_failure_replan_available(
-    bounded_evidence_role: bool,
+fn cold_start_tool_failure_replan_available(
     has_successful_tool_evidence: bool,
     consumed_replans: u8,
 ) -> bool {
-    bounded_evidence_role
-        && !has_successful_tool_evidence
-        && consumed_replans < DELEGATED_TOOL_FAILURE_REPLAN_BUDGET
+    !has_successful_tool_evidence && consumed_replans < COLD_START_TOOL_FAILURE_REPLAN_BUDGET
 }
 
 #[cfg(test)]
@@ -816,9 +823,13 @@ where
             clean_terminal_retry_attempted: false,
             terminal_failure_narration: None,
             consecutive_tool_failure_batches: 0,
-            delegated_failure_replans: 0,
+            cold_start_failure_replans: 0,
             consecutive_low_novelty_batches: 0,
             successful_tool_calls: 0,
+            last_terminal_answer_digest: String::new(),
+            repeated_terminal_answers: 0,
+            completion_gap_outstanding: false,
+            outstanding_closure_rungs: Vec::new(),
             tool_receipts_observed: recovered_tool_receipt_count,
             duplicate_tool_calls: 0,
             identical_action_digest: String::new(),
@@ -1229,7 +1240,7 @@ where
             // Rehydrate the bounded delegated-recovery lease from the durable
             // Goal stream. A graph/node replay must not reset a consumed
             // semantic replan and accidentally reopen an unbounded retry path.
-            turn_state.delegated_failure_replans = services
+            turn_state.cold_start_failure_replans = services
                 .goal_store()
                 .projection(&turn_state.goal_id)
                 .ok()
@@ -1239,10 +1250,10 @@ where
                         .interventions
                         .iter()
                         .filter(|intervention| {
-                            intervention.reason.starts_with(DELEGATED_TOOL_FAILURE_REPLAN_MARKER)
+                            intervention.reason.starts_with(COLD_START_TOOL_FAILURE_REPLAN_MARKER)
                         })
                         .count()
-                        .min(usize::from(DELEGATED_TOOL_FAILURE_REPLAN_BUDGET))
+                        .min(usize::from(COLD_START_TOOL_FAILURE_REPLAN_BUDGET))
                         as u8
                 })
                 .unwrap_or_default();
@@ -2325,6 +2336,100 @@ fn required_team_execution_count_for_execution_context(
 /// Pure: derived only from durable Program facts. The framework does NOT parse
 /// the model's own summary, so the Program projection stays the single source of
 /// truth.
+/// The instances the model may legally cite right now.
+///
+/// Every contract that needs an instance states where to fetch it
+/// ("returned by state_inspect", "from task_submit", "a real read_file return
+/// value in this session") and none of them state what it currently is. That
+/// forces fetch -> parse -> remember on every call, and the remember step fails
+/// in a context that grows past 100k tokens: one live run re-read the same file
+/// sixteen times because it could no longer find the ref it had already been
+/// handed, and another published a sha256 that was the digest of the empty
+/// string. These are facts the framework already holds; projecting them costs
+/// nothing and removes the guessing.
+///
+/// This states what exists, never what to choose. Which ref to cite stays the
+/// model's decision.
+fn citable_refs(
+    program: &crate::AgenticProgramProjection,
+    services: &crate::RuntimeServices,
+    session_id: &str,
+    turn_id: &str,
+) -> serde_json::Value {
+    let criteria = services
+        .goal_store()
+        .projection(&format!("goal:{}", program.root_execution_id.as_deref().unwrap_or("")))
+        .ok()
+        .flatten()
+        .map(|projection| {
+            projection
+                .goal
+                .criteria
+                .iter()
+                .map(|criterion| {
+                    serde_json::json!({
+                        "criterion_ref": criterion.id,
+                        "status": format!("{:?}", criterion.status).to_lowercase(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let accepted_results = program
+        .tasks
+        .values()
+        .filter(|task| task.status == crate::AgenticTaskStatus::Accepted)
+        .flat_map(|task| task.artifact_refs.iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .take(32)
+        .collect::<Vec<_>>();
+    let artifact_total = program.artifacts.len();
+    let artifacts = program
+        .artifacts
+        .values()
+        .take(32)
+        .map(|artifact| {
+            serde_json::json!({
+                "artifact_ref": artifact.artifact_ref,
+                "content_ref": artifact.content_ref,
+                "kind": artifact.kind,
+                "title": artifact.title,
+                "committed_by": artifact.committed_by,
+            })
+        })
+        .collect::<Vec<_>>();
+    let topic_refs = program
+        .teams
+        .values()
+        .map(|team| team.topic_ref.clone())
+        .filter(|reference| !reference.is_empty())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let active_completion_results = program
+        .completion_request
+        .as_ref()
+        .map(|request| request.result_refs.clone())
+        .unwrap_or_default();
+    let mut value = serde_json::json!({
+        "criteria": criteria,
+        "topic_refs": topic_refs,
+        "accepted_results": accepted_results,
+        "artifacts": artifacts,
+        "active_completion_results": active_completion_results,
+        "note": "Facts Runtime already holds. Cite from here instead of guessing a reference; anything outside it is still refused.",
+    });
+    // Never truncate silently: an unannounced omission is indistinguishable
+    // from "there is nothing more".
+    if artifact_total > 32 {
+        value["artifacts_more"] = serde_json::json!(artifact_total - 32);
+    }
+    let _ = session_id;
+    let _ = turn_id;
+    value
+}
+
 #[must_use]
 pub(super) fn agentic_turn_framing(
     services: &crate::RuntimeServices,
@@ -2346,6 +2451,7 @@ pub(super) fn agentic_turn_framing(
             let mut view = agentic_closure_view(&program, completion_gap.as_deref());
             if let Some(object) = view.as_object_mut() {
                 object.insert("budgets".to_string(), budgets);
+                object.insert("citable_refs".to_string(), citable_refs(&program, services, session_id, turn_id));
                 // Live occupancy: the model needs to know how much is already
                 // running before it decides to spawn or wait. Reference
                 // harnesses state the available concurrency slots; we state the
@@ -2487,7 +2593,17 @@ fn agentic_closure_view(
         .count();
     let teams = program.teams.len();
     let required_teams = usize::from(program.required_team_count.max(1));
-    let unclassified = program.unresolved.len();
+    // The unclassified-issue count comes from the Task-recorded issues that
+    // `issues::completion_gap` reads, NOT from `program.unresolved` (which is
+    // derived from Goal-level gaps). Run one19 had the two disagree: this view
+    // reported `satisfied: [... classify_issues]` and `facts.unresolved: 0`
+    // while the same object reported `completion_gap:
+    // issue_requires_classification` and two entries in
+    // `unclassified_issue_refs`. A model told the gap is both closed and open
+    // concludes the Objective is done and writes its final answer, which is
+    // exactly what it did - seven times.
+    let issue_blockers = crate::agentic::issues::open_issue_blockers(program);
+    let unclassified = issue_blockers.len();
 
     let mut remaining: Vec<serde_json::Value> = Vec::new();
     if teams < required_teams {
@@ -2515,9 +2631,28 @@ fn agentic_closure_view(
             "step": "accepted_task", "outstanding": published - accepted
         }));
     }
-    if !program.unresolved.is_empty() {
+    // The integration obligation is a durable structural fact the Program
+    // already records, so it belongs in this always-on view. It used to live
+    // only in `root_agentic_terminal_action`, which returns None while a
+    // completion gap is open - so precisely when the model still had work to
+    // do, the one rung that names the synthesis Task was invisible to it. One
+    // live 1-Team run reached a satisfied verdict with three accepted Tasks
+    // and no integration Artifact; everything else passed, and the only thing
+    // missing was this advertisement.
+    if accepted >= 2
+        && accepted == published
+        && crate::agentic::supervision::completion_ready_result_artifact_refs(program).is_empty()
+    {
         remaining.push(serde_json::json!({
-            "step": "classify_issues", "outstanding": unclassified.max(program.unresolved.len()),
+            "step": "publish_integration_task",
+            "outstanding": accepted,
+            "hint": "Publish one genuine synthesis Task with depends_on covering these accepted deliveries. Choose its Team, author, objective, acceptance criterion, and evidence semantics yourself; its accepted Artifact must be the final result."
+        }));
+    }
+    if !issue_blockers.is_empty() {
+        remaining.push(serde_json::json!({
+            "step": "classify_issues", "outstanding": unclassified,
+            "issue_refs": issue_blockers.iter().map(|(reference, _)| reference.clone()).collect::<Vec<_>>(),
             "hint": "Completion is rejected while any entry stays unclassified; dispose them through one message_publish.issue_dispositions."
         }));
     }
@@ -2534,10 +2669,30 @@ fn agentic_closure_view(
         }
     }
     if let Some(gap) = completion_gap {
+        // The rung must name the action that closes THIS gap. Every gap used to
+        // be rendered as `objective_review`, so an `issue_requires_classification`
+        // gap was advertised as a review while the completion-gap guidance in the
+        // same envelope asked for `message_publish`. The model was handed two
+        // mutually exclusive instructions for one gap and satisfied neither.
+        let kind = crate::agentic::issues::completion_gap_kind(gap);
+        let hint = if kind.is_issue_gap() {
+            format!(
+                "The Goal verifier records a completion gap, so the Objective is not closable yet: {gap}. \
+                 Close it by classifying EVERY unclassified issue_ref listed above through ONE \
+                 `message_publish` call carrying `issue_dispositions`. Each entry needs the exact \
+                 `issue:` reference, a disposition of `must_resolve`, `disclose` or `resolved`, a \
+                 durable `reason_ref`, and `evidence_refs` drawn from artifact://, tool://, task:, \
+                 issue: or program: (the issue's own source Task ref is durable). Do not request \
+                 completion until this clears."
+            )
+        } else {
+            "The Goal verifier records a completion gap, so the Objective is not closable yet. Close this gap first; do not re-request completion until it clears. Close it by having an Agent READ the delivered results itself in its own execution and then call objective_review: a read by another Agent, by the root, or by an earlier attempt of the same Agent does not count, and submitting the review before those reads only burns the retry budget.".to_string()
+        };
         remaining.push(serde_json::json!({
-            "step": "objective_review",
+            "step": kind.closure_step(),
             "outstanding_gap": gap,
-            "hint": "The Goal verifier records a completion gap, so the Objective is not closable yet. Close this gap first; do not re-request completion until it clears."
+            "closing_tool": kind.closing_tool(),
+            "hint": hint
         }));
     }
 
@@ -2573,7 +2728,7 @@ fn agentic_closure_view(
     if accepted >= published && published > 0 {
         satisfied.push("accepted_task");
     }
-    if program.unresolved.is_empty() {
+    if issue_blockers.is_empty() {
         satisfied.push("classify_issues");
     }
 
@@ -2603,6 +2758,11 @@ fn agentic_closure_view(
             "tasks_reviewed": reviewed,
             "tasks_accepted": accepted,
             "unresolved": program.unresolved.len(),
+            "unclassified_issues": unclassified,
+            "issue_refs": issue_blockers
+                .iter()
+                .map(|(reference, _)| reference.clone())
+                .collect::<Vec<_>>(),
         },
         "satisfied": satisfied,
         "remaining": remaining,
@@ -2992,6 +3152,208 @@ fn closure_view_blocks_exit_while_the_goal_completion_gap_remains() {
         !steps.contains(&"objective_complete_request"),
         "the exit action must not be advertised while the gap remains: {steps:?}"
     );
+}
+
+#[test]
+#[cfg(test)]
+fn closure_view_names_the_integration_task_while_a_completion_gap_is_open() {
+    // The rung used to live only in `root_agentic_terminal_action`, which
+    // returns None while the Goal records a completion gap. A run with two
+    // accepted deliveries and no integration Artifact was therefore never told
+    // to publish the synthesis Task, reached a satisfied verdict, and failed
+    // only the harness's synthesis gate. The always-on view must name it in
+    // every state, gap or no gap.
+    let mut program = crate::AgenticProgramProjection::empty("program:test", "objective:test");
+    program.required_team_count = 1;
+    program.teams.insert(
+        "team:1".to_string(),
+        crate::AgenticTeamProjection {
+            team_id: "team:1".to_string(),
+            name: "team".to_string(),
+            mission: "mission".to_string(),
+            objective: None,
+            lifecycle: Default::default(),
+            member_ids: vec!["agent:1".to_string(), "agent:2".to_string()],
+            task_ids: vec!["task:1".to_string(), "task:2".to_string()],
+            topic_ref: String::new(),
+            created_by: "root".to_string(),
+        },
+    );
+    for (id, claimant) in [("task:1", "agent:1"), ("task:2", "agent:2")] {
+        program.tasks.insert(
+            id.to_string(),
+            crate::AgenticTaskProjection {
+        task_id: id.to_string(),
+        team_id: "team:1".to_string(),
+        title: format!("delivery {id}"),
+        objective: "objective".to_string(),
+        acceptance: "accepted evidence".to_string(),
+        acceptance_checks: Vec::new(),
+        criterion_source: Default::default(),
+        required_capabilities: Vec::new(),
+        depends_on: Vec::new(),
+        status: crate::AgenticTaskStatus::Accepted,
+        claimant: Some(claimant.to_string()),
+        claim_generation: 1,
+        claim_execution_id: None,
+        claimed_at_ms: None,
+        lease_expires_at_ms: None,
+        active_attempts: Default::default(),
+        artifact_refs: vec![format!("artifact:{id}")],
+        evidence_refs: vec!["tool://receipt".to_string()],
+        unresolved: Vec::new(),
+        review_reason: None,
+        reviewed_by: Some("agent:2".to_string()),
+        failed_attempts: 0,
+        review_generation: 1,
+        failed_review_attempts: 0,
+        last_failure: None,
+        replacement_task_refs: Vec::new(),
+        supersede_evidence_refs: Vec::new(),
+        superseded_reason: None,
+        superseded_by: None,
+        obligation_refs: Vec::new(),
+        purpose: Default::default(),
+        execution_requirements: Vec::new(),
+        expertise_hints: Vec::new(),
+        cancel_requested_by: None,
+        cancel_reason_ref: None,
+        cancel_evidence_refs: Vec::new(),
+        pending_retirement: None,
+            },
+        );
+    }
+    let view = agentic_closure_view(&program, Some("original_intent_review_required:user_intent"));
+    let steps = view["remaining"]
+        .as_array()
+        .expect("remaining")
+        .iter()
+        .filter_map(|step| step.get("step").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>();
+    assert!(
+        steps.contains(&"publish_integration_task"),
+        "two accepted deliveries with no integration Artifact must name the synthesis rung: {steps:?}"
+    );
+    assert!(
+        steps.contains(&"objective_review"),
+        "the Goal gap stays advertised alongside it: {steps:?}"
+    );
+    assert!(
+        !steps.contains(&"objective_complete_request"),
+        "the exit action stays closed while the gap remains: {steps:?}"
+    );
+    // The rung's own hint must carry the same read-first rule the
+    // completion-gap guidance carries. One live run lost its review attempt
+    // because the rung said only "close this gap first": the reviewer submitted
+    // before reading, burned the three-retry budget, and only then read the
+    // results.
+    let objective_review_rung = view["remaining"]
+        .as_array()
+        .expect("remaining")
+        .iter()
+        .find(|step| step.get("step").and_then(serde_json::Value::as_str) == Some("objective_review"))
+        .expect("objective_review rung");
+    let hint = objective_review_rung
+        .get("hint")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        hint.contains("READ the delivered results itself in its own execution"),
+        "the rung must say the reviewer reads first: {hint}"
+    );
+    assert!(
+        hint.contains("an earlier attempt of the same Agent does not count"),
+        "the rung must name whose read counts: {hint}"
+    );
+}
+
+#[test]
+#[cfg(test)]
+fn citable_refs_states_what_exists_and_never_what_to_choose() {
+    // The contracts say where to fetch an instance ("returned by
+    // state_inspect", "from task_submit") and never what it is, so the model has
+    // to fetch, parse and remember it - and the remember step fails in a large
+    // context. One live run published a sha256 that was the digest of the empty
+    // string because it could no longer recall the real one.
+    let mut program = crate::AgenticProgramProjection::empty("program:test", "objective:test");
+    program.required_team_count = 1;
+    program.root_execution_id = Some("root-execution".to_string());
+    program.teams.insert(
+        "team:1".to_string(),
+        crate::AgenticTeamProjection {
+            team_id: "team:1".to_string(),
+            name: "team".to_string(),
+            mission: "mission".to_string(),
+            objective: None,
+            lifecycle: Default::default(),
+            member_ids: vec!["agent:1".to_string(), "agent:2".to_string()],
+            task_ids: vec!["task:1".to_string(), "task:2".to_string()],
+            topic_ref: "topic:one".to_string(),
+            created_by: "root".to_string(),
+        },
+    );
+    for id in ["task:1", "task:2"] {
+        program.tasks.insert(
+            id.to_string(),
+            crate::AgenticTaskProjection {
+                task_id: id.to_string(),
+                team_id: "team:1".to_string(),
+                title: format!("delivery {id}"),
+                objective: "objective".to_string(),
+                acceptance: "accepted evidence".to_string(),
+                acceptance_checks: Vec::new(),
+                criterion_source: Default::default(),
+                required_capabilities: Vec::new(),
+                depends_on: Vec::new(),
+                status: crate::AgenticTaskStatus::Accepted,
+                claimant: Some("agent:1".to_string()),
+                claim_generation: 1,
+                claim_execution_id: None,
+                claimed_at_ms: None,
+                lease_expires_at_ms: None,
+                active_attempts: Default::default(),
+                artifact_refs: vec![format!("artifact:{id}")],
+                evidence_refs: vec!["tool://receipt".to_string()],
+                unresolved: Vec::new(),
+                review_reason: None,
+                reviewed_by: Some("agent:2".to_string()),
+                failed_attempts: 0,
+                review_generation: 1,
+                failed_review_attempts: 0,
+                last_failure: None,
+                replacement_task_refs: Vec::new(),
+                supersede_evidence_refs: Vec::new(),
+                superseded_reason: None,
+                superseded_by: None,
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
+                cancel_requested_by: None,
+                cancel_reason_ref: None,
+                cancel_evidence_refs: Vec::new(),
+                pending_retirement: None,
+            },
+        );
+    }
+    let services = crate::RuntimeServices::in_memory().expect("services");
+    let refs = citable_refs(&program, &services, "session", "turn");
+    // The accepted results are named, so a review can cite them without guessing.
+    let accepted = refs["accepted_results"].as_array().expect("accepted_results");
+    assert_eq!(accepted.len(), 2, "{refs}");
+    assert!(accepted.iter().any(|value| value == "artifact:task:1"));
+    // The topic ref is named, so `message_publish` does not have to invent one.
+    assert_eq!(refs["topic_refs"][0], "topic:one");
+    // It states what exists and explicitly declines to choose.
+    assert!(
+        refs["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("never") == false && note.contains("Cite from here")),
+        "the note must offer the facts without prescribing a choice: {}",
+        refs["note"]
+    );
+    // An omission is announced, never silent.
+    assert!(refs.get("artifacts_more").is_none(), "two artifacts fit the cap");
 }
 
 #[test]
@@ -3727,13 +4089,35 @@ struct TurnGraphState {
     /// provider output retains the exact observed attempt identity.
     terminal_failure_narration: Option<TerminalFailureNarration>,
     consecutive_tool_failure_batches: usize,
-    /// A delegated leaf may receive one Runtime-owned semantic replan after
+    /// Any turn may receive one Runtime-owned semantic replan after
     /// consecutive tool failures with no retained evidence. This is a bounded
     /// agency-preserving recovery, not a retry loop; once consumed, the next
-    /// identical failure remains fail-closed and is surfaced as blocked.
-    delegated_failure_replans: u8,
+    /// identical failure remains fail-closed and is surfaced as blocked. It
+    /// covers the root turn too: a cold start is not a spin, and the root is
+    /// the actor that has to drive the collaboration.
+    cold_start_failure_replans: u8,
     consecutive_low_novelty_batches: usize,
     successful_tool_calls: usize,
+    /// Normalized digest of the root's most recent terminal answer, and how
+    /// many times it recurred with no intervening successful tool call.
+    ///
+    /// Run one19 emitted effectively the same final answer five times across
+    /// 86 seconds and nothing in the Runtime noticed: `repetition_guard` keys
+    /// on tool inputs and deterministic tool failures, so a model that stops
+    /// calling tools and starts restating its conclusion is invisible to it.
+    /// The turn then spent its whole remaining budget restating a conclusion it
+    /// had already reached instead of taking the one action that closed the gap.
+    /// These two fields are the observer for that failure mode.
+    last_terminal_answer_digest: String,
+    repeated_terminal_answers: u8,
+    /// Whether the Goal verifier currently records a completion gap. Set by the
+    /// completion-gap continuation so the model step can refuse to go tool-less
+    /// while an action is still owed.
+    completion_gap_outstanding: bool,
+    /// The Program-owned rungs the closure view still advertises. Same purpose:
+    /// a rung that names an action is an obligation to keep that action
+    /// callable.
+    outstanding_closure_rungs: Vec<String>,
     /// Count of committed success or failure tool receipts visible to later
     /// provider steps. Once non-zero, transport/protocol retry is forbidden:
     /// recovery may only synthesize once from retained evidence.

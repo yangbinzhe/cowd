@@ -105,6 +105,18 @@ class Monitor:
         inv["repeated_reads"] = [
             {"call": t[:90], "count": int(n)} for t, n in rows if int(n) >= 3]
 
+        # 3b. Repeated identical final-answer text. A model that has finished the
+        # work but does not know the next rung writes the same summary over and
+        # over; events keep flowing, so the silence signal never fires and the
+        # run burns its whole window. One live run emitted the same answer seven
+        # times over fourteen minutes while the monitor reported WORKING.
+        rows = self.q(
+            "SELECT substr(payload->>'content',1,120), count(*) FROM runtime_events "
+            "WHERE kind='model.item_completed' AND payload->>'kind'='text' "
+            "GROUP BY 1 ORDER BY 2 DESC LIMIT 4")
+        inv["repeated_text_answers"] = [
+            {"text": t, "count": int(n)} for t, n in rows if int(n) >= 3]
+
         # 4. Rework reasons verbatim (the acceptance-criteria fingerprint).
         rows = self.q(
             "SELECT substr(payload->'envelope'->'action'->'input'->>'reason',1,220) "
@@ -181,6 +193,18 @@ class Monitor:
                 "evidence": [f"{r['input'][:60]} x{r['count']}" for r in repeats[:3]],
                 "action": "stop; the loop guard or task framing is not breaking the cycle",
             })
+        # A model repeating its own final answer is spinning even though every
+        # round emits events: the work is done and the exit rung is not being
+        # taken. The silence signal cannot see it, so this one has to.
+        repeated_answers = [
+            r for r in inv.get("repeated_text_answers", []) if r["count"] >= 3]
+        if repeated_answers and snap.get("verdicts", 0) == 0:
+            findings.append({
+                "root_cause": "the model is repeating the same final answer instead of taking the next rung",
+                "evidence": [f"{r['text'][:80]}... x{r['count']}" for r in repeated_answers[:2]],
+                "action": "stop; the closure view is not naming the remaining rung, or the model is not reading it",
+            })
+
         # A repeated read is only waste when the reader keeps going and the
         # count is far past what independent agents would produce. Three agents
         # each opening the same file once is three first reads, not a loop; the

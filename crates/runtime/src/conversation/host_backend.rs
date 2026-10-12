@@ -2,6 +2,272 @@
 
 use super::*;
 
+/// Consecutive count of the same tool batch, driven by the question alone.
+///
+/// The result digest deliberately does not take part. A point lookup whose
+/// payload carries a revision counter changes bytes on every round while
+/// telling the model nothing new, so keying the streak on the answer let a
+/// stuck loop run forever: one live run issued the same `state_inspect` on one
+/// task entry 18 times over 11 minutes, the result bytes moved each time, the
+/// streak reset to 1 each time, and only an external monitor stopped it. What
+/// makes a repeat legitimate is not that the answer moved - it is that the
+/// caller is waiting, which `is_loop_nudge_repeatable_tool` decides before this
+/// function is ever reached.
+fn next_identical_action_streak(
+    previous_digest: &str,
+    action_fingerprint: &str,
+    current_streak: usize,
+) -> usize {
+    if previous_digest == action_fingerprint {
+        current_streak.saturating_add(1)
+    } else {
+        1
+    }
+}
+
+/// The durable `tool://` receipt references this turn has actually produced.
+///
+/// Bounded and ordered oldest-first so the list is stable across a run: a model
+/// that cites one of these can never be refused for identity, and one that needs
+/// a ref it does not hold sees immediately that it must read again rather than
+/// guessing. Only references the turn produced are listed - never a remembered
+/// one from an earlier session.
+fn durable_receipt_refs(messages: &[ConversationMessage]) -> Vec<String> {
+    const HELD_RECEIPT_LIMIT: usize = 16;
+    let mut refs = Vec::new();
+    for message in messages {
+        for block in &message.blocks {
+            let ContentBlock::ToolResult { output, .. } = block else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(output) else {
+                continue;
+            };
+            for key in ["evidence_ref", "full_output_ref", "output_ref"] {
+                if let Some(reference) = value.get(key).and_then(serde_json::Value::as_str) {
+                    if reference.starts_with("tool://") && !refs.iter().any(|r| r == reference) {
+                        refs.push(reference.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if refs.len() > HELD_RECEIPT_LIMIT {
+        refs.split_off(refs.len() - HELD_RECEIPT_LIMIT)
+    } else {
+        refs
+    }
+}
+
+/// Record guidance that a terminating turn will never deliver.
+///
+/// `pending_next_model_context` is drained unconditionally at the start of a
+/// model step, but a fuse intervention ends that same turn, so anything drained
+/// is delivered to nobody. One live run wrote the tool-failure nudge, then
+/// blocked the turn: the framework had decided what to tell the model and then
+/// closed its mouth. Recording the identities on the durable intervention makes
+/// the loss attributable (1006r M4: a failure path must produce evidence
+/// isomorphic to the success path) without leaking Private guidance text into
+/// the user-visible terminal.
+fn record_undelivered_guidance(
+    intervention: &mut harness_contract::goal::RuntimeIntervention,
+    undelivered: &[String],
+) {
+    if undelivered.is_empty() {
+        return;
+    }
+    let count = undelivered.len();
+    intervention
+        .evidence_refs
+        .extend(undelivered.iter().cloned());
+    if intervention.kind == harness_contract::goal::RuntimeInterventionKind::Block {
+        intervention.reason.push_str(&format!(
+            " Runtime prepared {count} guidance item(s) for a next model step that this \
+             termination prevented; they are recorded on the intervention evidence refs."
+        ));
+    }
+}
+
+#[test]
+fn duplicate_result_stubbing_is_on_unless_the_operator_opts_out() {
+    // Default-on matters: one live delegated Agent issued the same `read_file`
+    // sixteen times in a row against a 145k-token context, and the stub that
+    // would have broken that loop was opt-in, so it never ran. Only an explicit
+    // opt-out disables it.
+    std::env::remove_var("COWD_LOOP_STUB_RESULTS");
+    assert!(
+        !result_stub_disabled(),
+        "with no operator setting, stubbing must be on"
+    );
+    std::env::set_var("COWD_LOOP_STUB_RESULTS", "0");
+    assert!(result_stub_disabled(), "an explicit 0 opts out");
+    std::env::set_var("COWD_LOOP_STUB_RESULTS", "false");
+    assert!(result_stub_disabled(), "an explicit false opts out");
+    // Anything else, including a stale truthy value from the old opt-in spelling,
+    // keeps stubbing on.
+    std::env::set_var("COWD_LOOP_STUB_RESULTS", "1");
+    assert!(
+        !result_stub_disabled(),
+        "the old opt-in spelling must not silently disable it"
+    );
+    std::env::remove_var("COWD_LOOP_STUB_RESULTS");
+}
+
+#[test]
+fn held_receipts_name_only_what_this_turn_produced() {
+    // A model that has lost the thread cites a ref from an earlier session or a
+    // round it no longer holds; one live run was refused with "no canonical
+    // durable receipt in Session ...". Listing what the turn actually produced
+    // makes that refusal impossible to earn by identity.
+    use crate::ConversationMessage;
+    let mut messages = vec![ConversationMessage::tool_result(
+        "call-1",
+        "read_file",
+        serde_json::json!({"evidence_ref": "tool://first", "bytes": 10}).to_string(),
+        false,
+    )];
+    messages.push(ConversationMessage::tool_result(
+        "call-2",
+        "read_ref",
+        serde_json::json!({"full_output_ref": "tool://second"}).to_string(),
+        false,
+    ));
+    // A remembered reference from another session must never be offered.
+    messages.push(ConversationMessage::tool_result(
+        "call-3",
+        "read_ref",
+        serde_json::json!({"evidence_ref": "artifact://not-a-tool-receipt"}).to_string(),
+        false,
+    ));
+    let held = durable_receipt_refs(&messages);
+    assert_eq!(held, vec!["tool://first".to_string(), "tool://second".to_string()]);
+    // The list is bounded: an unbounded projection would grow the prompt every
+    // round for no new information.
+    let many = (0..40)
+        .map(|index| {
+            ConversationMessage::tool_result(
+                format!("call-{index}"),
+                "read_file",
+                serde_json::json!({"evidence_ref": format!("tool://r{index}")}).to_string(),
+                false,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(durable_receipt_refs(&many).len(), 16);
+}
+
+#[test]
+fn the_same_question_counts_as_a_repeat_even_when_the_answer_moved() {
+    // The bug this pins: the streak used to require an identical result too, so
+    // a point lookup whose payload carries a revision counter never accumulated.
+    // One live run issued the same `state_inspect` 18 times over 11 minutes.
+    let question = "tool_action:same";
+    let mut streak = next_identical_action_streak("", question, 0);
+    assert_eq!(streak, 1, "the first ask starts the streak");
+    for round in 2..=18 {
+        // Each round returns different bytes: a revision counter moved.
+        let _moved_result = format!("result-revision-{round}");
+        streak = next_identical_action_streak(question, question, streak);
+        assert_eq!(streak, round, "an unchanged question must keep counting");
+    }
+    assert_eq!(streak, 18);
+
+    // A different question resets it, so a genuine change of subject is not a loop.
+    assert_eq!(next_identical_action_streak(question, "tool_action:other", 18), 1);
+}
+
+#[test]
+fn only_a_genuine_wait_is_exempt_from_the_identical_call_streak() {
+    let call = |name: &str, input: &str| ModelToolCall {
+        id: "call-1".to_string(),
+        name: name.to_string(),
+        input: input.to_string(),
+        depends_on: Vec::new(),
+    };
+    // The documented wait: the model parks until a worker moves.
+    assert!(is_loop_nudge_repeatable_tool(&call(
+        "state_inspect",
+        r#"{"wait_for_workers": true}"#
+    )));
+    // A point lookup of one entry is not a wait. This is the shape that looped.
+    assert!(!is_loop_nudge_repeatable_tool(&call(
+        "state_inspect",
+        r#"{"entry_ref": "task:47819154d3e1b2385139b9bd"}"#
+    )));
+    // An explicit false is not a wait either.
+    assert!(!is_loop_nudge_repeatable_tool(&call(
+        "state_inspect",
+        r#"{"wait_for_workers": false}"#
+    )));
+    // The transport pollers stay exempt.
+    assert!(is_loop_nudge_repeatable_tool(&call("process", "{}")));
+    assert!(is_loop_nudge_repeatable_tool(&call("job_get_result", "{}")));
+    assert!(is_loop_nudge_repeatable_tool(&call("job_poll", "{}")));
+    // Ordinary tools are never exempt.
+    assert!(!is_loop_nudge_repeatable_tool(&call("read_file", "{}")));
+}
+
+#[test]
+fn a_terminating_turn_records_the_guidance_it_will_not_deliver() {
+    use harness_contract::goal::{RuntimeIntervention, RuntimeInterventionKind};
+
+    let blocked = || RuntimeIntervention {
+        goal_id: "goal:1".to_string(),
+        kind: RuntimeInterventionKind::Block,
+        reason: "multiple consecutive tool batches failed before any checked evidence was retained; stop speculative retries".to_string(),
+        evidence_refs: vec!["execution_node:node-1".to_string()],
+        expected_graph_revision: None,
+    };
+
+    // Nothing was prepared: the intervention is untouched, so a normal block
+    // does not grow a meaningless clause.
+    let mut untouched = blocked();
+    record_undelivered_guidance(&mut untouched, &[]);
+    assert_eq!(untouched.evidence_refs, vec!["execution_node:node-1".to_string()]);
+    assert!(!untouched.reason.contains("guidance item(s)"));
+
+    // Guidance was written for a next step the termination prevents: the
+    // identities become durable and the reason states the count.
+    let mut recorded = blocked();
+    record_undelivered_guidance(
+        &mut recorded,
+        &[
+            "tool-failure-nudge:node-1".to_string(),
+            "evidence-saturation-nudge:node-1".to_string(),
+        ],
+    );
+    assert!(
+        recorded
+            .evidence_refs
+            .contains(&"tool-failure-nudge:node-1".to_string()),
+        "the nudge identity must be durable: {:?}",
+        recorded.evidence_refs
+    );
+    assert!(
+        recorded.reason.contains("Runtime prepared 2 guidance item(s)"),
+        "the blocked reason must state what was not delivered: {}",
+        recorded.reason
+    );
+    assert!(
+        !recorded.reason.contains("Do not repeat them unchanged"),
+        "Private guidance text must not leak into the operator-visible reason"
+    );
+
+    // A non-blocking intervention still records the identities, but must not
+    // grow a clause the model is never shown.
+    let mut replan = RuntimeIntervention {
+        kind: RuntimeInterventionKind::Replan,
+        ..blocked()
+    };
+    record_undelivered_guidance(&mut replan, &["tool-failure-nudge:node-1".to_string()]);
+    assert!(
+        replan
+            .evidence_refs
+            .contains(&"tool-failure-nudge:node-1".to_string())
+    );
+    assert!(!replan.reason.contains("guidance item(s)"));
+}
+
 pub(super) fn requested_agentic_worker_wait(
     calls: &[ModelToolCall],
     successful: &BTreeSet<String>,
@@ -150,8 +416,22 @@ where
                         &session_id,
                         &turn_id,
                     );
+                    // The Objective is the purpose; a Task is a means. Waiting for
+                    // every Task rung to close as well deadlocks the exit: one live
+                    // run satisfied the Objective review and then spent its whole
+                    // remaining window in a Task rework cycle, never reaching the
+                    // request that would have bound the verdict.
+                    //
+                    // The Goal stays the authority. A reworked Task the Objective
+                    // genuinely depends on reopens the completion gap, which closes
+                    // this gate again on the next step; an unclassified issue keeps
+                    // `unresolved` non-empty and holds it shut the same way.
+                    let objective_ready = gap.is_none() && program.unresolved.is_empty();
                     let mut state = self.state.lock().await;
-                    if outstanding == 0 && gap.is_none() && program.completion_request.is_none() {
+                    if (outstanding == 0 || objective_ready)
+                        && gap.is_none()
+                        && program.completion_request.is_none()
+                    {
                         state.closure_ready_steps = state.closure_ready_steps.saturating_add(1);
                         if state.closure_ready_steps >= closure_drive_after_steps() {
                             state.closure_ready_steps = 0;
@@ -347,6 +627,7 @@ where
             clean_terminal_evidence,
             provider_retry_fenced,
             pending_next_model_context,
+            undelivered_guidance_refs,
             pending_disposition_inputs,
         ) = {
             let mut state = self.state.lock().await;
@@ -554,8 +835,67 @@ where
                     }
                 }
             }
+            // Guidance written for a next model step can outlive the step it
+            // was written for: a fuse intervention ends the turn right here, so
+            // anything drained below is delivered to nobody. Keep the identities
+            // so the durable intervention can record what Runtime wanted to say
+            // and did not, instead of letting the words evaporate.
+            let mut drained_guidance = std::mem::take(&mut state.pending_next_model_context);
+            let undelivered_guidance_refs = drained_guidance
+                .iter()
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>();
+            // The turn-position packet is re-rendered on every request by
+            // design: `context_plane` routes a `GOAL_STATE_PACKET_PREFIX` item to
+            // the volatile tail, so it never forks the stable prefix. But it was
+            // only ever pushed on the re-drive path, so a model working normally
+            // never learned where it stood and had to ask with `state_inspect`
+            // (one live run issued 153 of them). Push it on every step; the
+            // routing above already makes it per-request.
+            let turn_framing = crate::host::agentic_turn_framing(
+                self.services.as_ref(),
+                &state.session_id,
+                &state.turn_id,
+                state.iterations,
+                state.tool_results.len(),
+                state.started_at.elapsed().as_millis(),
+            );
+            let mut goal_state = ContextItem::new(
+                format!("goal-state:{}", ticket.node_id),
+                ContextSourceKind::Task,
+                ContextRole::Instruction,
+                format!(
+                    "#GoalState {}",
+                    serde_json::to_string(&turn_framing).unwrap_or_else(|_| "{}".to_string())
+                ),
+            );
+            goal_state.authority = ContextAuthority::System;
+            goal_state.visibility = ContextVisibility::Private;
+            // The instances this execution may cite as evidence. Every contract
+            // that needs one says where to fetch it and none says what it
+            // currently is, so a model that has lost the thread cites a ref from
+            // an earlier session or a round it no longer holds - one live run was
+            // refused with "no canonical durable receipt in Session ..." for
+            // exactly that. These are the durable receipts this turn actually
+            // produced, so citing one can never be refused for identity.
+            let held = durable_receipt_refs(&state.tool_results);
+            if !held.is_empty() {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(
+                    goal_state.content.trim_start_matches("#GoalState "),
+                ) {
+                    let mut value = value;
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert("held_receipts".to_string(), serde_json::json!(held));
+                    }
+                    goal_state.content =
+                        format!("#GoalState {}", serde_json::to_string(&value).unwrap_or_default());
+                }
+            }
+            // The re-drive path pushes the same id in the same step; keep one.
+            drained_guidance.retain(|item| item.id != goal_state.id);
+            drained_guidance.push(goal_state);
             let pending_next_model_context = model_context_for_step(
-                std::mem::take(&mut state.pending_next_model_context),
+                drained_guidance,
                 &state.persistent_collaboration_context,
             );
             (
@@ -572,10 +912,12 @@ where
                 clean_terminal_evidence,
                 state.tool_receipts_observed > 0,
                 pending_next_model_context,
+                undelivered_guidance_refs,
                 pending_disposition_inputs,
             )
         };
-        if let Some((intervention, observation)) = fuse_intervention {
+        if let Some((mut intervention, observation)) = fuse_intervention {
+            record_undelivered_guidance(&mut intervention, &undelivered_guidance_refs);
             let mut synthesize = dynamic_node(
                 ticket,
                 0,
@@ -799,10 +1141,39 @@ where
             NextModelControlPlanePriority::ExistingConstraint
         ) && !clean_terminal_synthesis
         {
-            if force_text_only_response {
+            // Hard invariant: while the framework still owes the model a
+            // mandatory action, it may not withdraw the tools that perform it.
+            //
+            // Run one19 broke exactly here. Its root Team completed, which set
+            // `force_text_only_next_model` on the strength of "a verified
+            // collaboration terminal leaves only presentation" - and at that
+            // same moment a `issue_requires_classification` gap opened that only
+            // `message_publish` can close. The next six provider requests went
+            // out with `tool_array_bytes == 0`; the model stated in its own
+            // final answer that the executable tool set was empty and that it
+            // could not classify the issue. Asking for an action and removing
+            // the only means of taking it is a framework defect, not a model
+            // failure, and it is fenced here rather than at each of the five
+            // sites that set the flag.
+            let mandatory_action_outstanding = {
+                let state = self.state.lock().await;
+                state.completion_gap_outstanding || !state.outstanding_closure_rungs.is_empty()
+            };
+            if force_text_only_response && !mandatory_action_outstanding {
                 runtime.require_next_model_final_response();
             } else if let Some(tool_ids) = force_tool_allowlist {
                 runtime.require_next_model_tool_action(tool_ids);
+            } else if mandatory_action_outstanding {
+                // Nothing pinned a tool, but one is owed. Name the tools that can
+                // close what is outstanding instead of sending a tool-less
+                // request the model cannot act on.
+                let required = {
+                    let state = self.state.lock().await;
+                    mandatory_action_tool_ids(&state)
+                };
+                if !required.is_empty() {
+                    runtime.require_next_model_tool_action(required);
+                }
             }
             if let Some(effort) = force_reasoning_effort {
                 runtime.require_next_model_reasoning_effort(effort);
@@ -1665,6 +2036,13 @@ where
                                 missing.push("a final response in the user's language".to_string());
                                 if !recover_write {
                                     state.force_text_only_next_model = true;
+                                    tracing::warn!(
+                                        target: "cowd::text_only_step",
+                                        site = "root_goal_acceptance_or_language_recovery",
+                                        completion_gap_outstanding = state.completion_gap_outstanding,
+                                        outstanding_closure_rungs = ?state.outstanding_closure_rungs,
+                                        "a text-only model step was armed; the invariant at the model-step boundary keeps the closing tool available while a mandatory action is outstanding"
+                                    );
                                 }
                             }
                             let reason = format!(
@@ -2110,6 +2488,13 @@ where
                                 state.content.push_str("\n\n");
                                 state.content.push_str(&instruction);
                                 state.force_text_only_next_model = true;
+                                tracing::warn!(
+                                    target: "cowd::text_only_step",
+                                    site = "terminal_presentation_recovery",
+                                    completion_gap_outstanding = state.completion_gap_outstanding,
+                                    outstanding_closure_rungs = ?state.outstanding_closure_rungs,
+                                    "a text-only model step was armed; the invariant at the model-step boundary keeps the closing tool available while a mandatory action is outstanding"
+                                );
                                 model_intervention =
                                     Some(harness_contract::goal::RuntimeIntervention {
                                         goal_id: state.goal_id.clone(),
@@ -2973,13 +3358,37 @@ where
             .await
             .extend_messages(messages);
         if let Some(required_team_count) = required_control_plane_team_count {
+            // `program_admitted` and `required_actions` used to be literals:
+            // `false` and `[team_create, agent_invite, task_publish]` on every
+            // event, forever. Run one19 emitted 19 of them - including the ones
+            // written after `team_create` succeeded, six Agents were invited and
+            // three Tasks were accepted - so the durable journal asserted the
+            // Program was never admitted while the Program projection said it
+            // was complete. A monitoring layer that trusts this event reads a
+            // lie; a model that trusts it is told to redo finished work. Derive
+            // both from the Program the Runtime actually holds.
+            let program = super::root_agentic_program_projection(
+                self.services.as_ref(),
+                &session_id,
+                &turn_id,
+            );
+            let (program_admitted, mut required_actions, closure_steps) =
+                root_control_plane_requirement(program.as_ref(), required_team_count);
+            // The event is a statement about what is still owed, so its status
+            // has to say whether anything is.
+            let status = if program_admitted && required_actions.is_empty() {
+                "satisfied"
+            } else {
+                "waiting"
+            };
+            required_actions.sort_unstable();
             self.services
                 .event_store()
                 .append(crate::RuntimeEventInput {
                     stream_id: format!("session:{session_id}"),
                     scope: crate::RuntimeEventScope::Session,
                     kind: "runtime.control_plane.required".to_string(),
-                    status: Some("waiting".to_string()),
+                    status: Some(status.to_string()),
                     actor: Some("conversation_runtime.root_control_plane".to_string()),
                     refs: vec![
                         crate::RuntimeEventRef {
@@ -2997,12 +3406,9 @@ where
                     ],
                     payload: serde_json::json!({
                         "required_team_count": required_team_count,
-                        "required_actions": [
-                            harness_contract::agent_action::TEAM_CREATE_TOOL_ID,
-                            harness_contract::agent_action::AGENT_INVITE_TOOL_ID,
-                            harness_contract::agent_action::TASK_PUBLISH_TOOL_ID,
-                        ],
-                        "program_admitted": false,
+                        "required_actions": required_actions,
+                        "program_admitted": program_admitted,
+                        "closure_steps": closure_steps,
                     }),
                 })
                 .map_err(|error| NodeExecutorError::Poll {
@@ -3013,6 +3419,90 @@ where
         tracing::debug!(node_id = %ticket.node_id, "committed model transcript published");
         Ok(())
     }
+}
+
+/// What the root control-plane event must assert, derived from the Program the
+/// Runtime actually holds.
+///
+/// Returns `(program_admitted, required_actions, closure_steps)`. `required_actions`
+/// names only the admission actions that are genuinely still missing, and
+/// `closure_steps` the Program-owned rungs still outstanding, so the event states
+/// what is owed rather than replaying a fixed list. A caller with no Program at all
+/// gets the original three actions, which is the only state in which they are true.
+pub(super) fn root_control_plane_requirement(
+    program: Option<&crate::AgenticProgramProjection>,
+    required_team_count: u8,
+) -> (bool, Vec<&'static str>, Vec<String>) {
+    let Some(program) = program else {
+        return (
+            false,
+            vec![
+                harness_contract::agent_action::TEAM_CREATE_TOOL_ID,
+                harness_contract::agent_action::AGENT_INVITE_TOOL_ID,
+                harness_contract::agent_action::TASK_PUBLISH_TOOL_ID,
+            ],
+            Vec::new(),
+        );
+    };
+    if program.teams.is_empty() {
+        return (
+            false,
+            vec![
+                harness_contract::agent_action::TEAM_CREATE_TOOL_ID,
+                harness_contract::agent_action::AGENT_INVITE_TOOL_ID,
+                harness_contract::agent_action::TASK_PUBLISH_TOOL_ID,
+            ],
+            Vec::new(),
+        );
+    }
+    let mut actions = Vec::new();
+    if program.teams.len() < usize::from(required_team_count) {
+        actions.push(harness_contract::agent_action::TEAM_CREATE_TOOL_ID);
+    }
+    if program.agents.is_empty() {
+        actions.push(harness_contract::agent_action::AGENT_INVITE_TOOL_ID);
+    }
+    if program.tasks.is_empty() {
+        actions.push(harness_contract::agent_action::TASK_PUBLISH_TOOL_ID);
+    }
+    let steps = super::outstanding_closure_steps(program)
+        .into_iter()
+        .filter(|step| step != "objective_complete_request")
+        .collect::<Vec<_>>();
+    (true, actions, steps)
+}
+
+/// The tool set that can close whatever mandatory action is still outstanding.
+///
+/// It is deliberately wider than one tool: closing an issue gap legitimately
+/// needs the references read first, and a one-tool allowlist that the model
+/// cannot satisfy without a read produces an invalid `required` tool choice
+/// (`provider_plane` fails closed to an omitted choice in that case, which is
+/// how the model ends up tool-less again).
+fn mandatory_action_tool_ids(state: &super::super::host::TurnGraphState) -> BTreeSet<String> {
+    let mut tools = BTreeSet::new();
+    for tool in state.outstanding_closure_rungs.iter().map(String::as_str) {
+        match tool {
+            "classify_issues" | "resolve_issue" => {
+                tools.insert("message_publish".to_string());
+            }
+            "objective_review" => {
+                tools.insert("objective_review".to_string());
+            }
+            "publish_integration_task" => {
+                tools.insert("task_publish".to_string());
+            }
+            "objective_complete_request" => {
+                tools.insert("objective_complete_request".to_string());
+            }
+            _ => {}
+        }
+    }
+    // Reads are always allowed: every closing action above takes references, and
+    // the gap text names them.
+    tools.insert("state_inspect".to_string());
+    tools.insert("evidence_retrieve".to_string());
+    tools
 }
 
 fn next_unverified_model_step_streak(current: usize, made_verified_progress: bool) -> usize {
@@ -3154,9 +3644,24 @@ pub(super) fn loop_block_after() -> usize {
 /// Pollers legitimately re-issue identical calls while waiting on external
 /// progress, so an unchanged result is expected rather than a loop. They are
 /// exempt from the identical-call notice to avoid false positives.
-fn is_loop_nudge_repeatable_tool(tool_name: &str) -> bool {
-    let lower = tool_name.to_ascii_lowercase();
-    lower == "process" || lower.ends_with("_get_result") || lower.ends_with("_poll")
+fn is_loop_nudge_repeatable_tool(call: &ModelToolCall) -> bool {
+    let lower = call.name.to_ascii_lowercase();
+    if lower == "process" || lower.ends_with("_get_result") || lower.ends_with("_poll") {
+        return true;
+    }
+    // `state_inspect(wait_for_workers=true)` is the documented wait: the model
+    // parks on it until a worker moves, so an unchanged answer is its normal
+    // contract and repeating it is not a loop. A point lookup of one entry is
+    // a different thing entirely and must keep counting.
+    lower == "state_inspect" && call_declares_wait_for_workers(call)
+}
+
+/// Whether this call's input asks Runtime to wait for workers.
+fn call_declares_wait_for_workers(call: &ModelToolCall) -> bool {
+    serde_json::from_str::<serde_json::Value>(&call.input)
+        .ok()
+        .and_then(|value| value.get("wait_for_workers").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3207,53 +3712,22 @@ pub(super) fn tool_scope_cap(tool_name: &str) -> usize {
 /// Opt-in result deduplication. When enabled, large byte-identical duplicate
 /// tool-result payloads are replaced by a short reference stub so a repeating
 /// model cannot inflate the context. Default **off**.
-pub(super) fn loop_stub_results_enabled() -> bool {
+/// Whether byte-identical duplicate result payloads keep re-entering context.
+///
+/// Default **on**: the durable evidence is untouched either way (bytes stay keyed
+/// by `tool_call` id and `evidence_retrieve` returns them in full), so the only
+/// thing an operator loses by stubbing is the ability to re-read a payload it
+/// already has. Set `COWD_LOOP_STUB_RESULTS=0` to opt out.
+pub(super) fn result_stub_disabled() -> bool {
     matches!(
         std::env::var("COWD_LOOP_STUB_RESULTS").ok().as_deref(),
-        Some("1") | Some("true") | Some("TRUE")
+        Some("0") | Some("false") | Some("FALSE")
     )
 }
 
 /// Payloads smaller than this are not worth stubbing: the stub itself plus the
 /// lost locality would outweigh the savings. Error results are never stubbed.
 const IDENTICAL_RESULT_STUB_MIN_CHARS: usize = 512;
-
-/// Replace large byte-identical duplicate tool-result payloads with a short
-/// reference stub. Returns the number of payloads stubbed. Pure and directly
-/// unit-testable; callers only invoke it when `COWD_LOOP_STUB_RESULTS` is on.
-fn stub_duplicate_result_payloads(messages: &mut [ConversationMessage]) -> usize {
-    let mut first_seen: std::collections::HashMap<(String, String), String> =
-        std::collections::HashMap::new();
-    let mut stubbed = 0usize;
-    for message in messages.iter_mut() {
-        for block in message.blocks.iter_mut() {
-            let ContentBlock::ToolResult {
-                tool_use_id,
-                tool_name,
-                output,
-                is_error,
-            } = block
-            else {
-                continue;
-            };
-            if *is_error || output.len() < IDENTICAL_RESULT_STUB_MIN_CHARS {
-                continue;
-            }
-            let key = (tool_name.clone(), output.clone());
-            match first_seen.get(&key) {
-                Some(origin) => {
-                    *output =
-                        format!("[duplicate identical `{tool_name}` result omitted; see {origin}]");
-                    stubbed = stubbed.saturating_add(1);
-                }
-                None => {
-                    first_seen.insert(key, format!("tool_call:{tool_use_id}"));
-                }
-            }
-        }
-    }
-    stubbed
-}
 
 /// Optional objective-level wall-clock cost ceiling for a required-Team
 /// collaboration turn. Configurable with `COWD_COLLABORATION_BUDGET_SECS`;
@@ -3298,8 +3772,23 @@ fn closure_drive_after_steps() -> usize {
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(3)
+        .unwrap_or(CLOSURE_DRIVE_AFTER_STEPS_DEFAULT)
 }
+
+/// How long to wait before the framework drives the completion request on the
+/// root's behalf once the closure gate passes.
+///
+/// The gate - no outstanding rung, no Goal completion gap, no request already
+/// pending - is itself the proof that the closure is ready, so waiting several
+/// more root steps buys no confirmation and spends the window. One live run
+/// satisfied the Objective review and then used its remaining steps closing
+/// Tasks; the request that would have bound the verdict never came, and the
+/// turn ended cancelled with the Goal still open.
+///
+/// The gate self-corrects against premature driving: publishing another Task
+/// raises `published` above `accepted`, which makes `accepted_task` outstanding
+/// again and closes the gate on the next step.
+const CLOSURE_DRIVE_AFTER_STEPS_DEFAULT: usize = 1;
 
 /// The Objective milestones the no-progress fuse measures.
 ///
@@ -3999,35 +4488,6 @@ mod safety_fuse_streak_tests {
         );
     }
 
-    #[test]
-    fn duplicate_result_payloads_are_stubbed_except_errors_and_small_payloads() {
-        use super::{ContentBlock, ConversationMessage, stub_duplicate_result_payloads};
-        let big = "x".repeat(600);
-        let small = "tiny".to_string();
-        let mut messages = vec![
-            ConversationMessage::tool_result("call-1", "read_file", big.clone(), false),
-            ConversationMessage::tool_result("call-2", "read_file", big.clone(), false),
-            ConversationMessage::tool_result("call-3", "read_file", small.clone(), false),
-            ConversationMessage::tool_result("call-4", "read_file", small.clone(), false),
-            ConversationMessage::tool_result("call-5", "read_file", big.clone(), true),
-        ];
-        let stubbed = stub_duplicate_result_payloads(&mut messages);
-        // Only the second large successful payload is a stub candidate: small
-        // payloads are left alone and error payloads are never stubbed.
-        assert_eq!(stubbed, 1);
-        let outputs = messages
-            .iter()
-            .map(|message| match message.blocks.first() {
-                Some(ContentBlock::ToolResult { output, .. }) => output.clone(),
-                _ => unreachable!(),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(outputs[0], big);
-        assert!(outputs[1].contains("duplicate identical"));
-        assert_eq!(outputs[2], small);
-        assert_eq!(outputs[3], small);
-        assert_eq!(outputs[4], big);
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5900,6 +6360,13 @@ where
         state
             .pending_transcript
             .insert(ticket.node_id.clone(), result.messages.clone());
+        // A successful tool batch is real progress: whatever the model concluded
+        // before it, the situation is now different, so a later restatement is a
+        // new answer rather than a loop.
+        if !successful_call_ids.is_empty() {
+            state.last_terminal_answer_digest.clear();
+            state.repeated_terminal_answers = 0;
+        }
         state.successful_tool_calls = state
             .successful_tool_calls
             .saturating_add(successful_call_ids.len());
@@ -5928,21 +6395,23 @@ where
         let loop_repeatable = !calls.is_empty()
             && calls
                 .iter()
-                .all(|call| is_loop_nudge_repeatable_tool(&call.name));
+                .all(is_loop_nudge_repeatable_tool);
         let batch_result_digest = terminal_evidence_digest(&result.messages);
         if loop_repeatable {
             state.identical_action_streak = 0;
             state.identical_action_digest.clear();
             state.identical_action_result_digest.clear();
-        } else if state.identical_action_digest == action_fingerprint
-            && state.identical_action_result_digest == batch_result_digest
-        {
-            state.identical_action_streak = state.identical_action_streak.saturating_add(1);
         } else {
-            state.identical_action_digest = action_fingerprint.clone();
-            state.identical_action_result_digest = batch_result_digest;
-            state.identical_action_streak = 1;
+            state.identical_action_streak = next_identical_action_streak(
+                &state.identical_action_digest,
+                &action_fingerprint,
+                state.identical_action_streak,
+            );
+            if state.identical_action_digest != action_fingerprint {
+                state.identical_action_digest = action_fingerprint.clone();
+            }
         }
+        state.identical_action_result_digest = batch_result_digest;
         match evaluate_loop_guard(
             state.identical_action_streak,
             loop_nudge_after(),
@@ -5955,7 +6424,7 @@ where
                     ContextSourceKind::ToolTrace,
                     ContextRole::Instruction,
                     format!(
-                        "This is the {streak}th consecutive identical tool call (same tools, same arguments, same result). Do not repeat it: change the arguments, use a different tool, or proceed with the evidence you already have."
+                        "This is the {streak}th consecutive identical tool call (same tools, same arguments). Do not repeat it: change the arguments, use a different tool, or proceed with the evidence you already have. A wait declared with wait_for_workers is never counted here."
                     ),
                 );
                 item.authority = ContextAuthority::System;
@@ -6142,16 +6611,15 @@ where
             state.consecutive_low_novelty_batches = 0;
         }
         let has_successful_tool_evidence = state.successful_tool_calls > 0;
-        let delegated_failure_replan_available = delegated_tool_failure_replan_available(
-            bounded_evidence_role,
+        let cold_start_failure_replan_available = super::cold_start_tool_failure_replan_available(
             has_successful_tool_evidence,
-            state.delegated_failure_replans,
+            state.cold_start_failure_replans,
         );
-        if repeated_local_failures && delegated_failure_replan_available {
+        if repeated_local_failures && cold_start_failure_replan_available {
             // Consume the single semantic-replan lease before releasing the
             // state guard. The next model step receives a fresh failure
             // streak, while a second consecutive failure is still terminal.
-            state.delegated_failure_replans = state.delegated_failure_replans.saturating_add(1);
+            state.cold_start_failure_replans = state.cold_start_failure_replans.saturating_add(1);
             state.consecutive_tool_failure_batches = 0;
         }
         let newly_completed_program_team_ids = completed_program_team_ids(&result.messages);
@@ -6160,20 +6628,36 @@ where
             state.collaboration_obligation.as_ref(),
             &newly_completed_program_team_ids,
         );
-        if loop_stub_results_enabled() && state.identical_action_streak >= 2 && failed == 0 {
-            // Opt-in context dedup for a repeating model: replace large
-            // byte-identical duplicate payloads in the retained transcript with
-            // a short reference stub. Evidence stays keyed by tool_call id, so
-            // dedup only shrinks redundant context.
-            let mut deduped = result.messages;
-            stub_duplicate_result_payloads(&mut deduped);
-            state.tool_results.extend(deduped);
+        if failed == 0 && !result_stub_disabled() {
+            // Byte-identical duplicate payloads never re-enter context. A model
+            // that cannot find what it already read reads it again, and every
+            // re-read puts the whole payload back - one live delegated Agent did
+            // the same `read_file` sixteen times over three and a half minutes
+            // against a 145k-token context.
+            //
+            // The dedup is seeded from the whole turn transcript, not just this
+            // batch: those sixteen reads were each in their own round, so a
+            // per-batch map never saw a repeat and stubbed nothing. Stubbing is
+            // default-on because the durable evidence is untouched - bytes stay
+            // keyed by tool_call id and `evidence_retrieve` still returns them
+            // in full. An operator opts out with COWD_LOOP_STUB_RESULTS=0.
+            let mut transcript = std::mem::take(&mut state.tool_results);
+            transcript.extend(result.messages);
+            crate::summary_compression::stub_duplicate_result_payloads(&mut transcript);
+            state.tool_results = transcript;
         } else {
             state.tool_results.extend(result.messages);
         }
         if completed_root_team_this_batch {
             // A verified collaboration terminal leaves only presentation.
             state.force_text_only_next_model = true;
+            tracing::warn!(
+                target: "cowd::text_only_step",
+                site = "completed_root_team_this_batch",
+                completion_gap_outstanding = state.completion_gap_outstanding,
+                outstanding_closure_rungs = ?state.outstanding_closure_rungs,
+                "a text-only model step was armed; the invariant at the model-step boundary keeps the closing tool available while a mandatory action is outstanding"
+            );
             state.force_reasoning_effort_next_model = Some("none".to_string());
         }
         if focus_synthesis_ready {
@@ -6192,6 +6676,13 @@ where
             // while provider-private reasoning, tool schemas, and stale protocol
             // turns cannot inflate the reduction request.
             state.force_text_only_next_model = true;
+            tracing::warn!(
+                target: "cowd::text_only_step",
+                site = "focus_synthesis_ready",
+                completion_gap_outstanding = state.completion_gap_outstanding,
+                outstanding_closure_rungs = ?state.outstanding_closure_rungs,
+                "a text-only model step was armed; the invariant at the model-step boundary keeps the closing tool available while a mandatory action is outstanding"
+            );
             state.force_reasoning_effort_next_model = Some("none".to_string());
             state.clean_terminal_synthesis_attempted = true;
             state.clean_terminal_synthesis_next = true;
@@ -6453,17 +6944,17 @@ where
         } else if repeated_local_failures {
             Some(RuntimeIntervention {
                 goal_id: goal_id.clone(),
-                kind: if delegated_failure_replan_available {
+                kind: if cold_start_failure_replan_available {
                     RuntimeInterventionKind::Replan
                 } else if has_successful_tool_evidence {
                     RuntimeInterventionKind::Synthesize
                 } else {
                     RuntimeInterventionKind::Block
                 },
-                reason: if delegated_failure_replan_available {
+                reason: if cold_start_failure_replan_available {
                     format!(
-                        "{}: one bounded delegated recovery lease is available: change the failed tool approach, inspect the exact Runtime diagnostic, and execute only an exposed authorized action; a second consecutive failure will block",
-                        DELEGATED_TOOL_FAILURE_REPLAN_MARKER
+                        "{}: one bounded cold-start recovery lease is available: read the exact Runtime diagnostic on each rejected call, change the tool or its arguments, and execute only an exposed authorized action; a second consecutive failure will block",
+                        COLD_START_TOOL_FAILURE_REPLAN_MARKER
                     )
                 } else if has_successful_tool_evidence {
                     "multiple consecutive tool batches failed after checked evidence was already retained; stop retrying and synthesize the bounded result with the failure explicit"
@@ -6621,6 +7112,13 @@ where
                             node
                         } else {
                             state.force_text_only_next_model = true;
+                            tracing::warn!(
+                                target: "cowd::text_only_step",
+                                site = "bounded_evidence_role_terminal",
+                                completion_gap_outstanding = state.completion_gap_outstanding,
+                                outstanding_closure_rungs = ?state.outstanding_closure_rungs,
+                                "a text-only model step was armed; the invariant at the model-step boundary keeps the closing tool available while a mandatory action is outstanding"
+                            );
                             state.content.push_str(
                                 "\n\nRuntime evidence checkpoint: the required evidence is complete, but no valid terminal presentation is available. Tools are disabled for the next response. Give every required Team output field using native structured output, JSON, Markdown headings, or `Field: value` labels, and ground every claim in retained receipts. State risks or unresolved work explicitly when applicable.\n",
                             );

@@ -1235,7 +1235,7 @@ async fn exercise_reviewed_goal_delivery(
             .await
             .err()
             .unwrap()
-            .contains("attempt is stale")
+            .contains("review attempt generation is stale")
     );
     let mut stolen_run = review_envelope.clone();
     stolen_run.action_id = "review-with-producer-run".into();
@@ -1645,6 +1645,7 @@ async fn exercise_reviewed_goal_delivery(
                     ],
                     evidence_refs: vec![content.selector.clone()],
                     reason_ref: content.selector.clone(),
+                    reason: String::new(),
                 },
             ),
         };
@@ -1881,6 +1882,7 @@ async fn exercise_reviewed_goal_delivery(
                 result_refs: vec![artifact.clone()],
                 evidence_refs: vec![content.selector.clone()],
                 reason_ref: content.selector.clone(),
+                reason: String::new(),
             }),
         )))
         .await
@@ -1917,6 +1919,7 @@ async fn exercise_reviewed_goal_delivery(
                 result_refs: vec![artifact.clone()],
                 evidence_refs: vec![content.selector.clone()],
                 reason_ref: content.selector.clone(),
+                reason: String::new(),
             }),
         )))
         .await
@@ -4297,6 +4300,7 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
                 result_refs: refs,
                 evidence_refs: vec![content.selector.clone()],
                 reason_ref: content.selector.clone(),
+                reason: String::new(),
             }),
         )
     };

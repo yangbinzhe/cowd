@@ -1422,6 +1422,7 @@ where
         //
         // The boundary matters: a reviewer of this file should be able to tell at a
         // glance which layer a block belongs to, and why it is or is not shared.
+        let answer_digest = terminal_answer_digest(&final_answer);
         {
             let mut state = self.state.lock().await;
             state.delivery_envelope = Some(envelope.clone());
@@ -1429,6 +1430,17 @@ where
             state.terminal_commit_owner = Some((ticket.node_id.clone(), ticket.attempt));
             state.committed_terminal_answer = Some(final_answer.clone());
             state.committed_terminal_completion = Some(completion);
+            // The observer for "the model stopped acting and started restating".
+            // A terminal answer that recurs with no intervening successful tool
+            // call is not a new conclusion, and counting it is what turns a
+            // silent loop into a visible, actable one.
+            if state.last_terminal_answer_digest == answer_digest {
+                state.repeated_terminal_answers =
+                    state.repeated_terminal_answers.saturating_add(1);
+            } else {
+                state.last_terminal_answer_digest = answer_digest.clone();
+                state.repeated_terminal_answers = 0;
+            }
         }
         let digest = format!("{:x}", Sha256::digest(final_answer.as_bytes()));
         let mut outcome = NodeExecutionOutcome::new(completed_result(
@@ -1457,11 +1469,19 @@ where
             // root finished too early. Do not fail the turn: return the root to
             // continue (bounded) with the gap disclosed, so it can classify
             // outstanding issues and get every Task accepted before completing.
-            if let Some(gap) = crate::agentic::agentic_program_completion_gap(
+            let recorded_gap = crate::agentic::agentic_program_completion_gap(
                 self.services.as_ref(),
                 &session_id,
                 &turn_id,
-            ) {
+            );
+            {
+                let mut state = self.state.lock().await;
+                // The obligation is recomputed from Goal truth on every
+                // presentation: a gap that just cleared must release the
+                // tool-availability guarantee with it.
+                state.completion_gap_outstanding = recorded_gap.is_some();
+            }
+            if let Some(gap) = recorded_gap {
                 let continue_gap = {
                     let mut state = self.state.lock().await;
                     claim_continuation_budget(&mut state, "completion_gap")
@@ -1514,26 +1534,62 @@ where
                     .into_iter()
                     .filter(|step| step != "objective_complete_request")
                     .collect::<Vec<_>>();
+                {
+                    let mut state = self.state.lock().await;
+                    state.outstanding_closure_rungs = outstanding.clone();
+                }
                 if !outstanding.is_empty() {
-                    let continue_rungs = {
+                    let (continue_rungs, repeated_answer, attempt) = {
                         let mut state = self.state.lock().await;
-                        claim_continuation_budget(&mut state, "closure_rung")
+                        let allowed = claim_continuation_budget(&mut state, "closure_rung");
+                        (allowed, state.repeated_terminal_answers, state.completion_gap_continuations)
                     };
                     if continue_rungs {
                         self.abandon_published_terminal().await;
                         observe_stage!("closure_rung_terminal_rollback");
-                        let mut item = ContextItem::new(
-                            format!("closure-rung-continuation:{}", ticket.node_id),
-                            ContextSourceKind::Task,
-                            ContextRole::Instruction,
+                        {
+                            let mut state = self.state.lock().await;
+                            state.force_text_only_next_model = false;
+                        }
+                        // Same escalation contract as the completion-gap path: a
+                        // repeated rung with a repeated answer is a loop, not a
+                        // plan, and the framework says so instead of restating.
+                        let escalation = if repeated_answer >= 2 {
                             format!(
+                                "ESCALATION (attempt {attempt}, identical answer #{repeated}): the same outstanding \
+                                 rungs have now been shown {attempt} time(s) and you have returned the same final answer \
+                                 {repeated} time(s) without a tool call. A restated answer is not delivered. Runtime has \
+                                 restricted this step to the actions that advance these rungs.",
+                                attempt = attempt,
+                                repeated = repeated_answer
+                            )
+                        } else if repeated_answer >= 1 || attempt >= 2 {
+                            format!(
+                                "NOTICE (attempt {attempt}): these rungs were already outstanding {attempt} time(s). \
+                                 Another prose answer will not be delivered; take the action that advances them.",
+                                attempt = attempt
+                            )
+                        } else {
+                            String::new()
+                        };
+                        let body = format!(
                                 "Runtime returned this turn to work because the collaboration is not finished: outstanding rungs: {}. \
                                  A submitted Task still needs its independent review by a different Agent, and the objective-review \
                                  Task is no exception. Invite or assign a reviewer inside the existing Team (do not create another \
                                  Team), have it read the submitted report through read_ref or evidence_retrieve and record its \
                                  task_review verdict, then present the final answer again.",
                                 outstanding.join(", ")
-                            ),
+                        );
+                        let guidance = if escalation.is_empty() {
+                            body
+                        } else {
+                            format!("{body}\n\n{escalation}")
+                        };
+                        let mut item = ContextItem::new(
+                            format!("closure-rung-continuation:{}", ticket.node_id),
+                            ContextSourceKind::Task,
+                            ContextRole::Instruction,
+                            guidance,
                         );
                         item.authority = ContextAuthority::System;
                         item.visibility = ContextVisibility::Private;
@@ -2068,19 +2124,27 @@ where
     /// And the one-shot terminal state has to be cleared, because the step that
     /// just finished was a zero-tool clean terminal synthesis.
     async fn push_completion_gap_guidance(&self, ticket: &NodeExecutionTicket, gap: &str) {
+        // Read the escalation counters before taking the lock again: how many
+        // times this same gap has already been shown, and how many times the
+        // model has already answered it with the same words.
+        let (attempt, repeated_answer) = {
+            let state = self.state.lock().await;
+            (
+                state.completion_gap_continuations,
+                state.repeated_terminal_answers,
+            )
+        };
+        let kind = crate::agentic::issues::completion_gap_kind(gap);
         {
             let mut state = self.state.lock().await;
             state.clean_terminal_synthesis_next = false;
             state.force_text_only_next_model = false;
             state.force_tool_allowlist_next_model = None;
+            // The framework now owes the model a mandatory action, so the next
+            // model step must keep the tool that performs it.
+            state.completion_gap_outstanding = true;
         }
-        let mut item = ContextItem::new(
-            format!("objective-completion-gap:{}", ticket.node_id),
-            ContextSourceKind::Task,
-            ContextRole::Instruction,
-            if gap.contains("original_intent_review_required")
-                || gap.contains("criterion_review_required")
-            {
+        let body = if kind == crate::agentic::issues::CompletionGapKind::ObjectiveReview {
                 // The scope discipline is shared with the Program receipt's
                 // actionable guidance. Both sites read it from the order
                 // contract so a rule change cannot land on one layer only.
@@ -2089,8 +2153,10 @@ where
                     "Runtime returned this turn to work because the Objective is not complete yet: {gap}. \
                      The final answer you just wrote is not being delivered. This is an Objective-review \
                      gap, not a Task-issue classification gap: {scope}. If every current Agent produced one of the delivered result artifacts, \
-                     invite a fresh reviewer Agent inside the existing Team (do not create another Team) \
-                     and give it a narrowly scoped Objective-review Task. The reviewer must use read-only \
+                     give the Objective-review Task to a reviewer Agent inside the existing Team (do not create \
+                     another Team). Use the reviewer you already have: a retry by the same Agent after it reads \
+                     counts, while inviting a new one discards the reads it already made and starts over. Only \
+                     invite a different physical reviewer when Runtime explicitly requires one. The reviewer must \
                      tools such as `read_ref` to inspect each current delivered result and its durable \
                      evidence, then call `objective_review` under its Runtime-bound Agent identity for the \
                      exact open criterion with decision `satisfied`, `gap` or `blocked`, current \
@@ -2120,13 +2186,97 @@ where
                      labelled limitation without asserting an estimate is a measurement. Then present the \
                      final answer again."
                 )
-            },
+            };
+            // Escalation. The guidance above is a pure function of the gap, so
+            // an unchanged gap produced an unchanged instruction on every
+            // continuation: run one19 received byte-identical text on five
+            // consecutive rounds (the only difference in the whole context
+            // envelope was `elapsed_ms` and `rounds`) and answered with the same
+            // final answer every time. Restating the same request is not an
+            // intervention. From the second occurrence the instruction says so,
+            // names the counter, and states that a prose restatement will not be
+            // delivered; from the third it stops asking and pins the tool.
+            let escalation = if repeated_answer >= 2 {
+                format!(
+                    "ESCALATION (attempt {attempt}, identical answer #{repeated}): this exact gap was already \
+                     shown to you {attempt} time(s) and you have now returned the same final answer {repeated} \
+                     time(s) without calling a single tool. Runtime does not deliver a restated answer. The only \
+                     action that clears this gap is `{tool}`. Your next response MUST be that tool call and \
+                     nothing else; Runtime has restricted this step to it. Read the required references first if \
+                     you have not, then call it.",
+                    attempt = attempt,
+                    repeated = repeated_answer,
+                    tool = kind.closing_tool()
+                )
+            } else if repeated_answer >= 1 || attempt >= 2 {
+                format!(
+                    "NOTICE (attempt {attempt}): you have already been shown this gap {attempt} time(s). \
+                     Another prose answer will not be delivered either. Take the action named above - `{tool}` \
+                     - and only then present the final answer.",
+                    attempt = attempt,
+                    tool = kind.closing_tool()
+                )
+            } else {
+                String::new()
+            };
+        let guidance = if escalation.is_empty() {
+            body
+        } else {
+            format!("{body}\n\n{escalation}")
+        };
+        let mut item = ContextItem::new(
+            format!("objective-completion-gap:{}", ticket.node_id),
+            ContextSourceKind::Task,
+            ContextRole::Instruction,
+            guidance,
         );
         item.authority = ContextAuthority::System;
         item.visibility = ContextVisibility::Private;
         item.evidence = vec![format!("execution_node:{}", ticket.node_id)];
+        // Once prose has demonstrably stopped working, stop accepting it. The
+        // framework is not choosing the model's decision here - it is removing
+        // the one response shape that has already failed repeatedly, so the next
+        // step has to be the action that closes the gap.
+        if repeated_answer >= 2 {
+            let mut allow = std::collections::BTreeSet::new();
+            allow.insert(kind.closing_tool().to_string());
+            // `state_inspect` and `evidence_retrieve` stay available because the
+            // closing action legitimately needs references read first, and the
+            // gap text names them.
+            allow.insert("state_inspect".to_string());
+            allow.insert("evidence_retrieve".to_string());
+            let mut state = self.state.lock().await;
+            state.force_tool_allowlist_next_model = Some(allow);
+            state.force_text_only_next_model = false;
+            tracing::warn!(
+                target: "cowd::completion_gap",
+                graph_id = %ticket.graph_id,
+                gap = %gap,
+                attempt,
+                repeated_answer,
+                closing_tool = kind.closing_tool(),
+                "repeated identical final answer with no tool call; pinning the next model step to the closing tool"
+            );
+        }
         self.runtime.lock().await.push_next_model_context_item(item);
     }
+}
+
+/// Digest of a terminal answer for repeat detection.
+///
+/// Whitespace and case are normalized away because the model restates its
+/// conclusion with cosmetic edits; the substance is what has to be identical
+/// for the answer to be a loop rather than a revision. Leading and trailing
+/// space, line breaks and runs of blanks are the only edits a restating model
+/// makes, so collapsing them is enough to catch the loop without conflating two
+/// genuinely different answers.
+pub(super) fn terminal_answer_digest(answer: &str) -> String {
+    let normalized = answer
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    format!("{:x}", Sha256::digest(normalized.as_bytes()))
 }
 
 /// Bounded number of times a success presentation is returned to continue

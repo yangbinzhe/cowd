@@ -179,6 +179,7 @@ fn action_purpose(action: &str) -> &'static str {
         "task_review" => "Independently accept, challenge, or request rework.",
         "message_publish" => "Publish a durable scoped discussion entry.",
         "artifact_commit" => "Attach a durable content reference and provenance.",
+        "objective_review" => "Settle one open Objective criterion with a satisfied/gap/blocked verdict over a set of delivered results.",
         "objective_complete_request" => "Ask the Supervisor to verify terminal invariants.",
         _ => "Apply one bounded semantic collaboration action.",
     }
@@ -220,6 +221,30 @@ pub fn runtime_capability_primer() -> String {
     .join("\n")
 }
 
+/// Byte ceiling for one primer section.
+///
+/// The primer lives in the shared Provider cache prefix, so it is entered on
+/// every turn of every session. An order that holds on every turn belongs in
+/// `agentic::order_contract`, which is the single source every prompt site
+/// reads; the primer should carry only what this turn needs. A section that
+/// outgrows its ceiling must be split or moved into the contract, not silently
+/// expanded - the old guard reported only a whole-primer byte count
+/// (`primer must stay small: 4376`), which named neither the rule that grew nor
+/// where it should go.
+///
+/// These ceilings are independent; the whole-primer budget asserted by
+/// `primer_is_short_and_states_ownership_and_exit_discipline` stays binding.
+const PRIMER_SECTION_BUDGETS: &[(&str, usize)] = &[
+    ("## Agent-first collaboration contract", 600),
+    ("## Shortest path first", 380),
+    ("## Text tool-call frame (only if you emit calls as text markup)", 1040),
+    ("## Closure discipline", 420),
+    ("## Canonical references", 260),
+    ("## Instruction precedence", 260),
+    ("## Recovery", 160),
+    ("## Collaboration rules (Agent-first)", 1290),
+];
+
 /// Usage guidance for the tools that are ACTUALLY callable on this request.
 /// A tool that is not callable gets no guidance, so a model is never told about
 /// a capability it cannot use — and the prompt stays proportional to the surface.
@@ -249,6 +274,11 @@ pub fn render_tool_guidance(present: &std::collections::BTreeSet<String>) -> Str
     if present.contains("read_file") {
         lines.push(
             "- `read_file`: one bounded window; `complete=true` yields a verifiable EOF receipt. On truncation continue from `nextOffset` instead of re-reading whole files.",
+        );
+    }
+    if present.contains("objective_review") {
+        lines.push(
+            "- `objective_review`: settle ONE open Objective criterion with decision `satisfied`, `gap` or `blocked`. It is the only action that satisfies the original user-intent criterion; a Task review, a prose assertion or a re-submitted completion request does not. Call it under a Runtime-bound Agent identity that is distinct from the producer of every result it reviews: give the review to a reviewer Agent in an EXISTING Team (never a new Team) and let that same Agent read each delivered result with `read_ref` or `evidence_retrieve` before it submits one review whose `result_refs` cover the full current set, with the evidence refs those reads produced and a durable `reason_ref`. A retry by that same Agent counts; inviting a new one discards the reads it already made. When a completion gap lists `uncovered_result_refs`, those are exactly the refs no current review covers yet.",
         );
     }
     if present.contains("bash") {
@@ -387,10 +417,80 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
 
 #[cfg(test)]
 mod prompt_core_tests {
-    use super::{render_tool_guidance, runtime_capability_primer};
+    use super::{render_tool_guidance, runtime_capability_primer, PRIMER_SECTION_BUDGETS};
 
     fn set(items: &[&str]) -> std::collections::BTreeSet<String> {
         items.iter().map(|item| (*item).to_string()).collect()
+    }
+
+    /// Split the primer on its `## ` headings, returning `(heading, bytes)`
+    /// with the heading line included in its own section.
+    fn primer_sections(primer: &str) -> Vec<(String, usize)> {
+        let mut sections: Vec<(String, usize)> = Vec::new();
+        for line in primer.split('\n') {
+            let is_heading = line.starts_with("## ");
+            if is_heading || sections.is_empty() {
+                sections.push((line.to_string(), line.len() + 1));
+                continue;
+            }
+            sections.last_mut().expect("section").1 += line.len() + 1;
+        }
+        sections
+    }
+
+    #[test]
+    fn every_primer_section_stays_inside_its_own_budget() {
+        let primer = runtime_capability_primer();
+        let sections = primer_sections(&primer);
+        for (heading, budget) in PRIMER_SECTION_BUDGETS {
+            let measured = sections
+                .iter()
+                .find(|(name, _)| name == heading)
+                .map(|(_, bytes)| *bytes)
+                .unwrap_or_else(|| panic!("primer lost the section {heading}"));
+            assert!(
+                measured <= *budget,
+                "primer section `{heading}` is {} bytes over its {budget}-byte ceiling: \
+                 split it, or move the rule into agentic::order_contract where every \
+                 prompt site reads it from one place",
+                measured.saturating_sub(*budget)
+            );
+        }
+        let declared: usize = PRIMER_SECTION_BUDGETS.iter().map(|(_, b)| b).sum();
+        assert!(
+            primer.len() <= declared,
+            "the primer outgrew the sum of its section ceilings"
+        );
+    }
+
+    /// A rule that exists in two places has two wordings, and the two drift.
+    /// Every order the contract owns must therefore appear exactly once: the
+    /// primer may paraphrase the situation, but never restate the rule.
+    #[test]
+    fn no_primer_section_restates_an_order_contract_rule() {
+        use crate::agentic::order_contract;
+        let primer = runtime_capability_primer().to_lowercase();
+        let rules = [
+            order_contract::TASK_AUTHORING_DISCIPLINE,
+            order_contract::REVIEWER_SCOPE_DISCIPLINE,
+            order_contract::EVIDENCE_ECONOMY,
+            order_contract::OBJECTIVE_REVIEW_SCOPE_DISCIPLINE,
+        ];
+        for rule in rules {
+            let lowered = rule.to_lowercase();
+            let words: Vec<&str> = lowered
+                .split(|ch: char| !ch.is_alphanumeric() && ch != '`' && ch != '_')
+                .filter(|word| !word.is_empty())
+                .collect();
+            for window in words.windows(6) {
+                let phrase = window.join(" ");
+                assert!(
+                    !primer.contains(&phrase),
+                    "the primer restates an order-contract rule (`{phrase}...`): \
+                     the contract is the single source; reference it, do not re-word it"
+                );
+            }
+        }
     }
 
     #[test]

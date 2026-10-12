@@ -1,3 +1,20 @@
+/// The Program-logical artifact key an `artifact://` selector spells, if it is one.
+///
+/// Runtime names a one-shot Task deliverable `artifact:<24 hex>` and repeats that
+/// spelling in the completion gap and the citable-refs projection. A model that
+/// adds the `://` itself produces a selector no ArtifactStore ever issued, so the
+/// store either refuses it or - worse - resolves it against an unrelated entry.
+/// Only the 24-hex shape is treated as logical: a real selector carries `art_`
+/// or `sha256:` and keeps going straight to the store.
+fn program_logical_artifact_key(selector: &str) -> Option<String> {
+    let target = selector.strip_prefix("artifact://")?;
+    if target.len() == 24 && target.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Some(format!("artifact:{target}"))
+    } else {
+        None
+    }
+}
+
 impl GatewayToolExecutor {
     async fn execute_authorized_output_with_progress(
         &self,
@@ -90,6 +107,7 @@ impl GatewayToolExecutor {
         ))
     }
 
+
     async fn execute_evidence_retrieve(
         &self,
         input: EvidenceRetrieveToolRequest,
@@ -157,6 +175,36 @@ impl GatewayToolExecutor {
                 access.media_type,
                 access.visibility_scope,
             )
+        } else if let Some(logical_key) = program_logical_artifact_key(&selector) {
+            // A 24-hex `artifact://` target is a Program-logical key by
+            // construction: real content selectors are `artifact://art_<hex>` or
+            // `artifact://sha256:<hex>`. Resolving it through the store first can
+            // succeed against an unrelated entry and silently return the wrong
+            // bytes - one live run read a deliverable four times and kept being
+            // told it had not read it, because every read came back with the
+            // source file instead of the report. Map the logical key to the
+            // selector the Program recorded, and only fall back to the store when
+            // no Program claims the key.
+            let mapped = services
+                .agent_action_service()
+                .list_programs()
+                .ok()
+                .and_then(|programs| {
+                    programs.iter().find_map(|program| {
+                        program
+                            .artifacts
+                            .get(&logical_key)
+                            .map(|artifact| artifact.content_ref.clone())
+                    })
+                });
+            match mapped {
+                Some(content_ref) => store.resolve(&content_ref).map_err(|error| {
+                    ToolError::new(format!("evidence_retrieve resolve failed: {error}"))
+                })?,
+                None => store.resolve(&selector).map_err(|error| {
+                    ToolError::new(format!("evidence_retrieve resolve failed: {error}"))
+                })?,
+            }
         } else {
             match store.resolve(&selector) {
                 Ok(artifact) => artifact,
@@ -245,5 +293,38 @@ impl GatewayToolExecutor {
             "coverage": page["coverage"],
         }))
         .map_err(|error| ToolError::new(error.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod program_logical_key_tests {
+    use super::program_logical_artifact_key;
+
+    #[test]
+    fn only_a_twenty_four_hex_artifact_selector_is_a_program_logical_key() {
+        // Runtime names a one-shot Task deliverable `artifact:<24 hex>` and the
+        // model routinely adds the `://` itself. That selector used to be
+        // resolved against the store first, which could succeed against an
+        // unrelated entry: one live run read a deliverable four times and kept
+        // being told it had not read it, because every read returned the source
+        // file instead of the report.
+        assert_eq!(
+            program_logical_artifact_key("artifact://576a1504640073bfc867d006").as_deref(),
+            Some("artifact:576a1504640073bfc867d006")
+        );
+        // A real content selector is not a logical key and keeps going straight
+        // to the store.
+        assert_eq!(
+            program_logical_artifact_key("artifact://art_4ada628cd226485d8e9ba4c14517d101"),
+            None
+        );
+        assert_eq!(
+            program_logical_artifact_key("artifact://sha256:07741e4ec372d6ce7d0391928a8ea9d5"),
+            None
+        );
+        // Other schemes and malformed targets are not ours to reinterpret.
+        assert_eq!(program_logical_artifact_key("tool://tool-raw-abc"), None);
+        assert_eq!(program_logical_artifact_key("artifact://not-hex-at-all"), None);
+        assert_eq!(program_logical_artifact_key("artifact://576a1504640073bfc867d00"), None);
     }
 }

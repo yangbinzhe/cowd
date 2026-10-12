@@ -540,7 +540,6 @@ impl GoalStore {
                     goal.review_refs.sort();
                     goal.review_refs.dedup();
                     goal.reviews.push(harness_contract::goal::ObjectiveReviewRecord {
-                        review_id,
                         criterion_ref: input.criterion_ref.clone(),
                         spec_revision: goal.spec_revision,
                         input_manifest_digest: goal.spec_digest.clone(),
@@ -550,7 +549,17 @@ impl GoalStore {
                         reviewer_execution_id: envelope.actor.execution_id.clone(),
                         producer_refs: producer_refs.clone(),
                         decision: decision.to_string(),
-                        reason_ref: input.reason_ref.clone(),
+                        // A review the model did not attach a report to still owes
+                        // a durable reason_ref. Runtime points it at this review's
+                        // own Goal record, which is durable by construction, so
+                        // downstream readers keep a resolvable reference without
+                        // the model having to write and commit a report first.
+                        reason_ref: if input.reason_ref.trim().is_empty() {
+                            format!("objective_review:{review_id}")
+                        } else {
+                            input.reason_ref.clone()
+                        },
+                        review_id,
                         verification: verification.cloned(),
                     });
                     // A satisfied review can retire the `completion_gap` that
@@ -2343,6 +2352,7 @@ mod tests {
                 result_refs: vec![],
                 evidence_refs: vec![material.selector.clone()],
                 reason_ref: material.selector.clone(),
+                reason: "the reviewed delivery does not yet cover every current result".to_string(),
             }),
         };
         let team = services
@@ -3016,6 +3026,7 @@ mod tests {
                     result_refs: vec![],
                     evidence_refs: vec![material.selector.clone()],
                     reason_ref: material.selector.clone(),
+                reason: "the reviewed delivery does not yet cover every current result".to_string(),
                 }),
             })
             .await
