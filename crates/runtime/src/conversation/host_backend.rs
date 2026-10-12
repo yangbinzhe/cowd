@@ -3688,6 +3688,39 @@ fn is_loop_nudge_repeatable_tool(call: &ModelToolCall) -> bool {
     lower == "state_inspect" && call_declares_wait_for_workers(call)
 }
 
+/// Count the successful, non-wait calls of one batch and report the ones that
+/// have now been issued enough times to stop carrying information.
+///
+/// Extracted so the filter is testable on its own: a call that failed is not
+/// evidence of a decision the model repeated, and a wait is not a repeat at all.
+/// Both exclusions are the difference between a diagnosis that helps and one that
+/// trains the model to ignore it.
+pub(super) fn record_repeated_calls(
+    turn_id: &str,
+    calls: &[ModelToolCall],
+    successful_call_ids: &std::collections::BTreeSet<String>,
+) -> Vec<(String, usize)> {
+    let mut repeated = Vec::new();
+    for call in calls {
+        if !successful_call_ids.contains(&call.id) {
+            continue;
+        }
+        // A wait is not a repeat: parking on `wait_for_workers` until a worker
+        // moves is the documented contract, and an unchanged answer is its normal
+        // result. Same exemption the streak guard uses.
+        if is_loop_nudge_repeatable_tool(call) {
+            continue;
+        }
+        let input_hash = crate::tool_invocation::stable_hash(&call.input);
+        if let Some(count) =
+            crate::repetition_guard::record_repeated_call(turn_id, &call.name, &input_hash)
+        {
+            repeated.push((call.name.clone(), count));
+        }
+    }
+    repeated
+}
+
 /// Whether this call's input asks Runtime to wait for workers.
 fn call_declares_wait_for_workers(call: &ModelToolCall) -> bool {
     serde_json::from_str::<serde_json::Value>(&call.input)
@@ -6456,24 +6489,7 @@ where
         // was missing - that the call has been made before and produced this
         // result - and where the same bytes can be had without another call.
         let repeat_turn = state.turn_id.clone();
-        let mut repeated_calls: Vec<(String, usize)> = Vec::new();
-        for call in &calls {
-            if !successful_call_ids.contains(&call.id) {
-                continue;
-            }
-            // A wait is not a repeat: parking on `wait_for_workers` until a
-            // worker moves is the documented contract, and an unchanged answer
-            // is its normal result. Same exemption the streak guard uses.
-            if is_loop_nudge_repeatable_tool(call) {
-                continue;
-            }
-            let input_hash = crate::tool_invocation::stable_hash(&call.input);
-            if let Some(count) =
-                crate::repetition_guard::record_repeated_call(&repeat_turn, &call.name, &input_hash)
-            {
-                repeated_calls.push((call.name.clone(), count));
-            }
-        }
+        let repeated_calls = record_repeated_calls(&repeat_turn, &calls, &successful_call_ids);
         if let Some((tool, count)) = repeated_calls.first() {
             let repeated_tools = repeated_calls
                 .iter()

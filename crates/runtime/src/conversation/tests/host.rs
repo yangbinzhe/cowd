@@ -323,3 +323,99 @@ fn a_terminal_request_keeps_the_tools_it_still_owes_and_drops_them_only_when_not
     assert!(integration.contains("task_publish"));
     assert!(integration.contains("evidence_retrieve"));
 }
+
+/// The cumulative repeat counter must not count a wait, and must not count a call
+/// that failed. Both exclusions are what keep the diagnosis worth reading: a model
+/// that is told its legitimate `wait_for_workers` poll is a loop learns to ignore
+/// the diagnosis, which is how an earlier monitor lost its operator.
+#[test]
+fn the_repeat_counter_skips_waits_and_failed_calls() {
+    use super::host_backend::record_repeated_calls;
+    use crate::conversation::ModelToolCall;
+
+    fn call(id: &str, name: &str, input: &str) -> ModelToolCall {
+        ModelToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            input: input.to_string(),
+            depends_on: Vec::new(),
+        }
+    }
+
+    let turn = "v22-repeat-filter";
+    crate::repetition_guard::clear_turn(turn);
+    let bound = crate::repetition_guard::repeated_call_bound();
+
+    // A wait, issued far more times than the bound, is never counted.
+    let wait = call("w", "state_inspect", r#"{"wait_for_workers":true}"#);
+    for _ in 0..(bound + 3) {
+        let succeeded = std::collections::BTreeSet::from(["w".to_string()]);
+        assert!(
+            record_repeated_calls(turn, std::slice::from_ref(&wait), &succeeded).is_empty(),
+            "a wait_for_workers poll is not a repeat"
+        );
+    }
+
+    // A failed call is not a decision the model repeated, so it is not counted.
+    let failing = call("f", "read_file", r#"{"path":"a.rs"}"#);
+    for _ in 0..(bound + 3) {
+        assert!(
+            record_repeated_calls(turn, std::slice::from_ref(&failing), &std::collections::BTreeSet::new())
+                .is_empty(),
+            "a failed call must not count toward the repeat bound"
+        );
+    }
+
+    // The same call succeeding does count, which is the whole point.
+    let working = call("s", "read_file", r#"{"path":"b.rs"}"#);
+    let succeeded = std::collections::BTreeSet::from(["s".to_string()]);
+    for _ in 1..bound {
+        assert!(record_repeated_calls(turn, std::slice::from_ref(&working), &succeeded).is_empty());
+    }
+    assert_eq!(
+        record_repeated_calls(turn, std::slice::from_ref(&working), &succeeded),
+        vec![("read_file".to_string(), bound)]
+    );
+    crate::repetition_guard::clear_turn(turn);
+}
+
+/// Re-dispatch opens a new agent graph but keeps the turn, and the count has to
+/// survive it. Run one20's 31 identical `state_inspect` queries were spread over
+/// five agent graphs; a counter keyed on the graph would have seen at most
+/// `bound` of them, which is exactly the blind spot this closes.
+#[test]
+fn the_repeat_count_survives_a_re_dispatch_that_opens_a_new_graph() {
+    use super::host_backend::record_repeated_calls;
+    use crate::conversation::ModelToolCall;
+
+    fn call(id: &str, input: &str) -> ModelToolCall {
+        ModelToolCall {
+            id: id.to_string(),
+            name: "state_inspect".to_string(),
+            input: input.to_string(),
+            depends_on: Vec::new(),
+        }
+    }
+
+    let turn = "v22-repeat-across-graphs";
+    crate::repetition_guard::clear_turn(turn);
+    let bound = crate::repetition_guard::repeated_call_bound();
+    let query = r#"{"query":"task:77fb8340a3eb5091224bb31d"}"#;
+
+    // Attempt one runs below the bound.
+    for index in 0..(bound - 1) {
+        let attempt = call(&format!("a{index}"), query);
+        let succeeded = std::collections::BTreeSet::from([format!("a{index}")]);
+        assert!(record_repeated_calls(turn, &[attempt], &succeeded).is_empty());
+    }
+    // Re-dispatch: a fresh graph, a fresh call id, the same question. The count
+    // must carry over rather than restart.
+    let redispatched = call("b0", query);
+    let succeeded = std::collections::BTreeSet::from(["b0".to_string()]);
+    assert_eq!(
+        record_repeated_calls(turn, &[redispatched], &succeeded),
+        vec![("state_inspect".to_string(), bound)],
+        "a re-dispatched identical call must be recognised as the same call"
+    );
+    crate::repetition_guard::clear_turn(turn);
+}
