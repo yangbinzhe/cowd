@@ -29,6 +29,7 @@ similar_answer_pairs = _module.similar_answer_pairs
 verify = _module.verify
 finding_fingerprints = _module.finding_fingerprints
 findings_text = _module.findings_text
+finding_counts = _module.finding_counts
 converged = _module.converged
 load_state = _module.load_state
 save_state = _module.save_state
@@ -108,6 +109,7 @@ def carried(result, conclusion, marks):
     return {
         "fingerprint": result["fingerprint"],
         "findings_text": findings_text(conclusion),
+        "finding_counts": result["finding_counts"],
         "repeat_count": result["repeat_count"],
         "milestones": marks,
     }
@@ -443,9 +445,54 @@ def _():
     assert second["repeat_count"] == 2, second
     assert second["escalate"] is False, second
     state = carried(second, grown, milestones())
-    third = verify(state, grown, milestones())
+    still_going = spinning((15, 15, 15))
+    still_going["findings"][0]["evidence"].append(
+        '{"reference": "artifact:015125cb446fef55279efeae"} x9'
+    )
+    still_going["findings"][1]["evidence"].append(
+        '{"reference": "artifact:015125cb446fef55279efeae"} x9'
+    )
+    third = verify(state, still_going, milestones())
     assert third["repeat_count"] == 3, third
     assert third["escalate"] is True, third
+
+
+@case("a frozen finding is history, not a live loop")
+def _():
+    # The live 2026-10-13 run: the agent stopped re-reading after the runtime
+    # forced it to conclude, but the finding kept reporting the same x8, the
+    # repeat counted 1 -> 2 -> 3 on frozen evidence, and the monitor stopped a
+    # run whose team had moved on. A repeat counts only when the counts moved.
+    first = verify(None, spinning((8, 8, 8)), milestones())
+    state = carried(first, spinning((8, 8, 8)), milestones())
+    second = verify(state, spinning((8, 8, 8)), milestones())
+    assert second["repeat_count"] == 1, second
+    assert second["escalate"] is False, second
+    assert second["counts_grew"] is False, second
+    # One more emission and the loop is live again.
+    third = verify(state, spinning((9, 8, 8)), milestones())
+    assert third["repeat_count"] == 2, third
+    assert third["counts_grew"] is True, third
+    state = carried(third, spinning((9, 8, 8)), milestones())
+    fourth = verify(state, spinning((10, 9, 9)), milestones())
+    assert fourth["repeat_count"] == 3, fourth
+    assert fourth["escalate"] is True, fourth
+
+
+@case("finding counts read the loop's pulse out of the evidence")
+def _():
+    counts = finding_counts(spinning((8, 8, 8)))
+    # Two findings, three evidence lines each, every line x8.
+    assert counts["identical tool inputs repeated: the model is re-issuing the same call"] == 24
+    idle = {"state": "SPINNING", "findings": [{
+        "root_cause": "the model keeps concluding without acting",
+        "evidence": ["7 consecutive text answers with no tool call between them"],
+    }]}
+    assert finding_counts(idle)["the model keeps concluding without acting"] == 7
+    # A terminal sentence finding has no counts.
+    assert finding_counts({"state": "TERMINAL", "findings": ["verdict reached"]}) == {
+        "verdict reached": 0
+    }
 
 
 @case("the first report of a finding is not yet an escalation")

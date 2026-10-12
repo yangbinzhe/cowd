@@ -135,10 +135,33 @@ seed_convergence() {
 
 field() { printf '%s' "$1" | jq -r "$2"; }
 
+# A live loop's counts rise every interval (one31: x10 -> x11 -> x13). The
+# escalation counts a repeat only when the counts moved, so the replay must
+# keep issuing the same calls between rounds or it would be replaying a loop
+# that had already stopped.
+grow_loop() {
+  local now_ms n ref payload_call
+  now_ms=$(( $(date +%s) * 1000 ))
+  n=$(( $(psql "$PG_URL" -tAc "SELECT count(*) FROM runtime_events") + 5000 ))
+  local hexes=(
+    83a19d51623c6e8987c1ac51
+    d19f537ffb5070bccb9249f3
+    46df7642c86b72c61dccb17c
+  )
+  for ref in "${hexes[@]}"; do
+    payload_call='{"kind":"tool_call","content":"{\"reference\": \"artifact:'"$ref"'\"}","tool_name":"read_ref"}'
+    n=$(( n + 1 ))
+    psql_q -c "INSERT INTO runtime_events (event_id, stream_id, sequence, scope, kind, status, actor, payload, refs, created_at_ms, commit_cursor, transaction_id, transaction_index) VALUES ('g$n','s',1,'conversation','model.item_completed','completed','root','$payload_call','[]',$(( now_ms - 2000 )),1,'replay-tx',0)"
+  done
+}
+
 seed_loop
 failures=0
 previous_repeat=0
 for round in 1 2 3; do
+  if [[ "$round" -gt 1 ]]; then
+    grow_loop
+  fi
   report="$(python3 "$MONITOR" "$PG_URL" --investigate --state-file "$STATE_FILE")"
   state="$(field "$report" '.conclusion.state')"
   repeat="$(field "$report" '.verification.repeat_count')"

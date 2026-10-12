@@ -13,6 +13,7 @@ import json
 import subprocess
 import sys
 import os
+import re
 import time
 from collections import Counter
 from difflib import SequenceMatcher
@@ -62,6 +63,32 @@ def findings_text(conclusion):
     return json.dumps(conclusion.get("findings", []), sort_keys=True)
 
 
+def finding_counts(conclusion):
+    """Each finding's evidence counts, keyed the same way as the fingerprint.
+
+    The count is the loop's pulse: it rises while the model keeps issuing the
+    call and freezes when the behavior stops. A finding whose count has not
+    moved since the last report is history, not a live loop - run one31's
+    counts rose every interval (x10 -> x11 -> x13), while a run whose agent
+    stopped re-reading keeps reporting the same x8 forever.
+    """
+    counts = {}
+    for finding in conclusion.get("findings", []):
+        if isinstance(finding, str):
+            counts[finding] = 0
+            continue
+        total = 0
+        for evidence in finding.get("evidence", []):
+            match = re.search(r"x(\d+)\s*$", str(evidence).strip())
+            if match:
+                total += int(match.group(1))
+            else:
+                digits = re.findall(r"\b\d+\b", str(evidence))
+                total += int(digits[0]) if digits else 0
+        counts[str(finding.get("root_cause", ""))] = total
+    return counts
+
+
 def converged(previous_milestones, milestones):
     """Did the Objective actually move toward closure since the last report?
 
@@ -109,6 +136,8 @@ def verify(previous, conclusion, milestones, threshold=None):
             "escalate": False,
             "similarity_to_previous": None,
             "fingerprint": [],
+            "finding_counts": {},
+            "counts_grew": False,
             "reason": "terminal",
         }
     fingerprints = finding_fingerprints(conclusion)
@@ -119,16 +148,29 @@ def verify(previous, conclusion, milestones, threshold=None):
             "escalate": False,
             "similarity_to_previous": None,
             "fingerprint": fingerprints,
+            "finding_counts": {},
+            "counts_grew": False,
             "reason": "no finding to repeat",
         }
     previous = previous or {}
     previous_fingerprint = previous.get("fingerprint") or []
     previous_text = previous.get("findings_text") or ""
+    previous_counts = previous.get("finding_counts") or {}
     current_text = findings_text(conclusion)
+    counts = finding_counts(conclusion)
+    grew = any(
+        count > int(previous_counts.get(cause, 0) or 0)
+        for cause, count in counts.items()
+    )
     if previous_fingerprint == fingerprints and not converged(
         previous.get("milestones") or {}, milestones
     ):
-        repeat_count = int(previous.get("repeat_count", 0) or 0) + 1
+        # A repeat counts only when the loop is still running: the same finding
+        # with the same counts is history. A live loop's counts rise every
+        # interval (one31: x10 -> x11 -> x13); a finding frozen at x8 describes
+        # waste that already happened, and stopping the run now recovers none
+        # of it while killing work that has moved on.
+        repeat_count = int(previous.get("repeat_count", 0) or 0) + 1 if grew else 1
     else:
         repeat_count = 1
     similarity = (
@@ -142,6 +184,8 @@ def verify(previous, conclusion, milestones, threshold=None):
         "escalate": repeat_count >= threshold and state == "SPINNING",
         "similarity_to_previous": similarity,
         "fingerprint": fingerprints,
+        "finding_counts": counts,
+        "counts_grew": grew,
         "reason": (
             "the same finding, %d consecutive reports, no convergence milestone"
             % repeat_count
@@ -645,6 +689,7 @@ def main():
         {
             "fingerprint": verification["fingerprint"],
             "findings_text": findings_text(conclusion),
+            "finding_counts": verification["finding_counts"],
             "repeat_count": verification["repeat_count"],
             "milestones": {key: snap.get(key, 0) for key in MILESTONE_KEYS},
             "updated_at_ms": int(time.time() * 1000),
