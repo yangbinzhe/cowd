@@ -273,3 +273,53 @@ fn the_control_plane_requirement_is_derived_from_the_program_not_written_as_lite
         "no admission action is outstanding once Team, Agents and Tasks exist: {actions:?}"
     );
 }
+
+/// Prompt isolation and capability are two different axes, and only one of them
+/// may be decided by "this is the terminal request".
+///
+/// `clean_terminal_synthesis` exists to keep a long exploratory transcript out of
+/// the reduction request - a real cost optimization, worth 1.5M cache-read tokens
+/// on a single one19 run. It was also silently withdrawing every tool, on the
+/// theory that "a verified collaboration terminal leaves only presentation". That
+/// theory is false whenever an obligation is still open: run one19 spent six
+/// requests with an empty `tools` array while `message_publish` was the only thing
+/// that could close its Objective. The tools a terminal request exposes must be a
+/// function of what is owed, never of which prompt shape was chosen.
+#[test]
+fn a_terminal_request_keeps_the_tools_it_still_owes_and_drops_them_only_when_nothing_is_owed() {
+    use super::host_backend::mandatory_action_tool_ids;
+
+    // Nothing owed: a tool-less terminal is correct, and this is the only case
+    // in which it is.
+    let idle = mandatory_action_tool_ids(false, &[]);
+    assert!(
+        idle.is_empty(),
+        "with no outstanding obligation the terminal request may drop every tool: {idle:?}"
+    );
+
+    // A completion gap is owed: the closing tool must survive the terminal
+    // request, together with the reads the closing action needs.
+    let owed = mandatory_action_tool_ids(true, &["classify_issues".to_string()]);
+    for required in ["message_publish", "state_inspect", "evidence_retrieve"] {
+        assert!(
+            owed.contains(required),
+            "a terminal request that still owes an issue classification must expose {required}: {owed:?}"
+        );
+    }
+
+    // An Objective-review gap owes a different tool. The capability follows the
+    // obligation, not the rung name the model happens to be on.
+    let review = mandatory_action_tool_ids(true, &["objective_review".to_string()]);
+    assert!(review.contains("objective_review"));
+    assert!(review.contains("state_inspect"));
+    assert!(
+        !review.contains("message_publish"),
+        "an Objective-review gap must not be handed the issue-classification tool: {review:?}"
+    );
+
+    // The read tools are always present, because every closing action above
+    // legitimately needs its references read first.
+    let integration = mandatory_action_tool_ids(true, &["publish_integration_task".to_string()]);
+    assert!(integration.contains("task_publish"));
+    assert!(integration.contains("evidence_retrieve"));
+}

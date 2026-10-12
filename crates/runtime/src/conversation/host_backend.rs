@@ -1155,9 +1155,12 @@ where
             // the only means of taking it is a framework defect, not a model
             // failure, and it is fenced here rather than at each of the five
             // sites that set the flag.
-            let mandatory_action_outstanding = {
+            let (mandatory_action_outstanding, owed_rungs) = {
                 let state = self.state.lock().await;
-                state.completion_gap_outstanding || !state.outstanding_closure_rungs.is_empty()
+                (
+                    state.completion_gap_outstanding || !state.outstanding_closure_rungs.is_empty(),
+                    state.outstanding_closure_rungs.clone(),
+                )
             };
             if force_text_only_response && !mandatory_action_outstanding {
                 runtime.require_next_model_final_response();
@@ -1167,10 +1170,7 @@ where
                 // Nothing pinned a tool, but one is owed. Name the tools that can
                 // close what is outstanding instead of sending a tool-less
                 // request the model cannot act on.
-                let required = {
-                    let state = self.state.lock().await;
-                    mandatory_action_tool_ids(&state)
-                };
+                let required = mandatory_action_tool_ids(true, &owed_rungs);
                 if !required.is_empty() {
                     runtime.require_next_model_tool_action(required);
                 }
@@ -1210,6 +1210,27 @@ where
                     })
                 })
             };
+        // The capability axis, decided independently of the prompt-isolation
+        // axis that `clean_terminal_synthesis` represents. Isolating the prompt
+        // keeps a long exploratory transcript out of the reduction request; it
+        // is not a reason to withdraw the tools that close the Objective. Only
+        // "nothing is owed" earns a tool-less terminal.
+        let terminal_required_tools = if clean_terminal_synthesis {
+            let owed = {
+                let state = self.state.lock().await;
+                if state.completion_gap_outstanding || !state.outstanding_closure_rungs.is_empty() {
+                    Some(mandatory_action_tool_ids(
+                        true,
+                        &state.outstanding_closure_rungs,
+                    ))
+                } else {
+                    None
+                }
+            };
+            owed.filter(|tools| !tools.is_empty())
+        } else {
+            None
+        };
         let result = if clean_terminal_synthesis {
             runtime
                 .execute_clean_terminal_synthesis(
@@ -1222,6 +1243,7 @@ where
                         .as_ref()
                         .map(|(_, history)| history.clone())
                         .unwrap_or_default(),
+                    terminal_required_tools.as_ref(),
                 )
                 .await
         } else {
@@ -3479,9 +3501,12 @@ pub(super) fn root_control_plane_requirement(
 /// cannot satisfy without a read produces an invalid `required` tool choice
 /// (`provider_plane` fails closed to an omitted choice in that case, which is
 /// how the model ends up tool-less again).
-fn mandatory_action_tool_ids(state: &super::super::host::TurnGraphState) -> BTreeSet<String> {
+pub(super) fn mandatory_action_tool_ids(
+    completion_gap_outstanding: bool,
+    outstanding_closure_rungs: &[String],
+) -> BTreeSet<String> {
     let mut tools = BTreeSet::new();
-    for tool in state.outstanding_closure_rungs.iter().map(String::as_str) {
+    for tool in outstanding_closure_rungs.iter().map(String::as_str) {
         match tool {
             "classify_issues" | "resolve_issue" => {
                 tools.insert("message_publish".to_string());
@@ -3498,8 +3523,15 @@ fn mandatory_action_tool_ids(state: &super::super::host::TurnGraphState) -> BTre
             _ => {}
         }
     }
-    // Reads are always allowed: every closing action above takes references, and
-    // the gap text names them.
+    // The reads are part of the closing set, not a standing allowance. A
+    // terminal request with nothing left to close must stay genuinely
+    // tool-less: that is the case where rendering from the receipts already in
+    // hand is the whole job, and leaving two tools exposed would quietly turn
+    // every clean terminal synthesis into a two-tool step. The unit test that
+    // asserts the empty case is what caught this.
+    if tools.is_empty() {
+        return tools;
+    }
     tools.insert("state_inspect".to_string());
     tools.insert("evidence_retrieve".to_string());
     tools

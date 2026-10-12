@@ -2677,7 +2677,12 @@ async fn clean_terminal_does_not_retry_after_its_provider_attempt() {
     runtime.set_active_model("private-model");
 
     let error = runtime
-        .execute_clean_terminal_synthesis("give a concise answer", "checked evidence", Vec::new())
+        .execute_clean_terminal_synthesis(
+            "give a concise answer",
+            "checked evidence",
+            Vec::new(),
+            None,
+        )
         .await
         .expect_err("clean terminal must not retry after its provider attempt");
     assert!(error.to_string().contains("maximum context length"));
