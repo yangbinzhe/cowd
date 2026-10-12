@@ -1254,15 +1254,13 @@ where
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-            let owed = gap_outstanding || !rungs.is_empty() || !projected.is_empty();
             let mut all_rungs = rungs;
             for step in projected {
                 if !all_rungs.contains(&step) {
                     all_rungs.push(step);
                 }
             }
-            owed.then(|| mandatory_action_tool_ids(true, &all_rungs))
-                .filter(|tools| !tools.is_empty())
+            terminal_required_tools(gap_outstanding, all_rungs)
         } else {
             None
         };
@@ -3529,6 +3527,26 @@ pub(super) fn root_control_plane_requirement(
     (true, actions, steps)
 }
 
+/// The tools a terminal request must still expose, given what the Objective owes.
+///
+/// `None` means a tool-less terminal is correct, which is true in exactly one
+/// case: nothing is owed. Every other answer is a non-empty set, because a
+/// request that asks the model to finish something cannot also withdraw the tool
+/// that finishes it.
+///
+/// Extracted so the rule is checkable without a provider failure to trigger the
+/// path. The live trigger is a provider failure mid-collaboration, which is not
+/// something a test can arrange - so without this, the one case the fix exists for
+/// would have had no coverage at all.
+pub(super) fn terminal_required_tools(
+    gap_outstanding: bool,
+    outstanding_rungs: Vec<String>,
+) -> Option<BTreeSet<String>> {
+    let owed = gap_outstanding || !outstanding_rungs.is_empty();
+    owed.then(|| mandatory_action_tool_ids(true, &outstanding_rungs))
+        .filter(|tools| !tools.is_empty())
+}
+
 /// The tool set that can close whatever mandatory action is still outstanding.
 ///
 /// It is deliberately wider than one tool: closing an issue gap legitimately
@@ -3541,16 +3559,32 @@ pub(super) fn mandatory_action_tool_ids(
     outstanding_closure_rungs: &[String],
 ) -> BTreeSet<String> {
     let mut tools = BTreeSet::new();
+    // Every rung the closure view can advertise has to name the tool that closes
+    // it. `publish_task` was missing, which is the rung a fresh collaboration is
+    // shortest of: run one23 was handed a tool-less request with three Teams and
+    // nothing published, and the fix for that mapped `publish_task` to no tool at
+    // all - so the invariant would have read "tools owed" and then handed back an
+    // empty set, which `.filter` turned back into "nothing owed". A rung with no
+    // tool is not a rung; it is a label.
     for tool in outstanding_closure_rungs.iter().map(String::as_str) {
         match tool {
+            "team" => {
+                tools.insert("team_create".to_string());
+            }
+            "publish_task" | "publish_integration_task" => {
+                tools.insert("task_publish".to_string());
+            }
+            "claim_task" => {
+                tools.insert("task_claim".to_string());
+            }
+            "independent_review" | "accepted_task" => {
+                tools.insert("task_review".to_string());
+            }
             "classify_issues" | "resolve_issue" => {
                 tools.insert("message_publish".to_string());
             }
             "objective_review" => {
                 tools.insert("objective_review".to_string());
-            }
-            "publish_integration_task" => {
-                tools.insert("task_publish".to_string());
             }
             "objective_complete_request" => {
                 tools.insert("objective_complete_request".to_string());
