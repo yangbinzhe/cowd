@@ -1338,7 +1338,13 @@ impl LiveScenarioRunner {
             if let Some(object) = diagnostics.as_object_mut() {
                 object.insert("cancellation".to_string(), cleanup);
             }
-            return failed_scenario_with_session_and_execution(
+            // The turn failed, but the Program it created is durable. Recover
+            // it so the report can still judge Program closure; without this the
+            // gate reads `program=missing` for a run that built a real one.
+            let agentic_program = self
+                .root_agentic_program(&session_id, turn_id_ref, &mut trace)
+                .ok();
+            return failed_scenario_with_session_execution_and_program(
                 spec,
                 started,
                 trace,
@@ -1346,6 +1352,7 @@ impl LiveScenarioRunner {
                 execution_id,
                 terminal_error,
                 diagnostics,
+                agentic_program,
             );
         };
         let terminal_wait = terminal;
@@ -4787,18 +4794,61 @@ fn failed_scenario_with_session_and_execution(
     error: String,
     diagnostics: Value,
 ) -> Value {
-    // A failed scenario already spent its provider budget before it failed, so it
-    // must report the same metrics a passing scenario reports. Omitting them here
-    // is what made the provider-round gate read zero exactly when it was supposed
-    // to check the claim: both of its sources sum `metrics.model_rounds` per
-    // scenario. The diagnostics carry the observer's own timeline, so the failed
-    // scenario is measured by the same algorithm as a passing one.
+    failed_scenario_with_session_execution_and_program(
+        spec,
+        started,
+        trace,
+        session_id,
+        execution_id,
+        error,
+        diagnostics,
+        None,
+    )
+}
+
+/// Build the failure payload, optionally carrying the Agentic Program the run
+/// already created.
+///
+/// `metrics` was fixed for exactly this reason once: a failed scenario already
+/// spent its provider budget, so omitting the metrics made the provider-round
+/// gate read zero precisely when it was supposed to check the claim.
+/// `production_trace` was left as `Value::Null`, which is the same defect one
+/// field over - and worse, because it does not merely under-report, it erases a
+/// fact the Runtime durably holds. A scenario that really did create a Team,
+/// publish Tasks and bind an Objective verdict, then failed one acceptance
+/// check, reported `program=missing` to `agentic_program_closure_verified`. The
+/// report could only ever see a Program when the scenario passed, so the gate
+/// that is supposed to judge Program closure was structurally blind to the runs
+/// that most needed judging.
+#[allow(clippy::too_many_arguments)]
+fn failed_scenario_with_session_execution_and_program(
+    spec: LiveScenarioSpec,
+    started: Instant,
+    trace: Vec<Value>,
+    session_id: String,
+    execution_id: Option<String>,
+    error: String,
+    diagnostics: Value,
+    agentic_program: Option<runtime::AgenticProgramProjection>,
+) -> Value {
     let metrics = scenario_metrics(
         diagnostics.pointer("/timeline").unwrap_or(&Value::Null),
         &[],
-        None,
+        agentic_program.as_ref(),
         started.elapsed(),
     );
+    let production_trace = agentic_program
+        .as_ref()
+        .and_then(|program| serde_json::to_value(program).ok())
+        .map(|program| {
+            json!({
+                "session_id": if session_id.is_empty() { Value::Null } else { Value::String(session_id.clone()) },
+                "execution_id": execution_id.clone(),
+                "agentic_program": program,
+                "message_materialized": false,
+                "recovered_from_durable_store_on_failure": true,
+            })
+        });
     json!({
         "scenario_id": spec.id,
         "status": "failed",
@@ -4809,7 +4859,7 @@ fn failed_scenario_with_session_and_execution(
         "metrics": metrics,
         "failure_diagnostics": diagnostics,
         "trace": trace,
-        "production_trace": Value::Null,
+        "production_trace": production_trace.unwrap_or(Value::Null),
     })
 }
 

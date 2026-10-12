@@ -214,6 +214,25 @@ impl HarnessEvalReportGate {
 /// summary counter is never sufficient to pass the gate.
 #[must_use]
 pub fn evaluate_agentic_program_closure(value: &Value) -> Value {
+    // Idempotence is load-bearing here, not defensive style. This evaluator runs
+    // at two layers: `runner` evaluates the raw Program projection into a
+    // closure, and the report gate evaluates `report.agentic_program_closure`
+    // again. The second input is the first one's OUTPUT, which has `checks`,
+    // `facts`, `status` and `missing` but none of the projection's `teams` /
+    // `agents` / `tasks` maps - so a second pass read every one of them as empty
+    // and produced an all-zero evaluation. The verdict happened to agree
+    // ("failed" both times), which is exactly what made the defect invisible:
+    // the gate evidence read `program=missing, teams=0, agents=0` while the
+    // report body carried teams=1, agents=4, tasks=3. Anyone debugging from the
+    // gate evidence hunts a Program that never existed.
+    //
+    // An already-evaluated closure is returned as it stands. Re-deriving it from
+    // its own summary is the disconnect, not a cheaper path to the same answer.
+    if value.get("checks").and_then(Value::as_array).is_some()
+        && value.get("status").and_then(Value::as_str).is_some()
+    {
+        return value.clone();
+    }
     let projection = value.get("projection").unwrap_or(value);
     let mut checks = Vec::new();
     let mut missing = Vec::new();
@@ -1609,6 +1628,38 @@ mod gate_tests {
             .expect("missing checks")
             .iter()
             .any(|item| item == "tasks_accepted_and_independently_verified"));
+    }
+
+    #[test]
+    fn re_evaluating_a_closure_keeps_the_facts_the_gate_evidence_reads() {
+        // The gate evaluates `report.agentic_program_closure`, which `runner`
+        // has already evaluated from the raw Program projection. Without
+        // idempotence the second pass read the projection's `teams` / `agents` /
+        // `tasks` maps out of a value that only carries `checks` / `facts` /
+        // `status`, so every field came back empty and the gate evidence read
+        // `program=missing, teams=0, agents=0, tasks=0` while the report body
+        // carried teams=1, agents=2, tasks=1. The verdict agreed by luck, which
+        // is why nothing caught it: a wrong reason and a right verdict look
+        // identical from outside.
+        let projection = verified_agentic_program_closure();
+        let once = evaluate_agentic_program_closure(&projection);
+        let twice = evaluate_agentic_program_closure(&once);
+        assert_eq!(once["facts"], twice["facts"]);
+        assert_eq!(once["status"], twice["status"]);
+        assert_eq!(twice["facts"]["teams"], 1);
+        assert_eq!(twice["facts"]["agents"], 2);
+        assert_eq!(twice["facts"]["active_tasks"], 1);
+        // The evidence string the gate prints must name the Program the report
+        // actually holds, not an empty one.
+        let evidence = agentic_closure_gate_evidence(&twice);
+        assert!(
+            !evidence.contains("program=missing"),
+            "gate evidence must not claim the Program is absent: {evidence}"
+        );
+        assert!(
+            evidence.contains("teams=1") && evidence.contains("agents=2"),
+            "gate evidence must be derivable from the report body: {evidence}"
+        );
     }
 
     #[test]
