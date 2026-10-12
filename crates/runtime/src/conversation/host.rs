@@ -2576,6 +2576,37 @@ impl RootAgenticTerminalAction {
 /// no roles, Team assignment, Task contents or workflow template: only durable
 /// facts the Program already records, plus the step names the runtime itself
 /// advertises. The model still decides how to satisfy each remaining rung.
+/// Whether the delivered results have been synthesized by one artifact.
+///
+/// Mirrors the harness's `synthesized_final_artifact_findings` exactly, because
+/// the two layers must not disagree about what the operator asked for. An artifact
+/// synthesizes when it hangs off an accepted Task - that Task is the synthesis's
+/// host, not one of the things it synthesizes - and `relates_to` at least two
+/// accepted Tasks, counting the host.
+fn delivered_results_are_synthesized(program: &crate::AgenticProgramProjection) -> bool {
+    let accepted = program
+        .tasks
+        .values()
+        .filter(|task| task.status == crate::AgenticTaskStatus::Accepted)
+        .collect::<Vec<_>>();
+    if accepted.len() <= 1 {
+        return true;
+    }
+    program.artifacts.values().any(|artifact| {
+        let hosted = accepted
+            .iter()
+            .any(|task| task.artifact_refs.contains(&artifact.artifact_ref));
+        if !hosted {
+            return false;
+        }
+        accepted
+            .iter()
+            .filter(|task| artifact.relates_to.contains(&task.task_id))
+            .count()
+            >= 2
+    })
+}
+
 fn agentic_closure_view(
     program: &crate::AgenticProgramProjection,
     completion_gap: Option<&str>,
@@ -2639,10 +2670,22 @@ fn agentic_closure_view(
     // live 1-Team run reached a satisfied verdict with three accepted Tasks
     // and no integration Artifact; everything else passed, and the only thing
     // missing was this advertisement.
-    if accepted >= 2
-        && accepted == published
-        && crate::agentic::supervision::completion_ready_result_artifact_refs(program).is_empty()
-    {
+    // An integration Task is owed whenever the delivered results have not been
+    // synthesized, which is the operator's own requirement: the 1-Team scenario
+    // asks for "最终 artifact 综合三项事实".
+    //
+    // The condition used to be `completion_ready_result_artifact_refs(program)
+    // .is_empty()`, which answers a different question - whether the per-Task
+    // artifacts are individually deliverable. Run one24 published three accepted
+    // Tasks, each with its own report artifact, so that set was non-empty, the
+    // rung was never advertised, and the model closed the Objective with no
+    // synthesis at all. The verifier accepted it. The harness's
+    // `synthesized_final_artifact_present` check did not, and it was right.
+    //
+    // The rule now mirrors the harness: with two or more accepted Tasks, an
+    // artifact synthesizes only if it hangs off an accepted Task and `relates_to`
+    // at least two of them. Anything less leaves the Tasks unsynthesized.
+    if accepted >= 2 && accepted == published && !delivered_results_are_synthesized(program) {
         remaining.push(serde_json::json!({
             "step": "publish_integration_task",
             "outstanding": accepted,

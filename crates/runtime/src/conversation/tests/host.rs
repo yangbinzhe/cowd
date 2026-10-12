@@ -515,3 +515,111 @@ fn a_terminal_request_keeps_tools_exactly_when_something_is_owed() {
         "the exit request is not an obligation"
     );
 }
+
+/// The integration rung must follow the operator's requirement, not the runtime's
+/// more permissive view of what counts as delivered.
+///
+/// Run one24 published three accepted Tasks, each with its own per-file report
+/// artifact. `completion_ready_result_artifact_refs` was therefore non-empty, the
+/// rung was never advertised, and the model closed the Objective with no synthesis
+/// - while the operator had asked for "最终 artifact 综合三项事实" and the harness's
+/// `synthesized_final_artifact_present` check correctly refused the run.
+///
+/// Two layers must not disagree about what the operator asked for, so the rule here
+/// mirrors the harness's: an artifact synthesizes only when it hangs off an accepted
+/// Task and `relates_to` at least two of them.
+#[test]
+fn three_per_task_reports_are_not_a_synthesis() {
+    use super::delivered_results_are_synthesized;
+    use crate::{AgenticProgramProjection, AgenticTaskProjection, AgenticTaskStatus};
+
+    let mut program = AgenticProgramProjection::empty("program", "objective");
+    for index in 0..3 {
+        let artifact_ref = format!("artifact:{index}");
+        program.artifacts.insert(
+            artifact_ref.clone(),
+            crate::AgenticArtifactProjection {
+                artifact_ref: artifact_ref.clone(),
+                kind: "report".into(),
+                title: format!("report {index}"),
+                content_ref: format!("artifact://art_{index}"),
+                committed_by: format!("agent:{index}"),
+                relates_to: Vec::new(),
+                claim_execution_id: None,
+                claim_generation: None,
+            },
+        );
+        program.tasks.insert(
+            format!("task:{index}"),
+            AgenticTaskProjection {
+                task_id: format!("task:{index}"),
+                team_id: "team:1".into(),
+                title: format!("task {index}"),
+                objective: "o".into(),
+                acceptance: "a".into(),
+                acceptance_checks: Vec::new(),
+                criterion_source: Default::default(),
+                required_capabilities: Vec::new(),
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
+                depends_on: Vec::new(),
+                status: AgenticTaskStatus::Accepted,
+                claimant: Some(format!("agent:{index}")),
+                claim_generation: 0,
+                claim_execution_id: None,
+                claimed_at_ms: None,
+                lease_expires_at_ms: None,
+                active_attempts: Default::default(),
+                artifact_refs: vec![artifact_ref],
+                evidence_refs: Vec::new(),
+                unresolved: Vec::new(),
+                review_reason: None,
+                reviewed_by: Some("agent:reviewer".into()),
+                failed_attempts: 0,
+                review_generation: 0,
+                failed_review_attempts: 0,
+                last_failure: None,
+                replacement_task_refs: Vec::new(),
+                supersede_evidence_refs: Vec::new(),
+                superseded_reason: None,
+                superseded_by: None,
+                cancel_requested_by: None,
+                cancel_reason_ref: None,
+                cancel_evidence_refs: Vec::new(),
+                pending_retirement: None,
+            },
+        );
+    }
+    assert!(
+        !delivered_results_are_synthesized(&program),
+        "three per-Task reports relate to nothing, so they are not a synthesis"
+    );
+
+    // A fourth artifact hosted on one Task and relating to two of them is a
+    // synthesis, and the obligation is discharged.
+    program.artifacts.insert(
+        "artifact:synthesis".to_string(),
+        crate::AgenticArtifactProjection {
+            artifact_ref: "artifact:synthesis".to_string(),
+            kind: "report".into(),
+            title: "synthesis".into(),
+            content_ref: "artifact://art_synthesis".into(),
+            committed_by: "agent:0".into(),
+            relates_to: vec!["task:0".to_string(), "task:1".to_string()],
+            claim_execution_id: None,
+            claim_generation: None,
+        },
+    );
+    program
+        .tasks
+        .get_mut("task:0")
+        .expect("task 0")
+        .artifact_refs
+        .push("artifact:synthesis".to_string());
+    assert!(
+        delivered_results_are_synthesized(&program),
+        "an artifact hosted on an accepted Task and relating to two of them synthesizes"
+    );
+}

@@ -1155,13 +1155,44 @@ where
             // the only means of taking it is a framework defect, not a model
             // failure, and it is fenced here rather than at each of the five
             // sites that set the flag.
-            let (mandatory_action_outstanding, owed_rungs) = {
+            // The obligation is read from the Program projection as well as from
+            // the two continuation flags. The flags only exist once a gap has been
+            // *detected*, which is late: run one25 was sent a text-only step while
+            // three Teams existed and no Task had been published, so both flags
+            // were false, the invariant read "nothing owed", and the request went
+            // out with an empty `tools` array. Reading the projection names
+            // `publish_task` the moment the Teams exist.
+            let (mut mandatory_action_outstanding, mut owed_rungs) = {
                 let state = self.state.lock().await;
                 (
                     state.completion_gap_outstanding || !state.outstanding_closure_rungs.is_empty(),
                     state.outstanding_closure_rungs.clone(),
                 )
             };
+            if !mandatory_action_outstanding {
+                let (session_id, turn_id) = {
+                    let state = self.state.lock().await;
+                    (state.session_id.clone(), state.turn_id.clone())
+                };
+                if let Some(program) = super::root_agentic_program_projection(
+                    self.services.as_ref(),
+                    &session_id,
+                    &turn_id,
+                ) {
+                    let projected = super::outstanding_closure_steps(&program)
+                        .into_iter()
+                        .filter(|step| step != "objective_complete_request")
+                        .collect::<Vec<_>>();
+                    if !projected.is_empty() {
+                        mandatory_action_outstanding = true;
+                        for step in projected {
+                            if !owed_rungs.contains(&step) {
+                                owed_rungs.push(step);
+                            }
+                        }
+                    }
+                }
+            }
             if force_text_only_response && !mandatory_action_outstanding {
                 runtime.require_next_model_final_response();
             } else if let Some(tool_ids) = force_tool_allowlist {
@@ -1260,7 +1291,15 @@ where
                     all_rungs.push(step);
                 }
             }
-            terminal_required_tools(gap_outstanding, all_rungs)
+            let decision = terminal_required_tools(gap_outstanding, all_rungs.clone());
+            tracing::warn!(
+                target: "cowd::terminal_capability",
+                %session_id, %turn_id, clean_terminal_synthesis,
+                gap_outstanding, ?all_rungs,
+                tools = ?decision.as_ref().map(|t| t.iter().cloned().collect::<Vec<_>>()),
+                "deciding the tool set for a terminal request"
+            );
+            decision
         } else {
             None
         };
