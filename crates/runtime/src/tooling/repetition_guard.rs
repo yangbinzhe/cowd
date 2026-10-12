@@ -429,6 +429,29 @@ fn state_derived_cause(message: &str, input_refs: &[String]) -> bool {
     names_outside_the_input(&run)
 }
 
+/// Clear the failure breakers filed under one turn, leaving the cumulative
+/// repeat counts alone.
+///
+/// An accept makes a *failure* breaker stale: a call that failed before the accept
+/// must not be suppressed by a pre-accept failure. It does nothing to a call that
+/// succeeded. Run one25's repeat counter was reset by every accepted Task review,
+/// so a call issued ten times never reached the block bound of six and the
+/// dispatch was never refused - the diagnostic fired seven times and the model
+/// issued the call ten times anyway.
+///
+/// Progress invalidates a conclusion about failure. It does not invalidate the
+/// observation that the same call keeps returning the same bytes.
+pub fn clear_failure_breakers(turn_id: &str) {
+    let needle = format!(":{turn_id}:");
+    repetition_ledger()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|key, _| {
+            !key.contains(needle.as_str())
+                || key.starts_with("repeat:")
+        });
+}
+
 pub fn clear_turn(turn_id: &str) {
     // Keys carry a type prefix (`call:` / `cause:`) before the turn, so the turn
     // is not at the start of the key.
@@ -1053,6 +1076,56 @@ mod repetition_guard_tests {
         assert_eq!(
             repeated_call_count(turn, "read_ref", "hash"),
             repeated_call_bound() - 1
+        );
+        clear_turn(turn);
+    }
+
+    /// Progress invalidates a conclusion about failure, not the observation that
+    /// the same call keeps returning the same bytes.
+    ///
+    /// An accept used to clear the whole ledger, which reset the cumulative repeat
+    /// count with it. Run one25 issued the same `glob_search` ten times across a
+    /// collaboration that accepted several Tasks: the count was wiped on every
+    /// accept, never reached the block bound of six, and the call was never
+    /// refused - the model was diagnosed seven times and kept going.
+    #[test]
+    fn an_accept_clears_failure_breakers_but_not_the_repeat_count() {
+        let turn = "v22-clear-scope";
+        clear_turn(turn);
+        // A failure breaker filed under this turn. The breaker needs
+        // `repetition_bound()` consecutive identical failures before it trips, so
+        // the last one is the one that reports.
+        let mut tripped = None;
+        for _ in 0..repetition_bound() {
+            tripped = record_tool_failure(
+                turn,
+                "read_file",
+                "hash-fail",
+                &[],
+                ToolFailureKind::ExecutionError,
+                "deterministic boom",
+            );
+        }
+        assert!(tripped.is_some(), "the failure breaker must be filed");
+        // A cumulative repeat count filed under the same turn.
+        for _ in 0..repeated_call_block_bound() {
+            record_repeated_call(turn, "glob_search", "hash-repeat");
+        }
+        let before = repeated_call_count(turn, "glob_search", "hash-repeat");
+        assert!(before >= repeated_call_block_bound());
+
+        clear_failure_breakers(turn);
+
+        // The failure breaker is gone: a fresh attempt is not suppressed.
+        assert!(
+            refusal_for(turn, "read_file", "hash-fail").is_none(),
+            "an accept must clear the failure breaker"
+        );
+        // The repeat count survives: the call really was issued that many times.
+        assert_eq!(
+            repeated_call_count(turn, "glob_search", "hash-repeat"),
+            before,
+            "an accept must not reset the cumulative repeat count"
         );
         clear_turn(turn);
     }

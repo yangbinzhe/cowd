@@ -697,11 +697,16 @@ pub(crate) fn apply_task_review(
         match input.decision {
             TaskReviewDecision::Accept => {
                 task.status = AgenticTaskStatus::Accepted;
-                // Durable progress for this turn: every repetition breaker filed
+                // Durable progress for this turn: every failure breaker filed
                 // under it is stale, because a later call that failed before the
                 // accept must not be suppressed by a pre-accept failure. This is
                 // the only production site where a Task becomes Accepted.
-                crate::repetition_guard::clear_turn(&envelope.actor.turn_id);
+                //
+                // Failure breakers only. Clearing the whole ledger here also wiped
+                // the cumulative repeat counts, so a call issued ten times never
+                // reached its block bound and was never refused - run one25 was
+                // diagnosed seven times and issued the call ten times anyway.
+                crate::repetition_guard::clear_failure_breakers(&envelope.actor.turn_id);
             }
             TaskReviewDecision::Challenge | TaskReviewDecision::Rework => {
                 task.claimant = None;
