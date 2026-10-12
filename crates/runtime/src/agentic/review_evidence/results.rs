@@ -199,11 +199,25 @@ pub(super) async fn resolve_result(
             unscoped_effect: false,
         });
     }
+    // Every failure below names the reference being resolved. Run one30 cited
+    // three real `tool://` read_ref receipts, one resolution failed, and the model
+    // was told six words - "artifact does not exist" - with no reference, no
+    // selector and no next step. It then concluded the formal review step could
+    // not complete and wrote four final answers describing that blocker instead
+    // of fixing it. The store's error is a fact about a selector; the model needs
+    // to know which selector.
     let content = if let Some(artifact) = program.artifacts.get(reference) {
         services
             .artifact_store()
             .resolve(&artifact.content_ref)
-            .map_err(|error| error.to_string())?
+            .map_err(|error| {
+                format!(
+                    "objective_review result {reference} points to durable content Runtime cannot read: {error} \
+                     (Runtime recorded selector {} for this result; cite the result ref the Task returned \
+                     from task_submit, or read it with evidence_retrieve)",
+                    artifact.content_ref
+                )
+            })?
     } else if reference.starts_with("tool://") {
         tool_content(services, &actor.session_id, reference).await?
     } else if reference.starts_with("artifact://") || logical_selector.is_some() {
@@ -214,7 +228,13 @@ pub(super) async fn resolve_result(
         services
             .artifact_store()
             .resolve(selector)
-            .map_err(|error| error.to_string())?
+            .map_err(|error| {
+                format!(
+                    "objective_review result {reference} points to durable content Runtime cannot read: {error} \
+                     (resolved selector {selector}; cite the result ref the Task returned from task_submit, \
+                     or read it with evidence_retrieve)"
+                )
+            })?
     } else {
         return Err(format!(
             "review result has no Runtime-resolved producer:{reference}"
@@ -428,7 +448,13 @@ pub(super) async fn resolve_result(
                         .artifact_store()
                         .read(&raw, &raw.visibility_scope, None)
                         .await
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| {
+                            format!(
+                                "objective_review result {reference} has a durable receipt Runtime cannot read: {error} \
+                                 (selector {}); read it with evidence_retrieve instead of re-issuing the call",
+                                raw.selector
+                            )
+                        })?;
                     if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                         publication = value["status"] == "published"
                             && value["content_ref"] == content.selector

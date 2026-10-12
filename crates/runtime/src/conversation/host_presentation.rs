@@ -521,6 +521,60 @@ where
     C: ApiClient + Send + Sync + 'static,
     T: ToolExecutor,
 {
+    /// Present an honest partial terminal when the model has stopped acting.
+    ///
+    /// The same shape the bounded-convergence and focus-write paths use: an
+    /// explicit `Partial` completion carrying a disclosure that names what was
+    /// done, what was not, and why. It is not a failure - the durable work stays
+    /// visible in the Program projection and the reason the Objective did not
+    /// close is stated rather than implied by a scenario timeout.
+    async fn honest_partial_terminal(
+        &self,
+        ticket: &NodeExecutionTicket,
+        gap: &str,
+        idle_answers: u8,
+    ) -> NodeExecutionOutcome {
+        let disclosure = format!(
+            "Execution stopped safely: the model concluded {idle_answers} times in a row without taking \
+             an action, so Runtime stopped asking rather than spending the remaining budget on \
+             restatements. The durable work already committed stays visible in the Program projection. \
+             The outstanding completion gap is: {gap}. Close it with the action that gap names, then \
+             request completion."
+        );
+        self.abandon_published_terminal().await;
+        let iteration = {
+            let mut state = self.state.lock().await;
+            state.terminal_override = Some((
+                harness_contract::goal::GoalCompletion::Partial,
+                disclosure.clone(),
+            ));
+            state.iterations
+        };
+        let mut next = dynamic_node(
+            ticket,
+            iteration,
+            "consecutive-answer-stop-synthesize",
+            ExecutionNodeKind::Synthesize,
+            crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND,
+            "inline_model",
+        );
+        next.executor_kind =
+            crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND.to_string();
+        NodeExecutionOutcome::new(completed_result(
+            Some(format!("{}:consecutive-answer-stop", ticket.graph_id)),
+            ExecutionUsage::default(),
+        ))
+        .with_replan(ExecutionGraphReplan {
+            nodes: vec![next.clone()],
+            edges: dynamic_edges(&ticket.node_id, &[next]),
+            reason: format!(
+                "the model concluded {idle_answers} times without acting; presenting the honest partial terminal instead of spending the remaining budget"
+            ),
+            framework_authored: true,
+        })
+    }
+
+
     #[allow(clippy::too_many_arguments)]
     async fn record_terminal_provider_usage(
         &self,
@@ -1495,6 +1549,31 @@ where
                 state.completion_gap_outstanding = recorded_gap.is_some();
             }
             if let Some(gap) = recorded_gap {
+                // Stop when the model has stopped acting. Concluding again after
+                // being sent back is not progress, and the budget it burns is the
+                // user's: run one30 wrote seven final answers across four minutes
+                // with one tool call in the whole window, and the scenario timed
+                // out with the Objective still open.
+                //
+                // The honest terminal is the right ending, not a failure: the
+                // durable work is real and stays visible, and the reason it did not
+                // close is stated rather than implied by a timeout.
+                let idle_answers = {
+                    let state = self.state.lock().await;
+                    state.repeated_terminal_answers
+                };
+                if let Some(bound) = consecutive_answer_stop_bound() {
+                    if idle_answers >= bound {
+                        tracing::warn!(
+                            target: "cowd::consecutive_answer_stop",
+                            graph_id = %ticket.graph_id,
+                            idle_answers,
+                            gap = %gap,
+                            "the model concluded repeatedly without acting; presenting the honest terminal instead of spending the remaining budget"
+                        );
+                        return Ok(self.honest_partial_terminal(ticket, &gap, idle_answers).await);
+                    }
+                }
                 let continue_gap = {
                     let mut state = self.state.lock().await;
                     claim_continuation_budget(&mut state, "completion_gap")
@@ -2291,6 +2370,43 @@ pub(super) fn terminal_answer_digest(answer: &str) -> String {
     format!("{:x}", Sha256::digest(normalized.as_bytes()))
 }
 
+/// Consecutive conclusions with no tool call after which Runtime stops asking.
+///
+/// The first version of this bound did not exist: the only stop was
+/// `completion_gap_continuation_bound()` at 5, which counts how many times the
+/// gap was shown rather than whether the model did anything about it. Run one30
+/// was shown the gap five times, concluded seven times, and never acted once.
+///
+/// Override with `COWD_CONSECUTIVE_ANSWER_STOP`; `0` disables the stop entirely,
+/// and a value that does not parse falls back to the default rather than
+/// silently removing the stop.
+fn consecutive_answer_stop_bound() -> Option<u8> {
+    consecutive_answer_stop_bound_from(
+        std::env::var("COWD_CONSECUTIVE_ANSWER_STOP")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// The bound as a pure function of the configured value, so the contract is
+/// testable without mutating the process environment.
+///
+/// The first spelling returned `u8` with `unwrap_or(3)`, which made the
+/// documented `0 disables` behave as the exact opposite: `idle_answers >= 0` is
+/// true on the first conclusion, so the documented off switch stopped the run
+/// immediately. An operator who reads the contract must get the behavior the
+/// contract states.
+fn consecutive_answer_stop_bound_from(raw: Option<&str>) -> Option<u8> {
+    match raw {
+        None => Some(3),
+        Some(value) => match value.trim().parse::<u8>() {
+            Ok(0) => None,
+            Ok(bound) => Some(bound),
+            Err(_) => Some(3),
+        },
+    }
+}
+
 /// Bounded number of times a success presentation is returned to continue
 /// because a real Objective completion gap remains. Defaults to 5; override
 /// with `COWD_COMPLETION_GAP_CONTINUATIONS`. Beyond the bound the turn presents
@@ -2723,6 +2839,25 @@ mod terminal_usage_tests {
                 .expect("replay legacy terminal usage")
                 .cache_dimensions_known
         );
+    }
+
+    #[test]
+    fn consecutive_answer_stop_defaults_to_three_and_honors_the_documented_off_switch() {
+        // Unset means the default.
+        assert_eq!(consecutive_answer_stop_bound_from(None), Some(3));
+        // A configured bound is honored as written.
+        assert_eq!(consecutive_answer_stop_bound_from(Some("5")), Some(5));
+        assert_eq!(consecutive_answer_stop_bound_from(Some(" 2 ")), Some(2));
+        // The documented `0 disables` must disable, not mean "stop on the first
+        // conclusion": the first spelling parsed 0 into the same u8 as any other
+        // value, and `idle_answers >= 0` is true immediately.
+        assert_eq!(consecutive_answer_stop_bound_from(Some("0")), None);
+        // A value that does not parse falls back to the default rather than
+        // silently removing the stop.
+        assert_eq!(consecutive_answer_stop_bound_from(Some("")), Some(3));
+        assert_eq!(consecutive_answer_stop_bound_from(Some("abc")), Some(3));
+        assert_eq!(consecutive_answer_stop_bound_from(Some("-1")), Some(3));
+        assert_eq!(consecutive_answer_stop_bound_from(Some("300")), Some(3));
     }
 }
 

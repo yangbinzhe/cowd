@@ -708,20 +708,67 @@ impl RuntimeServices {
                 break;
             }
             if !matched {
-                return Err("obligation requires a Runtime-bound producer with the declared capability, definition, skill and actual tool receipt".into());
+                // Name the requirement that was not met. The old message listed
+                // all four requirements, so a model whose Task had the right
+                // capability but the wrong definition was told both were wrong
+                // and had no way to tell which.
+                let mut unmet = Vec::new();
+                if let Some(capability) = &required.capability_id {
+                    unmet.push(format!("capability `{capability}`"));
+                }
+                if let Some(definition) = &required.agent_definition_ref {
+                    unmet.push(format!("agent definition `{definition}`"));
+                }
+                if let Some(skill) = &required.skill_ref {
+                    unmet.push(format!("skill `{skill}`"));
+                }
+                if let Some(tool) = &required.tool_ref {
+                    unmet.push(format!("tool `{tool}`"));
+                }
+                let detail = if unmet.is_empty() {
+                    "a Runtime-bound producer with an actual tool receipt".to_string()
+                } else {
+                    unmet.join(", ")
+                };
+                return Err(format!(
+                    "obligation {obligation_id} requires a producer with {detail}, and no delivered \
+                     result was produced by one. Publish a Task whose claimant satisfies that requirement, \
+                     or record the gap explicitly rather than asserting it is covered.",
+                    obligation_id = obligation.obligation_id
+                ));
             }
         }
         if coverage.is_empty() {
-            return Err("independent review has no current results".into());
+            // Name what IS current. The old message said the review had no
+            // current results and stopped; a model that had just named three
+            // real receipts was told its evidence did not exist, with no list of
+            // what Runtime considered current and no spelling to try.
+            let current =
+                crate::agentic::supervision::completion_ready_result_artifact_refs(program);
+            let detail = if current.is_empty() {
+                "no delivered result is accepted yet, so there is nothing to review; publish and \
+                 accept a Task first"
+                    .to_string()
+            } else {
+                format!(
+                    "the delivered result refs Runtime currently holds are: [{}]. Cite those \
+                     (or the `task:<id>` that produced them) in result_refs, then read each one with \
+                     evidence_retrieve before submitting the review",
+                    current.join(", ")
+                )
+            };
+            return Err(format!(
+                "independent review has no current results: {detail}"
+            ));
         }
         if let Some(packet) = packet {
-                // A read is a fact about this Agent node, not about one dispatch of it.
-                // The per-attempt stream made a re-dispatched reviewer start from zero
-                // reads, so it was refused for "not having read" bodies it had already
-                // read, and each refusal burned the retry budget until the attempt
-                // settled. Union the node attempts; observe still verifies every payload
-                // sha256 and bytes, so a stale body cannot pass, and receipts from any
-                // other Agent node are still excluded.
+            // A read is a fact about this Agent node, not about one dispatch of it.
+            // The per-attempt stream made a re-dispatched reviewer start from zero
+            // reads, so it was refused for "not having read" bodies it had already
+            // read, and each refusal burned the retry budget until the attempt
+            // settled. Union the node attempts; observe still verifies every payload
+            // sha256 and bytes, so a stale body cannot pass, and receipts from any
+            // other Agent node are still excluded.
             for receipt in self
                 .commit_service()
                 .load_delegated_agent_tool_receipts_all_attempts(
@@ -826,8 +873,7 @@ impl RuntimeServices {
                     // Non-evidence `read_ref` calls simply have no full_output_ref
                     // and are skipped below. (`"read"` was never a tool name; the
                     // facade is `read_ref`, so that arm could not match anything.)
-                    if !event
-                        .payload["tool_name"]
+                    if !event.payload["tool_name"]
                         .as_str()
                         .is_some_and(counts_as_physical_read)
                     {
@@ -863,7 +909,19 @@ impl RuntimeServices {
                     let raw = self
                         .artifact_store()
                         .resolve(&access.retrieval_selector)
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| {
+                            // Name the receipt and the selector. This is the exact
+                            // shape that cost run one30 its whole window: the model
+                            // cited a real receipt, the selector did not resolve,
+                            // and it was told "artifact does not exist" with nothing
+                            // it could act on.
+                            format!(
+                                "review evidence receipt tool://{reference} points to durable content \
+                                 Runtime cannot read: {error} (selector {}); re-read it with \
+                                 evidence_retrieve and cite the reference that call returns",
+                                access.retrieval_selector
+                            )
+                        })?;
                     if raw.sha256 != access.sha256 || raw.bytes != access.bytes {
                         return Err("review raw receipt integrity mismatch".into());
                     }
@@ -871,7 +929,13 @@ impl RuntimeServices {
                         .artifact_store()
                         .read(&raw, &raw.visibility_scope, None)
                         .await
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| {
+                            format!(
+                                "review evidence receipt tool://{reference} is not readable: {error} \
+                                 (selector {})",
+                                raw.selector
+                            )
+                        })?;
                     let Ok(output) = std::str::from_utf8(&bytes) else {
                         continue;
                     };

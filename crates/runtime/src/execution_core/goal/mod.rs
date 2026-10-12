@@ -376,7 +376,26 @@ impl GoalStore {
                     .iter()
                     .any(|criterion| criterion.id == criterion_ref)
                 {
-                    return Err("Objective update criterion does not exist".to_string());
+                    // The ObjectiveReview branch below already lists the valid ids
+                    // for the same condition. Two spellings of one rule in one
+                    // function is how a model ends up guessing: run one19 guessed
+                    // its way through a refusal that named the rule and nothing else.
+                    let valid = current
+                        .criteria
+                        .iter()
+                        .map(|criterion| criterion.id.as_str())
+                        .chain(
+                            current
+                                .obligations
+                                .iter()
+                                .map(|obligation| obligation.obligation_id.as_str()),
+                        )
+                        .collect::<Vec<_>>();
+                    return Err(format!(
+                        "Objective update criterion {criterion_ref} does not exist in the current \
+                         specification; valid ids: [{}]",
+                        valid.join(", ")
+                    ));
                 }
             }
         }
@@ -412,7 +431,19 @@ impl GoalStore {
                 if proof.goal_spec_revision != Some(current.spec_revision)
                     || proof.goal_spec_digest.as_deref() != Some(current.spec_digest.as_str())
                 {
-                    return Err("review source Goal specification changed".into());
+                    // The review was prepared against one revision and the Goal has
+                    // moved. Saying only "changed" leaves the model to re-read
+                    // everything to find out what it is now.
+                    return Err(format!(
+                        "review source Goal specification changed: this review was prepared against \
+                         revision {:?} digest {:?}, and the Goal is now at revision {} digest {}. \
+                         Re-read the current Goal through state_inspect and submit the review against \
+                         that revision.",
+                        proof.goal_spec_revision,
+                        proof.goal_spec_digest,
+                        current.spec_revision,
+                        current.spec_digest
+                    ));
                 }
             }
         }
