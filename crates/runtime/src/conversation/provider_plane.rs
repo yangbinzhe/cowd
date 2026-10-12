@@ -1989,10 +1989,30 @@ where
                         if let Some(callback) = &self.tool_callback {
                             callback.on_usage(&usage);
                         }
+                        // Name what IS available, not only what is not. The message
+                        // used to list the refused names and stop, so a model that
+                        // asked for a tool outside the lease learned nothing about
+                        // where to go - one20 was refused four different Agent
+                        // actions this way and one24 `grep_search`.
+                        let available = {
+                            let mut names = exposed_tool_ids
+                                .iter()
+                                .filter(|name| !unexposed_tool_names.contains(name))
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            names.sort();
+                            if names.len() > 20 {
+                                format!("{} (and {} more)", names[..20].join(", "), names.len() - 20)
+                            } else if names.is_empty() {
+                                "none".to_string()
+                            } else {
+                                names.join(", ")
+                            }
+                        };
                         return Err(
                         RuntimeError::with_provider_failure_metadata(
                             format!(
-                                "tool_protocol_violation: provider requested unknown, unavailable, or unauthorized tool names outside this request's exposure lease: [{}]{}",
+                                "tool_protocol_violation: provider requested unknown, unavailable, or unauthorized tool names outside this request's exposure lease: [{}]{}. Tools available in this request: [{available}]",
                                 unexposed_tool_names.join(", "),
                                 (!denied_by_overlay.is_empty()).then(|| format!(
                                     "; governed one-request allowlist rejected [{}]",

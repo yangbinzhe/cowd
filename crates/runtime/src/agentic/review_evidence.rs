@@ -357,10 +357,35 @@ fn task_review_attempt_rejection(
             .iter()
             .all(|reference| task.artifact_refs.contains(reference))
     {
+        // Name the legal refs, not just the rule. Runtime reads `task.artifact_refs`
+        // in this very condition, so it already knows the answer; the old message
+        // named the Task and the rule and made the model guess the refs. Run one28
+        // guessed eighteen times, each one refused with `state_derived: true` - a
+        // cause the model could not have put in its own input, which is precisely
+        // the case where the framework has to supply it.
+        let legal = if task.artifact_refs.is_empty() {
+            "this Task has no delivered artifact yet; submit or inspect it first".to_string()
+        } else {
+            task.artifact_refs.join(", ")
+        };
+        let shape = if task.artifact_refs.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " A conforming call is {{\"task_ref\": \"{}\", \"decision\": \"accept\", \
+                 \"reason\": \"...\", \"evidence_refs\": [{}]}}.",
+                task.task_id,
+                task.artifact_refs
+                    .iter()
+                    .map(|reference| format!("\"{reference}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         return Err(format!(
             "task review cites results outside Task {}: a Task review covers only that Task's \
-             delivered artifacts; cite this Task's artifact refs, or settle the criterion with \
-             objective_review",
+             delivered artifacts. This Task's legal result refs are: {legal}.{shape} Cite those, \
+             or settle the criterion with objective_review.",
             task.task_id
         ));
     }
@@ -1091,6 +1116,18 @@ mod tests {
         assert!(
             refusal.contains("covers only that Task's"),
             "the refusal must name the rule: {refusal}"
+        );
+        // The rule is not enough. Runtime reads `task.artifact_refs` in the same
+        // condition that produced this refusal, so it already knows the legal set;
+        // run one28 was told the rule eighteen times and guessed eighteen times.
+        // The refusal has to hand over the answer.
+        assert!(
+            refusal.contains("artifact:a"),
+            "the refusal must name this Task's legal artifact refs: {refusal}"
+        );
+        assert!(
+            refusal.contains("\"evidence_refs\""),
+            "the refusal must show a conforming input shape: {refusal}"
         );
     }
 

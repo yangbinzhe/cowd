@@ -101,11 +101,26 @@ pub(crate) fn repeated_call_bound() -> usize {
 /// failures, and it is the only thing in the framework that has ever actually
 /// stopped a loop.
 pub(crate) fn repeated_call_block_bound() -> usize {
+    repeated_call_block_bound_for("")
+}
+
+/// The block bound for one tool.
+///
+/// A wait is not a loop. `state_inspect` point queries are how a model polls for a
+/// worker to advance, and the documented primitive for that
+/// (`wait_for_workers: true`) is already exempt from the streak guard. Run one28
+/// polled a Task thirteen times, was refused thirteen times, and kept polling -
+/// the bound was stopping the symptom while the model still had nowhere to wait.
+/// Polling therefore gets four times the diagnostic bound rather than two, which
+/// is a bound and not a licence: the turn still ends, and the scenario timeout
+/// still applies.
+pub(crate) fn repeated_call_block_bound_for(tool_name: &str) -> usize {
+    let multiplier = if tool_name == "state_inspect" { 4 } else { 2 };
     std::env::var("COWD_TOOL_REPEAT_BLOCK_LIMIT")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(repeated_call_bound().saturating_mul(2))
+        .unwrap_or_else(|| repeated_call_bound().saturating_mul(multiplier))
 }
 
 /// The cumulative count so far, without recording a new call.
@@ -1128,5 +1143,22 @@ mod repetition_guard_tests {
             "an accept must not reset the cumulative repeat count"
         );
         clear_turn(turn);
+    }
+
+    /// Polling is waiting, not looping. `state_inspect` point queries are how a
+    /// model waits for a worker to advance, and the documented primitive for it
+    /// (`wait_for_workers: true`) is already exempt from the streak guard. Run
+    /// one28 polled a Task thirteen times, was refused thirteen times, and kept
+    /// polling - the bound stopped the symptom while the model had nowhere to wait.
+    #[test]
+    fn a_polling_tool_gets_a_wider_block_bound_than_a_reading_tool() {
+        assert_eq!(repeated_call_block_bound_for(""), repeated_call_bound() * 2);
+        assert_eq!(
+            repeated_call_block_bound_for("state_inspect"),
+            repeated_call_bound() * 4
+        );
+        assert_eq!(repeated_call_block_bound_for("read_file"), repeated_call_bound() * 2);
+        // A wider bound is still a bound.
+        assert!(repeated_call_block_bound_for("state_inspect") > 0);
     }
 }

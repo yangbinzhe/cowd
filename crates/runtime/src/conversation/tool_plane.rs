@@ -1386,7 +1386,8 @@ where
         // dispatched at all, which is the only mechanism here that has ever
         // actually stopped a loop.
         let repeated = crate::repetition_guard::repeated_call_count(&turn_id, tool_name, &input_hash);
-        let repeated_refusal = repeated >= crate::repetition_guard::repeated_call_block_bound();
+        let repeated_refusal =
+            repeated >= crate::repetition_guard::repeated_call_block_bound_for(tool_name);
         let Some(refusal) = crate::repetition_guard::refusal_for(&turn_id, tool_name, &input_hash)
         else {
             if !repeated_refusal {
@@ -1396,14 +1397,38 @@ where
                 %tool_name, %turn_id, repeated,
                 "dispatch refused for a repeatedly identical successful call"
             );
+            // The way out has to match the tool. Telling a model that polled
+            // `state_inspect` thirteen times to "open the durable receipt" sends it
+            // somewhere it does not want to go - run one28 was given exactly that
+            // advice and re-issued the call thirteen times anyway. A refusal that
+            // names no reachable next step is not a bound; it is a wall.
+            let way_out = match tool_name {
+                "read_file" | "read_ref" | "glob_search" | "grep_search" | "workspace_snapshot" => {
+                    "The bytes are already committed: open the durable receipt with \
+                     `evidence_retrieve` (same bytes, Runtime-bound hash) instead of issuing the \
+                     call again."
+                }
+                "state_inspect" => {
+                    "You are waiting for a worker to move. Use the Runtime wait primitive - \
+                     `state_inspect` with `wait_for_workers: true` - which parks until a worker \
+                     advances instead of polling. If nothing is in flight, take a different action."
+                }
+                _ => {
+                    "Take a different action, or report the objective as blocked through \
+                     `objective_complete_request` with a blocked_reason."
+                }
+            };
             let reason = format!(
-                "Runtime refused to dispatch this call again: the identical call has already been \
-                 issued {repeated} times in this turn and each time returned the same result, so \
-                 issuing it again cannot advance the objective. The bytes you want are already \
-                 committed: open the durable receipt with `evidence_retrieve`, take a different \
-                 action, or report the objective as blocked through objective_complete_request."
+                "Runtime refused to dispatch this call again: the identical `{tool_name}` call has \
+                 already been issued {repeated} times in this turn and each time returned the same \
+                 result, so issuing it again cannot advance the objective. {way_out}"
             );
-            return Some(self.repeated_call_refusal_message(tool_use_id, &reason));
+            return Some(self.repeated_call_refusal_message(
+                tool_use_id,
+                tool_name,
+                input,
+                &reason,
+            ));
         };
         tracing::warn!(%tool_name, %turn_id, "dispatch refused for a repeatedly failing call");
         let reason = format!(
@@ -1468,10 +1493,19 @@ where
     /// result is what the model reads, and it has to name the durable receipt
     /// rather than only saying "do not repeat" - a model told to change its input
     /// without being told where the bytes already are has nowhere to go.
-    fn repeated_call_refusal_message(&self, tool_use_id: &str, reason: &str) -> ConversationMessage {
+    fn repeated_call_refusal_message(
+        &self,
+        tool_use_id: &str,
+        tool_name: &str,
+        input: &str,
+        reason: &str,
+    ) -> ConversationMessage {
         let turn_id = self.active_turn_id();
+        // The real tool name and input, not a placeholder. Run one28 left thirteen
+        // refusals recorded as `repeated_call` with an empty input, so an operator
+        // reading the journal could not tell which call Runtime had stopped.
         let record = self
-            .start_tool_invocation_record(tool_use_id, "repeated_call", "", 0)
+            .start_tool_invocation_record(tool_use_id, tool_name, input, 0)
             .refused(reason, now_ms());
         let refs = vec![
             RuntimeEventRef {
