@@ -13,7 +13,10 @@ import json
 import subprocess
 import sys
 import os
+import re
+import time
 from collections import Counter
+from difflib import SequenceMatcher
 
 
 def psql(url, sql):
@@ -24,6 +27,230 @@ def psql(url, sql):
     if out.returncode != 0:
         raise RuntimeError(out.stderr.strip())
     return [line.split("\u0001") for line in out.stdout.splitlines() if line.strip()]
+
+
+def normalize_evidence(text):
+    """Blind an evidence line to the counts that grow while a loop runs.
+
+    A repeated-call evidence line reads `{"reference": "artifact:d19f..."} x13`.
+    The count rises every interval; the subject does not. Comparing the raw
+    line would call every interval a new finding, which is exactly the mistake
+    that let run one31 repeat the same finding ten times without anything
+    counting. Standalone integers are normalized too (`13 steps, 0 completion
+    requests`), while identifiers keep their shape: `d19f` is digits glued to
+    letters, so the word-boundary digit pattern leaves the reference intact.
+    """
+    without_count = re.sub(r"\s+x\d+$", "", str(text).strip())
+    return re.sub(r"\b\d+\b", "#", without_count)
+
+
+def finding_fingerprints(conclusion):
+    """Stable identity of a report's findings, independent of the counts.
+
+    Two reports carry the same finding when the root causes and the named
+    subjects match; the repetition counts are deliberately excluded. Sorted so
+    the fingerprint is a set, not a sequence.
+    """
+    fingerprints = []
+    for finding in conclusion.get("findings", []):
+        if isinstance(finding, str):
+            # The terminal conclusion reports a plain sentence ("verdict
+            # reached"), not a structured finding. It is its own fingerprint;
+            # the caller short-circuits on TERMINAL before it matters.
+            fingerprints.append(finding)
+            continue
+        subjects = sorted(
+            normalize_evidence(evidence) for evidence in finding.get("evidence", [])
+        )
+        fingerprints.append(
+            "%s :: %s" % (finding.get("root_cause", ""), " | ".join(subjects))
+        )
+    return sorted(fingerprints)
+
+
+def findings_text(conclusion):
+    """The findings as one comparable string, for the similarity evidence."""
+    return json.dumps(conclusion.get("findings", []), sort_keys=True)
+
+
+def converged(previous_milestones, milestones):
+    """Did the Objective actually move toward closure since the last report?
+
+    Only a completion request or a verdict counts. Reviews and reworks are
+    work-phase churn that a spinning run also produces: run one31's reviewers
+    reviewed the same looping output three times (objective_reviews 2 -> 3 -> 4)
+    while the loop ran, so treating a review as convergence would renew the
+    loop's lease every interval.
+    """
+    if not previous_milestones:
+        return False
+    for key in ("completion_requests", "verdicts"):
+        if int(milestones.get(key, 0) or 0) > int(previous_milestones.get(key, 0) or 0):
+            return True
+    return False
+
+
+def verify(previous, conclusion, milestones, threshold=None):
+    """Verify this report against the previous one, and say when to stop waiting.
+
+    A finding that survives into the next report with its counts only growing
+    is not a new observation, it is the same observation confirmed. This
+    function counts those confirmations; `escalate` turns true once the same
+    finding has been reported `threshold` times in a row with no convergence
+    milestone in between. That is the signal the harness acts on: the monitor
+    has now told the operator the same thing three times and nothing has
+    changed, which is itself the proof that the run is stuck.
+
+    The similarity between consecutive reports is computed and reported, but it
+    is not the detector. Run one30's seven real conclusions measured 0.34
+    average pairwise similarity while the loop was real; fingerprint equality
+    sees what a similarity threshold cannot.
+    """
+    if threshold is None:
+        threshold = int(os.environ.get("COWD_MONITOR_ESCALATE_AFTER", "3"))
+    state = conclusion.get("state", "")
+    if state == "TERMINAL":
+        return {
+            "repeat_count": 0,
+            "threshold": threshold,
+            "escalate": False,
+            "similarity_to_previous": None,
+            "fingerprint": [],
+            "reason": "terminal",
+        }
+    fingerprints = finding_fingerprints(conclusion)
+    if not fingerprints:
+        return {
+            "repeat_count": 0,
+            "threshold": threshold,
+            "escalate": False,
+            "similarity_to_previous": None,
+            "fingerprint": fingerprints,
+            "reason": "no finding to repeat",
+        }
+    previous = previous or {}
+    previous_fingerprint = previous.get("fingerprint") or []
+    previous_text = previous.get("findings_text") or ""
+    current_text = findings_text(conclusion)
+    if previous_fingerprint == fingerprints and not converged(
+        previous.get("milestones") or {}, milestones
+    ):
+        repeat_count = int(previous.get("repeat_count", 0) or 0) + 1
+    else:
+        repeat_count = 1
+    similarity = (
+        round(SequenceMatcher(None, previous_text, current_text).ratio(), 3)
+        if previous_text
+        else None
+    )
+    return {
+        "repeat_count": repeat_count,
+        "threshold": threshold,
+        "escalate": repeat_count >= threshold and state == "SPINNING",
+        "similarity_to_previous": similarity,
+        "fingerprint": fingerprints,
+        "reason": (
+            "the same finding, %d consecutive reports, no convergence milestone"
+            % repeat_count
+            if repeat_count > 1
+            else "first report of this finding"
+        ),
+    }
+
+
+MILESTONE_KEYS = (
+    "completion_requests",
+    "verdicts",
+    "reopens",
+    "objective_reviews",
+    "reworks",
+)
+
+
+def load_state(path):
+    """Read the previous report's verification state, or None.
+
+    A missing, unreadable or corrupt state file is a first observation, never a
+    crash: a monitor that dies on unexpected data is worse than no monitor (the
+    multi-line payload incident kept the monitor dark for a 35-minute run).
+    """
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            state = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def save_state(path, state):
+    """Persist the verification state atomically. Returns True when durable.
+
+    Written to a sibling temp file and renamed, so a monitor killed mid-write
+    leaves either the old state or the new one, never half of one. A failure to
+    persist is reported, not swallowed into silence: without state the
+    escalation cannot count, and an escalation that silently cannot happen is
+    the failure this whole mechanism exists to remove.
+    """
+    if not path:
+        return None
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(state, handle)
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def longest_idle_answer_run(events, threshold=None):
+    """Longest run of text answers with no completed tool call between them.
+
+    `events` is a list of (kind, status) in time order. A text answer extends the
+    run; a completed tool invocation ends it, because work in between is progress
+    and progress is not a loop.
+
+    This is the signal that actually fires on a reworded loop. Run one30's root
+    wrote seven final answers across four minutes with one tool call in the whole
+    window; the lexical similarity between them averaged 0.34 and never exceeded
+    0.95 twice in a row.
+    """
+    if threshold is None:
+        threshold = int(os.environ.get("COWD_MONITOR_IDLE_ANSWERS", "3"))
+    best = 0
+    run = 0
+    for kind, status in events:
+        if kind == "model.item_completed":
+            run += 1
+            best = max(best, run)
+        elif kind == "tool.invocation.completed" and status == "completed":
+            run = 0
+    return {"run": best, "threshold": threshold}
+
+
+def similar_answer_pairs(texts, threshold=None):
+    """Consecutive answer pairs above a lexical-similarity threshold.
+
+    Reported as evidence, not used as the detector: measured against a real
+    reworded loop this stays low while the loop is real.
+    """
+    if threshold is None:
+        threshold = float(os.environ.get("COWD_MONITOR_SIMILARITY", "0.9"))
+    if len(texts) < 2:
+        return []
+    ordered = list(reversed(texts))
+    return [
+        round(SequenceMatcher(None, ordered[index - 1], ordered[index]).ratio(), 3)
+        for index in range(1, len(ordered))
+        if SequenceMatcher(None, ordered[index - 1], ordered[index]).ratio() >= threshold
+    ]
 
 
 def repeated_tool_call_ratio_bp(tool_calls, distinct_inputs):
@@ -167,7 +394,32 @@ class Monitor:
             for r in rows
             if len(r) == 2 and r[1].isdigit() and int(r[1]) >= 3
         ]
-
+        # 3c. Consecutive conclusions with no action in between.
+        #
+        # The first attempt at this checked lexical similarity between consecutive
+        # answers. Measured against run one30's seven real final answers, the
+        # consecutive similarities were [0.95, 0.31, 0.16, 0.11, 0.23, 0.30] - the
+        # model rewrote substantially every time, so a similarity threshold cannot
+        # see the loop. What is invariant is not the words: it is that the model
+        # concluded, was sent back, and concluded again without doing anything.
+        #
+        # So the signal is structural: the longest run of text answers with no
+        # completed tool invocation between them.
+        rows = self.q(
+            "SELECT kind, status FROM runtime_events "
+            "WHERE kind IN ('model.item_completed','tool.invocation.completed') "
+            "ORDER BY created_at_ms")
+        inv["consecutive_idle_answers"] = longest_idle_answer_run(rows)
+        # A high lexical similarity is still worth reporting when it happens - it
+        # is the same loop in an easier-to-see spelling - but it is no longer the
+        # detector.
+        rows = self.q(
+            "SELECT substr(replace(replace(payload->>'content', chr(10), ' '), "
+            "chr(13), ' '), 1, 600) FROM runtime_events "
+            "WHERE kind='model.item_completed' AND payload->>'kind'='text' "
+            "ORDER BY created_at_ms DESC LIMIT 8")
+        window = [r[0] for r in rows if r and r[0]]
+        inv["similar_answer_pairs"] = similar_answer_pairs(window)
         # 4. Rework reasons verbatim (the acceptance-criteria fingerprint).
         rows = self.q(
             "SELECT substr(payload->'envelope'->'action'->'input'->>'reason',1,220) "
@@ -272,13 +524,66 @@ class Monitor:
                 "evidence": [f"{r['call'][:60]} x{r['count']}" for r in reads[:3]],
                 "action": "stop; efficiency contract not reaching delegated actors",
             })
+        idle = inv.get("consecutive_idle_answers") or {}
+        if idle.get("run", 0) >= idle.get("threshold", 3) and snap.get("verdicts", 0) == 0:
+            findings.append({
+                "root_cause": (
+                    "the model keeps concluding without acting: N text answers in a "
+                    "row with no completed tool call between them"
+                ),
+                "evidence": [
+                    "%d consecutive text answers with no tool call between them"
+                    % idle["run"]
+                ],
+                "action": (
+                    "stop; the model has stopped acting. A lexical similarity check "
+                    "cannot see this - one30's answers averaged 0.34 similarity while "
+                    "the loop was real"
+                ),
+            })
+        if inv.get("similar_answer_pairs") and snap.get("verdicts", 0) == 0:
+            findings.append({
+                "root_cause": "consecutive answers are near-identical in wording",
+                "evidence": [
+                    "pairs above threshold: %s" % inv["similar_answer_pairs"]
+                ],
+                "action": "stop; the model is restating itself",
+            })
         state = "SPINNING" if findings else "WORKING"
         return {"state": state, "findings": findings}
 
 
+def parse_args(argv):
+    """Positional postgres url, plus `--investigate` and `--state-file`.
+
+    An unknown or missing state file is a first observation, never an error:
+    the monitor's job is to observe this run, and it must not refuse to start
+    because its memory of the last interval is unreadable.
+    """
+    url = None
+    investigate = False
+    state_file = os.environ.get("COWD_MONITOR_STATE_FILE")
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--investigate":
+            investigate = True
+        elif arg == "--state-file":
+            index += 1
+            state_file = argv[index] if index < len(argv) else None
+        elif arg.startswith("--state-file="):
+            state_file = arg.split("=", 1)[1]
+        elif url is None:
+            url = arg
+        index += 1
+    return url, investigate, state_file
+
+
 def main():
-    url = sys.argv[1]
-    investigate = "--investigate" in sys.argv
+    url, investigate, state_file = parse_args(sys.argv[1:])
+    if not url:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
     m = Monitor(url)
     snap = m.snapshot()
     inv = m.investigate(snap) if investigate else {}
@@ -286,7 +591,24 @@ def main():
     out = dict(snap)
     out["investigation"] = inv
     out["conclusion"] = conclusion
+    # Verify this report against the previous one before anyone reads it. A
+    # finding that comes back with only its counts growing is the same finding
+    # confirmed, and `escalate` is what turns that confirmation into a stop
+    # instead of another line in a log nobody acts on.
+    verification = verify(load_state(state_file), conclusion, snap)
+    verification["state_persisted"] = save_state(
+        state_file,
+        {
+            "fingerprint": verification["fingerprint"],
+            "findings_text": findings_text(conclusion),
+            "repeat_count": verification["repeat_count"],
+            "milestones": {key: snap.get(key, 0) for key in MILESTONE_KEYS},
+            "updated_at_ms": int(time.time() * 1000),
+        },
+    )
+    out["verification"] = verification
     print(json.dumps(out, indent=1, ensure_ascii=False))
+    return 0
 
 
 if __name__ == "__main__":

@@ -140,22 +140,47 @@ monitor_progress() {
 
 # Deep semantic monitoring. Surface progress counters count events; a rework
 # loop or a redundant-read loop emits events forever while the Objective never
-# advances. This loop compares SEMANTIC milestones (verdicts, reopens,
-# reviews, requests) and stops the run when they have not moved for
-# COWD_EVAL_DEEP_MONITOR_STALL_SECS while the run keeps burning steps.
+# advances. Two stop paths, both evidence-backed:
+#
+#  1. ESCALATION (primary). The monitor verifies each report against the
+#     previous one. The same finding, repeated COWD_MONITOR_ESCALATE_AFTER
+#     times in a row with no convergence milestone in between, is a loop the
+#     monitor has confirmed by watching it persist - it stops the run.
+#     Run one31 printed that finding ten times across six minutes while the
+#     run burned its whole window: the detector saw it, nothing counted it.
+#  2. SILENCE (backstop). Semantic milestones frozen for
+#     COWD_EVAL_DEEP_MONITOR_STALL_SECS AND no durable event at all in that
+#     window, for a run that has gone quiet (Qwen v11: 13 steps in 14 minutes,
+#     frozen).
+#
+# Event liveness deliberately gates only the silence path. A repeated-tool-call
+# loop emits an event every few seconds, so requiring silence made the one loop
+# shape that most needed stopping unstoppable - the gate protected the run from
+# the operator instead of the reverse.
 monitor_semantic_health() {
   local interval="${COWD_EVAL_DEEP_MONITOR_INTERVAL_SECS:-60}"
   local monitor="$ROOT/scripts/diagnostics/deep-run-monitor.py"
   [[ -f "$monitor" ]] || return 0
+  # The verification state is what makes a repeated finding count. It lives in
+  # the evidence directory so a post-mortem can replay the escalation; a
+  # read-only evidence root degrades to a temp file rather than losing the
+  # escalation entirely.
+  local state_file="$EVIDENCE_ROOT/deep-monitor-state.json"
+  # The evidence root is reused across runs, so a state file left by the
+  # previous run would carry its repeat count into this one: a fresh run whose
+  # first report matches the old run's last finding would escalate on its first
+  # interval. The verification state belongs to this run; start it empty.
+  rm -f "$state_file" 2>/dev/null || true
+  mkdir -p "$EVIDENCE_ROOT" 2>/dev/null || state_file="$(mktemp /tmp/cowd-deep-monitor-state.XXXXXX)"
   while kill -0 "$HARNESS_PID" >/dev/null 2>&1; do
-    local report state milestones findings now
+    local report state milestones findings now escalate repeat_count state_persisted
     # A monitor that cannot read the database is itself a finding. Silently
     # skipping the turn made a crashing monitor indistinguishable from a quiet
     # one: on a live run the monitor raised on every iteration, this loop
     # treated each empty report as "no data" and continued, and the deep monitor
     # emitted four lines across a 35-minute run that was working the whole time.
     # Emit the failure instead of swallowing it.
-    if ! report="$(python3 "$monitor" "$COWD_TEST_POSTGRES_URL" --investigate 2>/dev/null)"; then
+    if ! report="$(python3 "$monitor" "$COWD_TEST_POSTGRES_URL" --investigate --state-file "$state_file" 2>/dev/null)"; then
       printf '{"event":"harness_eval_deep_monitor_error","reason":"deep-run-monitor failed; semantic health is unobserved this interval"}\n' >&2
       sleep "$interval"
       continue
@@ -178,21 +203,43 @@ monitor_semantic_health() {
     local last_event_age
     last_event_age="$(printf '%s' "$report" | jq -r '.last_event_age_s // 0' 2>/dev/null || echo 0)"
     findings="$(printf '%s' "$report" | jq -c '.conclusion.findings' 2>/dev/null || echo '[]')"
+    # The monitor's own verification: has it told us this same thing before?
+    escalate="$(printf '%s' "$report" | jq -r '.verification.escalate // false' 2>/dev/null || echo false)"
+    repeat_count="$(printf '%s' "$report" | jq -r '.verification.repeat_count // 0' 2>/dev/null || echo 0)"
+    state_persisted="$(printf '%s' "$report" | jq -r '.verification.state_persisted // "true"' 2>/dev/null || echo true)"
+    # An escalation that cannot be counted is the failure this mechanism exists
+    # to remove, so say so instead of letting the run spin unobserved.
+    if [[ "$state_persisted" == "false" ]]; then
+      printf '{"event":"harness_eval_deep_monitor_error","reason":"deep-monitor state not persisted; repeated findings cannot escalate"}\n' >&2
+    fi
     now="$(date +%s)"
     if [[ -n "$milestones" && "$milestones" != "$DEEP_MONITOR_LAST_MILESTONE" ]]; then
       DEEP_MONITOR_LAST_MILESTONE="$milestones"
       DEEP_MONITOR_LAST_CHANGE_TS="$now"
     fi
-    printf '{"event":"harness_eval_deep_monitor","state":"%s","milestones":"%s","stall_for_s":%d,"findings":%s}\n' \
-      "$state" "$milestones" "$(( now - DEEP_MONITOR_LAST_CHANGE_TS ))" "$findings"
+    printf '{"event":"harness_eval_deep_monitor","state":"%s","milestones":"%s","stall_for_s":%d,"repeat_count":%d,"findings":%s}\n' \
+      "$state" "$milestones" "$(( now - DEEP_MONITOR_LAST_CHANGE_TS ))" "${repeat_count:-0}" "$findings"
     if [[ "$DEEP_MONITOR_LAST_CHANGE_TS" -gt 0 ]]; then
       local stalled_for=$(( now - DEEP_MONITOR_LAST_CHANGE_TS ))
-      # Stop only on CONFIRMED waste: an active finding AND semantic milestones
-      # frozen for the stall window AND no durable event at all in that window.
-      # A run that is still emitting events is working, whatever the Objective
-      # milestones say. A single recoverable rework never trips it.
+      # Stop path 1: the monitor has now reported the same finding N times in a
+      # row with no completion request and no verdict in between. Its counts
+      # only grew while it repeated, which is the definition of a confirmed
+      # loop. Event liveness is NOT required here: a loop that keeps calling
+      # tools keeps events flowing, and that is precisely the run to stop.
+      if [[ "$state" == "SPINNING" && "$escalate" == "true" ]]; then
+        printf '%s' "$report" >"$EVIDENCE_ROOT/deep-monitor-final-report.json" 2>/dev/null || true
+        printf '{"event":"harness_eval_deep_monitor_stop","reason":"confirmed spinning: the same finding repeated %s consecutive reports with no convergence milestone","state":"%s","stall_for_s":%d,"findings":%s}\n' \
+          "${repeat_count:-0}" "$state" "$stalled_for" "$findings" >&2
+        kill "$HARNESS_PID" >/dev/null 2>&1 || true
+        return 0
+      fi
+      # Stop path 2 (backstop): confirmed waste by silence - an active finding
+      # AND semantic milestones frozen for the stall window AND no durable
+      # event at all in that window. A single recoverable rework never trips
+      # it, and a run that is still emitting events is left to path 1.
       if [[ "$stalled_for" -ge "$DEEP_MONITOR_STALL_SECS" && "$state" == "SPINNING" \
             && "${last_event_age:-0}" -ge "$DEEP_MONITOR_STALL_SECS" ]]; then
+        printf '%s' "$report" >"$EVIDENCE_ROOT/deep-monitor-final-report.json" 2>/dev/null || true
         printf '{"event":"harness_eval_deep_monitor_stop","reason":"confirmed spinning: findings present, semantic milestones frozen and no durable event in the stall window","state":"%s","stall_for_s":%d,"findings":%s}\n' \
           "$state" "$stalled_for" "$findings" >&2
         kill "$HARNESS_PID" >/dev/null 2>&1 || true
