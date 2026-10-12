@@ -4,6 +4,7 @@ use harness_contract::agent_action::{
     TaskAttemptFailInput, TaskClaimInput, TaskPublishInput, TaskReviewDecision, TaskReviewInput,
     TaskSubmitInput, TaskSupersedeInput, TeamCreateInput,
 };
+use serde_json::Value;
 use harness_contract::goal::{
     AcceptanceCriterion, AcceptanceStatus, GoalCompletion, GoalContract, ObjectiveTerminal,
     ObjectiveTerminalKind,
@@ -4567,16 +4568,55 @@ fn rework_on_a_reading_the_operator_ruled_out_is_refused() {
         Some("rework_contradicts_operator_discipline"),
         "{refused:?}"
     );
-    // The conflict is durable in the receipt, which is what the journal keeps:
-    // the code names the class and the message names the discipline, so a reader
-    // can see a reviewer attempted a reading the operator ruled out.
+    // The conflict is durable in three places, and each reaches a different
+    // reader: the receipt reaches the reviewer that earned it, the event reaches
+    // anyone auditing the journal, and `program_warnings` reaches the root model
+    // and the monitoring layer for the rest of the Program's life.
     let error = refused.error.expect("rejection error");
     assert!(
         error.message.contains("truncated"),
         "the receipt must name the operator discipline it protects: {}",
         error.message
     );
-    assert!(error.message.contains(&task), "{}", error.message);
+    assert!(
+        error.message.contains(&task),
+        "the receipt must name the Task: {}",
+        error.message
+    );
+    // The receipt restates the operator's own requirement, not only the discipline
+    // it protects - otherwise the reviewer is told what it may not read and never
+    // what was actually asked for. Asserted against whatever this fixture's
+    // objective says, so the check survives a change of fixture text.
+    assert!(
+        error.message.contains("The operator's requirement is:"),
+        "the receipt must restate the operator's own requirement: {}",
+        error.message
+    );
+    let events = store
+        .list_stream("agentic-program:program-1")
+        .expect("program stream");
+    assert!(
+        events.iter().any(|event| {
+            event.kind == "agentic.review_discipline_conflict"
+                && event.payload.get("task_ref").and_then(Value::as_str) == Some(task.as_str())
+                && event
+                    .payload
+                    .get("discipline")
+                    .and_then(Value::as_str)
+                    .is_some_and(|discipline| discipline.contains("truncated"))
+        }),
+        "the conflict must be a durable event, or a reviewer can repeat it once per \
+         attempt forever with nothing in the Program showing it: {events:?}"
+    );
+    // And it must be folded into the projection the root and monitoring read.
+    let projection = service.project("program-1").expect("projection");
+    assert!(
+        projection.program_warnings.iter().any(|warning| warning
+            .contains("a reading the operator ruled out")
+            && warning.contains(&task)),
+        "{:?}",
+        projection.program_warnings
+    );
 }
 
 /// The new gate refuses a refusal, so it must fail open on everything it does not

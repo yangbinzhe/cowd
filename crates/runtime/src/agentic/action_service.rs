@@ -140,6 +140,14 @@ const TASK_LEASE_RENEWED_EVENT_KIND: &str = "agentic.task_lease_renewed";
 /// completion forever without the bounded-convergence reopen count ever
 /// seeing it. Recorded durably so that loop is still bounded.
 const COMPLETION_REJECTED_EVENT_KIND: &str = "agentic.completion_rejected";
+/// A reviewer's rework refused for resting on a reading the operator ruled out.
+///
+/// Durable for the same reason `agentic.completion_rejected` is: without a record,
+/// a reviewer can send the same Task back on the same ruled-out reading once per
+/// attempt, forever, and nothing in the Program ever shows it happened. The event
+/// is folded into `program_warnings`, which is the field the root model and the
+/// monitoring layer already read.
+const REVIEW_DISCIPLINE_CONFLICT_EVENT_KIND: &str = "agentic.review_discipline_conflict";
 const TOPIC_CURSOR_EVENT_KIND: &str = "agentic.topic_observation_acknowledged";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -430,21 +438,31 @@ impl AgentActionService {
                 if let Some(discipline) =
                     crate::agentic::order_contract::contradicted_reading_discipline(&input.reason)
                 {
-                    // The conflict is durable in the rejection receipt itself - its
-                    // code and its message name the discipline - because that is the
-                    // artifact the journal keeps. An earlier version also pushed a
-                    // `program_warnings` entry here; it was dead code, since this
-                    // validation path returns the receipt without committing the
-                    // projection it mutated, so the warning never reached anyone.
+                    // The conflict has to outlive the receipt. The receipt reaches
+                    // the reviewer that earned it; the durable marker reaches
+                    // everyone who reads the Program later, and the fold turns it
+                    // into a `program_warnings` entry - the same field the authoring
+                    // side uses, so one place answers "what did the model add that
+                    // the operator never asked for".
+                    self.record_review_discipline_conflict(
+                        &projection,
+                        envelope,
+                        &input.task_ref,
+                        discipline,
+                        &input.reason,
+                    );
                     return Ok(rejected(
                         envelope,
                         projection.revision,
                         "rework_contradicts_operator_discipline",
                         &format!(
                             "Task `{}` was sent back on a reading the operator explicitly ruled out: \
-                             {discipline}. Accept the Task, or name a deliverable the operator's own \
-                             objective requires - not a stricter reading of one it already stated.",
-                            input.task_ref
+                             {discipline}. The operator's requirement is: {}. Accept the Task, or name \
+                             a deliverable that requirement itself asks for - not a stricter reading of it.",
+                            input.task_ref,
+                            crate::agentic::work_market::operator_requirement_summary_for_projection(
+                                &projection
+                            )
                         ),
                     ));
                 }
@@ -1403,14 +1421,101 @@ impl AgentActionService {
             idempotency_key: Some(format!("completion-rejected:{}", envelope.action_id)),
             schema_version: 1,
         };
-        let _ = self.store.append_transaction(AppendTransactionRequest {
+        // Same two corrections as the discipline-conflict marker: append while
+        // already holding the stream lock, and carry the expected revision. This
+        // marker was written with `append_transaction` and an empty
+        // `expected_streams`, which the store rejects - so the bounded-convergence
+        // count it exists to feed never saw a single one, behind a `let _ =` that
+        // swallowed the error for the life of the feature.
+        if let Err(error) = self.store.append_transaction_locked(AppendTransactionRequest {
             transaction_id: format!(
                 "completion-rejected:{}:{}",
                 projection.program_id, envelope.action_id
             ),
-            expected_streams: Vec::new(),
+            expected_streams: vec![ExpectedStreamRevision {
+                stream_id: program_stream(&projection.program_id),
+                expected_revision: projection.revision,
+            }],
             events: vec![event],
-        });
+        }) {
+            tracing::warn!(
+                target: "cowd::agentic",
+                program_id = %projection.program_id,
+                %error,
+                "completion rejection marker not recorded; the reopen bound is measuring fewer rejections than occurred"
+            );
+        }
+    }
+
+    /// Record a durable marker for a rework refused on a reading the operator
+    /// ruled out. Best-effort, like `record_completion_rejection`: a failed append
+    /// must not change the refusal the caller already computed.
+    ///
+    /// The marker is what makes the conflict visible after the fact. The refusal
+    /// receipt reaches the reviewer that earned it; this reaches everyone who
+    /// reads the Program later, including the root model deciding whether to trust
+    /// a rework and the operator auditing why work kept going back and forth.
+    fn record_review_discipline_conflict(
+        &self,
+        projection: &AgenticProgramProjection,
+        envelope: &AgentActionEnvelope,
+        task_ref: &str,
+        discipline: &str,
+        reviewer_reason: &str,
+    ) {
+        let stream_id = program_stream(&projection.program_id);
+        let event = RuntimeTransactionEventInput {
+            event: RuntimeEventInput {
+                stream_id,
+                scope: RuntimeEventScope::Program,
+                kind: REVIEW_DISCIPLINE_CONFLICT_EVENT_KIND.to_string(),
+                status: Some("rejected".to_string()),
+                actor: Some(envelope.actor.actor_id.clone()),
+                refs: vec![
+                    RuntimeEventRef {
+                        kind: "task".to_string(),
+                        id: task_ref.to_string(),
+                    },
+                    RuntimeEventRef {
+                        kind: "objective".to_string(),
+                        id: envelope.actor.objective_id.clone(),
+                    },
+                ],
+                payload: json!({
+                    "program_id": projection.program_id,
+                    "task_ref": task_ref,
+                    "review_action_id": envelope.action_id,
+                    "discipline": discipline,
+                    "reviewer_reason": reviewer_reason.chars().take(240).collect::<String>(),
+                }),
+            },
+            idempotency_key: Some(format!("review-discipline-conflict:{}", envelope.action_id)),
+            schema_version: 1,
+        };
+        // `append_transaction_locked`, not `append_transaction`: the caller is
+        // already inside `with_stream_locks` for this stream, and the locking
+        // variant would re-acquire it. The expected revision is mandatory - an
+        // empty `expected_streams` is rejected outright, which is how the
+        // completion-rejection marker next door failed silently for its whole
+        // life behind a `let _ =`.
+        if let Err(error) = self.store.append_transaction_locked(AppendTransactionRequest {
+            transaction_id: format!(
+                "review-discipline-conflict:{}:{}",
+                projection.program_id, envelope.action_id
+            ),
+            expected_streams: vec![ExpectedStreamRevision {
+                stream_id: program_stream(&projection.program_id),
+                expected_revision: projection.revision,
+            }],
+            events: vec![event],
+        }) {
+            tracing::warn!(
+                target: "cowd::agentic",
+                program_id = %projection.program_id,
+                %error,
+                "review discipline-conflict marker not recorded; the conflict stays visible only in the receipt"
+            );
+        }
     }
 
     /// Commit the Goal decision and the exact Program request disposition in
@@ -1799,6 +1904,34 @@ fn apply_projection_events(
                     ));
                 }
                 *projection = inherited;
+            }
+            projection.revision = event.sequence;
+            continue;
+        }
+        if event.kind == REVIEW_DISCIPLINE_CONFLICT_EVENT_KIND {
+            // Derived, never stored: `program_warnings` is a fold of the durable
+            // journal, exactly like the authoring-side warning. A reviewer that
+            // tried a reading the operator ruled out stays visible for the rest of
+            // the Program's life, so the root can weigh later rework accordingly
+            // and an operator can see why work kept going back and forth.
+            let task_ref = event
+                .payload
+                .get("task_ref")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let discipline = event
+                .payload
+                .get("discipline")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if !task_ref.is_empty() && !discipline.is_empty() {
+                let warning = format!(
+                    "Task `{task_ref}` was sent back on a reading the operator ruled out: \
+                     {discipline}. The rework was refused; the operator's requirement stands."
+                );
+                if !projection.program_warnings.contains(&warning) {
+                    projection.program_warnings.push(warning);
+                }
             }
             projection.revision = event.sequence;
             continue;
