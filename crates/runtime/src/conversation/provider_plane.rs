@@ -453,6 +453,21 @@ where
     ) -> Result<(ModelStepResult, Option<String>), RuntimeError> {
         let started_at = Instant::now();
         self.configure_terminal_tool_exposure(exposure_reason, required_tools);
+        // The tool choice belongs to this request too. `configure_tool_choice` was
+        // only ever called from the ordinary model-step path, so a demand for a
+        // tool call made on a terminal request was silently dropped: run one30 was
+        // escalated twice, both escalated requests carried the closing tools, and
+        // the model answered with prose both times because nothing told the
+        // provider a tool call was required.
+        //
+        // `tool_choice: required` is invalid when no tool is exposed, so it is
+        // gated on the exposure this request actually built - the same fail-closed
+        // rule the model-step path uses.
+        let terminal_tools_exposed = required_tools.is_some_and(|tools| !tools.is_empty());
+        let one_shot_tool_required =
+            terminal_tools_exposed && self.next_model_tool_required.swap(false, Ordering::SeqCst);
+        self.api_client
+            .configure_tool_choice(one_shot_tool_required, None);
 
         let mut prompt = PromptAssembly::new(self.system_prompt.clone());
         // A terminal synthesis is its own request with its own system section, so
