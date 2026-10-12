@@ -13,7 +13,6 @@ import json
 import subprocess
 import sys
 import os
-import re
 import time
 from collections import Counter
 from difflib import SequenceMatcher
@@ -29,27 +28,22 @@ def psql(url, sql):
     return [line.split("\u0001") for line in out.stdout.splitlines() if line.strip()]
 
 
-def normalize_evidence(text):
-    """Blind an evidence line to the counts that grow while a loop runs.
-
-    A repeated-call evidence line reads `{"reference": "artifact:d19f..."} x13`.
-    The count rises every interval; the subject does not. Comparing the raw
-    line would call every interval a new finding, which is exactly the mistake
-    that let run one31 repeat the same finding ten times without anything
-    counting. Standalone integers are normalized too (`13 steps, 0 completion
-    requests`), while identifiers keep their shape: `d19f` is digits glued to
-    letters, so the word-boundary digit pattern leaves the reference intact.
-    """
-    without_count = re.sub(r"\s+x\d+$", "", str(text).strip())
-    return re.sub(r"\b\d+\b", "#", without_count)
-
-
 def finding_fingerprints(conclusion):
-    """Stable identity of a report's findings, independent of the counts.
+    """Stable identity of a report's findings: the root causes, nothing else.
 
-    Two reports carry the same finding when the root causes and the named
-    subjects match; the repetition counts are deliberately excluded. Sorted so
-    the fingerprint is a set, not a sequence.
+    The evidence list is the proof, not the identity, and it moves while the
+    loop is real. A live run (2026-10-12, live_one_team_execution) reset its own
+    escalation twice because a second and then a third repeated input crossed
+    the reporting threshold and joined the evidence roster: the finding was the
+    same finding with more examples, but the fingerprint grew with the roster
+    and the counter restarted. The same instability sits in the
+    `objective never requested` finding, whose evidence quotes the recent
+    actions and therefore changes whenever any action is applied.
+
+    The root cause is what the finding asserts; the evidence merely shows it.
+    Two reports carry the same finding when they assert the same things, and a
+    loop that accumulates more examples is still the same loop - a worsening
+    loop must not look like a new one.
     """
     fingerprints = []
     for finding in conclusion.get("findings", []):
@@ -59,12 +53,7 @@ def finding_fingerprints(conclusion):
             # the caller short-circuits on TERMINAL before it matters.
             fingerprints.append(finding)
             continue
-        subjects = sorted(
-            normalize_evidence(evidence) for evidence in finding.get("evidence", [])
-        )
-        fingerprints.append(
-            "%s :: %s" % (finding.get("root_cause", ""), " | ".join(subjects))
-        )
+        fingerprints.append(str(finding.get("root_cause", "")))
     return sorted(fingerprints)
 
 
@@ -100,6 +89,10 @@ def verify(previous, conclusion, milestones, threshold=None):
     milestone in between. That is the signal the harness acts on: the monitor
     has now told the operator the same thing three times and nothing has
     changed, which is itself the proof that the run is stuck.
+
+    Identity is the set of root causes. The evidence roster is excluded
+    because it grows while a loop worsens, and a loop that accumulates more
+    examples is still the same loop.
 
     The similarity between consecutive reports is computed and reported, but it
     is not the detector. Run one30's seven real conclusions measured 0.34

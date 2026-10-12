@@ -326,10 +326,58 @@ def _():
     assert finding_fingerprints(spinning((10, 10, 9))) == finding_fingerprints(
         spinning((13, 13, 12))
     ), "counts are not identity"
-    # The subject is identity: a different artifact is a different finding.
-    other = spinning((10, 10, 9))
-    other["findings"][0]["evidence"][0] = '{"reference": "artifact:0000"} x10'
-    assert finding_fingerprints(other) != finding_fingerprints(spinning())
+
+
+@case("a growing evidence roster does not change a finding's identity")
+def _():
+    # The live 2026-10-12 run reset its own escalation twice because a second
+    # and then a third repeated input crossed the reporting threshold and joined
+    # the evidence list. The finding was the same finding with more examples.
+    # A worsening loop must not look like a new one.
+    two_examples = spinning((10, 10, 9))
+    three_examples = spinning((10, 10, 9))
+    three_examples["findings"][0]["evidence"].append(
+        '{"reference": "artifact:015125cb446fef55279efeae"} x7'
+    )
+    assert finding_fingerprints(two_examples) == finding_fingerprints(three_examples)
+    # The subject is not identity either: looping on a different file is still
+    # the same class of waste, and the post-mortem keeps the current evidence.
+    other_file = spinning((10, 10, 9))
+    other_file["findings"][0]["evidence"][0] = '{"path": "crates/other.rs"} x10'
+    assert finding_fingerprints(other_file) == finding_fingerprints(spinning())
+    # The assertion is identity: a different root cause is a different finding.
+    different = {
+        "state": "SPINNING",
+        "findings": [{
+            "root_cause": "rework loop: reviewers enforce criteria beyond the operator's stated requirement",
+            "evidence": ["invented criterion"],
+            "action": "stop",
+        }],
+    }
+    assert finding_fingerprints(different) != finding_fingerprints(spinning())
+
+
+@case("a finding set that only gained evidence keeps counting its repeat")
+def _():
+    # The exact regression the live run exposed: the second report carried one
+    # more evidence line under the same root causes, and the counter restarted
+    # from 1 instead of advancing to the escalation.
+    first = verify(None, spinning((14, 14, 14)), milestones())
+    state = carried(first, spinning((14, 14, 14)), milestones())
+    grown = spinning((14, 14, 14))
+    grown["findings"][0]["evidence"].append(
+        '{"reference": "artifact:015125cb446fef55279efeae"} x9'
+    )
+    grown["findings"][1]["evidence"].append(
+        '{"reference": "artifact:015125cb446fef55279efeae"} x9'
+    )
+    second = verify(state, grown, milestones())
+    assert second["repeat_count"] == 2, second
+    assert second["escalate"] is False, second
+    state = carried(second, grown, milestones())
+    third = verify(state, grown, milestones())
+    assert third["repeat_count"] == 3, third
+    assert third["escalate"] is True, third
 
 
 @case("the first report of a finding is not yet an escalation")
