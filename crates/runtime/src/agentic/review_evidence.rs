@@ -64,6 +64,57 @@ pub(crate) fn work_manifest_digest(program: &AgenticProgramProjection) -> String
     format!("{:x}", Sha256::digest(value.to_string().as_bytes()))
 }
 
+/// The refusal the model sees when an obligation's producer requirement is not
+/// met. Pure so the acceptance can assert the model is told WHICH requirement
+/// failed: the old text listed all four, so a Task with the right capability
+/// and the wrong definition was told both were wrong.
+pub(crate) fn unmet_obligation_error(
+    obligation_id: &str,
+    required: &harness_contract::goal::ObjectiveProducerContract,
+) -> String {
+    let mut unmet = Vec::new();
+    if let Some(capability) = &required.capability_id {
+        unmet.push(format!("capability `{capability}`"));
+    }
+    if let Some(definition) = &required.agent_definition_ref {
+        unmet.push(format!("agent definition `{definition}`"));
+    }
+    if let Some(skill) = &required.skill_ref {
+        unmet.push(format!("skill `{skill}`"));
+    }
+    if let Some(tool) = &required.tool_ref {
+        unmet.push(format!("tool `{tool}`"));
+    }
+    let detail = if unmet.is_empty() {
+        "a Runtime-bound producer with an actual tool receipt".to_string()
+    } else {
+        unmet.join(", ")
+    };
+    format!(
+        "obligation {obligation_id} requires a producer with {detail}, and no delivered result was \
+         produced by one. Publish a Task whose claimant satisfies that requirement, or record the \
+         gap explicitly rather than asserting it is covered."
+    )
+}
+
+/// The refusal the model sees when a review cites no current result. Pure so
+/// the acceptance can assert the model is told which refs Runtime holds.
+pub(crate) fn no_current_results_error(current: &[String]) -> String {
+    let detail = if current.is_empty() {
+        "no delivered result is accepted yet, so there is nothing to review; publish and accept a \
+         Task first"
+            .to_string()
+    } else {
+        format!(
+            "the delivered result refs Runtime currently holds are: [{}]. Cite those (or the \
+             `task:<id>` that produced them) in result_refs, then read each one with \
+             evidence_retrieve before submitting the review",
+            current.join(", ")
+        )
+    };
+    format!("independent review has no current results: {detail}")
+}
+
 /// Compact only trusted ToolHost output, before the existing receipt owner
 /// applies its size bound. The caller still receives the complete original page.
 pub(crate) fn compact_read_receipt(output: &str) -> String {
@@ -712,30 +763,7 @@ impl RuntimeServices {
                 // all four requirements, so a model whose Task had the right
                 // capability but the wrong definition was told both were wrong
                 // and had no way to tell which.
-                let mut unmet = Vec::new();
-                if let Some(capability) = &required.capability_id {
-                    unmet.push(format!("capability `{capability}`"));
-                }
-                if let Some(definition) = &required.agent_definition_ref {
-                    unmet.push(format!("agent definition `{definition}`"));
-                }
-                if let Some(skill) = &required.skill_ref {
-                    unmet.push(format!("skill `{skill}`"));
-                }
-                if let Some(tool) = &required.tool_ref {
-                    unmet.push(format!("tool `{tool}`"));
-                }
-                let detail = if unmet.is_empty() {
-                    "a Runtime-bound producer with an actual tool receipt".to_string()
-                } else {
-                    unmet.join(", ")
-                };
-                return Err(format!(
-                    "obligation {obligation_id} requires a producer with {detail}, and no delivered \
-                     result was produced by one. Publish a Task whose claimant satisfies that requirement, \
-                     or record the gap explicitly rather than asserting it is covered.",
-                    obligation_id = obligation.obligation_id
-                ));
+                return Err(unmet_obligation_error(&obligation.obligation_id, required));
             }
         }
         if coverage.is_empty() {
@@ -745,21 +773,7 @@ impl RuntimeServices {
             // what Runtime considered current and no spelling to try.
             let current =
                 crate::agentic::supervision::completion_ready_result_artifact_refs(program);
-            let detail = if current.is_empty() {
-                "no delivered result is accepted yet, so there is nothing to review; publish and \
-                 accept a Task first"
-                    .to_string()
-            } else {
-                format!(
-                    "the delivered result refs Runtime currently holds are: [{}]. Cite those \
-                     (or the `task:<id>` that produced them) in result_refs, then read each one with \
-                     evidence_retrieve before submitting the review",
-                    current.join(", ")
-                )
-            };
-            return Err(format!(
-                "independent review has no current results: {detail}"
-            ));
+            return Err(no_current_results_error(&current));
         }
         if let Some(packet) = packet {
             // A read is a fact about this Agent node, not about one dispatch of it.
@@ -915,11 +929,13 @@ impl RuntimeServices {
                             // cited a real receipt, the selector did not resolve,
                             // and it was told "artifact does not exist" with nothing
                             // it could act on.
-                            format!(
-                                "review evidence receipt tool://{reference} points to durable content \
-                                 Runtime cannot read: {error} (selector {}); re-read it with \
-                                 evidence_retrieve and cite the reference that call returns",
-                                access.retrieval_selector
+                            results::unresolvable_receipt_error(
+                                "review evidence receipt tool://",
+                                reference,
+                                &access.retrieval_selector,
+                                &error.to_string(),
+                                "re-read it with evidence_retrieve and cite the reference that call \
+                                 returns",
                             )
                         })?;
                     if raw.sha256 != access.sha256 || raw.bytes != access.bytes {
@@ -930,10 +946,13 @@ impl RuntimeServices {
                         .read(&raw, &raw.visibility_scope, None)
                         .await
                         .map_err(|error| {
-                            format!(
-                                "review evidence receipt tool://{reference} is not readable: {error} \
-                                 (selector {})",
-                                raw.selector
+                            results::unreadable_receipt_error(
+                                "review evidence receipt tool://",
+                                reference,
+                                &raw.selector,
+                                &error.to_string(),
+                                "re-read it with evidence_retrieve and cite the reference that call \
+                                 returns",
                             )
                         })?;
                     let Ok(output) = std::str::from_utf8(&bytes) else {
@@ -1061,6 +1080,49 @@ impl RuntimeServices {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refusal_names_which_producer_requirement_was_not_met() {
+        // V27-B2: the old text listed all four requirements, so a Task with
+        // the right capability and the wrong definition was told both were
+        // wrong. The model must be able to tell which one to fix.
+        let required = harness_contract::goal::ObjectiveProducerContract {
+            capability_id: Some("capability:reader".into()),
+            agent_definition_ref: Some("definition:reviewer".into()),
+            skill_ref: None,
+            tool_ref: None,
+        };
+        let refusal = unmet_obligation_error("obligation:1", &required);
+        assert!(
+            refusal.contains("capability `capability:reader`"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains("agent definition `definition:reviewer`"),
+            "{refusal}"
+        );
+        // A requirement that was not set is not named as unmet.
+        assert!(!refusal.contains("skill `"), "{refusal}");
+        assert!(!refusal.contains("tool `"), "{refusal}");
+        // And the way out is stated.
+        assert!(refusal.contains("Publish a Task"), "{refusal}");
+    }
+
+    #[test]
+    fn a_refusal_lists_the_result_refs_runtime_currently_holds() {
+        // V27-B1: a model that had just named three real receipts was told its
+        // evidence did not exist. It must be told what IS current.
+        let with_refs = no_current_results_error(&[
+            "artifact://1111".to_string(),
+            "artifact://2222".to_string(),
+        ]);
+        assert!(with_refs.contains("artifact://1111"), "{with_refs}");
+        assert!(with_refs.contains("artifact://2222"), "{with_refs}");
+        assert!(with_refs.contains("evidence_retrieve"), "{with_refs}");
+        let empty = no_current_results_error(&[]);
+        assert!(empty.contains("publish and accept a Task first"), "{empty}");
+        assert!(!empty.contains("artifact://"), "{empty}");
+    }
 
     fn coverage() -> ReadCoverage {
         ReadCoverage {

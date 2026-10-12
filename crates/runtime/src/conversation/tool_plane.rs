@@ -587,6 +587,7 @@ where
         let tool_name = task.tool_name.as_str();
         let refusal = self.blocked_repeated_call(tool_name, tool_use_id, input, iterations);
         if let Some(refusal) = refusal {
+            self.note_refusal_ignored(tool_name, input);
             return Ok(refusal);
         }
         let (pre_hook_result, effective_input, model_delivery_requirement, mut permission_context) =
@@ -1370,6 +1371,41 @@ where
     /// The refusal is also recorded as evidence. A refusal that only returns a tool
     /// result leaves the report unable to reconcile with the ledger: the model was
     /// answered, but no invocation record exists for the answer.
+    ///
+    /// A refusal the model answers by issuing the same call again is a refusal it
+    /// is not reading. Run one31 read the same file seven times: the Runtime
+    /// refused the fifth, sixth and seventh with guidance, and the model issued
+    /// them anyway. Past the ignored-refusal bound the next model step is
+    /// text-only, so the model must conclude rather than re-issue - the same
+    /// one-request override the judge and recovery paths already use.
+    fn note_refusal_ignored(&self, tool_name: &str, input: &str) {
+        let Some(ignored_bound) = ignored_refusal_stop_bound() else {
+            return;
+        };
+        let input_hash = crate::tool_invocation::stable_hash(input);
+        let repeated = crate::repetition_guard::repeated_call_count(
+            &self.active_turn_id(),
+            tool_name,
+            &input_hash,
+        );
+        let block_bound = crate::repetition_guard::repeated_call_block_bound_for(tool_name);
+        if repeated < block_bound + 1 + ignored_bound {
+            return;
+        }
+        // The turn state is not reachable from here - the tool plane runs on
+        // ConversationRuntime, the state lives with the turn backend - so the
+        // escalation is recorded turn-scoped in the guard the refusal path
+        // already keys on, and the model-step preparation consumes it.
+        crate::repetition_guard::mark_refusal_ignored(&self.active_turn_id());
+        tracing::warn!(
+            %tool_name,
+            repeated,
+            block_bound,
+            ignored_bound,
+            "the model kept issuing a call Runtime had already refused; the next step is text-only so it must conclude"
+        );
+    }
+
     fn blocked_repeated_call(
         &self,
         tool_name: &str,
@@ -1940,9 +1976,47 @@ where
     }
 }
 
+/// Consecutive ignored refusals after which the next model step is text-only.
+///
+/// Pure so the contract is testable: unset means 2, `0` disables the
+/// escalation, and a value that does not parse falls back to the default
+/// rather than silently removing the stop. The first spelling of the
+/// `consecutive_answer_stop_bound` contract made the documented off switch do
+/// the opposite of what it said; this one is checked by a test.
+fn ignored_refusal_stop_bound() -> Option<usize> {
+    ignored_refusal_stop_bound_from(std::env::var("COWD_IGNORED_REFUSAL_LIMIT").ok().as_deref())
+}
+
+/// The bound as a pure function of the configured value, so the contract is
+/// testable without mutating the process environment.
+fn ignored_refusal_stop_bound_from(raw: Option<&str>) -> Option<usize> {
+    match raw {
+        None => Some(2),
+        Some(value) => match value.trim().parse::<usize>() {
+            Ok(0) => None,
+            Ok(bound) => Some(bound),
+            Err(_) => Some(2),
+        },
+    }
+}
+
 #[cfg(test)]
 mod agentic_action_body_tests {
     use super::agentic_action_body;
+
+    #[test]
+    fn the_ignored_refusal_bound_honors_its_documented_contract() {
+        // Unset means the default of two ignored refusals.
+        assert_eq!(super::ignored_refusal_stop_bound_from(None), Some(2));
+        // A configured bound is honored as written.
+        assert_eq!(super::ignored_refusal_stop_bound_from(Some("4")), Some(4));
+        // The documented `0 disables` must disable, not mean "escalate on the
+        // first refusal".
+        assert_eq!(super::ignored_refusal_stop_bound_from(Some("0")), None);
+        // A value that does not parse falls back to the default.
+        assert_eq!(super::ignored_refusal_stop_bound_from(Some("")), Some(2));
+        assert_eq!(super::ignored_refusal_stop_bound_from(Some("abc")), Some(2));
+    }
 
     fn receipt(status: &str, changed_refs: &[&str], duplicate: bool) -> String {
         serde_json::json!({

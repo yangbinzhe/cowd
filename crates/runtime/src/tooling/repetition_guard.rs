@@ -33,7 +33,7 @@
 //! invocation into a diagnosis, which is the framework stating what it already
 //! knows and leaving the judgment to the model.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
 use crate::tool_invocation::ToolFailureKind;
@@ -461,10 +461,43 @@ pub fn clear_failure_breakers(turn_id: &str) {
     repetition_ledger()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .retain(|key, _| {
-            !key.contains(needle.as_str())
-                || key.starts_with("repeat:")
-        });
+        .retain(|key, _| !key.contains(needle.as_str()) || key.starts_with("repeat:"));
+    clear_ignored_refusal(turn_id);
+}
+
+/// Turns whose model answered a refusal by issuing the same call again.
+///
+/// A refusal the model does not read is a refusal that costs a provider round
+/// every time it is ignored: run one31 read one file seven times, was refused
+/// for the fifth, sixth and seventh, and issued them anyway. The tool plane
+/// marks the turn here and the model-step preparation consumes the mark by
+/// forcing a text-only step, so the model must conclude instead of re-issuing.
+fn ignored_refusal_turns() -> &'static std::sync::Mutex<BTreeSet<String>> {
+    static TURNS: OnceLock<std::sync::Mutex<BTreeSet<String>>> = OnceLock::new();
+    TURNS.get_or_init(|| std::sync::Mutex::new(BTreeSet::new()))
+}
+
+pub fn mark_refusal_ignored(turn_id: &str) {
+    ignored_refusal_turns()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(turn_id.to_string());
+}
+
+/// Read and clear the mark: the escalation applies to exactly one step, like
+/// every other one-request override in the turn state.
+pub fn take_refusal_ignored(turn_id: &str) -> bool {
+    ignored_refusal_turns()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(turn_id)
+}
+
+fn clear_ignored_refusal(turn_id: &str) {
+    ignored_refusal_turns()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(turn_id);
 }
 
 pub fn clear_turn(turn_id: &str) {
@@ -531,6 +564,33 @@ mod repetition_guard_tests {
         () => {
             concat!("turn-", line!(), "-", column!())
         };
+    }
+
+    #[test]
+    fn an_ignored_refusal_mark_is_consumed_by_exactly_one_step() {
+        let t = turn!();
+        // Nothing marked: nothing to consume.
+        assert!(!take_refusal_ignored(t));
+        mark_refusal_ignored(t);
+        // The first reader consumes it, like every one-request override.
+        assert!(take_refusal_ignored(t));
+        assert!(
+            !take_refusal_ignored(t),
+            "the mark must apply to exactly one step"
+        );
+        // Another turn is unaffected.
+        mark_refusal_ignored(t);
+        assert!(take_refusal_ignored(&format!("{t}-other")) == false);
+    }
+
+    #[test]
+    fn progress_clears_the_ignored_refusal_mark() {
+        let t = turn!();
+        mark_refusal_ignored(t);
+        // An accepted task transition is progress; a mark filed under the old
+        // state must not outlive it.
+        clear_failure_breakers(t);
+        assert!(!take_refusal_ignored(t));
     }
 
     fn err(turn: &str, kind: ToolFailureKind, msg: &str) -> Option<String> {

@@ -72,6 +72,47 @@ pub(super) fn tool_effect_from_store(
     }
 }
 
+/// The refusal the model sees when a cited receipt's selector does not resolve.
+///
+/// Pure so the acceptance can assert what the model sees without a store:
+/// V27-M4 requires the reference, the selector and the next step in the text,
+/// because one30 was told six words - "artifact does not exist" - and spent
+/// its window writing conclusions about the blocker instead of fixing it.
+pub(super) fn unresolvable_receipt_error(
+    subject: &str,
+    reference: &str,
+    selector: &str,
+    error: &str,
+    guidance: &str,
+) -> String {
+    format!(
+        "{subject} {reference} points to durable content Runtime cannot read: {error} \
+         (selector {selector}); {guidance}"
+    )
+}
+
+/// The refusal the model sees when a resolved receipt cannot be read back.
+pub(super) fn unreadable_receipt_error(
+    subject: &str,
+    reference: &str,
+    selector: &str,
+    error: &str,
+    guidance: &str,
+) -> String {
+    format!(
+        "{subject} {reference} has a durable receipt Runtime cannot read: {error} \
+         (selector {selector}); {guidance}"
+    )
+}
+
+/// The refusal the model sees when a Session receipt for a cited `tool://`
+/// reference cannot be authenticated.
+pub(super) fn unauthenticated_receipt_error(reference: &str, error: &str) -> String {
+    format!(
+        "result Tool evidence {reference} has no readable authenticated Session receipt: {error}"
+    )
+}
+
 async fn tool_content(
     services: &RuntimeServices,
     session: &str,
@@ -83,12 +124,20 @@ async fn tool_content(
     let access = services
         .session_evidence_access(session, id)
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(|error| unauthenticated_receipt_error(reference, &error.to_string()))?
         .ok_or("result Tool evidence has no authenticated Session receipt")?;
     let content = services
         .artifact_store()
         .resolve(&access.retrieval_selector)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            unresolvable_receipt_error(
+                "result Tool evidence",
+                reference,
+                &access.retrieval_selector,
+                &error.to_string(),
+                "read it with evidence_retrieve instead of re-issuing the call",
+            )
+        })?;
     if content.sha256 != access.sha256
         || content.bytes != access.bytes
         || content.media_type != access.media_type
@@ -211,11 +260,13 @@ pub(super) async fn resolve_result(
             .artifact_store()
             .resolve(&artifact.content_ref)
             .map_err(|error| {
-                format!(
-                    "objective_review result {reference} points to durable content Runtime cannot read: {error} \
-                     (Runtime recorded selector {} for this result; cite the result ref the Task returned \
-                     from task_submit, or read it with evidence_retrieve)",
-                    artifact.content_ref
+                unresolvable_receipt_error(
+                    "objective_review result",
+                    reference,
+                    &artifact.content_ref,
+                    &error.to_string(),
+                    "cite the result ref the Task returned from task_submit, or read it with \
+                     evidence_retrieve",
                 )
             })?
     } else if reference.starts_with("tool://") {
@@ -449,10 +500,12 @@ pub(super) async fn resolve_result(
                         .read(&raw, &raw.visibility_scope, None)
                         .await
                         .map_err(|error| {
-                            format!(
-                                "objective_review result {reference} has a durable receipt Runtime cannot read: {error} \
-                                 (selector {}); read it with evidence_retrieve instead of re-issuing the call",
-                                raw.selector
+                            unreadable_receipt_error(
+                                "objective_review result",
+                                reference,
+                                &raw.selector,
+                                &error.to_string(),
+                                "read it with evidence_retrieve instead of re-issuing the call",
                             )
                         })?;
                     if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
@@ -676,6 +729,40 @@ pub(super) fn delegated_effect_scopes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_refusal_names_the_receipt_the_selector_and_the_next_step() {
+        // V27-M4, the structural acceptance: run one30 was told six words -
+        // "artifact does not exist" - about a receipt it had really cited, and
+        // spent its window concluding the step was blocked. Every refusal on
+        // this path must name what it could not read and how to read it.
+        let unresolved = unresolvable_receipt_error(
+            "objective_review result",
+            "artifact://9ecebe69",
+            "sha256:9ecebe69",
+            "content missing",
+            "cite the result ref the Task returned from task_submit, or read it with evidence_retrieve",
+        );
+        assert!(unresolved.contains("artifact://9ecebe69"), "{unresolved}");
+        assert!(unresolved.contains("sha256:9ecebe69"), "{unresolved}");
+        assert!(unresolved.contains("evidence_retrieve"), "{unresolved}");
+        assert!(unresolved.contains("content missing"), "{unresolved}");
+
+        let unreadable = unreadable_receipt_error(
+            "objective_review result",
+            "artifact://9ecebe69",
+            "sha256:9ecebe69",
+            "io error",
+            "read it with evidence_retrieve instead of re-issuing the call",
+        );
+        assert!(unreadable.contains("artifact://9ecebe69"), "{unreadable}");
+        assert!(unreadable.contains("sha256:9ecebe69"), "{unreadable}");
+        assert!(unreadable.contains("evidence_retrieve"), "{unreadable}");
+
+        let unauthenticated = unauthenticated_receipt_error("tool://42", "no session");
+        assert!(unauthenticated.contains("tool://42"), "{unauthenticated}");
+        assert!(unauthenticated.contains("no session"), "{unauthenticated}");
+    }
+
     #[test]
     fn delegated_historical_effect_targets_require_typed_same_workspace_write_evidence() {
         let mut receipt = crate::execution_core::graph::DurableAgentToolReceipt {

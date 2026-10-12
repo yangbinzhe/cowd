@@ -905,7 +905,11 @@ where
                 // The override applies to exactly one Provider request. A
                 // recovery may schedule another explicit override below, but
                 // stale state must never disable tools for later turns.
-                std::mem::take(&mut state.force_text_only_next_model),
+                // A refusal the model answered by issuing the same call again
+                // also forces this step to be text-only: the model must
+                // conclude instead of paying for another refused round.
+                std::mem::take(&mut state.force_text_only_next_model)
+                    || crate::repetition_guard::take_refusal_ignored(&state.turn_id),
                 state.force_tool_allowlist_next_model.take(),
                 state.force_reasoning_effort_next_model.take(),
                 clean_terminal_synthesis,
