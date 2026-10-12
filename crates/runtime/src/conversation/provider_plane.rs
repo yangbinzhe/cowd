@@ -330,6 +330,22 @@ where
         self.next_model_tool_required.store(true, Ordering::SeqCst);
     }
 
+    /// Make one real tool call mandatory without restricting which tool.
+    ///
+    /// The allowlist and the required flag are independent fields, and conflating
+    /// them is what broke run one26. Forcing a tool call is how Runtime says "a
+    /// prose answer will not be delivered"; narrowing the tool set is how it says
+    /// "you may only use these". The second is a much stronger claim, and it was
+    /// being made on the strength of the first's justification.
+    ///
+    /// one26 needed `agent_invite` to staff a Team before it could publish the
+    /// owed Task. The allowlist held only the rung's closing tool plus two reads,
+    /// so the call was refused, the whole frame was discarded with no per-call
+    /// record, and the model re-issued it sixteen times.
+    pub(crate) fn require_next_model_tool_call(&self) {
+        self.next_model_tool_required.store(true, Ordering::SeqCst);
+    }
+
     /// Test support for proving that every small Agent action remains
     /// available when a collaboration obligation requires a real action.
     #[cfg(test)]
@@ -1943,6 +1959,31 @@ where
                         }
                         calls = executable_calls;
                     } else {
+                        // Every call in this frame was refused, so the frame is
+                        // discarded whole. Record each one before returning.
+                        //
+                        // The `has_executable_call` branch above already files a
+                        // per-call reason; this branch used to file nothing, which
+                        // left the model with a protocol-violation error that named
+                        // the tools but not the calls, and no Runtime record of what
+                        // it had asked for. Run one26 re-issued the same
+                        // `agent_invite` sixteen times against exactly that silence.
+                        for call in &calls {
+                            let overlay = denied_by_overlay.contains(&call.name);
+                            let reason = if overlay {
+                                "the action is outside this request's governed tool allowlist"
+                            } else {
+                                "the action is unknown, unavailable, or outside this request's exposure lease"
+                            };
+                            tracing::warn!(
+                                target: "cowd::tool_exposure",
+                                tool = %call.name,
+                                tool_call_id = %call.id,
+                                input = %call.input.chars().take(200).collect::<String>(),
+                                overlay_denied = overlay,
+                                "{reason}; the whole frame was discarded"
+                            );
+                        }
                         self.reconcile_provider_context_usage(usage);
                         self.usage_tracker.record(usage);
                         if let Some(callback) = &self.tool_callback {

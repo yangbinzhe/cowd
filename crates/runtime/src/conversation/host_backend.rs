@@ -1198,13 +1198,21 @@ where
             } else if let Some(tool_ids) = force_tool_allowlist {
                 runtime.require_next_model_tool_action(tool_ids);
             } else if mandatory_action_outstanding {
-                // Nothing pinned a tool, but one is owed. Name the tools that can
-                // close what is outstanding instead of sending a tool-less
-                // request the model cannot act on.
-                let required = mandatory_action_tool_ids(true, &owed_rungs);
-                if !required.is_empty() {
-                    runtime.require_next_model_tool_action(required);
-                }
+                // Something is owed, so this step must produce a tool call rather
+                // than a prose answer. Force the call and leave the tool set alone.
+                //
+                // The first version called `require_next_model_tool_action` with
+                // the minimal closing set, which sets a one-request allowlist as
+                // well as the required flag. Run one26 needed `agent_invite` to
+                // staff a Team before it could publish the owed Task; the allowlist
+                // held only the rung's closing tool plus two reads, so the call was
+                // refused, the frame was discarded with no per-call record, and the
+                // model re-issued it sixteen times.
+                //
+                // Withdrawing the tool that performs the owed action is a framework
+                // defect. Deciding which tool the model may use is not the
+                // framework's call at all.
+                runtime.require_next_model_tool_call();
             }
             if let Some(effort) = force_reasoning_effort {
                 runtime.require_next_model_reasoning_effort(effort);
@@ -3809,10 +3817,19 @@ pub(super) fn record_repeated_calls(
     successful_call_ids: &std::collections::BTreeSet<String>,
 ) -> Vec<(String, usize)> {
     let mut repeated = Vec::new();
+    let _ = successful_call_ids;
     for call in calls {
-        if !successful_call_ids.contains(&call.id) {
-            continue;
-        }
+        // Every call the model emitted counts, whether Runtime dispatched it or
+        // not. The repeat counter answers "did the model ask for the same thing
+        // again", and that question is about the model's decision, not about
+        // Runtime's dispatch.
+        //
+        // The first version counted only calls present in `successful_call_ids`.
+        // Run one26 re-issued the same `agent_invite` sixteen times and every one
+        // of them was refused before dispatch, so none was ever in that set, the
+        // count never moved, and the block bound was unreachable - the guard was
+        // blind to exactly the loop it was built for.
+        //
         // A wait is not a repeat: parking on `wait_for_workers` until a worker
         // moves is the documented contract, and an unchanged answer is its normal
         // result. Same exemption the streak guard uses.

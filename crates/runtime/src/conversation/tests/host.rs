@@ -356,15 +356,23 @@ fn the_repeat_counter_skips_waits_and_failed_calls() {
         );
     }
 
-    // A failed call is not a decision the model repeated, so it is not counted.
-    let failing = call("f", "read_file", r#"{"path":"a.rs"}"#);
-    for _ in 0..(bound + 3) {
+    // A call Runtime refused before dispatch still counts. The model decided to
+    // ask for it, and asking again is the decision that repeats - run one26
+    // re-issued the same `agent_invite` sixteen times, every one refused before
+    // dispatch, and a counter keyed on successful dispatch never moved.
+    let refused = call("f", "read_file", r#"{"path":"a.rs"}"#);
+    for _ in 1..bound {
         assert!(
-            record_repeated_calls(turn, std::slice::from_ref(&failing), &std::collections::BTreeSet::new())
+            record_repeated_calls(turn, std::slice::from_ref(&refused), &std::collections::BTreeSet::new())
                 .is_empty(),
-            "a failed call must not count toward the repeat bound"
+            "below the bound the counter stays silent"
         );
     }
+    assert_eq!(
+        record_repeated_calls(turn, std::slice::from_ref(&refused), &std::collections::BTreeSet::new()),
+        vec![("read_file".to_string(), bound)],
+        "a call refused before dispatch must still reach the bound"
+    );
 
     // The same call succeeding does count, which is the whole point.
     let working = call("s", "read_file", r#"{"path":"b.rs"}"#);
