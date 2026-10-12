@@ -118,14 +118,24 @@ async fn tool_content(
     session: &str,
     reference: &str,
 ) -> Result<ArtifactRef, String> {
-    let id = reference
-        .strip_prefix("tool://")
-        .ok_or("result is not a Tool evidence reference")?;
+    let id = reference.strip_prefix("tool://").ok_or_else(|| {
+        format!(
+            "result {reference} is not a Tool evidence reference; cite a `tool://` reference a \
+             tool call in this Session returned"
+        )
+    })?;
     let access = services
         .session_evidence_access(session, id)
         .await
         .map_err(|error| unauthenticated_receipt_error(reference, &error.to_string()))?
-        .ok_or("result Tool evidence has no authenticated Session receipt")?;
+        .ok_or_else(|| {
+            // Name the reference here too: the model cited `tool://X` and was
+            // told its receipt did not exist, with no X to act on.
+            format!(
+                "result Tool evidence {reference} has no authenticated Session receipt; cite a \
+                 reference a tool call in this Session actually returned"
+            )
+        })?;
     let content = services
         .artifact_store()
         .resolve(&access.retrieval_selector)
@@ -143,7 +153,10 @@ async fn tool_content(
         || content.media_type != access.media_type
         || content.visibility_scope != access.visibility_scope
     {
-        return Err("result Tool evidence does not match its durable content".into());
+        return Err(format!(
+            "result Tool evidence {reference} does not match its durable content; re-read it with \
+             evidence_retrieve and cite the reference that call returns"
+        ));
     }
     Ok(content)
 }
