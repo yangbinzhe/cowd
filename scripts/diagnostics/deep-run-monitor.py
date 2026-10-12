@@ -204,26 +204,41 @@ def save_state(path, state):
 
 
 def longest_idle_answer_run(events, threshold=None):
-    """Longest run of text answers with no completed tool call between them.
+    """Longest run of TEXT answers with no action between them.
 
-    `events` is a list of (kind, status) in time order. A text answer extends the
-    run; a completed tool invocation ends it, because work in between is progress
-    and progress is not a loop.
+    `events` is a list of (kind, payload_kind, status) in time order. Only a
+    `text` item extends the run; anything that IS an action resets it: a
+    completed tool invocation, an applied agentic action, a started invocation,
+    an execution effect - or the model emitting a tool_call item, which is the
+    model acting regardless of what the tool then did.
 
-    This is the signal that actually fires on a reworded loop. Run one30's root
-    wrote seven final answers across four minutes with one tool call in the whole
-    window; the lexical similarity between them averaged 0.34 and never exceeded
-    0.95 twice in a row.
+    The first spelling counted every `model.item_completed` as an answer and
+    reset only on `tool.invocation.completed`. Measured against a live
+    multi-agent run that was working, it reported a run of 8 whose composition
+    was ['tool_call','tool_call','tool_call','public_reasoning','tool_call',
+    'public_reasoning','tool_call','public_reasoning'] - zero text answers,
+    because agentic actions (task_submit, artifact_commit) apply without a
+    tool invocation event and reasoning items are not conclusions. It would
+    have stopped a healthy run. The one30 signal it was built for is real:
+    that root wrote final TEXT answers, seven of them, with one tool call in
+    the whole window.
     """
     if threshold is None:
         threshold = int(os.environ.get("COWD_MONITOR_IDLE_ANSWERS", "3"))
     best = 0
     run = 0
-    for kind, status in events:
-        if kind == "model.item_completed":
+    for kind, payload_kind, status in events:
+        if kind == "model.item_completed" and payload_kind == "text":
             run += 1
             best = max(best, run)
-        elif kind == "tool.invocation.completed" and status == "completed":
+        elif kind == "model.item_completed" and payload_kind == "tool_call":
+            run = 0
+        elif kind in (
+            "tool.invocation.completed",
+            "tool.invocation.started",
+            "agentic.action_applied",
+            "execution.effect.intent",
+        ):
             run = 0
     return {"run": best, "threshold": threshold}
 
@@ -272,6 +287,19 @@ def pairs(rows):
     for row in rows:
         if len(row) == 2 and row[1].strip().lstrip("-").isdigit():
             yield row[0], int(row[1])
+
+
+def pairs3(rows):
+    """Yield only the rows that really are (actor, value, count) triples.
+
+    The actor-scoped repeat queries select three columns; a value containing a
+    newline still arrives as several physical lines, so the arity of a parsed
+    row is not guaranteed. Skipping the malformed ones keeps one unexpected
+    payload from taking the monitor down.
+    """
+    for row in rows:
+        if len(row) == 3 and row[2].strip().lstrip("-").isdigit():
+            yield row[0], row[1], int(row[2])
 
 
 class Monitor:
@@ -346,20 +374,28 @@ class Monitor:
         inv["task_churn"] = [{"task": t, "events": int(n)} for t, n in rows if t]
 
         # 2. Repeated tool inputs (loop signature) with exact shapes.
+        # Grouped by actor AND input: one actor re-issuing the same call is a
+        # loop, while N agents each issuing it once is N first reads - the
+        # receipt-reuse contract is per-agent by design. Summing across actors
+        # turns independent information gathering into a finding.
         rows = self.q(
-            "SELECT substr(payload->>'content',1,90), count(*) FROM runtime_events "
+            "SELECT payload->>'_runtime_activity_binding', substr(payload->>'content',1,90), "
+            "count(*) FROM runtime_events "
             "WHERE kind='model.item_completed' AND payload->>'kind'='tool_call' "
-            "GROUP BY 1 ORDER BY 2 DESC LIMIT 6")
+            "GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 6")
         inv["repeated_tool_inputs"] = [
-            {"input": t, "count": n} for t, n in pairs(rows) if n >= 3]
+            {"input": t, "count": n} for _, t, n in pairs3(rows) if n >= 3]
         # 3. Redundant full reads of the same path.
+        # Same actor scoping as above: three agents opening one file once each
+        # is three first reads, not a redundant-read loop.
         rows = self.q(
-            "SELECT payload->>'content', count(*) FROM runtime_events "
+            "SELECT payload->>'_runtime_activity_binding', payload->>'content', count(*) "
+            "FROM runtime_events "
             "WHERE kind='model.item_completed' AND payload->>'kind'='tool_call' "
             "AND payload->>'tool_name' IN ('read_file','read_ref') "
-            "GROUP BY 1 ORDER BY 2 DESC LIMIT 4")
+            "GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 4")
         inv["repeated_reads"] = [
-            {"call": t[:90], "count": n} for t, n in pairs(rows) if n >= 3]
+            {"call": t[:90], "count": n} for _, t, n in pairs3(rows) if n >= 3]
 
         # 3b. Repeated identical final-answer text. A model that has finished the
         # work but does not know the next rung writes the same summary over and
@@ -374,18 +410,21 @@ class Monitor:
         # continued silently, and the monitor went dark for the entire 35-minute
         # run while the run itself was working. A monitor that crashes on
         # unexpected data is worse than no monitor.
+        # Actor-scoped like the tool queries: two agents independently writing
+        # a similar summary is not one model restating itself.
         rows = self.q(
-            "SELECT substr(replace(replace(payload->>'content', chr(10), ' '), "
+            "SELECT payload->>'_runtime_activity_binding', "
+            "substr(replace(replace(payload->>'content', chr(10), ' '), "
             "chr(13), ' '),1,120), count(*) FROM runtime_events "
             "WHERE kind='model.item_completed' AND payload->>'kind'='text' "
-            "GROUP BY 1 ORDER BY 2 DESC LIMIT 4")
+            "GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 4")
         inv["repeated_tool_call_ratio_bp"] = repeated_tool_call_ratio_bp(
             snap["tool_calls"], snap["tool_calls_distinct_inputs"]
         )
         inv["repeated_text_answers"] = [
-            {"text": r[0], "count": int(r[1])}
-            for r in rows
-            if len(r) == 2 and r[1].isdigit() and int(r[1]) >= 3
+            {"text": t, "count": n}
+            for _, t, n in pairs3(rows)
+            if n >= 3
         ]
         # 3c. Consecutive conclusions with no action in between.
         #
@@ -399,20 +438,32 @@ class Monitor:
         # So the signal is structural: the longest run of text answers with no
         # completed tool invocation between them.
         rows = self.q(
-            "SELECT kind, status FROM runtime_events "
-            "WHERE kind IN ('model.item_completed','tool.invocation.completed') "
+            "SELECT kind, payload->>'kind', status FROM runtime_events "
+            "WHERE kind IN ('model.item_completed','tool.invocation.completed',"
+            "'tool.invocation.started','agentic.action_applied','execution.effect.intent') "
             "ORDER BY created_at_ms")
         inv["consecutive_idle_answers"] = longest_idle_answer_run(rows)
         # A high lexical similarity is still worth reporting when it happens - it
         # is the same loop in an easier-to-see spelling - but it is no longer the
         # detector.
+        # Per actor: two agents independently writing a similar summary is not
+        # one model restating itself, and a cross-actor window invents pairs
+        # that no single writer produced.
         rows = self.q(
-            "SELECT substr(replace(replace(payload->>'content', chr(10), ' '), "
+            "SELECT payload->>'_runtime_activity_binding', "
+            "substr(replace(replace(payload->>'content', chr(10), ' '), "
             "chr(13), ' '), 1, 600) FROM runtime_events "
             "WHERE kind='model.item_completed' AND payload->>'kind'='text' "
-            "ORDER BY created_at_ms DESC LIMIT 8")
-        window = [r[0] for r in rows if r and r[0]]
-        inv["similar_answer_pairs"] = similar_answer_pairs(window)
+            "ORDER BY created_at_ms DESC LIMIT 48")
+        per_actor = {}
+        for row in rows:
+            if len(row) == 2 and row[0] and row[1]:
+                per_actor.setdefault(row[0], []).append(row[1])
+        pairs_found = []
+        for texts in per_actor.values():
+            window = list(reversed(texts))[:8]
+            pairs_found.extend(similar_answer_pairs(window))
+        inv["similar_answer_pairs"] = pairs_found
         # 4. Rework reasons verbatim (the acceptance-criteria fingerprint).
         rows = self.q(
             "SELECT substr(payload->'envelope'->'action'->'input'->>'reason',1,220) "

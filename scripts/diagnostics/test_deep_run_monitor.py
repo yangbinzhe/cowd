@@ -22,6 +22,7 @@ _module = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_module)
 Monitor = _module.Monitor
 pairs = _module.pairs
+pairs3 = _module.pairs3
 repeated_tool_call_ratio_bp = _module.repeated_tool_call_ratio_bp
 longest_idle_answer_run = _module.longest_idle_answer_run
 similar_answer_pairs = _module.similar_answer_pairs
@@ -280,29 +281,96 @@ def _():
     # concluded, was sent back, and concluded again without doing anything.
     events = []
     # real work first
-    events += [("model.item_completed", "completed")] * 2
-    events += [("tool.invocation.completed", "completed")]
+    events += [("model.item_completed", "tool_call", "completed")]
+    events += [("tool.invocation.completed", None, "completed")]
     # then the loop: six conclusions, one tool call in the whole window
-    events += [("model.item_completed", "completed")] * 6
+    events += [("model.item_completed", "text", "completed")] * 3
+    events += [("model.item_completed", "tool_call", "completed")]
+    events += [("model.item_completed", "text", "completed")] * 3
     result = longest_idle_answer_run(events)
-    assert result["run"] >= 6, result
+    assert result["run"] >= 3, result
     assert result["run"] >= result["threshold"], result
 
     # Two answers, a tool call, one more answer: the run is 2, below the
     # threshold, so nothing fires. A verdict suppresses the finding separately,
     # in the caller.
-    healthy = [("model.item_completed", "completed")] * 2
-    healthy += [("tool.invocation.completed", "completed")]
-    healthy += [("model.item_completed", "completed")]
+    healthy = [("model.item_completed", "text", "completed")] * 2
+    healthy += [("tool.invocation.completed", None, "completed")]
+    healthy += [("model.item_completed", "text", "completed")]
     assert longest_idle_answer_run(healthy)["run"] == 2, longest_idle_answer_run(healthy)
     assert longest_idle_answer_run(healthy)["run"] < longest_idle_answer_run(healthy)["threshold"]
 
     # Work in between is progress, not a loop.
     interleaved = []
     for _ in range(6):
-        interleaved += [("model.item_completed", "completed"),
-                        ("tool.invocation.completed", "completed")]
-    assert longest_idle_answer_run(interleaved)["run"] == 1
+        interleaved += [("model.item_completed", "tool_call", "completed"),
+                        ("tool.invocation.completed", None, "completed")]
+    # Every round acts, so there is no conclusion run at all.
+    assert longest_idle_answer_run(interleaved)["run"] == 0
+
+
+@case("tool calls and reasoning are not conclusions, and agentic actions reset")
+def _():
+    # The live 2026-10-12 run this detector nearly stopped: its reported run of
+    # 8 was ['tool_call','tool_call','tool_call','public_reasoning','tool_call',
+    # 'public_reasoning','tool_call','public_reasoning'] - zero text answers,
+    # because agentic actions (task_submit, artifact_commit) apply without a
+    # tool-invocation event and reasoning is not a conclusion.
+    working = [
+        ("model.item_completed", "tool_call", "completed"),
+        ("model.item_completed", "tool_call", "completed"),
+        ("model.item_completed", "tool_call", "completed"),
+        ("model.item_completed", "public_reasoning", "completed"),
+        ("model.item_completed", "tool_call", "completed"),
+        ("model.item_completed", "public_reasoning", "completed"),
+        ("model.item_completed", "tool_call", "completed"),
+        ("model.item_completed", "public_reasoning", "completed"),
+    ]
+    assert longest_idle_answer_run(working)["run"] == 0, longest_idle_answer_run(working)
+    # Agentic actions are work and reset the run even without a tool event.
+    agentic = [("model.item_completed", "text", "completed")] * 2
+    agentic += [("agentic.action_applied", None, "applied")]
+    agentic += [("model.item_completed", "text", "completed")]
+    assert longest_idle_answer_run(agentic)["run"] == 2, longest_idle_answer_run(agentic)
+    # Three conclusions with nothing in between is the real signal.
+    looping = [("model.item_completed", "text", "completed")] * 3
+    assert longest_idle_answer_run(looping)["run"] == 3
+    assert longest_idle_answer_run(looping)["run"] >= longest_idle_answer_run(looping)["threshold"]
+    # A started invocation is action too.
+    started = [("model.item_completed", "text", "completed")] * 2
+    started += [("tool.invocation.started", None, "started")]
+    started += [("model.item_completed", "text", "completed")]
+    assert longest_idle_answer_run(started)["run"] == 2
+
+
+@case("repeat queries are actor-scoped: independent agents are not a loop")
+def _():
+    # Three agents each reading the same file once is three first reads; the
+    # receipt-reuse contract is per-agent by design. A cross-actor sum turns
+    # independent information gathering into a finding.
+    rows = [
+        ["actor-a", '{"path": "crates/runtime/src/lib.rs"}', "1"],
+        ["actor-b", '{"path": "crates/runtime/src/lib.rs"}', "1"],
+        ["actor-c", '{"path": "crates/runtime/src/lib.rs"}', "1"],
+        ["actor-a", '{"path": "other.rs"}', "2"],
+    ]
+    parsed = list(pairs3(rows))
+    assert ("actor-a", '{"path": "crates/runtime/src/lib.rs"}', 1) in parsed, parsed
+    assert all(isinstance(count, int) for _, _, count in parsed), parsed
+    # No actor reached the redundant-read bound, so no finding is possible.
+    conclusion = Monitor("").conclude(
+        snap(model_steps=90, last_event_age_s=10),
+        inv(repeated_reads=[{"call": '{"path": "crates/runtime/src/lib.rs"}', "count": 3}]),
+    )
+    assert conclusion["state"] == "WORKING", conclusion
+    # One actor reading it eight times is the real loop.
+    conclusion = Monitor("").conclude(
+        snap(model_steps=90, last_event_age_s=10),
+        inv(repeated_reads=[{"call": '{"path": "crates/runtime/src/lib.rs"}', "count": 8}]),
+    )
+    assert conclusion["state"] == "SPINNING", conclusion
+    # Malformed rows are dropped, not fatal.
+    assert list(pairs3([["a", "b"], ["a", "b", "x"], ["a", "b", "3"]])) == [("a", "b", 3)]
 
 
 @case("a lexical similarity is reported as evidence, not used as the detector")
