@@ -26,6 +26,19 @@ def psql(url, sql):
     return [line.split("\u0001") for line in out.stdout.splitlines() if line.strip()]
 
 
+def pairs(rows):
+    """Yield only the rows that really are (value, count) pairs.
+
+    A value containing a newline arrives as several physical lines, so the
+    arity of a parsed row is not guaranteed. Skipping the malformed ones keeps
+    one unexpected payload from taking the monitor down; the caller still sees
+    every well-formed row.
+    """
+    for row in rows:
+        if len(row) == 2 and row[1].strip().lstrip("-").isdigit():
+            yield row[0], int(row[1])
+
+
 class Monitor:
     def __init__(self, url):
         self.url = url
@@ -95,7 +108,7 @@ class Monitor:
             "WHERE kind='model.item_completed' AND payload->>'kind'='tool_call' "
             "GROUP BY 1 ORDER BY 2 DESC LIMIT 6")
         inv["repeated_tool_inputs"] = [
-            {"input": t, "count": int(n)} for t, n in rows if int(n) >= 3]
+            {"input": t, "count": n} for t, n in pairs(rows) if n >= 3]
         # 3. Redundant full reads of the same path.
         rows = self.q(
             "SELECT payload->>'content', count(*) FROM runtime_events "
@@ -103,19 +116,31 @@ class Monitor:
             "AND payload->>'tool_name' IN ('read_file','read_ref') "
             "GROUP BY 1 ORDER BY 2 DESC LIMIT 4")
         inv["repeated_reads"] = [
-            {"call": t[:90], "count": int(n)} for t, n in rows if int(n) >= 3]
+            {"call": t[:90], "count": n} for t, n in pairs(rows) if n >= 3]
 
         # 3b. Repeated identical final-answer text. A model that has finished the
         # work but does not know the next rung writes the same summary over and
         # over; events keep flowing, so the silence signal never fires and the
         # run burns its whole window. One live run emitted the same answer seven
         # times over fourteen minutes while the monitor reported WORKING.
+        # `chr(10)`/`chr(13)` are replaced because a text payload is multi-line
+        # markdown: psql emits the newlines verbatim and the row parser then sees
+        # one physical line per output line, so the unpack fails and the whole
+        # monitor dies. It died exactly this way on a live run - every iteration
+        # raised, the shell loop treated the empty report as "no data" and
+        # continued silently, and the monitor went dark for the entire 35-minute
+        # run while the run itself was working. A monitor that crashes on
+        # unexpected data is worse than no monitor.
         rows = self.q(
-            "SELECT substr(payload->>'content',1,120), count(*) FROM runtime_events "
+            "SELECT substr(replace(replace(payload->>'content', chr(10), ' '), "
+            "chr(13), ' '),1,120), count(*) FROM runtime_events "
             "WHERE kind='model.item_completed' AND payload->>'kind'='text' "
             "GROUP BY 1 ORDER BY 2 DESC LIMIT 4")
         inv["repeated_text_answers"] = [
-            {"text": t, "count": int(n)} for t, n in rows if int(n) >= 3]
+            {"text": r[0], "count": int(r[1])}
+            for r in rows
+            if len(r) == 2 and r[1].isdigit() and int(r[1]) >= 3
+        ]
 
         # 4. Rework reasons verbatim (the acceptance-criteria fingerprint).
         rows = self.q(

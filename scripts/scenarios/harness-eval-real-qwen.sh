@@ -149,7 +149,17 @@ monitor_semantic_health() {
   [[ -f "$monitor" ]] || return 0
   while kill -0 "$HARNESS_PID" >/dev/null 2>&1; do
     local report state milestones findings now
-    report="$(python3 "$monitor" "$COWD_TEST_POSTGRES_URL" --investigate 2>/dev/null || true)"
+    # A monitor that cannot read the database is itself a finding. Silently
+    # skipping the turn made a crashing monitor indistinguishable from a quiet
+    # one: on a live run the monitor raised on every iteration, this loop
+    # treated each empty report as "no data" and continued, and the deep monitor
+    # emitted four lines across a 35-minute run that was working the whole time.
+    # Emit the failure instead of swallowing it.
+    if ! report="$(python3 "$monitor" "$COWD_TEST_POSTGRES_URL" --investigate 2>/dev/null)"; then
+      printf '{"event":"harness_eval_deep_monitor_error","reason":"deep-run-monitor failed; semantic health is unobserved this interval"}\n' >&2
+      sleep "$interval"
+      continue
+    fi
     [[ -n "$report" ]] || { sleep "$interval"; continue; }
     state="$(printf '%s' "$report" | jq -r '.conclusion.state // ""' 2>/dev/null || true)"
     # Only convergence toward the Objective counts as a semantic milestone.

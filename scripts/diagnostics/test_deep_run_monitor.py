@@ -20,6 +20,7 @@ _spec = importlib.util.spec_from_file_location(
 _module = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_module)
 Monitor = _module.Monitor
+pairs = _module.pairs
 
 
 def snap(**overrides):
@@ -167,6 +168,32 @@ def _():
         inv(repeated_text_answers=[{"text": "done", "count": 9}]),
     )
     assert conclusion["state"] == "TERMINAL", conclusion
+
+
+@case("a multi-line text payload never breaks the monitor's row parsing")
+def _():
+    # A `text` payload is multi-line markdown. psql emits the newlines verbatim,
+    # so the parsed rows are not guaranteed to be (value, count) pairs. The
+    # repeated-answer detector unpacked them blindly and raised on every
+    # iteration of a live run: the shell loop treated each empty report as "no
+    # data" and continued, so the deep monitor emitted four lines across a
+    # 35-minute run that was working the whole time. The monitor must survive a
+    # payload it did not expect.
+    rows = pairs(
+        [
+            ["# Audit Report", "2"],
+            ["", ""],
+            ["## Executive Summary", ""],
+            ["a normal single-line answer", "4"],
+            ["orphan line with no count"],
+            ["not a number", "abc"],
+        ],
+    )
+    parsed = list(rows)
+    assert ("a normal single-line answer", 4) in parsed, parsed
+    assert all(isinstance(count, int) for _, count in parsed), parsed
+    # Malformed rows are dropped, not fatal.
+    assert len(parsed) == 2, parsed
 
 
 def main():
