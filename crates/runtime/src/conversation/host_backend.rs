@@ -1136,6 +1136,16 @@ where
                 detail: Some("requesting model".to_string()),
             });
         }
+        // Taken once, before either consumer, and read by both: the model-step
+        // boundary below uses it to demand a tool call, and the terminal-request
+        // builder further down uses it to keep that request from being tool-less.
+        // Declaring it inside the boundary's block would leave the builder unable
+        // to see it, and taking it twice would leave the second reader with
+        // `false` - either way the escalation is silently dropped.
+        let force_tool_call = {
+            let mut state = self.state.lock().await;
+            std::mem::take(&mut state.force_tool_call_next_model)
+        };
         if matches!(
             control_plane_priority,
             NextModelControlPlanePriority::ExistingConstraint
@@ -1193,10 +1203,6 @@ where
                     }
                 }
             }
-            let force_tool_call = {
-                let mut state = self.state.lock().await;
-                std::mem::take(&mut state.force_tool_call_next_model)
-            };
             if force_text_only_response && !mandatory_action_outstanding && !force_tool_call {
                 runtime.require_next_model_final_response();
             } else if let Some(tool_ids) = force_tool_allowlist {
@@ -1262,11 +1268,6 @@ where
         // keeps a long exploratory transcript out of the reduction request; it
         // is not a reason to withdraw the tools that close the Objective. Only
         // "nothing is owed" earns a tool-less terminal.
-        // The capability axis, decided independently of the prompt-isolation
-        // axis that `clean_terminal_synthesis` represents. Isolating the prompt
-        // keeps a long exploratory transcript out of the reduction request; it
-        // is not a reason to withdraw the tools that close the Objective. Only
-        // "nothing is owed" earns a tool-less terminal.
         //
         // The obligation is read from the Program projection, not only from the
         // two flags the continuation paths set. Those flags exist once a
@@ -1286,6 +1287,7 @@ where
                     state.turn_id.clone(),
                 )
             };
+            let escalated = force_tool_call;
             // `publish_integration_task` and the rungs below `objective_complete_request`
             // are work the Objective still needs; the request step itself is the
             // model's own exit and is not a reason to keep tools.
@@ -1307,11 +1309,20 @@ where
                     all_rungs.push(step);
                 }
             }
-            let decision = terminal_required_tools(gap_outstanding, all_rungs.clone());
+            let mut decision = terminal_required_tools(gap_outstanding, all_rungs.clone());
+            // An escalated step must not be a tool-less one. The escalation exists
+            // because the model concluded instead of acting; handing it a request
+            // with an empty `tools` array and a demand for a tool call is a
+            // contradiction the model resolves by concluding again. Run one29's
+            // escalation fired four times and the model concluded four more times,
+            // every one of those requests carrying no tools at all.
+            if escalated && decision.is_none() {
+                decision = Some(mandatory_action_tool_ids(true, &all_rungs));
+            }
             tracing::warn!(
                 target: "cowd::terminal_capability",
                 %session_id, %turn_id, clean_terminal_synthesis,
-                gap_outstanding, ?all_rungs,
+                gap_outstanding, ?all_rungs, escalated,
                 tools = ?decision.as_ref().map(|t| t.iter().cloned().collect::<Vec<_>>()),
                 "deciding the tool set for a terminal request"
             );
