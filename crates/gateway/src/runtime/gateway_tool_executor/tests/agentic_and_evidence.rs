@@ -2041,6 +2041,47 @@ async fn a_string_that_is_neither_valid_nor_cut_off_is_still_refused() {
     );
 }
 
+/// The refusal has to name the defect the model actually has.
+///
+/// This is the exact shape a live run produced: the model quoted the array and
+/// repeated the `input` key inside one object instead of emitting one
+/// `{tool, input}` entry per action. Runtime answered "send an array value as
+/// raw JSON, not a JSON-encoded string" - accurate about the type and useless
+/// about the problem, so the model's single repair attempt reproduced the same
+/// frame. Nothing here is salvaged, and nothing is guessed; the refusal only
+/// reports the shape the model used.
+#[tokio::test]
+async fn a_refusal_names_the_missing_tool_field_rather_than_the_quoting() {
+    let registry = GatewayToolRegistry::builtin()
+        .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
+        .expect("runtime tools");
+    let executor = GatewayToolExecutor::new(None, false, registry);
+    // One object holding three `input` keys, never closed, then a `]` that
+    // already closes the array. Neither salvage nor delimiter-closing can help:
+    // the splitter sees no top-level comma, and closing the delimiters appends a
+    // second `]`.
+    let inner = concat!(
+        r#"[{"input": {"expertise_hints": ["formal_methods"], "mission": "Formalize definitions."}"#,
+        r#", "input": {"mission": "Survey applications."}"#,
+        r#", "input": {"mission": "Design the experiment."}]"#
+    );
+    let frame = serde_json::json!({"actions": inner}).to_string();
+
+    let error = executor
+        .validate_tool_input("agent_action_batch", &frame)
+        .expect_err("entries without a `tool` are not a dispatchable batch");
+    let message = error.to_string();
+    assert!(message.contains("$.actions"), "{message}");
+    assert!(
+        message.contains("carry `input` but no `tool`"),
+        "the refusal must name the real defect: {message}"
+    );
+    assert!(
+        message.contains("one action per entry"),
+        "the refusal must say what to send instead: {message}"
+    );
+}
+
 /// A logical artifact key that no Program maps must still fail with the store's
 /// own error. The mapping is a fallback for a real reference, not a way to make
 /// an unknown id resolve: laundering "this does not exist" into "read failed"

@@ -109,7 +109,20 @@ impl ToolExecutor for GatewayToolExecutor {
         self.tool_host
             .pin_snapshot()
             .validate_input(&canonical_name, &value)
-            .map_err(|error| self.input_contract_error(&canonical_name, error))
+            .map_err(|error| {
+                // A schema refusal that names only the first thing the checker
+                // tripped on sends the model off to fix the wrong thing. One live
+                // frame was refused with "send an array, not a JSON-encoded
+                // string" when the model had sent an array - quoted - and the
+                // real defect was that its entries repeated the `input` key and
+                // carried no `tool` at all. Name what is actually wrong, derived
+                // from the bytes the model sent, so the repair attempt lands.
+                let message = match unrepairable_field_hint(&value) {
+                    Some(hint) => format!("{error}. {hint}"),
+                    None => error.to_string(),
+                };
+                self.input_contract_error(&canonical_name, message)
+            })
         // Hand back the bytes Runtime will actually dispatch so the
         // transcript, the governed plan and the execution cannot disagree.
         // `Value` re-serializes deterministically, so a model that repeats the

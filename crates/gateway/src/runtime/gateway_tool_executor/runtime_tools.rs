@@ -91,6 +91,47 @@ fn push_salvaged_element(
     }
 }
 
+/// Name the structural defect in a quoted field that could not be repaired.
+///
+/// A refusal that names only the first thing the schema checker tripped on
+/// sends the model off to fix the wrong thing. One live frame was refused with
+/// "send an array, not a JSON-encoded string" when the model *had* sent an array,
+/// quoted; the real defect was that its entries repeated the `input` key and
+/// carried no `tool` at all, so the model spent its one repair attempt making
+/// the same frame again. This reads the bytes the model sent and says what is
+/// actually wrong with the shape.
+///
+/// No content is inferred and no field is invented: the only claim is about the
+/// shape the model used, which is exactly what it has to change.
+fn unrepairable_field_hint(value: &serde_json::Value) -> Option<String> {
+    let object = value.as_object()?;
+    for (field, field_value) in object {
+        let serde_json::Value::String(text) = field_value else {
+            continue;
+        };
+        let trimmed = text.trim();
+        if !trimmed.starts_with('[') {
+            continue;
+        }
+        let has_tool = trimmed.contains("\"tool\"");
+        let has_input = trimmed.contains("\"input\"");
+        if has_input && !has_tool {
+            return Some(format!(
+                "the entries inside `{field}` carry `input` but no `tool`; each entry must be \
+                 {{\"tool\": \"<action>\", \"input\": {{...}}}} with one action per entry, not \
+                 several `input` keys inside one object"
+            ));
+        }
+        if !has_tool && !has_input {
+            return Some(format!(
+                "the entries inside `{field}` are not action objects; each entry must be \
+                 {{\"tool\": \"<action>\", \"input\": {{...}}}}"
+            ));
+        }
+    }
+    None
+}
+
 impl GatewayToolExecutor {
     /// What the schema-boundary coercion did to one field.
     ///
