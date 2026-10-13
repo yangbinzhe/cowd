@@ -350,7 +350,53 @@ fn agentic_supervisor_actor(
     }
 }
 
+/// The Task status as the durable record spells it (snake_case, matching the
+/// enum's serde form), so a reader never has to map `Submitted` back to
+/// `submitted`.
+fn task_status_str(status: super::super::program::AgenticTaskStatus) -> String {
+    serde_json::to_value(status)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{status:?}"))
+}
+
 impl RuntimeServices {
+    /// Record why Runtime declined to dispatch one Task, and return.
+    ///
+    /// Every decline in this file used to be a bare `return Ok(Vec::new())`, so
+    /// nine different reasons all looked identical from outside: "no dispatch
+    /// happened". A Task stuck `Submitted` with no reviewer could not be told
+    /// apart from one that was never asked, and two root causes were guessed
+    /// wrong from that silence. The record is deduplicated on
+    /// (task, mode, reason, status) inside `AgentActionService`, so a Program
+    /// that stays undispatchable emits one record rather than one per tick.
+    fn decline_dispatch(
+        self: &Arc<Self>,
+        program_id: &str,
+        task_ref: &str,
+        mode: super::super::execution::helpers::DispatchMode,
+        reason: crate::agentic::action_service::AgenticDispatchDeclineReason,
+        task_status: &str,
+        eligible_members: usize,
+        busy_members: usize,
+        consecutive_deferrals: usize,
+        review_generation: u64,
+    ) -> Result<Vec<AgenticDispatchReceipt>, String> {
+        self.agent_action_service()
+            .record_dispatch_decline(crate::agentic::action_service::AgenticDispatchDecline {
+                program_id,
+                task_ref,
+                mode: mode.as_str(),
+                reason,
+                task_status,
+                eligible_members,
+                busy_members,
+                consecutive_deferrals,
+                review_generation,
+            });
+        Ok(Vec::new())
+    }
+
     /// Reconsider durable ready work after a physical member exits. Busy
     /// admissions remain in the original journal; no timer or second queue
     /// is needed to discover that the member is free again.
@@ -363,7 +409,20 @@ impl RuntimeServices {
             .project_snapshot(program_id)
             .map_err(|error| error.to_string())?;
         if initial.status != super::super::program::AgenticProgramStatus::Open {
-            return Ok(Vec::new());
+            // Program-scoped: there is no Task yet, so the record carries an empty
+            // task_ref and the program's own status.
+            return self
+                .decline_dispatch(
+                    program_id,
+                    "",
+                    super::super::execution::helpers::DispatchMode::Execute,
+                    crate::agentic::action_service::AgenticDispatchDeclineReason::ProgramNotOpen,
+                    "program",
+                    0,
+                    0,
+                    0,
+                    0,
+                );
         }
         // Reviewers are independent and gate Task closure. Admit Review
         // requests before starting new Execute work so a `Submitted` Task is
@@ -1226,12 +1285,36 @@ impl RuntimeServices {
         context: &AgenticDispatchContext,
         _trigger: &AgentActionEnvelope,
     ) -> Result<Vec<AgenticDispatchReceipt>, String> {
+        // Multi-task action/startup passes may carry a semantic snapshot
+        // from before their previous dispatch. Availability is always read
+        // from the current durable Program, then fenced again at append.
+        // Read before any decline so every record can name the Task's real
+        // status instead of a placeholder.
+        let availability = self
+            .agent_action_service()
+            .project_snapshot(&projection.program_id)
+            .map_err(|error| error.to_string())?;
+        let task = availability
+            .tasks
+            .get(task_ref)
+            .ok_or_else(|| format!("agentic_task_not_found:{task_ref}"))?;
         // Anti-idle-spin: a dispatch that keeps deferring backs off; skip it
         // silently until its backoff window elapses instead of re-attempting
         // (and logging) on every reconcile tick.
         let starvation_key = dispatch_starvation_key(&projection.program_id, task_ref, mode);
         if dispatch_starvation_backing_off(&starvation_key) {
-            return Ok(Vec::new());
+            return self
+                .decline_dispatch(
+                    &projection.program_id,
+                    task_ref,
+                    mode,
+                    crate::agentic::action_service::AgenticDispatchDeclineReason::StarvationBackoff,
+                    &task_status_str(task.status),
+                    0,
+                    0,
+                    dispatch_starvation_count(&starvation_key),
+                    task.review_generation,
+                );
         }
         // Program status is business truth, not renewed execution authority.
         // Late submissions and startup recovery must respect the owning root's
@@ -1243,26 +1326,36 @@ impl RuntimeServices {
                 .await
                 .map_err(|error| format!("agentic_dispatch_root_unavailable:{root_id}:{error}"))?;
             if agentic_graph_is_terminal(&graph) {
-                return Ok(Vec::new());
+                return self
+                    .decline_dispatch(
+                        &projection.program_id,
+                        task_ref,
+                        mode,
+                        crate::agentic::action_service::AgenticDispatchDeclineReason::RootGraphTerminal,
+                        &task_status_str(task.status),
+                        0,
+                        0,
+                        0,
+                        task.review_generation,
+                    );
             }
             Some(graph)
         } else {
             None
         };
-        // Multi-task action/startup passes may carry a semantic snapshot
-        // from before their previous dispatch. Availability is always read
-        // from the current durable Program, then fenced again at append.
-        let availability = self
-            .agent_action_service()
-            .project_snapshot(&projection.program_id)
-            .map_err(|error| error.to_string())?;
-        let task = availability
-            .tasks
-            .get(task_ref)
-            .ok_or_else(|| format!("agentic_task_not_found:{task_ref}"))?;
         let coordination_wake = if let DispatchMode::Coordination(revision) = mode {
             let Some((_, wake)) = availability.coordination_wake(revision) else {
-                return Ok(Vec::new());
+                return self.decline_dispatch(
+                    &projection.program_id,
+                    task_ref,
+                    mode,
+                    crate::agentic::action_service::AgenticDispatchDeclineReason::CoordinationWakeAbsent,
+                    &task_status_str(task.status),
+                    0,
+                    0,
+                    0,
+                    task.review_generation,
+                );
             };
             if wake
                 .intent
@@ -1274,7 +1367,30 @@ impl RuntimeServices {
                     .as_ref()
                     .is_some_and(|consumption| consumption.settled)
             {
-                return Ok(Vec::new());
+                // Three different faults share this branch; name which one held
+                // rather than collapsing them into "coordination declined".
+                let reason = if wake
+                    .intent
+                    .as_ref()
+                    .is_none_or(|intent| intent.task_ref != task_ref)
+                {
+                    crate::agentic::action_service::AgenticDispatchDeclineReason::CoordinationIntentMismatch
+                } else if !availability.coordination_request_current(wake) {
+                    crate::agentic::action_service::AgenticDispatchDeclineReason::CoordinationNotCurrent
+                } else {
+                    crate::agentic::action_service::AgenticDispatchDeclineReason::CoordinationAlreadySettled
+                };
+                return self.decline_dispatch(
+                    &projection.program_id,
+                    task_ref,
+                    mode,
+                    reason,
+                    &task_status_str(task.status),
+                    0,
+                    0,
+                    0,
+                    task.review_generation,
+                );
             }
             Some(wake)
         } else {
@@ -1286,14 +1402,39 @@ impl RuntimeServices {
             DispatchMode::Review => task.status != AgenticTaskStatus::Submitted,
             DispatchMode::Coordination(_) => false,
         } {
-            return Ok(Vec::new());
+            // The single most important decline to be able to read: a Review that
+            // never ran because the Task was not `Submitted` looks exactly like a
+            // Review that was never requested.
+            return self.decline_dispatch(
+                &projection.program_id,
+                task_ref,
+                mode,
+                crate::agentic::action_service::AgenticDispatchDeclineReason::ModeStateMismatch,
+                &task_status_str(task.status),
+                0,
+                0,
+                0,
+                task.review_generation,
+            );
         }
         let attempt_mode = mode.attempt_mode();
         if task.active_attempts.values().any(|attempt| {
             attempt.mode == attempt_mode
                 && resumed.is_none_or(|resume| resume.execution_id != attempt.execution_id)
         }) {
-            return Ok(Vec::new());
+            // An attempt for this very mode is already in flight, so a second
+            // dispatch would be the duplicate the guard exists to prevent.
+            return self.decline_dispatch(
+                &projection.program_id,
+                task_ref,
+                mode,
+                crate::agentic::action_service::AgenticDispatchDeclineReason::FlightBusy,
+                &task_status_str(task.status),
+                0,
+                0,
+                0,
+                task.review_generation,
+            );
         }
         let attempt_generation = match mode {
             DispatchMode::Execute => task.claim_generation,
@@ -1310,7 +1451,17 @@ impl RuntimeServices {
                 attempt_generation
             ),
         ) else {
-            return Ok(Vec::new());
+            return self.decline_dispatch(
+                &projection.program_id,
+                task_ref,
+                mode,
+                crate::agentic::action_service::AgenticDispatchDeclineReason::FlightBusy,
+                &task_status_str(task.status),
+                0,
+                0,
+                0,
+                task.review_generation,
+            );
         };
         let mut members = eligible_members(&availability, task, mode)
             .into_iter()
@@ -1332,13 +1483,27 @@ impl RuntimeServices {
                 })
         };
         if members.is_empty() {
+            // This used to be the only decline with any signal at all, and it was
+            // a `tracing::info!` - which a release build filters out and which
+            // lands in a log file the evaluation never surfaces. The durable
+            // record replaces it rather than sitting next to it.
             tracing::info!(
                 program_id = %projection.program_id,
                 task_ref = %task.task_id,
                 mode = mode.as_str(),
                 "agentic dispatch deferred: roster has no eligible member"
             );
-            return Ok(Vec::new());
+            return self.decline_dispatch(
+                &projection.program_id,
+                &task.task_id,
+                mode,
+                crate::agentic::action_service::AgenticDispatchDeclineReason::NoEligibleMember,
+                &task_status_str(task.status),
+                0,
+                0,
+                0,
+                task.review_generation,
+            );
         }
         // Parallelism belongs between independent Tasks. Starting every
         // eligible model for the same Task merely burns tokens before the CAS
@@ -1346,6 +1511,9 @@ impl RuntimeServices {
         // one independent reviewer; task-level concurrency remains unbounded
         // by this selection and naturally spreads across roster members.
         members.sort_by_key(|member| member_dispatch_rank(projection, member, task, mode));
+        // Captured before the selection loop consumes `members`, so the decline
+        // record can still say how many members were eligible in the first place.
+        let eligible_member_count = members.len();
         let mut rejected_members = Vec::new();
         let mut selected = None;
         let mut busy_eligible = false;
@@ -1412,6 +1580,23 @@ impl RuntimeServices {
                 consecutive_deferrals = consecutive,
                 "agentic dispatch deferred: no free eligible member"
             );
+            // Durable counterpart of the log line above. The two counts are the
+            // whole diagnosis: `eligible_members` says whether the roster could
+            // have served this Task at all, `busy_members` says whether it was
+            // merely occupied. A starved Review and a Review nobody was eligible
+            // for are different failures and used to look identical.
+            self.agent_action_service()
+                .record_dispatch_decline(crate::agentic::action_service::AgenticDispatchDecline {
+                    program_id: &projection.program_id,
+                    task_ref: &task.task_id,
+                    mode: mode.as_str(),
+                    reason: crate::agentic::action_service::AgenticDispatchDeclineReason::NoFreeEligibleMember,
+                    task_status: &task_status_str(task.status),
+                    eligible_members: eligible_member_count,
+                    busy_members: rejected_members.len(),
+                    consecutive_deferrals: consecutive,
+                    review_generation: task.review_generation,
+                });
             if consecutive > dispatch_starvation_bound() {
                 // Escalate as a real failure so the reconcile path records it
                 // and the Program can reach an honest bounded terminal instead

@@ -76,6 +76,16 @@ cleanup() {
     kill "$GATEWAY_PID" >/dev/null 2>&1 || true
     wait "$GATEWAY_PID" >/dev/null 2>&1 || true
   fi
+  # The gateway writes its diagnostics to a file appender under
+  # $RUN_ROOT/config/logs, and only reaches stderr when COWD_LOG_STDERR is set -
+  # which this harness never sets. Two root causes were guessed wrong because
+  # the only signal for them was an `info!` line living in that file. Copy it
+  # next to the durable evidence so the next investigation looks in one place.
+  if [[ -d "$RUN_ROOT/config/logs" ]]; then
+    local log_dest="$EVIDENCE_ROOT/gateway-logs"
+    mkdir -p "$log_dest" 2>/dev/null || true
+    cp -R "$RUN_ROOT/config/logs/." "$log_dest/" 2>/dev/null || true
+  fi
   if [[ "$status" -ne 0 || "${COWD_EVAL_KEEP_GATEWAY_ARTIFACTS:-}" == "1" ]]; then
     printf 'isolated Gateway artifacts: %s\n' "$RUN_ROOT" >&2
   else

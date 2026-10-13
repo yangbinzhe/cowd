@@ -126,8 +126,145 @@ impl AgentActionService {
             }
         }
     }
+
+    /// Append one dispatch decline record.
+    ///
+    /// The dispatch machinery declines for nine different reasons and, until now,
+    /// left no durable trace of any of them. A Task that sat `Submitted` with no
+    /// reviewer was therefore indistinguishable from a Task that was never asked:
+    /// both looked like "no review dispatch happened", and the only way to tell
+    /// them apart was a log line that lives in a file the evaluation never
+    /// surfaces, at a level a release build filters out. Two root causes were
+    /// guessed wrong from exactly that silence.
+    ///
+    /// Same shape and same stream discipline as [`Self::record_wait_disposition`]:
+    /// its own stream, `Relation` scope so it cannot re-arm the `Program` lane,
+    /// and a fenced append that retries the fence rather than dropping the
+    /// second writer.
+    pub(crate) fn record_dispatch_decline(&self, record: AgenticDispatchDecline<'_>) {
+        let stream_id = format!("agentic-dispatch:{}", record.program_id);
+        let payload = serde_json::json!({
+            "program_id": record.program_id,
+            "task_ref": record.task_ref,
+            "mode": record.mode,
+            "reason": record.reason.as_str(),
+            "task_status": record.task_status,
+            "eligible_members": record.eligible_members,
+            "busy_members": record.busy_members,
+            "consecutive_deferrals": record.consecutive_deferrals,
+            "review_generation": record.review_generation,
+        });
+        // One record per distinct (task, mode, reason). `dispatch_ready_agentic_work`
+        // runs on every worker exit, so a Program that cannot be dispatched would
+        // otherwise emit the same decline forever and bury the one that mattered.
+        let idempotency_key = format!(
+            "{}:{}:{}:{}",
+            record.task_ref, record.mode, record.reason.as_str(), record.task_status
+        );
+        let mut attempt = 0_u8;
+        let request = AppendTransactionRequest {
+            transaction_id: format!("agentic-dispatch-decline:{idempotency_key}"),
+            expected_streams: Vec::new(),
+            events: vec![RuntimeTransactionEventInput {
+                event: RuntimeEventInput {
+                    stream_id: stream_id.clone(),
+                    scope: RuntimeEventScope::Relation,
+                    kind: DISPATCH_DECLINED_EVENT_KIND.to_string(),
+                    status: Some("declined".to_string()),
+                    actor: Some("runtime.agentic-dispatch".to_string()),
+                    refs: Vec::new(),
+                    payload,
+                },
+                // The deduplication the plan asks for: an unchanged reason is not
+                // news, and re-appending it would advance the stream without
+                // adding anything a reader could act on.
+                idempotency_key: Some(idempotency_key),
+                schema_version: 1,
+            }],
+        };
+        loop {
+            let expected = self.store.stream_revision(&stream_id).unwrap_or_default();
+            let request = AppendTransactionRequest {
+                transaction_id: request.transaction_id.clone(),
+                expected_streams: vec![ExpectedStreamRevision {
+                    stream_id: stream_id.clone(),
+                    expected_revision: expected,
+                }],
+                events: request.events.clone(),
+            };
+            match self.store.append_transaction(request) {
+                Ok(_) => return,
+                Err(error) if attempt < 8 && error.to_string().contains("revision") => {
+                    attempt = attempt.saturating_add(1);
+                    continue;
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "agentic dispatch decline record not appended");
+                    return;
+                }
+            }
+        }
+    }
 }
 
+/// Why Runtime declined to dispatch one Task in one mode.
+///
+/// An enum rather than a formatted string: the reader is a query against
+/// `runtime_events`, and matching on prose is how the previous two root causes
+/// were guessed wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgenticDispatchDeclineReason {
+    ProgramNotOpen,
+    StarvationBackoff,
+    RootGraphTerminal,
+    CoordinationWakeAbsent,
+    CoordinationIntentMismatch,
+    CoordinationNotCurrent,
+    CoordinationAlreadySettled,
+    ModeStateMismatch,
+    NoEligibleMember,
+    NoFreeEligibleMember,
+    FlightBusy,
+}
+
+impl AgenticDispatchDeclineReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProgramNotOpen => "program_not_open",
+            Self::StarvationBackoff => "starvation_backoff",
+            Self::RootGraphTerminal => "root_graph_terminal",
+            Self::CoordinationWakeAbsent => "coordination_wake_absent",
+            Self::CoordinationIntentMismatch => "coordination_intent_mismatch",
+            Self::CoordinationNotCurrent => "coordination_not_current",
+            Self::CoordinationAlreadySettled => "coordination_already_settled",
+            Self::ModeStateMismatch => "mode_state_mismatch",
+            Self::NoEligibleMember => "no_eligible_member",
+            Self::NoFreeEligibleMember => "no_free_eligible_member",
+            Self::FlightBusy => "flight_busy",
+        }
+    }
+}
+
+/// One "Runtime did not dispatch this" record.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AgenticDispatchDecline<'a> {
+    pub program_id: &'a str,
+    pub task_ref: &'a str,
+    pub mode: &'static str,
+    pub reason: AgenticDispatchDeclineReason,
+    /// The Task's status at the moment of the decline. A `mode_state_mismatch` is
+    /// unreadable without it: the reader needs to see which status was expected.
+    pub task_status: &'a str,
+    pub eligible_members: usize,
+    pub busy_members: usize,
+    pub consecutive_deferrals: usize,
+    pub review_generation: u64,
+}
+
+/// Runtime declined to dispatch one Task in one mode. Durable for the same reason
+/// `agentic.program_wait_disposition` is: a decline nobody can read is a decline
+/// nobody can diagnose, and the dispatch path declines for nine reasons.
+const DISPATCH_DECLINED_EVENT_KIND: &str = "agentic.dispatch.declined";
 const PROGRAM_OPENED_EVENT_KIND: &str = "agentic.program_opened";
 const OBJECTIVE_VERDICT_EVENT_KIND: &str = "agentic.objective_verdict_bound";
 const COMPLETION_REOPENED_EVENT_KIND: &str = "agentic.completion_reopened";

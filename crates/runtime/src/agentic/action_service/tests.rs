@@ -4653,3 +4653,129 @@ fn a_rework_naming_a_real_deliverable_is_not_refused_as_a_discipline_conflict() 
         "a rework naming a real operator deliverable must not be refused: {receipt:?}"
     );
 }
+
+/// A decline nobody can read is a decline nobody can diagnose.
+///
+/// The dispatch path declines for nine reasons and, until now, left no durable
+/// trace of any of them. A Task stuck `Submitted` with no reviewer was
+/// indistinguishable from one that was never asked, and two root causes were
+/// guessed wrong from exactly that silence.
+#[test]
+fn a_dispatch_decline_is_recorded_durably_with_its_reason() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = AgentActionService::new(Arc::clone(&store));
+    service.record_dispatch_decline(AgenticDispatchDecline {
+        program_id: "program-1",
+        task_ref: "task-1",
+        mode: "review",
+        reason: AgenticDispatchDeclineReason::ModeStateMismatch,
+        task_status: "claimed",
+        eligible_members: 2,
+        busy_members: 1,
+        consecutive_deferrals: 3,
+        review_generation: 0,
+    });
+
+    let recorded = store
+        .all_events(64)
+        .expect("read the durable event log")
+        .into_iter()
+        .filter(|event| event.kind == "agentic.dispatch.declined")
+        .collect::<Vec<_>>();
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    let payload = &recorded[0].payload;
+    assert_eq!(payload["reason"], "mode_state_mismatch");
+    assert_eq!(payload["task_ref"], "task-1");
+    assert_eq!(payload["mode"], "review");
+    assert_eq!(payload["task_status"], "claimed");
+    assert_eq!(payload["eligible_members"], 2);
+    assert_eq!(payload["busy_members"], 1);
+    assert_eq!(payload["consecutive_deferrals"], 3);
+    // A diagnostic record must not be able to re-arm the Program lane.
+    assert_eq!(recorded[0].scope, RuntimeEventScope::Relation);
+}
+
+/// `dispatch_ready_agentic_work` runs on every worker exit, so a Program that
+/// stays undispatchable would emit the same decline forever and bury the one
+/// that mattered.
+#[test]
+fn an_unchanged_decline_is_recorded_once_and_a_changed_one_again() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = AgentActionService::new(Arc::clone(&store));
+    fn decline(
+        reason: AgenticDispatchDeclineReason,
+        task_status: &str,
+    ) -> AgenticDispatchDecline<'_> {
+        AgenticDispatchDecline {
+            program_id: "program-1",
+            task_ref: "task-1",
+            mode: "review",
+            reason,
+            task_status,
+            eligible_members: 1,
+            busy_members: 0,
+            consecutive_deferrals: 1,
+            review_generation: 0,
+        }
+    }
+    for _ in 0..5 {
+        service.record_dispatch_decline(decline(
+            AgenticDispatchDeclineReason::ModeStateMismatch,
+            "claimed",
+        ));
+    }
+    let count = |kind: &str| {
+        store
+            .all_events(64)
+            .expect("read the durable event log")
+            .into_iter()
+            .filter(|event| event.kind == kind)
+            .count()
+    };
+    assert_eq!(
+        count("agentic.dispatch.declined"),
+        1,
+        "the same decline repeated is not news"
+    );
+    // The Task advanced, so the same reason now describes a different fact.
+    service.record_dispatch_decline(decline(
+        AgenticDispatchDeclineReason::ModeStateMismatch,
+        "submitted",
+    ));
+    assert_eq!(count("agentic.dispatch.declined"), 2);
+    // A different reason is a different failure.
+    service.record_dispatch_decline(decline(
+        AgenticDispatchDeclineReason::NoEligibleMember,
+        "submitted",
+    ));
+    assert_eq!(count("agentic.dispatch.declined"), 3);
+}
+
+/// Every reason must serialize to a distinct, stable name: the reader is a query
+/// against `runtime_events`, and matching on prose is how the previous two root
+/// causes were guessed wrong.
+#[test]
+fn every_decline_reason_has_a_distinct_stable_name() {
+    let reasons = [
+        AgenticDispatchDeclineReason::ProgramNotOpen,
+        AgenticDispatchDeclineReason::StarvationBackoff,
+        AgenticDispatchDeclineReason::RootGraphTerminal,
+        AgenticDispatchDeclineReason::CoordinationWakeAbsent,
+        AgenticDispatchDeclineReason::CoordinationIntentMismatch,
+        AgenticDispatchDeclineReason::CoordinationNotCurrent,
+        AgenticDispatchDeclineReason::CoordinationAlreadySettled,
+        AgenticDispatchDeclineReason::ModeStateMismatch,
+        AgenticDispatchDeclineReason::NoEligibleMember,
+        AgenticDispatchDeclineReason::NoFreeEligibleMember,
+        AgenticDispatchDeclineReason::FlightBusy,
+    ];
+    let names = reasons
+        .iter()
+        .map(|reason| reason.as_str())
+        .collect::<Vec<_>>();
+    let unique = names.iter().collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(unique.len(), names.len(), "duplicate reason name in {names:?}");
+    for name in &names {
+        assert!(!name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_'), "{name}");
+    }
+}
