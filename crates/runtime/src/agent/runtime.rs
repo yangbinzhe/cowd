@@ -681,6 +681,13 @@ impl AgentRuntime {
         // dispatch while retaining the previous run's exclusive lock.
         drop(_run_guard);
         if let Some(services) = self.services() {
+            // Why a Submitted Task can sit with no reviewer: this reconcile is
+            // the only thing that admits Review work after an agent finishes,
+            // and one live run ended with two Tasks `Submitted`, zero review
+            // dispatches, and not one `worker-exit-reconcile` action anywhere in
+            // the journal. Each branch below says which condition held, so the
+            // next run names the cause instead of leaving it to be inferred.
+            let has_agentic_binding = packet.agentic_binding.is_some();
             let reason = match &result {
                 Ok(returned) => returned
                     .failure
@@ -695,13 +702,27 @@ impl AgentRuntime {
                 tracing::warn!(run_id = packet.run_id(), %error, "Agent attempt settlement awaits durable recovery");
             }
             if let Some(binding) = packet.agentic_binding.as_ref() {
-                if let Err(error) = services
-                    .dispatch_ready_agentic_work(&binding.program_id)
-                    .await
-                {
-                    tracing::warn!(run_id = packet.run_id(), %error, "ready Agent work awaits recovery after worker exit");
+                match services.dispatch_ready_agentic_work(&binding.program_id).await {
+                    Ok(receipts) => tracing::info!(
+                        run_id = packet.run_id(),
+                        program_id = %binding.program_id,
+                        dispatched = receipts.len(),
+                        "worker-exit reconcile ran after an agent finished"
+                    ),
+                    Err(error) => tracing::warn!(run_id = packet.run_id(), %error, "ready Agent work awaits recovery after worker exit"),
                 }
+            } else {
+                tracing::info!(
+                    run_id = packet.run_id(),
+                    has_agentic_binding,
+                    "worker-exit reconcile skipped: this agent carries no Agentic binding, so no Review work can be admitted"
+                );
             }
+        } else {
+            tracing::info!(
+                run_id = packet.run_id(),
+                "worker-exit reconcile skipped: no RuntimeServices are bound to this agent"
+            );
         }
         result
     }
