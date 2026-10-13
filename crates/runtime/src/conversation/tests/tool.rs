@@ -2352,7 +2352,7 @@
         let turn = runtime.active_turn_id();
         let input = serde_json::json!({"query": "task:be3f9b4582fb9f712fa8ed66"}).to_string();
         let hash = crate::tool_invocation::stable_hash(&input);
-        let bound = crate::repetition_guard::repeated_call_block_bound_for("state_inspect");
+        let bound = crate::repetition_guard::repeated_call_block_bound_for("state_inspect", "{}");
         for _ in 0..bound {
             crate::repetition_guard::record_repeated_call(&turn, "state_inspect", &hash);
         }
@@ -2401,7 +2401,7 @@
         .without_memory();
 
         let turn = runtime.active_turn_id();
-        let bound = crate::repetition_guard::repeated_call_block_bound_for("state_inspect");
+        let bound = crate::repetition_guard::repeated_call_block_bound_for("state_inspect", "{}");
         for index in 0..bound {
             let input = serde_json::json!({"query": format!("task:{index}")}).to_string();
             let hash = crate::tool_invocation::stable_hash(&input);

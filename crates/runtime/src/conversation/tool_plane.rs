@@ -1487,7 +1487,7 @@ where
             tool_name,
             &input_hash,
         );
-        let block_bound = crate::repetition_guard::repeated_call_block_bound_for(tool_name);
+        let block_bound = crate::repetition_guard::repeated_call_block_bound_for(tool_name, input);
         if repeated < block_bound + 1 + ignored_bound {
             return;
         }
@@ -1522,7 +1522,7 @@ where
         // actually stopped a loop.
         let repeated = crate::repetition_guard::repeated_call_count(&turn_id, tool_name, &input_hash);
         let repeated_refusal =
-            repeated >= crate::repetition_guard::repeated_call_block_bound_for(tool_name);
+            repeated >= crate::repetition_guard::repeated_call_block_bound_for(tool_name, input);
         let Some(refusal) = crate::repetition_guard::refusal_for(&turn_id, tool_name, &input_hash)
         else {
             if !repeated_refusal {

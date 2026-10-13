@@ -101,7 +101,7 @@ pub(crate) fn repeated_call_bound() -> usize {
 /// failures, and it is the only thing in the framework that has ever actually
 /// stopped a loop.
 pub(crate) fn repeated_call_block_bound() -> usize {
-    repeated_call_block_bound_for("")
+    repeated_call_block_bound_for("", "{}")
 }
 
 /// The block bound for one tool.
@@ -114,13 +114,40 @@ pub(crate) fn repeated_call_block_bound() -> usize {
 /// Polling therefore gets four times the diagnostic bound rather than two, which
 /// is a bound and not a licence: the turn still ends, and the scenario timeout
 /// still applies.
-pub(crate) fn repeated_call_block_bound_for(tool_name: &str) -> usize {
-    let multiplier = if tool_name == "state_inspect" { 4 } else { 2 };
+pub(crate) fn repeated_call_block_bound_for(tool_name: &str, input: &str) -> usize {
+    // `state_inspect(wait_for_workers: true)` is the documented wait: the model
+    // parks on it until a worker moves, so an unchanged answer is its normal
+    // contract and it earns the wider bound. A point lookup of one entry is a
+    // different thing entirely - one live run polled `{"query": "task:..."}`
+    // five times with nothing in flight while the wider bound let it keep
+    // going to twelve, and the stagnation monitor stopped the run first.
+    let multiplier =
+        if tool_name == "state_inspect" && input_declares_wait_for_workers(input) {
+            4
+        } else {
+            2
+        };
     std::env::var("COWD_TOOL_REPEAT_BLOCK_LIMIT")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or_else(|| repeated_call_bound().saturating_mul(multiplier))
+}
+
+/// Whether this input asks Runtime to wait for workers.
+///
+/// Same question `call_declares_wait_for_workers` answers for a `ModelToolCall`,
+/// asked of the raw input string so the breaker can consult it before the call
+/// is admitted. An unparseable input is not a wait.
+fn input_declares_wait_for_workers(input: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(input)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("wait_for_workers")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(false)
 }
 
 /// The cumulative count so far, without recording a new call.
@@ -1212,13 +1239,44 @@ mod repetition_guard_tests {
     /// polling - the bound stopped the symptom while the model had nowhere to wait.
     #[test]
     fn a_polling_tool_gets_a_wider_block_bound_than_a_reading_tool() {
-        assert_eq!(repeated_call_block_bound_for(""), repeated_call_bound() * 2);
+        assert_eq!(repeated_call_block_bound_for("", "{}"), repeated_call_bound() * 2);
         assert_eq!(
-            repeated_call_block_bound_for("state_inspect"),
+            repeated_call_block_bound_for("read_file", "{}"),
+            repeated_call_bound() * 2
+        );
+        // A wider bound is still a bound.
+        assert!(repeated_call_block_bound_for("state_inspect", "{}") > 0);
+    }
+
+    /// Only the documented wait earns the wider bound.
+    ///
+    /// The wider bound exists because parking on `wait_for_workers` until a
+    /// worker moves is the tool's contract, so an unchanged answer is normal. A
+    /// point lookup is not a wait: one live run polled `{"query": "task:..."}`
+    /// five times with nothing in flight while the wider bound let it keep
+    /// going to twelve, and the stagnation monitor stopped the run first.
+    #[test]
+    fn only_the_documented_wait_earns_the_wider_block_bound() {
+        let wait = r#"{"wait_for_workers": true}"#;
+        let point_lookup = r#"{"query": "task:26efb4ebc0ebaadef83d66fd"}"#;
+        assert_eq!(
+            repeated_call_block_bound_for("state_inspect", wait),
             repeated_call_bound() * 4
         );
-        assert_eq!(repeated_call_block_bound_for("read_file"), repeated_call_bound() * 2);
-        // A wider bound is still a bound.
-        assert!(repeated_call_block_bound_for("state_inspect") > 0);
+        assert_eq!(
+            repeated_call_block_bound_for("state_inspect", point_lookup),
+            repeated_call_bound() * 2,
+            "a point lookup is polling, not waiting, and must not get the wait's bound"
+        );
+        // An unparseable input is not a wait either.
+        assert_eq!(
+            repeated_call_block_bound_for("state_inspect", "not json"),
+            repeated_call_bound() * 2
+        );
+        // A different tool that happens to carry the flag is still not a wait.
+        assert_eq!(
+            repeated_call_block_bound_for("read_file", wait),
+            repeated_call_bound() * 2
+        );
     }
 }
