@@ -82,6 +82,56 @@ pub enum LivenessVerdict {
     },
 }
 
+/// What one stream event says about the answer being produced.
+///
+/// The guard used to count every event as progress, which meant a model that
+/// streamed the same answer over and over never went inactive: the inactivity
+/// window was reset by bytes, not by meaning. One live run sat at 0.958
+/// consecutive-answer similarity for minutes while the tracker reported steady
+/// progress, and the monitor stopped the run because nothing in the framework
+/// would.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LivenessProgress {
+    /// More text in the answer currently being produced.
+    Text(String),
+    /// The answer is complete: the guard decides whether it was new.
+    AnswerComplete,
+    /// Carries no answer content.
+    Ignore,
+}
+
+/// How much two consecutive answers may overlap before the second one stops
+/// counting as progress.
+pub const REPEATED_ANSWER_SIMILARITY_BP: u16 = 9_000;
+
+/// Token-set overlap in basis points, 0..=10_000.
+///
+/// Deliberately the same shape as the mission organizer's objective
+/// similarity: alphanumeric tokens, lowercased, Jaccard. Enough to tell "the
+/// model said the same thing again" from "the model said something new", which
+/// is the only question the guard asks.
+#[must_use]
+pub fn answer_similarity_bp(left: &str, right: &str) -> u16 {
+    let tokens = |value: &str| {
+        value
+            .split(|character: char| !character.is_alphanumeric())
+            .filter(|token| !token.is_empty())
+            .map(str::to_lowercase)
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let left = tokens(left);
+    let right = tokens(right);
+    if left.is_empty() || right.is_empty() {
+        return 0;
+    }
+    let intersection = left.intersection(&right).count();
+    let union = left.union(&right).count();
+    if union == 0 {
+        return 0;
+    }
+    u16::try_from(intersection.saturating_mul(10_000) / union).unwrap_or(10_000)
+}
+
 /// The liveness contract for one turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LivenessContract {
@@ -372,10 +422,40 @@ where
     S: futures::Stream<Item = T>,
     F: FnMut(LivenessVerdict),
 {
+    guard_liveness_with_progress(stream, contract, on_stall, |_| LivenessProgress::Ignore)
+}
+
+/// [`guard_liveness`] for a caller that can say what each event means.
+///
+/// `progress` classifies one event. Text accumulates into the answer being
+/// produced; when that answer completes, the guard compares it with the
+/// previous one and records progress only if it is genuinely new. A repeated
+/// answer therefore stops resetting the inactivity window, and the existing
+/// ladder - refocus, summarize, request commit, ask - eventually fires.
+pub fn guard_liveness_with_progress<S, T, F, K>(
+    stream: S,
+    contract: LivenessContract,
+    mut on_stall: F,
+    mut progress: K,
+) -> impl futures::Stream<Item = T>
+where
+    S: futures::Stream<Item = T>,
+    F: FnMut(LivenessVerdict),
+    K: FnMut(&T) -> LivenessProgress,
+{
     let tracker = LivenessTracker::new(contract);
     // `last_notified` keeps the ladder from repeating itself: once the runtime
     // has been told what to do at a given rung, it is told again only when the
     // ladder actually advances, or never - repeating "you are idle" is noise.
+    //
+    // `previous` and `current` hold the last completed answer and the one being
+    // assembled. Progress is recorded per completed answer, not per event, so a
+    // stream that keeps producing bytes without saying anything new stops
+    // resetting the window.
+    // `progress` rides in the state tuple so each poll can take it out and put
+    // it back: `unfold` needs an `FnMut` closure, and a closure that moved its
+    // own `FnMut` argument into an `async move` block could only ever be called
+    // once.
     futures::stream::unfold(
         (
             Box::pin(stream),
@@ -383,27 +463,61 @@ where
             None::<Duration>,
             Some(on_stall),
             0_u32,
+            None::<String>,
+            String::new(),
+            Some(progress),
         ),
-        move |(mut inner, mut tracker, mut pending, mut on_stall, mut last_notified)| async move {
-            loop {
-                let idle = pending.take().unwrap_or(Duration::ZERO);
-                if let LivenessVerdict::Stalled { step, .. } = tracker.evaluate(idle) {
-                    if step > last_notified && step <= tracker.contract().escalation_budget {
-                        last_notified = step;
-                        if let Some(callback) = on_stall.as_mut() {
-                            (callback)(tracker.evaluate(idle));
+        move |(mut inner, mut tracker, mut pending, mut on_stall, mut last_notified, mut previous, mut current, mut progress)| {
+            async move {
+                let mut progress = progress.take().expect("progress classifier is restored every poll");
+                loop {
+                    let idle = pending.take().unwrap_or(Duration::ZERO);
+                    if let LivenessVerdict::Stalled { step, .. } = tracker.evaluate(idle) {
+                        if step > last_notified && step <= tracker.contract().escalation_budget {
+                            last_notified = step;
+                            if let Some(callback) = on_stall.as_mut() {
+                                (callback)(tracker.evaluate(idle));
+                            }
+                            let _ = tracker.escalate();
                         }
-                        let _ = tracker.escalate();
                     }
-                }
-                let window = tracker.contract().inactivity_window;
-                match tokio::time::timeout(window, futures::StreamExt::next(&mut inner)).await {
-                    Ok(Some(item)) => {
-                        tracker.record_progress();
-                        return Some((item, (inner, tracker, None, on_stall, last_notified)));
+                    let window = tracker.contract().inactivity_window;
+                    match tokio::time::timeout(window, futures::StreamExt::next(&mut inner)).await {
+                        Ok(Some(item)) => {
+                            // A repeated answer spends the window instead of
+                            // resetting it. Without this the guard could only ever
+                            // see a silent stream, and a model that keeps streaming
+                            // the same words would look alive forever - which is
+                            // exactly what one live run did at 0.958 similarity.
+                            let mut spent = false;
+                            match progress(&item) {
+                                LivenessProgress::Text(text) => current.push_str(&text),
+                                LivenessProgress::AnswerComplete => {
+                                    // An empty answer is neither a repeat nor news:
+                                    // the model produced nothing to compare.
+                                    if current.trim().is_empty() {
+                                        current.clear();
+                                    } else {
+                                        let repeated = previous.as_deref().is_some_and(|last| {
+                                            answer_similarity_bp(last, &current)
+                                                >= REPEATED_ANSWER_SIMILARITY_BP
+                                        });
+                                        if repeated {
+                                            spent = true;
+                                        } else {
+                                            tracker.record_progress();
+                                        }
+                                        previous = Some(std::mem::take(&mut current));
+                                    }
+                                }
+                                LivenessProgress::Ignore => {}
+                            }
+                            let carried = if spent { Some(window) } else { None };
+                            return Some((item, (inner, tracker, carried, on_stall, last_notified, previous, current, Some(progress))));
+                        }
+                        Ok(None) => return None,
+                        Err(_elapsed) => pending = Some(window),
                     }
-                    Ok(None) => return None,
-                    Err(_elapsed) => pending = Some(window),
                 }
             }
         },
@@ -857,5 +971,127 @@ mod terminal_tests {
             );
         }
         assert_eq!(tracker.requests_issued(), 0);
+    }
+
+    /// Two answers that say the same thing are the same answer.
+    ///
+    /// The live run sat at 0.958 consecutive-answer similarity while the tracker
+    /// reported steady progress, because every delta reset the window. The
+    /// similarity is token-set Jaccard, so re-ordering the same words still
+    /// counts as a repeat - which is the shape a model produces when it is
+    /// restating itself.
+    #[test]
+    fn a_reworded_repeat_is_still_a_repeat() {
+        let first = "The task is partially complete and no artifacts were produced.";
+        let reordered = "No artifacts were produced and the task is partially complete.";
+        let different = "Three teams were created and two agents claimed tasks.";
+        assert!(
+            answer_similarity_bp(first, reordered) >= REPEATED_ANSWER_SIMILARITY_BP,
+            "{}",
+            answer_similarity_bp(first, reordered)
+        );
+        assert!(
+            answer_similarity_bp(first, different) < REPEATED_ANSWER_SIMILARITY_BP,
+            "{}",
+            answer_similarity_bp(first, different)
+        );
+        assert_eq!(answer_similarity_bp("", ""), 0);
+    }
+
+    /// A stream that yields each item after a fixed gap, so the guard's
+    /// inactivity window can actually expire between items.
+    fn paced(items: Vec<LivenessProgress>, gap: Duration) -> impl futures::Stream<Item = LivenessProgress> {
+        futures::stream::unfold(items.into_iter(), move |mut remaining| async move {
+            let item = remaining.next()?;
+            tokio::time::sleep(gap).await;
+            Some((item, remaining))
+        })
+    }
+
+    fn answers(items: usize, answer: &str) -> Vec<LivenessProgress> {
+        (0..items)
+            .flat_map(|_| {
+                vec![
+                    LivenessProgress::Text(answer.to_string()),
+                    LivenessProgress::AnswerComplete,
+                ]
+            })
+            .collect()
+    }
+
+    /// A repeated answer stops resetting the inactivity window.
+    ///
+    /// The guard counts progress per completed answer, not per event, so a
+    /// stream that keeps producing the same words eventually goes inactive and
+    /// the existing ladder gets to help the model.
+    #[tokio::test]
+    async fn a_repeated_answer_is_not_progress() {
+        let window = Duration::from_millis(100);
+        let gap = Duration::from_millis(40);
+        let repeated = "The objective is only partially satisfied and no artifact was committed.";
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&seen);
+        let mut guarded = Box::pin(guard_liveness_with_progress(
+            paced(answers(6, repeated), gap),
+            LivenessContract {
+                inactivity_window: window,
+                escalation_budget: 4,
+                wall_clock_bound: None,
+            },
+            move |verdict| {
+                if let LivenessVerdict::Stalled { action, .. } = verdict {
+                    sink.lock().unwrap().push(action);
+                }
+            },
+            |event| event.clone(),
+        ));
+        while futures::StreamExt::next(&mut guarded).await.is_some() {}
+        assert!(
+            !seen.lock().unwrap().is_empty(),
+            "a model restating itself must eventually be helped"
+        );
+    }
+
+    /// A model that keeps saying new things is never bothered.
+    #[tokio::test]
+    async fn a_changing_answer_is_progress() {
+        let window = Duration::from_millis(100);
+        let gap = Duration::from_millis(40);
+        let items = [
+            "Three teams were created and three agents invited.",
+            "Three tasks were published and two of them claimed.",
+            "Two artifacts were committed and one task submitted.",
+            "One task was reviewed and the objective advanced.",
+        ]
+        .iter()
+        .flat_map(|answer| {
+            vec![
+                LivenessProgress::Text((*answer).to_string()),
+                LivenessProgress::AnswerComplete,
+            ]
+        })
+        .collect::<Vec<_>>();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&seen);
+        let mut guarded = Box::pin(guard_liveness_with_progress(
+            paced(items, gap),
+            LivenessContract {
+                inactivity_window: window,
+                escalation_budget: 4,
+                wall_clock_bound: None,
+            },
+            move |verdict| {
+                if let LivenessVerdict::Stalled { action, .. } = verdict {
+                    sink.lock().unwrap().push(action);
+                }
+            },
+            |event| event.clone(),
+        ));
+        while futures::StreamExt::next(&mut guarded).await.is_some() {}
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a model making progress must not be nagged: {:?}",
+            seen.lock().unwrap()
+        );
     }
 }

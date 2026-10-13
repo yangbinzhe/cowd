@@ -949,13 +949,29 @@ impl ProviderRuntimeClient {
         // without a new value being threaded through Runtime construction; the
         // optional `liveness_stall_sink` remains for callers that want an
         // immediate out-of-band reaction.
-        Box::pin(crate::liveness::guard_liveness(
+        // The guard reads the answer, not the byte count. A model that streams
+        // the same answer again and again used to reset the inactivity window
+        // on every delta, so the ladder never fired and nothing in the
+       // framework helped it: one live run sat at 0.958 consecutive-answer
+        // similarity while the tracker reported steady progress, and the eval
+        // monitor stopped the run because the runtime would not.
+        Box::pin(crate::liveness::guard_liveness_with_progress(
             events,
             contract,
             move |verdict| {
                 if let Ok(mut recorded) = recorded_stalls.lock() {
                     recorded.push(verdict);
                 }
+            },
+            |event| match event {
+                // A failed event carries no answer, so it is not progress.
+                Ok(crate::conversation::AssistantEvent::TextDelta(text)) => {
+                    crate::liveness::LivenessProgress::Text(text.clone())
+                }
+                Ok(crate::conversation::AssistantEvent::ItemCompleted { .. }) => {
+                    crate::liveness::LivenessProgress::AnswerComplete
+                }
+                _ => crate::liveness::LivenessProgress::Ignore,
             },
         ))
     }
