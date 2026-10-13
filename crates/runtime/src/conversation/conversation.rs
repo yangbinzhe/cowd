@@ -2613,13 +2613,23 @@ pub trait ToolExecutor: Send + Sync + 'static {
     }
 
     /// Validate provider-supplied input before Runtime publishes the ToolUse
-    /// block, negotiates permission, or reserves execution capacity.
+    /// block, negotiates permission, or reserves execution capacity, and hand
+    /// back the exact bytes Runtime will dispatch.
     /// Production executors bind this check to their pinned catalog; the
     /// fallback keeps lightweight test executors compatible while still
     /// rejecting malformed JSON at the protocol boundary.
-    fn validate_tool_input(&self, _tool_name: &str, input: &str) -> Result<(), ToolError> {
+    ///
+    /// The returned string is authoritative for everything downstream of this
+    /// boundary: the transcript's ToolUse block, the governed plan and the
+    /// physical dispatch must all describe the same input. A production
+    /// executor therefore repairs the one-shot shape corruption it owns - a
+    /// field the schema types as array/object/integer arriving as a
+    /// JSON-encoded string - here, where the schema is already pinned, instead
+    /// of leaving that repair in the dispatch path where the caller can no
+    /// longer reach it.
+    fn validate_tool_input(&self, _tool_name: &str, input: &str) -> Result<String, ToolError> {
         serde_json::from_str::<serde_json::Value>(input)
-            .map(|_| ())
+            .map(|_| input.to_string())
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))
     }
 

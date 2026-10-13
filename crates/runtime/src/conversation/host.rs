@@ -4751,11 +4751,19 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                 input: candidate.call.input.clone(),
                 depends_on: Vec::new(),
             };
-            if let Err(error) =
-                tool_executor.validate_tool_input(&request.tool_name, &request.input)
+            // Dispatch the bytes the contract boundary hands back, not the raw
+            // frame: the repair for a string-typed array/object field happens
+            // here, so everything downstream sees the same input.
+            let request = match tool_executor.validate_tool_input(&request.tool_name, &request.input)
             {
-                return defer(format!("input_contract_rejected:{error}"));
-            }
+                Ok(repaired) => crate::tool_dispatch::ToolRequest {
+                    input: repaired,
+                    ..request
+                },
+                Err(error) => {
+                    return defer(format!("input_contract_rejected:{error}"));
+                }
+            };
             let prepared =
                 tool_executor.prepare_governed_invocations(std::slice::from_ref(&request));
             let Some(invocation) = prepared

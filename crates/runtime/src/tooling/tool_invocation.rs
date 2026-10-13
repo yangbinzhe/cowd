@@ -50,6 +50,12 @@ pub enum ToolFailureKind {
     Timeout,
     Panic,
     HookDenied,
+    /// The call never reached an executor: its arguments did not match the
+    /// tool's pinned schema. This is the one failure the invocation record
+    /// used to have no word for, so a frame Runtime refused before dispatch
+    /// left no trace at all and neither monitoring nor the report could
+    /// attribute it.
+    InputContractRejected,
     Unknown,
 }
 
@@ -63,6 +69,7 @@ impl ToolFailureKind {
             Self::Timeout => "timeout",
             Self::Panic => "panic",
             Self::HookDenied => "hook_denied",
+            Self::InputContractRejected => "input_contract_rejected",
             Self::Unknown => "unknown",
         }
     }

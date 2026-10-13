@@ -75,7 +75,7 @@ impl ToolExecutor for GatewayToolExecutor {
         }
     }
 
-    fn validate_tool_input(&self, tool_name: &str, input: &str) -> Result<(), ToolError> {
+    fn validate_tool_input(&self, tool_name: &str, input: &str) -> Result<String, ToolError> {
         let canonical_name = <Self as ToolExecutor>::resolve_tool_name(self, tool_name)
             .ok_or_else(|| ToolError::new(format!("tool `{tool_name}` is not registered")))?;
         if self
@@ -87,12 +87,35 @@ impl ToolExecutor for GatewayToolExecutor {
                 "tool `{canonical_name}` is not enabled by the current --allowedTools setting"
             )));
         }
-        let value = serde_json::from_str::<serde_json::Value>(input)
+        let mut value = serde_json::from_str::<serde_json::Value>(input)
             .map_err(|error| self.input_contract_error(&canonical_name, error))?;
+        // The repair belongs here, at the boundary that already holds the
+        // pinned schema, not in the dispatch path. It used to live only inside
+        // `execute_runtime_tool_with_binding`, which is downstream of this
+        // check - so the one corruption it exists to fix, a field the schema
+        // types as array/object arriving as a JSON-encoded string, was refused
+        // here before the repair could ever run. One live run lost a whole
+        // objective to exactly that: two identical frames refused, the single
+        // frame-repair budget spent, three Teams and zero Tasks, verdict
+        // `partial`.
+        let repaired_fields = self.coerce_string_typed_structured_fields(&canonical_name, &mut value);
+        if !repaired_fields.is_empty() {
+            tracing::info!(
+                tool_name,
+                ?repaired_fields,
+                "coerced string-typed structured tool input fields at the schema boundary"
+            );
+        }
         self.tool_host
             .pin_snapshot()
             .validate_input(&canonical_name, &value)
             .map_err(|error| self.input_contract_error(&canonical_name, error))
+        // Hand back the bytes Runtime will actually dispatch so the
+        // transcript, the governed plan and the execution cannot disagree.
+        // `Value` re-serializes deterministically, so a model that repeats the
+        // same frame still hashes the same and the repetition guard still sees
+        // it.
+        .map(|()| serde_json::to_string(&value).unwrap_or_else(|_| input.to_string()))
     }
 
     fn has_registered_tools(&self) -> bool {

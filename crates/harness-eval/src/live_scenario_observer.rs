@@ -911,6 +911,13 @@ fn is_execution_activity(kind: &str) -> bool {
             | "tool.invocation.started"
             | "tool.invocation.completed"
             | "tool.invocation.failed"
+            // A call Runtime refused before dispatch never entered the
+            // invocation lifecycle, so it has no `tool.invocation.*` event to
+            // be counted by. Without this kind a frame that was refused whole
+            // - and everything the model asked for in it - was invisible to
+            // the observer, which is how a run could report tool activity
+            // while the model's last three calls had gone nowhere.
+            | "tool.call.rejected_before_dispatch"
             | "tool.execution_plan.created"
             | "tool.schedule.created"
     )

@@ -1902,6 +1902,32 @@ where
                 );
             }
             canonicalize_model_tool_names(&mut calls, self.tool_executor.as_ref());
+            // Repair the one-shot shape corruption before any consumer reads
+            // these bytes. The coercion lives in the executor that owns the
+            // pinned schema, and this boundary is the first place that schema
+            // is consulted for the frame - the transcript clone below, the
+            // contract check further down and the governed plan all read
+            // `calls`. Leaving the repair in the dispatch path instead meant
+            // the contract check refused a frame the repair existed to fix.
+            //
+            // The check below validates these same bytes again. That is one
+            // extra in-memory schema walk per call against a provider round
+            // trip, paid so that no consumer can ever observe an unrepaired
+            // frame regardless of what is inserted between here and there.
+            for call in &mut calls {
+                if let Ok(repaired) =
+                    self.tool_executor.validate_tool_input(&call.name, &call.input)
+                {
+                    if repaired != call.input {
+                        tracing::info!(
+                            tool_name = %call.name,
+                            tool_call_id = %call.id,
+                            "repaired the model's tool input shape at the schema boundary"
+                        );
+                        call.input = repaired;
+                    }
+                }
+            }
             let requested_tool_call_count = calls.len();
             let transcript_calls = calls.clone();
             let mut rejected_tool_calls = Vec::<(ModelToolCall, String)>::new();
@@ -2072,6 +2098,63 @@ where
                 .iter()
                 .find_map(|call| invalid_arguments.get(&call.id).map(|error| (call, error)))
             {
+                // Every call in this frame was refused, so nothing will run.
+                // Record each one before returning: the sibling branch above
+                // answers the model in-step through `preflight_tool_results`,
+                // and this branch used to answer nobody - no assistant
+                // message, no tool result, no invocation record. The model's
+                // own calls became invisible, so a run that lost its whole
+                // objective to two refused frames showed three Teams, zero
+                // Tasks and no trace of what it had asked for. The invariant
+                // is that every call the model emits is accounted for.
+                // Not `tool.invocation.failed`: an invocation lifecycle event
+                // requires an active Runtime activity binding, and a call that
+                // never dispatched has none by definition - so that kind is
+                // refused here for exactly the reason this record exists. A
+                // distinct kind says what actually happened and survives.
+                for rejected in &calls {
+                    let Some(reason) = invalid_arguments.get(&rejected.id) else {
+                        continue;
+                    };
+                    let invocation_id = format!(
+                        "tool-inv-{}",
+                        crate::tool_invocation::stable_hash(&format!(
+                            "{}:{}:{}",
+                            self.session_id(),
+                            rejected.id,
+                            rejected.input
+                        ))
+                    );
+                    self.append_execution_runtime_event(
+                        crate::RuntimeEventScope::Tool,
+                        "tool.call.rejected_before_dispatch",
+                        Some("failed".to_string()),
+                        vec![
+                            crate::RuntimeEventRef {
+                                kind: "tool_invocation".to_string(),
+                                id: invocation_id.clone(),
+                            },
+                            crate::RuntimeEventRef {
+                                kind: "tool_call".to_string(),
+                                id: rejected.id.clone(),
+                            },
+                        ],
+                        serde_json::json!({
+                            "invocation_id": invocation_id,
+                            "tool_call_id": rejected.id,
+                            "tool_name": rejected.name,
+                            "failure_kind": crate::ToolFailureKind::InputContractRejected.as_str(),
+                            "reason": reason,
+                            "side_effect_committed": false,
+                            "dispatched": false,
+                            "model_visible_preview": rejected
+                                .input
+                                .chars()
+                                .take(200)
+                                .collect::<String>(),
+                        }),
+                    );
+                }
                 // Tool arguments are provider protocol, not an executable
                 // request. Reject them before transcript publication and
                 // permission negotiation so malformed calls cannot create an

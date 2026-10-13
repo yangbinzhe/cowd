@@ -766,7 +766,10 @@ fn validate_schema_value(
             _ => true,
         };
         if !type_matches {
-            return Err(format!("{path}: value has the wrong JSON type"));
+            return Err(format!(
+                "{path}: value has the wrong JSON type{}",
+                declared_type_guidance(expected, value)
+            ));
         }
     }
 
@@ -850,6 +853,56 @@ fn schema_type_matches(expected: &str, value: &Value) -> bool {
         "string" => value.is_string(),
         _ => true,
     }
+}
+
+/// The JSON type name of a value, for a refusal the model can act on.
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(number) => {
+            if number.is_f64() && !number.is_i64() && !number.is_u64() {
+                "number"
+            } else {
+                "integer"
+            }
+        }
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// Name what the schema wants and what actually arrived.
+///
+/// `value has the wrong JSON type` says where the call is wrong and nothing
+/// about what to send instead, so a model that quoted an array field as a
+/// string re-emits the identical frame. One live run did exactly that twice,
+/// spent its single frame-repair budget on it, and ended the objective
+/// `partial` with three Teams and zero Tasks. Everything here is derived from
+/// the schema and the value: no tool-specific branch, no invented shape.
+fn declared_type_guidance(expected: &Value, value: &Value) -> String {
+    let declared = match expected {
+        Value::String(expected) => expected.clone(),
+        Value::Array(expected) => expected
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" or "),
+        _ => return String::new(),
+    };
+    let received = json_type_name(value);
+    let quoted_container = value.is_string() && declared.split(" or ").any(|kind| {
+        matches!(kind, "array" | "object" | "integer" | "number" | "boolean" | "null")
+    });
+    format!(
+        " (declared type: {declared}; received: {received}; send a {declared} value{})",
+        if quoted_container {
+            format!(" as raw JSON, not as a JSON-encoded string")
+        } else {
+            String::new()
+        }
+    )
 }
 
 fn validate_count_bounds(
@@ -1142,6 +1195,73 @@ mod tests {
                 .validate_authorization(&authorization(&descriptor, None), "read_file", &input)
                 .unwrap_err(),
             ToolHostError::InvalidLeaseSignature
+        );
+    }
+
+    /// A refusal has to say what to send, not only where the call is wrong.
+    ///
+    /// `value has the wrong JSON type` named the field and nothing else, and a
+    /// model answered it by re-emitting the identical frame - twice, which
+    /// spent its single frame-repair budget and ended the objective `partial`
+    /// with three Teams and zero Tasks.
+    #[test]
+    fn a_type_mismatch_refusal_names_the_declared_type_and_the_shape_to_send() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "actions": {
+                    "type": "array",
+                    "items": {"type": "object"}
+                }
+            },
+            "required": ["actions"]
+        });
+        let error = validate_schema_value(
+            &schema,
+            &schema,
+            &json!({"actions": "[{\"tool\":\"team_create\",\"input\":{}}]"}),
+            "$",
+        )
+        .expect_err("a string where the schema declares an array must be refused");
+        assert_eq!(
+            error,
+            "$.actions: value has the wrong JSON type (declared type: array; received: string; \
+             send a array value as raw JSON, not as a JSON-encoded string)"
+        );
+    }
+
+    /// A field the schema types as `string` is never told to become a
+    /// container: legitimate JSON text in a string field stays legitimate.
+    #[test]
+    fn a_string_field_is_never_given_container_guidance() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"content": {"type": "string"}},
+            "required": ["content"]
+        });
+        let error = validate_schema_value(&schema, &schema, &json!({"content": 7}), "$")
+            .expect_err("an integer where the schema declares a string must be refused");
+        assert_eq!(
+            error,
+            "$.content: value has the wrong JSON type (declared type: string; received: integer; \
+             send a string value)"
+        );
+    }
+
+    /// A union type is reported as the union, and the guidance still fits.
+    #[test]
+    fn a_union_type_refusal_names_every_declared_type() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"ref": {"type": ["string", "null"]}},
+            "required": ["ref"]
+        });
+        let error = validate_schema_value(&schema, &schema, &json!({"ref": []}), "$")
+            .expect_err("an array where the schema declares string-or-null must be refused");
+        assert_eq!(
+            error,
+            "$.ref: value has the wrong JSON type (declared type: string or null; received: array; \
+             send a string or null value)"
         );
     }
 

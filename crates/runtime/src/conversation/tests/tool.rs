@@ -1167,13 +1167,13 @@
             vec!["tool_search".to_string()]
         }
 
-        fn validate_tool_input(&self, tool_name: &str, input: &str) -> Result<(), ToolError> {
+        fn validate_tool_input(&self, tool_name: &str, input: &str) -> Result<String, ToolError> {
             let input = serde_json::from_str::<serde_json::Value>(input)
                 .map_err(|error| ToolError::new(error.to_string()))?;
             if tool_name == "tool_search" && input.get("query").is_none() {
                 return Err(ToolError::new("missing required field `query`"));
             }
-            Ok(())
+            Ok(serde_json::to_string(&input).unwrap_or_else(|_| input.to_string()))
         }
     }
 
@@ -2223,6 +2223,70 @@
         assert!(!transcript.iter().any(|message| message.blocks.iter().any(
             |block| matches!(block, ContentBlock::ToolUse { id, .. } if id == "invalid-search")
         )));
+    }
+
+    /// A frame Runtime refuses whole must still leave a record of what the
+    /// model asked for.
+    ///
+    /// The sibling branch - some calls valid, some not - answers the model
+    /// in-step through `preflight_tool_results`. This branch used to answer
+    /// nobody: no assistant message, no tool result, no invocation record, so
+    /// the model's own calls became invisible. One live run lost its whole
+    /// objective to two refused frames and its database showed three Teams,
+    /// zero Tasks and no trace of either call.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wholly_refused_frame_is_accounted_for_in_the_durable_event_log() {
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        // The turn boundary rebinds the runtime onto the services' own store,
+        // so a store attached here would be replaced before anything ran.
+        let store = Arc::clone(services.event_store());
+        let runtime = crate::ConversationRuntime::new(
+            Session::new(),
+            InvalidInputThenFinalClient {
+                attempts: Arc::new(AtomicUsize::new(0)),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            },
+            InputContractToolExecutor,
+            PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
+            vec!["answer directly".to_string()],
+        )
+        .without_memory()
+        .with_runtime_event_store(Arc::clone(&store));
+
+        let (_runtime, result) = submit_test_owned_conversation_turn(
+            runtime,
+            Arc::clone(&services),
+            "verify a wholly refused frame is recorded",
+            &SharedPrompter::none(),
+            test_execution_lineage(),
+        )
+        .await;
+        result.expect("the bounded recovery must still complete");
+
+        let recorded = store
+            .all_events(512)
+            .expect("read the durable event log")
+            .into_iter()
+            .filter(|event| event.kind == "tool.call.rejected_before_dispatch")
+            .map(|event| event.payload)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the one refused call must be recorded exactly once: {recorded:?}"
+        );
+        let payload = &recorded[0];
+        assert_eq!(payload["tool_call_id"], "invalid-search");
+        assert_eq!(payload["tool_name"], "tool_search");
+        assert_eq!(payload["failure_kind"], "input_contract_rejected");
+        assert_eq!(payload["dispatched"], false);
+        assert_eq!(payload["side_effect_committed"], false);
+        assert!(
+            payload["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("missing required field `query`")),
+            "{payload}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -1850,6 +1850,75 @@ fn the_container_coercion_still_works_after_the_restructure() {
     );
 }
 
+/// The contract boundary has to repair, not just refuse.
+///
+/// The coercion above lives in the executor, but it used to run only inside
+/// `execute_runtime_tool_with_binding` - downstream of
+/// `validate_tool_input`, which is where Runtime actually decides whether a
+/// frame may run at all. So the one corruption the coercion exists to fix was
+/// refused before the repair could reach it: one live run sent two identical
+/// `agent_action_batch` frames with `actions` as a JSON-encoded string, was
+/// refused twice, spent its single frame-repair budget, and ended with three
+/// Teams, zero Tasks and verdict `partial`. This test drives the boundary the
+/// runtime really calls.
+#[tokio::test]
+async fn the_contract_boundary_repairs_a_string_typed_array_and_hands_back_dispatch_bytes() {
+    let registry = GatewayToolRegistry::builtin()
+        .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
+        .expect("runtime tools");
+    let executor = GatewayToolExecutor::new(None, false, registry);
+    let malformed = serde_json::json!({
+        "actions": serde_json::json!([
+            {"tool": "team_create", "input": {"name": "Delta", "mission": "boundary repair"}}
+        ])
+        .to_string()
+    })
+    .to_string();
+
+    let dispatched = executor
+        .validate_tool_input("agent_action_batch", &malformed)
+        .expect("a JSON-encoded array in an array field is repairable at the boundary");
+    let value: serde_json::Value = serde_json::from_str(&dispatched).expect("dispatched JSON");
+    assert!(
+        value["actions"].is_array(),
+        "the bytes Runtime dispatches must carry the array, not the string: {dispatched}"
+    );
+    assert_eq!(value["actions"][0]["tool"], "team_create");
+}
+
+/// Repair is not a licence to wave a frame through. A string that does not
+/// parse as the declared type is still a contract violation, and the refusal
+/// now says what to send.
+#[tokio::test]
+async fn the_contract_boundary_still_refuses_a_string_that_is_not_the_declared_type() {
+    let registry = GatewayToolRegistry::builtin()
+        .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
+        .expect("runtime tools");
+    let executor = GatewayToolExecutor::new(None, false, registry);
+
+    let error = executor
+        .validate_tool_input("agent_action_batch", r#"{"actions": "[{]"}"#)
+        .expect_err("a string that is not a JSON array must still be refused");
+    let message = error.to_string();
+    assert!(message.contains("$.actions"), "{message}");
+    assert!(message.contains("declared type: array"), "{message}");
+    assert!(message.contains("received: string"), "{message}");
+}
+
+/// A field the schema types as `string` keeps its JSON text untouched: the
+/// repair never rewrites a value the contract already accepts.
+#[tokio::test]
+async fn the_contract_boundary_leaves_a_string_field_alone() {
+    let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
+    let input = r#"{"command": "echo [1,2,3]"}"#;
+
+    let dispatched = executor
+        .validate_tool_input("bash", input)
+        .expect("valid bash input");
+    let value: serde_json::Value = serde_json::from_str(&dispatched).expect("dispatched JSON");
+    assert_eq!(value["command"], "echo [1,2,3]");
+}
+
 /// A logical artifact key that no Program maps must still fail with the store's
 /// own error. The mapping is a fallback for a real reference, not a way to make
 /// an unknown id resolve: laundering "this does not exist" into "read failed"
