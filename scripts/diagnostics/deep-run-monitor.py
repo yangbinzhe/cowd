@@ -508,6 +508,37 @@ class Monitor:
             window = list(reversed(texts))[:8]
             pairs_found.extend(similar_answer_pairs(window))
         inv["similar_answer_pairs"] = pairs_found
+        # 3d. Closure-phase content: is the reviewer's own report re-entering
+        # the delivered set?
+        #
+        # Mon7's livelock was invisible to every count-based signal: rounds
+        # grew, actions grew, the monitor said WORKING - while the model
+        # committed its own review report twelve times for five reviews and
+        # each commit grew the delivered set, invalidating the review it
+        # belonged to. The loop's identity is in the CONTENT: more review-report
+        # commits than reviews means the closure activity is feeding the gate
+        # that is judging it.
+        rows = self.q(
+            "SELECT count(*) FROM runtime_events "
+            "WHERE kind='model.item_completed' AND payload->>'kind'='tool_call' "
+            "AND payload->>'tool_name'='artifact_commit' "
+            "AND payload->>'content' ILIKE '%Review Report%'")
+        review_report_commits = int(rows[0][0]) if rows and rows[0] else 0
+        rows = self.q(
+            "SELECT payload->'envelope'->'action'->>'kind', count(*) FROM runtime_events "
+            "WHERE kind='agentic.action_applied' "
+            "AND payload->'envelope'->'action'->>'kind' IN "
+            "('objective_review','objective_complete_request') GROUP BY 1")
+        closure_counts = {k: int(n) for k, n in rows}
+        rows = self.q(
+            "SELECT count(*) FROM runtime_events WHERE kind='agentic.completion_reopened'")
+        reopens = int(rows[0][0]) if rows and rows[0] else 0
+        inv["closure"] = {
+            "objective_reviews": closure_counts.get("objective_review", 0),
+            "completion_requests": closure_counts.get("objective_complete_request", 0),
+            "reopens": reopens,
+            "review_report_commits": review_report_commits,
+        }
         # 4. Rework reasons verbatim (the acceptance-criteria fingerprint).
         rows = self.q(
             "SELECT substr(payload->'envelope'->'action'->'input'->>'reason',1,220) "
@@ -636,6 +667,28 @@ class Monitor:
                     "pairs above threshold: %s" % inv["similar_answer_pairs"]
                 ],
                 "action": "stop; the model is restating itself",
+            })
+        # The closure loop count-based monitoring cannot see: the reviewer's
+        # own report re-entering the delivered set. More review-report commits
+        # than reviews means the closure activity is feeding the gate judging
+        # it - mon7 ran twelve report commits for five reviews, sixty minutes,
+        # no verdict, while every counter said WORKING.
+        closure = inv.get("closure") or {}
+        reviews = closure.get("objective_reviews", 0)
+        commits = closure.get("review_report_commits", 0)
+        if commits > reviews and reviews >= 2 and snap.get("verdicts", 0) == 0:
+            findings.append({
+                "root_cause": (
+                    "the objective reviewer's own report is re-entering the delivered set"
+                ),
+                "evidence": [
+                    "%d review-report commits for %d objective reviews (%d reopens); each commit "
+                    "grows the delivered set and invalidates the review it belongs to"
+                    % (commits, reviews, closure.get("reopens", 0))
+                ],
+                "action": (
+                    "stop; the delivered-set exclusion is not reaching this reviewer's artifacts"
+                ),
             })
         state = "SPINNING" if findings else "WORKING"
         return {"state": state, "findings": findings}

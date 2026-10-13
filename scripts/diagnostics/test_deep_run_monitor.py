@@ -585,6 +585,65 @@ def _():
     assert result["escalate"] is False, result
 
 
+@case("the reviewer's own report re-entering the delivered set is spinning")
+def _():
+    # Mon7's livelock, compressed: seventeen review-report commits for five
+    # reviews across sixty minutes with no verdict, while every count-based
+    # signal said WORKING. The closure activity was feeding the gate judging
+    # it - each commit grew the delivered set and invalidated its own review.
+    conclusion = Monitor("").conclude(
+        snap(model_steps=514, last_event_age_s=5),
+        inv(closure={
+            "objective_reviews": 5,
+            "completion_requests": 2,
+            "reopens": 2,
+            "review_report_commits": 17,
+        }),
+    )
+    assert conclusion["state"] == "SPINNING", conclusion
+    assert any(
+        "re-entering the delivered set" in f["root_cause"]
+        for f in conclusion["findings"]
+    ), conclusion
+
+
+@case("a healthy closure is not the reviewer's report loop")
+def _():
+    # One review, one report commit: the closure did its job once.
+    conclusion = Monitor("").conclude(
+        snap(model_steps=100, last_event_age_s=5),
+        inv(closure={
+            "objective_reviews": 1,
+            "completion_requests": 1,
+            "reopens": 0,
+            "review_report_commits": 1,
+        }),
+    )
+    assert conclusion["state"] == "WORKING", conclusion
+    # A gap review then a satisfied one, one report each: still healthy.
+    conclusion = Monitor("").conclude(
+        snap(model_steps=100, last_event_age_s=5),
+        inv(closure={
+            "objective_reviews": 2,
+            "completion_requests": 2,
+            "reopens": 1,
+            "review_report_commits": 2,
+        }),
+    )
+    assert conclusion["state"] == "WORKING", conclusion
+    # After the verdict, nothing spins however the closure looked.
+    conclusion = Monitor("").conclude(
+        snap(model_steps=100, verdicts=1, last_event_age_s=5),
+        inv(closure={
+            "objective_reviews": 5,
+            "completion_requests": 2,
+            "reopens": 2,
+            "review_report_commits": 17,
+        }),
+    )
+    assert conclusion["state"] == "TERMINAL", conclusion
+
+
 @case("a terminal conclusion's plain-sentence finding never breaks the fingerprint")
 def _():
     # conclude() reports a satisfied verdict as findings: ["verdict reached"] -
