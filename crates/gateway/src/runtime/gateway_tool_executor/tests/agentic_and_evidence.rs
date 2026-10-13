@@ -1776,7 +1776,11 @@ fn a_pure_one_of_schema_still_coerces_its_variant_fields() {
         "media_type": "text/plain"
     });
     let repaired = executor.coerce_string_typed_structured_fields("artifact_publish", &mut value);
-    assert_eq!(repaired, vec!["block_index".to_string()], "{repaired:?}");
+    assert_eq!(
+        GatewayToolExecutor::coerced_field_names(&repaired),
+        vec!["block_index".to_string()],
+        "{repaired:?}"
+    );
     assert_eq!(
         value["block_index"],
         serde_json::json!(0),
@@ -1843,7 +1847,11 @@ fn the_container_coercion_still_works_after_the_restructure() {
         .to_string()
     });
     let repaired = executor.coerce_string_typed_structured_fields("agent_action_batch", &mut value);
-    assert_eq!(repaired, vec!["actions".to_string()], "{repaired:?}");
+    assert_eq!(
+        GatewayToolExecutor::coerced_field_names(&repaired),
+        vec!["actions".to_string()],
+        "{repaired:?}"
+    );
     assert!(
         value["actions"].is_array(),
         "the JSON-encoded array must be coerced back into an array"
@@ -1917,6 +1925,120 @@ async fn the_contract_boundary_leaves_a_string_field_alone() {
         .expect("valid bash input");
     let value: serde_json::Value = serde_json::from_str(&dispatched).expect("dispatched JSON");
     assert_eq!(value["command"], "echo [1,2,3]");
+}
+
+/// A frame that does not parse as a whole must be salvaged entry by entry.
+///
+/// Three live frames were refused whole with "value has the wrong JSON type".
+/// None of them was a clean cut-off tail: the delimiter-closing repair refused
+/// all three, because the model had dropped closing braces in the middle and
+/// omitted the `tool` field on later entries. The individual entries that were
+/// well formed were still perfectly good JSON, and Runtime threw them away too.
+#[tokio::test]
+async fn a_frame_that_does_not_parse_is_salvaged_entry_by_entry() {
+    let registry = GatewayToolRegistry::builtin()
+        .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
+        .expect("runtime tools");
+    let executor = GatewayToolExecutor::new(None, false, registry);
+    let first = r#"{"tool":"team_create","input":{"name":"Alpha","mission":"first"}}"#;
+    let second = r#"{"tool":"agent_invite","input":{"team_ref":"team:a","mission":"second"}}"#;
+    // The third entry is cut off inside its own object, exactly as the provider
+    // ceiling leaves it.
+    let inner = format!(r#"[{first},{second},{{"tool":"task_publish","input":"#);
+    let cut_off = serde_json::json!({"actions": inner}).to_string();
+
+    let dispatched = executor
+        .validate_tool_input("agent_action_batch", &cut_off)
+        .expect("the valid entries of an unparseable frame must survive");
+    let value: serde_json::Value = serde_json::from_str(&dispatched).expect("dispatched JSON");
+    let actions = value["actions"].as_array().expect("salvaged array");
+    assert_eq!(
+        actions.len(),
+        2,
+        "only the two well-formed entries may survive: {dispatched}"
+    );
+    assert_eq!(actions[0]["tool"], "team_create");
+    assert_eq!(actions[1]["tool"], "agent_invite");
+}
+
+/// The salvage must be reported, not performed silently: the model has to know
+/// an entry was dropped, or it will believe it sent everything it wrote.
+#[tokio::test]
+async fn a_salvaged_frame_reports_how_many_entries_were_dropped() {
+    let registry = GatewayToolRegistry::builtin()
+        .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
+        .expect("runtime tools");
+    let executor = GatewayToolExecutor::new(None, false, registry);
+    let first = r#"{"tool":"team_create","input":{"name":"Alpha","mission":"first"}}"#;
+    let inner = format!(r#"[{first},{{"tool":"task_publish","input":"#);
+    let cut_off = serde_json::json!({"actions": inner}).to_string();
+
+    let coercions = executor.tool_input_coercions("agent_action_batch", &cut_off);
+    assert_eq!(coercions.len(), 1, "{coercions:?}");
+    assert_eq!(coercions[0].field, "actions");
+    assert!(
+        coercions[0].truncated,
+        "a salvaged frame must be reported as repaired: {coercions:?}"
+    );
+    assert_eq!(coercions[0].salvaged_items, 1, "{coercions:?}");
+    assert_eq!(
+        coercions[0].dropped_items, 1,
+        "the entry that did not parse must be counted, not hidden: {coercions:?}"
+    );
+}
+
+/// The shape the live runs actually produced: later entries that omit `tool`
+/// and drop their closing brace. The first entry is well formed and must still
+/// run; the rest must be reported as dropped rather than silently discarded.
+#[tokio::test]
+async fn entries_that_omit_the_tool_field_do_not_discard_the_valid_ones() {
+    let registry = GatewayToolRegistry::builtin()
+        .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
+        .expect("runtime tools");
+    let executor = GatewayToolExecutor::new(None, false, registry);
+    let inner = concat!(
+        r#"[{"tool":"team_create","input":{"name":"Alpha","mission":"first"}}"#,
+        r#", "input": {"mission":"second"},"#,
+        r#" "input": {"mission":"third"}]"#
+    );
+    let frame = serde_json::json!({"actions": inner}).to_string();
+
+    let dispatched = executor
+        .validate_tool_input("agent_action_batch", &frame)
+        .expect("the one well-formed entry must survive");
+    let value: serde_json::Value = serde_json::from_str(&dispatched).expect("dispatched JSON");
+    let actions = value["actions"].as_array().expect("salvaged array");
+    assert_eq!(actions.len(), 1, "{dispatched}");
+    assert_eq!(actions[0]["tool"], "team_create");
+
+    let coercions = executor.tool_input_coercions("agent_action_batch", &frame);
+    assert_eq!(coercions[0].dropped_items, 2, "{coercions:?}");
+}
+
+/// Salvage is not a licence to guess. A string that is neither valid JSON nor a
+/// cut-off container is still a contract violation.
+#[tokio::test]
+async fn a_string_that_is_neither_valid_nor_cut_off_is_still_refused() {
+    let registry = GatewayToolRegistry::builtin()
+        .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
+        .expect("runtime tools");
+    let executor = GatewayToolExecutor::new(None, false, registry);
+
+    let error = executor
+        .validate_tool_input("agent_action_batch", r#"{"actions": "team_create please"}"#)
+        .expect_err("prose is not a cut-off container");
+    assert!(
+        error.to_string().contains("$.actions"),
+        "{error}"
+    );
+    let coercions = executor.tool_input_coercions(
+        "agent_action_batch",
+        r#"{"actions": "team_create please"}"#,
+    );
+    assert!(
+        coercions.is_empty(),
+        "nothing was repaired, so nothing may be reported: {coercions:?}"
+    );
 }
 
 /// A logical artifact key that no Program maps must still fail with the store's

@@ -1177,6 +1177,45 @@
         }
     }
 
+    /// An executor that salvages a cut-off frame the way the production one
+    /// does: it hands back repaired bytes and reports that an entry was
+    /// dropped.
+    struct SalvagingToolExecutor;
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for SalvagingToolExecutor {
+        async fn execute_output(
+            &self,
+            name: &str,
+            _input: &str,
+        ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+            Err(ToolError::new(format!("unexpected tool execution: {name}")))
+        }
+
+        fn available_tool_names(&self) -> Vec<String> {
+            vec!["tool_search".to_string()]
+        }
+
+        fn validate_tool_input(&self, _tool_name: &str, input: &str) -> Result<String, ToolError> {
+            // The repair lane hands back bytes that differ from the frame.
+            Ok(format!(r#"{{"repaired":true,"original":{input}}}"#))
+        }
+
+        fn tool_input_coercions(
+            &self,
+            _tool_name: &str,
+            _input: &str,
+        ) -> Vec<harness_contract::tool::ToolInputCoercion> {
+            vec![harness_contract::tool::ToolInputCoercion {
+                field: "actions".to_string(),
+                truncated: true,
+                salvaged_items: 2,
+                dropped_items: 1,
+                original_len: 940,
+            }]
+        }
+    }
+
     struct TeamTerminalReceiptExecutor;
 
     #[async_trait::async_trait]
@@ -2223,6 +2262,72 @@
         assert!(!transcript.iter().any(|message| message.blocks.iter().any(
             |block| matches!(block, ContentBlock::ToolUse { id, .. } if id == "invalid-search")
         )));
+    }
+
+    /// A salvaged frame must be durable evidence and must be answered in-step.
+    ///
+    /// The salvage itself is the easy half. What makes it safe is that the model
+    /// is told, in the very next request, that an entry was dropped - otherwise
+    /// the boundary has replaced "discard everything" with "discard something
+    /// quietly", which is the same swallowed-work defect wearing a better
+    /// reputation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_salvaged_frame_is_recorded_and_reported_to_the_model() {
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        let store = Arc::clone(services.event_store());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let runtime = crate::ConversationRuntime::new(
+            Session::new(),
+            InvalidInputThenFinalClient {
+                attempts: Arc::new(AtomicUsize::new(0)),
+                requests: Arc::clone(&requests),
+            },
+            SalvagingToolExecutor,
+            PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
+            vec!["answer directly".to_string()],
+        )
+        .without_memory()
+        .with_runtime_event_store(Arc::clone(&store));
+
+        let (_runtime, result) = submit_test_owned_conversation_turn(
+            runtime,
+            Arc::clone(&services),
+            "verify a salvaged frame is reported",
+            &SharedPrompter::none(),
+            test_execution_lineage(),
+        )
+        .await;
+        result.expect("the turn must complete");
+
+        let recorded = store
+            .all_events(512)
+            .expect("read the durable event log")
+            .into_iter()
+            .filter(|event| event.kind == "tool.call.repaired_before_dispatch")
+            .map(|event| event.payload)
+            .collect::<Vec<_>>();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0]["tool_name"], "tool_search");
+        assert_eq!(recorded[0]["field"], "actions");
+        assert_eq!(recorded[0]["salvaged_items"], 2);
+        assert_eq!(recorded[0]["dropped_items"], 1);
+
+        assert!(
+            requests
+                .lock()
+                .expect("captured requests")
+                .iter()
+                .flat_map(|request| request
+                    .prompt
+                    .trusted_system
+                    .iter()
+                    .chain(request.prompt.contextual_packets.iter().map(|p| &p.content))
+                    .cloned()
+                    .collect::<Vec<_>>())
+                .any(|fragment| fragment.contains("were not valid JSON and were")
+                    && fragment.contains("dropped")),
+            "the model must be told an entry was dropped"
+        );
     }
 
     /// A frame Runtime refuses whole must still leave a record of what the

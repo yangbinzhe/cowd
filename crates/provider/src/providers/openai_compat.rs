@@ -2474,7 +2474,20 @@ fn parse_tool_arguments(arguments: &str) -> Value {
 /// closes structures that are still open at end-of-input, respecting strings
 /// and escapes, and never invents keys or values, so a repaired-but-wrong
 /// object is still rejected by the tool's own schema validation.
-fn repair_truncated_json(arguments: &str) -> Option<Value> {
+/// Close the delimiters a cut-off frame left open and re-parse.
+///
+/// A model whose output hits the provider ceiling stops mid-value, which
+/// leaves the JSON unbalanced rather than invalid. Closing what is open and
+/// dropping the incomplete tail recovers the complete prefix instead of
+/// throwing away work the model already finished. Balanced-but-invalid input
+/// is still refused: guessing there would launder a real mistake into a
+/// valid one.
+///
+/// Public because the corruption is not confined to the top level. A frame can
+/// parse cleanly at the top while one of its fields is a quoted string that was
+/// cut off, and the boundary that owns the schema has to be able to salvage
+/// that field too.
+pub fn repair_truncated_json(arguments: &str) -> Option<Value> {
     let trimmed = arguments.trim_start();
     let first = trimmed.chars().next()?;
     if first != '{' && first != '[' {

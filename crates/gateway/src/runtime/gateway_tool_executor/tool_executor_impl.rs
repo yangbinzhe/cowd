@@ -118,6 +118,31 @@ impl ToolExecutor for GatewayToolExecutor {
         .map(|()| serde_json::to_string(&value).unwrap_or_else(|_| input.to_string()))
     }
 
+    fn tool_input_coercions(
+        &self,
+        tool_name: &str,
+        input: &str,
+    ) -> Vec<harness_contract::tool::ToolInputCoercion> {
+        let Ok(canonical_name) = <Self as ToolExecutor>::resolve_tool_name(self, tool_name)
+            .ok_or_else(|| ToolError::new(format!("tool `{tool_name}` is not registered")))
+        else {
+            return Vec::new();
+        };
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(input) else {
+            return Vec::new();
+        };
+        self.coerce_string_typed_structured_fields(&canonical_name, &mut value)
+            .into_iter()
+            .map(|coerced| harness_contract::tool::ToolInputCoercion {
+                field: coerced.field,
+                truncated: coerced.truncated,
+                salvaged_items: coerced.salvaged_items,
+                dropped_items: coerced.dropped_items,
+                original_len: coerced.original_len,
+            })
+            .collect()
+    }
+
     fn has_registered_tools(&self) -> bool {
         !self.available_tool_names().is_empty()
     }

@@ -2633,6 +2633,21 @@ pub trait ToolExecutor: Send + Sync + 'static {
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))
     }
 
+    /// What the schema boundary changed about this exact input.
+    ///
+    /// Called with the bytes the model sent, before any repair, so the answer
+    /// describes the model's frame rather than the repaired one. The default is
+    /// empty: an executor that owns no pinned catalog has nothing to report.
+    /// Production executors override it so a salvaged cut-off frame is reported
+    /// instead of silently repaired.
+    fn tool_input_coercions(
+        &self,
+        _tool_name: &str,
+        _input: &str,
+    ) -> Vec<harness_contract::tool::ToolInputCoercion> {
+        Vec::new()
+    }
+
     /// Production executors override this with a receipt from their pinned
     /// ToolHost. The fallback is deliberately read-only for small embedded and
     /// test executors that do not own a catalog.

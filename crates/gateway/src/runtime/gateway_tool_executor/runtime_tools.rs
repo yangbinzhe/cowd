@@ -14,7 +14,92 @@ async fn reconcile_program_barrier(services: &runtime::RuntimeServices, program_
     }
 }
 
+/// What the schema-boundary coercion did to one field.
+///
+/// `truncated` is the part that matters downstream: it says the model's frame
+/// was cut off by the provider output ceiling and the trailing incomplete items
+/// were dropped. Silently salvaging those would create a new swallowed-work
+/// defect - the model would believe it sent three actions while two ran - so
+/// the boundary has to report it rather than just repair it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CoercedField {
+    pub field: String,
+    pub truncated: bool,
+    pub salvaged_items: usize,
+    /// Items that did not parse and were dropped. Reported so the model can
+    /// re-emit exactly what was lost.
+    pub dropped_items: usize,
+    pub original_len: usize,
+}
+
+/// Keep the elements of a quoted array that parse, and count the rest.
+///
+/// A frame the provider cut off, or a model that dropped a closing brace in the
+/// middle, leaves the array unparseable as a whole while its individual entries
+/// are still perfectly good JSON. Closing the delimiters does not recover
+/// those: `repair_truncated_json` was run against three live frames and refused
+/// all three, because the damage is not at the tail. So the salvage walks the
+/// array at the top level and keeps what parses.
+///
+/// Returns `(items, dropped)`. `None` when the text is not an array body at all.
+fn salvage_array_elements(text: &str) -> Option<(Vec<serde_json::Value>, usize)> {
+    let body = text.trim().strip_prefix('[')?;
+    let mut items = Vec::new();
+    let mut dropped = 0usize;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut start = 0usize;
+    for (index, character) in body.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => in_string = true,
+            '{' | '[' => depth += 1,
+            '}' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                push_salvaged_element(&body[start..index], &mut items, &mut dropped);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    push_salvaged_element(&body[start..], &mut items, &mut dropped);
+    Some((items, dropped))
+}
+
+fn push_salvaged_element(
+    text: &str,
+    items: &mut Vec<serde_json::Value>,
+    dropped: &mut usize,
+) {
+    let candidate = text.trim().trim_end_matches(',').trim();
+    if candidate.is_empty() {
+        return;
+    }
+    match serde_json::from_str::<serde_json::Value>(candidate) {
+        Ok(value) => items.push(value),
+        Err(_) => *dropped += 1,
+    }
+}
+
 impl GatewayToolExecutor {
+    /// What the schema-boundary coercion did to one field.
+    ///
+    /// `truncated` is the part that matters downstream: it says the model's
+    /// frame was cut off by the provider output ceiling and the trailing
+    /// incomplete items were dropped. Silently salvaging those would create a
+    /// new swallowed-work defect - the model would believe it sent three
+    /// actions while two ran - so the boundary has to report it rather than
+    /// just repair it.
     /// Absorb a text-protocol corruption at the schema-aware boundary: a weak
     /// model on the DSML path frequently declares a structured parameter as
     /// `string="true"`, so an array/object field arrives as a JSON-encoded
@@ -28,7 +113,7 @@ impl GatewayToolExecutor {
         &self,
         tool_name: &str,
         value: &mut serde_json::Value,
-    ) -> Vec<String> {
+    ) -> Vec<CoercedField> {
         let Some(object) = value.as_object_mut() else {
             return Vec::new();
         };
@@ -90,8 +175,15 @@ impl GatewayToolExecutor {
                     .map(serde_json::Value::from)
                     .or_else(|| trimmed.parse::<f64>().ok().map(serde_json::Value::from));
                 if let Some(parsed) = parsed {
+                    let original_len = text.chars().count();
                     object.insert(field.clone(), parsed);
-                    repaired.push(field.clone());
+                    repaired.push(CoercedField {
+                        field: field.clone(),
+                        truncated: false,
+                        salvaged_items: 0,
+                        dropped_items: 0,
+                        original_len,
+                    });
                 }
                 continue;
             }
@@ -105,20 +197,55 @@ impl GatewayToolExecutor {
             if trimmed.is_empty() {
                 continue;
             }
-            let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-                continue;
+            // A quoted string that does not parse is usually not a model
+            // mistake at all: the provider cut the frame off mid-value. One
+            // live run wrote three actions, had two of them cut away, and
+            // Runtime threw all three out with "value has the wrong JSON
+            // type" - which told the model nothing it could act on. Salvage
+            // the complete prefix and report that a tail was dropped.
+            let (parsed, truncated, dropped_items) =
+                match serde_json::from_str::<serde_json::Value>(trimmed) {
+                    Ok(parsed) => (parsed, false, 0),
+                    Err(_) => match salvage_array_elements(trimmed) {
+                        Some((items, dropped)) if !items.is_empty() => {
+                            (serde_json::Value::Array(items), true, dropped)
+                        }
+                        // An object field keeps the delimiter-closing repair:
+                        // its damage really is a cut-off tail.
+                        _ => match provider::repair_truncated_json(trimmed) {
+                            Some(salvaged) => (salvaged, true, 0),
+                            None => continue,
+                        },
+                    },
             };
+            let original_len = text.chars().count();
             let shape_matches = matches!(
                 (&parsed, expected),
                 (serde_json::Value::Array(_), Some("array"))
                     | (serde_json::Value::Object(_), Some("object"))
             );
             if shape_matches {
+                let salvaged_items = parsed.as_array().map_or(0, Vec::len);
                 object.insert(field.clone(), parsed);
-                repaired.push(field.clone());
+                repaired.push(CoercedField {
+                    field: field.clone(),
+                    truncated,
+                    salvaged_items,
+                    dropped_items,
+                    original_len,
+                });
             }
         }
         repaired
+    }
+
+    /// The field names a coercion touched, for logs and assertions that only
+    /// care which fields moved.
+    pub(crate) fn coerced_field_names(coerced: &[CoercedField]) -> Vec<String> {
+        coerced
+            .iter()
+            .map(|coerced| coerced.field.clone())
+            .collect()
     }
 
     fn input_contract_error(&self, tool_name: &str, error: impl std::fmt::Display) -> ToolError {
@@ -405,7 +532,15 @@ impl GatewayToolExecutor {
                 .get("tool")
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| {
-                    ToolError::new(format!("agent_action_batch action[{index}] needs a `tool`"))
+                    // Three live frames omitted `tool` on their later entries and
+                    // wrote `"input": {...}, "input": {...}` instead. The refusal
+                    // named the index and nothing else, so the model had to guess
+                    // what the field wanted. The allowed values are already the
+                    // single source of truth the enum owns.
+                    ToolError::new(format!(
+                        "agent_action_batch action[{index}] needs a `tool` naming one of: {}",
+                        harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.join(", ")
+                    ))
                 })?;
             if !is_agent_action_tool(inner_tool) {
                 return Err(ToolError::new(format!(

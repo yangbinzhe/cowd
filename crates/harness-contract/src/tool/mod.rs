@@ -234,6 +234,30 @@ pub struct ToolExecutionAuthorization {
 
 pub type ToolPermissionMode = PermissionMode;
 
+/// What the schema boundary had to change about a model-supplied input.
+///
+/// `truncated` is the field that matters to the model: it says the provider cut
+/// the frame off mid-value, so the complete prefix was applied and the trailing
+/// incomplete items were dropped. Reporting it is not optional. A boundary that
+/// salvages silently invents a new swallowed-work defect, because the model
+/// believes it sent every item it wrote while only some of them ran.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolInputCoercion {
+    pub field: String,
+    pub truncated: bool,
+    /// Top-level items that survived a truncation repair. Zero for scalars and
+    /// objects.
+    #[serde(default)]
+    pub salvaged_items: usize,
+    /// Items that did not parse and were dropped. Non-zero means the model has
+    /// work to re-emit, and the notice must say so.
+    #[serde(default)]
+    pub dropped_items: usize,
+    /// Character length of the quoted string the model actually sent.
+    #[serde(default)]
+    pub original_len: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolDefinition {
     pub name: String,

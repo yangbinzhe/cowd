@@ -130,6 +130,73 @@ const fn provider_admission_timeout_ms(
     }
 }
 
+/// Record a cut-off frame Runtime salvaged, and tell the model what was lost.
+///
+/// The provider output ceiling cuts a tool frame off mid-value, which leaves
+/// the JSON unbalanced rather than invalid. Salvaging the complete prefix is
+/// the right repair - one live run wrote three actions, had the third cut away,
+/// and Runtime discarded all three with "value has the wrong JSON type" - but a
+/// silent salvage is its own defect: the model would believe every item it
+/// wrote ran. So the salvage is durable evidence and it is answered in-step
+/// through the same context channel the protocol-recovery and liveness paths
+/// already use.
+impl<C, T> ConversationRuntime<C, T>
+where
+    C: ApiClient,
+    T: ToolExecutor,
+{
+    fn record_truncated_frame_salvage(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+        coercion: &harness_contract::tool::ToolInputCoercion,
+    ) {
+        self.append_execution_runtime_event(
+            crate::RuntimeEventScope::Tool,
+            "tool.call.repaired_before_dispatch",
+            Some("repaired".to_string()),
+            vec![
+                crate::RuntimeEventRef {
+                    kind: "tool_call".to_string(),
+                    id: tool_call_id.to_string(),
+                },
+                crate::RuntimeEventRef {
+                    kind: "tool".to_string(),
+                    id: tool_name.to_string(),
+                },
+            ],
+            serde_json::json!({
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "field": coercion.field,
+                "original_len": coercion.original_len,
+                "salvaged_items": coercion.salvaged_items,
+                "dropped_items": coercion.dropped_items,
+                "truncated": true,
+            }),
+        );
+        let mut item = crate::ContextItem::new(
+            format!("runtime-truncated-frame:{tool_call_id}"),
+            crate::ContextSourceKind::Task,
+            crate::ContextRole::Instruction,
+            format!(
+                "Runtime notice: your previous `{tool_name}` frame did not parse as a whole, so \
+                 Runtime salvaged it entry by entry instead of discarding your work. {} item(s) \
+                 of `{}` were valid and were applied; {} item(s) were not valid JSON and were \
+                 dropped. Re-emit ONLY the dropped entries, each as {{\"tool\": \"<action>\", \
+                 \"input\": {{...}}}} with every brace closed, and keep each field short - a few \
+                 sentences per mission - so the whole frame parses. Do not repeat the entries \
+                 that already ran.",
+                coercion.salvaged_items, coercion.field, coercion.dropped_items
+            ),
+        );
+        item.authority = crate::ContextAuthority::System;
+        item.visibility = crate::ContextVisibility::Private;
+        item.evidence = vec![format!("tool_call:{tool_call_id}")];
+        self.push_next_model_context_item(item);
+    }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct TurnProviderState {
     pub(super) tool_exposure: TurnToolExposureMetrics,
@@ -1919,11 +1986,25 @@ where
                     self.tool_executor.validate_tool_input(&call.name, &call.input)
                 {
                     if repaired != call.input {
+                        // A repair that only closes a cut-off frame is not the
+                        // same as one that fixes a quoting mistake: items were
+                        // dropped. Record it and tell the model in-step, or the
+                        // salvage becomes the swallowed work it was meant to
+                        // prevent.
+                        let salvaged = self
+                            .tool_executor
+                            .tool_input_coercions(&call.name, &call.input)
+                            .into_iter()
+                            .filter(|coercion| coercion.truncated)
+                            .collect::<Vec<_>>();
                         tracing::info!(
                             tool_name = %call.name,
                             tool_call_id = %call.id,
                             "repaired the model's tool input shape at the schema boundary"
                         );
+                        for coercion in &salvaged {
+                            self.record_truncated_frame_salvage(&call.id, &call.name, coercion);
+                        }
                         call.input = repaired;
                     }
                 }

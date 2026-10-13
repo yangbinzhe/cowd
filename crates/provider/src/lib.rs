@@ -29,6 +29,7 @@ pub use model_protocol::provider_catalog::{
 };
 pub use providers::anthropic::{AnthropicClient, AnthropicClient as ApiClient, AuthSource};
 pub use providers::openai_compat::{OpenAiCompatClient, OpenAiCompatConfig, OpenAiWireProtocol};
+pub use providers::openai_compat::repair_truncated_json;
 pub use providers::{
     detect_provider_kind, max_tokens_for_model, max_tokens_for_model_with_override,
     model_context_window, model_context_window_resolution, model_context_window_with_overrides,

@@ -918,6 +918,11 @@ fn is_execution_activity(kind: &str) -> bool {
             // the observer, which is how a run could report tool activity
             // while the model's last three calls had gone nowhere.
             | "tool.call.rejected_before_dispatch"
+            // The mirror image: Runtime changed the model's input because the
+            // provider cut the frame off, so items were dropped. Counting only
+            // the refusals would hide every salvage, which is exactly the
+            // swallowed work the salvage exists to prevent.
+            | "tool.call.repaired_before_dispatch"
             | "tool.execution_plan.created"
             | "tool.schedule.created"
     )
