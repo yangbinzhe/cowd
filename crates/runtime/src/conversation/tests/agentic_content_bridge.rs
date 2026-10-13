@@ -566,3 +566,150 @@ async fn the_earlier_body_fallback_never_crosses_a_task_fence() {
         "a body written for one Task must never be recovered for another"
     );
 }
+
+/// A delivered Task nobody is reviewing must be named, not inferred.
+///
+/// The root used to see these as ordinary `Submitted` rows, identical to one a
+/// reviewer was already working. It therefore waited, polled, and gave up with
+/// the work delivered and unverified - which is exactly how the run with two
+/// `Submitted` Tasks and zero review dispatches ended.
+#[tokio::test]
+async fn a_submitted_task_with_no_reviewer_is_named_with_its_action() {
+    let services = crate::RuntimeServices::in_memory().unwrap();
+    let mut program = crate::AgenticProgramProjection::empty("awaiting-review", "original-goal");
+    program.session_id = "awaiting-review-session".into();
+    let base = crate::AgenticTaskProjection {
+        task_id: "task:delivered".to_string(),
+        team_id: "team:a".to_string(),
+        title: "delivered work".to_string(),
+        objective: "objective".to_string(),
+        acceptance: "accepted evidence".to_string(),
+        acceptance_checks: Vec::new(),
+        criterion_source: Default::default(),
+        required_capabilities: Vec::new(),
+        depends_on: Vec::new(),
+        status: crate::AgenticTaskStatus::Submitted,
+        claimant: Some("agent:author".to_string()),
+        claim_generation: 1,
+        claim_execution_id: None,
+        claimed_at_ms: None,
+        lease_expires_at_ms: None,
+        claim_renewal_streak: 0,
+        active_attempts: Default::default(),
+        artifact_refs: vec!["artifact:delivered".to_string()],
+        evidence_refs: vec!["tool://receipt".to_string()],
+        unresolved: Vec::new(),
+        review_reason: None,
+        reviewed_by: None,
+        failed_attempts: 0,
+        review_generation: 0,
+        failed_review_attempts: 0,
+        last_failure: None,
+        replacement_task_refs: Vec::new(),
+        supersede_evidence_refs: Vec::new(),
+        superseded_reason: None,
+        superseded_by: None,
+        obligation_refs: Vec::new(),
+        purpose: Default::default(),
+        execution_requirements: Vec::new(),
+        expertise_hints: Vec::new(),
+        cancel_requested_by: None,
+        cancel_reason_ref: None,
+        cancel_evidence_refs: Vec::new(),
+        pending_retirement: None,
+    };
+    // A Task a reviewer already holds is not waiting work.
+    let mut under_review = base.clone();
+    program.tasks.insert(base.task_id.clone(), base);
+    under_review.task_id = "task:under-review".to_string();
+    under_review.active_attempts.insert(
+        "attempt:review".to_string(),
+        crate::agentic::AgenticTaskAttemptProjection {
+            execution_id: "run:review".to_string(),
+            agent_id: "agent:reviewer".to_string(),
+            membership_id: "membership:1".to_string(),
+            mode: harness_contract::agent_action::AgentAttemptMode::Review,
+            generation: 0,
+        },
+    );
+    program.tasks.insert(under_review.task_id.clone(), under_review);
+
+    let checkpoint: serde_json::Value =
+        serde_json::from_str(&super::compact_agentic_program_checkpoint(Some(&services), &program))
+            .unwrap();
+    let awaiting = checkpoint["awaiting_independent_review"].as_array().unwrap();
+    assert_eq!(awaiting.len(), 1, "{awaiting:?}");
+    assert_eq!(awaiting[0]["task_ref"], "task:delivered");
+    assert_eq!(awaiting[0]["claimant"], "agent:author");
+    let action = &checkpoint["awaiting_review_action"]["instruction"];
+    let action = action.as_str().expect("an action must be named");
+    assert!(action.contains("task:delivered") || action.contains("awaiting_independent_review"), "{action}");
+    assert!(action.contains("agent_invite"), "{action}");
+    assert!(action.contains("different Agent"), "{action}");
+}
+
+/// Nothing waiting means no nagging: a checkpoint that always carries the action
+/// would train the root to ignore it.
+#[tokio::test]
+async fn a_program_with_every_task_under_review_carries_no_action() {
+    let services = crate::RuntimeServices::in_memory().unwrap();
+    let mut program = crate::AgenticProgramProjection::empty("all-reviewed", "original-goal");
+    program.session_id = "all-reviewed-session".into();
+    let mut task = crate::AgenticTaskProjection {
+        task_id: "task:1".to_string(),
+        team_id: "team:a".to_string(),
+        title: "under review".to_string(),
+        objective: "objective".to_string(),
+        acceptance: "accepted evidence".to_string(),
+        acceptance_checks: Vec::new(),
+        criterion_source: Default::default(),
+        required_capabilities: Vec::new(),
+        depends_on: Vec::new(),
+        status: crate::AgenticTaskStatus::Submitted,
+        claimant: Some("agent:author".to_string()),
+        claim_generation: 1,
+        claim_execution_id: None,
+        claimed_at_ms: None,
+        lease_expires_at_ms: None,
+        claim_renewal_streak: 0,
+        active_attempts: Default::default(),
+        artifact_refs: vec!["artifact:1".to_string()],
+        evidence_refs: vec![],
+        unresolved: Vec::new(),
+        review_reason: None,
+        reviewed_by: None,
+        failed_attempts: 0,
+        review_generation: 0,
+        failed_review_attempts: 0,
+        last_failure: None,
+        replacement_task_refs: Vec::new(),
+        supersede_evidence_refs: Vec::new(),
+        superseded_reason: None,
+        superseded_by: None,
+        obligation_refs: Vec::new(),
+        purpose: Default::default(),
+        execution_requirements: Vec::new(),
+        expertise_hints: Vec::new(),
+        cancel_requested_by: None,
+        cancel_reason_ref: None,
+        cancel_evidence_refs: Vec::new(),
+        pending_retirement: None,
+    };
+    task.active_attempts.insert(
+        "attempt:review".to_string(),
+        crate::agentic::AgenticTaskAttemptProjection {
+            execution_id: "run:review".to_string(),
+            agent_id: "agent:reviewer".to_string(),
+            membership_id: "membership:1".to_string(),
+            mode: harness_contract::agent_action::AgentAttemptMode::Review,
+            generation: 0,
+        },
+    );
+    program.tasks.insert(task.task_id.clone(), task);
+
+    let checkpoint: serde_json::Value =
+        serde_json::from_str(&super::compact_agentic_program_checkpoint(Some(&services), &program))
+            .unwrap();
+    assert!(checkpoint["awaiting_independent_review"].as_array().unwrap().is_empty());
+    assert!(checkpoint["awaiting_review_action"].is_null());
+}

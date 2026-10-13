@@ -2997,6 +2997,32 @@ fn compact_agentic_program_checkpoint(
             "read_request":{"name":"state_inspect","input":{"entry_ref":task.task_id}}
         })
     }).collect::<Vec<_>>();
+    // Tasks whose author submitted but which no independent reviewer has picked
+    // up. The root used to see these as ordinary `Submitted` rows and had no way
+    // to tell "a reviewer is on it" from "nobody was ever asked" - so it waited,
+    // polled, and eventually gave up with the work delivered and unverified. The
+    // root is the only party that can act on it: it can invite another Agent, or
+    // create another Team, to review.
+    let awaiting_review = program
+        .tasks
+        .values()
+        .filter(|task| {
+            task.status == crate::AgenticTaskStatus::Submitted
+                && !task.active_attempts.values().any(|attempt| {
+                    attempt.mode == harness_contract::agent_action::AgentAttemptMode::Review
+                })
+        })
+        .map(|task| {
+            serde_json::json!({
+                "task_ref": task.task_id,
+                "team_ref": task.team_id,
+                "claimant": task.claimant,
+                "artifact_refs": task.artifact_refs,
+                "read_request":{"name":"state_inspect","input":{"entry_ref":task.task_id}}
+            })
+        })
+        .collect::<Vec<_>>();
+    let has_awaiting_review = !awaiting_review.is_empty();
     let artifacts = visible_artifacts.into_iter().take(METADATA_WINDOW)
         .map(|artifact| {
             let content = services.filter(|_| Some(artifact.artifact_ref.as_str()) == preview_ref).and_then(|services| {
@@ -3055,6 +3081,22 @@ fn compact_agentic_program_checkpoint(
         "teams": teams,
         "agents": agents,
         "tasks": tasks,
+        // Non-empty means work is delivered but unverified and nobody is
+        // verifying it. Name it, and name the action, rather than leaving the
+        // root to infer it from a row that looks the same as an in-flight one.
+        "awaiting_independent_review": awaiting_review,
+        "awaiting_review_action": if has_awaiting_review {
+            serde_json::json!({
+                "instruction": "Each task_ref in `awaiting_independent_review` has a submitted \
+                                 artifact and no reviewer. Dispatch an independent reviewer for it \
+                                 now: the reviewer must be a different Agent from the claimant, in a \
+                                 different Team when one exists. Use `agent_invite` to add one, then \
+                                 `task_claim` in review mode. Do not wait, do not poll, and do not \
+                                 conclude while delivered work is unverified."
+            })
+        } else {
+            serde_json::Value::Null
+        },
         "artifacts": artifacts,
         "continuation": program.continuation,
         "issues":issues.iter().take(METADATA_WINDOW).map(|issue| serde_json::json!({

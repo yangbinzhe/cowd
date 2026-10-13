@@ -31,7 +31,8 @@ pub(crate) use ingress::agentic_program_completion_gap;
 pub use program::{
     AgentMemberProjection, AgenticArtifactProjection, AgenticCompletionRequestProjection,
     AgenticMembershipLifecycle, AgenticMembershipProjection, AgenticObjectiveVerdictProjection,
-    AgenticProgramProjection, AgenticProgramStatus, AgenticTaskProjection, AgenticTaskRetirement,
+    AgenticProgramProjection, AgenticProgramStatus, AgenticTaskAttemptProjection,
+    AgenticTaskProjection, AgenticTaskRetirement,
     AgenticTaskStatus, AgenticTeamLifecycle, AgenticTeamProjection, AgenticTopicEntryProjection,
 };
 pub(crate) use read_model::AgenticReadModel;
