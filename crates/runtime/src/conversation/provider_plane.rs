@@ -2197,6 +2197,38 @@ where
                     let Some(reason) = invalid_arguments.get(&rejected.id) else {
                         continue;
                     };
+                    // Answer the model in-step, the way codex's `RespondToModel`
+                    // branch does: the refusal becomes a tool result the model
+                    // reads on its next step, carrying the exact shape to send.
+                    //
+                    // This branch used to record the decline and return an `Err`
+                    // that named nothing the model could act on, so a model whose
+                    // frame was refused could not tell that its call had not run:
+                    // one live run sent the same malformed `agent_action_batch`
+                    // twice, was refused twice, and concluded "the tool call
+                     // format violated the schema" - having never been told, in
+                    // its own transcript, that nothing had executed.
+                    let message = ConversationMessage::tool_result(
+                        rejected.id.clone(),
+                        rejected.name.clone(),
+                        format!(
+                            "Runtime did not execute this call: {reason}. \
+                             Nothing from it ran and no state changed. \
+                             Send the same intended action again in the exact shape above."
+                        ),
+                        true,
+                    );
+                    self.session
+                        .write()
+                        .await
+                        .push_message(message.clone())
+                        .map_err(|error| {
+                            RuntimeError::new(error.to_string())
+                                .with_effect_receipts(early_tool_receipts.clone())
+                        })?;
+                    let sequence = self.session_head().await.message_count.wrapping_sub(1);
+                    self.record_message_event(&message, sequence);
+                    self.remember_tool_trace_from_message(&message);
                     let invocation_id = format!(
                         "tool-inv-{}",
                         crate::tool_invocation::stable_hash(&format!(

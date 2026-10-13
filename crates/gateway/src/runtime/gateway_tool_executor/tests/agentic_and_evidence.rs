@@ -2147,3 +2147,77 @@ async fn a_valid_artifact_selector_still_resolves() {
     assert_eq!(value["available"], true);
     assert!(value["bytes"].as_u64().unwrap() > 0, "{value}");
 }
+
+/// Every structured-input tool must advertise an example that passes its own
+/// schema.
+///
+/// The example exists so a model can copy a correct shape instead of
+/// synthesizing one. An example that fails the tool's own `validate_input` is
+/// worse than no example - the model copies it and is refused, which is the
+/// exact loop this was built to end. Checking for the literal string
+/// `Example input:` would only catch a missing injection, not a drifted one.
+#[tokio::test]
+async fn every_structured_input_tool_advertises_an_example_that_validates() {
+    let registry = GatewayToolRegistry::builtin()
+        .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
+        .expect("runtime tools");
+    let executor = GatewayToolExecutor::new(None, false, registry);
+    let mut checked = 0_usize;
+    let mut skipped = 0_usize;
+    for definition in crate::runtime_bootstrap::runtime_capability_tool_definitions() {
+        let Some(example) = harness_contract::tool_input_contract::input_example(
+            &definition.input_schema,
+        ) else {
+            // Nothing to fill in: an example of `{}` would be noise.
+            skipped += 1;
+            continue;
+        };
+        let rendered = serde_json::to_string(&example).expect("example renders");
+        executor
+            .validate_tool_input(&definition.name, &rendered)
+            .unwrap_or_else(|error| panic!("example for `{}` fails its own schema: {error}\n{rendered}", definition.name));
+        let description = definition.description.unwrap_or_default();
+        assert!(
+            description.contains("Example input:"),
+            "`{}` has an example but its description does not carry it",
+            definition.name
+        );
+        assert!(
+            description.contains(&rendered),
+            "`{}` description carries a different example than the schema derives",
+            definition.name
+        );
+        checked += 1;
+    }
+    assert!(
+        checked > 20,
+        "expected the runtime tool surface to be covered, checked {checked}"
+    );
+    assert!(skipped > 0, "some tools legitimately have nothing to fill in");
+}
+
+/// The case this whole patch exists for: the batch entry wrapper.
+#[tokio::test]
+async fn the_batch_tool_advertises_the_entry_wrapper() {
+    let definition = crate::runtime_bootstrap::runtime_capability_tool_definitions()
+        .into_iter()
+        .find(|definition| definition.name == "agent_action_batch")
+        .expect("agent_action_batch is registered");
+    let description = definition.description.unwrap_or_default();
+    assert!(description.contains("Example input:"), "{description}");
+    let rendered = description
+        .split("Example input:")
+        .nth(1)
+        .expect("the example marker")
+        .trim();
+    let example: serde_json::Value = serde_json::from_str(rendered).expect("example parses");
+    let entry = example["actions"]
+        .as_array()
+        .expect("actions array")
+        .first()
+        .expect("one entry")
+        .as_object()
+        .expect("entry object");
+    assert!(entry.contains_key("tool"), "the wrapper must be shown: {rendered}");
+    assert!(entry.contains_key("input"), "the payload must be shown: {rendered}");
+}

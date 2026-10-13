@@ -32,6 +32,172 @@ const DESCRIPTION_MAX_CHARS: usize = 200;
 const REF_HINT: &str = "canonical Runtime ref; the receipt that returned the object \
                          carries the exact value; verify one with `read_ref`";
 
+/// Longest example rendered for one tool. Past this an example stops being
+/// something a model copies and becomes something it skims.
+const EXAMPLE_MAX_CHARS: usize = 600;
+
+/// Beyond this many `oneOf` variants only the first is examplified and the rest
+/// are pointed at the contract lines: seven examples is seven that nobody reads.
+const MAX_EXAMPLIFIED_VARIANTS: usize = 4;
+
+/// A value a model recognizes as a placeholder to replace, never as content to
+/// repeat.
+fn placeholder(field: &str) -> Value {
+    Value::String(format!("<{field}>"))
+}
+
+/// Minimal instance a model can copy, derived only from `schema`.
+///
+/// The contract lines say what a tool accepts. They do not say what a correct
+/// call *looks like*, and a model that has to synthesize one from a field list
+/// eventually drops the wrapper while keeping the content: one live run emitted
+/// `{"actions": "[{\"input\": {...}}]"}` four times - every mission and
+/// acceptance was present, the `{tool, input}` envelope never was - and being
+/// told "each entry must be {tool, input}" did not fix it.
+///
+/// Both codex and opencode solve this the same way for their patch tools: a
+/// complete literal example in the contract. This generates one from the schema
+/// so it cannot drift from the contract it illustrates.
+///
+/// Nothing here guesses meaning. Every value is a recognizable placeholder, an
+/// enum's first legal value, or an empty container of the declared type - so the
+/// example is always shape-correct and field-complete, and never mistaken for
+/// content.
+#[must_use]
+pub fn input_example(schema: &Value) -> Option<Value> {
+    let defs = schema.get("$defs").and_then(Value::as_object);
+    let mut rendered = 0_usize;
+    let example = example_for(schema, defs, 0, &mut rendered, "value");
+    // A schema that declares nothing to fill in has nothing to exemplify; an
+    // example of `{}` is noise.
+    let is_empty = example.as_object().is_some_and(Map::is_empty);
+    (!is_empty).then_some(example)
+}
+
+fn example_for(
+    schema: &Value,
+    defs: Option<&Map<String, Value>>,
+    depth: usize,
+    rendered: &mut usize,
+    field_name: &str,
+) -> Value {
+    if depth > MAX_REF_DEPTH || *rendered > EXAMPLE_MAX_CHARS {
+        return Value::Null;
+    }
+    // The module's existing resolver, reused rather than reimplemented: a second
+    // `$ref` walker is a second thing that can drift.
+    let schema = follow_ref(schema, defs);
+    if let Some(one) = schema.get("const") {
+        return one.clone();
+    }
+    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+        // The first legal value is the one a model can copy without choosing.
+        return values.first().cloned().unwrap_or(Value::Null);
+    }
+    // A tagged enum is the case this function exists for: the model's difficulty
+    // is picking the variant, so each variant gets its own example.
+    for keyword in ["oneOf", "anyOf"] {
+        let Some(variants) = schema.get(keyword).and_then(Value::as_array) else {
+            continue;
+        };
+        // ONE valid instance, never a list of them. An array of examples is not
+        // itself a legal input, and a model that copies it is refused for a shape
+        // the framework handed it - which is the exact loop this ends. The other
+        // variants are already named by `input_contract_summary`, which lists
+        // every variant's required fields; the example's job is to show one shape
+        // that validates, not to enumerate the choice.
+        for variant in variants.iter().take(MAX_EXAMPLIFIED_VARIANTS) {
+            let resolved = follow_ref(variant, defs);
+            let example = example_for(resolved, defs, depth + 1, rendered, field_name);
+            if !example.is_null() {
+                return example;
+            }
+        }
+    }
+    // `Option<T>` is emitted as `"type": ["string", "null"]`, not as a bare
+    // string. Reading only the string form sent every optional field down the
+    // object branch, which produced `{}` - an example that fails its own schema.
+    // Take the first non-null member, the same reading `validate_schema_value`
+    // uses.
+    let declared_type = match schema.get("type") {
+        Some(Value::String(one)) => Some(one.clone()),
+        Some(Value::Array(choices)) => choices
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|choice| *choice != "null")
+            .map(str::to_string),
+        _ => None,
+    };
+    match declared_type.as_deref() {
+        Some("string") => {
+            let example = placeholder(field_name);
+            *rendered += example.as_str().map_or(0, str::len);
+            example
+        }
+        Some("integer") | Some("number") => Value::from(0),
+        Some("boolean") => Value::Bool(true),
+        Some("array") => match schema.get("items") {
+            // One element shows the element's shape; an empty array shows none.
+            Some(items) => {
+                let item = example_for(items, defs, depth + 1, rendered, field_name);
+                if item.is_null() {
+                    Value::Array(Vec::new())
+                } else {
+                    Value::Array(vec![item])
+                }
+            }
+            None => Value::Array(Vec::new()),
+        },
+        _ => object_example(schema, defs, depth, rendered),
+    }
+}
+
+fn object_example(
+    schema: &Value,
+    defs: Option<&Map<String, Value>>,
+    depth: usize,
+    rendered: &mut usize,
+) -> Value {
+    let properties = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if properties.is_empty() {
+        return Value::Object(Map::new());
+    }
+    let required = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    // A tool with nothing mandatory has nothing an example must show. Filling in
+    // every optional field instead would teach a model to send what it may omit -
+    // `state_inspect` would be exemplified with all six of its optional filters,
+    // when the common correct call is `{}`.
+    if required.is_empty() {
+        return Value::Object(Map::new());
+    }
+    let mut example = Map::new();
+    for (field, field_schema) in &properties {
+        // Required fields are the ones whose absence is a refusal. An optional
+        // field in the example would teach a model to send what it may omit -
+        // unless it is the discriminator: a tagged enum's `source`/`kind` is
+        // pinned to one constant and is semantically mandatory even when the
+        // `required` list omits it, and an example without it shows the model a
+        // variant it cannot actually send.
+        let is_discriminator = field_schema.get("const").is_some();
+        if !required.iter().any(|name| name == field) && !is_discriminator {
+            continue;
+        }
+        let value = example_for(field_schema, defs, depth + 1, rendered, field);
+        if !value.is_null() {
+            example.insert(field.clone(), value);
+        }
+    }
+    Value::Object(example)
+}
+
 /// Compact statement of what one tool accepts, derived only from `schema`.
 ///
 /// Returns `None` when the schema declares nothing a model has to be told, so a
@@ -553,4 +719,176 @@ mod tests {
         assert!(input_contract_summary(&json!({"type": "object"})).is_none());
         assert!(input_contract_summary(&json!({"type": "string"})).is_none());
     }
+
+    /// The example exists so a model can copy it, so it has to be a valid
+    /// instance of the very schema it illustrates. An example that fails its own
+    /// schema is worse than no example: the model copies it and is refused.
+    #[test]
+    fn the_example_is_a_valid_instance_of_its_own_schema() {
+        let cases = [
+            // Every JSON scalar type.
+            json!({"type":"object","properties":{"s":{"type":"string"},"i":{"type":"integer"},"b":{"type":"boolean"}},"required":["s","i","b"]}),
+            // An enum takes its first legal value.
+            json!({"type":"object","properties":{"source":{"type":"string","enum":["file","message_block"]}},"required":["source"]}),
+            // An array shows one element, not none.
+            json!({"type":"object","properties":{"tags":{"type":"array","items":{"type":"string"}}},"required":["tags"]}),
+            // A nested object is filled in too, or the wrapper is still missing.
+            json!({"type":"object","properties":{"input":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},"required":["input"]}),
+        ];
+        for schema in cases {
+            let example = input_example(&schema).expect("an example");
+            let errors = minimal_schema_errors(&schema, &example, "$");
+            assert_eq!(errors, Vec::<String>::new(), "example {example} vs schema {schema}");
+        }
+    }
+
+    /// The invariants that make an example copyable: required fields present,
+    /// declared types honored, enum values legal. The authoritative check - the
+    /// same `validate_input` Runtime uses - lives with the gateway's tools, where
+    /// every real tool schema is exercised; this one keeps the unit local.
+    fn minimal_schema_errors(schema: &Value, value: &Value, path: &str) -> Vec<String> {
+        let mut errors = Vec::new();
+        if let Some(expected) = schema.get("type") {
+            let choices: Vec<&str> = match expected {
+                Value::String(one) => vec![one.as_str()],
+                Value::Array(many) => many.iter().filter_map(Value::as_str).collect(),
+                _ => Vec::new(),
+            };
+            if !choices.is_empty() {
+                let ok = choices.iter().any(|choice| match *choice {
+                    "string" => value.is_string(),
+                    "integer" => value.as_i64().is_some(),
+                    "number" => value.as_f64().is_some(),
+                    "boolean" => value.is_boolean(),
+                    "array" => value.is_array(),
+                    "object" => value.is_object(),
+                    "null" => value.is_null(),
+                    _ => true,
+                });
+                if !ok {
+                    errors.push(format!("{path}: expected one of {choices:?}"));
+                }
+            }
+        }
+        if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+            if !values.contains(value) {
+                errors.push(format!("{path}: not an allowed value"));
+            }
+        }
+        if let (Some(object), Some(required)) = (
+            value.as_object(),
+            schema.get("required").and_then(Value::as_array),
+        ) {
+            for field in required.iter().filter_map(Value::as_str) {
+                if !object.contains_key(field) {
+                    errors.push(format!("{path}: missing required `{field}`"));
+                }
+            }
+        }
+        if let (Some(object), Some(properties)) = (
+            value.as_object(),
+            schema.get("properties").and_then(Value::as_object),
+        ) {
+            for (field, field_value) in object {
+                if let Some(field_schema) = properties.get(field) {
+                    errors.extend(minimal_schema_errors(
+                        field_schema,
+                        field_value,
+                        &format!("{path}.{field}"),
+                    ));
+                }
+            }
+        }
+        if let (Some(array), Some(items)) = (
+            value.as_array(),
+            schema.get("items"),
+        ) {
+            for (index, item) in array.iter().enumerate() {
+                errors.extend(minimal_schema_errors(items, item, &format!("{path}[{index}]")));
+            }
+        }
+        errors
+    }
+
+    /// The case that matters most: the entry wrapper a model keeps dropping.
+    #[test]
+    fn the_batch_entry_wrapper_is_exemplified() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "actions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "tool": {"type": "string"},
+                            "input": {"type": "object"}
+                        },
+                        "required": ["tool", "input"]
+                    }
+                }
+            },
+            "required": ["actions"]
+        });
+        let example = input_example(&schema).expect("an example");
+        let actions = example["actions"].as_array().expect("actions array");
+        assert_eq!(actions.len(), 1);
+        assert!(actions[0].get("tool").is_some(), "the wrapper must be shown: {example}");
+        assert!(actions[0].get("input").is_some(), "the payload must be shown: {example}");
+    }
+
+    /// An optional field must not appear: an example that shows one teaches a
+    /// model to send what it is allowed to omit.
+    #[test]
+    fn only_required_fields_are_exemplified() {
+        let schema = json!({
+            "type":"object",
+            "properties":{"need":{"type":"string"},"optional":{"type":"string"}},
+            "required":["need"]
+        });
+        let example = input_example(&schema).expect("an example");
+        assert!(example.get("need").is_some(), "{example}");
+        assert!(example.get("optional").is_none(), "{example}");
+    }
+
+    /// A tagged enum is examplified with ONE valid instance, never a list.
+    ///
+    /// An array of examples is not itself a legal input, so a model that copies
+    /// it is refused for a shape the framework handed it. The example's job is to
+    /// show one shape that validates; `input_contract_summary` already names
+    /// every variant's required fields, so the choice is not lost.
+    #[test]
+    fn a_tagged_enum_is_exemplified_with_one_valid_instance() {
+        let schema = json!({
+            "oneOf": [
+                {"type":"object","properties":{"source":{"const":"file"},"path":{"type":"string"}},"required":["path"]},
+                {"type":"object","properties":{"source":{"const":"message_block"},"block_index":{"type":"integer"}},"required":["block_index"]}
+            ]
+        });
+        let example = input_example(&schema).expect("an example");
+        assert!(example.is_object(), "one instance, not a list of them: {example}");
+        assert_eq!(example["source"], "file");
+        assert_eq!(example["path"], "<path>");
+        // The instance validates against the schema that produced it.
+        let errors = minimal_schema_errors(&schema, &example, "$");
+        assert_eq!(errors, Vec::<String>::new(), "{errors:?}");
+    }
+
+    /// A schema with nothing to fill in has nothing to exemplify: an example of
+    /// `{}` is noise a model learns to skip.
+    #[test]
+    fn a_schema_with_nothing_to_fill_in_has_no_example() {
+        assert!(input_example(&json!({"type":"object"})).is_none());
+        assert!(input_example(&json!({"type":"object","properties":{},"required":[]})).is_none());
+    }
+
+    /// Placeholders must be recognizable as placeholders, so a model replaces
+    /// them instead of repeating them as content.
+    #[test]
+    fn placeholders_are_recognizable() {
+        let schema = json!({"type":"object","properties":{"team_ref":{"type":"string"}},"required":["team_ref"]});
+        let example = input_example(&schema).expect("an example");
+        assert_eq!(example["team_ref"], "<team_ref>");
+    }
+
 }

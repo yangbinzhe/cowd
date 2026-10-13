@@ -316,10 +316,28 @@ impl GatewayToolExecutor {
             .into_iter()
             .find(|descriptor| descriptor.canonical_id == tool_name)
             .map(|descriptor| descriptor.schema_hash);
+        // A refusal that names the defect but shows no correct shape leaves the
+        // model to synthesize one, which is the thing it cannot reliably do:
+        // one live run was told "each entry must be {tool, input}" and sent the
+        // same malformed frame again. codex and opencode both put a complete
+        // literal example in the contract; this puts the same example in the
+        // refusal, so the repair attempt has something to copy.
+        let message = match definition
+            .as_ref()
+            .and_then(|definition| {
+                harness_contract::tool_input_contract::input_example(&definition.input_schema)
+            }) {
+            Some(example) => format!(
+                "{error}. Send it shaped like this: {}",
+                serde_json::to_string(&example).unwrap_or_else(|_| example.to_string()
+                )
+            ),
+            None => error.to_string(),
+        };
         ToolError::from_failure(
             harness_contract::tool::ToolExecutionFailure::input_contract(
                 tool_name,
-                error.to_string(),
+                message,
                 schema_hash,
                 allowed_fields,
             ),
