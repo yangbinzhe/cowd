@@ -881,10 +881,24 @@ async fn wait_disposition(
             // replan, withdraw, or retire it.
             return if crate::agentic::execution::dispatch::stranded_task_refs(projection).is_empty()
             {
-                Ok(WaitDisposition::Wait {
-                    revision: projection.revision,
-                    active_graphs,
-                })
+                // A Submitted task with no active child graph is a worker that
+                // finished: its deliverable is in and its review is owed, but no
+                // live actor is performing that review. Parking here parks
+                // forever - mon8's root submitted two tasks, its turn ended on
+                // `satisfied`, and the Program then waited eleven minutes for
+                // reviews nothing would ever perform. Wake the root instead: its
+                // closure view names the outstanding review as the next rung.
+                if has_submitted_tasks_without_active_graph(projection) {
+                    Ok(WaitDisposition::Resume {
+                        revision: projection.revision,
+                        reason: "submitted_review_owed",
+                    })
+                } else {
+                    Ok(WaitDisposition::Wait {
+                        revision: projection.revision,
+                        active_graphs,
+                    })
+                }
             } else {
                 Ok(WaitDisposition::Resume {
                     revision: projection.revision,
@@ -960,6 +974,21 @@ fn has_unsettled_tasks(projection: &AgenticProgramProjection) -> bool {
                 | AgenticTaskStatus::CancelRequested
         )
     })
+}
+
+/// A task whose worker has delivered (Submitted) while no child graph is active.
+///
+/// This is the state mon8 wedged in: the owning Agent finished and submitted,
+/// the turn that would have reviewed the submission ended on its own terminal,
+/// and the Program parked on "unsettled tasks, nothing stranded" forever. The
+/// missing-link caution above covers a task whose link may not be durable yet;
+/// a Submitted task's worker is done, so the only thing missing is the review,
+/// and waiting cannot produce it.
+fn has_submitted_tasks_without_active_graph(projection: &AgenticProgramProjection) -> bool {
+    projection
+        .tasks
+        .values()
+        .any(|task| task.status == AgenticTaskStatus::Submitted)
 }
 
 async fn active_agentic_child_graphs(
@@ -2587,5 +2616,152 @@ mod tests {
             .filter(|event| event.kind == "agentic.program_wait_disposition")
             .map(|event| event.payload)
             .collect()
+    }
+
+    #[tokio::test]
+    async fn a_submitted_task_with_no_active_graph_wakes_the_root_instead_of_parking() {
+        // Mon8's wedge: the root submitted its tasks, the turn ended on
+        // `satisfied`, and the Program parked on "unsettled tasks, nothing
+        // stranded" for eleven minutes waiting for reviews no live actor would
+        // ever perform. A Submitted task with no active child graph must wake
+        // the root to collect the owed review, not park.
+        let services = RuntimeServices::in_memory().expect("runtime");
+        let program_id = "program-wait-submitted";
+        let root_id = "root-wait-submitted";
+        let wait_node = register_root_wait(&services, root_id, program_id);
+        open_program(&services, program_id, root_id);
+        let actions = services.agent_action_service();
+        let root = root_actor(program_id, root_id);
+        let team_ref = actions
+            .project(program_id)
+            .expect("opened projection")
+            .teams
+            .keys()
+            .next()
+            .cloned()
+            .expect("opened Program has a Team");
+        let executor = actions
+            .apply(&AgentActionEnvelope {
+                action_id: "submitted-invite".to_string(),
+                actor: root.clone(),
+                expected_revision: None,
+                action: AgentAction::AgentInvite(
+                    serde_json::from_value(serde_json::json!({
+                        "team_ref": team_ref,
+                        "role": "Executor",
+                        "mission": "produce one verifiable fact",
+                        "required_capabilities": ["read"]
+                    }))
+                    .unwrap(),
+                ),
+            })
+            .expect("invite Agent")
+            .changed_refs[0]
+            .clone();
+        let task = actions
+            .apply(&AgentActionEnvelope {
+                action_id: "submitted-task".to_string(),
+                actor: root.clone(),
+                expected_revision: None,
+                action: AgentAction::TaskPublish(
+                    serde_json::from_value(serde_json::json!({
+                        "team_ref": team_ref,
+                        "title": "One fact",
+                        "objective": "extract one verifiable fact",
+                        "acceptance": "artifact plus evidence",
+                        "required_capabilities": ["read"]
+                    }))
+                    .unwrap(),
+                ),
+            })
+            .expect("publish Task")
+            .changed_refs[0]
+            .clone();
+        let agent_actor = {
+            let mut actor = root.clone();
+            actor.kind = AgentActorKind::Agent;
+            actor.actor_id = executor.clone();
+            actor.team_id = Some(team_ref.clone());
+            actor.agent_id = Some(executor.clone());
+            actor.execution_id = Some("agent-child-submitted".to_string());
+            actor
+        };
+        actions
+            .apply(&AgentActionEnvelope {
+                action_id: "submitted-claim".to_string(),
+                actor: agent_actor.clone(),
+                expected_revision: None,
+                action: AgentAction::TaskClaim(
+                    serde_json::from_value(serde_json::json!({"task_ref": task})).unwrap(),
+                ),
+            })
+            .expect("claim Task");
+        let content = services
+            .artifact_store()
+            .write_bytes(
+                harness_contract::context::ArtifactWriteDescriptor {
+                    media_type: "text/markdown".to_string(),
+                    visibility_scope: format!("session:{program_id}"),
+                    expected_bytes: None,
+                    original_name: Some("fact.md".to_string()),
+                },
+                b"one verifiable fact",
+            )
+            .await
+            .expect("artifact content");
+        let artifact = actions
+            .apply(&AgentActionEnvelope {
+                action_id: "submitted-artifact".to_string(),
+                actor: agent_actor.clone(),
+                expected_revision: None,
+                action: AgentAction::ArtifactCommit(
+                    serde_json::from_value(serde_json::json!({
+                        "content_ref": content.selector,
+                        "kind": "report",
+                        "title": "One fact",
+                        "relates_to": [task]
+                    }))
+                    .unwrap(),
+                ),
+            })
+            .expect("commit artifact")
+            .changed_refs[0]
+            .clone();
+        actions
+            .apply(&AgentActionEnvelope {
+                action_id: "submitted-submit".to_string(),
+                actor: agent_actor.clone(),
+                expected_revision: None,
+                action: AgentAction::TaskSubmit(
+                    serde_json::from_value(serde_json::json!({
+                        "task_ref": task,
+                        "artifact_refs": [artifact],
+                        "evidence_refs": ["tool://submitted-observation"]
+                    }))
+                    .unwrap(),
+                ),
+            })
+            .expect("submit Task");
+        services
+            .execution_supervisor()
+            .drive_registered(root_id)
+            .await
+            .expect("drive wait root");
+        assert_ne!(
+            services
+                .graph_state_store()
+                .load(root_id)
+                .expect("root")
+                .node_statuses[&wait_node],
+            ExecutionNodeStatus::WaitingExternal,
+            "a Submitted task with no active graph must wake the root, not park"
+        );
+        let dispositions = wait_dispositions(&services, program_id);
+        assert!(
+            dispositions.iter().any(|disposition| {
+                disposition.get("reason").and_then(|r| r.as_str()) == Some("submitted_review_owed")
+            }),
+            "the wake must name the owed review: {dispositions:?}"
+        );
     }
 }
