@@ -188,6 +188,55 @@ where
             });
         };
         self.record_governed_tool_plan(&plan, self.session_head().await.message_count);
+        // Accountability: a call the model emitted that is neither scheduled
+        // nor refused was swallowed, and a swallowed call is invisible to the
+        // model, the ledger and the operator. Report it and tell the model,
+        // rather than letting it disappear the way mon6's objective_review did.
+        let swallowed = unaccounted_calls(&pending, &plan, &compilation.rejected);
+        for (call_id, tool_name) in &swallowed {
+            let input_preview = pending
+                .iter()
+                .find(|(id, _, _)| id == call_id)
+                .map(|(_, _, input)| input.chars().take(200).collect::<String>())
+                .unwrap_or_default();
+            self.append_execution_runtime_event(
+                RuntimeEventScope::Tool,
+                "tool.call.unaccounted",
+                Some("unaccounted".to_string()),
+                vec![RuntimeEventRef {
+                    kind: "tool_call".to_string(),
+                    id: call_id.clone(),
+                }],
+                serde_json::json!({
+                    "tool_name": tool_name,
+                    "input": input_preview,
+                    "reason": "neither scheduled by the governed plan nor refused; dropped without a record",
+                }),
+            );
+            tracing::warn!(
+                target: "cowd::tool_accountability",
+                tool = %tool_name,
+                tool_call_id = %call_id,
+                "a model call was dropped without being scheduled or refused"
+            );
+            let message = ConversationMessage::tool_result(
+                call_id.clone(),
+                tool_name.clone(),
+                "Runtime dropped this call without scheduling or refusing it: it was never \
+                 executed. Issue it again, or take a different action."
+                    .to_string(),
+                true,
+            );
+            self.session
+                .write()
+                .await
+                .push_message(message.clone())
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            let sequence = self.session_head().await.message_count.wrapping_sub(1);
+            self.record_message_event(&message, sequence);
+            self.remember_tool_trace_from_message(&message);
+            preflight_messages.push(message);
+        }
         let decision = self.retarget_active_turn_strategy_for_governed_plan(&plan, calls)?;
         self.tool_executor.bind_execution_decision(decision.clone());
         let mut validation = plan.validate_against_execution_decision(&decision);
@@ -2000,9 +2049,99 @@ fn ignored_refusal_stop_bound_from(raw: Option<&str>) -> Option<usize> {
     }
 }
 
+/// The calls the model emitted that the governed plan neither scheduled nor
+/// refused - the ones that were swallowed.
+///
+/// Run mon6 (2026-10-13) emitted `objective_review` - the closure rung, the
+/// first time any run reached for it - and the call vanished: no invocation,
+/// no plan rejection, no early-defer, no exposure denial, no warning. The
+/// provider attempt had completed; the node replanned the same second on a
+/// completion gap. The model never learned its closing action had been eaten,
+/// went back to reading, and the monitor stopped the run twelve minutes later.
+///
+/// Pure so the accountability invariant is testable without a Runtime: given
+/// what was emitted, what the plan scheduled and what it refused, exactly the
+/// swallowed set remains.
+pub(crate) fn unaccounted_calls(
+    pending: &[(String, String, String)],
+    plan: &crate::governed_tool_plan::GovernedToolPlan,
+    rejected: &[crate::governed_tool_plan::GovernedToolCompileRejection],
+) -> Vec<(String, String)> {
+    use std::collections::BTreeSet;
+    let scheduled: BTreeSet<&str> = plan
+        .tasks
+        .iter()
+        .map(|task| task.tool_call_id.as_str())
+        .collect();
+    let refused: BTreeSet<&str> = rejected
+        .iter()
+        .map(|entry| entry.tool_call_id.as_str())
+        .collect();
+    pending
+        .iter()
+        .filter(|(call_id, _, _)| {
+            !scheduled.contains(call_id.as_str()) && !refused.contains(call_id.as_str())
+        })
+        .map(|(call_id, tool_name, _)| (call_id.clone(), tool_name.clone()))
+        .collect()
+}
+
 #[cfg(test)]
 mod agentic_action_body_tests {
     use super::agentic_action_body;
+
+    #[test]
+    fn a_call_the_plan_neither_scheduled_nor_refused_is_the_swallowed_one() {
+        use crate::governed_tool_plan::ValidatedGovernedToolDag;
+        use crate::tool_dispatch::ToolRequest;
+        let requests = vec![
+            ToolRequest {
+                tool_use_id: "call-1".to_string(),
+                tool_name: "read_file".to_string(),
+                input: "{\"path\":\"a.rs\"}".to_string(),
+                depends_on: Vec::new(),
+            },
+            ToolRequest {
+                tool_use_id: "call-2".to_string(),
+                tool_name: "read_file".to_string(),
+                input: "{\"path\":\"b.rs\"}".to_string(),
+                depends_on: Vec::new(),
+            },
+        ];
+        let plan = ValidatedGovernedToolDag::from_requests(&requests);
+        // mon6's shape: the model emitted a third call - the closure rung - and
+        // the plan holds only the two reads. The third is the swallowed one.
+        let pending = vec![
+            (
+                "call-1".to_string(),
+                "read_file".to_string(),
+                "{\"path\":\"a.rs\"}".to_string(),
+            ),
+            (
+                "call-2".to_string(),
+                "read_file".to_string(),
+                "{\"path\":\"b.rs\"}".to_string(),
+            ),
+            (
+                "call-3".to_string(),
+                "objective_review".to_string(),
+                "{\"criterion_ref\":\"user_intent\"}".to_string(),
+            ),
+        ];
+        assert_eq!(
+            super::unaccounted_calls(&pending, &plan, &[]),
+            vec![("call-3".to_string(), "objective_review".to_string())]
+        );
+        // A refused call is accounted for, not swallowed.
+        let rejected = vec![crate::governed_tool_plan::GovernedToolCompileRejection {
+            tool_call_id: "call-3".to_string(),
+            tool_name: "objective_review".to_string(),
+            reason: "criterion unsatisfied".to_string(),
+        }];
+        assert!(super::unaccounted_calls(&pending, &plan, &rejected).is_empty());
+        // Everything scheduled: nothing to report.
+        assert!(super::unaccounted_calls(&pending[..2], &plan, &[]).is_empty());
+    }
 
     #[test]
     fn the_ignored_refusal_bound_honors_its_documented_contract() {
