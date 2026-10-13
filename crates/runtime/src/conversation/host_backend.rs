@@ -3070,17 +3070,27 @@ where
                     // silently dropped - the exact loop Qwen v9 died in.
                     let repairable_tool_frame = protocol_failure
                         || repairable_tool_input_error(&reason);
+                    // The budget belongs to the defect, not to the turn. A
+                    // model that recovered from one mistake and then made a
+                    // different one has not stopped learning, and a turn that
+                    // runs for many minutes will hit more than one defect.
                     let frame_repair_attempt = provider_frame_repair_attempt(
                         repairable_tool_frame,
                         tool_exposure_miss,
                         post_receipt_failure,
                         terminal_provider_route_failure,
                         clean_terminal_synthesis,
-                        state.provider_frame_repair_attempts,
+                        state
+                            .provider_frame_repair_attempts
+                            .get(&frame_repair_defect_signature(&reason))
+                            .copied()
+                            .unwrap_or(0),
                     );
                     if frame_repair_attempt.is_some() {
-                        state.provider_frame_repair_attempts =
-                            state.provider_frame_repair_attempts.saturating_add(1);
+                        *state
+                            .provider_frame_repair_attempts
+                            .entry(frame_repair_defect_signature(&reason))
+                            .or_insert(0) += 1;
                     }
                     let identity = runtime_observation_identity(&self.services, &state, ticket);
                     (
@@ -3724,6 +3734,35 @@ pub(super) fn provider_frame_repair_attempt(
         .then_some(attempts_so_far.saturating_add(1))
 }
 
+/// The defect a refused frame names, normalized to what the model must change.
+///
+/// The repair budget is keyed on this, so it has to separate "the model has not
+/// learned" from "the model erred again". Two live frames differed by a factor
+/// of three in length - 1642 and 5511 characters - and were the same mistake:
+/// every entry omitted `tool`. Keeping anything that varies between attempts,
+/// such as length or the declared/received restatement, would make them look
+/// like two different defects and hand out a fresh budget each time.
+///
+/// Everything is read out of Runtime's own refusal string, which the governed
+/// tool contracts own, so the model cannot shape the signature.
+pub(super) fn frame_repair_defect_signature(reason: &str) -> String {
+    let tool = reason
+        .split("exposed tool `")
+        .nth(1)
+        .and_then(|rest| rest.split('`').next())
+        .unwrap_or("unknown")
+        .to_string();
+    // `tool `X` input violates its pinned schema: $.actions: value has the wrong
+    // JSON type (declared type: array; ...)`. The pointer plus the defect phrase
+    // is the whole claim; the parenthetical restates it and is dropped.
+    let defect = reason
+        .split("pinned schema: ")
+        .nth(1)
+        .map(|rest| rest.split('(').next().unwrap_or(rest).trim().to_string())
+        .unwrap_or_else(|| reason.chars().take(160).collect());
+    format!("{tool}|{defect}")
+}
+
 #[test]
 fn a_tool_input_contract_error_is_repairable_but_a_transport_error_is_not() {
     // The governed tool contracts' own error strings name a shape the model can
@@ -3778,6 +3817,78 @@ fn malformed_frame_earns_one_repair_attempt_even_after_receipts() {
     assert_eq!(
         provider_frame_repair_attempt(true, false, true, false, true, 0),
         None
+    );
+}
+
+/// The budget belongs to the defect, not to the turn.
+///
+/// One live run recovered perfectly from its first malformed frame - the next
+/// batch was a well-formed array - and was then killed by a second frame that
+/// differed only in length. A per-turn counter had already spent its single
+/// attempt, so a model that was demonstrably learning was stopped anyway.
+#[test]
+fn a_second_distinct_defect_earns_its_own_repair_attempt() {
+    let first = frame_repair_defect_signature(
+        "tool_protocol_violation: provider supplied invalid arguments for exposed tool \
+         `agent_action_batch`: tool `agent_action_batch` input violates its pinned schema: \
+         $.actions: value has the wrong JSON type (declared type: array; received: string)",
+    );
+    let second = frame_repair_defect_signature(
+        "tool_protocol_violation: provider supplied invalid arguments for exposed tool \
+         `agent_action_batch`: tool `agent_action_batch` input violates its pinned schema: \
+         $.actions[0]: missing required field `tool`",
+    );
+    assert_ne!(first, second, "distinct defects must be distinct signatures");
+    // Each signature starts from zero and therefore earns the full budget, while
+    // the second occurrence of the SAME defect is still refused - that is where
+    // the model has stopped learning.
+    for signature in [&first, &second] {
+        let mut attempts = std::collections::BTreeMap::new();
+        assert_eq!(
+            provider_frame_repair_attempt(true, false, true, false, false, 0),
+            Some(1)
+        );
+        *attempts.entry(signature.clone()).or_insert(0) += 1;
+        assert_eq!(
+            provider_frame_repair_attempt(true, false, true, false, false, 1),
+            None
+        );
+    }
+}
+
+/// Frames that differ only in length are the same mistake.
+///
+/// The two live frames were 1642 and 5511 characters and both omitted `tool` on
+/// every entry. Anything that varies between attempts - length, the
+/// declared/received restatement - must not reach the signature, or the budget
+/// resets on every retry and stops meaning anything.
+#[test]
+fn frames_that_differ_only_in_length_share_one_signature() {
+    let short = frame_repair_defect_signature(
+        "tool_protocol_violation: provider supplied invalid arguments for exposed tool \
+         `agent_action_batch`: tool `agent_action_batch` input violates its pinned schema: \
+         $.actions: value has the wrong JSON type (declared type: array; received: string; \
+         send a array value as raw JSON, not as a JSON-encoded string)",
+    );
+    let long = frame_repair_defect_signature(
+        "tool_protocol_violation: provider supplied invalid arguments for exposed tool \
+         `agent_action_batch`: tool `agent_action_batch` input violates its pinned schema: \
+         $.actions: value has the wrong JSON type (declared type: array; received: string)",
+    );
+    assert_eq!(short, long, "{short} vs {long}");
+}
+
+/// A refusal that names no pinned schema still normalizes to something stable
+/// rather than swallowing the whole reason, which would make every occurrence
+/// look distinct.
+#[test]
+fn a_refusal_without_a_pinned_schema_still_normalizes() {
+    let first = frame_repair_defect_signature("tool_protocol_violation: unparseable frame");
+    let second = frame_repair_defect_signature("tool_protocol_violation: unparseable frame");
+    assert_eq!(first, second);
+    assert_ne!(
+        first,
+        frame_repair_defect_signature("tool_protocol_violation: a different defect")
     );
 }
 

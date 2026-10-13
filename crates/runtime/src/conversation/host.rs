@@ -803,7 +803,7 @@ where
             force_reasoning_effort_next_model: None,
             terminal_recovery_attempts: 0,
             provider_protocol_recovery_attempts: 0,
-            provider_frame_repair_attempts: 0,
+            provider_frame_repair_attempts: std::collections::BTreeMap::new(),
             agentic_protocol_recovery_attempts: 0,
             agentic_program_context_revision: None,
             execution_role,
@@ -4105,7 +4105,15 @@ struct TurnGraphState {
     /// Bounded malformed-frame repair continuations. Independent of
     /// `provider_protocol_recovery_attempts` because a frame defect is
     /// repairable even when the turn already holds successful receipts.
-    provider_frame_repair_attempts: u8,
+    ///
+    /// Keyed by defect signature, not a single counter. A turn that runs for
+    /// many minutes emits dozens of batches, and the budget has to answer "has
+    /// the model stopped learning from the refusal", not "has the model ever
+    /// erred twice". One live run recovered perfectly from its first malformed
+    /// frame and was then killed by a second, different-length frame with the
+    /// same underlying mistake, because a per-turn counter had already spent
+    /// its single attempt.
+    provider_frame_repair_attempts: std::collections::BTreeMap<String, u8>,
     /// Bounded extra provider steps reserved only for closing the durable
     /// Agent-first artifact/submit/review transaction after generic safety
     /// heuristics would otherwise withdraw its required action tool.
