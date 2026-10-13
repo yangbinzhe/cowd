@@ -28,6 +28,42 @@ pub(crate) fn claim_lease_ms() -> u64 {
         .saturating_mul(1_000)
 }
 
+/// Consecutive claims of one Task with no progress in between.
+///
+/// Run mon7's final task expired its lease and the model re-claimed it four
+/// times over fourteen minutes, submitting the same committed artifact every
+/// time, and never reached the completion request again. A renewal costs one
+/// durable action and moves nothing, so nothing counted them.
+///
+/// The streak resets on progress - a delivered result, a review, the claim
+/// ending - so a healthy Task never accumulates one and this bound is never
+/// reached by work that is actually advancing. Pure so the contract is
+/// testable: unset means 3, `0` disables the refusal, an unparseable value
+/// falls back rather than silently removing the discipline.
+pub(crate) fn claim_renewal_bound() -> Option<u32> {
+    match std::env::var("COWD_TASK_RECLAIM_LIMIT") {
+        Err(_) => Some(3),
+        Ok(value) => match value.trim().parse::<u32>() {
+            Ok(0) => None,
+            Ok(bound) => Some(bound),
+            Err(_) => Some(3),
+        },
+    }
+}
+
+/// The bound as a pure function of the configured value.
+#[cfg(test)]
+pub(crate) fn claim_renewal_bound_from(raw: Option<&str>) -> Option<u32> {
+    match raw {
+        None => Some(3),
+        Some(value) => match value.trim().parse::<u32>() {
+            Ok(0) => None,
+            Ok(bound) => Some(bound),
+            Err(_) => Some(3),
+        },
+    }
+}
+
 // Bounded failure progress. Retries stay evidence-driven, but a Task that keeps
 // failing with *different* reasons can otherwise re-enter Rework forever and
 // park the root on the Program barrier (G56/G57 root non-finalization). After
@@ -79,6 +115,7 @@ pub(crate) fn apply_task_publish(
             claim_execution_id: None,
             claimed_at_ms: None,
             lease_expires_at_ms: None,
+            claim_renewal_streak: 0,
             active_attempts: Default::default(),
             artifact_refs: Vec::new(),
             evidence_refs: Vec::new(),
@@ -382,6 +419,13 @@ pub(crate) fn apply_task_claim(
             && task.claim_execution_id == envelope.actor.execution_id;
         if !renewal {
             task.claim_generation = task.claim_generation.saturating_add(1);
+            task.claim_renewal_streak = 1;
+        } else {
+            // A renewal with nothing new in between is one more turn of the
+            // same wheel. The validator refuses the claim past the bound; the
+            // streak itself is reset by progress (a new deliverable or a
+            // status change), never by time.
+            task.claim_renewal_streak = task.claim_renewal_streak.saturating_add(1);
         }
         task.status = AgenticTaskStatus::Claimed;
         task.claimant = Some(
@@ -410,6 +454,8 @@ pub(crate) fn apply_task_release(
         projection.settle_coordination(envelope.actor.execution_id.as_deref().unwrap_or(""), None);
     }
     if let Some(task) = projection.tasks.get_mut(&input.task_ref) {
+        // The claim ends here, so its renewal streak ends with it.
+        task.claim_renewal_streak = 0;
         if let Some(execution_id) = envelope.actor.execution_id.as_deref() {
             task.active_attempts.remove(execution_id);
         }
@@ -657,6 +703,9 @@ pub(crate) fn apply_task_submit(
         task.artifact_refs.clone_from(&artifact_refs);
         task.evidence_refs = evidence_refs;
         task.unresolved.clone_from(&input.unresolved);
+        // A delivered result is progress: the renewal streak exists to count
+        // re-claims with nothing new in between, and this is something new.
+        task.claim_renewal_streak = 0;
     }
 }
 
@@ -685,6 +734,8 @@ pub(crate) fn apply_task_review(
     input: &TaskReviewInput,
 ) {
     if let Some(task) = projection.tasks.get_mut(&input.task_ref) {
+        // A review is the task moving forward; the renewal streak resets.
+        task.claim_renewal_streak = 0;
         if let Some(execution_id) = envelope.actor.execution_id.as_deref() {
             task.active_attempts.remove(execution_id);
         }
@@ -772,6 +823,160 @@ mod tests {
     }
 
     #[test]
+    fn renewals_accumulate_the_streak_and_a_fresh_claim_resets_it() {
+        let mut projection = AgenticProgramProjection::empty("program", "objective");
+        projection.tasks.insert(
+            "task".to_string(),
+            AgenticTaskProjection {
+                task_id: "task".to_string(),
+                team_id: "team".to_string(),
+                title: "long task".to_string(),
+                objective: "finish without an arbitrary wall timeout".to_string(),
+                acceptance: "durable evidence".to_string(),
+                acceptance_checks: Vec::new(),
+                criterion_source: Default::default(),
+                required_capabilities: Vec::new(),
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
+                depends_on: Vec::new(),
+                status: AgenticTaskStatus::Published,
+                claimant: None,
+                claim_generation: 0,
+                claim_execution_id: None,
+                claimed_at_ms: None,
+                lease_expires_at_ms: None,
+                claim_renewal_streak: 0,
+                active_attempts: Default::default(),
+                artifact_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                unresolved: Vec::new(),
+                review_reason: None,
+                reviewed_by: None,
+                failed_attempts: 0,
+                review_generation: 0,
+                failed_review_attempts: 0,
+                last_failure: None,
+                replacement_task_refs: Vec::new(),
+                supersede_evidence_refs: Vec::new(),
+                superseded_reason: None,
+                superseded_by: None,
+                cancel_requested_by: None,
+                cancel_reason_ref: None,
+                cancel_evidence_refs: Vec::new(),
+                pending_retirement: None,
+            },
+        );
+        let envelope = claim_envelope("exec-1");
+        apply_task_claim(&mut projection, &envelope, &claim_input(), 1_000);
+        // The same execution renewing is one more turn of the same wheel.
+        apply_task_claim(&mut projection, &envelope, &claim_input(), 2_000);
+        apply_task_claim(&mut projection, &envelope, &claim_input(), 3_000);
+        // A different execution is a fresh claim, not a renewal.
+        let other = claim_envelope("exec-2");
+        apply_task_claim(&mut projection, &other, &claim_input(), 4_000);
+        assert_eq!(projection.tasks["task"].claim_renewal_streak, 1);
+        // A fresh claim by a different execution advances the generation.
+        assert_eq!(projection.tasks["task"].claim_generation, 2);
+    }
+
+    #[test]
+    fn a_delivered_result_resets_the_renewal_streak() {
+        let mut projection = AgenticProgramProjection::empty("program", "objective");
+        projection.tasks.insert(
+            "task".to_string(),
+            AgenticTaskProjection {
+                claim_renewal_streak: 0,
+                task_id: "task".to_string(),
+                team_id: "team".to_string(),
+                title: "long task".to_string(),
+                objective: "finish".to_string(),
+                acceptance: "durable evidence".to_string(),
+                acceptance_checks: Vec::new(),
+                criterion_source: Default::default(),
+                required_capabilities: Vec::new(),
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
+                depends_on: Vec::new(),
+                status: AgenticTaskStatus::Claimed,
+                claimant: Some("agent".to_string()),
+                claim_generation: 1,
+                claim_execution_id: Some("exec-1".to_string()),
+                claimed_at_ms: Some(1_000),
+                lease_expires_at_ms: Some(91_000),
+                active_attempts: Default::default(),
+                artifact_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                unresolved: Vec::new(),
+                review_reason: None,
+                reviewed_by: None,
+                failed_attempts: 0,
+                review_generation: 0,
+                failed_review_attempts: 0,
+                last_failure: None,
+                replacement_task_refs: Vec::new(),
+                supersede_evidence_refs: Vec::new(),
+                superseded_reason: None,
+                superseded_by: None,
+                cancel_requested_by: None,
+                cancel_reason_ref: None,
+                cancel_evidence_refs: Vec::new(),
+                pending_retirement: None,
+            },
+        );
+        // Mon7's shape: two renewals, then a submission finally lands. The
+        // delivered result is progress and the streak must clear.
+        let envelope = claim_envelope("exec-1");
+        let submit = AgentActionEnvelope {
+            action: AgentAction::TaskSubmit(harness_contract::agent_action::TaskSubmitInput {
+                task_ref: "task".to_string(),
+                artifact_refs: vec!["artifact:fresh".to_string()],
+                evidence_refs: Vec::new(),
+                unresolved: Vec::new(),
+                deliverable: None,
+            }),
+            ..envelope.clone()
+        };
+        apply_task_submit(&mut projection, &submit, &submit_input());
+        assert_eq!(projection.tasks["task"].claim_renewal_streak, 0);
+        assert_eq!(
+            projection.tasks["task"].status,
+            AgenticTaskStatus::Submitted
+        );
+    }
+
+    #[test]
+    fn the_reclaim_bound_honors_its_documented_contract() {
+        assert_eq!(claim_renewal_bound_from(None), Some(3));
+        assert_eq!(claim_renewal_bound_from(Some("5")), Some(5));
+        // The documented `0 disables` must disable.
+        assert_eq!(claim_renewal_bound_from(Some("0")), None);
+        // Unparseable falls back rather than removing the discipline.
+        assert_eq!(claim_renewal_bound_from(Some("")), Some(3));
+        assert_eq!(claim_renewal_bound_from(Some("abc")), Some(3));
+    }
+
+    fn claim_input() -> TaskClaimInput {
+        TaskClaimInput {
+            task_ref: "task".to_string(),
+            reason: None,
+        }
+    }
+
+    fn submit_input() -> harness_contract::agent_action::TaskSubmitInput {
+        harness_contract::agent_action::TaskSubmitInput {
+            task_ref: "task".to_string(),
+            artifact_refs: vec!["artifact:fresh".to_string()],
+            evidence_refs: Vec::new(),
+            unresolved: Vec::new(),
+            deliverable: None,
+        }
+    }
+
+    #[test]
     fn same_execution_claim_heartbeat_renews_without_advancing_generation() {
         let mut projection = AgenticProgramProjection::empty("program", "objective");
         projection.tasks.insert(
@@ -792,6 +997,7 @@ mod tests {
                 claim_execution_id: None,
                 claimed_at_ms: None,
                 lease_expires_at_ms: None,
+                claim_renewal_streak: 0,
                 active_attempts: Default::default(),
                 artifact_refs: Vec::new(),
                 evidence_refs: Vec::new(),
@@ -838,6 +1044,7 @@ mod tests {
         projection.tasks.insert(
             "task".to_string(),
             AgenticTaskProjection {
+                claim_renewal_streak: 0,
                 task_id: "task".to_string(),
                 team_id: "team".to_string(),
                 title: "task".to_string(),
@@ -917,6 +1124,7 @@ mod tests {
             claim_execution_id: None,
             claimed_at_ms: None,
             lease_expires_at_ms: None,
+            claim_renewal_streak: 0,
             active_attempts: Default::default(),
             artifact_refs: Vec::new(),
             evidence_refs: Vec::new(),
@@ -964,6 +1172,7 @@ mod tests {
     fn retirement_waits_for_every_admitted_physical_attempt_to_settle() {
         let mut projection = AgenticProgramProjection::empty("program", "objective");
         let task = AgenticTaskProjection {
+            claim_renewal_streak: 0,
             task_id: "task".to_string(),
             team_id: "team".to_string(),
             title: "cancel safely".to_string(),

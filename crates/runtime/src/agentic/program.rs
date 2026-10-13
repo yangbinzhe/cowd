@@ -439,6 +439,16 @@ pub struct AgenticTaskProjection {
     pub claim_execution_id: Option<String>,
     pub claimed_at_ms: Option<u64>,
     pub lease_expires_at_ms: Option<u64>,
+    /// Consecutive renewals of this claim with no progress in between.
+    ///
+    /// Run mon7's final task expired its lease and the model re-claimed it
+    /// four times, submitting the same committed artifact every time, for
+    /// fourteen minutes, and never reached the completion request again. A
+    /// renewal is free today, so nothing counted them. The streak resets the
+    /// moment the task moves - a new deliverable or a status change - so a
+    /// healthy long task never accumulates one.
+    #[serde(default)]
+    pub claim_renewal_streak: u32,
     /// Physical effects admitted by Runtime. Unlike `claim_execution_id`,
     /// this also covers pre-claim execution and independent review work.
     #[serde(default)]

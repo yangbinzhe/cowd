@@ -3242,6 +3242,7 @@ fn closure_view_names_the_integration_task_while_a_completion_gap_is_open() {
         claim_execution_id: None,
         claimed_at_ms: None,
         lease_expires_at_ms: None,
+        claim_renewal_streak: 0,
         active_attempts: Default::default(),
         artifact_refs: vec![format!("artifact:{id}")],
         evidence_refs: vec!["tool://receipt".to_string()],
@@ -3355,6 +3356,7 @@ fn citable_refs_states_what_exists_and_never_what_to_choose() {
                 claim_execution_id: None,
                 claimed_at_ms: None,
                 lease_expires_at_ms: None,
+                claim_renewal_streak: 0,
                 active_attempts: Default::default(),
                 artifact_refs: vec![format!("artifact:{id}")],
                 evidence_refs: vec!["tool://receipt".to_string()],
@@ -3424,6 +3426,7 @@ fn closure_view_opens_the_exit_when_only_the_request_remains() {
         },
     );
     let mut task = crate::AgenticTaskProjection {
+        claim_renewal_streak: 0,
         task_id: "task:1".to_string(),
         team_id: "team:1".to_string(),
         title: "delivered".to_string(),

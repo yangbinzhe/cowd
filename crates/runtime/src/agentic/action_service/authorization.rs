@@ -391,6 +391,27 @@ fn validate_task_claim(
     {
         return Some(("task_not_claimable", format!("{:?}", task.status)));
     }
+    // A renewal is free today, so a Task that never advances can be re-claimed
+    // forever: run mon7's final task burned fourteen minutes that way. Past the
+    // bound the claim is refused with the two actions that actually move it.
+    if expired_claim || same_execution_renewal {
+        if let Some(bound) = crate::agentic::work_market::claim_renewal_bound() {
+            if task.claim_renewal_streak >= bound {
+                return Some((
+                    "task_reclaim_without_progress",
+                    format!(
+                        "task {} has been claimed {} times in a row with no new deliverable and no \
+                         status change; the artifacts already committed for it are [{}]. Submit a \
+                         NEW deliverable, or release the task with task_release so the work can \
+                         move - re-claiming it again cannot advance the objective.",
+                        input.task_ref,
+                        task.claim_renewal_streak,
+                        task.artifact_refs.join(", ")
+                    ),
+                ));
+            }
+        }
+    }
     if !matches!(
         envelope.actor.kind,
         AgentActorKind::Agent | AgentActorKind::TeamLead
@@ -871,4 +892,131 @@ fn validate_task_review(
     // a storage selector does not prove inspection and only couples the model
     // contract to ArtifactStore internals.
     None
+}
+
+#[cfg(test)]
+mod reclaim_discipline_tests {
+    use super::*;
+    use harness_contract::agent_action::{AgentActorBinding, AgentActorKind, TaskClaimInput};
+
+    fn envelope(execution_id: &str) -> AgentActionEnvelope {
+        AgentActionEnvelope {
+            action_id: format!("claim:{}", execution_id),
+            actor: AgentActorBinding {
+                objective_id: "objective".to_string(),
+                program_id: "program".to_string(),
+                session_id: "session".to_string(),
+                turn_id: "turn".to_string(),
+                root_execution_id: Some("root".to_string()),
+                required_team_count: 1,
+                exact_team_count: None,
+                objective_summary: "finish".to_string(),
+                model_lease: "model".to_string(),
+                permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
+                resource_scopes: Vec::new(),
+                actor_id: "agent".to_string(),
+                kind: AgentActorKind::Agent,
+                execution_id: Some(execution_id.to_string()),
+                team_id: Some("team".to_string()),
+                agent_id: Some("agent".to_string()),
+            },
+            expected_revision: None,
+            action: AgentAction::TaskClaim(TaskClaimInput {
+                task_ref: "task".to_string(),
+                reason: None,
+            }),
+        }
+    }
+    fn projection_with_streak(streak: u32) -> AgenticProgramProjection {
+        let mut projection = AgenticProgramProjection::empty("program", "objective");
+        projection.agents.insert(
+            "agent".to_string(),
+            crate::agentic::program::AgentMemberProjection {
+                agent_id: "agent".to_string(),
+                display_name: String::new(),
+                role: "worker".to_string(),
+                mission: String::new(),
+                required_capabilities: Vec::new(),
+                invited_by: "root".to_string(),
+                membership_ids: Vec::new(),
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
+            },
+        );
+        projection.tasks.insert(
+            "task".to_string(),
+            crate::agentic::program::AgenticTaskProjection {
+                task_id: "task".to_string(),
+                team_id: "team".to_string(),
+                title: "final synthesis".to_string(),
+                objective: "finish".to_string(),
+                acceptance: "durable evidence".to_string(),
+                acceptance_checks: Vec::new(),
+                criterion_source: Default::default(),
+                required_capabilities: Vec::new(),
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
+                depends_on: Vec::new(),
+                status: AgenticTaskStatus::Claimed,
+                claimant: Some("agent".to_string()),
+                claim_generation: 1,
+                claim_execution_id: Some("exec-1".to_string()),
+                claimed_at_ms: Some(1_000),
+                lease_expires_at_ms: Some(1_000),
+                claim_renewal_streak: streak,
+                active_attempts: Default::default(),
+                artifact_refs: vec!["artifact:f6ef9d7b4065b9aaa56ad6b7".to_string()],
+                evidence_refs: Vec::new(),
+                unresolved: Vec::new(),
+                review_reason: None,
+                reviewed_by: None,
+                failed_attempts: 0,
+                review_generation: 0,
+                failed_review_attempts: 0,
+                last_failure: None,
+                replacement_task_refs: Vec::new(),
+                supersede_evidence_refs: Vec::new(),
+                superseded_reason: None,
+                superseded_by: None,
+                cancel_requested_by: None,
+                cancel_reason_ref: None,
+                cancel_evidence_refs: Vec::new(),
+                pending_retirement: None,
+            },
+        );
+        projection
+    }
+    #[test]
+    fn a_reclaim_without_progress_is_refused_past_the_bound() {
+        let projection = projection_with_streak(3);
+        let refusal = validate_task_claim(&projection, &envelope("exec-1"), &claim_input(), 10_000);
+        let (code, detail) = refusal.expect("the re-claim must be refused");
+        assert_eq!(code, "task_reclaim_without_progress");
+        assert!(
+            detail.contains("artifact:f6ef9d7b4065b9aaa56ad6b7"),
+            "{detail}"
+        );
+        assert!(detail.contains("task_release"), "{detail}");
+    }
+    #[test]
+    fn a_reclaim_below_the_bound_still_passes() {
+        let projection = projection_with_streak(2);
+        let refusal = validate_task_claim(&projection, &envelope("exec-1"), &claim_input(), 10_000);
+        assert!(
+            refusal
+                .as_ref()
+                .map_or(true, |(c, _)| *c != "task_reclaim_without_progress"),
+            "{refusal:?}"
+        );
+    }
+    fn claim_input() -> TaskClaimInput {
+        TaskClaimInput {
+            task_ref: "task".to_string(),
+            reason: None,
+        }
+    }
 }

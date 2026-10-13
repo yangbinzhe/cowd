@@ -1168,6 +1168,7 @@ mod tests {
                 claim_execution_id: None,
                 claimed_at_ms: None,
                 lease_expires_at_ms: None,
+                claim_renewal_streak: 0,
                 active_attempts: Default::default(),
                 artifact_refs: Vec::new(),
                 evidence_refs: Vec::new(),
@@ -1608,6 +1609,7 @@ mod tests {
                     claim_execution_id: None,
                     claimed_at_ms: None,
                     lease_expires_at_ms: None,
+                    claim_renewal_streak: 0,
                     active_attempts: Default::default(),
                     artifact_refs: vec![artifact.to_string()],
                     evidence_refs: Vec::new(),
@@ -1660,6 +1662,7 @@ mod tests {
         program.tasks.insert(
             "task:empty".to_string(),
             crate::AgenticTaskProjection {
+                claim_renewal_streak: 0,
                 task_id: "task:empty".to_string(),
                 team_id: "team:1".to_string(),
                 title: "work".to_string(),

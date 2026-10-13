@@ -1065,6 +1065,7 @@ mod tests {
             claim_execution_id: None,
             claimed_at_ms: None,
             lease_expires_at_ms: None,
+            claim_renewal_streak: 0,
             active_attempts: Default::default(),
             artifact_refs: artifact_refs.into_iter().map(str::to_string).collect(),
             evidence_refs: Vec::new(),

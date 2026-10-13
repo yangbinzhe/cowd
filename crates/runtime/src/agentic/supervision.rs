@@ -279,6 +279,7 @@ mod tests {
             claim_execution_id: Some("graph:author".to_string()),
             claimed_at_ms: Some(1),
             lease_expires_at_ms: Some(2),
+            claim_renewal_streak: 0,
             active_attempts: Default::default(),
             artifact_refs: artifact_refs.into_iter().map(str::to_string).collect(),
             evidence_refs: vec!["evidence:review".to_string()],

@@ -7723,6 +7723,7 @@ mod zero_recovery_guard_tests {
                     claim_execution_id: None,
                     claimed_at_ms: None,
                     lease_expires_at_ms: None,
+                    claim_renewal_streak: 0,
                     active_attempts: Default::default(),
                     artifact_refs: vec![artifact.to_string()],
                     evidence_refs: Vec::new(),
