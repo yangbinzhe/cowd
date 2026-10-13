@@ -310,13 +310,16 @@ pub fn evaluate_agentic_program_closure(value: &Value) -> Value {
 
     let agents_well_formed = !agents.is_empty()
         && agents.iter().all(|(agent_id, agent)| {
-            let team_id = agent.get("team_id").and_then(Value::as_str);
+            // Membership lives on the team side: AgentMemberProjection carries
+            // no team_id field (its fields are agent_id, role, mission,
+            // membership_ids, ...), so reading agent.team_id here compared None
+            // against every team and the check could never pass on a real
+            // projection. An agent is well-formed when its id matches its key
+            // and some team lists it as a member, which is where the projection
+            // records the relationship.
             agent.get("agent_id").and_then(Value::as_str) == Some(agent_id)
-                && team_id.is_some_and(|team_id| teams.contains_key(team_id))
-                && team_id.is_some_and(|team_id| {
-                    teams
-                        .get(team_id)
-                        .and_then(|team| team.get("member_ids"))
+                && teams.values().any(|team| {
+                    team.get("member_ids")
                         .and_then(Value::as_array)
                         .is_some_and(|members| {
                             members
@@ -340,6 +343,7 @@ pub fn evaluate_agentic_program_closure(value: &Value) -> Value {
             let team_id = task.get("team_id").and_then(Value::as_str);
             let claimant = task.get("claimant").and_then(Value::as_str);
             let reviewer = task.get("reviewed_by").and_then(Value::as_str);
+            let status = task.get("status").and_then(Value::as_str);
             task.get("task_id").and_then(Value::as_str) == Some(task_id)
                 && team_id.is_some_and(|team_id| teams.contains_key(team_id))
                 && team_id.is_some_and(|team_id| {
@@ -351,18 +355,28 @@ pub fn evaluate_agentic_program_closure(value: &Value) -> Value {
                             task_ids.iter().any(|id| id.as_str() == Some(task_id))
                         })
                 })
-                && task.get("status").and_then(Value::as_str) == Some("accepted")
-                && claimant.is_some_and(|agent_id| agents.contains_key(agent_id))
-                && reviewer.is_some_and(|agent_id| agents.contains_key(agent_id))
-                && claimant != reviewer
-                && !task
-                    .get("artifact_refs")
-                    .and_then(Value::as_array)
-                    .is_none_or(Vec::is_empty)
-                && !task
-                    .get("evidence_refs")
-                    .and_then(Value::as_array)
-                    .is_none_or(Vec::is_empty)
+                && status.is_some_and(|status| {
+                    // A withdrawn task is a settled task: the work was
+                    // intentionally retracted, a legitimate terminal state.
+                    // Mon9 closed with four accepted and two withdrawn tasks
+                    // and the check failed on the two.
+                    matches!(status, "accepted" | "withdrawn")
+                })
+                // A withdrawn task is an empty shell: no claimant, no reviewer,
+                // no artifacts. Only the accepted path requires the full
+                // independent-verification shape.
+                && (status == Some("withdrawn")
+                    || (claimant.is_some_and(|agent_id| agents.contains_key(agent_id))
+                        && reviewer.is_some_and(|agent_id| agents.contains_key(agent_id))
+                        && claimant != reviewer
+                        && !task
+                            .get("artifact_refs")
+                            .and_then(Value::as_array)
+                            .is_none_or(Vec::is_empty)
+                        && !task
+                            .get("evidence_refs")
+                            .and_then(Value::as_array)
+                            .is_none_or(Vec::is_empty)))
         });
     check(
         "tasks_accepted_and_independently_verified",
@@ -431,11 +445,17 @@ pub fn evaluate_agentic_program_closure(value: &Value) -> Value {
                                         && entry
                                             .get("actor_id")
                                             .and_then(Value::as_str)
-                                            .is_some_and(|agent_id| agents.contains_key(agent_id))
-                                        && !entry
-                                            .get("refs")
-                                            .and_then(Value::as_array)
-                                            .is_none_or(Vec::is_empty)
+                                            .is_some_and(|actor| {
+                                                // The root publishes to topics
+                                                // too: mon9's second entry is
+                                                // the root's issue disposition,
+                                                // and requiring an agent actor
+                                                // judged legitimate root
+                                                // coordination as malformed.
+                                                agents.contains_key(actor)
+                                                    || actor.starts_with("root:")
+                                            })
+                                        && topic_entry_references_something(entry)
                                 })
                         })
                 })
@@ -529,6 +549,25 @@ fn program_identity_check(projection: &Value) -> (bool, Value) {
     )
 }
 
+/// A topic entry references something when any reference-bearing field is
+/// non-empty. Mon9's root entry carried its references in
+/// `issue_dispositions[].evidence_refs`, not in `refs`, so reading only `refs`
+/// judged real coordination as reference-free.
+fn topic_entry_references_something(entry: &Value) -> bool {
+    let nonempty = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty())
+    };
+    if nonempty(entry.get("refs")) || nonempty(entry.get("recipients")) {
+        return true;
+    }
+    entry
+        .get("issue_dispositions")
+        .and_then(Value::as_array)
+        .is_some_and(|items| items.iter().any(|item| nonempty(item.get("evidence_refs"))))
+}
+
 fn terminal_projection_verified(
     projection: &Value,
     artifacts: &serde_json::Map<String, Value>,
@@ -542,7 +581,9 @@ fn terminal_projection_verified(
         && completion.is_some_and(|completion| {
             has_nonempty_string(completion.get("action_id"))
                 && has_nonempty_string(completion.get("requested_by"))
-                && completion.get("primary_artifact_ref").and_then(Value::as_str)
+                && completion
+                    .get("primary_artifact_ref")
+                    .and_then(Value::as_str)
                     == final_artifact_ref
                 && !completion
                     .get("evidence_refs")
@@ -1622,6 +1663,144 @@ mod gate_tests {
         let mut tampered = closure;
         tampered["projection"]["tasks"]["task-test"]["reviewed_by"] = json!("agent-claimant");
         let result = evaluate_agentic_program_closure(&tampered);
+        assert_eq!(result["status"], "failed");
+        assert!(result["missing"]
+            .as_array()
+            .expect("missing checks")
+            .iter()
+            .any(|item| item == "tasks_accepted_and_independently_verified"));
+    }
+
+    /// Mon9's real projection shape, as a fixture. Every field name comes from
+    /// the projection structs: agents carry no team_id (membership lives in the
+    /// team's member_ids), withdrawn tasks are empty shells, and the root
+    /// publishes topic entries whose references sit in issue_dispositions.
+    fn mon9_shaped_projection() -> Value {
+        let mut agents = serde_json::Map::new();
+        for index in 0..8 {
+            let agent_id = format!("agent:{index:04}");
+            agents.insert(
+                agent_id.clone(),
+                json!({
+                    "agent_id": agent_id,
+                    "display_name": format!("Worker {index}"),
+                    "role": "Executor",
+                    "mission": "produce one verifiable fact",
+                    "required_capabilities": ["read"],
+                    "invited_by": "root",
+                    "membership_ids": ["membership:1"]
+                }),
+            );
+        }
+        let mut tasks = serde_json::Map::new();
+        for index in 0..4 {
+            let task_id = format!("task:accepted-{index}");
+            tasks.insert(
+                task_id.clone(),
+                json!({
+                    "task_id": task_id,
+                    "team_id": "team:1",
+                    "status": "accepted",
+                    "claimant": "agent:0000",
+                    "reviewed_by": "agent:0001",
+                    "artifact_refs": [format!("artifact:{index}")],
+                    "evidence_refs": [format!("evidence:{index}")],
+                    "depends_on": []
+                }),
+            );
+        }
+        for index in 0..2 {
+            let task_id = format!("task:withdrawn-{index}");
+            tasks.insert(
+                task_id.clone(),
+                json!({
+                    "task_id": task_id,
+                    "team_id": "team:1",
+                    "status": "withdrawn",
+                    "claimant": null,
+                    "reviewed_by": null,
+                    "artifact_refs": [],
+                    "evidence_refs": [],
+                    "depends_on": []
+                }),
+            );
+        }
+        json!({
+            "program_id": "program:mon9",
+            "objective_id": "objective:mon9",
+            "session_id": "session:mon9",
+            "turn_id": "turn:mon9",
+            "root_execution_id": "root:mon9",
+            "required_team_count": 1,
+            "status": "verified",
+            "teams": {
+                "team:1": {
+                    "team_id": "team:1",
+                    "name": "Verification",
+                    "topic_ref": "topic:1",
+                    "member_ids": (0..8).map(|i| format!("agent:{i:04}")).collect::<Vec<_>>(),
+                    "task_ids": (0..4).map(|i| format!("task:accepted-{i}"))
+                        .chain((0..2).map(|i| format!("task:withdrawn-{i}")))
+                        .collect::<Vec<_>>()
+                }
+            },
+            "agents": agents,
+            "tasks": tasks,
+            "artifacts": {
+                "artifact:0": {"artifact_ref": "artifact:0", "content_ref": "content:0", "committed_by": "agent:0000"},
+                "artifact:1": {"artifact_ref": "artifact:1", "content_ref": "content:1", "committed_by": "agent:0000"},
+                "artifact:2": {"artifact_ref": "artifact:2", "content_ref": "content:2", "committed_by": "agent:0000"},
+                "artifact:3": {"artifact_ref": "artifact:3", "content_ref": "content:3", "committed_by": "agent:0000"}
+            },
+            "topics": {
+                "topic:1": [
+                    {
+                        "entry_id": "message:agent-entry",
+                        "actor_id": "agent:0002",
+                        "refs": [],
+                        "recipients": ["agent:0003"]
+                    },
+                    {
+                        "entry_id": "message:root-entry",
+                        "actor_id": "root:mon9",
+                        "refs": [],
+                        "issue_dispositions": [{
+                            "disposition": "disclose",
+                            "evidence_refs": ["task:accepted-0"]
+                        }]
+                    }
+                ]
+            },
+            "final_artifact_ref": "artifact:0",
+            "completion_request": {
+                "action_id": "complete:1",
+                "requested_by": "root:mon9",
+                "program_revision": 2,
+                "primary_artifact_ref": "artifact:0",
+                "evidence_refs": ["evidence:final"]
+            },
+            "objective_verdict": {
+                "kind": "satisfied",
+                "terminal_fence": "fence:1",
+                "authority_revision": 78
+            },
+            "unresolved": []
+        })
+    }
+
+    #[test]
+    fn a_real_program_shape_passes_the_closure_gate() {
+        let result = evaluate_agentic_program_closure(&mon9_shaped_projection());
+        assert_eq!(result["status"], "passed", "{}", result["missing"]);
+        assert_eq!(result["facts"]["agents"], 8);
+        assert_eq!(result["facts"]["active_tasks"], 6);
+    }
+
+    #[test]
+    fn a_withdrawn_task_is_not_a_defect_but_an_unsettled_one_is() {
+        let mut withdrawn = mon9_shaped_projection();
+        withdrawn["tasks"]["task:withdrawn-0"]["status"] = json!("claimed");
+        let result = evaluate_agentic_program_closure(&withdrawn);
         assert_eq!(result["status"], "failed");
         assert!(result["missing"]
             .as_array()
