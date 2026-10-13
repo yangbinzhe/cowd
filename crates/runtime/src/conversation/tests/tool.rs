@@ -2330,6 +2330,111 @@
         );
     }
 
+    /// The delegated Agent's tool path must refuse a call the model keeps
+    /// repeating.
+    ///
+    /// The hard breaker lived only in `execute_single_tool`, which a delegated
+    /// Agent never enters: its calls go through `execute_tool_batch_step`. The
+    /// counter already recorded that path, so one live run committed the
+    /// identical artifact eleven times against a block bound of six - the count
+    /// was kept and nothing acted on it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_delegated_batch_path_refuses_a_call_that_keeps_repeating() {
+        let runtime = crate::ConversationRuntime::new(
+            Session::new(),
+            FinalAnswerClient,
+            NoopToolExecutor,
+            PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
+            vec!["answer directly".to_string()],
+        )
+        .without_memory();
+
+        let turn = runtime.active_turn_id();
+        let input = serde_json::json!({"query": "task:be3f9b4582fb9f712fa8ed66"}).to_string();
+        let hash = crate::tool_invocation::stable_hash(&input);
+        let bound = crate::repetition_guard::repeated_call_block_bound_for("state_inspect");
+        for _ in 0..bound {
+            crate::repetition_guard::record_repeated_call(&turn, "state_inspect", &hash);
+        }
+
+        let result = runtime
+            .execute_tool_batch_step(
+                &[crate::conversation::ModelToolCall {
+                    id: "repeat-1".to_string(),
+                    name: "state_inspect".to_string(),
+                    input,
+                    depends_on: Vec::new(),
+                }],
+                &crate::SharedPrompter::none(),
+                1,
+            )
+            .await
+            .expect("the batch step must answer rather than error");
+
+        assert_eq!(result.failed, 1, "{:?}", result.messages);
+        assert!(
+            result.messages.iter().any(|message| message.blocks.iter().any(
+                |block| matches!(block, ContentBlock::ToolResult { is_error: true, .. })
+            )),
+            "the refusal must reach the model as a tool result: {:?}",
+            result.messages
+        );
+        // The refusal names the tool and the way out, so the model can act on it
+        // rather than guessing why its call did not run.
+        let text = format!("{:?}", result.messages);
+        assert!(text.contains("state_inspect"), "{text}");
+        assert!(text.contains("Runtime refused"), "{text}");
+    }
+
+    /// Alternating between two different inputs is not a repeat: the breaker
+    /// keys on the exact bytes, so a model doing two different things must not
+    /// be stopped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn alternating_distinct_inputs_on_the_batch_path_is_not_a_repeat() {
+        let runtime = crate::ConversationRuntime::new(
+            Session::new(),
+            FinalAnswerClient,
+            NoopToolExecutor,
+            PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
+            vec!["answer directly".to_string()],
+        )
+        .without_memory();
+
+        let turn = runtime.active_turn_id();
+        let bound = crate::repetition_guard::repeated_call_block_bound_for("state_inspect");
+        for index in 0..bound {
+            let input = serde_json::json!({"query": format!("task:{index}")}).to_string();
+            let hash = crate::tool_invocation::stable_hash(&input);
+            crate::repetition_guard::record_repeated_call(&turn, "state_inspect", &hash);
+        }
+
+        // The governed compiler has no such tool registered, so this batch is
+        // rejected for a reason that has nothing to do with repetition. What
+        // matters is that the repetition breaker is not what stopped it.
+        let result = runtime
+            .execute_tool_batch_step(
+                &[crate::conversation::ModelToolCall {
+                    id: "distinct-1".to_string(),
+                    name: "state_inspect".to_string(),
+                    input: serde_json::json!({"query": "task:fresh"}).to_string(),
+                    depends_on: Vec::new(),
+                }],
+                &crate::SharedPrompter::none(),
+                1,
+            )
+            .await
+            .expect("the batch step must answer");
+
+        // The governed compiler has no such tool in this bare runtime, so the
+        // call is refused for that reason. What must not happen is a refusal
+        // from the repetition breaker, which is what this test is about.
+        let text = format!("{:?}", result.messages);
+        assert!(
+            !text.contains("Runtime refused"),
+            "a distinct input must not be refused as a repeat: {text}"
+        );
+    }
+
     /// A frame Runtime refuses whole must still leave a record of what the
     /// model asked for.
     ///

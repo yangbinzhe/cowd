@@ -61,8 +61,50 @@ where
         }
         use crate::tool_dispatch::ToolRequest;
 
+        // The hard repetition breaker lives in `execute_single_tool`, which this
+        // path never enters. A delegated Agent's calls arrive here instead, so
+        // the same bytes could be dispatched without any bound: one live run
+        // committed the identical artifact eleven times against a block bound of
+        // six. The counter already covers this path - `record_repeated_calls`
+        // runs on the common path after both branches - so the count was being
+        // kept and nothing acted on it. Refuse here exactly as the root path
+        // does, and record each refusal the same way it already records itself.
+        let mut refused_ids = std::collections::BTreeSet::new();
+        let mut refusal_messages = Vec::new();
+        for call in calls {
+            let Some(refusal) =
+                self.blocked_repeated_call(&call.name, &call.id, &call.input, iteration)
+            else {
+                continue;
+            };
+            self.note_refusal_ignored(&call.name, &call.input);
+            refused_ids.insert(call.id.clone());
+            refusal_messages.push(refusal);
+        }
+        for refusal in &refusal_messages {
+            self.session
+                .write()
+                .await
+                .push_message(refusal.clone())
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            let sequence = self.session_head().await.message_count.wrapping_sub(1);
+            self.record_message_event(refusal, sequence);
+            self.remember_tool_trace_from_message(refusal);
+        }
+        if refused_ids.len() == calls.len() {
+            // Every call in this batch was refused, so there is nothing to
+            // compile. Answer with the refusals rather than an empty plan the
+            // model cannot act on.
+            return Ok(ToolBatchStepResult {
+                failed: refusal_messages.len(),
+                messages: refusal_messages,
+                max_concurrency_observed: 0,
+                parallel_batches: 0,
+            });
+        }
         let mut requests = calls
             .iter()
+            .filter(|call| !refused_ids.contains(&call.id))
             .map(|call| ToolRequest {
                 tool_use_id: call.id.clone(),
                 tool_name: call.name.clone(),
@@ -73,6 +115,7 @@ where
         let _ = crate::intent_planner::infer_tool_dependencies(&mut requests);
         let pending = calls
             .iter()
+            .filter(|call| !refused_ids.contains(&call.id))
             .map(|call| (call.id.clone(), call.name.clone(), call.input.clone()))
             .collect::<Vec<_>>();
         let prepared = self.tool_executor.prepare_governed_invocations(&requests);
@@ -180,9 +223,15 @@ where
             );
         }
         let Some(plan) = compilation.plan else {
+            // The caller rolls back eagerly written tool messages and republishes
+            // from this result, so a refusal that is not in here is a refusal the
+            // model never sees.
+            let mut messages = refusal_messages;
+            messages.extend(preflight_messages);
+            let failed = count_failed_tool_results(&messages);
             return Ok(ToolBatchStepResult {
-                failed: preflight_messages.len(),
-                messages: preflight_messages,
+                failed,
+                messages,
                 max_concurrency_observed: 0,
                 parallel_batches: 0,
             });
@@ -247,7 +296,8 @@ where
         self.record_tool_strategy_validation(&validation, self.session_head().await.message_count);
         let mut max_concurrency_observed = 0;
         let mut parallel_batches = 0;
-        let mut messages = preflight_messages;
+        let mut messages = refusal_messages;
+        messages.extend(preflight_messages);
         if validation.allowed {
             self.record_tool_schedule(&plan, &requests, self.session_head().await.message_count);
             let context = ConversationGovernedToolContext {
