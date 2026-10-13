@@ -542,7 +542,7 @@ fn terminal_projection_verified(
         && completion.is_some_and(|completion| {
             has_nonempty_string(completion.get("action_id"))
                 && has_nonempty_string(completion.get("requested_by"))
-                && completion.get("final_artifact_ref").and_then(Value::as_str)
+                && completion.get("primary_artifact_ref").and_then(Value::as_str)
                     == final_artifact_ref
                 && !completion
                     .get("evidence_refs")
@@ -1563,7 +1563,7 @@ mod gate_tests {
                     "action_id": "complete-test",
                     "requested_by": "agent-claimant",
                     "program_revision": 2,
-                    "final_artifact_ref": "artifact-test",
+                    "primary_artifact_ref": "artifact-test",
                     "evidence_refs": ["evidence:test"]
                 },
                 "objective_verdict": {
