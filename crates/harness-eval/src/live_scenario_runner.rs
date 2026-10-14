@@ -240,8 +240,9 @@ fn bounded_scenario_minimum(key: &str, default: usize, maximum: usize) -> Result
 fn group_theory_spec() -> Result<LiveScenarioSpec, String> {
     let minimum_teams = bounded_scenario_minimum("COWD_EVAL_GROUP_THEORY_TEAM_MINIMUM", 3, 12)?;
     let minimum_edges = minimum_teams.saturating_sub(1);
+    let paths = GROUP_THEORY_SOURCE_PATHS.join("`、`");
     let prompt = format!(
-        "这是隔离环境中的 Agent-first 深度任务：调研群论在当前 AI 中的应用并形成可复核测评方案。根据目标自主设计 Team、Agent、Task 和依赖关系，不要套用固定名称或每队固定人数。本场景按 {minimum_teams} 个有真实 Task 的 Team 验收（这是验收标准，不是你的拓扑模板：你仍然自主决定建几个、怎么分）；并让可独立的研究工作物理并发。工作必须覆盖数学定义与可证伪边界、当前应用证据、C4 对照实验设计、综合风险。每项有效 Task 都要由 Agent 领取，提交 artifact/evidence，再由不同 Agent 独立 review；综合 Task 必须通过 depends_on 消费上游 accepted Task。使用 Program/Team topic 交换有引用的摘要，最终 artifact 只能在依赖满足后提交。不得编造论文、链接、实验或工具输出；外部事实无法取得时保留 unresolved。最终结论包含 C4、至少三个实际读取的完整源码路径，并区分研究、调研、分析、处理、模拟的输入输出。只使用只读工具与 Agent Action，不用 bash 或写文件工具。"
+        "这是隔离环境中的 Agent-first 深度任务：调研群论在当前 AI 中的应用并形成可复核测评方案。根据目标自主设计 Team、Agent、Task 和依赖关系，不要套用固定名称或每队固定人数。本场景按 {minimum_teams} 个有真实 Task 的 Team 验收（这是验收标准，不是你的拓扑模板：你仍然自主决定建几个、怎么分）；并让可独立的研究工作物理并发。工作必须覆盖数学定义与可证伪边界、当前应用证据、C4 对照实验设计、综合风险。每项有效 Task 都要由 Agent 领取，提交 artifact/evidence，再由不同 Agent 独立 review；综合 Task 必须通过 depends_on 消费上游 accepted Task。使用 Program/Team topic 交换有引用的摘要，最终 artifact 只能在依赖满足后提交。不得编造论文、链接、实验或工具输出；外部事实无法取得时保留 unresolved。必须完整读取并覆盖 `{paths}` 三个源码路径到 EOF，这三个路径是验收证据不是可选阅读；最终结论必须原样包含 C4、这三个路径、研究/调研/分析/处理/模拟五个阶段的输入输出区分，并明确声明模拟为未执行的模拟（本场景只读，不执行任何代码）。只使用只读工具与 Agent Action，不用 bash 或写文件工具。"
     );
     Ok(LiveScenarioSpec {
         id: GROUP_THEORY_SCENARIO_ID,
