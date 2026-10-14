@@ -2375,6 +2375,34 @@ pub(super) fn topic_entry_visible(entry: &AgenticTopicEntryProjection, agent_id:
             .any(|recipient| recipient == agent_id)
 }
 
+/// Remove the fields that describe the read, not the thing that was read.
+///
+/// A `state_inspect` directory page carries the program revision on the envelope,
+/// on every entry, and in the program-wide `counts` block. None of those say whether
+/// the entity the model asked about moved - a Task stays `published` while the
+/// program advances elsewhere, and the entry's `revision` still climbs. Comparing the
+/// raw page therefore never sees a stall in exactly the case a model polls one Task
+/// while other work proceeds, which is the commonest loop of all.
+fn strip_envelope_fields(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.remove("revision");
+            object.remove("next_rungs");
+            object.remove("counts");
+            object.remove("coverage");
+            for nested in object.values_mut() {
+                strip_envelope_fields(nested);
+            }
+        }
+        serde_json::Value::Array(entries) => {
+            for nested in entries.iter_mut() {
+                strip_envelope_fields(nested);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn inspected_observation(
     envelope: &AgentActionEnvelope,
     projection: &AgenticProgramProjection,
@@ -2491,11 +2519,24 @@ fn inspected_observation(
         let input_hash = crate::tool_invocation::stable_hash(
             &serde_json::to_string(input).unwrap_or_default(),
         );
-        let revision = u64::try_from(projection.revision).unwrap_or(u64::MAX);
+        // The token is what was actually asked about, not the program revision.
+        //
+        // Keying on the revision missed the commonest loop: a model polling
+        // `state_inspect {"query": "task:X"}` while the program advances elsewhere.
+        // The revision moves, so the check never fires, and the same query is
+        // re-issued against a Task that has not moved at all - one live run did
+        // exactly that and was stopped for spinning with this shape in the evidence.
+        //
+        // So the token is a digest of the answer with the envelope's `revision`
+        // stripped out. What remains is the entity content, and if that is identical
+        // the question was answered identically, whatever the rest of the program did.
+        let mut answer = value.clone();
+        strip_envelope_fields(&mut answer);
+        let state_token = serde_json::to_string(&answer).unwrap_or_default();
         if crate::repetition_guard::record_unchanged_inspection(
             &envelope.actor.turn_id,
             &input_hash,
-            revision,
+            &state_token,
         ) {
             // Answer the question that was asked, not the bytes that were asked for.
             //
@@ -2510,7 +2551,7 @@ fn inspected_observation(
             // would have returned. Runtime serves that instead of re-sending the whole
             // page, and names the ways to get more: a newer `after_revision`, a
             // different query, or one exact `entry_ref`.
-            let revision = i64::try_from(revision).unwrap_or(i64::MAX);
+            let revision = i64::try_from(projection.revision).unwrap_or(i64::MAX);
             value = json!({
                 "program_id": projection.program_id,
                 "revision": revision,

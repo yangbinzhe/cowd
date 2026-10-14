@@ -189,25 +189,21 @@ pub fn observe_call_pattern(turn_id: &str, tool_name: &str) -> bool {
 /// that parameter exists.
 /// The one table of last-seen revisions. Two `static` items in two functions would
 /// be two different tables, and the clear would silently not clear.
-fn inspection_memory() -> &'static std::sync::Mutex<BTreeMap<String, u64>> {
-    static LAST_REVISION: OnceLock<std::sync::Mutex<BTreeMap<String, u64>>> = OnceLock::new();
+fn inspection_memory() -> &'static std::sync::Mutex<BTreeMap<String, String>> {
+    static LAST_REVISION: OnceLock<std::sync::Mutex<BTreeMap<String, String>>> = OnceLock::new();
     LAST_REVISION.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
 
-pub fn record_unchanged_inspection(turn_id: &str, input_hash: &str, revision: u64) -> bool {
+pub fn record_unchanged_inspection(turn_id: &str, input_hash: &str, state_token: &str) -> bool {
     let seen = inspection_memory();
     let key = format!("inspect:{turn_id}:{input_hash}");
     let mut seen = seen
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match seen.get(&key).copied() {
-        Some(previous) if previous == revision => true,
-        Some(_) => {
-            seen.insert(key, revision);
-            false
-        }
-        None => {
-            seen.insert(key, revision);
+    match seen.get(&key) {
+        Some(previous) if previous == state_token => true,
+        _ => {
+            seen.insert(key, state_token.to_string());
             false
         }
     }
@@ -1639,24 +1635,24 @@ mod repetition_guard_tests {
         let turn = "v17-inspect-stall";
         clear_turn(turn);
         assert!(
-            !record_unchanged_inspection(turn, "hash-a", 7),
+            !record_unchanged_inspection(turn, "hash-a", "rev-7"),
             "the first read establishes the revision"
         );
         assert!(
-            record_unchanged_inspection(turn, "hash-a", 7),
+            record_unchanged_inspection(turn, "hash-a", "rev-7"),
             "the same input at the same revision is the observation worth reporting"
         );
         assert!(
-            !record_unchanged_inspection(turn, "hash-a", 8),
+            !record_unchanged_inspection(turn, "hash-a", "rev-8"),
             "a moved revision is progress, and must not be reported as a stall"
         );
         assert!(
-            !record_unchanged_inspection(turn, "hash-b", 8),
+            !record_unchanged_inspection(turn, "hash-b", "rev-8"),
             "a different input is a different question, even at the same revision"
         );
         clear_turn(turn);
         assert!(
-            !record_unchanged_inspection(turn, "hash-a", 8),
+            !record_unchanged_inspection(turn, "hash-a", "rev-8"),
             "a fresh turn must not inherit the previous turn's last-seen revision"
         );
         clear_turn(turn);

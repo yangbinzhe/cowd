@@ -1256,6 +1256,100 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
         );
     }
 
+    /// The stall signal is the entity that was asked about, not the program revision.
+    ///
+    /// Keying on the revision missed the commonest loop: a model polling
+    /// `state_inspect {"query": "task:X"}` while the program advances elsewhere. The
+    /// revision moves, the check never fires, and the same query is re-issued against
+    /// a Task that has not moved at all. One live run was stopped for spinning with
+    /// exactly that shape in the evidence, after a revision-based check had already
+    /// shipped and been measured.
+    #[test]
+    fn an_unchanged_entity_is_a_stall_even_while_the_program_advances() {
+        let turn = "turn-entity-stall";
+        let service = AgentActionService::new(Arc::new(RuntimeEventStore::for_test()));
+        let team_ref = service
+            .apply(&root_in_turn(
+                turn,
+                "entity-team",
+                AgentAction::TeamCreate(TeamCreateInput {
+                    name: "Entity Team".to_string(),
+                    mission: "hold a task that does not move".to_string(),
+                    objective: None,
+                }),
+            ))
+            .expect("team mutation")
+            .changed_refs
+            .first()
+            .cloned()
+            .expect("the created team ref");
+        let task_ref = service
+            .apply(&root_in_turn(
+                turn,
+                "entity-task",
+                AgentAction::TaskPublish(harness_contract::agent_action::TaskPublishInput {
+                    title: "A task that does not move".to_string(),
+                    objective: "stay put".to_string(),
+                    acceptance: "nothing changes".to_string(),
+                    team_ref: team_ref.clone(),
+                    depends_on: Vec::new(),
+                    expertise_hints: Vec::new(),
+                    required_capabilities: Vec::new(),
+                    execution_requirements: Vec::new(),
+                    acceptance_checks: Vec::new(),
+                    criterion_source: Default::default(),
+                    obligation_refs: Vec::new(),
+                    purpose: Default::default(),
+                }),
+            ))
+            .expect("task mutation")
+            .changed_refs
+            .first()
+            .cloned()
+            .expect("the published task ref");
+        let request = || AgentAction::StateInspect(StateInspectInput {
+            query: Some(task_ref.clone()),
+            wait_for_workers: false,
+            scope_ref: None,
+            after_revision: None,
+            page_cursor: None,
+            entry_ref: None,
+        });
+        let first = service
+            .apply(&root_in_turn(turn, "entity-first", request()))
+            .expect("first read")
+            .projection
+            .expect("program page");
+        assert_ne!(
+            first["unchanged"],
+            serde_json::json!(true),
+            "the first read is served in full: {first}"
+        );
+        // Advance the program without touching the Task the query asked about.
+        service
+            .apply(&root_in_turn(
+                turn,
+                "entity-elsewhere",
+                AgentAction::TeamCreate(TeamCreateInput {
+                    name: "Unrelated Team".to_string(),
+                    mission: "advance the revision elsewhere".to_string(),
+                    objective: None,
+                }),
+            ))
+            .expect("team mutation");
+        let second = service
+            .apply(&root_in_turn(turn, "entity-second", request()))
+            .expect("second read")
+            .projection
+            .expect("program page");
+        assert_eq!(
+            second["unchanged"],
+            serde_json::json!(true),
+            "the Task the query asked about did not move, so this is a stall even \
+             though the program revision did: {second}"
+        );
+    }
+
     /// An exact-entity read and the `unchanged` receipt stay narrow.
     ///
     /// The `unchanged` receipt exists to be a few bytes; attaching rungs to it
