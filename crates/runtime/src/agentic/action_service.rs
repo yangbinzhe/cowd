@@ -2390,6 +2390,12 @@ fn strip_envelope_fields(value: &mut serde_json::Value) {
             object.remove("next_rungs");
             object.remove("counts");
             object.remove("coverage");
+            // Caller identity, not entity state. The receipt echoes the action id
+            // and receipt id of whoever asked, so two identical questions produce
+            // different bytes and an unchanged entity reads as a change.
+            object.remove("action_id");
+            object.remove("receipt_id");
+            object.remove("actionable");
             for nested in object.values_mut() {
                 strip_envelope_fields(nested);
             }
