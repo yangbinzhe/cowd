@@ -1,6 +1,7 @@
 //! Provider admission, request execution, and governed terminal synthesis.
 
 use super::*;
+use super::frame_refusal::{FrameRefusal, refusal_event_refs, wholly_refused_frame_reason};
 
 #[derive(Debug, Clone)]
 pub(crate) struct TerminalProviderAnswer {
@@ -194,6 +195,34 @@ where
         item.visibility = crate::ContextVisibility::Private;
         item.evidence = vec![format!("tool_call:{tool_call_id}")];
         self.push_next_model_context_item(item);
+    }
+
+    /// Answer every refused call in one place, and file the durable record for it.
+    ///
+    /// A call Runtime refused before dispatch produced nothing, so the model has to
+    /// be told that in its own transcript or it will conclude the tool is broken and
+    /// retry the same bytes. Every refusal branch routes through here so that
+    /// obligation is structural rather than something each branch has to remember -
+    /// the unexposed-tool branch was the one that did not, and a model that asked
+    /// sixteen times for a tool outside its lease was never once shown its own call.
+    fn record_refused_calls(&self, refusals: &[FrameRefusal]) {
+        let session_id = self.session_id().to_string();
+        for refusal in refusals {
+            let invocation_id = refusal.invocation_id(&session_id);
+            self.append_execution_runtime_event(
+                crate::RuntimeEventScope::Tool,
+                "tool.call.rejected_before_dispatch",
+                Some("failed".to_string()),
+                refusal_event_refs(&invocation_id, refusal),
+                refusal.event_payload(&invocation_id),
+            );
+        }
+    }
+
+    /// Record every refusal, then answer each with the whole-frame message.
+    fn answer_refused_calls(&self, refusals: &[FrameRefusal]) -> Vec<ConversationMessage> {
+        self.record_refused_calls(refusals);
+        refusals.iter().map(FrameRefusal::tool_result).collect()
     }
 }
 
@@ -2011,7 +2040,10 @@ where
             }
             let requested_tool_call_count = calls.len();
             let transcript_calls = calls.clone();
-            let mut rejected_tool_calls = Vec::<(ModelToolCall, String)>::new();
+            // One shape for "the model asked for something that did not run",
+            // shared with the whole-frame branches so a refusal is answered and
+            // recorded the same way whichever branch found it.
+            let mut rejected_tool_calls = Vec::<FrameRefusal>::new();
             let unexposed_tool_names = unexposed_model_tool_names(&calls, &exposed_tool_ids);
             if !unexposed_tool_names.is_empty() {
                 let activation_candidates = unexposed_tool_names
@@ -2065,14 +2097,12 @@ where
                         for call in calls {
                             if rejected_names.contains(&call.name) {
                                 let overlay = denied_by_overlay.contains(&call.name);
-                                rejected_tool_calls.push((
+                                rejected_tool_calls.push(FrameRefusal::new(
                                     call,
                                     if overlay {
                                         "the action is outside this request's governed tool allowlist"
-                                            .to_string()
                                     } else {
                                         "the action is unknown, unavailable, or outside this request's exposure lease"
-                                            .to_string()
                                     },
                                 ));
                             } else {
@@ -2090,22 +2120,40 @@ where
                         // the tools but not the calls, and no Runtime record of what
                         // it had asked for. Run one26 re-issued the same
                         // `agent_invite` sixteen times against exactly that silence.
-                        for call in &calls {
-                            let overlay = denied_by_overlay.contains(&call.name);
-                            let reason = if overlay {
-                                "the action is outside this request's governed tool allowlist"
-                            } else {
-                                "the action is unknown, unavailable, or outside this request's exposure lease"
-                            };
+                        //
+                        // It also used to answer the model with a bare error and no
+                        // tool result, which is the defect the invalid-arguments
+                        // branch already had fixed: the model's own frame left no
+                        // assistant message and no tool result, so nothing in its
+                        // transcript said the call had not run. Same obligation,
+                        // same treatment - the frame is answered in-step and the
+                        // available-tool list still reaches the model.
+                        let refusals = calls
+                            .iter()
+                            .map(|call| {
+                                let overlay = denied_by_overlay.contains(&call.name);
+                                FrameRefusal::new(
+                                    call.clone(),
+                                    if overlay {
+                                        "the action is outside this request's governed tool allowlist"
+                                    } else {
+                                        "the action is unknown, unavailable, or outside this request's exposure lease"
+                                    },
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        for refusal in &refusals {
                             tracing::warn!(
                                 target: "cowd::tool_exposure",
-                                tool = %call.name,
-                                tool_call_id = %call.id,
-                                input = %call.input.chars().take(200).collect::<String>(),
-                                overlay_denied = overlay,
-                                "{reason}; the whole frame was discarded"
+                                tool = %refusal.call.name,
+                                tool_call_id = %refusal.call.id,
+                                input = %refusal.call.input.chars().take(200).collect::<String>(),
+                                overlay_denied = denied_by_overlay.contains(&refusal.call.name),
+                                "{}; the whole frame was discarded",
+                                refusal.reason
                             );
                         }
+                        let refusal_results = self.answer_refused_calls(&refusals);
                         self.reconcile_provider_context_usage(usage);
                         self.usage_tracker.record(usage);
                         if let Some(callback) = &self.tool_callback {
@@ -2131,23 +2179,123 @@ where
                                 names.join(", ")
                             }
                         };
-                        return Err(
-                        RuntimeError::with_provider_failure_metadata(
-                            format!(
-                                "tool_protocol_violation: provider requested unknown, unavailable, or unauthorized tool names outside this request's exposure lease: [{}]{}. Tools available in this request: [{available}]",
-                                unexposed_tool_names.join(", "),
-                                (!denied_by_overlay.is_empty()).then(|| format!(
+                        // A deliberate text-only checkpoint is a different situation,
+                        // not a stricter case of this one. Runtime asked for prose and
+                        // the model emitted a call, so a tool result describing a shape
+                        // to re-emit is advice it cannot take: the host's text-only
+                        // recovery ladder owns that step and must keep it. Answering
+                        // in-step is for a model that had schemas and picked one
+                        // outside its lease.
+                        //
+                        // Gated on the checkpoint flag, not on an empty exposure set:
+                        // a runtime that simply registers no tools still benefits from
+                        // being told which tools exist, and one that was asked for text
+                        // does not.
+                        if text_only_response {
+                            return Err(RuntimeError::with_provider_failure_metadata(
+                                format!(
+                                    "tool_protocol_violation: provider emitted a tool call during a request that exposed no tool schemas: [{}]. Produce a normal visible final answer instead.",
+                                    unexposed_tool_names.join(", ")
+                                ),
+                                None,
+                                true,
+                                crate::execution_core::graph::ResourceResultClass::Failed,
+                            )
+                            .with_provider_usage(usage)
+                            .with_effect_receipts(early_tool_receipts));
+                        }
+                        // The bound is counted before the answer is built, so a frame
+                        // that comes back unchanged costs one step and not sixteen.
+                        let mut repeated_refusal = false;
+                        for refusal in &refusals {
+                            let refused_times = crate::repetition_guard::record_refused_frame(
+                                &self.active_turn_id(),
+                                &refusal.call.name,
+                                &refusal.call.input,
+                            );
+                            if refused_times > 1 {
+                                repeated_refusal = true;
+                            }
+                        }
+                        if repeated_refusal {
+                            return Err(RuntimeError::with_provider_failure_metadata(
+                                format!(
+                                    "tool_protocol_violation: provider re-sent a tool frame Runtime had already refused and answered with the exact shape to send: [{}]. Tools available in this request: [{available}]",
+                                    unexposed_tool_names.join(", ")
+                                ),
+                                None,
+                                true,
+                                crate::execution_core::graph::ResourceResultClass::Failed,
+                            )
+                            .with_provider_usage(usage)
+                            .with_effect_receipts(early_tool_receipts)
+                            .with_repeated_tool_frame_refusal());
+                        }
+                        // The shared sentence says the frame was refused and that
+                        // nothing ran; this branch adds the two facts only it knows -
+                        // which tools the request did expose, and whether a governed
+                        // one-request allowlist (rather than the exposure lease) is
+                        // what closed them, because those send the model to different
+                        // places.
+                        let overlay_note = (!denied_by_overlay.is_empty())
+                            .then(|| {
+                                format!(
                                     "; governed one-request allowlist rejected [{}]",
                                     denied_by_overlay.join(", ")
-                                )).unwrap_or_default()
-                            ),
-                            None,
-                            true,
-                            crate::execution_core::graph::ResourceResultClass::Failed,
-                        )
-                        .with_provider_usage(usage)
-                        .with_effect_receipts(early_tool_receipts),
-                    );
+                                )
+                            })
+                            .unwrap_or_default();
+                        let replan_reason = format!(
+                            "{} Tools available in this request: [{available}]{overlay_note}. \
+                             Re-emit the same intended action(s) using only those tools.",
+                            wholly_refused_frame_reason(&refusals)
+                        );
+                        let mut blocks = Vec::new();
+                        if !public_reasoning.is_empty() {
+                            blocks.push(ContentBlock::ReasoningSummary {
+                                text: public_reasoning.clone(),
+                            });
+                        }
+                        if !private_reasoning.is_empty() || signature.is_some() {
+                            blocks.push(ContentBlock::Thinking {
+                                thinking: private_reasoning.clone(),
+                                signature: signature.clone(),
+                            });
+                        }
+                        blocks.push(ContentBlock::Text { text: text.clone() });
+                        for call in &transcript_calls {
+                            blocks.push(ContentBlock::ToolUse {
+                                id: call.id.clone(),
+                                name: call.name.clone(),
+                                input: call.input.clone(),
+                            });
+                        }
+                        let assistant_message = ConversationMessage {
+                            role: crate::session::MessageRole::Assistant,
+                            blocks,
+                            usage: Some(usage),
+                        };
+                        self.consume_active_runtime_inputs_for_next_step(
+                            TurnInputCheckpoint::AfterProviderResponse,
+                        );
+                        return Ok(ModelStepResult {
+                            intent: ModelStepIntent::Replan { reason: replan_reason },
+                            assistant_message,
+                            preflight_tool_results: refusal_results,
+                            usage,
+                            model: effective_model.clone(),
+                            models_used: models_tried.clone(),
+                            first_token_latency_ms: first_event_at.map(|first| {
+                                u64::try_from(first.saturating_duration_since(stream_started).as_millis())
+                                    .unwrap_or(u64::MAX)
+                            }),
+                            active_stream_duration_ms: first_event_at.map(|first| millis_since(first).max(1)),
+                            wall_duration_ms: millis_since(started_at).max(1),
+                            early_tool_receipts,
+                            early_tool_deferrals,
+                            response_completed_at_ms,
+                            text_only_response,
+                        });
                     }
                 }
             }
@@ -2164,11 +2312,9 @@ where
                 let mut executable_calls = Vec::with_capacity(calls.len());
                 for call in calls {
                     if let Some(error) = invalid_arguments.get(&call.id) {
-                        rejected_tool_calls.push((
+                        rejected_tool_calls.push(FrameRefusal::new(
                             call,
-                            format!(
-                                "the arguments do not match the exposed tool contract: {error}"
-                            ),
+                            format!("the arguments do not match the exposed tool contract: {error}"),
                         ));
                     } else {
                         executable_calls.push(call);
@@ -2229,74 +2375,27 @@ where
                     .with_effect_receipts(early_tool_receipts)
                     .with_repeated_tool_frame_refusal());
                 }
-                let mut refusal_results = Vec::with_capacity(calls.len());
-                for rejected in &calls {
-                    let Some(reason) = invalid_arguments.get(&rejected.id) else {
-                        continue;
-                    };
-                    // Answer the model in-step, the way codex's `RespondToModel`
-                    // branch does: the refusal becomes a tool result the model
-                    // reads on its next step, carrying the exact shape to send.
-                    //
-                    // It has to travel as a `preflight_tool_result`, NOT as a
-                    // session write. The model-step node truncates the session
-                    // back to its entry length after every step
-                    // (`host_backend.rs:1362`) and republishes only
-                    // `assistant_message` plus `preflight_tool_results` - so a
-                    // message pushed here is discarded before the model ever
-                    // sees it. One live run proved it: four frames were refused,
-                    // four declines were recorded durably, and the transcript
-                    // showed the assistant's malformed ToolUse with no tool
-                    // result under it at all.
-                    refusal_results.push(ConversationMessage::tool_result(
-                        rejected.id.clone(),
-                        rejected.name.clone(),
-                        format!(
-                            "Runtime did not execute this call: {reason}. \
-                             Nothing from it ran and no state changed. \
-                             Send the same intended action again in the exact shape above."
-                        ),
-                        true,
-                    ));
-                    let invocation_id = format!(
-                        "tool-inv-{}",
-                        crate::tool_invocation::stable_hash(&format!(
-                            "{}:{}:{}",
-                            self.session_id(),
-                            rejected.id,
-                            rejected.input
-                        ))
-                    );
-                    self.append_execution_runtime_event(
-                        crate::RuntimeEventScope::Tool,
-                        "tool.call.rejected_before_dispatch",
-                        Some("failed".to_string()),
-                        vec![
-                            crate::RuntimeEventRef {
-                                kind: "tool_invocation".to_string(),
-                                id: invocation_id.clone(),
-                            },
-                            crate::RuntimeEventRef {
-                                kind: "tool_call".to_string(),
-                                id: rejected.id.clone(),
-                            },
-                        ],
-                        serde_json::json!({
-                            "invocation_id": invocation_id,
-                            "tool_call_id": rejected.id,
-                            "tool_name": rejected.name,
-                            "failure_kind": crate::ToolFailureKind::InputContractRejected.as_str(),
-                            "reason": reason,
-                            "side_effect_committed": false,
-                            "dispatched": false,
-                            "model_visible_preview": rejected
-                                .input
-                                .chars()
-                                .take(200)
-                                .collect::<String>(),
-                        }),
-                    );
-                }
+                // Answer the model in-step, the way codex's `RespondToModel`
+                // branch does: the refusal becomes a tool result the model reads on
+                // its next step, carrying the exact shape to send.
+                //
+                // It has to travel as a `preflight_tool_result`, NOT as a session
+                // write. The model-step node truncates the session back to its entry
+                // length after every step (`host_backend.rs:1362`) and republishes
+                // only `assistant_message` plus `preflight_tool_results` - so a
+                // message pushed here is discarded before the model ever sees it. One
+                // live run proved it: four frames were refused, four declines were
+                // recorded durably, and the transcript showed the assistant's
+                // malformed ToolUse with no tool result under it at all.
+                let refusals = calls
+                    .iter()
+                    .filter_map(|rejected| {
+                        invalid_arguments
+                            .get(&rejected.id)
+                            .map(|reason| FrameRefusal::new(rejected.clone(), reason.clone()))
+                    })
+                    .collect::<Vec<_>>();
+                let refusal_results = self.answer_refused_calls(&refusals);
                 // Tool arguments are provider protocol, not an executable
                 // request. Reject them before transcript publication and
                 // permission negotiation so malformed calls cannot create an
@@ -2418,14 +2517,19 @@ where
                 &assistant_message,
                 self.session_head().await.message_count.wrapping_sub(1),
             );
+            // Recorded here so the durable log shows what was asked for; answered
+            // with the individual-call message rather than the whole-frame one,
+            // because the model needs to know its other calls did run.
+            self.record_refused_calls(&rejected_tool_calls);
             let preflight_tool_results = rejected_tool_calls
                 .into_iter()
-                .map(|(call, reason)| {
+                .map(|refusal| {
                     ConversationMessage::tool_result(
-                        call.id,
-                        call.name,
+                        refusal.call.id,
+                        refusal.call.name,
                         format!(
-                            "Runtime rejected this individual tool call without executing it: {reason}. Other valid calls from the same response continue; use only the currently exposed tool definitions."
+                            "Runtime rejected this individual tool call without executing it: {}. Other valid calls from the same response continue; use only the currently exposed tool definitions.",
+                            refusal.reason
                         ),
                         true,
                     )

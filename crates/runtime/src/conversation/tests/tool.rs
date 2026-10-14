@@ -2120,22 +2120,51 @@
         assert_eq!(summary.usage.input_tokens, 30);
         assert_eq!(summary.usage.output_tokens, 5);
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
-        assert!(requests
+        // The refusal is answered in-step rather than through a host-authored
+        // replan directive, so the second request carries a Tool-role result bound
+        // to the model's own call id. That is what makes the defect learnable: the
+        // model reads its exact frame back next to the reason it did not run.
+        //
+        // It also still carries the available-tool list, which is this branch's own
+        // high-value information: a model that asked for a tool outside its lease
+        // learns where to go instead of only what it may not use.
+        let second_request = requests
             .lock()
             .expect("captured requests")
             .get(1)
-            .is_some_and(|request| request
+            .cloned()
+            .expect("the recovery request");
+        let answered = second_request
+            .messages
+            .iter()
+            .flat_map(|message| &message.blocks)
+            .any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolResult { tool_use_id, is_error: true, .. }
+                        if tool_use_id == "hidden-tool"
+                ) && format!("{block:?}").contains("Runtime did not execute this call")
+            });
+        assert!(
+            answered,
+            "the refused frame must be answered in the model's own transcript: {:?}",
+            second_request.messages
+        );
+        assert!(
+            second_request
                 .prompt
                 .trusted_system
                 .iter()
                 .chain(
-                    request
+                    second_request
                         .prompt
                         .contextual_packets
                         .iter()
                         .map(|packet| &packet.content),
                 )
-                .any(|fragment| fragment.contains("provider-protocol recovery"))));
+                .any(|fragment| fragment.contains("Tools available in this request")),
+            "the available-tool list must still reach the model"
+        );
 
         let transcript = runtime.session_snapshot().await.materialize_messages();
         assert_eq!(
@@ -2145,14 +2174,25 @@
                 .count(),
             1
         );
-        let assistants = transcript
-            .iter()
-            .filter(|message| message.role == crate::MessageRole::Assistant)
-            .collect::<Vec<_>>();
-        assert_eq!(assistants.len(), 1);
-        assert!(assistants[0].blocks.iter().any(
+        // The model's own refused frame stays in the transcript, answered by an
+        // error tool result. Asserting it vanished was asserting the information
+        // loss this branch was rewritten to remove.
+        assert!(
+            transcript.iter().any(|message| message.blocks.iter().any(
+                |block| matches!(block, ContentBlock::ToolUse { id, .. } if id == "hidden-tool")
+            )),
+            "the model's own refused frame must remain visible: {transcript:?}"
+        );
+        assert!(
+            transcript.iter().any(|message| message.blocks.iter().any(
+                |block| matches!(block, ContentBlock::ToolResult { tool_use_id, is_error: true, .. }
+                    if tool_use_id == "hidden-tool")
+            )),
+            "the refused frame must carry the answer the model reads next: {transcript:?}"
+        );
+        assert!(transcript.iter().any(|message| message.blocks.iter().any(
             |block| matches!(block, ContentBlock::Text { text } if text == "exposure recovery retained current objective")
-        ));
+        )));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2515,6 +2555,131 @@
                 .is_some_and(|reason| reason.contains("missing required field `query`")),
             "{payload}"
         );
+    }
+
+    /// Every whole-frame refusal must answer the model and leave a durable record.
+    ///
+    /// Written as one test over both branches, because the defect was never that a
+    /// branch answered badly - it was that one branch answered not at all. The
+    /// unexposed-tool branch returned a bare error: no assistant frame, no tool
+    /// result, no invocation record, so the model's own call vanished and run one26
+    /// re-issued the same `agent_invite` sixteen times against that silence. Routing
+    /// both branches through one renderer is what makes the obligation structural,
+    /// and this is the test that fails if a third branch is added without it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_whole_frame_refusal_answers_the_model_and_is_recorded() {
+        // The invalid-arguments branch.
+        {
+            let services = crate::RuntimeServices::in_memory().expect("runtime services");
+            let store = Arc::clone(services.event_store());
+            let runtime = crate::ConversationRuntime::new(
+                Session::new(),
+                InvalidInputThenFinalClient {
+                    attempts: Arc::new(AtomicUsize::new(0)),
+                    requests: Arc::new(Mutex::new(Vec::new())),
+                },
+                InputContractToolExecutor,
+                PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
+                vec!["answer directly".to_string()],
+            )
+            .without_memory()
+            .with_runtime_event_store(Arc::clone(&store));
+
+            let (runtime, result) = submit_test_owned_conversation_turn(
+                runtime,
+                Arc::clone(&services),
+                "verify a wholly refused frame is answered",
+                &SharedPrompter::none(),
+                test_execution_lineage(),
+            )
+            .await;
+            result.expect("the turn must complete");
+            assert_whole_frame_refusal_is_answered_and_recorded(
+                &runtime,
+                &store,
+                "invalid-search",
+                "the invalid-arguments branch",
+            )
+            .await;
+        }
+        // The unexposed-tool branch.
+        {
+            let services = crate::RuntimeServices::in_memory().expect("runtime services");
+            let store = Arc::clone(services.event_store());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let runtime = crate::ConversationRuntime::new(
+                Session::new(),
+                UnexposedToolThenFinalClient {
+                    attempts: Arc::new(AtomicUsize::new(0)),
+                    requests: Arc::clone(&requests),
+                },
+                NoopToolExecutor,
+                PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
+                vec!["answer directly".to_string()],
+            )
+            .without_memory()
+            .with_runtime_event_store(Arc::clone(&store));
+
+            let (runtime, result) = submit_test_owned_conversation_turn(
+                runtime,
+                Arc::clone(&services),
+                "verify an unexposed frame is answered",
+                &SharedPrompter::none(),
+                test_execution_lineage(),
+            )
+            .await;
+            result.expect("the turn must complete");
+            assert_whole_frame_refusal_is_answered_and_recorded(
+                &runtime,
+                &store,
+                "hidden-tool",
+                "the unexposed-tool branch",
+            )
+            .await;
+        }
+    }
+
+    /// The shared obligation: the model's frame stays visible, is answered, and is
+    /// recorded durably under one event kind.
+    async fn assert_whole_frame_refusal_is_answered_and_recorded<C, T>(
+        runtime: &crate::ConversationRuntime<C, T>,
+        store: &std::sync::Arc<crate::RuntimeEventStore>,
+        tool_use_id: &str,
+        branch: &str,
+    )
+    where
+        C: ApiClient,
+        T: ToolExecutor,
+    {
+        let transcript = runtime.session_snapshot().await.materialize_messages();
+        assert!(
+            transcript.iter().any(|message| message.blocks.iter().any(
+                |block| matches!(block, ContentBlock::ToolUse { id, .. } if id == tool_use_id)
+            )),
+            "{branch}: the model's own refused frame must stay visible: {transcript:?}"
+        );
+        assert!(
+            transcript.iter().any(|message| message.blocks.iter().any(
+                |block| matches!(block, ContentBlock::ToolResult { tool_use_id, is_error: true, .. }
+                    if tool_use_id == tool_use_id)
+            )),
+            "{branch}: the refused frame must carry an error tool result: {transcript:?}"
+        );
+        let recorded = store
+            .all_events(512)
+            .expect("read the durable event log")
+            .into_iter()
+            .filter(|event| event.kind == "tool.call.rejected_before_dispatch")
+            .map(|event| event.payload)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "{branch}: the refused call must be recorded exactly once: {recorded:?}"
+        );
+        assert_eq!(recorded[0]["tool_call_id"], tool_use_id, "{branch}");
+        assert_eq!(recorded[0]["dispatched"], false, "{branch}");
+        assert_eq!(recorded[0]["side_effect_committed"], false, "{branch}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

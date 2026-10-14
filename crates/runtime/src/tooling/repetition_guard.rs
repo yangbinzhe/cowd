@@ -63,6 +63,78 @@ fn repetition_ledger() -> &'static std::sync::Mutex<BTreeMap<String, RepetitionS
     LEDGER.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
 
+/// The namespaces this ledger is divided into, and the one place each is spelled.
+///
+/// Four questions are asked of one map, and each used to write its own prefix as a
+/// string literal at every construction and read site. That is how a clear rule
+/// drifts: `clear_failure_breakers` preserves the successful-repeat count across a
+/// Task accept because a call issued ten times must still reach its block bound, and
+/// it spelled that exception as `key.starts_with("repeat:")`. When the refused-frame
+/// namespace was added it answered the same question - a call that never produced a
+/// side effect - but it was not in the exception, so an accept silently reset the
+/// count and a model could re-send one malformed frame two at a time forever, as long
+/// as a Task was accepted in between. Deriving the prefix and the clear rule from one
+/// enum makes that class of drift impossible to introduce quietly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LedgerNamespace {
+    /// The same call again, after it failed to execute.
+    Call,
+    /// The same dead end again, however the model rewords its prose.
+    Cause,
+    /// The same *successful* call, counted in total rather than as a streak.
+    Repeat,
+    /// The same *refused* frame, counted before it ever reached an executor.
+    Refused,
+}
+
+impl LedgerNamespace {
+    /// The literal prefix. Every key in the ledger starts with one of these, and
+    /// nothing else may.
+    pub(crate) const fn prefix(self) -> &'static str {
+        match self {
+            Self::Call => "call:",
+            Self::Cause => "cause:",
+            Self::Repeat => "repeat:",
+            Self::Refused => "refused:",
+        }
+    }
+
+    /// Assemble one key. The discriminator is an input hash, an error signature, or
+    /// whatever else separates two entries inside the namespace.
+    pub(crate) fn key(self, turn_id: &str, tool_name: &str, discriminator: &str) -> String {
+        format!(
+            "{}{turn_id}:{tool_name}:{discriminator}",
+            self.prefix()
+        )
+    }
+
+    /// The prefix every key of one namespace under one turn and tool shares, for
+    /// range scans.
+    pub(crate) fn scan_prefix(self, turn_id: &str, tool_name: &str) -> String {
+        format!("{}{turn_id}:{tool_name}:", self.prefix())
+    }
+
+    /// Whether a Task accept preserves this namespace.
+    ///
+    /// An accept is durable progress, and progress invalidates a failure breaker: a
+    /// call that failed before the accept must not be suppressed by it. It says
+    /// nothing about a protocol count, because a call that was refused never reached
+    /// an executor and a call that succeeded and returned the same bytes did not
+    /// change anything either. Those two keep counting across an accept for the same
+    /// reason: the model really did emit them that many times.
+    pub(crate) const fn survives_failure_breaker_clear(self) -> bool {
+        matches!(self, Self::Repeat | Self::Refused)
+    }
+}
+
+/// Every namespace, so a clear rule can be written against all of them at once.
+pub(crate) const LEDGER_NAMESPACES: [LedgerNamespace; 4] = [
+    LedgerNamespace::Call,
+    LedgerNamespace::Cause,
+    LedgerNamespace::Repeat,
+    LedgerNamespace::Refused,
+];
+
 /// How many recent calls the pattern window holds.
 const PATTERN_WINDOW: usize = 12;
 
@@ -224,7 +296,7 @@ fn input_declares_wait_for_workers(input: &str) -> bool {
 /// dispatched again eighty milliseconds later. One assembly makes that drift
 /// impossible rather than merely unlikely.
 fn repeated_call_key(turn_id: &str, tool_name: &str, input_hash: &str) -> String {
-    format!("repeat:{turn_id}:{tool_name}:{input_hash}")
+    LedgerNamespace::Repeat.key(turn_id, tool_name, input_hash)
 }
 
 /// Count one frame Runtime refused before dispatch, under its own namespace.
@@ -236,9 +308,10 @@ fn repeated_call_key(turn_id: &str, tool_name: &str, input_hash: &str) -> String
 /// not share the per-input ledger - a frame that was never dispatched has no
 /// business consuming the bound of a call that might later succeed.
 pub fn record_refused_frame(turn_id: &str, tool_name: &str, input: &str) -> usize {
-    let key = format!(
-        "refused:{turn_id}:{tool_name}:{}",
-        crate::tool_invocation::stable_hash(input)
+    let key = LedgerNamespace::Refused.key(
+        turn_id,
+        tool_name,
+        &crate::tool_invocation::stable_hash(input),
     );
     let mut ledger = repetition_ledger()
         .lock()
@@ -378,9 +451,9 @@ pub fn record_tool_failure(
     // runtime-state condition, so no rewording can make it succeed and refusing
     // it refuses nothing that could have worked. A cause the model *did* name is
     // fixable by naming something else, and must not be refused.
-    let call_key = format!("call:{turn_id}:{tool_name}:{input_hash}");
+    let call_key = LedgerNamespace::Call.key(turn_id, tool_name, input_hash);
     let signature = error_signature(message);
-    let cause_key = format!("cause:{turn_id}:{tool_name}:{signature}");
+    let cause_key = LedgerNamespace::Cause.key(turn_id, tool_name, &signature);
     let state_derived = state_derived_cause(message, input_refs);
     let mut ledger = repetition_ledger()
         .lock()
@@ -478,7 +551,7 @@ pub fn refusal_for(turn_id: &str, tool_name: &str, input_hash: &str) -> Option<R
     let ledger = repetition_ledger()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(entry) = ledger.get(&format!("call:{turn_id}:{tool_name}:{input_hash}")) {
+    if let Some(entry) = ledger.get(&LedgerNamespace::Call.key(turn_id, tool_name, input_hash)) {
         if entry.count >= bound {
             return Some(RefusalRecord {
                 cause_signature: entry.signature.clone(),
@@ -487,7 +560,7 @@ pub fn refusal_for(turn_id: &str, tool_name: &str, input_hash: &str) -> Option<R
             });
         }
     }
-    let prefix = format!("cause:{turn_id}:{tool_name}:");
+    let prefix = LedgerNamespace::Cause.scan_prefix(turn_id, tool_name);
     ledger
         .range(prefix.clone()..)
         .take_while(|(key, _)| key.starts_with(&prefix))
@@ -516,7 +589,7 @@ pub fn cause_blocked_for_tool(turn_id: &str, tool_name: &str) -> bool {
         return false;
     }
     let bound = repetition_bound();
-    let prefix = format!("cause:{turn_id}:{tool_name}:");
+    let prefix = LedgerNamespace::Cause.scan_prefix(turn_id, tool_name);
     repetition_ledger()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -590,7 +663,13 @@ pub fn clear_failure_breakers(turn_id: &str) {
     repetition_ledger()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .retain(|key, _| !key.contains(needle.as_str()) || key.starts_with("repeat:"));
+        .retain(|key, _| {
+            !key.contains(needle.as_str())
+                || LEDGER_NAMESPACES
+                    .iter()
+                    .any(|namespace| key.starts_with(namespace.prefix())
+                        && namespace.survives_failure_breaker_clear())
+        });
     clear_ignored_refusal(turn_id);
 }
 
@@ -1336,6 +1415,127 @@ mod repetition_guard_tests {
             "an accept must not reset the cumulative repeat count"
         );
         clear_turn(turn);
+    }
+
+    /// The four namespaces spell their keys in exactly one place, and the spelling
+    /// is the one the ledger already used.
+    ///
+    /// These strings are not free to change: a key that moves is a counter that
+    /// silently restarts, which is the failure this enum exists to prevent. Pinning
+    /// them turns "someone renames a prefix" from a silent reset into a test failure.
+    #[test]
+    fn every_namespace_key_is_stable_and_unambiguous() {
+        assert_eq!(
+            LedgerNamespace::Call.key("t1", "read_file", "h1"),
+            "call:t1:read_file:h1"
+        );
+        assert_eq!(
+            LedgerNamespace::Cause.key("t1", "read_file", "sig"),
+            "cause:t1:read_file:sig"
+        );
+        assert_eq!(
+            LedgerNamespace::Repeat.key("t1", "read_file", "h1"),
+            "repeat:t1:read_file:h1"
+        );
+        assert_eq!(
+            LedgerNamespace::Refused.key("t1", "read_file", "h1"),
+            "refused:t1:read_file:h1"
+        );
+        assert_eq!(
+            LedgerNamespace::Cause.scan_prefix("t1", "read_file"),
+            "cause:t1:read_file:"
+        );
+        // No namespace may be a prefix of another, or a range scan over one would
+        // silently read another's entries.
+        for left in LEDGER_NAMESPACES {
+            for right in LEDGER_NAMESPACES {
+                if left == right {
+                    continue;
+                }
+                assert!(
+                    !right.prefix().starts_with(left.prefix()),
+                    "{:?} is a prefix of {:?}",
+                    left,
+                    right
+                );
+            }
+        }
+    }
+
+    /// An accept clears failure breakers and preserves every protocol count.
+    ///
+    /// The refused-frame namespace used to be cleared too, because the exception was
+    /// spelled as a literal that only named the successful-repeat prefix. A model
+    /// could then re-send one malformed frame two at a time, indefinitely, as long as
+    /// a Task was accepted in between - the same "the count never reaches its bound"
+    /// defect the repeat namespace was already exempted for. The rule now comes from
+    /// the namespace, so a namespace added later inherits the right answer instead of
+    /// having to be remembered.
+    #[test]
+    fn an_accept_preserves_the_refused_frame_count() {
+        let turn = "v23-refused-accept";
+        clear_turn(turn);
+        // A failure breaker, which the accept must clear.
+        for _ in 0..repetition_bound() {
+            record_tool_failure(
+                turn,
+                "read_file",
+                "hash-fail",
+                &[],
+                ToolFailureKind::ExecutionError,
+                "deterministic boom",
+            );
+        }
+        assert!(
+            refusal_for(turn, "read_file", "hash-fail").is_some(),
+            "the failure breaker must be filed"
+        );
+        // A refused frame, which the accept must not clear.
+        let before = record_refused_frame(turn, "agent_action_batch", "{}");
+        assert_eq!(before, 1);
+
+        clear_failure_breakers(turn);
+
+        assert!(
+            refusal_for(turn, "read_file", "hash-fail").is_none(),
+            "an accept must clear the failure breaker"
+        );
+        assert_eq!(
+            record_refused_frame(turn, "agent_action_batch", "{}"),
+            before + 1,
+            "an accept must not reset the refused-frame count: a model that re-sends \
+             one malformed frame between accepts must still hit its bound"
+        );
+        clear_turn(turn);
+    }
+
+    /// The clear rule is a property of the namespace, not a remembered string.
+    ///
+    /// Written as an exhaustive assertion over all four so that adding a fifth
+    /// namespace fails here until someone decides, deliberately, which side of the
+    /// accept boundary it belongs on.
+    #[test]
+    fn the_accept_boundary_is_classified_for_every_namespace() {
+        for namespace in LEDGER_NAMESPACES {
+            let survives = namespace.survives_failure_breaker_clear();
+            match namespace {
+                LedgerNamespace::Call | LedgerNamespace::Cause => {
+                    assert!(
+                        !survives,
+                        "{:?} counts execution failures, which durable progress invalidates",
+                        namespace
+                    );
+                }
+                LedgerNamespace::Repeat | LedgerNamespace::Refused => {
+                    assert!(
+                        survives,
+                        "{:?} counts protocol repeats that never changed any state, \
+                         so progress says nothing about them",
+                        namespace
+                    );
+                }
+            }
+        }
     }
 
     /// Polling is waiting, not looping. `state_inspect` point queries are how a

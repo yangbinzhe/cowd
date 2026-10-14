@@ -1311,14 +1311,31 @@
             .expect("turn strategy");
         runtime.require_next_model_tools(["tool_search".to_string()]);
 
-        let error = runtime
+        // The ceiling is the point, not the mechanism. The frame is answered
+        // in-step now - a bare error left the model's own call out of its
+        // transcript entirely - so what must still hold is that the allowlist
+        // names the rejection and that nothing was activated.
+        let refused = runtime
             .execute_model_step("inspect README", true)
             .await
-            .expect_err("the one-request allowlist must reject deferred activation");
-        assert!(!error.is_tool_exposure_miss(), "{error}");
-        assert!(error
-            .to_string()
-            .contains("governed one-request allowlist rejected [custom_reader]"));
+            .expect("the one-request allowlist must refuse the frame");
+        let ModelStepIntent::Replan { reason } = refused.intent else {
+            panic!("a wholly refused frame must be answered with a replan");
+        };
+        assert!(
+            reason.contains("governed one-request allowlist rejected [custom_reader]"),
+            "{reason}"
+        );
+        assert!(
+            refused
+                .preflight_tool_results
+                .iter()
+                .any(|message| message.blocks.iter().any(|block| matches!(
+                    block,
+                    ContentBlock::ToolResult { is_error: true, .. }
+                ))),
+            "the refused call must be answered in the model's own transcript"
+        );
         assert!(!runtime
             .tool_exposure_state
             .lock()
@@ -1525,13 +1542,20 @@
                 .is_some_and(|state| state.active.contains("custom_reader")),
             "tool_search must activate custom_reader before the following provider request"
         );
-        let protocol_error = runtime
+        // Answered in-step rather than failed, so the model reads its own call
+        // back next to the reason it did not run. The lease is still what refuses
+        // it, and the next request still invokes the activated tool.
+        let refused = runtime
             .execute_model_step("inspect files", false)
             .await
-            .expect_err("an invented tool must fail the active exposure lease");
-        assert!(protocol_error
-            .to_string()
-            .contains("outside this request's exposure lease"));
+            .expect("an invented tool must be refused by the active exposure lease");
+        let ModelStepIntent::Replan { reason } = refused.intent else {
+            panic!("a wholly refused frame must be answered with a replan");
+        };
+        assert!(
+            reason.contains("outside this request's exposure lease"),
+            "{reason}"
+        );
         let activated = runtime
             .execute_model_step("inspect files", false)
             .await

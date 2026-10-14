@@ -18,6 +18,8 @@ mod context_plane;
 mod evidence_terminal_plane;
 #[path = "provider_plane.rs"]
 mod provider_plane;
+#[path = "frame_refusal.rs"]
+pub(crate) mod frame_refusal;
 use provider_plane::TurnProviderState;
 #[path = "tool_plane.rs"]
 mod tool_plane;
