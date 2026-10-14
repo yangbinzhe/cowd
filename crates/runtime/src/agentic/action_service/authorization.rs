@@ -416,9 +416,28 @@ fn validate_task_claim(
         envelope.actor.kind,
         AgentActorKind::Agent | AgentActorKind::TeamLead
     ) {
+        // Name the actor, the rule and the way out. The message used to be a
+        // bare status - "task claims require a roster-bound Agent" - and a root
+        // model that called `task_claim` directly could not tell from it who was
+        // refused or what to do instead: one live run emitted "任务领取因
+        // roster-bound Agent 失败" four times in a row and never moved. The
+        // refusal twenty lines above already sets the standard - it names the
+        // task, the count, the artifacts and the two actions that advance it.
+        let kind = format!("{:?}", envelope.actor.kind);
+        let actor = &envelope.actor.actor_id;
+        let team = task.team_id.as_str();
         return Some((
             "actor_cannot_execute_task",
-            "task claims require a roster-bound Agent".to_string(),
+            format!(
+                "task {} cannot be claimed by actor `{actor}` (kind {kind}): a claim may only be \
+                 issued by an Agent or TeamLead that is a member of Team `{team}`. You are not \
+                 that Actor, so do not issue `task_claim` at all - Runtime admits an executor and \
+                 an independent reviewer for a Published Task on its own, from the Team's roster. \
+                 Make sure the Team has a free member (`agent_invite` into `{team}`), then leave \
+                 the claim to Runtime and continue with `state_inspect` or the next independent \
+                 piece of work.",
+                input.task_ref
+            ),
         ));
     }
     if let Some(waiting) = task.depends_on.iter().find(|dependency| {
@@ -1018,5 +1037,35 @@ mod reclaim_discipline_tests {
             task_ref: "task".to_string(),
             reason: None,
         }
+    }
+
+    /// A root that claims a Task must be told who it is, what the rule is, and
+    /// what to do instead.
+    ///
+    /// The message used to be "task claims require a roster-bound Agent" and
+    /// nothing else. One live run read it as an unexplained failure and emitted
+    /// "任务领取因 roster-bound Agent 失败" four times in a row without ever
+    /// changing its approach - a status, not a way out.
+    #[test]
+    fn a_root_claim_is_refused_with_the_actor_the_rule_and_the_way_out() {
+        let mut root = envelope("exec-root");
+        root.actor.kind = AgentActorKind::Root;
+        root.actor.actor_id = "root:session".to_string();
+        root.actor.agent_id = None;
+        root.actor.team_id = None;
+        let refusal = validate_task_claim(&projection_with_streak(0), &root, &claim_input(), 10_000);
+        let (code, detail) = refusal.expect("a root claim must be refused");
+        assert_eq!(code, "actor_cannot_execute_task");
+        assert!(detail.contains("root:session"), "who was refused: {detail}");
+        assert!(detail.contains("Root"), "what kind of actor: {detail}");
+        assert!(detail.contains("team"), "which Team owns the Task: {detail}");
+        assert!(
+            detail.contains("agent_invite"),
+            "the reachable next step: {detail}"
+        );
+        assert!(
+            detail.contains("Runtime admits"),
+            "the model must know the claim is not its job: {detail}"
+        );
     }
 }

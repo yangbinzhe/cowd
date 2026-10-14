@@ -609,7 +609,7 @@ fn agent_action_tool_definitions() -> Vec<RuntimeToolDefinition> {
         ),
         agent_action_definition::<action::TaskClaimInput>(
             action::TASK_CLAIM_TOOL_ID,
-            "Claim one available Task. Runtime derives the caller identity and checks roster, capabilities, dependencies and lease state.",
+            "Claim one available Task. Only an Agent or TeamLead that is a member of the Task's Team may claim it - Runtime derives the caller identity and refuses anyone else, so as the root you must not call this: publish the Task and Runtime admits the executor and an independent reviewer from the Team's roster on its own. Runtime checks roster, capabilities, dependencies and lease state.",
         ),
         agent_action_definition::<action::TaskReleaseInput>(
             action::TASK_RELEASE_TOOL_ID,
