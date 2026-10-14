@@ -850,6 +850,53 @@ impl GatewayToolExecutor {
                     }
                 });
             }
+            // A refused action must reach the model as a failed tool call.
+            //
+            // It used to arrive as a *successful* result carrying
+            // `"status": "rejected"` somewhere inside a pretty-printed receipt. The
+            // model read a completed tool call and re-sent the same bytes: one live
+            // run emitted the identical string-typed `agent_action_batch` frame three
+            // times, was refused twice on the durable log, and was told nothing on
+            // either occasion.
+            //
+            // The model-step path already answers a refused frame in-step through
+            // `preflight_tool_results` (P41/U2). This is the tool path, and it owed
+            // the same obligation - the refusal is only useful if the thing that
+            // emitted the frame can read it.
+            if matches!(
+                observation.status,
+                harness_contract::agent_action::AgentActionStatus::Rejected
+                    | harness_contract::agent_action::AgentActionStatus::Blocked
+            ) {
+                let error = observation.error.as_ref();
+                let code = error
+                    .map(|error| error.code.as_str())
+                    .unwrap_or("action_refused");
+                let message = error
+                    .map(|error| error.message.as_str())
+                    .unwrap_or("Runtime refused this action");
+                let guidance = if observation.actionable.is_empty() {
+                    String::new()
+                } else {
+                    format!("\nRuntime guidance: {}", observation.actionable.join("; "))
+                };
+                // The structured receipt stays inside the failure, verbatim, so a
+                // caller that wants to deserialize the observation still can. What
+                // changes is that the call is now marked failed, which is the part
+                // the model reads.
+                let receipt = serialize_agent_action_receipt(
+                    &observation,
+                    resolved_content_ref.as_deref(),
+                )
+                .unwrap_or_else(|_: serde_json::Error| String::new());
+                return Err(ToolError::new(format!(
+                    "Runtime did not execute `{}`: {code}: {message}. \
+                     Nothing from it ran and no state changed. \
+                     Re-emit the same intended action with the corrected arguments.{guidance}\n\
+                     Structured receipt: {receipt}",
+                    envelope.action.kind()
+                )));
+            }
             return serialize_agent_action_receipt(&observation, resolved_content_ref.as_deref())
                 .map_err(|error| ToolError::new(error.to_string()));
         }

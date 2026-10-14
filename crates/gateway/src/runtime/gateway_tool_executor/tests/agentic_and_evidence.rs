@@ -708,9 +708,23 @@ async fn agent_action_gateway_commits_small_actions_and_rejects_fake_content() {
             },
         )
         .await
-        .expect("structured rejection");
+        .expect_err("a refused action must reach the model as a failed tool call");
+    // The structured receipt survives inside the failure, so a caller that wants to
+    // deserialize the observation still can. What changed is that the call is marked
+    // failed: it used to arrive as a *successful* result carrying
+    // `"status": "rejected"` inside a pretty-printed blob, and one live run re-sent
+    // the identical malformed frame three times because it read a completed call.
+    let message = rejected.to_string();
+    assert!(
+        message.contains("Runtime did not execute"),
+        "the failure must lead with what did not run: {message}"
+    );
+    let receipt = message
+        .split("Structured receipt: ")
+        .nth(1)
+        .expect("the structured receipt must survive inside the failure");
     let rejected: harness_contract::agent_action::AgentActionObservation =
-        serde_json::from_str(&rejected).expect("artifact rejection");
+        serde_json::from_str(receipt).expect("artifact rejection");
     assert_eq!(
         rejected.status,
         harness_contract::agent_action::AgentActionStatus::Rejected
