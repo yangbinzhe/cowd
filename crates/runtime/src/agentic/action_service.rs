@@ -2481,7 +2481,13 @@ fn inspected_observation(
     // The revision is Runtime's own progress signal, so "same input, same revision"
     // is the honest observation, and the notice names the two parameters that already
     // exist to make the next ask cheap. It does not refuse, stub, or narrow anything.
-    if !unchanged {
+    // Program-level reads only. An exact `entry_ref`/`scope_ref` asks about one
+    // entity, and re-asking is legitimate: whether a topic became visible, whether a
+    // Task moved, whether a ref resolved are all questions whose answer can change
+    // without the program revision moving. One live test asserts exactly that - a
+    // cross-team read answering `not_found` - and collapsing it into an unchanged
+    // receipt would hide the answer.
+    if !unchanged && input.entry_ref.is_none() && input.scope_ref.is_none() {
         let input_hash = crate::tool_invocation::stable_hash(
             &serde_json::to_string(input).unwrap_or_default(),
         );
@@ -2491,19 +2497,33 @@ fn inspected_observation(
             &input_hash,
             revision,
         ) {
-            if let Some(object) = value.as_object_mut() {
-                object.insert(
-                    "notice".to_string(),
-                    serde_json::Value::String(
-                        "Runtime notice: this same state_inspect returned the same program \
-                         revision as last time, so nothing has advanced. To wait cheaply, \
-                         re-issue it with `after_revision: <revision>` (Runtime answers \
-                         `{unchanged: true}` in a few bytes), or with `wait_for_workers: true` \
-                         to park until a worker moves. Do not re-issue the same query."
-                            .to_string(),
-                    ),
-                );
-            }
+            // Answer the question that was asked, not the bytes that were asked for.
+            //
+            // A notice alone was tried first and measured: it reached the model
+            // twenty-two times in one live run and the share of calls that repeated an
+            // actor's own exact input did not move. Telling a model that polling is
+            // expensive is advice; the model has already decided what it needs by the
+            // time it reads the result.
+            //
+            // At an unchanged revision the honest answer to "what is the state" is
+            // "the state you already have" - which is exactly what `after_revision`
+            // would have returned. Runtime serves that instead of re-sending the whole
+            // page, and names the ways to get more: a newer `after_revision`, a
+            // different query, or one exact `entry_ref`.
+            let revision = i64::try_from(revision).unwrap_or(i64::MAX);
+            value = json!({
+                "program_id": projection.program_id,
+                "revision": revision,
+                "unchanged": true,
+                "notice": "Runtime answered this with the same receipt `after_revision` \
+                           would have returned: the program revision has not moved since \
+                           your last identical query, so the state you already hold is \
+                           current. To wait cheaply, re-issue with \
+                           `after_revision: <revision>`, or with `wait_for_workers: true` \
+                           to park until a worker moves. For something specific, read one \
+                           exact `entry_ref` or ask a different query - a broad listing \
+                           is only re-sent when the revision actually advances."
+            });
         }
     }
     AgentActionObservation {

@@ -13,13 +13,23 @@ use harness_contract::goal::{
 use super::*;
 
 fn root(action_id: &str, action: AgentAction) -> AgentActionEnvelope {
+    root_in_turn("turn-1", action_id, action)
+}
+
+/// Same fixture, an isolated turn.
+///
+/// Every guard in this crate keys on the turn - the repetition ledger, the pattern
+/// window, the inspection memory - and libtest runs tests on parallel threads, so a
+/// shared turn lets one test's counters decide another test's outcome. The suite
+/// passed test-by-test and failed as a suite for exactly this reason.
+fn root_in_turn(turn_id: &str, action_id: &str, action: AgentAction) -> AgentActionEnvelope {
     AgentActionEnvelope {
         action_id: action_id.to_string(),
         actor: AgentActorBinding {
             objective_id: "objective-1".to_string(),
             program_id: "program-1".to_string(),
             session_id: "session-1".to_string(),
-            turn_id: "turn-1".to_string(),
+            turn_id: turn_id.to_string(),
             root_execution_id: Some("root-execution-1".to_string()),
             required_team_count: 0,
             exact_team_count: None,
@@ -1105,7 +1115,6 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
     assert_eq!(member["membership"]["membership_id"], membership);
 }
 
-#[test]
     /// A program-level read names the outstanding rungs, and names them from the
     /// same function the barrier checkpoint renders them from.
     ///
@@ -1117,9 +1126,10 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
     /// path is what turns "something is owed" into "this is what closes it".
     #[test]
     fn a_program_level_read_names_the_outstanding_rungs() {
+        let turn = "turn-rungs";
         let service = AgentActionService::new(Arc::new(RuntimeEventStore::for_test()));
         service
-            .apply(&root(
+            .apply(&root_in_turn(turn,
                 "rung-team",
                 AgentAction::TeamCreate(TeamCreateInput {
                     name: "Rung Team".to_string(),
@@ -1129,7 +1139,7 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
             ))
             .expect("team mutation");
         let page = service
-            .apply(&root(
+            .apply(&root_in_turn(turn,
                 "rung-inspect",
                 AgentAction::StateInspect(StateInspectInput {
                     query: None,
@@ -1165,6 +1175,84 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
             serde_json::Value::Array(crate::host::closure_rungs_for_program(&program)),
             page["next_rungs"].clone(),
             "both paths must render the same rungs"
+        );
+    }
+
+    /// The second identical read at an unchanged revision is answered with the cheap
+    /// receipt, not with the whole page again.
+    ///
+    /// A notice alone was tried and measured: it reached the model twenty-two times in
+    /// one live run and the share of calls that repeated an actor's own exact input did
+    /// not move. At an unchanged revision the honest answer to "what is the state" is
+    /// "the state you already have", which is what `after_revision` would have
+    /// returned. Runtime now serves that, and names the ways to get more.
+    #[test]
+    fn a_repeated_read_at_an_unchanged_revision_is_answered_cheaply() {
+        let turn = "turn-cheap";
+        let service = AgentActionService::new(Arc::new(RuntimeEventStore::for_test()));
+        service
+            .apply(&root_in_turn(turn,
+                "cheap-team",
+                AgentAction::TeamCreate(TeamCreateInput {
+                    name: "Cheap Team".to_string(),
+                    mission: "hold state that does not move".to_string(),
+                    objective: None,
+                }),
+            ))
+            .expect("team mutation");
+        let request = || AgentAction::StateInspect(StateInspectInput {
+            query: None,
+            wait_for_workers: false,
+            scope_ref: None,
+            after_revision: None,
+            page_cursor: None,
+            entry_ref: None,
+        });
+        let first = service
+            .apply(&root_in_turn(turn,"cheap-first", request()))
+            .expect("first read")
+            .projection
+            .expect("program page");
+        assert!(
+            first.get("entries").is_some() || first.get("next_rungs").is_some(),
+            "the first read is a real page: {first}"
+        );
+        let second = service
+            .apply(&root_in_turn(turn,"cheap-second", request()))
+            .expect("second read")
+            .projection
+            .expect("program page");
+        assert_eq!(
+            second["unchanged"],
+            serde_json::json!(true),
+            "an unchanged revision must be answered with the cheap receipt: {second}"
+        );
+        assert!(
+            second["notice"]
+                .as_str()
+                .is_some_and(|notice| notice.contains("after_revision")),
+            "and it must name how to wait cheaply or ask for something specific: {second}"
+        );
+        // The full page is still reachable the moment anything moves.
+        service
+            .apply(&root_in_turn(turn,
+                "cheap-move",
+                AgentAction::TeamCreate(TeamCreateInput {
+                    name: "Cheap Team Two".to_string(),
+                    mission: "advance the revision".to_string(),
+                    objective: None,
+                }),
+            ))
+            .expect("team mutation");
+        let third = service
+            .apply(&root_in_turn(turn,"cheap-third", request()))
+            .expect("third read")
+            .projection
+            .expect("program page");
+        assert_ne!(
+            third["unchanged"],
+            serde_json::json!(true),
+            "a moved revision must re-send the page: {third}"
         );
     }
 
