@@ -1522,8 +1522,25 @@ where
         // — so the verified Objective terminal exists and this presentation
         // defers to it instead of failing.
         observe_stage!("completion_gap_and_objective_drive");
+        // `Satisfied` alone left a hole the size of a whole failure mode. A root
+        // that gives up early - `Partial`, "here is what I managed" - skipped this
+        // entire block, including the closure-rung rollback below, so a Program
+        // with unreviewed Submitted Tasks was never returned to work and its only
+        // closure authority was later fenced off by the root's own terminal graph.
+        // One live run recorded exactly that: three `partially_satisfied`
+        // terminals, two `review / root_graph_terminal` dispatch declines, zero
+        // reviews, zero accepted Tasks.
+        //
+        // `Partial` is a claim about the Objective, not about the Program, and the
+        // Program is what says whether the work is finished. Both claims now reach
+        // the same check; the checks themselves are unchanged and still bounded, so
+        // a genuinely finished or genuinely blocked Program falls straight through.
         if execution_role.owns_root_presentation()
-            && completion == harness_contract::goal::GoalCompletion::Satisfied
+            && matches!(
+                completion,
+                harness_contract::goal::GoalCompletion::Satisfied
+                    | harness_contract::goal::GoalCompletion::Partial
+            )
         {
             // First make any durable Program completion request visible to the
             // authoritative GoalStore. The gap check must observe that verdict;
@@ -1622,10 +1639,22 @@ where
                 &session_id,
                 &turn_id,
             ) {
-                let outstanding = super::outstanding_closure_steps(&program)
-                    .into_iter()
-                    .filter(|step| step != "objective_complete_request")
-                    .collect::<Vec<_>>();
+                // Only a Program that is still live can be returned to work. A
+                // Verified or Blocked Program has already said its piece, and
+                // re-opening it here would turn an honest terminal into a loop.
+                // Same predicate `root_agentic_terminal_action` uses.
+                let program_still_live = matches!(
+                    program.status,
+                    crate::AgenticProgramStatus::Open | crate::AgenticProgramStatus::Waiting
+                );
+                let outstanding = if program_still_live {
+                    super::outstanding_closure_steps(&program)
+                        .into_iter()
+                        .filter(|step| step != "objective_complete_request")
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
                 {
                     let mut state = self.state.lock().await;
                     state.outstanding_closure_rungs = outstanding.clone();

@@ -360,6 +360,22 @@ fn task_status_str(status: super::super::program::AgenticTaskStatus) -> String {
         .unwrap_or_else(|| format!("{status:?}"))
 }
 
+/// Whether this dispatch may proceed even though the owning root's execution
+/// graph is already terminal.
+///
+/// The root-terminal fence stops a root that already left from having fresh
+/// execution started in its name. An owed review is not fresh execution: the Task
+/// was commissioned by that root, its deliverable is already in, and review is the
+/// Program's only closure authority. Refusing it strands the Program permanently -
+/// one live run recorded two `review / root_graph_terminal` declines after its root
+/// concluded, and zero Tasks ever reached `Accepted`.
+///
+/// Everything else - starting execution, opening a coordination round - stays
+/// fenced, because those genuinely are new work in a departed root's name.
+fn owed_review_survives_root_terminal(mode: DispatchMode, status: AgenticTaskStatus) -> bool {
+    mode == DispatchMode::Review && status == AgenticTaskStatus::Submitted
+}
+
 impl RuntimeServices {
     /// Record why Runtime declined to dispatch one Task, and return.
     ///
@@ -396,6 +412,7 @@ impl RuntimeServices {
             });
         Ok(Vec::new())
     }
+
 
     /// Reconsider durable ready work after a physical member exits. Busy
     /// admissions remain in the original journal; no timer or second queue
@@ -1326,18 +1343,29 @@ impl RuntimeServices {
                 .await
                 .map_err(|error| format!("agentic_dispatch_root_unavailable:{root_id}:{error}"))?;
             if agentic_graph_is_terminal(&graph) {
-                return self
-                    .decline_dispatch(
-                        &projection.program_id,
-                        task_ref,
-                        mode,
-                        crate::agentic::action_service::AgenticDispatchDeclineReason::RootGraphTerminal,
-                        &task_status_str(task.status),
-                        0,
-                        0,
-                        0,
-                        task.review_generation,
-                    );
+                // An owed review is not new business work. The fence exists so a
+                // root that already left cannot have fresh execution started in
+                // its name; it must not also strand the Program's only closure
+                // authority. A Submitted Task's deliverable is already in, the
+                // root commissioned that Task, and review is the single action
+                // that can retire it. Refusing the review here leaves the Program
+                // permanently open with no actor able to close it - one live run
+                // recorded exactly two `review / root_graph_terminal` declines
+                // after its root concluded, and zero Tasks ever reached Accepted.
+                if !owed_review_survives_root_terminal(mode, task.status) {
+                    return self
+                        .decline_dispatch(
+                            &projection.program_id,
+                            task_ref,
+                            mode,
+                            crate::agentic::action_service::AgenticDispatchDeclineReason::RootGraphTerminal,
+                            &task_status_str(task.status),
+                            0,
+                            0,
+                            0,
+                            task.review_generation,
+                        );
+                }
             }
             Some(graph)
         } else {
@@ -2137,4 +2165,55 @@ pub(crate) fn execution_graph_id(id: &str) -> &str {
     // One source: the store entry itself normalizes, so this is the same rule, not
     // a second copy that can drift from it.
     crate::execution_core::graph::graph_id_for_lookup(id)
+}
+
+#[cfg(test)]
+mod root_terminal_fence_tests {
+    use super::*;
+
+    /// An owed review outlives the root's terminal graph; everything else does not.
+    ///
+    /// This is the single condition that decided whether a Program could ever
+    /// close. One live run's root concluded `partially_satisfied`, its two
+    /// Submitted Tasks then asked for review, and both requests were declined
+    /// `root_graph_terminal` - so the Program's only closure authority was fenced
+    /// off by the root's own departure and nothing ever reached `Accepted`.
+    #[test]
+    fn an_owed_review_survives_the_roots_terminal_graph() {
+        assert!(
+            owed_review_survives_root_terminal(DispatchMode::Review, AgenticTaskStatus::Submitted),
+            "a Submitted Task's review is owed, not new work"
+        );
+    }
+
+    #[test]
+    fn everything_else_stays_fenced() {
+        // Fresh execution in a departed root's name is exactly what the fence is for.
+        assert!(!owed_review_survives_root_terminal(
+            DispatchMode::Execute,
+            AgenticTaskStatus::Submitted
+        ));
+        assert!(!owed_review_survives_root_terminal(
+            DispatchMode::Execute,
+            AgenticTaskStatus::Published
+        ));
+        // A review of work that has not been delivered yet has nothing to review.
+        assert!(!owed_review_survives_root_terminal(
+            DispatchMode::Review,
+            AgenticTaskStatus::Claimed
+        ));
+        assert!(!owed_review_survives_root_terminal(
+            DispatchMode::Review,
+            AgenticTaskStatus::Published
+        ));
+        // A review that already landed is not owed again.
+        assert!(!owed_review_survives_root_terminal(
+            DispatchMode::Review,
+            AgenticTaskStatus::Accepted
+        ));
+        assert!(!owed_review_survives_root_terminal(
+            DispatchMode::Coordination(1),
+            AgenticTaskStatus::Submitted
+        ));
+    }
 }

@@ -2420,13 +2420,13 @@ fn inspected_observation(
     } else {
         None
     };
-    let value = if goal.is_none()
+    let unchanged = goal.is_none()
         && input.after_revision == Some(projection.revision)
         && input.entry_ref.is_none()
         && input.scope_ref.is_none()
         && input.page_cursor.is_none()
-        && input.query.is_none()
-    {
+        && input.query.is_none();
+    let mut value = if unchanged {
         json!({
             "program_id": projection.program_id,
             "revision": projection.revision,
@@ -2445,6 +2445,31 @@ fn inspected_observation(
             }
         }
     };
+    // Name the outstanding rungs on a program-level read, from the same function
+    // the barrier checkpoint renders them from.
+    //
+    // `state_inspect` used to return bounded state pages and nothing else, so the
+    // one authoritative statement of what to do next existed only on the barrier
+    // path. A root that polled instead of waiting was therefore told that a rung
+    // was owed - the model-step invariant forces a tool call whenever one is -
+    // without ever being told which. One live run, forced to call something and
+    // given nothing to aim at, issued the same generic `{"query": "task"}` five
+    // times while two of its Tasks sat Submitted and unreviewed, and its next rung
+    // was `independent_review` the whole time.
+    //
+    // Not attached to the `unchanged` receipt: that path exists to stay a few
+    // bytes, and an unchanged revision means unchanged rungs, which the reader
+    // already has from the page that produced this revision.
+    if !unchanged && input.entry_ref.is_none() && input.scope_ref.is_none() {
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "next_rungs".to_string(),
+                serde_json::Value::Array(crate::host::closure_rungs_for_program(
+                    projection,
+                )),
+            );
+        }
+    }
     AgentActionObservation {
         receipt_id: format!(
             "observation:{}:{}",

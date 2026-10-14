@@ -2489,6 +2489,31 @@ pub(super) fn agentic_turn_framing(
     }
 }
 
+/// The outstanding closure rungs as the model reads them, from the one function
+/// that computes them.
+///
+/// The barrier path renders these inside the checkpoint projection. The polling
+/// path (`state_inspect`) used to render nothing but bounded state pages, so a
+/// root that stopped consulting the barrier and polled instead lost the only
+/// authoritative statement of what to do next: one live run polled the same
+/// generic query five times while two of its Tasks sat Submitted and unreviewed,
+/// because nothing on the polling path ever said the next rung was
+/// `independent_review`. Both paths now read this one function, so they cannot
+/// disagree about what is outstanding.
+///
+/// `completion_gap` is deliberately not threaded here: every rung is derived from
+/// the Program projection alone, so passing `None` yields the identical rungs
+/// while keeping this callable from a layer that has no Goal store.
+#[must_use]
+pub(crate) fn closure_rungs_for_program(
+    program: &crate::AgenticProgramProjection,
+) -> Vec<serde_json::Value> {
+    agentic_closure_view(program, None)["remaining"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// One-line summary used by the root re-drive and the deferred-protocol
 /// continuation so the model sees the outstanding rungs without parsing a whole
 /// checkpoint blob.

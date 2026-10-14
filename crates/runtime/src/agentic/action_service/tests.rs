@@ -1106,6 +1106,107 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
 }
 
 #[test]
+    /// A program-level read names the outstanding rungs, and names them from the
+    /// same function the barrier checkpoint renders them from.
+    ///
+    /// The model-step invariant already forces a tool call whenever a rung is
+    /// owed, but it never said which one. A root that was forced to call something
+    /// and given nothing to aim at issued the same generic `{"query": "task"}` five
+    /// times while two of its Tasks sat Submitted and unreviewed, and its next rung
+    /// was `independent_review` the whole time. Reading the rungs on the polling
+    /// path is what turns "something is owed" into "this is what closes it".
+    #[test]
+    fn a_program_level_read_names_the_outstanding_rungs() {
+        let service = AgentActionService::new(Arc::new(RuntimeEventStore::for_test()));
+        service
+            .apply(&root(
+                "rung-team",
+                AgentAction::TeamCreate(TeamCreateInput {
+                    name: "Rung Team".to_string(),
+                    mission: "hold a task that still owes its review".to_string(),
+                    objective: None,
+                }),
+            ))
+            .expect("team mutation");
+        let page = service
+            .apply(&root(
+                "rung-inspect",
+                AgentAction::StateInspect(StateInspectInput {
+                    query: None,
+                    wait_for_workers: false,
+                    scope_ref: None,
+                    after_revision: None,
+                    page_cursor: None,
+                    entry_ref: None,
+                }),
+            ))
+            .expect("program page")
+            .projection
+            .expect("bounded index page");
+        let rungs = page
+            .get("next_rungs")
+            .and_then(serde_json::Value::as_array)
+            .expect("a program-level read must name the outstanding rungs");
+        let steps = rungs
+            .iter()
+            .filter_map(|rung| rung.get("step").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(
+            steps.contains(&"publish_task"),
+            "no Task is published yet, so that rung must be named: {steps:?}"
+        );
+        // The rungs are the barrier view's own, not a second derivation of them.
+        let program = service
+            .project_if_exists("program-1")
+            .ok()
+            .flatten()
+            .expect("program projection");
+        assert_eq!(
+            serde_json::Value::Array(crate::host::closure_rungs_for_program(&program)),
+            page["next_rungs"].clone(),
+            "both paths must render the same rungs"
+        );
+    }
+
+    /// An exact-entity read and the `unchanged` receipt stay narrow.
+    ///
+    /// The `unchanged` receipt exists to be a few bytes; attaching rungs to it
+    /// would defeat the cheap-wait path. An exact read is about one entity, and a
+    /// reader that asked for one Task does not need the Program's rung list.
+    #[test]
+    fn exact_and_unchanged_reads_stay_narrow() {
+        let service = AgentActionService::new(Arc::new(RuntimeEventStore::for_test()));
+        service
+            .apply(&root(
+                "narrow-team",
+                AgentAction::TeamCreate(TeamCreateInput {
+                    name: "Narrow Team".to_string(),
+                    mission: "hold one task".to_string(),
+                    objective: None,
+                }),
+            ))
+            .expect("team mutation");
+        let exact = service
+            .apply(&root(
+                "narrow-exact",
+                AgentAction::StateInspect(StateInspectInput {
+                    query: None,
+                    wait_for_workers: false,
+                    scope_ref: Some("program-1".to_string()),
+                    after_revision: None,
+                    page_cursor: None,
+                    entry_ref: None,
+                }),
+            ))
+            .expect("exact read")
+            .projection
+            .expect("exact page");
+        assert!(
+            exact.get("next_rungs").is_none(),
+            "an exact-entity read must stay narrow: {exact}"
+        );
+    }
+
 fn state_inspect_pages_indexes_and_never_falls_back_to_full_program_dump() {
     let service = AgentActionService::new(Arc::new(RuntimeEventStore::for_test()));
     for index in 0..33 {
