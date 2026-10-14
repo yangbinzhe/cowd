@@ -2888,6 +2888,50 @@
         );
     }
 
+    /// The persistent text-only route is the one that disarms a model, so that is the
+    /// one that is projected. A unit test cannot reach it without a full verified
+    /// collaboration terminal, which is what production sets it from; the projection
+    /// itself is asserted against a live run rather than simulated here.
+    ///
+    /// What this test does pin is that the one-shot route is NOT projected: a
+    /// deliberate single text-only request is not a signal, and projecting it would
+    /// make the monitor's consecutive-round count meaningless.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_one_shot_text_only_request_is_not_projected_as_a_signal() {
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        let store = Arc::clone(services.event_store());
+        let runtime = crate::ConversationRuntime::new(
+            Session::new(),
+            FinalAnswerClient,
+            NoopToolExecutor,
+            PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
+            vec!["answer directly".to_string()],
+        )
+        .without_memory()
+        .with_runtime_event_store(Arc::clone(&store));
+
+        let (_runtime, result) = submit_test_owned_conversation_turn(
+            runtime,
+            Arc::clone(&services),
+            "conclude from retained evidence",
+            &SharedPrompter::none(),
+            test_execution_lineage(),
+        )
+        .await;
+        result.expect("the turn must complete");
+
+        let projected = store
+            .all_events(512)
+            .expect("read the durable event log")
+            .into_iter()
+            .filter(|event| event.kind == "model.request.text_only")
+            .count();
+        assert_eq!(
+            projected, 0,
+            "a one-shot text-only request is by design and must not be projected"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn reasoning_only_normal_step_continues_before_terminal_recovery() {
         let services = crate::RuntimeServices::in_memory().expect("runtime services");

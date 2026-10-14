@@ -2067,7 +2067,7 @@ where
         Ok(())
     }
 
-    pub(super) fn append_execution_runtime_event(
+    pub(crate) fn append_execution_runtime_event(
         &self,
         scope: RuntimeEventScope,
         kind: &'static str,

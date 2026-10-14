@@ -1207,7 +1207,52 @@ where
                     }
                 }
             }
+            let (state_iterations, state_completion_gap_outstanding, state_owed_rungs) = {
+                let state = self.state.lock().await;
+                (
+                    state.iterations,
+                    state.completion_gap_outstanding,
+                    state.outstanding_closure_rungs.clone(),
+                )
+            };
+            // Only the persistent route is projected here.
+            //
+            // The one-shot `require_next_model_final_response` is a deliberate single
+            // request and needs no projection. `force_text_only_next_model` survives
+            // across rounds, and that is the shape that disarms a model: one live run
+            // spent six consecutive rounds with a zero-byte tool array while every
+            // outer metric stayed healthy. A monitor cannot tell a deliberate terminal
+            // synthesis from a framework that disarmed the model by looking at one
+            // request, but it can count a run of them with no progress between.
             if force_text_only_response && !mandatory_action_outstanding && !force_tool_call {
+                // Project the decision, not just take it.
+                //
+                // One live run spent six consecutive rounds with a zero-byte tool
+                // array and told the model six times that it had no tools, while every
+                // outer metric - cursor, revision, team completed - stayed healthy. The
+                // evaluator could not see it because the state that caused it lives in
+                // this process, and nothing wrote it anywhere a monitor could read.
+                //
+                // `tool_array_bytes` was measurable only after the fact, from provider
+                // attempts. This is the same fact at the moment Runtime decides it,
+                // which is the only point at which anything could still act.
+                runtime.append_execution_runtime_event(
+                    crate::RuntimeEventScope::Tool,
+                    "model.request.text_only",
+                    Some("text_only".to_string()),
+                    vec![crate::RuntimeEventRef {
+                        kind: "execution_node".to_string(),
+                        id: ticket.node_id.clone(),
+                    }],
+                    serde_json::json!({
+                        "graph_id": ticket.graph_id,
+                        "iteration": state_iterations,
+                        "reason": "text-only checkpoint with no owed action",
+                        "completion_gap_outstanding": state_completion_gap_outstanding,
+                        "owed_rungs": state_owed_rungs,
+                        "note": "this request exposes no tool schema; a run that repeats it is a model the framework has disarmed"
+                    }),
+                );
                 runtime.require_next_model_final_response();
             } else if let Some(tool_ids) = force_tool_allowlist {
                 runtime.require_next_model_tool_action(tool_ids);
