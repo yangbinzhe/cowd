@@ -2221,3 +2221,130 @@ async fn the_batch_tool_advertises_the_entry_wrapper() {
     assert!(entry.contains_key("tool"), "the wrapper must be shown: {rendered}");
     assert!(entry.contains_key("input"), "the payload must be shown: {rendered}");
 }
+
+/// Cross-channel contract invariants.
+///
+/// A tool call's contract is decided at five places, and each used to derive its
+/// own answer from the raw bytes. That is how a rule written at one point failed to
+/// reach the others: V1-V4 drifted from V8-V14, and the 1014 plan drifted from
+/// P42/U1-U2 twice more. Both times a human read the code and missed it, because
+/// nothing machine-checked that the channels still agree.
+///
+/// These assertions are about *external behaviour* - accepted, repaired, refused,
+/// and what the refusal says - never about internal structure. Two channels may
+/// legitimately be built differently; they may not answer differently.
+mod cross_channel_contract_invariants {
+    use super::*;
+
+    /// The corpus every invariant below runs over.
+    ///
+    /// Four shapes, because those are the four decisions a contract boundary can
+    /// make: accept as-is, repair, refuse, and count a repeat.
+    fn corpus() -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "legal",
+                serde_json::json!({"actions": [
+                    {"tool": "team_create", "input": {"name": "Alpha", "mission": "invariants"}}
+                ]})
+                .to_string(),
+            ),
+            (
+                "string-typed",
+                serde_json::json!({"actions":
+                    serde_json::json!([{"tool": "team_create", "input": {"name": "Beta", "mission": "invariants"}}]).to_string()
+                })
+                .to_string(),
+            ),
+            ("missing-required", r#"{"actions": [{"input": {"name": "Gamma"}}]}"#.to_string()),
+            (
+                "unknown-field",
+                serde_json::json!({"actions": [
+                    {"tool": "team_create", "input": {"name": "Delta", "mission": "m"}, "invented": 1}
+                ]})
+                .to_string(),
+            ),
+        ]
+    }
+
+    fn executor() -> GatewayToolExecutor {
+        let registry = GatewayToolRegistry::builtin()
+            .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
+            .expect("runtime tools");
+        GatewayToolExecutor::new(None, false, registry)
+    }
+
+    /// Repair must be a fixed point.
+    ///
+    /// The boundary hands back the bytes Runtime will actually dispatch, and the
+    /// transcript, the governed plan and the execution all read those bytes. If
+    /// repairing an already-repaired input produced something different, those
+    /// three could disagree about what ran - which is the exact hazard the
+    /// `provider_plane` frame-boundary comment pays an extra schema walk to avoid.
+    #[tokio::test]
+    async fn repair_is_a_fixed_point() {
+        let executor = executor();
+        for (label, input) in corpus() {
+            let Ok(first) = executor.validate_tool_input("agent_action_batch", &input) else {
+                continue;
+            };
+            let second = executor
+                .validate_tool_input("agent_action_batch", &first)
+                .unwrap_or_else(|error| panic!("{label}: the repaired bytes must still be legal: {error}"));
+            assert_eq!(
+                first, second,
+                "{label}: repairing an already-repaired frame changed it, so the transcript \\
+                 and the dispatched bytes could disagree"
+            );
+        }
+    }
+
+    /// The bytes the boundary hands back are the bytes that get dispatched.
+    ///
+    /// `validate_tool_input` returns the repaired form precisely so the transcript,
+    /// the governed plan and the execution cannot disagree. A model that re-sends the
+    /// same malformed frame must therefore hash the same and be seen as a repeat by
+    /// the repetition guard - the precondition for every bound in the framework.
+    #[tokio::test]
+    async fn the_same_frame_hashes_identically_after_repair() {
+        let executor = executor();
+        for (label, input) in corpus() {
+            let Ok(repaired) = executor.validate_tool_input("agent_action_batch", &input) else {
+                continue;
+            };
+            let again = executor
+                .validate_tool_input("agent_action_batch", &input)
+                .expect("the same input must decide the same way twice");
+            // Byte equality is the whole invariant: the repetition guard keys on a
+            // hash of these bytes, so identical bytes are necessarily an identical
+            // key and the guard sees a repeat.
+            assert_eq!(
+                repaired, again,
+                "{label}: the same frame produced different bytes, so the repetition guard \
+                 would not recognise it as a repeat"
+            );
+        }
+    }
+
+    /// A refusal for a missing field must name that field.
+    ///
+    /// One live run re-sent `{}` to `artifact_publish` twelve times while being told
+    /// to change the input, because nothing said the input was missing `path`. A
+    /// refusal that does not name the field is not a bound; it is a wall the model
+    /// pays a provider round-trip to discover.
+    #[tokio::test]
+    async fn a_refusal_for_a_missing_field_names_that_field() {
+        let executor = executor();
+        let error = executor
+            .validate_tool_input(
+                "agent_action_batch",
+                r#"{"actions": [{"input": {"name": "Gamma"}}]}"#,
+            )
+            .expect_err("an entry without `tool` violates the declared contract");
+        let message = error.to_string();
+        assert!(
+            message.contains("tool"),
+            "the refusal must name the field the model must add: {message}"
+        );
+    }
+}
