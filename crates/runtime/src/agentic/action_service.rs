@@ -2533,8 +2533,24 @@ fn inspected_observation(
         let mut answer = value.clone();
         strip_envelope_fields(&mut answer);
         let state_token = serde_json::to_string(&answer).unwrap_or_default();
+        // Keyed on the actor's execution, not its turn.
+        //
+        // A delegated Agent issues each model step as its own turn, so a turn-keyed
+        // memory is empty at every step and can never see that the agent already
+        // asked. One live run polled the identical `state_inspect {"query":
+        // "task:X"}` eleven times across turn_index 18 through 22, with an
+        // entity-level token already in place, and nothing fired - because every
+        // one of those was a different turn.
+        //
+        // The execution id is the agent's own graph, which is stable for the whole
+        // run and is exactly the scope in which "you already asked" is true.
+        let inspection_scope = envelope
+            .actor
+            .execution_id
+            .clone()
+            .unwrap_or_else(|| envelope.actor.turn_id.clone());
         if crate::repetition_guard::record_unchanged_inspection(
-            &envelope.actor.turn_id,
+            &inspection_scope,
             &input_hash,
             &state_token,
         ) {
