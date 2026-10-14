@@ -2967,6 +2967,7 @@ where
                 // that governs tools decide whether the next node retries,
                 // changes strategy, or produces an honest blocked result.
                 let protocol_failure = error.is_provider_tool_protocol_failure();
+                let repeated_frame_refusal = error.is_repeated_tool_frame_refusal();
                 let tool_exposure_miss = error.is_tool_exposure_miss();
                 let provider_failure_scope = error.provider_failure_scope();
                 let terminal_provider_route_failure = provider_failure_scope.route_is_unavailable();
@@ -3045,6 +3046,19 @@ where
                     // before requesting its required escalation; synthesizing
                     // at that point discards the one governed retry and makes
                     // the terminal obligation impossible to satisfy.
+                    // Runtime already spent the governed repair the moment it
+                    // answered the first identical frame in-step with the exact
+                    // shape to send. Recording that here is what stops the
+                    // terminal narration from calling the same provider once
+                    // more merely to describe a defect the model was already
+                    // told how to fix - the guard in `terminal_narrated_answer`
+                    // keys on this counter and would otherwise see an unspent
+                    // budget.
+                    if repeated_frame_refusal {
+                        state.provider_protocol_recovery_attempts = state
+                            .provider_protocol_recovery_attempts
+                            .max(PROVIDER_PROTOCOL_RECOVERY_BUDGET + 1);
+                    }
                     let protocol_attempt = (protocol_failure
                         && (!post_receipt_failure || tool_exposure_miss))
                         .then(|| {
@@ -3139,7 +3153,21 @@ where
                         pending_delegated_protocol,
                     )
                 };
-                let intervention = if terminal_provider_route_failure {
+                let intervention = if repeated_frame_refusal {
+                    // The most specific signal wins. Runtime already answered
+                    // this exact frame in-step with the shape to send and the
+                    // model re-sent it unchanged, so the governed single retry
+                    // would buy one more identical frame. Stop here rather than
+                    // paying a provider round-trip to be told the same thing a
+                    // third time.
+                    RuntimeIntervention {
+                        goal_id: goal_id.clone(),
+                        kind: RuntimeInterventionKind::Block,
+                        reason: "provider re-sent a tool frame Runtime had already refused and answered with the exact shape to send; the frame was not executed and no further retry is granted".to_string(),
+                        evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
+                        expected_graph_revision: None,
+                    }
+                } else if terminal_provider_route_failure {
                     terminal_provider_route_intervention(&goal_id, ticket, provider_failure_scope)
                 } else if protocol_closed_after_receipt {
                     RuntimeIntervention {

@@ -2241,27 +2241,45 @@
             "input-contract recovery retained the objective"
         );
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        // The refusal is answered in-step, so the second request carries the
+        // tool result Runtime produced for the model's own malformed frame
+        // rather than a host-authored replan directive. This is what makes the
+        // defect learnable: the model reads its exact call back, next to the
+        // reason it did not run and the shape to send instead.
+        // The refusal travels as a Tool-role message bound to the model's own
+        // ToolUse id, which is where a provider expects a tool result. Putting
+        // it in the system prompt instead would leave the frame unanswered.
         assert!(requests
             .lock()
             .expect("captured requests")
             .get(1)
             .is_some_and(|request| request
-                .prompt
-                .trusted_system
+                .messages
                 .iter()
-                .chain(
-                    request
-                        .prompt
-                        .contextual_packets
-                        .iter()
-                        .map(|packet| &packet.content),
-                )
-                .any(|fragment| fragment.contains("provider-protocol recovery"))));
+                .flat_map(|message| &message.blocks)
+                .any(|block| matches!(
+                    block,
+                    ContentBlock::ToolResult { tool_use_id, is_error: true, .. }
+                        if tool_use_id == "invalid-search"
+                ) && format!("{block:?}").contains("Runtime did not execute this call")
+                    && format!("{block:?}").contains("missing required field `query`"))));
         assert!(summary.tool_results.is_empty());
+        // The malformed ToolUse stays in the transcript, answered by an error
+        // tool result. Asserting it vanished was asserting the information loss.
         let transcript = runtime.session_snapshot().await.materialize_messages();
-        assert!(!transcript.iter().any(|message| message.blocks.iter().any(
-            |block| matches!(block, ContentBlock::ToolUse { id, .. } if id == "invalid-search")
-        )));
+        assert!(
+            transcript.iter().any(|message| message.blocks.iter().any(
+                |block| matches!(block, ContentBlock::ToolUse { id, .. } if id == "invalid-search")
+            )),
+            "the model's own refused frame must remain visible: {transcript:?}"
+        );
+        assert!(
+            transcript.iter().any(|message| message.blocks.iter().any(
+                |block| matches!(block, ContentBlock::ToolResult { tool_use_id, is_error: true, .. }
+                    if tool_use_id == "invalid-search")
+            )),
+            "the refused frame must carry the answer the model reads next: {transcript:?}"
+        );
     }
 
     /// A salvaged frame must be durable evidence and must be answered in-step.
@@ -2534,15 +2552,42 @@
         assert_eq!(summary.terminal_completion, GoalCompletion::Partial);
         // The fallback explanation follows the user's original language.
         assert!(summary.final_answer.contains("Model service issue"));
-        assert!(runtime
+        // The refused frame stays in the transcript and carries its answer.
+        //
+        // The previous assertion demanded that it disappear. That encoded the
+        // very defect this branch was rewritten to remove: the model's own
+        // calls became invisible, so nothing told it that its call had not run.
+        // What must not survive is an *unanswered* ToolUse - a frame the model
+        // emitted with no result under it is exactly the fracture that let a
+        // live run lose its whole objective with no trace of what it asked for.
+        let transcript = runtime
             .session_snapshot()
             .await
-            .materialize_messages()
+            .materialize_messages();
+        let refused_ids = transcript
             .iter()
-            .all(|message| !message.blocks.iter().any(|block| matches!(
-                block,
-                ContentBlock::ToolUse { id, .. } if id == "repeated-invalid-search"
-            ))));
+            .flat_map(|message| &message.blocks)
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, .. } if id == "repeated-invalid-search" => {
+                    Some(id.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !refused_ids.is_empty(),
+            "the refused frame must stay visible to the model: {transcript:?}"
+        );
+        for refused_id in &refused_ids {
+            assert!(
+                transcript.iter().any(|message| message.blocks.iter().any(|block| matches!(
+                    block,
+                    ContentBlock::ToolResult { tool_use_id, is_error: true, .. }
+                        if tool_use_id == refused_id
+                ))),
+                "every refused ToolUse must carry an error tool result naming the shape to send: {transcript:?}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -2175,7 +2175,7 @@ where
                     }
                 }
                 calls = executable_calls;
-            } else if let Some((call, error)) = calls
+            } else if let Some((_, error)) = calls
                 .iter()
                 .find_map(|call| invalid_arguments.get(&call.id).map(|error| (call, error)))
             {
@@ -2193,6 +2193,43 @@ where
                 // never dispatched has none by definition - so that kind is
                 // refused here for exactly the reason this record exists. A
                 // distinct kind says what actually happened and survives.
+                //
+                // Answering the model is the first half of the obligation. The
+                // second is a bound, and it has to be counted here rather than
+                // borrowed from the per-input ledger: a frame that never
+                // dispatched has no business spending the bound of a call that
+                // might later succeed. One identical malformed frame is
+                // answered so the model can fix it; the second fails closed, so
+                // a provider that cannot emit valid arguments costs two steps
+                // and not two hundred.
+                let mut repeated_refusal: Option<(String, String)> = None;
+                for rejected in &calls {
+                    if invalid_arguments.get(&rejected.id).is_none() {
+                        continue;
+                    }
+                    let refused_times = crate::repetition_guard::record_refused_frame(
+                        &self.active_turn_id(),
+                        &rejected.name,
+                        &rejected.input,
+                    );
+                    if refused_times > 1 && repeated_refusal.is_none() {
+                        repeated_refusal = Some((rejected.name.clone(), error.clone()));
+                    }
+                }
+                if let Some((repeated_tool, repeated_error)) = repeated_refusal {
+                    return Err(RuntimeError::with_provider_failure_metadata(
+                        format!(
+                            "tool_protocol_violation: provider supplied invalid arguments for exposed tool `{repeated_tool}` twice without correcting them: {repeated_error}"
+                        ),
+                        None,
+                        true,
+                        crate::execution_core::graph::ResourceResultClass::Failed,
+                    )
+                    .with_provider_usage(usage)
+                    .with_effect_receipts(early_tool_receipts)
+                    .with_repeated_tool_frame_refusal());
+                }
+                let mut refusal_results = Vec::with_capacity(calls.len());
                 for rejected in &calls {
                     let Some(reason) = invalid_arguments.get(&rejected.id) else {
                         continue;
@@ -2201,14 +2238,17 @@ where
                     // branch does: the refusal becomes a tool result the model
                     // reads on its next step, carrying the exact shape to send.
                     //
-                    // This branch used to record the decline and return an `Err`
-                    // that named nothing the model could act on, so a model whose
-                    // frame was refused could not tell that its call had not run:
-                    // one live run sent the same malformed `agent_action_batch`
-                    // twice, was refused twice, and concluded "the tool call
-                     // format violated the schema" - having never been told, in
-                    // its own transcript, that nothing had executed.
-                    let message = ConversationMessage::tool_result(
+                    // It has to travel as a `preflight_tool_result`, NOT as a
+                    // session write. The model-step node truncates the session
+                    // back to its entry length after every step
+                    // (`host_backend.rs:1362`) and republishes only
+                    // `assistant_message` plus `preflight_tool_results` - so a
+                    // message pushed here is discarded before the model ever
+                    // sees it. One live run proved it: four frames were refused,
+                    // four declines were recorded durably, and the transcript
+                    // showed the assistant's malformed ToolUse with no tool
+                    // result under it at all.
+                    refusal_results.push(ConversationMessage::tool_result(
                         rejected.id.clone(),
                         rejected.name.clone(),
                         format!(
@@ -2217,18 +2257,7 @@ where
                              Send the same intended action again in the exact shape above."
                         ),
                         true,
-                    );
-                    self.session
-                        .write()
-                        .await
-                        .push_message(message.clone())
-                        .map_err(|error| {
-                            RuntimeError::new(error.to_string())
-                                .with_effect_receipts(early_tool_receipts.clone())
-                        })?;
-                    let sequence = self.session_head().await.message_count.wrapping_sub(1);
-                    self.record_message_event(&message, sequence);
-                    self.remember_tool_trace_from_message(&message);
+                    ));
                     let invocation_id = format!(
                         "tool-inv-{}",
                         crate::tool_invocation::stable_hash(&format!(
@@ -2278,19 +2307,74 @@ where
                 if let Some(callback) = &self.tool_callback {
                     callback.on_usage(&usage);
                 }
-                return Err(
-                    RuntimeError::with_provider_failure_metadata(
-                        format!(
-                            "tool_protocol_violation: provider supplied invalid arguments for exposed tool `{}`: {}",
-                            call.name, error
-                        ),
-                        None,
-                        true,
-                        crate::execution_core::graph::ResourceResultClass::Failed,
-                    )
-                    .with_provider_usage(usage)
-                    .with_effect_receipts(early_tool_receipts),
+                // Answer the step instead of failing it.
+                //
+                // Returning an `Err` here meant the model's own calls produced
+                // no assistant frame and no tool result: the transcript showed
+                // nothing at all for them, so the model could not tell its call
+                // had not run. codex turns the same defect into a
+                // `FunctionCallOutput` the model reads on its next step and sets
+                // `needs_follow_up`, so the turn continues rather than dying.
+                //
+                // The assistant frame still carries the model's own ToolUse
+                // blocks, so the transcript stays truthful about what it
+                // emitted; the refusals sit under them. The intent is a Replan
+                // so the next model step keeps its tools and is told what to
+                // fix, rather than being handed a terminal answer it never
+                // wrote.
+                let mut blocks = Vec::new();
+                if !public_reasoning.is_empty() {
+                    blocks.push(ContentBlock::ReasoningSummary {
+                        text: public_reasoning.clone(),
+                    });
+                }
+                if !private_reasoning.is_empty() || signature.is_some() {
+                    blocks.push(ContentBlock::Thinking {
+                        thinking: private_reasoning.clone(),
+                        signature: signature.clone(),
+                    });
+                }
+                blocks.push(ContentBlock::Text { text: text.clone() });
+                for call in &transcript_calls {
+                    blocks.push(ContentBlock::ToolUse {
+                        id: call.id.clone(),
+                        name: call.name.clone(),
+                        input: call.input.clone(),
+                    });
+                }
+                let assistant_message = ConversationMessage {
+                    role: crate::session::MessageRole::Assistant,
+                    blocks,
+                    usage: Some(usage),
+                };
+                self.consume_active_runtime_inputs_for_next_step(
+                    TurnInputCheckpoint::AfterProviderResponse,
                 );
+                return Ok(ModelStepResult {
+                    intent: ModelStepIntent::Replan {
+                        reason: format!(
+                            "Runtime refused every tool call in that response: {error}. \
+                             Each refused call has a tool result naming the exact shape to send. \
+                             Re-emit the same intended action(s) with the corrected arguments; \
+                             nothing from the refused frame executed."
+                        ),
+                    },
+                    assistant_message,
+                    preflight_tool_results: refusal_results,
+                    usage,
+                    model: effective_model.clone(),
+                    models_used: models_tried.clone(),
+                    first_token_latency_ms: first_event_at.map(|first| {
+                        u64::try_from(first.saturating_duration_since(stream_started).as_millis())
+                            .unwrap_or(u64::MAX)
+                    }),
+                    active_stream_duration_ms: first_event_at.map(|first| millis_since(first).max(1)),
+                    wall_duration_ms: millis_since(started_at).max(1),
+                    early_tool_receipts,
+                    early_tool_deferrals,
+                    response_completed_at_ms,
+                    text_only_response,
+                });
             }
             if discovery_activation_notice.is_some() {
                 if let Ok(mut notice) = self.next_model_tool_activation_notice.lock() {

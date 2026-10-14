@@ -227,6 +227,31 @@ fn repeated_call_key(turn_id: &str, tool_name: &str, input_hash: &str) -> String
     format!("repeat:{turn_id}:{tool_name}:{input_hash}")
 }
 
+/// Count one frame Runtime refused before dispatch, under its own namespace.
+///
+/// A refused frame must be answered in-step so the model can fix it, and it
+/// must also be bounded so a model that cannot fix it does not spin. Those are
+/// two different obligations and this counter exists for the second: the first
+/// identical refusal is answered, the second fails closed. It deliberately does
+/// not share the per-input ledger - a frame that was never dispatched has no
+/// business consuming the bound of a call that might later succeed.
+pub fn record_refused_frame(turn_id: &str, tool_name: &str, input: &str) -> usize {
+    let key = format!(
+        "refused:{turn_id}:{tool_name}:{}",
+        crate::tool_invocation::stable_hash(input)
+    );
+    let mut ledger = repetition_ledger()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = ledger.entry(key).or_insert(RepetitionState {
+        count: 0,
+        signature: String::new(),
+        state_derived: false,
+    });
+    entry.count = entry.count.saturating_add(1);
+    entry.count
+}
+
 /// The cumulative count so far, without recording a new call.
 pub fn repeated_call_count(turn_id: &str, tool_name: &str, input_hash: &str) -> usize {
     let key = repeated_call_key(turn_id, tool_name, input_hash);

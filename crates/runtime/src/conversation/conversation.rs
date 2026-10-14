@@ -2908,6 +2908,9 @@ pub struct RuntimeError {
     provider_retryable: bool,
     provider_usage: Option<TokenUsage>,
     effect_receipts: Vec<EarlyToolExecutionReceipt>,
+    /// Runtime already answered this exact malformed frame in-step and the
+    /// model re-sent it unchanged.
+    repeated_tool_frame_refusal: bool,
 }
 
 impl RuntimeError {
@@ -2925,6 +2928,7 @@ impl RuntimeError {
             provider_retryable: false,
             provider_usage: None,
             effect_receipts: Vec::new(),
+            repeated_tool_frame_refusal: false,
         }
     }
 
@@ -2945,6 +2949,7 @@ impl RuntimeError {
             provider_retryable: false,
             provider_usage: None,
             effect_receipts: Vec::new(),
+            repeated_tool_frame_refusal: false,
         }
     }
 
@@ -3007,6 +3012,7 @@ impl RuntimeError {
             provider_retryable,
             provider_usage: None,
             effect_receipts: Vec::new(),
+            repeated_tool_frame_refusal: false,
         }
     }
 
@@ -3026,6 +3032,7 @@ impl RuntimeError {
             provider_retryable: false,
             provider_usage: None,
             effect_receipts: Vec::new(),
+            repeated_tool_frame_refusal: false,
         }
     }
 
@@ -3060,6 +3067,24 @@ impl RuntimeError {
     #[must_use]
     pub const fn is_provider_tool_protocol_failure(&self) -> bool {
         self.provider_tool_protocol_failure
+    }
+
+    /// Mark the failure as a frame Runtime had already answered in-step.
+    ///
+    /// The host's protocol recovery exists for a model that has not yet been
+    /// told what was wrong. A frame that comes back byte-identical after
+    /// Runtime handed over the exact shape to send has been told, so spending
+    /// the single governed retry on it buys one more identical frame and
+    /// nothing else.
+    #[must_use]
+    pub const fn with_repeated_tool_frame_refusal(mut self) -> Self {
+        self.repeated_tool_frame_refusal = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn is_repeated_tool_frame_refusal(&self) -> bool {
+        self.repeated_tool_frame_refusal
     }
 
     #[must_use]
