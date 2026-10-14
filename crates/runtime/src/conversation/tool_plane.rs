@@ -1523,13 +1523,53 @@ where
         let repeated = crate::repetition_guard::repeated_call_count(&turn_id, tool_name, &input_hash);
         let repeated_refusal =
             repeated >= crate::repetition_guard::repeated_call_block_bound_for(tool_name, input);
+        // Measure the call pattern, but do not refuse on it alone.
+        //
+        // One live run read eight *different* artifacts in rotation, each input
+        // staying under its own bound, so no per-input breaker fired while the
+        // turn stood still - the stagnation monitor stopped the run because the
+        // framework's own guard would not. A tool dominating the recent window is
+        // the signal that case was missing.
+        //
+        // It is deliberately not a bound. An independent reviewer reading nine
+        // artifacts in a row produces the same dominance while doing exactly its
+        // job, and refusing that costs a real review. Dominance says the turn is
+        // cycling; only the absence of progress says the cycling is empty, and
+        // that verdict belongs to the guard that already measures progress. This
+        // records the measurement so that guard - and the operator - can see it.
+        let pattern_dominant =
+            crate::repetition_guard::observe_call_pattern(&turn_id, tool_name);
+        if pattern_dominant {
+            self.append_execution_runtime_event(
+                RuntimeEventScope::Tool,
+                "tool.call_pattern_dominant",
+                Some("observed".to_string()),
+                vec![
+                    RuntimeEventRef {
+                        kind: "tool_call".to_string(),
+                        id: tool_use_id.to_string(),
+                    },
+                    RuntimeEventRef {
+                        kind: "tool".to_string(),
+                        id: tool_name.to_string(),
+                    },
+                ],
+                serde_json::json!({
+                    "tool_name": tool_name,
+                    "turn_id": turn_id,
+                    "input_hash": input_hash,
+                    "identical_repeats": repeated,
+                    "note": "one tool dominates the recent call window; progress, not dominance, decides whether this is a loop",
+                }),
+            );
+        }
         let Some(refusal) = crate::repetition_guard::refusal_for(&turn_id, tool_name, &input_hash)
         else {
             if !repeated_refusal {
                 return None;
             }
             tracing::warn!(
-                %tool_name, %turn_id, repeated,
+                %tool_name, %turn_id, repeated, pattern_dominant,
                 "dispatch refused for a repeatedly identical successful call"
             );
             // The way out has to match the tool. Telling a model that polled

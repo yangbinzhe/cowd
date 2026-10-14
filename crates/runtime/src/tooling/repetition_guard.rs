@@ -63,6 +63,51 @@ fn repetition_ledger() -> &'static std::sync::Mutex<BTreeMap<String, RepetitionS
     LEDGER.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
 
+/// How many recent calls the pattern window holds.
+const PATTERN_WINDOW: usize = 12;
+
+/// How many of those may be the same tool before the window is a loop.
+///
+/// The per-input bound cannot see a model that rotates: one live run read eight
+/// different artifacts in rotation, every single input staying under its own
+/// bound of six, so no breaker fired while the turn made no progress. The
+/// stagnation monitor saw it and stopped the run; the framework's own guard did
+/// not. A pattern bound closes that gap without touching the per-input one.
+const PATTERN_DOMINANCE: usize = 9;
+
+/// Recent tool names for one turn, oldest first.
+fn pattern_window(turn_id: &str) -> &'static std::sync::Mutex<BTreeMap<String, Vec<String>>> {
+    static WINDOWS: OnceLock<std::sync::Mutex<BTreeMap<String, Vec<String>>>> = OnceLock::new();
+    WINDOWS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+/// Record one call in the turn's pattern window and report whether that tool now
+/// dominates it.
+///
+/// Dominance, not identity: the inputs may all differ and the turn is still
+/// going nowhere, which is precisely the case the per-input ledger is blind to.
+pub fn observe_call_pattern(turn_id: &str, tool_name: &str) -> bool {
+    let mut windows = pattern_window(turn_id)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let window = windows.entry(turn_id.to_string()).or_default();
+    window.push(tool_name.to_string());
+    if window.len() > PATTERN_WINDOW {
+        let excess = window.len() - PATTERN_WINDOW;
+        window.drain(..excess);
+    }
+    let occurrences = window.iter().filter(|name| *name == tool_name).count();
+    occurrences >= PATTERN_DOMINANCE
+}
+
+/// Forget one turn's pattern window, so a later turn starts clean.
+pub fn clear_call_pattern(turn_id: &str) {
+    pattern_window(turn_id)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(turn_id);
+}
+
 /// Consecutive identical **successful** calls tolerated before the model is told
 /// the call is not producing new information.
 ///
@@ -89,9 +134,6 @@ pub(crate) fn repeated_call_bound() -> usize {
 ///
 /// Returns `Some(count)` on the call that reaches the bound and on every call
 /// after it, so the caller can decide whether to say it once or every time.
-/// Returns `None` below the bound. The key is the same `(turn, tool, input_hash)`
-/// the failure ledger uses, so the two ledgers can never disagree about what
-/// "the same call" means.
 /// The cumulative count at which an identical call stops being dispatched.
 ///
 /// Deliberately above `repeated_call_bound`, so the model is told first and
@@ -134,6 +176,30 @@ pub(crate) fn repeated_call_block_bound_for(tool_name: &str, input: &str) -> usi
         .unwrap_or_else(|| repeated_call_bound().saturating_mul(multiplier))
 }
 
+/// Report a counter written under one turn and read under another.
+///
+/// The writer keys on the turn backend's `state.turn_id`; the reader keys on
+/// `ConversationRuntime::active_turn_id()`, which falls back to the session id
+/// when the input stream holds no active turn. When those two disagree the
+/// breaker is blind to the very loop it exists to stop, and nothing in the run
+/// says so. This makes the disagreement loud instead of silent.
+pub fn trace_repeated_call_key_mismatch(
+    writer_turn_id: &str,
+    reader_turn_id: &str,
+    tool_name: &str,
+    input_hash: &str,
+) {
+    if writer_turn_id != reader_turn_id {
+        tracing::warn!(
+            writer_turn_id,
+            reader_turn_id,
+            tool_name,
+            input_hash,
+            "repeated-call key mismatch: the counter is written under one turn and read under another, so this loop cannot be bounded"
+        );
+    }
+}
+
 /// Whether this input asks Runtime to wait for workers.
 ///
 /// Same question `call_declares_wait_for_workers` answers for a `ModelToolCall`,
@@ -150,9 +216,20 @@ fn input_declares_wait_for_workers(input: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The one place a repeated-call key is assembled.
+///
+/// It was written twice in this file and derived a third time by each caller,
+/// which is how a counter can be written under one turn and read under another:
+/// a live run showed the same `read_ref` dispatched eight times, refused, then
+/// dispatched again eighty milliseconds later. One assembly makes that drift
+/// impossible rather than merely unlikely.
+fn repeated_call_key(turn_id: &str, tool_name: &str, input_hash: &str) -> String {
+    format!("repeat:{turn_id}:{tool_name}:{input_hash}")
+}
+
 /// The cumulative count so far, without recording a new call.
 pub fn repeated_call_count(turn_id: &str, tool_name: &str, input_hash: &str) -> usize {
-    let key = format!("repeat:{turn_id}:{tool_name}:{input_hash}");
+    let key = repeated_call_key(turn_id, tool_name, input_hash);
     repetition_ledger()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -161,7 +238,7 @@ pub fn repeated_call_count(turn_id: &str, tool_name: &str, input_hash: &str) -> 
 }
 
 pub fn record_repeated_call(turn_id: &str, tool_name: &str, input_hash: &str) -> Option<usize> {
-    let key = format!("repeat:{turn_id}:{tool_name}:{input_hash}");
+    let key = repeated_call_key(turn_id, tool_name, input_hash);
     let mut ledger = repetition_ledger()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -535,6 +612,10 @@ pub fn clear_turn(turn_id: &str) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .retain(|key, _| !key.contains(needle.as_str()));
+    // The pattern window is keyed by the bare turn id, so it needs its own
+    // clear: a turn that inherits the previous turn's window starts already
+    // dominant and is refused for work it never did.
+    clear_call_pattern(turn_id);
 }
 
 /// Clear the breakers filed under one turn, but only for the role that owns it.
@@ -1278,5 +1359,122 @@ mod repetition_guard_tests {
             repeated_call_block_bound_for("read_file", wait),
             repeated_call_bound() * 2
         );
+    }
+}
+
+#[cfg(test)]
+mod pattern_window_tests {
+    use super::*;
+
+    /// A model that rotates inputs never trips a per-input bound. One live run
+    /// read eight different artifacts in turn, each under its own bound of six,
+    /// so nothing fired while the turn stood still - and the stagnation monitor
+    /// stopped the run because the framework's own guard would not.
+    #[test]
+    fn a_rotating_model_is_caught_by_the_pattern_window() {
+        let turn = "pattern-rotate";
+        clear_call_pattern(turn);
+        let mut tripped = false;
+        for index in 0..PATTERN_DOMINANCE {
+            // Every call is a different input, so the per-input ledger sees nine
+            // distinct calls and refuses none of them.
+            let tool = format!("read_ref-{index}");
+            tripped = observe_call_pattern(turn, &tool);
+        }
+        assert!(!tripped, "distinct tools are not a pattern");
+        for _ in 0..PATTERN_DOMINANCE {
+            if observe_call_pattern(turn, "read_ref") {
+                tripped = true;
+            }
+        }
+        assert!(tripped, "one tool dominating the window is a loop");
+        clear_call_pattern(turn);
+    }
+
+    /// The window must slide: a tool that was dominant long ago is not a loop
+    /// now, and a turn that inherits the previous turn's window would be refused
+    /// for work it never did.
+    #[test]
+    fn the_window_slides_and_a_turn_starts_clean() {
+        let turn = "pattern-slide";
+        clear_call_pattern(turn);
+        for issued in 1..PATTERN_DOMINANCE {
+            assert!(
+                !observe_call_pattern(turn, "read_ref"),
+                "call {issued} of {PATTERN_DOMINANCE} is not yet a loop"
+            );
+        }
+        assert!(
+            observe_call_pattern(turn, "read_ref"),
+            "the call that reaches dominance is the loop"
+        );
+        // Push the dominant tool out of the window with other work.
+        for index in 0..PATTERN_WINDOW {
+            observe_call_pattern(turn, &format!("other-{index}"));
+        }
+        assert!(
+            !observe_call_pattern(turn, "read_ref"),
+            "a tool pushed out of the window is no longer dominant"
+        );
+        clear_call_pattern(turn);
+        assert!(
+            !observe_call_pattern(turn, "read_ref"),
+            "a cleared turn starts empty"
+        );
+        clear_call_pattern(turn);
+    }
+
+    /// Dominance is a measurement, not a verdict.
+    ///
+    /// An independent reviewer reading nine artifacts in a row produces exactly
+    /// the dominance a rotating loop does, and refusing it costs a real review.
+    /// The per-input breaker must stay the only thing that refuses a call; the
+    /// window exists so the guard that measures progress can see the pattern.
+    #[test]
+    fn dominance_alone_does_not_refuse_a_call() {
+        let turn = "pattern-reviewer";
+        clear_call_pattern(turn);
+        // A reviewer's legitimate sequence: the same tool, nine *different*
+        // artifacts. Every input is seen once, so no per-input bound is anywhere
+        // near tripping - and this is exactly the shape a rotating loop takes,
+        // which is why the two need separating.
+        for index in 0..PATTERN_DOMINANCE {
+            let input = format!("{{\"reference\": \"artifact:{index}\"}}");
+            let hash = crate::tool_invocation::stable_hash(&input);
+            assert_eq!(
+                repeated_call_count(turn, "read_ref", &hash),
+                0,
+                "a first read of an artifact is not a repeat"
+            );
+            observe_call_pattern(turn, "read_ref");
+        }
+        // The window reports dominance: the signal now exists where it previously
+        // did not, which is the whole point of measuring it.
+        assert!(
+            observe_call_pattern(turn, "read_ref"),
+            "the tool dominates the window"
+        );
+        // And the per-input breaker, asked about any one of those inputs, still
+        // admits it - dominance has not silently become a bound.
+        let input = format!("{{\"reference\": \"artifact:0\"}}");
+        let hash = crate::tool_invocation::stable_hash(&input);
+        assert_eq!(repeated_call_count(turn, "read_ref", &hash), 0);
+        clear_call_pattern(turn);
+    }
+
+    /// A healthy mix of work never trips the window.
+    #[test]
+    fn a_healthy_mix_never_trips() {
+        let turn = "pattern-healthy";
+        clear_call_pattern(turn);
+        let tools = ["read_file", "grep_search", "read_ref", "edit", "state_inspect"];
+        for round in 0..40 {
+            let tool = tools[round % tools.len()];
+            assert!(
+                !observe_call_pattern(turn, tool),
+                "a balanced mix is not a loop: {tool} at round {round}"
+            );
+        }
+        clear_call_pattern(turn);
     }
 }
