@@ -1150,6 +1150,48 @@ impl GatewayToolExecutor {
         {
             return self.read_graph_node(&graph, &node).await;
         }
+        // The same read of the same immutable reference has the same answer, so the
+        // second one is answered with the receipt instead of the bytes.
+        //
+        // One live run issued the identical `{"limit": 64, "reference":
+        // "artifact:..."}` six times. The byte-identical result stub never fired,
+        // because a paged read is not byte-identical once the envelope carries a
+        // cursor or a receipt id - so the one shape of repeat the framework could
+        // already see was exactly the one it missed.
+        //
+        // Scoped to the session and the reading Agent, not the turn: a reference is
+        // immutable and the answer does not become different because a turn ended.
+        // The receipt names how to get the content again, so nothing is withheld.
+        let read_scope = format!(
+            "{}:{}",
+            binding.session_id.unwrap_or("no-session"),
+            binding
+                .memory_context
+                .as_ref()
+                .map(|context| context.agent_id.as_str())
+                .unwrap_or("no-agent")
+        );
+        // The key is the question itself, not a hash of it: it is short, and a hash
+        // here would only obscure what is being compared.
+        let read_key = format!(
+            "{}|{}|{}",
+            input.reference,
+            input.cursor.as_deref().unwrap_or(""),
+            input.limit.unwrap_or(0)
+        );
+        if runtime::repetition_guard::record_repeated_read(&read_scope, &read_key) {
+            return Ok(serde_json::to_string(&serde_json::json!({
+                "reference": input.reference,
+                "already_served": true,
+                "notice": "Runtime already returned this exact read (same reference, same \
+                           cursor, same limit) in this session, and durable content does not \
+                           change. Re-issuing it cannot return anything new. To page further, \
+                           pass the `cursor` from that earlier result; to read something else, \
+                           name a different `reference`. To re-read these bytes from scratch, \
+                           resolve the reference with `evidence_retrieve`."
+            }))
+            .map_err(|error| ToolError::new(error.to_string()))?);
+        }
         let (delegate, mut delegated) =
             unified_read_delegation(&input.reference).map_err(ToolError::new)?;
         if let Some(limit) = input.limit {

@@ -213,6 +213,42 @@ pub fn record_unchanged_inspection(turn_id: &str, input_hash: &str, revision: u6
     }
 }
 
+/// The one table of reads already served. Two `static` items in two functions would
+/// be two different tables, and the clear would silently clear nothing.
+fn served_reads() -> &'static std::sync::Mutex<BTreeMap<String, usize>> {
+    static SERVED: OnceLock<std::sync::Mutex<BTreeMap<String, usize>>> = OnceLock::new();
+    SERVED.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+/// Count one read of an immutable reference and report whether it is a repeat.
+///
+/// `read_ref` answers from durable content, so the same reference at the same paging
+/// position has the same answer forever. One live run issued the identical
+/// `{"limit": 64, "reference": "artifact:..."}` six times, and the byte-identical
+/// result stub never fired - a paged read is not byte-identical across calls once the
+/// envelope carries a cursor or a receipt id.
+///
+/// This is not the revision-based stall check: an immutable reference has no
+/// revision to compare, so "already served" is the whole observation.
+pub fn record_repeated_read(scope: &str, key: &str) -> bool {
+    let entry_key = format!("served:{scope}:{key}");
+    let mut served = served_reads()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let count = served.entry(entry_key).or_insert(0);
+    *count = count.saturating_add(1);
+    *count > 1
+}
+
+/// Forget one scope's served reads, so a later turn or Agent starts clean.
+pub fn clear_served_reads(scope: &str) {
+    let needle = format!("served:{scope}:");
+    served_reads()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|key, _| !key.starts_with(&needle));
+}
+
 /// Forget one turn's inspection memory, so a later turn starts clean.
 pub fn clear_inspection_memory(turn_id: &str) {
     let seen = inspection_memory();
@@ -1624,6 +1660,40 @@ mod repetition_guard_tests {
             "a fresh turn must not inherit the previous turn's last-seen revision"
         );
         clear_turn(turn);
+    }
+
+    /// An immutable reference read twice is a repeat, whatever the paging.
+    ///
+    /// The byte-identical stub cannot see this shape: a paged read is not
+    /// byte-identical once the envelope carries a cursor or a receipt id. One live
+    /// run issued the identical `{"limit": 64, "reference": "artifact:..."}` six
+    /// times against exactly that blind spot.
+    #[test]
+    fn an_immutable_reference_read_twice_is_a_repeat() {
+        let scope = "v17-served-reads";
+        clear_served_reads(scope);
+        assert!(
+            !record_repeated_read(scope, "artifact://a|64|"),
+            "the first read is served in full"
+        );
+        assert!(
+            record_repeated_read(scope, "artifact://a|64|"),
+            "the identical read is a repeat"
+        );
+        assert!(
+            !record_repeated_read(scope, "artifact://a|cursor-2|64|"),
+            "paging further is a different question"
+        );
+        assert!(
+            !record_repeated_read(scope, "artifact://b|64|"),
+            "a different reference is a different question"
+        );
+        clear_served_reads(scope);
+        assert!(
+            !record_repeated_read(scope, "artifact://a|64|"),
+            "a fresh scope must not inherit served reads"
+        );
+        clear_served_reads(scope);
     }
 
     /// Polling is waiting, not looping. `state_inspect` point queries are how a
