@@ -77,7 +77,31 @@ impl ToolExecutor for GatewayToolExecutor {
 
     fn validate_tool_input(&self, tool_name: &str, input: &str) -> Result<String, ToolError> {
         let canonical_name = <Self as ToolExecutor>::resolve_tool_name(self, tool_name)
-            .ok_or_else(|| ToolError::new(format!("tool `{tool_name}` is not registered")))?;
+            .ok_or_else(|| {
+                // A name the model got subtly wrong is one character from working, and a
+                // refusal that only says "not registered" makes it guess again. codex and
+                // opencode both write the correction into the error itself; the ranked
+                // suggestion engine already exists here and was wired only to the CLI and
+                // slash commands. One live run re-issued the same invented tool name
+                // sixteen times against exactly this silence.
+                let registered = self
+                    .tool_host
+                    .pin_snapshot()
+                    .snapshot()
+                    .catalog
+                    .definitions(None)
+                    .into_iter()
+                    .map(|definition| definition.name)
+                    .collect::<Vec<_>>();
+                let names = registered.iter().map(String::as_str).collect::<Vec<_>>();
+                let mut message = format!("tool `{tool_name}` is not registered");
+                match crate::suggestions::suggest_closest_term(tool_name, &names) {
+                    Some(closest) => message.push_str(&format!("\nDid you mean `{closest}`?")),
+                    None => {}
+                }
+                message.push_str(&format!("\nRegistered tools: [{}]", registered.join(", ")));
+                ToolError::new(message)
+            })?;
         if self
             .allowed_tools
             .as_ref()

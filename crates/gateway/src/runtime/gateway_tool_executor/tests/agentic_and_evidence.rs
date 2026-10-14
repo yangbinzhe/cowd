@@ -2348,3 +2348,34 @@ mod cross_channel_contract_invariants {
         );
     }
 }
+
+/// An unknown tool name is one character from working, so say which character.
+///
+/// One live run re-issued the same invented tool name sixteen times against a
+/// refusal that only said "not registered". codex and opencode both write the
+/// correction into the error itself; the ranked suggestion engine already existed
+/// here and was wired only to the CLI and slash commands.
+#[tokio::test]
+async fn an_unknown_tool_name_names_the_closest_registered_tool() {
+    let registry = GatewayToolRegistry::builtin()
+        .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
+        .expect("runtime tools");
+    let executor = GatewayToolExecutor::new(None, false, registry);
+
+    let error = executor
+        .validate_tool_input("read_files", "{}")
+        .expect_err("an unregistered name must be refused");
+    let message = error.to_string();
+    assert!(
+        message.contains("Did you mean"),
+        "the refusal must offer the correction: {message}"
+    );
+    assert!(
+        message.contains("read_file"),
+        "and it must be the right one: {message}"
+    );
+    assert!(
+        message.contains("Registered tools:"),
+        "the full set stays visible so the model is not funnelled: {message}"
+    );
+}
