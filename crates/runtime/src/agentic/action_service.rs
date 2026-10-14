@@ -2470,6 +2470,42 @@ fn inspected_observation(
             );
         }
     }
+    // Say the cheap way to ask, at the moment asking again is pointless.
+    //
+    // A model waiting for a worker polls, and every poll pulls the whole state back
+    // into context. Because the state carries the program revision the bytes are
+    // never identical, so the duplicate-result stub never fires: one live run issued
+    // the same `state_inspect` on one `task_ref` eleven times and another ten, each
+    // time re-sending the full state.
+    //
+    // The revision is Runtime's own progress signal, so "same input, same revision"
+    // is the honest observation, and the notice names the two parameters that already
+    // exist to make the next ask cheap. It does not refuse, stub, or narrow anything.
+    if !unchanged {
+        let input_hash = crate::tool_invocation::stable_hash(
+            &serde_json::to_string(input).unwrap_or_default(),
+        );
+        let revision = u64::try_from(projection.revision).unwrap_or(u64::MAX);
+        if crate::repetition_guard::record_unchanged_inspection(
+            &envelope.actor.turn_id,
+            &input_hash,
+            revision,
+        ) {
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "notice".to_string(),
+                    serde_json::Value::String(
+                        "Runtime notice: this same state_inspect returned the same program \
+                         revision as last time, so nothing has advanced. To wait cheaply, \
+                         re-issue it with `after_revision: <revision>` (Runtime answers \
+                         `{unchanged: true}` in a few bytes), or with `wait_for_workers: true` \
+                         to park until a worker moves. Do not re-issue the same query."
+                            .to_string(),
+                    ),
+                );
+            }
+        }
+    }
     AgentActionObservation {
         receipt_id: format!(
             "observation:{}:{}",

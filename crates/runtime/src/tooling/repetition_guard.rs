@@ -172,6 +172,57 @@ pub fn observe_call_pattern(turn_id: &str, tool_name: &str) -> bool {
     occurrences >= PATTERN_DOMINANCE
 }
 
+/// Record one `state_inspect` read and report whether it returned the revision it
+/// returned last time.
+///
+/// A model waiting for a worker polls. Each poll pulls the whole state back into
+/// context, and because the state carries the program revision the bytes are never
+/// identical, so the duplicate-result stub cannot see a repeat - one live run issued
+/// the same `state_inspect` on one `task_ref` eleven times, another ten, and every
+/// one of them re-sent the full state.
+///
+/// The revision is the progress signal Runtime already owns. Unchanged revision
+/// means unchanged state, whatever the model asked about, so the honest thing to say
+/// is not "you repeated yourself" but "nothing moved, and here is the cheap way to
+/// ask next time". `state_inspect` already answers `{unchanged: true, revision}` in a
+/// few bytes when the caller passes `after_revision`; this is what tells the caller
+/// that parameter exists.
+/// The one table of last-seen revisions. Two `static` items in two functions would
+/// be two different tables, and the clear would silently not clear.
+fn inspection_memory() -> &'static std::sync::Mutex<BTreeMap<String, u64>> {
+    static LAST_REVISION: OnceLock<std::sync::Mutex<BTreeMap<String, u64>>> = OnceLock::new();
+    LAST_REVISION.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+pub fn record_unchanged_inspection(turn_id: &str, input_hash: &str, revision: u64) -> bool {
+    let seen = inspection_memory();
+    let key = format!("inspect:{turn_id}:{input_hash}");
+    let mut seen = seen
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match seen.get(&key).copied() {
+        Some(previous) if previous == revision => true,
+        Some(_) => {
+            seen.insert(key, revision);
+            false
+        }
+        None => {
+            seen.insert(key, revision);
+            false
+        }
+    }
+}
+
+/// Forget one turn's inspection memory, so a later turn starts clean.
+pub fn clear_inspection_memory(turn_id: &str) {
+    let seen = inspection_memory();
+    let needle = format!("inspect:{turn_id}:");
+    seen
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|key, _| !key.starts_with(&needle));
+}
+
 /// Forget one turn's pattern window, so a later turn starts clean.
 pub fn clear_call_pattern(turn_id: &str) {
     pattern_window(turn_id)
@@ -720,6 +771,9 @@ pub fn clear_turn(turn_id: &str) {
     // clear: a turn that inherits the previous turn's window starts already
     // dominant and is refused for work it never did.
     clear_call_pattern(turn_id);
+    // Same for the inspection memory: a turn that inherited the previous turn's
+    // last-seen revision would be told "nothing moved" about a state it never read.
+    clear_inspection_memory(turn_id);
 }
 
 /// Clear the breakers filed under one turn, but only for the role that owns it.
@@ -1536,6 +1590,40 @@ mod repetition_guard_tests {
                 }
             }
         }
+    }
+
+    /// An unchanged revision is the honest signal that asking again is pointless.
+    ///
+    /// The duplicate-result stub cannot see a polling loop: the state carries the
+    /// program revision, so the bytes differ every round even though nothing moved.
+    /// One live run issued the same `state_inspect` on one `task_ref` eleven times
+    /// and another ten, each time re-sending the full state.
+    #[test]
+    fn an_unchanged_revision_is_reported_so_the_model_can_wait_cheaply() {
+        let turn = "v17-inspect-stall";
+        clear_turn(turn);
+        assert!(
+            !record_unchanged_inspection(turn, "hash-a", 7),
+            "the first read establishes the revision"
+        );
+        assert!(
+            record_unchanged_inspection(turn, "hash-a", 7),
+            "the same input at the same revision is the observation worth reporting"
+        );
+        assert!(
+            !record_unchanged_inspection(turn, "hash-a", 8),
+            "a moved revision is progress, and must not be reported as a stall"
+        );
+        assert!(
+            !record_unchanged_inspection(turn, "hash-b", 8),
+            "a different input is a different question, even at the same revision"
+        );
+        clear_turn(turn);
+        assert!(
+            !record_unchanged_inspection(turn, "hash-a", 8),
+            "a fresh turn must not inherit the previous turn's last-seen revision"
+        );
+        clear_turn(turn);
     }
 
     /// Polling is waiting, not looping. `state_inspect` point queries are how a
