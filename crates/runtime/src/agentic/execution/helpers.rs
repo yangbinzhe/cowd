@@ -319,7 +319,7 @@ pub(super) fn task_objective(
             topic_ref,
         ),
         DispatchMode::Review => format!(
-            "你是独立复核者 `{}`（不得复核自己）。任务 `{}`，验收判据：{}\n按序执行（勿增加步骤）：\n1) state_inspect 读取该 Task 与其已提交 artifact；\n2) 逐条检查验收判据：针对**每一条**给出“满足/不满足”，并引用你**亲自读取**到的证据（文件/行/字节或回执）；\n3) task_review 给出裁决：\n   - 当证据**确实支持**该条判据时，用 accept（不要因风格、篇幅或措辞拒绝）；\n   - 否则用 rework/challenge，且 `reason` **必须**写明：未满足的**具体条款** + 你实际读取到的**证据缺口**（例如“第(2)条要求 file:line，正文仅…，缺少…”）；禁止笼统拒绝。\n{scope_discipline}不要重做作者的工作；Runtime 已绑定 artifact，不要把内部存储选择器抄进 evidence_refs。你的 durable review 动作才是裁决。Program: {}。",
+            "你是独立复核者 `{}`（不得复核自己）。任务 `{}`，验收判据：{}\n按序执行（勿增加步骤）：\n1) state_inspect 读取该 Task 与其已提交 artifact；\n2) 逐条检查验收判据：针对**每一条**给出“满足/不满足”，并引用你**亲自读取**到的证据（文件/行/字节或回执）；\n3) task_review 给出裁决，三种互斥结果：\n   - 当证据**确实支持**该条判据时，用 accept（不要因风格、篇幅或措辞拒绝）；\n   - 当作者已在 `unresolved` 中**显式披露**某条判据的缺口、且该判据在本轮授权下**确实无法取得**（例如判据要求外部文献/引用，而本 Task 未声明 network/search 能力、或隔离环境无外部来源）时，用 accept 并在 `reason` 里点名“第(N)条按 unresolved 披露接受，理由：<授权边界>”。披露过的缺口不是缺陷，卡它才是；\n   - 否则用 rework/challenge，且 `reason` **必须**写明：未满足的**具体条款** + 你实际读取到的**证据缺口**（例如“第(2)条要求 file:line，正文仅…，缺少…”）；禁止笼统拒绝。\n{scope_discipline}不要重做作者的工作；Runtime 已绑定 artifact，不要把内部存储选择器抄进 evidence_refs。你的 durable review 动作才是裁决。Program: {}。",
             member.agent_id,
             task.task_id,
             task.acceptance,
