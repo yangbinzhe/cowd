@@ -1276,6 +1276,44 @@ where
                 // defect. Deciding which tool the model may use is not the
                 // framework's call at all.
                 runtime.require_next_model_tool_call();
+                // But "call a tool" is not "call the tool that closes the rung", and
+                // the difference is measured. One live run was obliged to call
+                // something with `independent_review` outstanding, satisfied the
+                // obligation with `state_inspect` seven times against a Task that had
+                // not moved, and never once named `task_review` - while the Gateway
+                // log shows `task_review` was exposed in that very request.
+                //
+                // The framework already knows the mapping: `mandatory_action_tool_ids`
+                // derives it, and `next_rungs` renders it on the polling path. What
+                // was missing is saying it *before* the call, so the decision is made
+                // with it instead of corrected by it. The tool set stays wide; only
+                // the guidance gets specific.
+                let owed = owed_rungs.clone();
+                let closing = mandatory_action_tool_ids(state_completion_gap_outstanding, &owed);
+                if !owed.is_empty() && !closing.is_empty() {
+                    let mut item = crate::ContextItem::new(
+                        format!("owed-action:{}", ticket.node_id),
+                        crate::ContextSourceKind::Task,
+                        crate::ContextRole::Instruction,
+                        format!(
+                            "Runtime requires an action this step, and these rungs are outstanding: {}. \
+                             The action that closes each one is: {}. Reading state again does not close \
+                             a rung - the current state is already reported to you on every read. \
+                             Take the closing action, or if you believe it is blocked, say so \
+                             explicitly with the reason.",
+                            owed.join(", "),
+                            closing
+                                .iter()
+                                .map(|tool| format!("`{tool}`"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    );
+                    item.authority = crate::ContextAuthority::System;
+                    item.visibility = crate::ContextVisibility::Private;
+                    item.evidence = vec![format!("execution_node:{}", ticket.node_id)];
+                    runtime.push_next_model_context_item(item);
+                }
             }
             if let Some(effort) = force_reasoning_effort {
                 runtime.require_next_model_reasoning_effort(effort);
