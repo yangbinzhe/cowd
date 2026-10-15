@@ -526,10 +526,28 @@ class Monitor:
         for row in rows:
             if len(row) == 2 and row[0] and row[1]:
                 per_actor.setdefault(row[0], []).append(row[1])
+        # Each pair carries the actor that wrote it, so the "is this actor also
+        # acting" question can be asked of the pair rather than of the run.
         pairs_found = []
-        for texts in per_actor.values():
+        for actor, texts in per_actor.items():
             window = list(reversed(texts))[:8]
-            pairs_found.extend(similar_answer_pairs(window))
+            for ratio in similar_answer_pairs(window):
+                pairs_found.append({"actor": actor, "ratio": ratio})
+        # 3c. Which actors actually completed tool calls.
+        # Restating means the model stopped acting. One live run was stopped for
+        # restating while it issued two *correct* `agent_action_batch` calls in the
+        # same window - it had been refused a malformed frame, read the refusal,
+        # corrected the shape, and narrated the same plan between the two
+        # corrections. The narration was not the problem; stopping it was.
+        completed = self.q(
+            "SELECT payload->>'_runtime_activity_binding', count(*) "
+            "FROM runtime_events WHERE kind='tool.invocation.completed' "
+            "GROUP BY 1")
+        inv["actors_with_completed_calls"] = {
+            row[0]: int(row[1])
+            for row in completed
+            if len(row) == 2 and row[0] and row[1].strip().lstrip("-").isdigit()
+        }
         inv["similar_answer_pairs"] = pairs_found
         # 3d. Closure-phase content: is the reviewer's own report re-entering
         # the delivered set?
@@ -707,11 +725,24 @@ class Monitor:
                     "the loop was real"
                 ),
             })
-        if inv.get("similar_answer_pairs") and snap.get("verdicts", 0) == 0:
+        # Run-level, not actor-level. One live run was stopped for restating while
+        # its delegated Agents were completing tool calls in the same window: the
+        # root narrated the same plan three times, and two *correct*
+        # `agent_action_batch` calls landed between those narrations. The narrator
+        # was not the actor, and asking only "is this actor acting" missed it.
+        #
+        # A run whose Agents are completing calls is progressing. The root's prose
+        # is how it coordinates; stopping the run for it kills work that is landing.
+        acting_total = sum(inv.get("actors_with_completed_calls", {}).values())
+        narrating_only = (
+            [] if acting_total > 0 else list(inv.get("similar_answer_pairs", []))
+        )
+        if narrating_only and snap.get("verdicts", 0) == 0:
             findings.append({
                 "root_cause": "consecutive answers are near-identical in wording",
                 "evidence": [
-                    "pairs above threshold: %s" % inv["similar_answer_pairs"]
+                    "pairs above threshold: %s"
+                    % [p["ratio"] for p in narrating_only]
                 ],
                 "action": "stop; the model is restating itself",
             })
