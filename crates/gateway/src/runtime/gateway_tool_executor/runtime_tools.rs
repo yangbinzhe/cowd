@@ -897,6 +897,48 @@ impl GatewayToolExecutor {
                     envelope.action.kind()
                 )));
             }
+            // A model that declares itself blocked by a missing tool is usually
+            // wrong, and nothing in the framework ever checked.
+            //
+            // One live run reached its terminal with `blocked_reason`: "Artifact
+            // creation and issue classification tools are not available" - while the
+            // Gateway log for that same request shows `artifact_commit` and
+            // `message_publish` sitting in the exposed set. It gave up over tools it
+            // was holding, which is the one19 shape returning at the most expensive
+            // possible moment.
+            //
+            // Runtime knows the exposed set. When the model says it cannot act, the
+            // answer travels in the same result, so the claim is checkable at the
+            // moment it is made rather than discovered in a post-mortem.
+            let declares_blocked = matches!(
+                envelope.action,
+                harness_contract::agent_action::AgentAction::ObjectiveCompleteRequest(ref input)
+                    if input.blocked
+            ) || matches!(
+                envelope.action,
+                harness_contract::agent_action::AgentAction::ObjectiveReview(ref input)
+                    if input.decision
+                        == harness_contract::agent_action::ObjectiveReviewDecision::Blocked
+            );
+            if declares_blocked {
+                let mut names = self
+                    .tool_host
+                    .pin_snapshot()
+                    .snapshot()
+                    .catalog
+                    .definitions(None)
+                    .into_iter()
+                    .map(|definition| definition.name)
+                    .collect::<Vec<_>>();
+                names.sort();
+                observation.actionable.push(format!(
+                    "You reported being blocked. These tools ARE exposed in this request: \
+                     [{}]. If your reason names one of them as unavailable, that is not \
+                     correct - use it. If the real obstacle is a missing fact rather than a \
+                     missing tool, name the fact.",
+                    names.join(", ")
+                ));
+            }
             return serialize_agent_action_receipt(&observation, resolved_content_ref.as_deref())
                 .map_err(|error| ToolError::new(error.to_string()));
         }
