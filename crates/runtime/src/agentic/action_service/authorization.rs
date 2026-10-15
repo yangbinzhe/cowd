@@ -1,7 +1,7 @@
 use harness_contract::agent_action::{
     AgentAction, AgentActionEnvelope, AgentActorKind, TaskAttemptDispatchInput,
     TaskAttemptFailInput, TaskClaimInput, TaskPublishInput, TaskReleaseInput, TaskReviewInput,
-    TaskSubmitInput, TaskSupersedeInput, TaskWithdrawInput,
+    TaskReviewDecision, TaskSubmitInput, TaskSupersedeInput, TaskWithdrawInput,
 };
 
 use crate::agentic::program::{AgenticProgramProjection, AgenticTaskStatus, AgenticTeamLifecycle};
@@ -897,6 +897,50 @@ fn validate_task_review(
             "review_has_no_evidence",
             "independent review must cite inspected tool:// or artifact:// evidence".to_string(),
         ));
+    }
+    // A rework must name the declared criterion it failed.
+    //
+    // Nothing validated what a reviewer demanded. One live run's reviewer required
+    // "documented domains" the isolated workspace could not supply, and another
+    // required a mathematically correct counterexample construction the operator
+    // never asked for; both were accepted, and the author was sent back to redo work
+    // the operator's own criteria did not require. The rework loop that ended those
+    // runs was manufactured here, not by the author.
+    //
+    // The Task declares `acceptance_checks`, and `objective_review` already carries a
+    // `criterion_ref` for exactly this purpose. `task_review` was the one verdict that
+    // could not say what it was judging, so a reviewer substituted its own standard
+    // for the operator's. An accept needs no anchor - accepting is never an overreach -
+    // but a rework sends someone back to work, and that has to be answerable to the
+    // declared criteria.
+    if input.decision == TaskReviewDecision::Rework && !task.acceptance_checks.is_empty() {
+        let anchored = task.acceptance_checks.iter().any(|check| {
+            let needle = check.trim();
+            // A check is prose, so match on a distinctive run rather than the whole
+            // string: a reviewer paraphrases, but it cannot paraphrase away the
+            // subject of the criterion.
+            needle.len() >= 12 && input.reason.contains(&needle[..12])
+                || needle.len() < 12 && input.reason.contains(needle)
+        });
+        if !anchored {
+            let declared = task
+                .acceptance_checks
+                .iter()
+                .map(|check| format!("- {check}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Some((
+                "rework_without_declared_criterion",
+                format!(
+                    "a rework must name the declared acceptance criterion it failed. \
+                     This Task declares:\n{declared}\n\
+                     Quote the criterion you are rejecting. If your objection is \
+                     outside these criteria, it may be recorded in `reason` alongside \
+                     an accept as a non-blocking observation - it cannot force the \
+                     author to redo work the operator did not ask for."
+                ),
+            ));
+        }
     }
     if let Some(reference) = input
         .evidence_refs
