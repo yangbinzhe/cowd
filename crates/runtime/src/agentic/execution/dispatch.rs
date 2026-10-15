@@ -25,8 +25,8 @@ struct DispatchStarvationState {
     next_attempt_at_ms: u64,
 }
 
-fn dispatch_starvation_ledger()
--> &'static std::sync::Mutex<std::collections::BTreeMap<String, DispatchStarvationState>> {
+fn dispatch_starvation_ledger(
+) -> &'static std::sync::Mutex<std::collections::BTreeMap<String, DispatchStarvationState>> {
     DISPATCH_STARVATION.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
 }
 
@@ -157,17 +157,25 @@ fn tool_contract_trace() -> bool {
 /// Record a durable milestone when an Agent's requested capability had no usable
 /// tool. This makes the *reason* a tool is missing auditable (which step of the
 /// capability→tool→host intersection dropped it) instead of a silent gap.
-fn record_tool_contract_milestone(
+pub(super) fn record_tool_contract_milestone(
     services: &Arc<RuntimeServices>,
     projection: &AgenticProgramProjection,
     task: &AgenticTaskProjection,
     member: &AgentMemberProjection,
     mode: DispatchMode,
     admission: &AgenticExecutionAdmission,
-) {
+) -> Result<(), String> {
+    let stream_id = format!("agentic-program:{}", projection.program_id);
+    let diagnostic_key = format!(
+        "tool-contract:{}:{}:{}:{}",
+        projection.program_id,
+        task.task_id,
+        member.agent_id,
+        mode.as_str(),
+    );
     let event = crate::RuntimeTransactionEventInput {
         event: crate::RuntimeEventInput {
-            stream_id: format!("agentic-program:{}", projection.program_id),
+            stream_id: stream_id.clone(),
             scope: crate::RuntimeEventScope::Program,
             kind: "agentic.tool_contract".to_string(),
             status: Some("degraded".to_string()),
@@ -183,22 +191,37 @@ fn record_tool_contract_milestone(
                 "missing_tool_alternatives": admission.missing_tool_alternatives,
             }),
         },
-        idempotency_key: Some(format!(
-            "tool-contract:{}:{}:{}",
-            projection.program_id, task.task_id, member.agent_id
-        )),
+        idempotency_key: Some(diagnostic_key.clone()),
         schema_version: 1,
     };
-    let _ = services
-        .event_store()
-        .append_transaction(crate::AppendTransactionRequest {
-            transaction_id: format!(
-                "tool-contract:{}:{}:{}",
-                projection.program_id, task.task_id, member.agent_id
-            ),
-            expected_streams: Vec::new(),
-            events: vec![event],
-        });
+    let store = services.event_store();
+    store.with_stream_lock(&stream_id, || {
+        if let Some(existing) = store
+            .event_by_idempotency_key(&stream_id, &diagnostic_key)
+            .map_err(|error| error.to_string())?
+        {
+            if existing.payload == event.event.payload {
+                return Ok(());
+            }
+            return Err(format!(
+                "tool-contract diagnostic `{diagnostic_key}` conflicts with its committed payload"
+            ));
+        }
+        let expected_revision = store
+            .stream_revision(&stream_id)
+            .map_err(|error| error.to_string())?;
+        store
+            .append_transaction_locked(crate::AppendTransactionRequest {
+                transaction_id: diagnostic_key,
+                expected_streams: vec![crate::ExpectedStreamRevision {
+                    stream_id: stream_id.clone(),
+                    expected_revision,
+                }],
+                events: vec![event],
+            })
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    })
 }
 pub(super) fn agentic_shared_prompt_package(
     projection: &AgenticProgramProjection,
@@ -398,8 +421,8 @@ impl RuntimeServices {
         consecutive_deferrals: usize,
         review_generation: u64,
     ) -> Result<Vec<AgenticDispatchReceipt>, String> {
-        self.agent_action_service()
-            .record_dispatch_decline(crate::agentic::action_service::AgenticDispatchDecline {
+        self.agent_action_service().record_dispatch_decline(
+            crate::agentic::action_service::AgenticDispatchDecline {
                 program_id,
                 task_ref,
                 mode: mode.as_str(),
@@ -409,10 +432,10 @@ impl RuntimeServices {
                 busy_members,
                 consecutive_deferrals,
                 review_generation,
-            });
+            },
+        );
         Ok(Vec::new())
     }
-
 
     /// Reconsider durable ready work after a physical member exits. Busy
     /// admissions remain in the original journal; no timer or second queue
@@ -428,18 +451,17 @@ impl RuntimeServices {
         if initial.status != super::super::program::AgenticProgramStatus::Open {
             // Program-scoped: there is no Task yet, so the record carries an empty
             // task_ref and the program's own status.
-            return self
-                .decline_dispatch(
-                    program_id,
-                    "",
-                    super::super::execution::helpers::DispatchMode::Execute,
-                    crate::agentic::action_service::AgenticDispatchDeclineReason::ProgramNotOpen,
-                    "program",
-                    0,
-                    0,
-                    0,
-                    0,
-                );
+            return self.decline_dispatch(
+                program_id,
+                "",
+                super::super::execution::helpers::DispatchMode::Execute,
+                crate::agentic::action_service::AgenticDispatchDeclineReason::ProgramNotOpen,
+                "program",
+                0,
+                0,
+                0,
+                0,
+            );
         }
         // Reviewers are independent and gate Task closure. Admit Review
         // requests before starting new Execute work so a `Submitted` Task is
@@ -1320,18 +1342,17 @@ impl RuntimeServices {
         // (and logging) on every reconcile tick.
         let starvation_key = dispatch_starvation_key(&projection.program_id, task_ref, mode);
         if dispatch_starvation_backing_off(&starvation_key) {
-            return self
-                .decline_dispatch(
-                    &projection.program_id,
-                    task_ref,
-                    mode,
-                    crate::agentic::action_service::AgenticDispatchDeclineReason::StarvationBackoff,
-                    &task_status_str(task.status),
-                    0,
-                    0,
-                    dispatch_starvation_count(&starvation_key),
-                    task.review_generation,
-                );
+            return self.decline_dispatch(
+                &projection.program_id,
+                task_ref,
+                mode,
+                crate::agentic::action_service::AgenticDispatchDeclineReason::StarvationBackoff,
+                &task_status_str(task.status),
+                0,
+                0,
+                dispatch_starvation_count(&starvation_key),
+                task.review_generation,
+            );
         }
         // Program status is business truth, not renewed execution authority.
         // Late submissions and startup recovery must respect the owning root's
@@ -1561,9 +1582,19 @@ impl RuntimeServices {
                             missing_tool_alternatives = %admission.missing_tool_alternatives.join(","),
                             "agent tool contract degraded: requested capability lacks a usable tool"
                         );
-                        record_tool_contract_milestone(
+                        if let Err(error) = record_tool_contract_milestone(
                             self, projection, task, member, mode, &admission,
-                        );
+                        ) {
+                            tracing::error!(
+                                program_id = %projection.program_id,
+                                task_ref = %task.task_id,
+                                agent_id = %member.agent_id,
+                                mode = mode.as_str(),
+                                missing_capabilities = %admission.missing_capabilities.join(","),
+                                error = %error,
+                                "failed to persist Agent tool-contract degradation event; admission remains safely degraded"
+                            );
+                        }
                     } else if tool_contract_trace() {
                         tracing::info!(
                             program_id = %projection.program_id,
@@ -1765,8 +1796,7 @@ impl RuntimeServices {
                 team_id: None,
                 graph_id: graph_id.clone(),
                 node_id: node_id.clone(),
-                attempt: u32::try_from(attempt_generation.saturating_add(1))
-                    .unwrap_or(u32::MAX),
+                attempt: u32::try_from(attempt_generation.saturating_add(1)).unwrap_or(u32::MAX),
                 expected_graph_revision: 0,
                 objective,
                 // The Program Task's natural-language acceptance remains a
@@ -1778,12 +1808,19 @@ impl RuntimeServices {
                 required_acceptance: RequiredAcceptance::default(),
                 output_acceptance: Vec::new(),
                 acceptance: Vec::new(),
-                constraints: vec![
-                    "Use Agent actions for collaboration state; prose never changes Program truth"
-                        .to_string(),
-                    "Put long reasoning in normal model content or files; tool JSON carries only compact references"
-                        .to_string(),
-                ],
+                constraints: {
+                    let mut constraints = vec![
+                        "Use Agent actions for collaboration state; prose never changes Program truth"
+                            .to_string(),
+                        "Put long reasoning in normal model content or files; tool JSON carries only compact references"
+                            .to_string(),
+                    ];
+                    constraints.extend(super::admission::capability_gap_constraints(
+                        &admission.missing_capabilities,
+                        &admission.missing_tool_alternatives,
+                    ));
+                    constraints
+                },
                 context_refs: vec![
                     format!("program:{}", projection.program_id),
                     format!("task:{}", task.task_id),
@@ -1806,7 +1843,10 @@ impl RuntimeServices {
                             task_ref: task.task_id.clone(),
                         },
                         DispatchMode::Coordination(_) => AgenticExecutionFocus::Coordination {
-                            wake_ref: coordination_wake.ok_or("coordination_wake_missing")?.entry_id.clone(),
+                            wake_ref: coordination_wake
+                                .ok_or("coordination_wake_missing")?
+                                .entry_id
+                                .clone(),
                         },
                     },
                 }),
@@ -2133,8 +2173,8 @@ mod lane_routing_tests {
     #[test]
     fn dispatch_starvation_ledger_counts_then_clears() {
         use super::{
-            DispatchMode, dispatch_starvation_bound, dispatch_starvation_clear,
-            dispatch_starvation_key, dispatch_starvation_record,
+            dispatch_starvation_bound, dispatch_starvation_clear, dispatch_starvation_key,
+            dispatch_starvation_record, DispatchMode,
         };
         let key = dispatch_starvation_key("program-test", "task-test", DispatchMode::Execute);
         dispatch_starvation_clear(&key);

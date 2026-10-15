@@ -1,4 +1,4 @@
-use super::helpers::{DispatchMode, semantic_terms};
+use super::helpers::{semantic_terms, DispatchMode};
 use super::*;
 
 #[derive(Debug, Clone)]
@@ -51,14 +51,6 @@ pub(super) fn resolve_agentic_execution_admission(
             ));
         }
     }
-    let effective_capabilities = required
-        .iter()
-        .map(|capability| {
-            capability_from_name(capability).ok_or_else(|| {
-                format!("Agent Definition catalog exposed unsupported capability `{capability}`")
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
     let skill_catalog = services.skill_catalog();
     let (allowed_skills, skill_tool_refs) = effective_skill_grants(&catalog_entry, &skill_catalog);
     let resolved = resolve_agent_capability(AgentCapabilityRequest {
@@ -92,6 +84,8 @@ pub(super) fn resolve_agentic_execution_admission(
         &skill_tool_refs,
         host_snapshot.as_ref(),
     )?;
+    let effective_capabilities =
+        effective_capabilities_after_intersection(&required, &missing_capabilities)?;
 
     Ok(AgenticExecutionAdmission {
         catalog_entry,
@@ -102,6 +96,46 @@ pub(super) fn resolve_agentic_execution_admission(
         missing_capabilities,
         missing_tool_alternatives,
     })
+}
+
+pub(super) fn effective_capabilities_after_intersection(
+    requested: &[String],
+    missing: &[String],
+) -> Result<Vec<AgentCapability>, String> {
+    requested
+        .iter()
+        .filter(|capability| !missing.contains(capability))
+        .map(|capability| {
+            capability_from_name(capability).ok_or_else(|| {
+                format!("Agent Definition catalog exposed unsupported capability `{capability}`")
+            })
+        })
+        .collect()
+}
+
+pub(super) fn capability_gap_constraints(
+    missing_capabilities: &[String],
+    missing_tool_alternatives: &[String],
+) -> Vec<String> {
+    if missing_capabilities.is_empty() {
+        return Vec::new();
+    }
+    let alternatives = if missing_tool_alternatives.is_empty() {
+        "no usable alternative tool is admitted".to_string()
+    } else {
+        format!(
+            "available alternatives were not admitted: {}",
+            missing_tool_alternatives.join(", ")
+        )
+    };
+    missing_capabilities
+        .iter()
+        .map(|capability| {
+            format!(
+                "Runtime capability gap: `{capability}` was requested but is not authorized by the admitted ToolHost/resource intersection; {alternatives}. Do not claim work or evidence requiring this capability was performed. If the bound Task acceptance requires it, complete all independent authorized work and record the exact unmet evidence in `unresolved`; do not infer or simulate external access."
+            )
+        })
+        .collect()
 }
 
 pub(super) fn required_capabilities(
@@ -446,4 +480,86 @@ pub(super) fn intersect_agentic_tools(
         host_binding.missing_capabilities,
         host_binding.missing_tool_alternatives,
     ))
+}
+
+#[cfg(test)]
+mod capability_truth_tests {
+    use super::{
+        capability_gap_constraints, effective_capabilities_after_intersection,
+        intersect_agentic_tools, AgenticToolHostSnapshot,
+    };
+    use harness_contract::agent::AgentCapability;
+
+    #[test]
+    fn capability_grants_exclude_tools_missing_after_host_intersection() {
+        let requested = vec!["read".to_string(), "network".to_string()];
+        let effective =
+            effective_capabilities_after_intersection(&requested, &["network".to_string()])
+                .expect("known requested capabilities");
+        assert_eq!(effective, vec![AgentCapability::Read]);
+    }
+
+    #[test]
+    fn host_intersection_controls_network_tools_grants_and_gap_constraints_together() {
+        let requested_capabilities = vec!["read".to_string(), "network".to_string()];
+        let resolved = crate::resolve_agent_capability(crate::AgentCapabilityRequest {
+            role_id: "network-bound-worker".to_string(),
+            allowed_capabilities: requested_capabilities.clone(),
+            evidence_duties: vec!["verify fresh external evidence".to_string()],
+        });
+        let mut requested_tools = resolved.allowed_tools.clone();
+        requested_tools.extend(
+            harness_contract::agent_action::AGENT_ACTION_TOOL_IDS
+                .iter()
+                .map(|tool| (*tool).to_string()),
+        );
+        for network_available in [false, true] {
+            let mut tools = requested_tools.clone();
+            if !network_available {
+                tools.retain(|tool| {
+                    !matches!(tool.as_str(), "web_search" | "web_fetch" | "mcp_tool")
+                });
+            }
+            let snapshot = AgenticToolHostSnapshot { tools };
+            let (allowed, missing, alternatives) = intersect_agentic_tools(
+                &resolved,
+                &requested_tools,
+                &std::collections::BTreeSet::new(),
+                Some(&snapshot),
+            )
+            .expect("missing network must remain a runnable degraded admission");
+            let grants =
+                effective_capabilities_after_intersection(&requested_capabilities, &missing)
+                    .expect("known capabilities");
+            let constraints = capability_gap_constraints(&missing, &alternatives);
+            assert_eq!(
+                allowed.iter().any(|tool| tool == "web_search"),
+                network_available
+            );
+            assert_eq!(
+                grants.contains(&AgentCapability::Network),
+                network_available
+            );
+            assert_eq!(constraints.is_empty(), network_available);
+            if !network_available {
+                assert_eq!(missing, ["network"]);
+                assert!(constraints[0].contains("unresolved"));
+                assert!(grants.contains(&AgentCapability::Read));
+            }
+        }
+    }
+
+    #[test]
+    fn missing_network_is_explicit_without_granting_an_alternative() {
+        let constraints = capability_gap_constraints(
+            &["network".to_string()],
+            &["web_search".to_string(), "web_fetch".to_string()],
+        );
+        assert_eq!(constraints.len(), 1);
+        assert!(constraints[0].contains("network"));
+        assert!(constraints[0].contains("web_search"));
+        assert!(constraints[0].contains("web_fetch"));
+        assert!(constraints[0].contains("unresolved"));
+        assert!(constraints[0].contains("not authorized"));
+    }
 }

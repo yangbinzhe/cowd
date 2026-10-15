@@ -12,16 +12,15 @@ use crate::execution_core::{
     NodeExecutionTicket, NodeExecutorError,
 };
 use crate::{
-    AutoCompactionEvent, ContentBlock, ContextAuthority, ContextEnvelope, ContextItem,
-    ContextProfile, ContextRole, ContextSourceKind, ContextVisibility, ConversationMessage,
-    CowdEvent, CowdEventBus, HookAbortSignal, HookProgressReporter, PermissionPolicy,
-    ProviderRuntimeClient, ProviderToolDefinition, ResumeContextPacket, RuntimeError,
-    RuntimeFeatureConfig, Session, SessionReadHead, ToolCallback, ToolExecutor, ToolFailureKind,
-    ToolInvocationRecord, TurnSummary, model_context_window_with_overrides,
-    permissions::SharedPrompter,
+    model_context_window_with_overrides, permissions::SharedPrompter, AutoCompactionEvent,
+    ContentBlock, ContextAuthority, ContextEnvelope, ContextItem, ContextProfile, ContextRole,
+    ContextSourceKind, ContextVisibility, ConversationMessage, CowdEvent, CowdEventBus,
+    HookAbortSignal, HookProgressReporter, PermissionPolicy, ProviderRuntimeClient,
+    ProviderToolDefinition, ResumeContextPacket, RuntimeError, RuntimeFeatureConfig, Session,
+    SessionReadHead, ToolCallback, ToolExecutor, ToolFailureKind, ToolInvocationRecord,
+    TurnSummary,
 };
 use async_trait::async_trait;
-use harness_contract::MeasureProvenance;
 use harness_contract::execution_graph::{
     ExecutionEdge, ExecutionEdgeKind, ExecutionNodeKind, ExecutionNodeResult, ExecutionNodeSpec,
     ExecutionNodeStatus, ExecutionUsage,
@@ -38,6 +37,7 @@ use harness_contract::turn::{
     CollaborationContinuationBinding, ContinuationAuthorization, SessionInputEnvelope,
     SessionInputProjection, SessionInputReceipt, TurnId, TurnInboxSnapshot, TurnInputCheckpoint,
 };
+use harness_contract::MeasureProvenance;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -593,11 +593,9 @@ fn continuation_goal_retains_original_intent_and_requires_fresh_verification() {
     assert_eq!(current.source_intent_ref, original.source_intent_ref);
     assert_eq!(current.spec_digest, original.spec_digest);
     assert_eq!(current.criteria[0].status, AcceptanceStatus::Open);
-    assert!(
-        current.criteria[0]
-            .required_evidence
-            .contains(&"execution_graph:next".into())
-    );
+    assert!(current.criteria[0]
+        .required_evidence
+        .contains(&"execution_graph:next".into()));
     assert_eq!(original.criteria[0].status, AcceptanceStatus::Satisfied);
 }
 
@@ -2359,7 +2357,10 @@ fn citable_refs(
 ) -> serde_json::Value {
     let criteria = services
         .goal_store()
-        .projection(&format!("goal:{}", program.root_execution_id.as_deref().unwrap_or("")))
+        .projection(&format!(
+            "goal:{}",
+            program.root_execution_id.as_deref().unwrap_or("")
+        ))
         .ok()
         .flatten()
         .map(|projection| {
@@ -2452,7 +2453,10 @@ pub(super) fn agentic_turn_framing(
             let mut view = agentic_closure_view(&program, completion_gap.as_deref());
             if let Some(object) = view.as_object_mut() {
                 object.insert("budgets".to_string(), budgets);
-                object.insert("citable_refs".to_string(), citable_refs(&program, services, session_id, turn_id));
+                object.insert(
+                    "citable_refs".to_string(),
+                    citable_refs(&program, services, session_id, turn_id),
+                );
                 // Live occupancy: the model needs to know how much is already
                 // running before it decides to spawn or wait. Reference
                 // harnesses state the available concurrency slots; we state the
@@ -2487,6 +2491,39 @@ pub(super) fn agentic_turn_framing(
             "budgets": budgets,
         }),
     }
+}
+
+/// Keep the complete Program view available to a delegated leaf while making
+/// ownership explicit. Root closure facts are useful context, but their
+/// `current`/`remaining` fields must never masquerade as the leaf's next action.
+pub(super) fn scope_turn_framing_for_role(
+    mut framing: serde_json::Value,
+    role: TurnExecutionRole,
+) -> serde_json::Value {
+    if !role.is_delegated_leaf() {
+        return framing;
+    }
+    if let Some(root_closure) = framing
+        .as_object_mut()
+        .and_then(|object| object.remove("closure"))
+    {
+        framing["program_progress"] = serde_json::json!({
+            "owner": "RootTurn",
+            "root_closure": root_closure,
+            "role_note": "This Program-wide closure state is read-only background. Complete the bound Task in your private role brief; the root coordinator owns Program-level closure.",
+        });
+    }
+    if let Some(capacity) = framing
+        .get_mut("capacity")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        capacity.insert(
+            "note".to_string(),
+            serde_json::json!("Program-wide occupancy is background context. Execute only the Runtime-attested bound Task; the root coordinator owns coordination and Program-level closure."),
+        );
+    }
+    framing["execution_role"] = serde_json::json!("DelegatedLeaf");
+    framing
 }
 
 /// The outstanding closure rungs as the model reads them, from the one function
@@ -3294,48 +3331,51 @@ fn closure_view_names_the_integration_task_while_a_completion_gap_is_open() {
         program.tasks.insert(
             id.to_string(),
             crate::AgenticTaskProjection {
-        task_id: id.to_string(),
-        team_id: "team:1".to_string(),
-        title: format!("delivery {id}"),
-        objective: "objective".to_string(),
-        acceptance: "accepted evidence".to_string(),
-        acceptance_checks: Vec::new(),
-        criterion_source: Default::default(),
-        required_capabilities: Vec::new(),
-        depends_on: Vec::new(),
-        status: crate::AgenticTaskStatus::Accepted,
-        claimant: Some(claimant.to_string()),
-        claim_generation: 1,
-        claim_execution_id: None,
-        claimed_at_ms: None,
-        lease_expires_at_ms: None,
-        claim_renewal_streak: 0,
-        active_attempts: Default::default(),
-        artifact_refs: vec![format!("artifact:{id}")],
-        evidence_refs: vec!["tool://receipt".to_string()],
-        unresolved: Vec::new(),
-        review_reason: None,
-        reviewed_by: Some("agent:2".to_string()),
-        failed_attempts: 0,
-        review_generation: 1,
-        failed_review_attempts: 0,
-        last_failure: None,
-        replacement_task_refs: Vec::new(),
-        supersede_evidence_refs: Vec::new(),
-        superseded_reason: None,
-        superseded_by: None,
-        obligation_refs: Vec::new(),
-        purpose: Default::default(),
-        execution_requirements: Vec::new(),
-        expertise_hints: Vec::new(),
-        cancel_requested_by: None,
-        cancel_reason_ref: None,
-        cancel_evidence_refs: Vec::new(),
-        pending_retirement: None,
+                task_id: id.to_string(),
+                team_id: "team:1".to_string(),
+                title: format!("delivery {id}"),
+                objective: "objective".to_string(),
+                acceptance: "accepted evidence".to_string(),
+                acceptance_checks: Vec::new(),
+                criterion_source: Default::default(),
+                required_capabilities: Vec::new(),
+                depends_on: Vec::new(),
+                status: crate::AgenticTaskStatus::Accepted,
+                claimant: Some(claimant.to_string()),
+                claim_generation: 1,
+                claim_execution_id: None,
+                claimed_at_ms: None,
+                lease_expires_at_ms: None,
+                claim_renewal_streak: 0,
+                active_attempts: Default::default(),
+                artifact_refs: vec![format!("artifact:{id}")],
+                evidence_refs: vec!["tool://receipt".to_string()],
+                unresolved: Vec::new(),
+                review_reason: None,
+                reviewed_by: Some("agent:2".to_string()),
+                failed_attempts: 0,
+                review_generation: 1,
+                failed_review_attempts: 0,
+                last_failure: None,
+                replacement_task_refs: Vec::new(),
+                supersede_evidence_refs: Vec::new(),
+                superseded_reason: None,
+                superseded_by: None,
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
+                cancel_requested_by: None,
+                cancel_reason_ref: None,
+                cancel_evidence_refs: Vec::new(),
+                pending_retirement: None,
             },
         );
     }
-    let view = agentic_closure_view(&program, Some("original_intent_review_required:user_intent"));
+    let view = agentic_closure_view(
+        &program,
+        Some("original_intent_review_required:user_intent"),
+    );
     let steps = view["remaining"]
         .as_array()
         .expect("remaining")
@@ -3363,7 +3403,9 @@ fn closure_view_names_the_integration_task_while_a_completion_gap_is_open() {
         .as_array()
         .expect("remaining")
         .iter()
-        .find(|step| step.get("step").and_then(serde_json::Value::as_str) == Some("objective_review"))
+        .find(|step| {
+            step.get("step").and_then(serde_json::Value::as_str) == Some("objective_review")
+        })
         .expect("objective_review rung");
     let hint = objective_review_rung
         .get("hint")
@@ -3452,7 +3494,9 @@ fn citable_refs_states_what_exists_and_never_what_to_choose() {
     let services = crate::RuntimeServices::in_memory().expect("services");
     let refs = citable_refs(&program, &services, "session", "turn");
     // The accepted results are named, so a review can cite them without guessing.
-    let accepted = refs["accepted_results"].as_array().expect("accepted_results");
+    let accepted = refs["accepted_results"]
+        .as_array()
+        .expect("accepted_results");
     assert_eq!(accepted.len(), 2, "{refs}");
     assert!(accepted.iter().any(|value| value == "artifact:task:1"));
     // The topic ref is named, so `message_publish` does not have to invent one.
@@ -3466,7 +3510,10 @@ fn citable_refs_states_what_exists_and_never_what_to_choose() {
         refs["note"]
     );
     // An omission is announced, never silent.
-    assert!(refs.get("artifacts_more").is_none(), "two artifacts fit the cap");
+    assert!(
+        refs.get("artifacts_more").is_none(),
+        "two artifacts fit the cap"
+    );
 }
 
 #[test]
@@ -3845,15 +3892,13 @@ mod write_obligation_probe {
                 4,
             )
             .expect("exact read receipt");
-        assert!(
-            verified_workspace_postcondition_write_evidence(
-                &["write:artifact.txt".to_string()],
-                &BTreeSet::from([4, 5]),
-                &[read],
-                &resolver,
-            )
-            .is_empty()
-        );
+        assert!(verified_workspace_postcondition_write_evidence(
+            &["write:artifact.txt".to_string()],
+            &BTreeSet::from([4, 5]),
+            &[read],
+            &resolver,
+        )
+        .is_empty());
     }
 
     #[test]
@@ -3875,11 +3920,9 @@ mod write_obligation_probe {
             true,
         );
         println!("SCOPES_PROBE {scopes:?}");
-        assert!(
-            scopes
-                .iter()
-                .any(|scope| scope == "write:cross-team-decision-report.html")
-        );
+        assert!(scopes
+            .iter()
+            .any(|scope| scope == "write:cross-team-decision-report.html"));
     }
 }
 
@@ -4829,16 +4872,16 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
             // Dispatch the bytes the contract boundary hands back, not the raw
             // frame: the repair for a string-typed array/object field happens
             // here, so everything downstream sees the same input.
-            let request = match tool_executor.validate_tool_input(&request.tool_name, &request.input)
-            {
-                Ok(repaired) => crate::tool_dispatch::ToolRequest {
-                    input: repaired,
-                    ..request
-                },
-                Err(error) => {
-                    return defer(format!("input_contract_rejected:{error}"));
-                }
-            };
+            let request =
+                match tool_executor.validate_tool_input(&request.tool_name, &request.input) {
+                    Ok(repaired) => crate::tool_dispatch::ToolRequest {
+                        input: repaired,
+                        ..request
+                    },
+                    Err(error) => {
+                        return defer(format!("input_contract_rejected:{error}"));
+                    }
+                };
             let prepared =
                 tool_executor.prepare_governed_invocations(std::slice::from_ref(&request));
             let Some(invocation) = prepared
@@ -6280,7 +6323,10 @@ struct TurnSynthesizeBackend<C: ApiClient, T: ToolExecutor> {
 
 #[cfg(test)]
 mod turn_framing_tests {
-    use super::{agentic_turn_framing, outstanding_closure_steps};
+    use super::{
+        agentic_turn_framing, outstanding_closure_steps, scope_turn_framing_for_role,
+        TurnExecutionRole,
+    };
 
     #[test]
     fn framing_without_a_program_reports_not_started_and_budgets() {
@@ -6304,5 +6350,49 @@ mod turn_framing_tests {
             steps.contains(&"objective_complete_request".to_string()),
             "{steps:?}"
         );
+    }
+
+    #[test]
+    fn delegated_framing_labels_root_closure_as_background_not_its_next_action() {
+        let view = serde_json::json!({
+            "closure": {
+                "current": "independent_review",
+                "exit_ready": false,
+                "remaining": [{"step": "task_review"}],
+                "completion_gap": "task_review"
+            },
+            "capacity": {
+                "note": "While any sub-task is in flight your only role is to coordinate",
+                "teams": 3
+            },
+            "budgets": {"rounds": 4}
+        });
+        let scoped = scope_turn_framing_for_role(view, TurnExecutionRole::DelegatedLeaf);
+        assert!(scoped.get("closure").is_none());
+        assert_eq!(
+            scoped["program_progress"]["owner"],
+            serde_json::json!("RootTurn")
+        );
+        assert_eq!(
+            scoped["program_progress"]["root_closure"]["remaining"][0]["step"],
+            serde_json::json!("task_review")
+        );
+        assert!(scoped["program_progress"]["role_note"]
+            .as_str()
+            .unwrap()
+            .contains("bound Task"));
+        assert!(!scoped["capacity"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("only role is to coordinate"));
+    }
+
+    #[test]
+    fn root_framing_keeps_authoritative_closure_fields() {
+        let view = serde_json::json!({
+            "closure": {"current": "independent_review", "remaining": []}
+        });
+        let scoped = scope_turn_framing_for_role(view.clone(), TurnExecutionRole::RootTurn);
+        assert_eq!(scoped, view);
     }
 }

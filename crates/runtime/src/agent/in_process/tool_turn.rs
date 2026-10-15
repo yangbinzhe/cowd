@@ -448,11 +448,12 @@ pub(super) fn agent_autonomy_checkpoint(
         {
             requires_execution_tools = true;
             actions.push(serde_json::json!({
-                "action": "execute_commit_submit",
+                "action": "execute_submit",
                 "task_ref": task.task_id,
                 "objective": task.objective,
                 "acceptance": task.acceptance,
-                "required_protocol": ["artifact_commit", "task_submit"],
+                "required_protocol": ["task_submit"],
+                "submission_contract": "Write the complete report as normal response text, then prefer one task_submit with deliverable selecting that report or the latest saved report from this same Task, Agent, and attempt. Use artifact_commit first only for file or multipart deliverables. Submit real evidence and explicit unresolved items; an empty or invalid report selection is still rejected.",
                 "claim_execution_id": packet.graph_id(),
             }));
         }
@@ -499,9 +500,14 @@ pub(super) fn agent_autonomy_checkpoint(
     let requires_tool_action = !actions.is_empty();
     let tool_ids =
         autonomy_checkpoint_tool_plan(packet, requires_tool_action, requires_execution_tools);
+    let role_contract = match mode {
+        "execute" => "Resolve only your bound execution action with native tools. If the Task fits, actively task_claim it before substantive execution; otherwise use the supplied message_publish decline option so the Team can reassign or replan. After claiming, write the complete report as normal response text and prefer one task_submit with deliverable selecting that report or the latest saved report from this same Task, Agent, and attempt. Use artifact_commit first only for file or multipart deliverables. Submit real evidence and explicit unresolved items.",
+        "review" => "Resolve only your bound independent review action with native tools. Read the submitted artifact body and relevant evidence, then issue task_review for this Task. Do not claim, execute, or resubmit the Task, and do not take ownership of Program-level closure.",
+        _ => unreachable!("checkpoint mode was validated above"),
+    };
     Ok(Some(AgentAutonomyCheckpoint {
         prompt: format!(
-            "Runtime safe checkpoint committed after your prior model round. It contains only canonical Agent-first Program/Task state. New authorized Topic entries are delivered separately at actual model safe points. Resolve the listed compact action with your native tools: if the bound Task fits, actively task_claim it before substantive execution; if it does not fit, do not claim and use the supplied message_publish option to explain the mismatch so the Team can reassign or replan. After a successful claim, do the work, commit a durable artifact, and submit exact evidence; in review mode inspect the submitted artifact and issue an independent task_review verdict. Do not invent identities, revisions, artifacts, sources, or completion. Preserve the substance and evidence of your earlier result and return a complete updated answer after the checkpoint is closed.\n\n{checkpoint}"
+            "Runtime safe checkpoint committed after your prior model round. It contains only canonical Agent-first Program/Task state. New authorized Topic entries are delivered separately at actual model safe points. {role_contract} Do not invent identities, revisions, artifacts, sources, or completion. Preserve the substance and evidence of your earlier result and return a complete updated answer after the checkpoint is closed.\n\n{checkpoint}"
         ),
         tool_ids,
         requires_tool_action,

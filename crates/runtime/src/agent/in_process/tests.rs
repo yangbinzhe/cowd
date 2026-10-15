@@ -233,24 +233,20 @@ async fn native_coordination_wire(supplement: bool, fail_input_request: bool) {
             harness_contract::agent_action::AgentActionStatus::Applied
         );
     }
-    assert!(
-        fixture
-            .services
-            .dispatch_ready_agentic_work("coord-program")
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        fixture
-            .services
-            .agent_runtime()
-            .execute_task(fixture.packet.clone())
-            .await
-            .unwrap()
-            .failure
-            .is_none()
-    );
+    assert!(fixture
+        .services
+        .dispatch_ready_agentic_work("coord-program")
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(fixture
+        .services
+        .agent_runtime()
+        .execute_task(fixture.packet.clone())
+        .await
+        .unwrap()
+        .failure
+        .is_none());
     assert_eq!(
         requests.lock().unwrap().len(),
         2 + 2 * usize::from(supplement) + usize::from(fail_input_request)
@@ -415,6 +411,80 @@ fn task_specific_role_brief_is_after_the_shared_system_boundary() {
         second_segments[boundary + 1..],
         "the extracted suffix remains a private Runtime-attested role brief"
     );
+}
+
+#[test]
+fn agentic_prompt_names_only_the_actions_owned_by_its_bound_focus() {
+    let mut packet = test_agent_packet(Vec::new());
+    packet.agentic_binding = Some(AgenticExecutionBinding {
+        program_id: "program:test".into(),
+        agent_id: "agent:test".into(),
+        membership_id: "membership:test".into(),
+        team_id: "team:test".into(),
+        task_team_id: "team:test".into(),
+        source_spec_revision: 1,
+        focus: AgenticExecutionFocus::TaskExecute {
+            task_ref: "task:execute-only".into(),
+        },
+    });
+    packet.allowed_tools = vec!["task_submit".into(), "task_review".into()];
+    let prompt = system_prompt(
+        &packet,
+        std::path::Path::new("/workspace"),
+        &packet.allowed_tools,
+    )
+    .join("\n");
+    assert!(prompt.contains("task:execute-only"));
+    assert!(prompt.contains("only the Task bound to this execution"));
+    assert!(!prompt.contains("review peers independently"));
+    assert!(prompt.contains("root coordinator owns Program-level closure"));
+}
+
+#[test]
+fn review_and_coordination_prompts_preserve_their_bound_action_owner() {
+    let cases = [
+        (
+            AgenticExecutionFocus::TaskReview {
+                task_ref: "task:review-only".into(),
+            },
+            "TaskReview owns only the submitted Task",
+        ),
+        (
+            AgenticExecutionFocus::Coordination {
+                wake_ref: "wake:coordination-only".into(),
+            },
+            "Coordination owns only the authorized wake",
+        ),
+        (
+            AgenticExecutionFocus::ObjectiveReview {
+                criterion_refs: vec!["criterion:review-only".into()],
+            },
+            "ObjectiveReview owns only these bound criteria",
+        ),
+    ];
+    for (focus, expected_owner) in cases {
+        let mut packet = test_agent_packet(Vec::new());
+        packet.agentic_binding = Some(AgenticExecutionBinding {
+            program_id: "program:test".into(),
+            agent_id: "agent:test".into(),
+            membership_id: "membership:test".into(),
+            team_id: "team:test".into(),
+            task_team_id: "team:test".into(),
+            source_spec_revision: 1,
+            focus,
+        });
+        packet.allowed_tools = vec!["task_submit".into(), "task_review".into()];
+        let prompt = system_prompt(
+            &packet,
+            std::path::Path::new("/workspace"),
+            &packet.allowed_tools,
+        )
+        .join("\n");
+        assert!(prompt.contains(expected_owner), "{prompt}");
+        assert!(!prompt.contains("claim eligible bounded work"));
+        assert!(!prompt.contains("review peers independently"));
+        assert!(!prompt.contains("TaskExecute owns only"));
+    }
 }
 
 #[test]
@@ -1137,14 +1207,12 @@ async fn runtime_artifact_materialization_uses_registered_write_classification()
             .unwrap(),
         "authorized:artifact_materialize"
     );
-    assert!(
-        executor
-            .execute_delegated_runtime_tool("unregistered", input, authorization.clone())
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("no registered effect descriptor")
-    );
+    assert!(executor
+        .execute_delegated_runtime_tool("unregistered", input, authorization.clone())
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("no registered effect descriptor"));
     let services = RuntimeServices::in_memory().unwrap();
     executor.tool_batch = Some(
         crate::execution_core::graph::executors::agent_tool::AgentToolBatchDispatcher::new(
@@ -1157,12 +1225,10 @@ async fn runtime_artifact_materialization_uses_registered_write_classification()
     assert!(!executor.owns_tool_resource_admission("checkpoint"));
     // With a production dispatcher, an absent parent fails admission. The
     // compatibility Echo host must no longer return a successful direct call.
-    assert!(
-        executor
-            .execute_delegated_runtime_tool("artifact_materialize", input, authorization)
-            .await
-            .is_err()
-    );
+    assert!(executor
+        .execute_delegated_runtime_tool("artifact_materialize", input, authorization)
+        .await
+        .is_err());
 }
 
 #[test]
@@ -1336,11 +1402,9 @@ fn workspace_internal_absolute_resource_path_is_normalized_once() {
             .expect("normalize internal absolute path");
     let normalized: serde_json::Value = serde_json::from_str(&normalized).expect("json");
     assert_eq!(normalized["path"], "fixtures/target.txt");
-    assert!(
-        normalized["content"]
-            .as_str()
-            .is_some_and(|content| content.contains(&root.path().display().to_string()))
-    );
+    assert!(normalized["content"]
+        .as_str()
+        .is_some_and(|content| content.contains(&root.path().display().to_string())));
 }
 
 #[test]
@@ -1633,11 +1697,9 @@ fn sandboxed_process_requires_and_accepts_only_a_whole_workspace_read_lease() {
     whole_workspace
         .enforce_resource_ceiling("execute_code", input)
         .expect("whole-workspace read lease admits the read-only sandbox");
-    assert!(
-        build(vec!["read:src".to_string()])
-            .enforce_resource_ceiling("execute_code", input)
-            .is_err()
-    );
+    assert!(build(vec!["read:src".to_string()])
+        .enforce_resource_ceiling("execute_code", input)
+        .is_err());
 }
 
 #[tokio::test]
@@ -1681,21 +1743,15 @@ async fn team_tool_boundary_enforces_the_exact_focus_scope() {
     executor
         .enforce_resource_ceiling("read_file", r#"{"path":"crates/runtime/src/lib.rs"}"#)
         .expect("in-scope read");
-    assert!(
-        executor
-            .enforce_resource_ceiling("read_file", r#"{"path":"crates/gateway/src/lib.rs"}"#,)
-            .is_err()
-    );
-    assert!(
-        executor
-            .enforce_resource_ceiling("read_file", r#"{"path":"../secret"}"#)
-            .is_err()
-    );
-    assert!(
-        executor
-            .enforce_resource_ceiling("grep_search", r#"{"pattern":"unsafe"}"#)
-            .is_err()
-    );
+    assert!(executor
+        .enforce_resource_ceiling("read_file", r#"{"path":"crates/gateway/src/lib.rs"}"#,)
+        .is_err());
+    assert!(executor
+        .enforce_resource_ceiling("read_file", r#"{"path":"../secret"}"#)
+        .is_err());
+    assert!(executor
+        .enforce_resource_ceiling("grep_search", r#"{"pattern":"unsafe"}"#)
+        .is_err());
     executor
         .enforce_resource_ceiling(
             "context_retrieve",
@@ -1727,11 +1783,9 @@ async fn team_tool_boundary_enforces_the_exact_focus_scope() {
         executor.resource_scopes.as_deref(),
     )
     .expect("outside glob stays representable");
-    assert!(
-        executor
-            .enforce_resource_ceiling("glob_search", &outside_glob)
-            .is_err()
-    );
+    assert!(executor
+        .enforce_resource_ceiling("glob_search", &outside_glob)
+        .is_err());
 
     let descriptor = test_tool_descriptor_for_input(
         "read_file",
@@ -1889,22 +1943,18 @@ fn team_tool_boundary_rejects_symlink_escape_for_existing_and_new_targets() {
         provider_model_obligations: Vec::new(),
     };
 
-    assert!(
-        executor
-            .enforce_resource_ceiling(
-                "read_file",
-                r#"{"path":"crates/runtime/escape/secret.txt"}"#,
-            )
-            .is_err()
-    );
-    assert!(
-        executor
-            .enforce_resource_ceiling(
-                "edit",
-                r#"{"path":"crates/runtime/escape/new.txt","content":"denied"}"#,
-            )
-            .is_err()
-    );
+    assert!(executor
+        .enforce_resource_ceiling(
+            "read_file",
+            r#"{"path":"crates/runtime/escape/secret.txt"}"#,
+        )
+        .is_err());
+    assert!(executor
+        .enforce_resource_ceiling(
+            "edit",
+            r#"{"path":"crates/runtime/escape/new.txt","content":"denied"}"#,
+        )
+        .is_err());
 }
 
 #[tokio::test]
@@ -1963,17 +2013,13 @@ async fn scoped_executor_advertises_only_packet_authorized_tools() {
         vec!["grep_search", "read_file"]
     );
     assert!(executor.has_tool("checkpoint"));
-    assert!(
-        !executor
-            .available_tool_names()
-            .contains(&"checkpoint".to_string())
-    );
-    assert!(
-        executor
-            .execute_output("checkpoint", r#"{"label":"model"}"#)
-            .await
-            .is_err()
-    );
+    assert!(!executor
+        .available_tool_names()
+        .contains(&"checkpoint".to_string()));
+    assert!(executor
+        .execute_output("checkpoint", r#"{"label":"model"}"#)
+        .await
+        .is_err());
 }
 
 #[tokio::test]
@@ -2042,13 +2088,11 @@ async fn scoped_executor_routes_hidden_checkpoint_for_runtime_guard_only() {
             .expect("hidden checkpoint should reach the pinned Runtime host"),
         harness_contract::context::ToolOutputDraft::bounded_inline("authorized:checkpoint")
     );
-    assert!(
-        executor
-            .receipts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty()
-    );
+    assert!(executor
+        .receipts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_empty());
     assert_eq!(
         executor
             .internal_checkpoint_input(serde_json::json!({
@@ -2202,11 +2246,9 @@ fn explicit_terminal_sections_outrank_embedded_contract_examples() {
         "Independent review completed with no contradiction."
     );
     assert_eq!(output["unresolved"], "[]");
-    assert!(
-        output["findings"]
-            .as_str()
-            .is_some_and(|value| value.contains("embedded source example"))
-    );
+    assert!(output["findings"]
+        .as_str()
+        .is_some_and(|value| value.contains("embedded source example")));
     assert_ne!(output["evidence"], "embedded source example");
 }
 
@@ -2248,11 +2290,9 @@ fn declared_custom_artifact_accepts_exact_json_or_markdown_only() {
     );
     let output = structured_agent_output_for_fields(markdown, &required)
         .expect("declared custom Markdown artifact");
-    assert!(
-        output["applications_survey"]
-            .as_str()
-            .is_some_and(|value| value.contains("### Vision / 3D"))
-    );
+    assert!(output["applications_survey"]
+        .as_str()
+        .is_some_and(|value| value.contains("### Vision / 3D")));
     assert_eq!(output["evidence"], "tool://read-1");
     assert_eq!(output["summary"], "Survey complete.");
 
@@ -2308,25 +2348,19 @@ fn verified_narrative_terminal_accepts_prose_without_accepting_tool_markup() {
         StructuredOutputField::Unresolved,
         mixed_output.get("unresolved"),
     ));
-    assert!(
-        mixed_output["review"]
-            .as_str()
-            .is_some_and(|review| review.contains("Terminal review completed"))
-    );
-    assert!(
-        normalized_narrative_terminal_body(
-            "<synthesized_terminal evidence_committed=1 />",
-            &[StructuredOutputField::Findings],
-        )
-        .is_none()
-    );
-    assert!(
-        normalized_narrative_terminal_body(
-            "<tool_call>read_file</tool_call>",
-            &[StructuredOutputField::Findings],
-        )
-        .is_none()
-    );
+    assert!(mixed_output["review"]
+        .as_str()
+        .is_some_and(|review| review.contains("Terminal review completed")));
+    assert!(normalized_narrative_terminal_body(
+        "<synthesized_terminal evidence_committed=1 />",
+        &[StructuredOutputField::Findings],
+    )
+    .is_none());
+    assert!(normalized_narrative_terminal_body(
+        "<tool_call>read_file</tool_call>",
+        &[StructuredOutputField::Findings],
+    )
+    .is_none());
     assert!(
         normalized_narrative_terminal_body("reviewed", &[StructuredOutputField::Review],).is_some(),
         "a verified review may use ordinary terminal prose"
@@ -2458,18 +2492,14 @@ async fn scoped_executor_propagates_runtime_authorization_for_normal_agent_tools
             .expect("authorized tool should execute"),
         harness_contract::context::ToolOutputDraft::bounded_inline("authorized:read_file")
     );
-    assert!(
-        executor
-            .execute_output("read_file", r#"{"path":"README.md"}"#)
-            .await
-            .is_err()
-    );
-    assert!(
-        executor
-            .execute_authorized_output(&authorization, "edit", r#"{"path":"README.md"}"#)
-            .await
-            .is_err()
-    );
+    assert!(executor
+        .execute_output("read_file", r#"{"path":"README.md"}"#)
+        .await
+        .is_err());
+    assert!(executor
+        .execute_authorized_output(&authorization, "edit", r#"{"path":"README.md"}"#)
+        .await
+        .is_err());
 }
 
 #[test]
@@ -2735,20 +2765,16 @@ async fn cancel_acknowledges_delivery_before_cleanup_and_tombstones_are_race_saf
         .expect("cancel acknowledges without waiting for cleanup")
         .expect("cancel task joins")
         .expect("cancel is accepted");
-    assert!(
-        worker
-            .active_runs
-            .lock()
-            .unwrap()
-            .contains_key("run-cancel")
-    );
-    assert!(
-        worker
-            .pending_cancellations
-            .lock()
-            .unwrap()
-            .contains("run-cancel")
-    );
+    assert!(worker
+        .active_runs
+        .lock()
+        .unwrap()
+        .contains_key("run-cancel"));
+    assert!(worker
+        .pending_cancellations
+        .lock()
+        .unwrap()
+        .contains("run-cancel"));
     drop(cleanup);
     assert!(worker.active_runs.lock().unwrap().is_empty());
     assert!(worker.pending_cancellations.lock().unwrap().is_empty());
@@ -3105,19 +3131,15 @@ async fn native_checkpoint_closes_only_after_its_typed_decline() {
     assert_eq!(apply("prose", &actor, AgentAction::MessagePublish(serde_json::from_value(serde_json::json!({
         "topic_ref":"topic:decline-program", "summary":"DECLINE: narrative only", "refs":[task]
     })).unwrap())).status, AgentActionStatus::Applied);
-    assert!(
-        agent_autonomy_checkpoint(&services, &packet)
-            .unwrap()
-            .is_some()
-    );
+    assert!(agent_autonomy_checkpoint(&services, &packet)
+        .unwrap()
+        .is_some());
     assert_eq!(apply("typed", &actor, AgentAction::MessagePublish(serde_json::from_value(serde_json::json!({
         "topic_ref":"topic:decline-program", "summary":"I lack the required expertise", "intent":{"kind":"decline","task_ref":task}
     })).unwrap())).status, AgentActionStatus::Applied);
-    assert!(
-        agent_autonomy_checkpoint(&services, &packet)
-            .unwrap()
-            .is_none()
-    );
+    assert!(agent_autonomy_checkpoint(&services, &packet)
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]
@@ -3195,11 +3217,9 @@ async fn generalized_coalesced_coordination_wake() {
     // immutable packet, then calls the shared authorized runtime tool path.
     // No fixture writes its response into the Program on its behalf.
     let worker = tokio::spawn(async move {
-        assert!(
-            checkpoint
-                .prompt
-                .contains("Check the boundary condition in source A")
-        );
+        assert!(checkpoint
+            .prompt
+            .contains("Check the boundary condition in source A"));
         let binding = packet.agentic_binding.as_ref().unwrap();
         let AgenticExecutionFocus::Coordination { wake_ref } = &binding.focus else {
             panic!("expected coordination")
@@ -3219,11 +3239,9 @@ async fn generalized_coalesced_coordination_wake() {
         }).to_string()).await.unwrap();
         let observation: serde_json::Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(observation["status"], "applied");
-        assert!(
-            agent_autonomy_checkpoint(&services, &packet)
-                .unwrap()
-                .is_none()
-        );
+        assert!(agent_autonomy_checkpoint(&services, &packet)
+            .unwrap()
+            .is_none());
         services
             .settle_abandoned_agentic_attempt(&packet, "deterministic worker exit")
             .await
@@ -3247,14 +3265,12 @@ async fn generalized_coalesced_coordination_wake() {
         1
     );
     for _ in 0..3 {
-        assert!(
-            fixture
-                .services
-                .dispatch_ready_agentic_work("coord-program")
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(fixture
+            .services
+            .dispatch_ready_agentic_work("coord-program")
+            .await
+            .unwrap()
+            .is_empty());
     }
     let mut novel = fixture.request.clone();
     novel.action_id = "model-new-source".into();
@@ -3404,6 +3420,55 @@ async fn cross_team_review_checkpoint_is_valid_but_cross_team_execution_is_fence
         }),
     )
     .expect("claim");
+    let mut execution_packet = test_agent_packet(Vec::new());
+    execution_packet.assignment = crate::test_support::agent_assignment(
+        None,
+        &author,
+        author_execution,
+        &task,
+        "session-checkpoint",
+        author_execution,
+        Some(&author_team),
+        author_execution,
+        "author-node",
+    );
+    execution_packet.allowed_tools = vec![
+        "task_submit".to_string(),
+        "artifact_commit".to_string(),
+        "read_file".to_string(),
+    ];
+    execution_packet.agentic_binding = Some(AgenticExecutionBinding {
+        program_id: "program-checkpoint".to_string(),
+        agent_id: author.clone(),
+        membership_id: format!("membership:{author}:{author_team}"),
+        team_id: author_team.clone(),
+        task_team_id: author_team.clone(),
+        source_spec_revision: 1,
+        focus: AgenticExecutionFocus::TaskExecute {
+            task_ref: task.clone(),
+        },
+    });
+    let execution_checkpoint = agent_autonomy_checkpoint(&services, &execution_packet)
+        .expect("claimed execution checkpoint")
+        .expect("claimed Task requires a submission");
+    let execution_state: serde_json::Value =
+        serde_json::from_str(execution_checkpoint.prompt.rsplit_once("\n\n").unwrap().1)
+            .expect("checkpoint JSON");
+    assert_eq!(
+        execution_state["required_actions"][0]["required_protocol"],
+        serde_json::json!(["task_submit"])
+    );
+    assert!(execution_checkpoint.prompt.contains("normal response text"));
+    assert!(execution_checkpoint
+        .prompt
+        .contains("same Task, Agent, and attempt"));
+    assert!(!execution_checkpoint
+        .prompt
+        .contains("independent task_review verdict"));
+    assert!(execution_checkpoint
+        .tool_ids
+        .iter()
+        .any(|tool| tool == "artifact_commit"));
     let content = services
         .artifact_store()
         .write_bytes(
@@ -3471,6 +3536,8 @@ async fn cross_team_review_checkpoint_is_valid_but_cross_team_execution_is_fence
         .expect("submitted Task requires a review action");
     assert!(checkpoint.prompt.contains("inspect_and_review"));
     assert!(checkpoint.tool_ids.iter().any(|tool| tool == "task_review"));
+    assert!(!checkpoint.prompt.contains("actively task_claim"));
+    assert!(!checkpoint.prompt.contains("prefer one task_submit"));
 
     packet
         .agentic_binding

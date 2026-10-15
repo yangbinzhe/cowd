@@ -442,21 +442,18 @@ pub(crate) fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition
 /// cannot drift from the contract it illustrates, and adding a field or a
 /// variant needs no edit here. Tools with nothing to fill in are left alone: an
 /// example of `{}` is noise a model learns to skip.
-fn attach_input_examples(
-    definitions: Vec<RuntimeToolDefinition>,
-) -> Vec<RuntimeToolDefinition> {
+fn attach_input_examples(definitions: Vec<RuntimeToolDefinition>) -> Vec<RuntimeToolDefinition> {
     definitions
         .into_iter()
         .map(|mut definition| {
-            if let Some(example) = harness_contract::tool_input_contract::input_example(
-                &definition.input_schema,
-            ) {
-                let rendered = serde_json::to_string(&example)
-                    .unwrap_or_else(|_| example.to_string());
+            if let Some(example) =
+                harness_contract::tool_input_contract::input_example(&definition.input_schema)
+            {
+                let rendered =
+                    serde_json::to_string(&example).unwrap_or_else(|_| example.to_string());
                 let description = definition.description.unwrap_or_default();
-                definition.description = Some(format!(
-                    "{description}\n\nExample input: {rendered}"
-                ));
+                definition.description =
+                    Some(format!("{description}\n\nExample input: {rendered}"));
             }
             definition
         })
@@ -625,7 +622,7 @@ fn agent_action_tool_definitions() -> Vec<RuntimeToolDefinition> {
         ),
         agent_action_definition::<action::TaskSubmitInput>(
             action::TASK_SUBMIT_TOOL_ID,
-            "Submit one claimed Task using committed artifact and evidence references. This is the preferred submission path: one deliverable block is enough, because Runtime persists it through exactly the same artifact path as artifact_commit - no separate artifact_publish call is needed. Long result content must be committed separately, never embedded in this action. unresolved carries honest limitations or follow-up disclosures for the independent reviewer; that reviewer decides whether they block Task acceptance.",
+            "Submit the Task bound to your execution with durable evidence references. Preferred for one report: use one `task_submit` with `deliverable` selecting a non-empty Text block from this response; Runtime also recovers the latest saved draft from this same Task and attempt when submission happens in a later step. No separate `artifact_commit` or `artifact_publish` is needed for that one-shot report; the report stays in normal response text and the tool input carries only its block index. For file-backed or multi-part results, commit each exact artifact first and pass its returned artifact references. `unresolved` records limitations honestly; an independent Agent decides whether they block acceptance.",
         ),
         agent_action_definition::<action::TaskReviewInput>(
             action::TASK_REVIEW_TOOL_ID,
@@ -991,16 +988,20 @@ mod tests {
         assert!(!publish.contains("DELIVERABLE REGISTRATION"), "{publish}");
         assert!(!commit.contains("CONTENT IDENTITY"), "{commit}");
         assert!(
-            submit.contains("preferred submission path"),
+            submit.contains("Preferred for one report"),
             "the one-shot deliverable path is the cheapest and must be said so: {submit}"
         );
-        assert!(submit.contains("artifact_commit"), "{submit}");
+        assert!(submit.contains("latest saved draft"), "{submit}");
+        assert!(submit.contains("file-backed or multi-part"), "{submit}");
+        assert!(
+            !submit.contains("Long result content must be committed separately"),
+            "the description must not contradict TaskSubmitInput's one-shot deliverable: {submit}"
+        );
     }
-
 
     /// The contract is attached where definitions leave the catalog, not where
     /// they are authored, so it has to be checked at the exit a model reads.
-     #[test]
+    #[test]
     fn injected_tools_reach_the_model_with_their_input_contract() {
         let mut catalog = tools::ToolCatalog::builtin();
         catalog = catalog
@@ -1019,7 +1020,10 @@ mod tests {
                 "the discriminator's legal values are what a model cannot guess: {description}"
             );
         }
-        assert!(description.contains("sha256: string (required)"), "{description}");
+        assert!(
+            description.contains("sha256: string (required)"),
+            "{description}"
+        );
         // The phrase that taught a model to send `{}`.
         assert!(!description.contains("No body in JSON"), "{description}");
 
@@ -1074,7 +1078,6 @@ mod tests {
         }
     }
 
-
     /// `agent_action_batch` states its boundary in two halves, and both must
     /// survive any future edit: the negative half (never workspace/shell/network
     /// tools, so the model does not burn rounds discovering it by rejection) and
@@ -1085,7 +1088,9 @@ mod tests {
             .into_iter()
             .find(|tool| tool.name == "agent_action_batch")
             .expect("agent_action_batch is a runtime capability tool");
-        let description = batch.description.expect("a description is the contract here");
+        let description = batch
+            .description
+            .expect("a description is the contract here");
         assert!(
             description.contains("never workspace/shell/network tools"),
             "the negative half of the boundary must stay explicit"
@@ -1096,7 +1101,7 @@ mod tests {
         );
     }
 
-     #[test]
+    #[test]
     fn mcp_annotations_select_explicit_external_effect_contracts() {
         for (annotations, expected_permission, expected_resolver) in [
             (
@@ -1132,7 +1137,7 @@ mod tests {
         }
     }
 
-     #[test]
+    #[test]
     fn every_gateway_runtime_tool_declares_a_concrete_effect_contract() {
         let mut tools = runtime_capability_tool_definitions();
         tools.extend(mcp_wrapper_tool_definitions());

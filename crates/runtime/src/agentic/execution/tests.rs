@@ -4980,6 +4980,74 @@ async fn one_shot_fixture() -> (
 }
 
 #[tokio::test]
+async fn tool_contract_milestone_persists_once_and_reports_conflicting_writes() {
+    let (services, _, author, task_ref, _) = one_shot_fixture().await;
+    let projection = services
+        .agent_action_service()
+        .project("program-dispatch")
+        .expect("program projection");
+    let task = &projection.tasks[&task_ref];
+    let member = &projection.agents[&author];
+    let mut admission = super::admission::resolve_agentic_execution_admission(
+        &services,
+        member,
+        task,
+        &AgenticDispatchContext {
+            session_id: "session-dispatch".to_string(),
+            turn_id: "turn-dispatch".to_string(),
+            model_lease: "test".to_string(),
+            permission_ceiling: PermissionMode::ReadOnly,
+            resource_scopes: Vec::new(),
+        },
+        DispatchMode::Execute,
+    )
+    .expect("bounded worker remains admissible");
+    admission.missing_capabilities = vec!["network".to_string()];
+    admission.missing_tool_alternatives = vec!["web_search".to_string()];
+    for _ in 0..2 {
+        super::dispatch::record_tool_contract_milestone(
+            &services,
+            &projection,
+            task,
+            member,
+            DispatchMode::Execute,
+            &admission,
+        )
+        .expect("persist the same contract idempotently");
+    }
+    let milestones = services
+        .event_store()
+        .all_events(256)
+        .expect("durable events")
+        .into_iter()
+        .filter(|event| event.kind == "agentic.tool_contract")
+        .collect::<Vec<_>>();
+    assert_eq!(milestones.len(), 1);
+    assert_eq!(milestones[0].payload["program_id"], "program-dispatch");
+    assert_eq!(milestones[0].payload["task_ref"], task_ref);
+    assert_eq!(milestones[0].payload["missing_capabilities"][0], "network");
+
+    admission.missing_capabilities.push("write".to_string());
+    let error = super::dispatch::record_tool_contract_milestone(
+        &services,
+        &projection,
+        task,
+        member,
+        DispatchMode::Execute,
+        &admission,
+    )
+    .expect_err("a rejected append must be visible to the dispatch caller");
+    assert!(error.contains("conflicts"), "{error}");
+    assert!(!admission
+        .effective_capabilities
+        .contains(&AgentCapability::Network));
+    assert!(!admission
+        .allowed_tools
+        .iter()
+        .any(|tool| tool == "web_search"));
+}
+
+#[tokio::test]
 async fn one_shot_task_deliverable_expands_to_the_canonical_artifact_path() {
     let (services, team, author, task, execution) = one_shot_fixture().await;
     let actions = services.agent_action_service();
@@ -5146,4 +5214,8 @@ async fn one_shot_deliverable_without_a_resolved_ref_is_rejected() {
         "unexpected rejection: {:?}",
         observation.error
     );
+    let guidance = &observation.error.as_ref().expect("rejection error").message;
+    assert!(guidance.contains("task_submit.deliverable"));
+    assert!(guidance.contains("same Task, Agent, and attempt"));
+    assert!(guidance.contains("file or multipart deliverables"));
 }

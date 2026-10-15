@@ -102,10 +102,7 @@ impl LedgerNamespace {
     /// Assemble one key. The discriminator is an input hash, an error signature, or
     /// whatever else separates two entries inside the namespace.
     pub(crate) fn key(self, turn_id: &str, tool_name: &str, discriminator: &str) -> String {
-        format!(
-            "{}{turn_id}:{tool_name}:{discriminator}",
-            self.prefix()
-        )
+        format!("{}{turn_id}:{tool_name}:{discriminator}", self.prefix())
     }
 
     /// The prefix every key of one namespace under one turn and tool shares, for
@@ -259,8 +256,7 @@ pub fn clear_served_reads(scope: &str) {
 pub fn clear_inspection_memory(turn_id: &str) {
     let seen = inspection_memory();
     let needle = format!("inspect:{turn_id}:");
-    seen
-        .lock()
+    seen.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .retain(|key, _| !key.starts_with(&needle));
 }
@@ -328,12 +324,11 @@ pub(crate) fn repeated_call_block_bound_for(tool_name: &str, input: &str) -> usi
     // different thing entirely - one live run polled `{"query": "task:..."}`
     // five times with nothing in flight while the wider bound let it keep
     // going to twelve, and the stagnation monitor stopped the run first.
-    let multiplier =
-        if tool_name == "state_inspect" && input_declares_wait_for_workers(input) {
-            4
-        } else {
-            2
-        };
+    let multiplier = if tool_name == "state_inspect" && input_declares_wait_for_workers(input) {
+        4
+    } else {
+        2
+    };
     std::env::var("COWD_TOOL_REPEAT_BLOCK_LIMIT")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
@@ -722,21 +717,50 @@ fn is_identifier(run: &str) -> bool {
 /// refused. This is the same identifier rule `error_signature` uses, so the
 /// classification cannot drift from the signature it is meant to explain.
 fn state_derived_cause(message: &str, input_refs: &[String]) -> bool {
-    let mut run = String::new();
-    let names_outside_the_input = |run: &str| {
-        is_identifier(run) && !input_refs.iter().any(|reference| reference.contains(run))
-    };
-    for ch in message.chars().take(200) {
-        if ch.is_ascii_hexdigit() {
-            run.push(ch);
-        } else {
-            if names_outside_the_input(&run) {
-                return true;
+    // Free prose is not an identity namespace. Scanning arbitrary hex-like
+    // words classified `sha256` (`a256`) as a Runtime-owned object and blocked
+    // a different, potentially valid recovery input. Only an explicitly typed
+    // durable reference can establish that Runtime resolved hidden state.
+    const TYPED_PREFIXES: &[&str] = &[
+        "run:",
+        "graph:",
+        "execution-graph:",
+        "session-ingress-graph:",
+        "task:",
+        "agent:",
+        "team:",
+        "program:",
+        "mission:",
+        "session:",
+        "turn:",
+        "artifact://",
+        "tool://",
+    ];
+    message.split_whitespace().take(40).any(|raw_token| {
+        let token = raw_token.trim_matches(|ch: char| "`'\"()[]{}<>,.;".contains(ch));
+        TYPED_PREFIXES.iter().any(|prefix| {
+            let Some(start) = token.find(prefix) else {
+                return false;
+            };
+            // Runtime error prose often renders a typed ref after a label such
+            // as `missing:run:<id>`. Accept the typed ref at punctuation
+            // boundaries, but never carve `arun:<id>` out of an ordinary word.
+            let has_word_prefix = token[..start]
+                .chars()
+                .last()
+                .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+            if has_word_prefix {
+                return false;
             }
-            run.clear();
-        }
-    }
-    names_outside_the_input(&run)
+            let suffix = &token[start + prefix.len()..];
+            let id_len = suffix
+                .find(|ch: char| !(ch.is_ascii_alphanumeric() || "_-/.".contains(ch)))
+                .unwrap_or(suffix.len());
+            let typed_ref = &token[start..start + prefix.len() + id_len];
+            is_identifier(&suffix[..id_len])
+                && !input_refs.iter().any(|reference| reference.contains(typed_ref))
+        })
+    })
 }
 
 /// Clear the failure breakers filed under one turn, leaving the cumulative
@@ -758,10 +782,10 @@ pub fn clear_failure_breakers(turn_id: &str) {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .retain(|key, _| {
             !key.contains(needle.as_str())
-                || LEDGER_NAMESPACES
-                    .iter()
-                    .any(|namespace| key.starts_with(namespace.prefix())
-                        && namespace.survives_failure_breaker_clear())
+                || LEDGER_NAMESPACES.iter().any(|namespace| {
+                    key.starts_with(namespace.prefix())
+                        && namespace.survives_failure_breaker_clear()
+                })
         });
     clear_ignored_refusal(turn_id);
 }
@@ -910,14 +934,12 @@ mod repetition_guard_tests {
         let turn = turn!();
         // First failure: advice, not a verdict. The model has not yet seen that
         // retrying changes nothing.
-        assert!(
-            err(
-                turn,
-                ToolFailureKind::ExecutionError,
-                "execution graph `run:abc123` does not exist"
-            )
-            .is_none()
-        );
+        assert!(err(
+            turn,
+            ToolFailureKind::ExecutionError,
+            "execution graph `run:abc123` does not exist"
+        )
+        .is_none());
         // Second: the graph id differs - a replan minted a new one - but the
         // message normalizes identifiers, so the cause is recognized.
         let tripped = err(
@@ -1039,6 +1061,67 @@ mod repetition_guard_tests {
             "the cause names an object the model did not send, so a reworded call \
              could not have succeeded either"
         );
+    }
+
+    #[test]
+    fn schema_word_sha256_does_not_block_a_different_recovery_reference() {
+        let turn = turn!();
+        let message = "Runtime did not execute `artifact_commit`: content_ref_unresolved: Commit a non-empty deliverable. Three shapes work: `artifact_publish` with `MessageBlock{message_id, block_index, sha256, media_type}";
+        record_tool_failure(
+            turn,
+            "artifact_commit",
+            "bad-current-block",
+            &[],
+            ToolFailureKind::ExecutionError,
+            message,
+        );
+        let diagnosis = record_tool_failure(
+            turn,
+            "artifact_commit",
+            "recover-from-current-draft",
+            &[],
+            ToolFailureKind::ExecutionError,
+            message,
+        );
+        assert!(diagnosis.is_some(), "the common cause remains observable");
+        assert!(
+            !is_dispatch_blocked(turn, "artifact_commit", "recover-from-current-draft"),
+            "the cause has no typed state reference, so a changed input must reach the resolver"
+        );
+        record_tool_failure(
+            turn,
+            "artifact_commit",
+            "bad-current-block",
+            &[],
+            ToolFailureKind::ExecutionError,
+            message,
+        );
+        assert!(
+            is_dispatch_blocked(turn, "artifact_commit", "bad-current-block"),
+            "the identical deterministic call must still be refused"
+        );
+    }
+
+    #[test]
+    fn state_derived_causes_require_a_typed_runtime_reference() {
+        let turn = turn!();
+        record_tool_failure(
+            turn,
+            "task_review",
+            "first-input",
+            &[],
+            ToolFailureKind::ExecutionError,
+            "review physical Agent packet missing:run:abc123",
+        );
+        record_tool_failure(
+            turn,
+            "task_review",
+            "different-input",
+            &[],
+            ToolFailureKind::ExecutionError,
+            "review physical Agent packet missing:run:9f8e7d",
+        );
+        assert!(is_dispatch_blocked(turn, "task_review", "different-input"));
     }
 
     /// Characterization (same run): the same input hash repeated across turns
@@ -1709,7 +1792,10 @@ mod repetition_guard_tests {
     /// polling - the bound stopped the symptom while the model had nowhere to wait.
     #[test]
     fn a_polling_tool_gets_a_wider_block_bound_than_a_reading_tool() {
-        assert_eq!(repeated_call_block_bound_for("", "{}"), repeated_call_bound() * 2);
+        assert_eq!(
+            repeated_call_block_bound_for("", "{}"),
+            repeated_call_bound() * 2
+        );
         assert_eq!(
             repeated_call_block_bound_for("read_file", "{}"),
             repeated_call_bound() * 2
@@ -1856,7 +1942,13 @@ mod pattern_window_tests {
     fn a_healthy_mix_never_trips() {
         let turn = "pattern-healthy";
         clear_call_pattern(turn);
-        let tools = ["read_file", "grep_search", "read_ref", "edit", "state_inspect"];
+        let tools = [
+            "read_file",
+            "grep_search",
+            "read_ref",
+            "edit",
+            "state_inspect",
+        ];
         for round in 0..40 {
             let tool = tools[round % tools.len()];
             assert!(

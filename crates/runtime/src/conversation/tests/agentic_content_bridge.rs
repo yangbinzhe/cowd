@@ -127,6 +127,22 @@ fn explicit_content_commit_call(id: &str) -> ModelToolCall {
     }
 }
 
+fn explicit_task_submit_call(id: &str) -> ModelToolCall {
+    ModelToolCall {
+        id: id.to_string(),
+        name: harness_contract::agent_action::TASK_SUBMIT_TOOL_ID.to_string(),
+        input: serde_json::json!({
+            "task_ref": "task:bound-report",
+            "artifact_refs": [],
+            "evidence_refs": ["tool://read-1"],
+            "unresolved": [],
+            "deliverable": {"block_index": 0, "kind": "report", "title": "Bound report"}
+        })
+        .to_string(),
+        depends_on: Vec::new(),
+    }
+}
+
 #[tokio::test]
 async fn parent_checkpoint_receives_consumable_agent_artifact_content() {
     let services = crate::RuntimeServices::in_memory().expect("runtime services");
@@ -271,6 +287,45 @@ async fn tool_only_artifact_commit_never_selects_a_previous_draft() {
         input["content_ref"].as_str(),
         Some("current_message_block:0")
     );
+}
+
+#[tokio::test]
+async fn one_shot_task_submit_recovers_the_previous_same_attempt_report_draft() {
+    let services = crate::RuntimeServices::in_memory().expect("runtime services");
+    let ticket = agentic_content_bridge_ticket("one-shot-submit-graph", "agent", 1);
+    let report = "# Research report\n\nThis is the exact authored report.";
+    let previous_message = ConversationMessage::assistant(vec![ContentBlock::Text {
+        text: report.to_string(),
+    }]);
+    persist_agentic_content_draft(services.as_ref(), &ticket, &previous_message)
+        .await
+        .expect("persist report draft");
+    let mut calls = vec![explicit_task_submit_call("submit-previous-report")];
+
+    resolve_explicit_agentic_content_refs(
+        services.as_ref(),
+        &ticket,
+        &ConversationMessage::assistant(vec![]),
+        &mut calls,
+    )
+    .await
+    .expect("resolve one-shot submission");
+
+    let input: serde_json::Value = serde_json::from_str(&calls[0].input).expect("resolved input");
+    let content_ref = input["deliverable"]["resolved_content_ref"]
+        .as_str()
+        .expect("Runtime-bound content reference");
+    let artifact = services
+        .artifact_store()
+        .resolve(content_ref)
+        .expect("durable report artifact");
+    let content = services
+        .artifact_store()
+        .read(&artifact, "execution:one-shot-submit-graph", None)
+        .await
+        .expect("read committed report");
+    assert_eq!(String::from_utf8(content).expect("UTF-8"), report);
+    assert_eq!(input["task_ref"], "task:bound-report");
 }
 
 #[tokio::test]
@@ -632,18 +687,26 @@ async fn a_submitted_task_with_no_reviewer_is_named_with_its_action() {
             generation: 0,
         },
     );
-    program.tasks.insert(under_review.task_id.clone(), under_review);
+    program
+        .tasks
+        .insert(under_review.task_id.clone(), under_review);
 
-    let checkpoint: serde_json::Value =
-        serde_json::from_str(&super::compact_agentic_program_checkpoint(Some(&services), &program))
-            .unwrap();
-    let awaiting = checkpoint["awaiting_independent_review"].as_array().unwrap();
+    let checkpoint: serde_json::Value = serde_json::from_str(
+        &super::compact_agentic_program_checkpoint(Some(&services), &program),
+    )
+    .unwrap();
+    let awaiting = checkpoint["awaiting_independent_review"]
+        .as_array()
+        .unwrap();
     assert_eq!(awaiting.len(), 1, "{awaiting:?}");
     assert_eq!(awaiting[0]["task_ref"], "task:delivered");
     assert_eq!(awaiting[0]["claimant"], "agent:author");
     let action = &checkpoint["awaiting_review_action"]["instruction"];
     let action = action.as_str().expect("an action must be named");
-    assert!(action.contains("task:delivered") || action.contains("awaiting_independent_review"), "{action}");
+    assert!(
+        action.contains("task:delivered") || action.contains("awaiting_independent_review"),
+        "{action}"
+    );
     assert!(action.contains("agent_invite"), "{action}");
     assert!(action.contains("different Agent"), "{action}");
 }
@@ -707,9 +770,13 @@ async fn a_program_with_every_task_under_review_carries_no_action() {
     );
     program.tasks.insert(task.task_id.clone(), task);
 
-    let checkpoint: serde_json::Value =
-        serde_json::from_str(&super::compact_agentic_program_checkpoint(Some(&services), &program))
-            .unwrap();
-    assert!(checkpoint["awaiting_independent_review"].as_array().unwrap().is_empty());
+    let checkpoint: serde_json::Value = serde_json::from_str(
+        &super::compact_agentic_program_checkpoint(Some(&services), &program),
+    )
+    .unwrap();
+    assert!(checkpoint["awaiting_independent_review"]
+        .as_array()
+        .unwrap()
+        .is_empty());
     assert!(checkpoint["awaiting_review_action"].is_null());
 }

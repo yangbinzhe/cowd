@@ -159,7 +159,10 @@ impl AgentActionService {
         // otherwise emit the same decline forever and bury the one that mattered.
         let idempotency_key = format!(
             "{}:{}:{}:{}",
-            record.task_ref, record.mode, record.reason.as_str(), record.task_status
+            record.task_ref,
+            record.mode,
+            record.reason.as_str(),
+            record.task_status
         );
         let mut attempt = 0_u8;
         let request = AppendTransactionRequest {
@@ -1564,17 +1567,20 @@ impl AgentActionService {
         // `expected_streams`, which the store rejects - so the bounded-convergence
         // count it exists to feed never saw a single one, behind a `let _ =` that
         // swallowed the error for the life of the feature.
-        if let Err(error) = self.store.append_transaction_locked(AppendTransactionRequest {
-            transaction_id: format!(
-                "completion-rejected:{}:{}",
-                projection.program_id, envelope.action_id
-            ),
-            expected_streams: vec![ExpectedStreamRevision {
-                stream_id: program_stream(&projection.program_id),
-                expected_revision: projection.revision,
-            }],
-            events: vec![event],
-        }) {
+        if let Err(error) = self
+            .store
+            .append_transaction_locked(AppendTransactionRequest {
+                transaction_id: format!(
+                    "completion-rejected:{}:{}",
+                    projection.program_id, envelope.action_id
+                ),
+                expected_streams: vec![ExpectedStreamRevision {
+                    stream_id: program_stream(&projection.program_id),
+                    expected_revision: projection.revision,
+                }],
+                events: vec![event],
+            })
+        {
             tracing::warn!(
                 target: "cowd::agentic",
                 program_id = %projection.program_id,
@@ -1640,17 +1646,20 @@ impl AgentActionService {
         // empty `expected_streams` is rejected outright, which is how the
         // completion-rejection marker next door failed silently for its whole
         // life behind a `let _ =`.
-        if let Err(error) = self.store.append_transaction_locked(AppendTransactionRequest {
-            transaction_id: format!(
-                "review-discipline-conflict:{}:{}",
-                projection.program_id, envelope.action_id
-            ),
-            expected_streams: vec![ExpectedStreamRevision {
-                stream_id: program_stream(&projection.program_id),
-                expected_revision: projection.revision,
-            }],
-            events: vec![event],
-        }) {
+        if let Err(error) = self
+            .store
+            .append_transaction_locked(AppendTransactionRequest {
+                transaction_id: format!(
+                    "review-discipline-conflict:{}:{}",
+                    projection.program_id, envelope.action_id
+                ),
+                expected_streams: vec![ExpectedStreamRevision {
+                    stream_id: program_stream(&projection.program_id),
+                    expected_revision: projection.revision,
+                }],
+                events: vec![event],
+            })
+        {
             tracing::warn!(
                 target: "cowd::agentic",
                 program_id = %projection.program_id,
@@ -2331,7 +2340,7 @@ fn applied_observation(
         status: AgentActionStatus::Applied,
         duplicate,
         changed_refs,
-        actionable: actionable(projection, duplicate),
+        actionable: actionable_for_actor(projection, &envelope.actor, duplicate),
         projection: Some(json!({
             "program_id": projection.program_id,
             "objective_id": projection.objective_id,
@@ -2496,12 +2505,23 @@ fn inspected_observation(
     // already has from the page that produced this revision.
     if !unchanged && input.entry_ref.is_none() && input.scope_ref.is_none() {
         if let Some(object) = value.as_object_mut() {
-            object.insert(
-                "next_rungs".to_string(),
-                serde_json::Value::Array(crate::host::closure_rungs_for_program(
-                    projection,
-                )),
-            );
+            let rungs =
+                serde_json::Value::Array(crate::host::closure_rungs_for_program(projection));
+            if matches!(
+                envelope.actor.kind,
+                AgentActorKind::Agent | AgentActorKind::TeamLead
+            ) {
+                object.insert(
+                    "program_progress".to_string(),
+                    json!({
+                        "owner": "RootTurn",
+                        "next_rungs": rungs,
+                        "role_note": "Program-wide closure is read-only background, not an assignment. Continue only the Task, review, or coordination work bound to this execution.",
+                    }),
+                );
+            } else {
+                object.insert("next_rungs".to_string(), rungs);
+            }
         }
     }
     // Say the cheap way to ask, at the moment asking again is pointless.
@@ -2522,9 +2542,8 @@ fn inspected_observation(
     // cross-team read answering `not_found` - and collapsing it into an unchanged
     // receipt would hide the answer.
     if !unchanged && input.entry_ref.is_none() && input.scope_ref.is_none() {
-        let input_hash = crate::tool_invocation::stable_hash(
-            &serde_json::to_string(input).unwrap_or_default(),
-        );
+        let input_hash =
+            crate::tool_invocation::stable_hash(&serde_json::to_string(input).unwrap_or_default());
         // The token is what was actually asked about, not the program revision.
         //
         // Keying on the revision missed the commonest loop: a model polling
@@ -2601,7 +2620,7 @@ fn inspected_observation(
         status: AgentActionStatus::Observed,
         duplicate: false,
         changed_refs: Vec::new(),
-        actionable: actionable(projection, false),
+        actionable: actionable_for_actor(projection, &envelope.actor, false),
         projection: Some(value),
         error: None,
     }
@@ -2958,6 +2977,56 @@ fn rejected(
     }
 }
 
+fn actionable_for_actor(
+    projection: &AgenticProgramProjection,
+    actor: &harness_contract::agent_action::AgentActorBinding,
+    duplicate: bool,
+) -> Vec<String> {
+    if !matches!(actor.kind, AgentActorKind::Agent | AgentActorKind::TeamLead)
+        || projection.status != super::program::AgenticProgramStatus::Open
+    {
+        return actionable(projection, duplicate);
+    }
+    let mut actions = Vec::new();
+    if duplicate {
+        actions.push("idempotent replay: no state was duplicated".to_string());
+    }
+    let bound_attempt = actor
+        .execution_id
+        .as_deref()
+        .zip(actor.agent_id.as_deref())
+        .and_then(|(execution_id, agent_id)| {
+            projection.tasks.values().find_map(|task| {
+                task.active_attempts
+                    .get(execution_id)
+                    .filter(|attempt| attempt.agent_id == agent_id)
+                    .map(|attempt| (task, attempt))
+            })
+        });
+    if let Some((task, attempt)) = bound_attempt {
+        use harness_contract::agent_action::AgentAttemptMode;
+        actions.push(match attempt.mode {
+            AgentAttemptMode::Execute => format!(
+                "Complete only your bound Task `{}`. Prefer one `task_submit` with `deliverable` selecting this response's report or the latest saved report from this same Task, Agent, claim and attempt. Use `artifact_commit` only for file-backed or multi-part deliverables. Include real durable evidence and disclose genuine gaps in `unresolved`.",
+                task.task_id,
+            ),
+            AgentAttemptMode::Review => format!(
+                "Read the submitted artifact for your bound Task `{}` and issue the independent `task_review` verdict. Do not execute or resubmit another Task.",
+                task.task_id,
+            ),
+            AgentAttemptMode::Coordination => format!(
+                "Respond only to the bound coordination work for Task `{}` using your authorized collaboration actions.",
+                task.task_id,
+            ),
+        });
+    }
+    actions.push(
+        "The root coordinator owns Program-level closure. Global Program progress is read-only background; follow only the Task, review, or coordination assignment in your private role brief."
+            .to_string(),
+    );
+    actions
+}
+
 fn actionable(projection: &AgenticProgramProjection, duplicate: bool) -> Vec<String> {
     let mut actions = Vec::new();
     if duplicate {
@@ -3100,13 +3169,11 @@ fn actionable(projection: &AgenticProgramProjection, duplicate: bool) -> Vec<Str
                 .to_string(),
         );
     }
-    // How to submit at all. The old guidance was "review a submitted Task", which names
-    // only one of the four things an Agent holding a Task can do, and said nothing about
-    // the three ways a body becomes committable. In d6v10 one Agent lost all thirteen of
-    // its `artifact_commit` calls to `content_ref_unresolved` - it wrote the report in one
-    // step and committed in a later one, and Runtime only ever resolved the current
-    // response. It then repeated the same call thirteen times, because nothing told it
-    // another shape existed.
+    // Make the execution Task's lowest-cost closeout the default. The previous text
+    // listed several commit shapes without saying that one `task_submit` can bind a
+    // same-attempt draft written in an earlier model step. That pushed a live Agent
+    // through a separate `artifact_commit` and made a mistaken current-block index look
+    // like a permanent delivery failure.
     let claimed = projection
         .tasks
         .values()
@@ -3118,7 +3185,7 @@ fn actionable(projection: &AgenticProgramProjection, duplicate: bool) -> Vec<Str
             .any(|t| t.status == AgenticTaskStatus::Submitted)
     {
         actions.push(
-            "To make a body committable: `artifact_publish` with `MessageBlock{message_id, block_index, sha256, media_type}` publishes any Text block of any of your responses; `artifact_commit` with `content_ref=current_message_block:<zero-based index>` commits a Text block of the response you are writing right now; `artifact_commit` with `content_ref=artifact://<selector>` commits something you already published. A body you wrote in an earlier step stays committable - name it with `artifact_publish(MessageBlock{...})` or use `message://current` and Runtime recovers it. Then `task_submit` with the returned `artifact:...` reference plus real durable evidence refs.".to_string(),
+            "For an Agent executing its bound claimed Task, prefer one `task_submit` with `deliverable` selecting the report's non-empty Text block. If the report was written in an earlier step, Runtime resolves the latest saved draft from this same Task, Agent, claim and attempt; do not guess a current-response block number or repeat `artifact_commit`. Use `artifact_commit` only for file-backed or multi-part deliverables, then pass its exact returned artifact reference to `task_submit`. Include real durable evidence references and disclose genuine gaps in `unresolved`. An Agent bound in review mode must read the submitted artifact and issue `task_review` instead of resubmitting it.".to_string(),
         );
     }
     if !projection.artifacts.is_empty()

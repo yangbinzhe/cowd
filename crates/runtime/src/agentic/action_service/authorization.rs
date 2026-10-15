@@ -829,7 +829,7 @@ fn validate_task_submission(
     if input.artifact_refs.is_empty() && !one_shot_deliverable {
         return Some((
             "task_submission_has_no_artifact",
-            "commit substantive work, then submit its compact artifact reference".to_string(),
+            "Write a non-empty report as normal response text, then use task_submit.deliverable to select it or the latest saved report from this same Task, Agent, and attempt. For file or multipart deliverables, use artifact_commit first and submit its compact artifact reference. Empty or invalid report selections remain rejected.".to_string(),
         ));
     }
     if input.evidence_refs.is_empty() && !one_shot_deliverable {

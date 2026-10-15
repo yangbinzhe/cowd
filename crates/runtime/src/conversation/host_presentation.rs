@@ -2,6 +2,21 @@
 
 use super::*;
 
+fn should_reconcile_agentic_terminal(
+    role: crate::TurnExecutionRole,
+    completion: harness_contract::goal::GoalCompletion,
+    terminal_override: Option<harness_contract::goal::GoalCompletion>,
+) -> bool {
+    role.owns_root_presentation()
+        && !(completion == harness_contract::goal::GoalCompletion::Partial
+            && terminal_override == Some(harness_contract::goal::GoalCompletion::Partial))
+        && matches!(
+            completion,
+            harness_contract::goal::GoalCompletion::Satisfied
+                | harness_contract::goal::GoalCompletion::Partial
+        )
+}
+
 impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
     type Output = crate::RuntimeToolExecutionOutcome;
     type Admission = Option<crate::ToolExecutionAdmission>;
@@ -573,7 +588,6 @@ where
             framework_authored: true,
         })
     }
-
 
     #[allow(clippy::too_many_arguments)]
     async fn record_terminal_provider_usage(
@@ -1499,8 +1513,7 @@ where
             // is progress, and progress is not a loop.
             let rewrote_previous = state.last_terminal_answer_digest != answer_digest;
             state.last_terminal_answer_digest = answer_digest.clone();
-            state.repeated_terminal_answers =
-                state.repeated_terminal_answers.saturating_add(1);
+            state.repeated_terminal_answers = state.repeated_terminal_answers.saturating_add(1);
             if rewrote_previous && state.repeated_terminal_answers > 1 {
                 tracing::warn!(
                     target: "cowd::repeated_final_answer",
@@ -1535,13 +1548,13 @@ where
         // Program is what says whether the work is finished. Both claims now reach
         // the same check; the checks themselves are unchanged and still bounded, so
         // a genuinely finished or genuinely blocked Program falls straight through.
-        if execution_role.owns_root_presentation()
-            && matches!(
-                completion,
-                harness_contract::goal::GoalCompletion::Satisfied
-                    | harness_contract::goal::GoalCompletion::Partial
-            )
-        {
+        if should_reconcile_agentic_terminal(
+            execution_role,
+            completion,
+            terminal_override
+                .as_ref()
+                .map(|(completion, _)| *completion),
+        ) {
             // First make any durable Program completion request visible to the
             // authoritative GoalStore. The gap check must observe that verdict;
             // checking first can miss a request that has not yet been reduced.
@@ -1588,7 +1601,9 @@ where
                             gap = %gap,
                             "the model concluded repeatedly without acting; presenting the honest terminal instead of spending the remaining budget"
                         );
-                        return Ok(self.honest_partial_terminal(ticket, &gap, idle_answers).await);
+                        return Ok(self
+                            .honest_partial_terminal(ticket, &gap, idle_answers)
+                            .await);
                     }
                 }
                 let continue_gap = {
@@ -1697,7 +1712,11 @@ where
                     let (continue_rungs, repeated_answer, attempt) = {
                         let mut state = self.state.lock().await;
                         let allowed = claim_continuation_budget(&mut state, "closure_rung");
-                        (allowed, state.repeated_terminal_answers, state.completion_gap_continuations)
+                        (
+                            allowed,
+                            state.repeated_terminal_answers,
+                            state.completion_gap_continuations,
+                        )
                     };
                     if continue_rungs {
                         self.abandon_published_terminal().await;
@@ -1728,12 +1747,12 @@ where
                             String::new()
                         };
                         let body = format!(
-                                "Runtime returned this turn to work because the collaboration is not finished: outstanding rungs: {}. \
+                            "Runtime returned this turn to work because the collaboration is not finished: outstanding rungs: {}. \
                                  A submitted Task still needs its independent review by a different Agent, and the objective-review \
                                  Task is no exception. Invite or assign a reviewer inside the existing Team (do not create another \
                                  Team), have it read the submitted report through read_ref or evidence_retrieve and record its \
                                  task_review verdict, then present the final answer again.",
-                                outstanding.join(", ")
+                            outstanding.join(", ")
                         );
                         let guidance = if escalation.is_empty() {
                             body
@@ -2300,12 +2319,12 @@ where
             state.completion_gap_outstanding = true;
         }
         let body = if kind == crate::agentic::issues::CompletionGapKind::ObjectiveReview {
-                // The scope discipline is shared with the Program receipt's
-                // actionable guidance. Both sites read it from the order
-                // contract so a rule change cannot land on one layer only.
-                let scope = crate::agentic::order_contract::OBJECTIVE_REVIEW_SCOPE_DISCIPLINE;
-                format!(
-                    "Runtime returned this turn to work because the Objective is not complete yet: {gap}. \
+            // The scope discipline is shared with the Program receipt's
+            // actionable guidance. Both sites read it from the order
+            // contract so a rule change cannot land on one layer only.
+            let scope = crate::agentic::order_contract::OBJECTIVE_REVIEW_SCOPE_DISCIPLINE;
+            format!(
+                "Runtime returned this turn to work because the Objective is not complete yet: {gap}. \
                      The final answer you just wrote is not being delivered. This is an Objective-review \
                      gap, not a Task-issue classification gap: {scope}. If every current Agent produced one of the delivered result artifacts, \
                      give the Objective-review Task to a reviewer Agent inside the existing Team (do not create \
@@ -2329,10 +2348,10 @@ where
                      user-intent criterion. Complete any acceptance review required for the new Task. \
                      After the Goal projection confirms the criterion is current and satisfied, present the \
                      final answer again."
-                )
-            } else {
-                format!(
-                    "Runtime returned this turn to work because the Objective is not complete yet: {gap}. \
+            )
+        } else {
+            format!(
+                "Runtime returned this turn to work because the Objective is not complete yet: {gap}. \
                      The final answer you just wrote is not being delivered. Resolve the gap with the Agent \
                      actions you already have - for an unadjudicated issue, call `message_publish` with \
                      `issue_dispositions` naming each `issue:` reference and a disposition of `must_resolve`, \
@@ -2340,39 +2359,39 @@ where
                      (`artifact://`, `tool://`, `task:`, `issue:` or `program:`). `disclose` preserves a \
                      labelled limitation without asserting an estimate is a measurement. Then present the \
                      final answer again."
-                )
-            };
-            // Escalation. The guidance above is a pure function of the gap, so
-            // an unchanged gap produced an unchanged instruction on every
-            // continuation: run one19 received byte-identical text on five
-            // consecutive rounds (the only difference in the whole context
-            // envelope was `elapsed_ms` and `rounds`) and answered with the same
-            // final answer every time. Restating the same request is not an
-            // intervention. From the second occurrence the instruction says so,
-            // names the counter, and states that a prose restatement will not be
-            // delivered; from the third it stops asking and pins the tool.
-            let escalation = if repeated_answer >= 2 {
-                format!(
-                    "ESCALATION (attempt {attempt}, consecutive answer #{repeated}): this exact gap was already \
+            )
+        };
+        // Escalation. The guidance above is a pure function of the gap, so
+        // an unchanged gap produced an unchanged instruction on every
+        // continuation: run one19 received byte-identical text on five
+        // consecutive rounds (the only difference in the whole context
+        // envelope was `elapsed_ms` and `rounds`) and answered with the same
+        // final answer every time. Restating the same request is not an
+        // intervention. From the second occurrence the instruction says so,
+        // names the counter, and states that a prose restatement will not be
+        // delivered; from the third it stops asking and pins the tool.
+        let escalation = if repeated_answer >= 2 {
+            format!(
+                "ESCALATION (attempt {attempt}, consecutive answer #{repeated}): this exact gap was already \
                      shown to you {attempt} time(s) and you have now concluded {repeated} time(s) in a row \
                      without a tool call. Runtime does not deliver another conclusion. The action that clears this \
                      gap is `{tool}`. Your next response MUST be a tool call - read the references you still need, \
                      then call it. Runtime has restricted this step to tool calls.",
-                    attempt = attempt,
-                    repeated = repeated_answer,
-                    tool = kind.closing_tool()
-                )
-            } else if repeated_answer >= 1 || attempt >= 2 {
-                format!(
-                    "NOTICE (attempt {attempt}): you have already been shown this gap {attempt} time(s). \
+                attempt = attempt,
+                repeated = repeated_answer,
+                tool = kind.closing_tool()
+            )
+        } else if repeated_answer >= 1 || attempt >= 2 {
+            format!(
+                "NOTICE (attempt {attempt}): you have already been shown this gap {attempt} time(s). \
                      Another prose answer will not be delivered either. Take the action named above - `{tool}` \
                      - and only then present the final answer.",
-                    attempt = attempt,
-                    tool = kind.closing_tool()
-                )
-            } else {
-                String::new()
-            };
+                attempt = attempt,
+                tool = kind.closing_tool()
+            )
+        } else {
+            String::new()
+        };
         let guidance = if escalation.is_empty() {
             body
         } else {
@@ -2762,6 +2781,41 @@ pub(super) fn terminal_aggregate_usage(
 #[cfg(test)]
 mod terminal_usage_tests {
     use super::*;
+
+    #[test]
+    fn explicit_partial_terminal_override_is_not_reopened_by_program_closure() {
+        assert!(should_reconcile_agentic_terminal(
+            crate::TurnExecutionRole::RootTurn,
+            GoalCompletion::Partial,
+            None,
+        ));
+        assert!(!should_reconcile_agentic_terminal(
+            crate::TurnExecutionRole::RootTurn,
+            GoalCompletion::Partial,
+            Some(GoalCompletion::Partial),
+        ));
+        assert!(!should_reconcile_agentic_terminal(
+            crate::TurnExecutionRole::DelegatedLeaf,
+            GoalCompletion::Partial,
+            None,
+        ));
+    }
+
+    #[test]
+    fn a_satisfied_override_does_not_bypass_program_closure_verification() {
+        for completion in [GoalCompletion::Satisfied, GoalCompletion::Partial] {
+            assert!(should_reconcile_agentic_terminal(
+                crate::TurnExecutionRole::RootTurn,
+                completion,
+                Some(GoalCompletion::Satisfied),
+            ));
+        }
+        assert!(should_reconcile_agentic_terminal(
+            crate::TurnExecutionRole::RootTurn,
+            GoalCompletion::Satisfied,
+            Some(GoalCompletion::Partial),
+        ));
+    }
 
     fn telemetry(
         input_tokens: u64,
@@ -3739,7 +3793,11 @@ pub(super) fn tool_batch_coverage_keys(calls: &[ModelToolCall]) -> BTreeSet<Stri
 /// off prematurely, but must still converge before repeatedly rebuilding an
 /// ever-larger provider context from unchanged evidence.
 pub(super) const fn evidence_saturation_limit(bounded_evidence_role: bool) -> usize {
-    if bounded_evidence_role { 2 } else { 3 }
+    if bounded_evidence_role {
+        2
+    } else {
+        3
+    }
 }
 
 pub(super) fn focus_acceptance_is_met(

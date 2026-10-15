@@ -88,6 +88,132 @@ fn supervisor(action_id: &str, execution_id: &str, action: AgentAction) -> Agent
 }
 
 #[test]
+fn delegated_inspection_and_action_receipts_keep_root_closure_as_background() {
+    use harness_contract::agent_action::AgentAttemptMode;
+
+    let service = AgentActionService::new(Arc::new(RuntimeEventStore::for_test()));
+    let team = service
+        .apply(&root(
+            "owner-team",
+            AgentAction::TeamCreate(TeamCreateInput {
+                name: "Bound work".into(),
+                mission: "complete assigned evidence".into(),
+                objective: None,
+            }),
+        ))
+        .expect("team")
+        .changed_refs[0]
+        .clone();
+    let member = service
+        .apply(&root(
+            "owner-member",
+            AgentAction::AgentInvite(
+                serde_json::from_value(json!({
+                    "team_ref": team,
+                    "role": "Bound worker",
+                    "mission": "work on one assignment",
+                    "required_capabilities": ["read"],
+                }))
+                .expect("member input"),
+            ),
+        ))
+        .expect("member")
+        .changed_refs[0]
+        .clone();
+    let task_ref = service
+        .apply(&root(
+            "owner-task",
+            AgentAction::TaskPublish(
+                serde_json::from_value(json!({
+                    "team_ref": team,
+                    "title": "Assigned report",
+                    "objective": "produce evidence",
+                    "acceptance": "independent evidence review",
+                }))
+                .expect("task input"),
+            ),
+        ))
+        .expect("task")
+        .changed_refs[0]
+        .clone();
+    let mut program = service.project("program-1").expect("program");
+    let root_request = root_in_turn(
+        "turn-owner-root",
+        "owner-root-inspect",
+        AgentAction::StateInspect(StateInspectInput::default()),
+    );
+    for mode in [
+        AgentAttemptMode::Execute,
+        AgentAttemptMode::Review,
+        AgentAttemptMode::Coordination,
+    ] {
+        let mut request = managed(
+            "owner-leaf-inspect",
+            &team,
+            &member,
+            AgentAction::StateInspect(StateInspectInput::default()),
+        );
+        let execution_id = format!("execution:owner-{mode:?}");
+        request.actor.execution_id = Some(execution_id.clone());
+        let task = program.tasks.get_mut(&task_ref).expect("bound Task");
+        task.status = if mode == AgentAttemptMode::Review {
+            AgenticTaskStatus::Submitted
+        } else {
+            AgenticTaskStatus::Claimed
+        };
+        task.active_attempts.clear();
+        task.active_attempts.insert(
+            execution_id.clone(),
+            super::super::program::AgenticTaskAttemptProjection {
+                execution_id,
+                agent_id: member.clone(),
+                membership_id: AgenticProgramProjection::membership_id(&member, &team),
+                mode,
+                generation: 0,
+            },
+        );
+        let observation = inspected_observation(&request, &program, None);
+        assert_eq!(observation.status, AgentActionStatus::Observed);
+        let page = observation.projection.expect("leaf page");
+        assert!(page.get("next_rungs").is_none());
+        assert_eq!(page["program_progress"]["owner"], "RootTurn");
+        assert!(page["program_progress"]["role_note"]
+            .as_str()
+            .unwrap()
+            .contains("read-only background"));
+        assert_eq!(
+            page["program_progress"]["next_rungs"],
+            serde_json::Value::Array(crate::host::closure_rungs_for_program(&program)),
+        );
+        let expected_action = match mode {
+            AgentAttemptMode::Execute => "task_submit",
+            AgentAttemptMode::Review => "task_review",
+            AgentAttemptMode::Coordination => "bound coordination",
+        };
+        assert!(observation
+            .actionable
+            .iter()
+            .any(|action| action.contains(expected_action)));
+        assert_eq!(
+            observation.actionable,
+            actionable_for_actor(&program, &request.actor, false)
+        );
+        assert!(!observation
+            .actionable
+            .iter()
+            .any(|action| action.contains("claim an available Task")
+                || action.contains("objective_complete_request")));
+        let root_page = inspected_observation(&root_request, &program, None)
+            .projection
+            .expect("root page");
+        assert_eq!(
+            root_page["next_rungs"],
+            page["program_progress"]["next_rungs"]
+        );
+    }
+}
+
+#[test]
 fn typed_decline_settles_only_its_opportunity_and_survives_cold_replay() {
     use harness_contract::agent_action::{AgentAttemptMode, TaskAttemptDispatchInput};
     let store = Arc::new(RuntimeEventStore::for_test());

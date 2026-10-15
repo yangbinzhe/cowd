@@ -33,12 +33,31 @@ pub(super) fn system_prompt(
         "Use only native tool calls exposed by this runtime. Never write simulated tool syntax such as <tool_call>, <function=...>, <parameter=...>, or JSON-shaped pseudo-calls in final text. If no native tool is authorized, answer directly from the supplied objective and upstream evidence.".into(),
         crate::prompt::stable_runtime_context_protocol(),
     ];
-    if tool_names.iter().any(|tool| is_agent_action_tool(tool)) {
+    if packet.agentic_binding.is_none() && tool_names.iter().any(|tool| is_agent_action_tool(tool))
+    {
         prompt.push(
             "# Stable autonomous-collaboration protocol\nYou are an active collaborator. Inspect current Program state, claim eligible bounded work, execute it with real tools, commit durable artifacts, submit evidence, review peers independently, publish scoped messages when coordination adds value, and create or publish follow-up work when the objective reveals a genuine gap. Prose never changes collaboration state. Runtime owns identity, permission, revisions, leases, execution and terminal truth; never invent them. Keep long content in normal output or files and use compact action references.".to_string(),
         );
     }
     prompt.push(crate::SYSTEM_PROMPT_CACHE_COHORT_BOUNDARY.to_string());
+    if let Some(binding) = packet.agentic_binding.as_ref() {
+        let focus_contract = match &binding.focus {
+            harness_contract::agent::AgenticExecutionFocus::TaskExecute { task_ref } => format!(
+                "TaskExecute owns only the Task bound to this execution: `{task_ref}`. Claim and complete that Task, then submit its result with `task_submit`. Do not review peer Tasks, claim another Task, or perform Program-level completion actions; the root coordinator owns Program-level closure. Global Program status is background context, not a new assignment."
+            ),
+            harness_contract::agent::AgenticExecutionFocus::TaskReview { task_ref } => format!(
+                "TaskReview owns only the submitted Task bound to this execution: `{task_ref}`. Read its submitted artifact and issue the independent `task_review` verdict. Do not execute or submit another Task; the root coordinator owns Program-level closure. Global Program status is background context, not a new assignment."
+            ),
+            harness_contract::agent::AgenticExecutionFocus::Coordination { wake_ref } => format!(
+                "Coordination owns only the authorized wake bound to this execution: `{wake_ref}`. Respond through the authorized collaboration action and do not claim unrelated Tasks or perform Program-level completion actions."
+            ),
+            harness_contract::agent::AgenticExecutionFocus::ObjectiveReview { criterion_refs } => format!(
+                "ObjectiveReview owns only these bound criteria: {}. Review those criteria with the authorized objective-review action; do not execute unrelated Tasks or close the root Objective.",
+                criterion_refs.join(", ")
+            ),
+        };
+        prompt.push(format!("# Bound Agent action owner\n{focus_contract}"));
+    }
     prompt.extend([
         format!("Objective: {}", packet.objective),
         format!("Workspace root: {}", workspace_root.display()),

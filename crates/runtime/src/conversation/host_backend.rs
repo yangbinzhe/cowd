@@ -140,7 +140,10 @@ fn held_receipts_name_only_what_this_turn_produced() {
         false,
     ));
     let held = durable_receipt_refs(&messages);
-    assert_eq!(held, vec!["tool://first".to_string(), "tool://second".to_string()]);
+    assert_eq!(
+        held,
+        vec!["tool://first".to_string(), "tool://second".to_string()]
+    );
     // The list is bounded: an unbounded projection would grow the prompt every
     // round for no new information.
     let many = (0..40)
@@ -173,7 +176,10 @@ fn the_same_question_counts_as_a_repeat_even_when_the_answer_moved() {
     assert_eq!(streak, 18);
 
     // A different question resets it, so a genuine change of subject is not a loop.
-    assert_eq!(next_identical_action_streak(question, "tool_action:other", 18), 1);
+    assert_eq!(
+        next_identical_action_streak(question, "tool_action:other", 18),
+        1
+    );
 }
 
 #[test]
@@ -211,19 +217,24 @@ fn only_a_genuine_wait_is_exempt_from_the_identical_call_streak() {
 fn a_terminating_turn_records_the_guidance_it_will_not_deliver() {
     use harness_contract::goal::{RuntimeIntervention, RuntimeInterventionKind};
 
-    let blocked = || RuntimeIntervention {
+    let blocked = || {
+        RuntimeIntervention {
         goal_id: "goal:1".to_string(),
         kind: RuntimeInterventionKind::Block,
         reason: "multiple consecutive tool batches failed before any checked evidence was retained; stop speculative retries".to_string(),
         evidence_refs: vec!["execution_node:node-1".to_string()],
         expected_graph_revision: None,
+    }
     };
 
     // Nothing was prepared: the intervention is untouched, so a normal block
     // does not grow a meaningless clause.
     let mut untouched = blocked();
     record_undelivered_guidance(&mut untouched, &[]);
-    assert_eq!(untouched.evidence_refs, vec!["execution_node:node-1".to_string()]);
+    assert_eq!(
+        untouched.evidence_refs,
+        vec!["execution_node:node-1".to_string()]
+    );
     assert!(!untouched.reason.contains("guidance item(s)"));
 
     // Guidance was written for a next step the termination prevents: the
@@ -244,7 +255,9 @@ fn a_terminating_turn_records_the_guidance_it_will_not_deliver() {
         recorded.evidence_refs
     );
     assert!(
-        recorded.reason.contains("Runtime prepared 2 guidance item(s)"),
+        recorded
+            .reason
+            .contains("Runtime prepared 2 guidance item(s)"),
         "the blocked reason must state what was not delivered: {}",
         recorded.reason
     );
@@ -260,11 +273,9 @@ fn a_terminating_turn_records_the_guidance_it_will_not_deliver() {
         ..blocked()
     };
     record_undelivered_guidance(&mut replan, &["tool-failure-nudge:node-1".to_string()]);
-    assert!(
-        replan
-            .evidence_refs
-            .contains(&"tool-failure-nudge:node-1".to_string())
-    );
+    assert!(replan
+        .evidence_refs
+        .contains(&"tool-failure-nudge:node-1".to_string()));
     assert!(!replan.reason.contains("guidance item(s)"));
 }
 
@@ -852,13 +863,16 @@ where
             // never learned where it stood and had to ask with `state_inspect`
             // (one live run issued 153 of them). Push it on every step; the
             // routing above already makes it per-request.
-            let turn_framing = crate::host::agentic_turn_framing(
-                self.services.as_ref(),
-                &state.session_id,
-                &state.turn_id,
-                state.iterations,
-                state.tool_results.len(),
-                state.started_at.elapsed().as_millis(),
+            let turn_framing = crate::host::scope_turn_framing_for_role(
+                crate::host::agentic_turn_framing(
+                    self.services.as_ref(),
+                    &state.session_id,
+                    &state.turn_id,
+                    state.iterations,
+                    state.tool_results.len(),
+                    state.started_at.elapsed().as_millis(),
+                ),
+                state.execution_role,
             );
             let mut goal_state = ContextItem::new(
                 format!("goal-state:{}", ticket.node_id),
@@ -1176,14 +1190,22 @@ where
             // were false, the invariant read "nothing owed", and the request went
             // out with an empty `tools` array. Reading the projection names
             // `publish_task` the moment the Teams exist.
-            let (mut mandatory_action_outstanding, mut owed_rungs) = {
+            let (execution_role, mut mandatory_action_outstanding, mut owed_rungs) = {
                 let state = self.state.lock().await;
+                let owns_root = state.execution_role.owns_root_presentation();
                 (
-                    state.completion_gap_outstanding || !state.outstanding_closure_rungs.is_empty(),
-                    state.outstanding_closure_rungs.clone(),
+                    state.execution_role,
+                    owns_root
+                        && (state.completion_gap_outstanding
+                            || !state.outstanding_closure_rungs.is_empty()),
+                    if owns_root {
+                        state.outstanding_closure_rungs.clone()
+                    } else {
+                        Vec::new()
+                    },
                 )
             };
-            if !mandatory_action_outstanding {
+            if execution_role.owns_root_presentation() && !mandatory_action_outstanding {
                 let (session_id, turn_id) = {
                     let state = self.state.lock().await;
                     (state.session_id.clone(), state.turn_id.clone())
@@ -2055,13 +2077,16 @@ where
                             // #GoalState + #ScratchPad: the model's position and
                             // the three exit channels, injected together with the
                             // re-drive so a stalled turn never continues blind.
-                            let framing = crate::host::agentic_turn_framing(
-                                self.services.as_ref(),
-                                &state.session_id,
-                                &state.turn_id,
-                                state.iterations,
-                                state.tool_results.len(),
-                                state.started_at.elapsed().as_millis(),
+                            let framing = crate::host::scope_turn_framing_for_role(
+                                crate::host::agentic_turn_framing(
+                                    self.services.as_ref(),
+                                    &state.session_id,
+                                    &state.turn_id,
+                                    state.iterations,
+                                    state.tool_results.len(),
+                                    state.started_at.elapsed().as_millis(),
+                                ),
+                                state.execution_role,
                             );
                             let mut goal_state = ContextItem::new(
                                 format!("goal-state:{}", ticket.node_id),
@@ -3964,7 +3989,10 @@ fn a_second_distinct_defect_earns_its_own_repair_attempt() {
          `agent_action_batch`: tool `agent_action_batch` input violates its pinned schema: \
          $.actions[0]: missing required field `tool`",
     );
-    assert_ne!(first, second, "distinct defects must be distinct signatures");
+    assert_ne!(
+        first, second,
+        "distinct defects must be distinct signatures"
+    );
     // Each signature starts from zero and therefore earns the full budget, while
     // the second occurrence of the SAME defect is still refused - that is where
     // the model has stopped learning.
@@ -4110,7 +4138,11 @@ pub(super) fn record_repeated_calls(
 fn call_declares_wait_for_workers(call: &ModelToolCall) -> bool {
     serde_json::from_str::<serde_json::Value>(&call.input)
         .ok()
-        .and_then(|value| value.get("wait_for_workers").and_then(serde_json::Value::as_bool))
+        .and_then(|value| {
+            value
+                .get("wait_for_workers")
+                .and_then(serde_json::Value::as_bool)
+        })
         .unwrap_or(false)
 }
 
@@ -4909,7 +4941,7 @@ mod safety_fuse_streak_tests {
 
     #[test]
     fn loop_guard_is_nudge_first_with_opt_in_hard_stop() {
-        use super::{LoopGuardAction, evaluate_loop_guard};
+        use super::{evaluate_loop_guard, LoopGuardAction};
         assert_eq!(
             evaluate_loop_guard(0, 3, false, 5),
             LoopGuardAction::Continue
@@ -4937,7 +4969,6 @@ mod safety_fuse_streak_tests {
             LoopGuardAction::Block { streak: 5 }
         );
     }
-
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6842,10 +6873,7 @@ where
         // same result is an identical call. Advise the model (default) and only
         // hard stop when the operator opted into the circuit breaker. Pollers
         // are exempt because an unchanged result is their normal contract.
-        let loop_repeatable = !calls.is_empty()
-            && calls
-                .iter()
-                .all(is_loop_nudge_repeatable_tool);
+        let loop_repeatable = !calls.is_empty() && calls.iter().all(is_loop_nudge_repeatable_tool);
         let batch_result_digest = terminal_evidence_digest(&result.messages);
         if loop_repeatable {
             state.identical_action_streak = 0;
