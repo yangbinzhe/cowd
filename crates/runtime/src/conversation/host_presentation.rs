@@ -1647,14 +1647,48 @@ where
                     program.status,
                     crate::AgenticProgramStatus::Open | crate::AgenticProgramStatus::Waiting
                 );
-                let outstanding = if program_still_live {
+                let all_rungs = if program_still_live {
                     super::outstanding_closure_steps(&program)
-                        .into_iter()
-                        .filter(|step| step != "objective_complete_request")
-                        .collect::<Vec<_>>()
                 } else {
                     Vec::new()
                 };
+                let outstanding = all_rungs
+                    .iter()
+                    .filter(|step| step.as_str() != "objective_complete_request")
+                    .cloned()
+                    .collect::<Vec<_>>();
+                // When the completion request is the ONLY rung left, the work is
+                // done and the model has one action to take. It was told nothing,
+                // and one live run finished every task - four published, five
+                // reviewed, three accepted - then wrote a prose conclusion instead
+                // of asking, and the run ended at its window with
+                // `objective_complete_requested: false`.
+                //
+                // Rolling back would be wrong here: the model is allowed to
+                // conclude, it just does not know that concluding means calling the
+                // tool. So this branch guides instead of rolling back.
+                let only_exit_rung = outstanding.is_empty()
+                    && all_rungs
+                        .iter()
+                        .any(|step| step == "objective_complete_request");
+                if only_exit_rung {
+                    let mut item = crate::ContextItem::new(
+                        format!("exit-rung:{}", ticket.node_id),
+                        crate::ContextSourceKind::Task,
+                        crate::ContextRole::Instruction,
+                        "Every Program rung is closed: the Teams exist, the Tasks are \
+                         published, submitted, independently reviewed and accepted. The only \
+                         outstanding action is yours: call `objective_complete_request` to \
+                         close the Objective. Runtime verifies it and rejects it if anything \
+                         regressed, so you never risk a premature exit. A prose answer is not \
+                         a completion request - Runtime cannot certify the Objective from one."
+                            .to_string(),
+                    );
+                    item.authority = crate::ContextAuthority::System;
+                    item.visibility = crate::ContextVisibility::Private;
+                    item.evidence = vec![format!("execution_node:{}", ticket.node_id)];
+                    self.runtime.lock().await.push_next_model_context_item(item);
+                }
                 {
                     let mut state = self.state.lock().await;
                     state.outstanding_closure_rungs = outstanding.clone();
