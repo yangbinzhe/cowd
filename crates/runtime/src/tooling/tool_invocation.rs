@@ -535,6 +535,9 @@ fn canonical_input_refs(input: &str) -> Vec<String> {
         .flat_map(|candidate| {
             reference_tokens(&candidate)
                 .map(str::to_owned)
+                .chain(
+                    crate::repetition_guard::runtime_identity_refs(&candidate).map(str::to_owned),
+                )
                 .collect::<Vec<_>>()
         })
         .filter(|reference| is_canonical_input_ref(reference))
@@ -724,6 +727,70 @@ mod tests {
                 expected_block
             );
         }
+    }
+
+    #[test]
+    fn nested_input_identity_is_not_hidden_state_after_a_receipt_type_error() {
+        let receipt = "receipt:program:cdd4f0b23dc5a34275b96e2a98375ba3435:session-1234:call-5678";
+        let input = serde_json::json!({"task_ref": "task:9ea7db69dc49d9e7", "evidence_refs": ["tool://observed-1234",receipt]}).to_string();
+        let corrected = serde_json::json!({"task_ref": "task:9ea7db69dc49d9e7", "evidence_refs": ["tool://observed-1234"]}).to_string();
+        let references = canonical_input_refs(&input);
+        assert!(references
+            .iter()
+            .any(|reference| reference == "program:cdd4f0b23dc5a34275b96e2a98375ba3435"));
+        assert!(!references
+            .iter()
+            .any(|reference| reference.starts_with("receipt:")));
+        let turn = "turn-nested-receipt-evidence";
+        for _ in 0..crate::repetition_guard::repetition_bound() {
+            crate::repetition_guard::record_tool_failure(
+                turn,
+                "task_submit",
+                &stable_hash(&input),
+                &references,
+                ToolFailureKind::ExecutionError,
+                &format!(
+                    "Runtime did not execute `task_submit`: unsupported_evidence_ref: {receipt}"
+                ),
+            );
+        }
+        assert!(crate::repetition_guard::is_dispatch_blocked(
+            turn,
+            "task_submit",
+            &stable_hash(&input)
+        ));
+        assert!(!crate::repetition_guard::is_dispatch_blocked(
+            turn,
+            "task_submit",
+            &stable_hash(&corrected)
+        ));
+    }
+
+    #[test]
+    fn input_refs_observe_every_typed_identity_the_error_lexer_can_derive() {
+        for value in [
+            "receipt:program:cdd4f0b23dc5:session-1234",
+            "missing:run:abc123",
+            "(task:9ea7db69)",
+            "arun:abc123",
+            "sha256",
+        ] {
+            let encoded = serde_json::json!({"reference": value}).to_string();
+            let references = canonical_input_refs(&encoded);
+            for identity in crate::repetition_guard::runtime_identity_refs(value) {
+                assert!(
+                    references
+                        .iter()
+                        .any(|reference| reference.contains(identity)),
+                    "{identity} in {references:?}"
+                );
+            }
+        }
+        assert!(
+            crate::repetition_guard::runtime_identity_refs("arun:abc123 sha256 plain text")
+                .next()
+                .is_none()
+        );
     }
 
     #[test]

@@ -1584,13 +1584,10 @@ where
                      call again."
                 }
                 "state_inspect" => {
-                    "You are waiting for a worker to move. Use the Runtime wait primitive - \
-                     `state_inspect` with `wait_for_workers: true` - which parks until a worker \
-                     advances instead of polling. If nothing is in flight, take a different action."
+                    "Reuse the existing state observation. Wait only through the protocol allowed by your current role, or take a different valid action."
                 }
                 _ => {
-                    "Take a different action, or report the objective as blocked through \
-                     `objective_complete_request` with a blocked_reason."
+                    crate::repetition_guard::SCOPED_RECOVERY_GUIDANCE
                 }
             };
             let reason = format!(
@@ -1609,9 +1606,9 @@ where
         let reason = format!(
             "Runtime refused to dispatch this call again: it has already failed \
              deterministically {} times in this turn, so retrying it cannot produce a \
-             different result. Take a different action, or report the objective as \
-             blocked through objective_complete_request.",
-            refusal.count
+             different result. {}",
+            refusal.count,
+            crate::repetition_guard::SCOPED_RECOVERY_GUIDANCE
         );
         // The recorded cause is the recovery path, not bookkeeping: when the
         // deterministic failure was an unresolvable evidence reference it

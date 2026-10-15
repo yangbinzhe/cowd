@@ -506,6 +506,8 @@ fn error_signature(message: &str) -> String {
     collapsed.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+pub(crate) const SCOPED_RECOVERY_GUIDANCE: &str = "Use a different valid action or existing durable observations. Report a genuine blocker only through the protocol owned by your current role; do not claim another role's authority.";
+
 /// Record a failure and decide what the next attempt should be told.
 ///
 /// Returns `Some(diagnosis)` when the breaker has tripped: the caller should
@@ -593,10 +595,7 @@ pub fn record_tool_failure(
     Some(format!(
         "This exact failure has now occurred {count} times and the cause has not \
          changed. Re-issuing the same call cannot produce a different result. \
-         Either change the input, reach the same fact through another tool, or - \
-         if the objective is genuinely unreachable - call \
-         objective_complete_request with blocked=true, a blocked_reason, \
-         human_review_required=true and recommended_next_actions. {scope}{detail}"
+         {SCOPED_RECOVERY_GUIDANCE} {scope}{detail}"
     ))
 }
 
@@ -708,19 +707,7 @@ fn is_identifier(run: &str) -> bool {
     run.len() >= 4 && run.chars().any(|ch| ch.is_ascii_digit())
 }
 
-/// Whether the cause names something the model could not have put in its own input.
-///
-/// An identifier in the message that is absent from the input's canonical refs was
-/// resolved by Runtime, not sent by the model - so the cause is a state condition,
-/// and no rewording of the input can make the call succeed. When the identifier is
-/// in the input, the model can name something else, and the call must not be
-/// refused. This is the same identifier rule `error_signature` uses, so the
-/// classification cannot drift from the signature it is meant to explain.
-fn state_derived_cause(message: &str, input_refs: &[String]) -> bool {
-    // Free prose is not an identity namespace. Scanning arbitrary hex-like
-    // words classified `sha256` (`a256`) as a Runtime-owned object and blocked
-    // a different, potentially valid recovery input. Only an explicitly typed
-    // durable reference can establish that Runtime resolved hidden state.
+pub(crate) fn runtime_identity_refs(text: &str) -> impl Iterator<Item = &str> {
     const TYPED_PREFIXES: &[&str] = &[
         "run:",
         "graph:",
@@ -736,31 +723,46 @@ fn state_derived_cause(message: &str, input_refs: &[String]) -> bool {
         "artifact://",
         "tool://",
     ];
-    message.split_whitespace().take(40).any(|raw_token| {
-        let token = raw_token.trim_matches(|ch: char| "`'\"()[]{}<>,.;".contains(ch));
-        TYPED_PREFIXES.iter().any(|prefix| {
-            let Some(start) = token.find(prefix) else {
-                return false;
-            };
-            // Runtime error prose often renders a typed ref after a label such
-            // as `missing:run:<id>`. Accept the typed ref at punctuation
-            // boundaries, but never carve `arun:<id>` out of an ordinary word.
-            let has_word_prefix = token[..start]
+    text.split_whitespace().flat_map(|raw_token| {
+        let token = raw_token.trim_matches(|character: char| "`'\"()[]{}<>,.;".contains(character));
+        TYPED_PREFIXES.iter().filter_map(move |prefix| {
+            let start = token.find(prefix)?;
+            if token[..start]
                 .chars()
                 .last()
-                .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_');
-            if has_word_prefix {
-                return false;
+                .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+            {
+                return None;
             }
             let suffix = &token[start + prefix.len()..];
-            let id_len = suffix
-                .find(|ch: char| !(ch.is_ascii_alphanumeric() || "_-/.".contains(ch)))
+            let length = suffix
+                .find(|character: char| {
+                    !(character.is_ascii_alphanumeric() || "_-/.".contains(character))
+                })
                 .unwrap_or(suffix.len());
-            let typed_ref = &token[start..start + prefix.len() + id_len];
-            is_identifier(&suffix[..id_len])
-                && !input_refs.iter().any(|reference| reference.contains(typed_ref))
+            is_identifier(&suffix[..length]).then_some(&token[start..start + prefix.len() + length])
         })
     })
+}
+
+/// Whether the cause names something the model could not have put in its own input.
+///
+/// An identifier in the message that is absent from the input's canonical refs was
+/// resolved by Runtime, not sent by the model - so the cause is a state condition,
+/// and no rewording of the input can make the call succeed. When the identifier is
+/// in the input, the model can name something else, and the call must not be
+/// refused. This is the same identifier rule `error_signature` uses, so the
+/// classification cannot drift from the signature it is meant to explain.
+fn state_derived_cause(message: &str, input_refs: &[String]) -> bool {
+    message
+        .split_whitespace()
+        .take(40)
+        .flat_map(runtime_identity_refs)
+        .any(|reference| {
+            !input_refs
+                .iter()
+                .any(|input_ref| input_ref.contains(reference))
+        })
 }
 
 /// Clear the failure breakers filed under one turn, leaving the cumulative
@@ -949,7 +951,8 @@ mod repetition_guard_tests {
         )
         .expect("the second identical failure must trip the breaker");
         assert!(tripped.contains("cannot produce a different result"));
-        assert!(tripped.contains("objective_complete_request"));
+        assert!(tripped.contains("protocol owned by your current role"));
+        assert!(!tripped.contains("objective_complete_request"));
     }
 
     /// The whole point: a replan changes the identifier but not the cause, so a

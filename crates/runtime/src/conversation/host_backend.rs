@@ -5048,16 +5048,17 @@ impl DelegatedAgenticProtocolState {
         let rework_note = self.rework_note();
         match self.mode.as_str() {
             "review" => format!(
-                "Runtime collaboration protocol: review Task `{}` is still {:?}. Independently inspect the exact submitted artifact_refs [{}] through evidence refs [{}], then use `task_review`. Accept only if its acceptance criterion is proved; otherwise request rework with a concrete reason. Cite the inspected evidence and do not return prose before the durable review action succeeds. Program `{}`.",
+                "Runtime collaboration protocol: review Task `{}` is still {:?}. Independently inspect the exact submitted artifact_refs [{}] through evidence refs [{}], then use `task_review`. Accept only if its acceptance criterion is proved; otherwise request rework with a concrete reason. Cite the inspected evidence and do not treat prose as durable review completion. {} Program `{}`.",
                 self.task_id,
                 self.status,
                 self.artifact_refs.join(", "),
                 self.artifact_evidence_refs.join(", "),
+                crate::agentic::order_contract::REVIEWER_SCOPE_DISCIPLINE,
                 self.program_id
             ),
             _ if self.artifact_refs.is_empty() => format!(
-                "Runtime collaboration protocol: execute Task `{}` is still {:?}. Publish an explicit file/hash via `artifact_publish`, or select an exact text block in the current response with `artifact_commit` content_ref=current_message_block:<zero-based-index>. Never assume a prior draft is selected. Commit the returned content_ref related to this exact Task, then call `task_submit` with its returned `artifact:...` changed_ref plus real durable source/test/tool evidence refs. Runtime binds artifact content automatically; do not duplicate the internal artifact:// selector as evidence. Do not return prose before durable submission succeeds. Program `{}`.{}",
-                self.task_id, self.status, self.program_id, rework_note
+                "Runtime collaboration protocol: execute Task `{}` is still {:?}. {} Program `{}`.{}",
+                self.task_id, self.status, crate::agentic::order_contract::TASK_REPORT_SUBMISSION_CONTRACT, self.program_id, rework_note
             ),
             _ => format!(
                 "Runtime collaboration protocol: artifact evidence for Task `{}` is durable. Call `task_submit` now with artifact_refs [{}] and evidence_refs [{}]; do not repeat research, recommit the artifact, guess references, or return prose before submission succeeds. The Task is still {:?}. Program `{}`.{}",

@@ -2388,6 +2388,61 @@
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failure_refusal_uses_the_bound_roles_protocol_not_a_root_exit_command() {
+        let runtime = crate::ConversationRuntime::new(
+            Session::new(),
+            FinalAnswerClient,
+            NoopToolExecutor,
+            PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
+            vec!["complete the bound Task".to_string()],
+        )
+        .without_memory();
+        let turn = runtime.active_turn_id();
+        let input =
+            r#"{"task_ref":"task:12345678","evidence_refs":["receipt:program:12345678:claim-7"]}"#;
+        let record = crate::ToolInvocationRecord::started(
+            "session-refusal-role",
+            1,
+            "refusal-role",
+            "task_submit",
+            input,
+            crate::ToolSafetyCategory::WriteLocal,
+            1,
+        );
+        for _ in 0..crate::repetition_guard::repetition_bound() {
+            crate::repetition_guard::record_tool_failure(
+                &turn,
+                "task_submit",
+                &record.input_hash,
+                &record.input_refs,
+                crate::ToolFailureKind::ExecutionError,
+                "unsupported_evidence_ref: receipt:program:12345678:claim-7",
+            );
+        }
+        let result = runtime
+            .execute_tool_batch_step(
+                &[crate::conversation::ModelToolCall {
+                    id: "refusal-role".into(),
+                    name: "task_submit".into(),
+                    input: input.into(),
+                    depends_on: Vec::new(),
+                }],
+                &crate::SharedPrompter::none(),
+                1,
+            )
+            .await
+            .unwrap();
+        let text = format!("{:?}", result.messages);
+        assert_eq!(result.failed, 1);
+        assert!(
+            text.contains("protocol owned by your current role"),
+            "{text}"
+        );
+        assert!(!text.contains("objective_complete_request"), "{text}");
+        assert!(!text.contains("wait_for_workers"), "{text}");
+    }
+
     /// The delegated Agent's tool path must refuse a call the model keeps
     /// repeating.
     ///
@@ -2442,6 +2497,8 @@
         let text = format!("{:?}", result.messages);
         assert!(text.contains("state_inspect"), "{text}");
         assert!(text.contains("Runtime refused"), "{text}");
+        assert!(!text.contains("objective_complete_request"), "{text}");
+        assert!(!text.contains("wait_for_workers"), "{text}");
     }
 
     /// Alternating between two different inputs is not a repeat: the breaker

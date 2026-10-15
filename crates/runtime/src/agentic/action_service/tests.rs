@@ -5076,6 +5076,140 @@ fn review_rejects_a_goal_from_another_program_even_with_matching_wording() {
 }
 
 #[test]
+fn action_receipts_remain_invalid_evidence_but_a_corrected_submission_can_succeed() {
+    let service = AgentActionService::new(Arc::new(RuntimeEventStore::for_test()));
+    let (team, worker, reviewer, task) = team_with_reviewer_and_task(
+        &service,
+        "evidence-type-recovery",
+        "one verifiable fact per file",
+        harness_contract::agent_action::CriterionSource::OperatorDerived,
+    );
+    let review = service
+        .apply(&managed(
+            "evidence-type-rework",
+            &team,
+            &reviewer,
+            AgentAction::TaskReview(TaskReviewInput {
+                task_ref: task.clone(),
+                decision: TaskReviewDecision::Rework,
+                reason: "the required fact is absent".into(),
+                operator_requirement: Some("test objective".into()),
+                evidence_refs: vec!["tool://independent-inspection".into()],
+            }),
+        ))
+        .unwrap();
+    assert_eq!(review.status, AgentActionStatus::Applied);
+    let claim = service
+        .apply(&managed(
+            "evidence-type-reclaim",
+            &team,
+            &worker,
+            AgentAction::TaskClaim(TaskClaimInput {
+                task_ref: task.clone(),
+                reason: None,
+            }),
+        ))
+        .unwrap();
+    assert_eq!(claim.status, AgentActionStatus::Applied);
+    let unresolved = service
+        .apply(&managed(
+            "evidence-type-no-text",
+            &team,
+            &worker,
+            AgentAction::ArtifactCommit(ArtifactCommitInput {
+                content_ref: "current_message_block:0".into(),
+                kind: "report".into(),
+                title: "No text must not become a report".into(),
+                relates_to: vec![task.clone()],
+            }),
+        ))
+        .unwrap();
+    assert_eq!(unresolved.status, AgentActionStatus::Rejected);
+    let error = unresolved.error.unwrap();
+    assert_eq!(error.code, "content_ref_unresolved");
+    assert!(error
+        .message
+        .starts_with("For an ordinary Task report, prefer task_submit.deliverable"));
+    let artifact = service
+        .apply(&managed(
+            "evidence-type-artifact",
+            &team,
+            &worker,
+            AgentAction::ArtifactCommit(ArtifactCommitInput {
+                content_ref: "artifact://corrected-report-fixture".into(),
+                kind: "report".into(),
+                title: "Corrected report".into(),
+                relates_to: vec![task.clone()],
+            }),
+        ))
+        .unwrap();
+    assert_eq!(artifact.status, AgentActionStatus::Applied);
+    let mut submission = TaskSubmitInput {
+        task_ref: task.clone(),
+        deliverable: None,
+        artifact_refs: artifact.changed_refs,
+        evidence_refs: vec![
+            "tool://observed-source".into(),
+            "receipt:program:0123:claim-7".into(),
+        ],
+        unresolved: Vec::new(),
+    };
+    let before = service.project("program-1").unwrap();
+    let invalid = service
+        .apply(&managed(
+            "evidence-type-invalid",
+            &team,
+            &worker,
+            AgentAction::TaskSubmit(submission.clone()),
+        ))
+        .unwrap();
+    assert_eq!(invalid.status, AgentActionStatus::Rejected);
+    let error = invalid.error.unwrap();
+    assert_eq!(error.code, "unsupported_evidence_ref");
+    assert!(error
+        .message
+        .starts_with("Evidence must use a durable tool:// or artifact:// observation."));
+    assert!(error.message.contains("receipt:program:0123:claim-7"));
+    assert_eq!(service.project("program-1").unwrap(), before);
+    submission.evidence_refs.pop();
+    let submitted = service
+        .apply(&managed(
+            "evidence-type-corrected",
+            &team,
+            &worker,
+            AgentAction::TaskSubmit(submission),
+        ))
+        .unwrap();
+    assert_eq!(submitted.status, AgentActionStatus::Applied);
+    assert_eq!(
+        service.project("program-1").unwrap().tasks[&task].status,
+        AgenticTaskStatus::Submitted
+    );
+    let before_review = service.project("program-1").unwrap();
+    let invalid_review = service
+        .apply(&managed(
+            "evidence-type-review-invalid",
+            &team,
+            &reviewer,
+            AgentAction::TaskReview(TaskReviewInput {
+                task_ref: task,
+                decision: TaskReviewDecision::Accept,
+                reason: "verified".into(),
+                operator_requirement: None,
+                evidence_refs: vec!["receipt:program:0123:claim-7".into()],
+            }),
+        ))
+        .unwrap();
+    assert_eq!(invalid_review.status, AgentActionStatus::Rejected);
+    let error = invalid_review.error.unwrap();
+    assert_eq!(error.code, "unsupported_evidence_ref");
+    assert!(error
+        .message
+        .starts_with("Evidence must use a durable tool:// or artifact:// observation."));
+    assert_eq!(service.project("program-1").unwrap(), before_review);
+}
+
+#[test]
 fn rework_without_operator_wording_is_refused() {
     let store = Arc::new(RuntimeEventStore::for_test());
     let service = AgentActionService::new(Arc::clone(&store));

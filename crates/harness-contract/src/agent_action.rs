@@ -278,8 +278,9 @@ pub struct TaskSubmitInput {
     /// do not duplicate storage selectors in `evidence_refs`.
     #[serde(default)]
     pub artifact_refs: Vec<String>,
-    /// Supporting durable observations such as source, command, test, or file
-    /// tool receipts. The committed artifact content is attached by Runtime.
+    /// Supporting source, command, test, or file observations using durable
+    /// tool:// or artifact:// references, never action receipt: IDs. Runtime
+    /// attaches the committed artifact content automatically.
     #[serde(default)]
     pub evidence_refs: Vec<String>,
     /// Known limitations, risks, or follow-up opportunities disclosed to the
@@ -330,9 +331,9 @@ pub struct TaskReviewInput {
     pub reason: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_requirement: Option<String>,
-    /// Durable observations used for the independent verdict, normally the
-    /// receipt returned after retrieving/inspecting the submitted artifact.
-    /// Runtime already knows which artifacts belong to the Task.
+    /// Durable tool:// or artifact:// observations used for the independent
+    /// verdict after retrieving/inspecting the submitted artifact, never action
+    /// receipt: IDs. Runtime already knows which artifacts belong to the Task.
     #[serde(default)]
     pub evidence_refs: Vec<String>,
 }
@@ -1387,5 +1388,21 @@ mod tests {
             .unwrap()
             .iter()
             .any(|field| field == "operator_requirement"));
+    }
+
+    #[test]
+    fn submission_and_review_schema_distinguish_content_evidence_from_action_receipts() {
+        for schema in [
+            serde_json::to_value(schemars::schema_for!(TaskSubmitInput)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(TaskReviewInput)).unwrap(),
+        ] {
+            let description = schema["properties"]["evidence_refs"]["description"]
+                .as_str()
+                .unwrap();
+            assert!(description.contains("tool://"));
+            assert!(description.contains("artifact://"));
+            assert!(description.contains("never action"));
+            assert!(description.contains("receipt:"));
+        }
     }
 }

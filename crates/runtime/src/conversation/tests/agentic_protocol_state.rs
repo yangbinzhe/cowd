@@ -1494,3 +1494,29 @@ async fn accepted_root_work_does_not_force_a_terminal_tool_or_promote_its_checkp
         "root must retain research and disposition choices: {choices:?}"
     );
 }
+
+#[test]
+fn execution_continuation_and_commit_refusal_share_the_saved_report_contract() {
+    let mut state = DelegatedAgenticProtocolState {
+        program_id: "program:delivery".into(),
+        task_id: "task:delivery".into(),
+        mode: "execute".into(),
+        status: crate::AgenticTaskStatus::Claimed,
+        artifact_refs: Vec::new(),
+        artifact_evidence_refs: Vec::new(),
+        owns_active_attempt: true,
+        review_reason: None,
+    };
+    let instruction = state.continuation_instruction();
+    assert!(instruction.contains(crate::agentic::order_contract::TASK_REPORT_SUBMISSION_CONTRACT));
+    assert!(instruction.contains("latest saved report"));
+    assert!(instruction.contains("Text alone is not Task completion"));
+    assert!(!instruction.contains("Never assume a prior draft is selected"));
+    assert!(!instruction.contains("Do not return prose before"));
+    state.mode = "review".into();
+    state.status = crate::AgenticTaskStatus::Submitted;
+    let instruction = state.continuation_instruction();
+    assert!(instruction.contains(crate::agentic::order_contract::REVIEWER_SCOPE_DISCIPLINE));
+    assert!(instruction.contains("operator_requirement"));
+    assert!(!instruction.contains("task_submit.deliverable"));
+}
