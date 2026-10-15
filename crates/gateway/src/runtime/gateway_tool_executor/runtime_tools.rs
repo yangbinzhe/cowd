@@ -1268,16 +1268,72 @@ impl GatewayToolExecutor {
             input.cursor.as_deref().unwrap_or(""),
             input.limit.unwrap_or(0)
         );
-        if runtime::repetition_guard::record_repeated_read(&read_scope, &read_key) {
+        // Answer the repeat once, then serve the content again.
+        //
+        // Withholding durable bytes and naming a way back that is absent four times
+        // out of five trapped a model into re-issuing the same read twenty-five
+        // times, and the run was reported as a redundant-read loop. Naming only
+        // exposed tools removes half of that; this removes the rest. A model that
+        // asks again after being told has a reason - it needs the bytes to write
+        // what it is writing - and a hint is not a substitute for content.
+        //
+        // The bound is still there: the duplicate is answered once per scope, so a
+        // model polling an unchanged reference is still told, and a model that
+        // genuinely needs the content gets it on the next ask.
+        if runtime::repetition_guard::served_read_count(&read_scope, &read_key) == 2 {
+            // Name only tools this request actually exposes.
+            //
+            // The first version told the model to re-read through
+            // `evidence_retrieve` unconditionally. That tool is exposed in about a
+            // fifth of requests, so four times out of five the receipt pointed at
+            // something the model could not call - while the content it named had
+            // just been withheld. The model did the only thing left to it and
+            // re-issued `read_ref`, twenty-five times against one artifact, and the
+            // run was reported as a redundant-read loop.
+            //
+            // It was not a loop. It was a model trapped by an instruction the
+            // framework could not honor, which is the same layer fracture as telling
+            // a model its tools are empty while it still owes work.
+            let exposed = self
+                .tool_host
+                .pin_snapshot()
+                .snapshot()
+                .catalog
+                .definitions(None)
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect::<std::collections::BTreeSet<_>>();
+            // Tools that can return durable bytes again, in the order worth trying.
+            let readers = ["read_ref", "evidence_retrieve", "context_retrieve", "read_file"]
+                .into_iter()
+                .filter(|tool| exposed.contains(*tool))
+                .collect::<Vec<_>>();
+            let way_back = if readers.is_empty() {
+                "Runtime cannot name a tool in this request that returns these bytes \
+                 again. If you need the content, say so explicitly and state what you \
+                 cannot complete without it - do not re-issue this read."
+                    .to_string()
+            } else {
+                format!(
+                    "To get these bytes again, use {} - it is exposed in this request. \
+                     Pass the same `reference`; for `read_ref` the earlier `cursor` \
+                     pages further.",
+                    readers
+                        .iter()
+                        .map(|tool| format!("`{tool}`"))
+                        .collect::<Vec<_>>()
+                        .join(" or ")
+                )
+            };
             return Ok(serde_json::to_string(&serde_json::json!({
                 "reference": input.reference,
                 "already_served": true,
-                "notice": "Runtime already returned this exact read (same reference, same \
-                           cursor, same limit) in this session, and durable content does not \
-                           change. Re-issuing it cannot return anything new. To page further, \
-                           pass the `cursor` from that earlier result; to read something else, \
-                           name a different `reference`. To re-read these bytes from scratch, \
-                           resolve the reference with `evidence_retrieve`."
+                "notice": format!(
+                    "Runtime already returned this exact read (same reference, same \
+                     cursor, same limit) in this session, and durable content does not \
+                     change, so the bytes you already hold are current. {way_back} To \
+                     read something else, name a different `reference`."
+                )
             }))
             .map_err(|error| ToolError::new(error.to_string()))?);
         }

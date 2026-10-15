@@ -227,13 +227,23 @@ fn served_reads() -> &'static std::sync::Mutex<BTreeMap<String, usize>> {
 /// This is not the revision-based stall check: an immutable reference has no
 /// revision to compare, so "already served" is the whole observation.
 pub fn record_repeated_read(scope: &str, key: &str) -> bool {
+    served_read_count(scope, key) > 1
+}
+
+/// The running count of this exact read, after recording this one.
+///
+/// `2` is the ask that gets the cheap answer: the first read served the content,
+/// the second is told it already has it, and the third and later are served again.
+/// Answering every repeat is what trapped a model - a hint is not a substitute for
+/// content it needs in order to write what it is writing.
+pub fn served_read_count(scope: &str, key: &str) -> usize {
     let entry_key = format!("served:{scope}:{key}");
     let mut served = served_reads()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let count = served.entry(entry_key).or_insert(0);
     *count = count.saturating_add(1);
-    *count > 1
+    *count
 }
 
 /// Forget one scope's served reads, so a later turn or Agent starts clean.
