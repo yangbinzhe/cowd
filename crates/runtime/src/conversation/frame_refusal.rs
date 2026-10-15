@@ -66,6 +66,17 @@ impl FrameRefusal {
             "reason": self.reason,
             "side_effect_committed": false,
             "dispatched": false,
+            // Whether the model was actually told. A refusal nobody reads costs a
+            // provider round-trip every time it is ignored, and for a while the only
+            // way to tell the two apart was to watch the model's behaviour: one live
+            // run was refused, wrote the same plan back three times at 0.98 wording
+            // similarity, and the durable log showed the refusal had been recorded
+            // correctly the whole time.
+            //
+            // Both paths set this - the model-step path through
+            // `preflight_tool_results`, the tool path through a failed call - so one
+            // count answers "did the model get told" across both.
+            "model_visible": true,
             "model_visible_preview": self
                 .call
                 .input
