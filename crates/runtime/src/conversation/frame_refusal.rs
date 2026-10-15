@@ -58,7 +58,24 @@ impl FrameRefusal {
     /// active Runtime activity binding, and a call that never dispatched has none by
     /// definition. A distinct kind says what actually happened and survives.
     pub(crate) fn event_payload(&self, invocation_id: &str) -> serde_json::Value {
+        // The exact bytes the model is handed, recorded next to the refusal.
+        //
+        // "Was the model told" was answerable only by watching its behaviour: a run
+        // refused, then wrote the same plan back three times at 0.98 similarity, and
+        // nothing in the database could say whether it had been told. The request body
+        // is not persisted anywhere, and `session_messages` is empty while a run is
+        // live, so the one artifact that would settle it did not exist.
+        let answered_with = self.tool_result();
+        let answered_text = answered_with
+            .blocks
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::ToolResult { output, .. } => Some(output.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
         serde_json::json!({
+            "answered_with": answered_text,
             "invocation_id": invocation_id,
             "tool_call_id": self.call.id,
             "tool_name": self.call.name,
