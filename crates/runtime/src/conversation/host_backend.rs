@@ -2242,7 +2242,22 @@ where
                             if recover_language {
                                 state.root_language_replan_attempted = true;
                                 missing.push("a final response in the user's language".to_string());
-                                if !recover_write {
+                                // Never while the Program still owes work.
+                                //
+                                // A text-only request tells the model the executable tool
+                                // set is empty. One live run received that while
+                                // `publish_task` was still outstanding, read "the tool
+                                // set is empty" as "the user prohibited tool calls", and
+                                // wrote four consecutive blocked declarations saying so -
+                                // handed a language correction and a work obligation in
+                                // the same breath, with no way to satisfy both.
+                                //
+                                // The model-step boundary already refuses to force a
+                                // text-only response while a mandatory action is
+                                // outstanding; this path armed the flag that narrows the
+                                // tool exposure without asking that question at all.
+                                let owed_work = !state.outstanding_closure_rungs.is_empty();
+                                if !recover_write && !owed_work {
                                     state.force_text_only_next_model = true;
                                     tracing::warn!(
                                         target: "cowd::text_only_step",
