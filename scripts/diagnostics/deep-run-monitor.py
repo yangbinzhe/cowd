@@ -428,7 +428,30 @@ class Monitor:
             "WHERE kind='model.item_completed' AND payload->>'kind'='tool_call' "
             "GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 6")
         inv["repeated_tool_inputs"] = [
-            {"input": t, "count": n} for _, t, n in pairs3(rows) if n >= 3]
+            {"actor": a, "input": t, "count": n}
+            for a, t, n in pairs3(rows) if n >= 3]
+        # 3a. Which actors actually advanced the Program.
+        # A model polling one Task while it commits artifacts and submits work is
+        # waiting on a worker, not spinning - and one live run was stopped for
+        # exactly that, with `artifact_commit` landing in the same minute as the
+        # poll the finding named. Repetition alone cannot tell the two apart;
+        # "this actor also moved the Program" can.
+        # Keyed on the execution graph, which is the one identity both sides
+        # share. A tool call's actor is an `activity:execution:<graph>:...`
+        # string and a committed action's actor is an `agent:<id>` string, so
+        # matching on either alone silently matches nothing and the exemption
+        # below never fires.
+        progress = self.q(
+            "SELECT payload->'envelope'->'actor'->>'execution_id', count(*) "
+            "FROM runtime_events WHERE kind='agentic.action_applied' "
+            "AND payload->'envelope'->'action'->>'kind' IN "
+            "('task_submit','artifact_commit','task_review','task_claim') "
+            "GROUP BY 1")
+        inv["actors_with_progress"] = {
+            row[0]: int(row[1])
+            for row in progress
+            if len(row) == 2 and row[0] and row[1].strip().lstrip("-").isdigit()
+        }
         # 3. Redundant full reads of the same path.
         # Same actor scoping as above: three agents opening one file once each
         # is three first reads, not a redundant-read loop.
@@ -605,10 +628,34 @@ class Monitor:
         # carries no content, so it cannot tell them apart; exclude them rather
         # than guess. The filter belongs with the judgment, not the collection,
         # so every caller of `conclude` gets the same answer.
-        repeats = [
-            r for r in inv.get("repeated_tool_inputs", [])
-            if r["count"] >= 5 and "current_message_block:" not in r["input"]
-        ]
+        # A repeat only counts when the actor that issued it moved nothing.
+        # Polling a Task an Agent is actively working is the documented way to
+        # wait; the framework even answers it with a cheap receipt when the entity
+        # has not moved. What it must not do is report a working model as spinning
+        # and stop the run - that turns a recoverable wait into a lost window, and
+        # one live run lost its hour to it while committing artifacts in the same
+        # minute as the poll it was stopped for.
+        progressing = inv.get("actors_with_progress", {})
+        repeats = []
+        for r in inv.get("repeated_tool_inputs", []):
+            if r["count"] < 5 or "current_message_block:" in r["input"]:
+                continue
+            # The stored field is the whole activity-binding JSON, so the graph id
+            # has to be read out of it rather than split off the front.
+            # `activity:execution:agentic-graph:<hex>:node:...` reduces to the graph
+            # id, which is the one identity a committed action also carries.
+            binding = r.get("actor") or ""
+            graph = ""
+            try:
+                activity = json.loads(binding).get("activity_id", "")
+            except Exception:
+                activity = binding
+            parts = activity.split(":")
+            if len(parts) >= 4:
+                graph = parts[2] + ":" + parts[3]
+            if graph and progressing.get(graph, 0) > 0:
+                continue
+            repeats.append(r)
         if repeats:
             findings.append({
                 "root_cause": "identical tool inputs repeated: the model is re-issuing the same call",
