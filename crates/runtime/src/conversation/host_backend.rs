@@ -627,6 +627,39 @@ where
                 framework_authored: true,
             }));
         }
+        let (root_requires_action_channel, operator_forbids_tool_use) = {
+            let state = self.state.lock().await;
+            let understanding =
+                state
+                    .task_understanding
+                    .as_ref()
+                    .ok_or_else(|| NodeExecutorError::Poll {
+                        node_id: ticket.node_id.clone(),
+                        reason: "model step has no admitted input constraint owner".to_string(),
+                    })?;
+            let program_status = if state.execution_role.owns_root_presentation() {
+                let objective_id = harness_contract::agent_action::root_objective_id(
+                    &state.session_id,
+                    &state.turn_id,
+                );
+                let program_id =
+                    harness_contract::agent_action::program_id_for_objective(&objective_id);
+                self.services
+                    .agent_action_service()
+                    .project_if_exists(&program_id)
+                    .map_err(|error| NodeExecutorError::Poll {
+                        node_id: ticket.node_id.clone(),
+                        reason: format!("load root request boundary: {error}"),
+                    })?
+                    .map(|program| program.status)
+            } else {
+                None
+            };
+            (
+                root_program_requires_action_channel(state.execution_role, program_status),
+                understanding.forbids_tool_use,
+            )
+        };
         let (
             content,
             first_step,
@@ -651,7 +684,8 @@ where
                 made_progress,
             );
             let mut clean_terminal_synthesis =
-                std::mem::take(&mut state.clean_terminal_synthesis_next);
+                std::mem::take(&mut state.clean_terminal_synthesis_next)
+                    && !root_requires_action_channel;
             if !pending_disposition_inputs.is_empty() {
                 // A terminal candidate produced for the pre-update topology is
                 // stale. Discard it and let the post-disposition graph decide
@@ -659,7 +693,8 @@ where
                 clean_terminal_synthesis = false;
                 state.clean_terminal_synthesis_attempted = false;
             }
-            if !clean_terminal_synthesis
+            if !root_requires_action_channel
+                && !clean_terminal_synthesis
                 && !state.clean_terminal_synthesis_attempted
                 && state.successful_tool_calls > 0
                 && state.consecutive_unverified_model_steps >= state.safety_lease.max_model_steps
@@ -922,8 +957,9 @@ where
                 // A refusal the model answered by issuing the same call again
                 // also forces this step to be text-only: the model must
                 // conclude instead of paying for another refused round.
-                std::mem::take(&mut state.force_text_only_next_model)
-                    || crate::repetition_guard::take_refusal_ignored(&state.turn_id),
+                (std::mem::take(&mut state.force_text_only_next_model)
+                    | crate::repetition_guard::take_refusal_ignored(&state.turn_id))
+                    && !root_requires_action_channel,
                 state.force_tool_allowlist_next_model.take(),
                 state.force_reasoning_effort_next_model.take(),
                 clean_terminal_synthesis,
@@ -1372,73 +1408,6 @@ where
                     })
                 })
             };
-        // The capability axis, decided independently of the prompt-isolation
-        // axis that `clean_terminal_synthesis` represents. Isolating the prompt
-        // keeps a long exploratory transcript out of the reduction request; it
-        // is not a reason to withdraw the tools that close the Objective. Only
-        // "nothing is owed" earns a tool-less terminal.
-        //
-        // The obligation is read from the Program projection, not only from the
-        // two flags the continuation paths set. Those flags exist once a
-        // completion gap or a closure rung has been *detected*, which is late:
-        // run one23 asked for a tool-less synthesis while three Teams existed and
-        // no Task had been published, so neither flag was set and the model was
-        // handed a request with an empty `tools` array and told to summarise. It
-        // summarised - and concluded the hard constraint was met because the
-        // Teams existed.
-        let terminal_required_tools = if clean_terminal_synthesis {
-            let (gap_outstanding, rungs, session_id, turn_id) = {
-                let state = self.state.lock().await;
-                (
-                    state.completion_gap_outstanding,
-                    state.outstanding_closure_rungs.clone(),
-                    state.session_id.clone(),
-                    state.turn_id.clone(),
-                )
-            };
-            let escalated = force_tool_call;
-            // `publish_integration_task` and the rungs below `objective_complete_request`
-            // are work the Objective still needs; the request step itself is the
-            // model's own exit and is not a reason to keep tools.
-            let projected = super::root_agentic_program_projection(
-                self.services.as_ref(),
-                &session_id,
-                &turn_id,
-            )
-            .map(|program| {
-                super::outstanding_closure_steps(&program)
-                    .into_iter()
-                    .filter(|step| step != "objective_complete_request")
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-            let mut all_rungs = rungs;
-            for step in projected {
-                if !all_rungs.contains(&step) {
-                    all_rungs.push(step);
-                }
-            }
-            let mut decision = terminal_required_tools(gap_outstanding, all_rungs.clone());
-            // An escalated step must not be a tool-less one. The escalation exists
-            // because the model concluded instead of acting; handing it a request
-            // with an empty `tools` array and a demand for a tool call is a
-            // contradiction the model resolves by concluding again. Run one29's
-            // escalation fired four times and the model concluded four more times,
-            // every one of those requests carrying no tools at all.
-            if escalated && decision.is_none() {
-                decision = Some(mandatory_action_tool_ids(true, &all_rungs));
-            }
-            tracing::warn!(
-                target: "cowd::terminal_capability",
-                %session_id, %turn_id, clean_terminal_synthesis,
-                gap_outstanding, ?all_rungs, escalated,
-                tools = ?decision.as_ref().map(|t| t.iter().cloned().collect::<Vec<_>>()),
-                "deciding the tool set for a terminal request"
-            );
-            decision
-        } else {
-            None
-        };
         let result = if clean_terminal_synthesis {
             runtime
                 .execute_clean_terminal_synthesis(
@@ -1451,7 +1420,6 @@ where
                         .as_ref()
                         .map(|(_, history)| history.clone())
                         .unwrap_or_default(),
-                    terminal_required_tools.as_ref(),
                 )
                 .await
         } else {
@@ -1461,6 +1429,7 @@ where
                     first_step,
                     early_dispatcher,
                     provider_retry_fenced,
+                    operator_forbids_tool_use,
                 )
                 .await
         };
@@ -1695,6 +1664,7 @@ where
                             authority.required_team_count = authority
                                 .required_team_count
                                 .max(supplemental.required_team_count);
+                            authority.forbids_tool_use |= supplemental.forbids_tool_use;
                             authority.requires_write |= supplemental.requires_write;
                             authority.requires_external_facts |=
                                 supplemental.requires_external_facts;
@@ -1786,7 +1756,7 @@ where
                 // during exactly such a request and Runtime durably executed
                 // it, feeding the request/reject loop the gap guidance was
                 // trying to break.
-                if force_text_only_response || step.text_only_response || clean_terminal_synthesis {
+                if step.text_only_response {
                     intent = match intent {
                         ModelStepIntent::ToolCalls { .. } => {
                             let final_text = step
@@ -2704,7 +2674,7 @@ where
                         // rather than a user-facing answer. The harness validates
                         // its exact schema; running normal prose recovery here can
                         // replace a valid score object with unrelated fallback text.
-                        } else if let Some(reason) = (!state.evaluation_judge_only)
+                        } else if let Some(reason) = (!state.evaluation_judge_only && !root_requires_action_channel)
                             .then(|| {
                                 final_answer_recovery_reason_for_execution_scope(
                                     &text,
@@ -2733,8 +2703,6 @@ where
                                     "Runtime final-answer recovery (mandatory): the prior provider response was unusable ({reason}). Do not call tools or emit simulated tool markup. Use only already committed evidence and return a concise final answer now; name any remaining uncertainty explicitly. Recovery attempt {}/{}.",
                                     state.terminal_recovery_attempts, normal_recovery_budget,
                                 );
-                                state.content.push_str("\n\n");
-                                state.content.push_str(&instruction);
                                 state.force_text_only_next_model = true;
                                 tracing::warn!(
                                     target: "cowd::text_only_step",
@@ -3758,24 +3726,20 @@ pub(super) fn root_control_plane_requirement(
     (true, actions, steps)
 }
 
-/// The tools a terminal request must still expose, given what the Objective owes.
-///
-/// `None` means a tool-less terminal is correct, which is true in exactly one
-/// case: nothing is owed. Every other answer is a non-empty set, because a
-/// request that asks the model to finish something cannot also withdraw the tool
-/// that finishes it.
-///
-/// Extracted so the rule is checkable without a provider failure to trigger the
-/// path. The live trigger is a provider failure mid-collaboration, which is not
-/// something a test can arrange - so without this, the one case the fix exists for
-/// would have had no coverage at all.
-pub(super) fn terminal_required_tools(
-    gap_outstanding: bool,
-    outstanding_rungs: Vec<String>,
-) -> Option<BTreeSet<String>> {
-    let owed = gap_outstanding || !outstanding_rungs.is_empty();
-    owed.then(|| mandatory_action_tool_ids(true, &outstanding_rungs))
-        .filter(|tools| !tools.is_empty())
+pub(super) fn root_program_requires_action_channel(
+    role: TurnExecutionRole,
+    program_status: Option<crate::AgenticProgramStatus>,
+) -> bool {
+    role.owns_root_presentation()
+        && program_status.is_some_and(|status| {
+            matches!(
+                status,
+                crate::AgenticProgramStatus::Open
+                    | crate::AgenticProgramStatus::Waiting
+                    | crate::AgenticProgramStatus::CompletionRequested
+                    | crate::AgenticProgramStatus::Draining
+            )
+        })
 }
 
 /// The tool set that can close whatever mandatory action is still outstanding.

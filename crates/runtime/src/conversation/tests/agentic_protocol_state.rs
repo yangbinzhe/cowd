@@ -1520,3 +1520,229 @@ fn execution_continuation_and_commit_refusal_share_the_saved_report_contract() {
     assert!(instruction.contains("operator_requirement"));
     assert!(!instruction.contains("task_submit.deliverable"));
 }
+
+#[derive(Clone)]
+struct RootPresentationRecoveryClient {
+    services: Arc<crate::RuntimeServices>,
+    requests: Arc<Mutex<Vec<ApiRequest>>>,
+}
+
+struct RootPresentationRecoveryReader;
+
+#[async_trait::async_trait]
+impl crate::RuntimeExecutionHost for RootPresentationRecoveryReader {
+    async fn execute_runtime_tool(
+        &self,
+        request: &crate::RuntimeToolExecutionRequest,
+    ) -> crate::RuntimeToolExecutionOutcome {
+        crate::RuntimeToolExecutionOutcome {
+            tool_use_id: request.tool_use_id.clone(),
+            tool_name: request.tool_name.clone(),
+            status: crate::RuntimeToolExecutionStatus::Executed,
+            category: request.category,
+            output: Some("fixture source evidence".into()),
+            error: None,
+            evidence_ref: format!("tool:{}", request.tool_use_id),
+            observed_evidence: Vec::new(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ToolExecutor for RootPresentationRecoveryReader {
+    async fn execute_output(
+        &self,
+        name: &str,
+        input: &str,
+    ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+        TopicSafePointReader.execute_output(name, input).await
+    }
+
+    fn available_tool_names(&self) -> Vec<String> {
+        TopicSafePointReader.available_tool_names()
+    }
+
+    fn collaboration_runtime_available(&self) -> bool {
+        true
+    }
+
+    fn registered_tool_effect(
+        &self,
+        name: &str,
+        _input: &serde_json::Value,
+    ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+        use harness_contract::policy::{PermissionOperation, PermissionResource, PermissionScope};
+        use harness_contract::tool::{
+            ToolApprovalClass, ToolEffectDescriptor, ToolEffectKind, ToolIdempotency,
+            ToolPermissionMode,
+        };
+        (name == "read_file").then(|| ToolEffectDescriptor {
+            tool_id: name.to_string(),
+            descriptor_hash: "root-recovery-read-v1".into(),
+            effect_kind: ToolEffectKind::Read,
+            idempotency: ToolIdempotency::Idempotent,
+            scopes: vec![PermissionScope::new(
+                PermissionResource::File,
+                PermissionOperation::Read,
+            )],
+            required_permission: ToolPermissionMode::ReadOnly,
+            approval_class: ToolApprovalClass::None,
+            uses_network: false,
+            spawns_process: false,
+            mutates_packages: false,
+            mutates_system: false,
+            assessment: harness_contract::policy::EffectAssessment::default(),
+        })
+    }
+}
+
+impl ApiClient for RootPresentationRecoveryClient {
+    fn stream(
+        &mut self,
+        request: ApiRequest,
+    ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+        let step = {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(request);
+            requests.len()
+        };
+        if step == 1 {
+            let graphs = self.services.graph_state_store();
+            let graph = graphs
+                .graph_ids()
+                .unwrap()
+                .into_iter()
+                .map(|graph_id| graphs.load(&graph_id).unwrap())
+                .find(|graph| {
+                    graph.parent_execution.is_none()
+                        && graph
+                            .nodes
+                            .iter()
+                            .any(|node| node.payload_ref.contains("\"kind\":\"conversation_turn\""))
+                })
+                .unwrap();
+            let lineage = graph.lineage.as_ref().unwrap();
+            let objective_id = harness_contract::agent_action::root_objective_id(
+                &lineage.session_id,
+                &lineage.turn_id,
+            );
+            let actor = AgentActorBinding {
+                program_id: harness_contract::agent_action::program_id_for_objective(&objective_id),
+                objective_id,
+                session_id: lineage.session_id.clone(),
+                turn_id: lineage.turn_id.clone(),
+                root_execution_id: Some(graph.id.clone()),
+                required_team_count: 1,
+                exact_team_count: None,
+                objective_summary:
+                    "Use read_file to inspect crates/runtime/src/lib.rs and retain source evidence"
+                        .into(),
+                model_lease: "test-model".into(),
+                permission_ceiling: Some(PermissionMode::ReadOnly),
+                resource_scopes: vec![format!("session:{}", lineage.session_id)],
+                actor_id: format!("root:{}", lineage.session_id),
+                kind: AgentActorKind::Root,
+                execution_id: Some(graph.id.clone()),
+                team_id: None,
+                agent_id: None,
+            };
+            applied_ref(
+                self.services.as_ref(),
+                &AgentActionEnvelope {
+                    action_id: "root-recovery-pending-team".into(),
+                    actor,
+                    expected_revision: None,
+                    action: AgentAction::TeamCreate(TeamCreateInput {
+                        name: "Pending source audit".into(),
+                        mission: "Evidence still requires an action channel".into(),
+                        objective: None,
+                    }),
+                },
+            );
+            crate::repetition_guard::mark_refusal_ignored(&lineage.turn_id);
+            return Box::pin(stream::iter(vec![
+                Ok(AssistantEvent::TextDelta("{".into())),
+                Ok(AssistantEvent::MessageStop),
+            ]));
+        }
+        if step == 2 {
+            return Box::pin(stream::iter(vec![
+                Ok(AssistantEvent::ToolUse {
+                    id: "root-recovery-source-read".into(),
+                    name: "read_file".into(),
+                    input: r#"{"path":"crates/runtime/src/lib.rs"}"#.into(),
+                }),
+                Ok(AssistantEvent::MessageStop),
+            ]));
+        }
+        Box::pin(stream::iter(vec![Err(RuntimeError::new(
+            "HTTP 402 Payment Required: root recovery test complete",
+        ))]))
+    }
+}
+
+#[tokio::test]
+async fn actual_root_recovery_keeps_native_calls_when_a_program_still_needs_work() {
+    let services =
+        crate::RuntimeServices::in_memory_with_tool_host(Arc::new(RootPresentationRecoveryReader))
+            .unwrap();
+    let session_store = Arc::new(crate::test_support::session_store());
+    let session = Session::new();
+    session_store
+        .create_session(&session::SessionRecord {
+            session_id: session.session_id.clone(),
+            platform: "test".to_string(),
+            chat_id: "root-presentation-recovery".to_string(),
+            user_id: None,
+            model: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_activity: "2026-01-01T00:00:00Z".to_string(),
+            message_count: 0,
+            reset_policy: "manual".to_string(),
+            metadata_json: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            status: "active".to_string(),
+        })
+        .await
+        .expect("create source evidence session");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut runtime = crate::ConversationRuntime::new(
+        session,
+        RootPresentationRecoveryClient {
+            services: Arc::clone(&services),
+            requests: Arc::clone(&requests),
+        },
+        RootPresentationRecoveryReader,
+        PermissionPolicy::new(PermissionMode::ReadOnly),
+        canonical_host_system_prompt(vec![]),
+    )
+    .without_memory()
+    .with_session_journal_port(crate::session_runtime_port::TestSessionPortAdapter::new(
+        session_store,
+    ))
+    .with_artifact_store(Arc::clone(services.artifact_store()));
+    runtime.set_active_model("test-model");
+    let (_, result) = submit_test_owned_conversation_turn(
+        runtime,
+        Arc::clone(&services),
+        "Create exactly 1 Team. Use read_file to inspect crates/runtime/src/lib.rs and retain source evidence",
+        &SharedPrompter::none(),
+        test_execution_lineage(),
+    )
+    .await;
+    let requests = requests.lock().unwrap();
+    assert!(requests.len() >= 3, "{result:?}");
+    let retained_read = requests.iter().skip(2).any(|request| request.messages.iter().any(|message| message.blocks.iter().any(|block| {
+        matches!(block, ContentBlock::ToolResult { tool_use_id, is_error: false, .. } if tool_use_id == "root-recovery-source-read")
+    })));
+    assert!(
+        retained_read,
+        "native call must execute and retain durable source evidence: {result:?}"
+    );
+    assert!(!requests[1]
+        .prompt
+        .contextual_packets
+        .iter()
+        .any(|packet| packet.content.contains("User-selected execution boundary")));
+}

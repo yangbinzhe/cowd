@@ -952,7 +952,7 @@
             .await
             .unwrap();
         runtime
-            .execute_model_step("summarize checked evidence", false)
+            .execute_model_step("summarize checked evidence\nRuntime recovery: Do not call tools.", false)
             .await
             .unwrap();
 
@@ -967,6 +967,67 @@
         assert!(projections[1]
             .deferred_ids
             .contains(&"custom_reader".to_string()));
+    }
+
+    #[tokio::test]
+    async fn admitted_user_tool_prohibition_survives_a_prompt_without_the_original_words() {
+        let projections = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ExposureRecordingApi {
+                projections: Arc::clone(&projections),
+                required_tool_choices: Arc::new(std::sync::Mutex::new(Vec::new())),
+                reasoning_efforts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            },
+            ExposureToolExecutor,
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+        runtime
+            .begin_turn_strategy(
+                "admitted-no-tools",
+                "Do not call tools; answer from supplied evidence.",
+            )
+            .unwrap();
+        runtime
+            .execute_model_step("Summarize the supplied evidence.", true)
+            .await
+            .unwrap();
+        let projections = projections.lock().unwrap();
+        assert!(!projections.is_empty());
+        assert!(projections
+            .iter()
+            .all(|projection| projection.active_ids.is_empty()));
+        assert!(projections[0]
+            .deferred_ids
+            .contains(&"custom_reader".to_string()));
+        drop(projections);
+        let mut deferred = ConversationRuntime::new(
+            Session::new(),
+            DirectDeferredApi,
+            DynamicExposureToolExecutor,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+        deferred
+            .begin_turn_strategy(
+                "admitted-no-tools-deferred",
+                "Do not call tools; use supplied evidence.",
+            )
+            .unwrap();
+        let refused = deferred
+            .execute_model_step("Continue from the supplied evidence.", true)
+            .await
+            .unwrap();
+        assert!(matches!(refused.intent, ModelStepIntent::Replan { .. }));
+        assert!(!deferred
+            .tool_exposure_state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|state| state.active.contains("custom_reader")));
     }
 
     struct MutationExposureToolExecutor;

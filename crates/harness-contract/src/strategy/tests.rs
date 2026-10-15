@@ -340,9 +340,28 @@ fn explicit_tool_prohibition_does_not_create_external_evidence_work() {
     let decision = decide_strategy(&StrategyInput::from_prompt(prompt));
 
     assert!(prompt_explicitly_forbids_tool_use(prompt));
+    assert!(decision.understanding.forbids_tool_use);
     assert_eq!(decision.pattern, ExecutionPattern::Direct);
     assert!(!decision.understanding.requires_external_facts);
     assert!(!decision.understanding.requests_multi_agent);
+}
+
+#[test]
+fn tool_prohibition_is_a_typed_admission_constraint_with_legacy_read_compatibility() {
+    for prompt in [
+        "Do not call tools; answer from supplied evidence.",
+        "不要使用工具，只回答已有事实。",
+    ] {
+        assert!(understand(&StrategyInput::from_prompt(prompt)).forbids_tool_use);
+    }
+    let current = understand(&StrategyInput::from_prompt(
+        "Read crates/runtime/src/lib.rs with read-only tools; do not use bash or write files.",
+    ));
+    assert!(!current.forbids_tool_use);
+    let mut legacy = serde_json::to_value(&current).unwrap();
+    legacy.as_object_mut().unwrap().remove("forbids_tool_use");
+    let restored: TaskUnderstanding = serde_json::from_value(legacy).unwrap();
+    assert!(!restored.forbids_tool_use);
 }
 
 #[test]

@@ -575,8 +575,7 @@ fn build_runtime_execution_decision_inner(
     // a valid model-only execution boundary, not a failed tool runtime. Keep
     // the original Execute/Explore policy gates in place so the surrounding
     // graph still owns verification and terminal commitment.
-    let tool_calls_explicitly_prohibited =
-        harness_contract::strategy::prompt_explicitly_forbids_tool_use(&user_input);
+    let tool_calls_explicitly_prohibited = strategy.understanding.forbids_tool_use;
     if tool_calls_explicitly_prohibited {
         strategy.reasons.push(
             "tool calls are intentionally prohibited by the bounded role contract; retain the graph policy and synthesize from supplied evidence"

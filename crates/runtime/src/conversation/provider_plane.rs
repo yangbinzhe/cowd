@@ -306,47 +306,17 @@ where
     }
 
     /// Build the exposure for a Runtime-owned terminal request.
-    ///
-    /// `required_tools` is the capability axis, and it is deliberately separate
-    /// from the prompt-isolation axis that brings callers here. A terminal
-    /// request carries no exploratory history - that part is the point, and it
-    /// is what keeps a 60-round transcript out of the reduction request. It says
-    /// nothing about whether the model still has work to do. When Runtime still
-    /// owes an action (a completion gap, an unclassified issue, an outstanding
-    /// closure rung), the tool that performs it must be exposed or the model is
-    /// asked for something it cannot do: run one19 spent six consecutive
-    /// requests with an empty `tools` array while `message_publish` was the only
-    /// thing that could close its Objective, and said so in its own final answer.
-    ///
-    /// `None` keeps the historical zero-tool terminal, which is correct exactly
-    /// when nothing is owed and only rendering remains.
-    fn configure_terminal_tool_exposure(
-        &mut self,
-        reason: &str,
-        required_tools: Option<&std::collections::BTreeSet<String>>,
-    ) {
+    fn configure_terminal_tool_exposure(&mut self, reason: &str) {
         let discovery = self.discover_tools_with_metrics();
         let known = discovery
             .descriptors
             .iter()
             .map(|descriptor| descriptor.canonical_id.clone())
             .collect::<std::collections::BTreeSet<_>>();
-        // An unknown name is omitted rather than activated: discovery,
-        // authorization and the resource ceiling stay authoritative, and a
-        // required tool choice with no exposed schema is an invalid request.
-        let active = required_tools
-            .map(|tools| {
-                tools
-                    .iter()
-                    .filter(|tool| known.contains(tool.as_str()))
-                    .cloned()
-                    .collect::<std::collections::BTreeSet<_>>()
-            })
-            .unwrap_or_default();
         let mut exposure = ToolExposureState {
             catalog_revision: discovery.catalog_revision,
             bootstrap: Default::default(),
-            active,
+            active: Default::default(),
             deferred: known,
             reason: reason.to_string(),
             revision: 0,
@@ -472,7 +442,6 @@ where
         objective: &str,
         evidence: &str,
         evidence_history: Vec<ConversationMessage>,
-        required_tools: Option<&std::collections::BTreeSet<String>>,
     ) -> Result<ModelStepResult, RuntimeError> {
         // This owner creates an isolated reduction request directly rather
         // than passing through `execute_model_step`, so it must apply the
@@ -487,47 +456,18 @@ where
             "Original objective:\n{objective}\n\n{evidence_instruction}Return the final answer now."
         )));
         let messages: HistoryView = messages.into();
-        // Two claims this request makes about itself, and both must be true of
-        // THIS request. The first used to assert "no continuation work", which
-        // was false whenever the Objective still had a completion gap - run t2
-        // was told there was nothing left to do, obeyed, wrote its final answer,
-        // and was then told to keep working. The second asserted "exposes no
-        // executable tools" unconditionally, the same lie one step later: run
-        // one19 was told to classify an issue with `message_publish` across six
-        // consecutive requests whose `tools` array was empty. State what is true
-        // and stop there.
-        let (system_section, exposure_reason) = match required_tools {
-            Some(tools) if !tools.is_empty() => (
-                format!(
-                    "## Clean terminal synthesis\n\
-                     Produce the final user-facing answer for the supplied objective from the checked \
-                     evidence receipts only. This request carries no exploratory history, but it does \
-                     expose the tools Runtime still needs from you: {}. Answer from the receipts you \
-                     already hold and use those tools for the actions they name - do not emit simulated \
-                     tool markup or plans to inspect more data. Give the best supported conclusion now \
-                     and state unresolved facts explicitly.",
-                    tools.iter().cloned().collect::<Vec<_>>().join(", ")
-                ),
-                "clean terminal synthesis keeps the closing tools Runtime still owes",
-            ),
-            _ => (
-                "## Clean terminal synthesis\n\
+        let system_section = "## Clean terminal synthesis\n\
                  Produce the final user-facing answer for the supplied objective from the checked \
                  evidence receipts only. This request exposes no executable tools, so answer from \
                  the receipts you already hold: do not emit function calls, simulated tool markup, \
                  or plans to inspect more data. Give the best supported conclusion now and state \
-                 unresolved facts explicitly."
-                    .to_string(),
-                "clean terminal synthesis exposes no executable tools",
-            ),
-        };
+                 unresolved facts explicitly.";
         self.execute_terminal_provider_step(
             objective,
-            &system_section,
+            system_section,
             messages,
-            exposure_reason,
+            "clean terminal synthesis exposes no executable tools",
             None,
-            required_tools,
         )
         .await
         .map(|(step, _)| step)
@@ -545,25 +485,11 @@ where
         messages: HistoryView,
         exposure_reason: &str,
         presentation: Option<(&str, &str, &str, u64)>,
-        required_tools: Option<&std::collections::BTreeSet<String>>,
     ) -> Result<(ModelStepResult, Option<String>), RuntimeError> {
         let started_at = Instant::now();
-        self.configure_terminal_tool_exposure(exposure_reason, required_tools);
-        // The tool choice belongs to this request too. `configure_tool_choice` was
-        // only ever called from the ordinary model-step path, so a demand for a
-        // tool call made on a terminal request was silently dropped: run one30 was
-        // escalated twice, both escalated requests carried the closing tools, and
-        // the model answered with prose both times because nothing told the
-        // provider a tool call was required.
-        //
-        // `tool_choice: required` is invalid when no tool is exposed, so it is
-        // gated on the exposure this request actually built - the same fail-closed
-        // rule the model-step path uses.
-        let terminal_tools_exposed = required_tools.is_some_and(|tools| !tools.is_empty());
-        let one_shot_tool_required =
-            terminal_tools_exposed && self.next_model_tool_required.swap(false, Ordering::SeqCst);
-        self.api_client
-            .configure_tool_choice(one_shot_tool_required, None);
+        self.configure_terminal_tool_exposure(exposure_reason);
+        self.next_model_tool_required.store(false, Ordering::SeqCst);
+        self.api_client.configure_tool_choice(false, None);
 
         let mut prompt = PromptAssembly::new(self.system_prompt.clone());
         // A terminal synthesis is its own request with its own system section, so
@@ -969,7 +895,6 @@ where
                     envelope_id,
                     envelope_revision,
                 )),
-                None,
             )
             .await?;
         let text = step
@@ -1067,7 +992,6 @@ where
                     envelope_id,
                     envelope_revision,
                 )),
-                None,
             )
             .await?;
         let text = step
@@ -1220,8 +1144,17 @@ where
         user_input: &str,
         first_step: bool,
     ) -> Result<ModelStepResult, RuntimeError> {
-        self.execute_model_step_with_early_dispatch(user_input, first_step, None, false)
-            .await
+        let forbids_tool_use = self
+            .active_turn_strategy()
+            .is_some_and(|strategy| strategy.decision.strategy.understanding.forbids_tool_use);
+        self.execute_model_step_with_early_dispatch(
+            user_input,
+            first_step,
+            None,
+            false,
+            forbids_tool_use,
+        )
+        .await
     }
 
     /// One clock for a whole model-step invocation.
@@ -1260,6 +1193,7 @@ where
         first_step: bool,
         early_dispatcher: Option<Arc<dyn EarlyToolDispatcher>>,
         provider_retry_fenced: bool,
+        explicitly_forbids_tool_use: bool,
     ) -> Result<ModelStepResult, RuntimeError> {
         let clock_stamp = self.turn_step_clock();
         if self.cancellation_token.is_cancelled() {
@@ -1324,8 +1258,6 @@ where
             .lock()
             .ok()
             .and_then(|mut effort| effort.take());
-        let explicitly_forbids_tool_use =
-            harness_contract::strategy::prompt_explicitly_forbids_tool_use(user_input);
         // Stable delegated wire schemas may intentionally include tools that
         // are outside this request's logical exposure. A terminal or
         // user-forbidden tool boundary must therefore carry an explicit empty

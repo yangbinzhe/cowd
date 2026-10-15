@@ -48,6 +48,8 @@ pub struct TaskUnderstanding {
     /// must never turn an otherwise authorized tool call into a hard deny.
     #[serde(default)]
     pub forbids_workspace_write: bool,
+    #[serde(default)]
+    pub forbids_tool_use: bool,
     pub requires_write: bool,
     pub requires_external_facts: bool,
     #[serde(default)]
@@ -2503,6 +2505,7 @@ pub fn understand(input: &StrategyInput) -> TaskUnderstanding {
         complexity,
         risk,
         forbids_workspace_write,
+        forbids_tool_use: tool_use_forbidden,
         requires_write,
         requires_external_facts,
         requires_tool_evidence,

@@ -479,51 +479,43 @@ fn a_program_with_teams_but_no_tasks_still_owes_publish_task() {
     assert_eq!(owed, vec!["publish_task".to_string()], "{owed:?}");
 }
 
-/// The one case a tool-less terminal is correct, and the two it is not.
-///
-/// Run one23 was handed a request with an empty `tools` array while three Teams
-/// existed and no Task had been published. Neither continuation flag was set, so
-/// the gate read "nothing owed" and the model was asked to summarise - which it
-/// did, concluding the operator's hard constraint was met because the Teams
-/// existed. The obligation has to come from the Program projection, and it has to
-/// be checked here rather than trusted to a live provider failure to exercise.
 #[test]
-fn a_terminal_request_keeps_tools_exactly_when_something_is_owed() {
-    use super::host_backend::terminal_required_tools;
+fn an_unfinished_root_program_keeps_the_action_channel_until_a_durable_terminal() {
+    use super::host_backend::root_program_requires_action_channel;
+    use super::TurnExecutionRole;
+    use crate::AgenticProgramStatus;
 
-    // Nothing owed: rendering from the receipts in hand is the whole job.
-    assert!(
-        terminal_required_tools(false, Vec::new()).is_none(),
-        "with nothing owed the terminal request may drop every tool"
-    );
-
-    // Teams exist, no Task published: `publish_task` is owed.
-    let publishing = terminal_required_tools(false, vec!["publish_task".to_string()])
-        .expect("an unpublished Task owes tools");
-    assert!(
-        publishing.contains("task_publish"),
-        "the tool that publishes must survive the terminal request: {publishing:?}"
-    );
-    assert!(
-        publishing.contains("state_inspect") && publishing.contains("evidence_retrieve"),
-        "the reads the closing action needs must survive too: {publishing:?}"
-    );
-
-    // A completion gap is owed: the closing tool for that gap.
-    let gap = terminal_required_tools(true, vec!["classify_issues".to_string()])
-        .expect("an open completion gap owes tools");
-    assert!(
-        gap.contains("message_publish"),
-        "the tool that closes the gap must survive: {gap:?}"
-    );
-
-    // The exit request alone is the model's own decision, not an obligation, so a
-    // Program whose only remaining rung is that request still gets a tool-less
-    // terminal. Otherwise no finished Program could ever close.
-    assert!(
-        terminal_required_tools(false, Vec::new()).is_none(),
-        "the exit request is not an obligation"
-    );
+    assert!(!root_program_requires_action_channel(
+        TurnExecutionRole::RootTurn,
+        None
+    ));
+    for status in [
+        AgenticProgramStatus::Open,
+        AgenticProgramStatus::Waiting,
+        AgenticProgramStatus::CompletionRequested,
+        AgenticProgramStatus::Draining,
+    ] {
+        assert!(root_program_requires_action_channel(
+            TurnExecutionRole::RootTurn,
+            Some(status)
+        ));
+        assert!(!root_program_requires_action_channel(
+            TurnExecutionRole::DelegatedLeaf,
+            Some(status)
+        ));
+    }
+    for status in [
+        AgenticProgramStatus::Verified,
+        AgenticProgramStatus::Partial,
+        AgenticProgramStatus::Blocked,
+        AgenticProgramStatus::Failed,
+        AgenticProgramStatus::Cancelled,
+    ] {
+        assert!(!root_program_requires_action_channel(
+            TurnExecutionRole::RootTurn,
+            Some(status)
+        ));
+    }
 }
 
 /// The integration rung must follow the operator's requirement, not the runtime's

@@ -2681,7 +2681,6 @@ async fn clean_terminal_does_not_retry_after_its_provider_attempt() {
             "give a concise answer",
             "checked evidence",
             Vec::new(),
-            None,
         )
         .await
         .expect_err("clean terminal must not retry after its provider attempt");
