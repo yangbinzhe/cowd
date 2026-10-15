@@ -273,9 +273,12 @@ pub struct TaskAttemptDispatchInput {
 #[serde(deny_unknown_fields)]
 pub struct TaskSubmitInput {
     pub task_ref: String,
-    /// Collaboration artifact references returned as `changed_refs` by
-    /// `artifact_commit`. Runtime binds their durable content automatically;
-    /// do not duplicate storage selectors in `evidence_refs`.
+    /// Your own deliverable artifact references returned as `changed_refs` by
+    /// `artifact_commit`, bound to this Task and active claim. Never include
+    /// peer-produced dependency artifacts here: read their retained content
+    /// and cite the returned durable observations in `evidence_refs` instead.
+    /// For an ordinary report using `deliverable`, leave this array empty.
+    /// Runtime binds your committed content automatically.
     #[serde(default)]
     pub artifact_refs: Vec<String>,
     /// Supporting source, command, test, or file observations using durable

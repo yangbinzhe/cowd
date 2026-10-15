@@ -856,7 +856,7 @@ impl AgentActionService {
                 if !objective.contains(requirement) {
                     return Ok(rejected(envelope, projection.revision,
                         "review_requirement_not_in_objective",
-                        "operator_requirement does not occur in the bound original operator objective. Copy its exact relevant wording from state_inspect; added Task acceptance alone is not an operator requirement."));
+                        &format!("operator_requirement does not occur in the bound original operator objective. Copy an exact relevant substring of the original objective below, not a translation or added Task acceptance. Explain the actual missing deliverable separately in reason. Bound original operator objective: {objective:?}. Rejected operator_requirement: {requirement:?}")));
                 }
             }
         }
@@ -952,7 +952,11 @@ impl AgentActionService {
             // the Session journal by the async Gateway ingress before this
             // synchronous Program transition is applied.
             if let Some(reference) = evidence_refs.iter().find(|reference| {
-                reference.starts_with("artifact://") && artifacts.resolve(reference).is_err()
+                reference.starts_with("artifact://")
+                    && artifacts.resolve(reference).is_err()
+                    && !projection
+                        .artifact_content_selector(reference)
+                        .is_some_and(|selector| artifacts.resolve(selector).is_ok())
             }) {
                 return Ok(rejected(
                     envelope,
@@ -3099,9 +3103,10 @@ fn actionable(projection: &AgenticProgramProjection, duplicate: bool) -> Vec<Str
             .values()
             .any(|t| t.status == AgenticTaskStatus::Submitted)
     {
-        actions.push(
-            "For an Agent executing its bound claimed Task, prefer one `task_submit` with `deliverable` selecting the report's non-empty Text block. If the report was written in an earlier step, Runtime resolves the latest saved draft from this same Task, Agent, claim and attempt; do not guess a current-response block number or repeat `artifact_commit`. Use `artifact_commit` only for file-backed or multi-part deliverables, then pass its exact returned artifact reference to `task_submit`. Include real durable evidence references and disclose genuine gaps in `unresolved`. An Agent bound in review mode must read the submitted artifact and issue `task_review` instead of resubmitting it.".to_string(),
-        );
+        actions.push(format!(
+            "For an Agent executing its bound claimed Task: {} Disclose genuine gaps in unresolved. An Agent bound in review mode must read the submitted artifact and issue task_review instead of resubmitting it.",
+            crate::agentic::order_contract::TASK_REPORT_SUBMISSION_CONTRACT,
+        ));
     }
     if !projection.artifacts.is_empty()
         && projection

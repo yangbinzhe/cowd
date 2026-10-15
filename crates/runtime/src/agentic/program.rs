@@ -90,6 +90,17 @@ pub struct AgenticProgramProjection {
 }
 
 impl AgenticProgramProjection {
+    pub(crate) fn artifact_content_selector(&self, reference: &str) -> Option<&str> {
+        self.artifacts
+            .get(reference)
+            .or_else(|| {
+                reference
+                    .strip_prefix("artifact://")
+                    .and_then(|suffix| self.artifacts.get(&format!("artifact:{suffix}")))
+            })
+            .map(|artifact| artifact.content_ref.as_str())
+    }
+
     /// Business references survive a new authorization, while physical Task
     /// aggregates retain immutable ingress lineage. Both admission and actor
     /// authentication must use this same identity mapping.

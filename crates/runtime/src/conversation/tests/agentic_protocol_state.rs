@@ -1511,6 +1511,8 @@ fn execution_continuation_and_commit_refusal_share_the_saved_report_contract() {
     assert!(instruction.contains(crate::agentic::order_contract::TASK_REPORT_SUBMISSION_CONTRACT));
     assert!(instruction.contains("latest saved report"));
     assert!(instruction.contains("Text alone is not Task completion"));
+    assert!(instruction.contains("leave artifact_refs empty"));
+    assert!(instruction.contains("Peer-produced dependency artifacts are supporting evidence"));
     assert!(!instruction.contains("Never assume a prior draft is selected"));
     assert!(!instruction.contains("Do not return prose before"));
     state.mode = "review".into();
@@ -1518,6 +1520,8 @@ fn execution_continuation_and_commit_refusal_share_the_saved_report_contract() {
     let instruction = state.continuation_instruction();
     assert!(instruction.contains(crate::agentic::order_contract::REVIEWER_SCOPE_DISCIPLINE));
     assert!(instruction.contains("operator_requirement"));
+    assert!(instruction.contains("actual durable Runtime receipts and state"));
+    assert!(instruction.contains("Never require simulated tool markup"));
     assert!(!instruction.contains("task_submit.deliverable"));
 }
 
@@ -1733,6 +1737,11 @@ async fn actual_root_recovery_keeps_native_calls_when_a_program_still_needs_work
     .await;
     let requests = requests.lock().unwrap();
     assert!(requests.len() >= 3, "{result:?}");
+    assert!(requests[0].prompt.contextual_packets.iter().any(|packet| {
+        packet
+            .content
+            .contains(crate::agentic::order_contract::TASK_AUTHORING_DISCIPLINE)
+    }));
     let retained_read = requests.iter().skip(2).any(|request| request.messages.iter().any(|message| message.blocks.iter().any(|block| {
         matches!(block, ContentBlock::ToolResult { tool_use_id, is_error: false, .. } if tool_use_id == "root-recovery-source-read")
     })));

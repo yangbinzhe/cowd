@@ -294,20 +294,14 @@ impl RuntimeServices {
                 match self.artifact_store().resolve(evidence_ref) {
                     Ok(artifact) => artifact,
                     Err(store_error) => {
-                        let logical = format!(
-                            "artifact:{}",
-                            evidence_ref.trim_start_matches("artifact://")
-                        );
                         let mapped = self
                             .agent_action_service()
                             .project_if_exists(&actor.program_id)
-                            .ok()
-                            .flatten()
+                            .map_err(|error| format!("load evidence Program: {error}"))?
                             .and_then(|program| {
                                 program
-                                    .artifacts
-                                    .get(&logical)
-                                    .map(|artifact| artifact.content_ref.clone())
+                                    .artifact_content_selector(evidence_ref)
+                                    .map(str::to_string)
                             });
                         match mapped {
                             Some(content_ref) => self.artifact_store().resolve(&content_ref).map_err(

@@ -2006,7 +2006,7 @@ async fn production_artifact_authority_closes_submit_review_and_completion_chain
         .await
         .expect("durable content");
     let service = AgentActionService::new(Arc::new(RuntimeEventStore::for_test()))
-        .with_artifact_store(artifacts);
+        .with_artifact_store(Arc::clone(&artifacts));
     let team = service
         .apply(&root(
             "durable-team",
@@ -2110,7 +2110,123 @@ async fn production_artifact_authority_closes_submit_review_and_completion_chain
         Some(&artifact),
     );
     assert_eq!(inspect["read_request"]["evidence_ref"], content.selector);
-    let durable_submit = service
+    let borrowed_artifact = service
+        .apply(&root(
+            "durable-peer-artifact",
+            AgentAction::ArtifactCommit(ArtifactCommitInput {
+                content_ref: content.selector.clone(),
+                kind: "report".into(),
+                title: "Supporting peer result".into(),
+                relates_to: Vec::new(),
+            }),
+        ))
+        .unwrap()
+        .changed_refs[0]
+        .clone();
+    let borrowed_alias = format!(
+        "artifact://{}",
+        borrowed_artifact.strip_prefix("artifact:").unwrap()
+    );
+    let projection = service.project("program-1").unwrap();
+    assert!(super::actionable(&projection, false).iter().any(|instruction| {
+        instruction.contains(crate::agentic::order_contract::TASK_REPORT_SUBMISSION_CONTRACT)
+    }));
+    assert_eq!(
+        projection.artifact_content_selector(&borrowed_artifact),
+        Some(content.selector.as_str())
+    );
+    assert_eq!(
+        projection.artifact_content_selector(&borrowed_alias),
+        Some(content.selector.as_str())
+    );
+    assert!(
+        AgenticProgramProjection::empty("another-program", "another-objective")
+            .artifact_content_selector(&borrowed_alias)
+            .is_none()
+    );
+    let unowned = service
+        .apply(&managed(
+            "durable-peer-as-own",
+            &team,
+            &worker,
+            AgentAction::TaskSubmit(TaskSubmitInput {
+                task_ref: task.clone(),
+                artifact_refs: vec![borrowed_artifact],
+                evidence_refs: vec![content.selector.clone()],
+                unresolved: Vec::new(),
+                deliverable: None,
+            }),
+        ))
+        .unwrap();
+    assert_eq!(unowned.status, AgentActionStatus::Rejected);
+    let unowned_error = unowned.error.unwrap();
+    assert_eq!(unowned_error.code, "artifact_not_bound_to_active_claim");
+    assert!(unowned_error
+        .message
+        .contains("supporting evidence, not your new deliverable"));
+    assert!(unowned_error
+        .message
+        .contains(crate::agentic::order_contract::TASK_REPORT_SUBMISSION_CONTRACT));
+    let missing_content = artifacts
+        .write_bytes(
+            harness_contract::context::ArtifactWriteDescriptor {
+                media_type: "text/plain".into(),
+                visibility_scope: "session:session-1".into(),
+                expected_bytes: None,
+                original_name: None,
+            },
+            b"content that becomes unavailable",
+        )
+        .await
+        .unwrap();
+    let missing_artifact = service
+        .apply(&root(
+            "durable-missing-content",
+            AgentAction::ArtifactCommit(ArtifactCommitInput {
+                content_ref: missing_content.selector.clone(),
+                kind: "report".into(),
+                title: "Missing content".into(),
+                relates_to: Vec::new(),
+            }),
+        ))
+        .unwrap()
+        .changed_refs[0]
+        .clone();
+    artifacts
+        .delete(&missing_content, "session:session-1")
+        .unwrap();
+    let before = service.project("program-1").unwrap().revision;
+    for (index, reference) in [
+        "artifact://unknown-logical-key".to_string(),
+        format!(
+            "artifact://{}",
+            missing_artifact.strip_prefix("artifact:").unwrap()
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let rejected = service
+            .apply(&managed(
+                &format!("durable-invalid-evidence-{index}"),
+                &team,
+                &worker,
+                AgentAction::TaskSubmit(TaskSubmitInput {
+                    task_ref: task.clone(),
+                    artifact_refs: vec![artifact.clone()],
+                    evidence_refs: vec![reference],
+                    unresolved: Vec::new(),
+                    deliverable: None,
+                }),
+            ))
+            .unwrap();
+        assert_eq!(rejected.status, AgentActionStatus::Rejected);
+        assert_eq!(rejected.error.unwrap().code, "evidence_not_durable");
+        assert_eq!(service.project("program-1").unwrap().revision, before);
+    }
+    let restored = AgentActionService::new(Arc::clone(&service.store))
+        .with_artifact_store(Arc::clone(&artifacts));
+    let durable_submit = restored
         .apply(&managed(
             "durable-submit",
             &team,
@@ -2119,7 +2235,7 @@ async fn production_artifact_authority_closes_submit_review_and_completion_chain
                 deliverable: None,
                 task_ref: task.clone(),
                 artifact_refs: vec![artifact.clone()],
-                evidence_refs: vec![content.selector.clone()],
+                evidence_refs: vec![borrowed_alias],
                 unresolved: vec![
                     "Known limitation disclosed in the reviewed artifact; not an acceptance blocker"
                         .to_string(),
@@ -2171,11 +2287,9 @@ async fn production_artifact_authority_closes_submit_review_and_completion_chain
     );
     let before = service.project("program-1").unwrap();
     let issue = super::super::issues::issues(&before).remove(0);
-    assert!(
-        super::super::issues::completion_gap(&before)
-            .unwrap()
-            .starts_with("issue_requires_classification:")
-    );
+    assert!(super::super::issues::completion_gap(&before)
+        .unwrap()
+        .starts_with("issue_requires_classification:"));
     let classify = |action_id: &str, disposition| {
         root(
             action_id,
@@ -2249,11 +2363,9 @@ async fn production_artifact_authority_closes_submit_review_and_completion_chain
     );
     let mut changed = adjudicated.clone();
     changed.tasks.get_mut(&task).unwrap().unresolved[0].push_str(" revised source");
-    assert!(
-        super::super::issues::completion_gap(&changed)
-            .unwrap()
-            .starts_with("issue_requires_classification:")
-    );
+    assert!(super::super::issues::completion_gap(&changed)
+        .unwrap()
+        .starts_with("issue_requires_classification:"));
     let restarted = AgentActionService::new(Arc::clone(&service.store));
     let recovered =
         super::super::issues::issues(&restarted.project("program-1").unwrap()).remove(0);
@@ -4905,6 +5017,109 @@ fn create_bound_review_goal(store: Arc<RuntimeEventStore>, objective: &str, prog
         .expect("persist review goal");
 }
 
+#[tokio::test]
+async fn program_evidence_alias_preflight_preserves_scope_and_content_guards() {
+    let services = crate::RuntimeServices::in_memory().unwrap();
+    let service = services.agent_action_service();
+    let content = services
+        .artifact_store()
+        .write_bytes(
+            harness_contract::context::ArtifactWriteDescriptor {
+                media_type: "text/plain".into(),
+                visibility_scope: "session:session-1".into(),
+                expected_bytes: None,
+                original_name: None,
+            },
+            b"retained evidence",
+        )
+        .await
+        .unwrap();
+    service
+        .apply(&root(
+            "alias-team",
+            AgentAction::TeamCreate(TeamCreateInput {
+                name: "Evidence".into(),
+                mission: "Verify scoped evidence".into(),
+                objective: None,
+            }),
+        ))
+        .unwrap();
+    let committed = service
+        .apply(&root(
+            "alias-content",
+            AgentAction::ArtifactCommit(ArtifactCommitInput {
+                content_ref: content.selector.clone(),
+                kind: "report".into(),
+                title: "Evidence".into(),
+                relates_to: Vec::new(),
+            }),
+        ))
+        .unwrap();
+    assert_eq!(committed.status, AgentActionStatus::Applied);
+    let logical = &committed.changed_refs[0];
+    let alias = format!("artifact://{}", logical.strip_prefix("artifact:").unwrap());
+    let actor = root(
+        "scope",
+        AgentAction::StateInspect(StateInspectInput::default()),
+    )
+    .actor;
+    let review = |reference: String| {
+        AgentAction::TaskReview(TaskReviewInput {
+            task_ref: "task:preflight-only".into(),
+            decision: TaskReviewDecision::Accept,
+            reason: "retained content".into(),
+            evidence_refs: vec![reference],
+            operator_requirement: None,
+        })
+    };
+    for reference in [content.selector.clone(), alias.clone()] {
+        services
+            .validate_agent_action_evidence(&actor, &review(reference))
+            .await
+            .unwrap();
+    }
+    let unknown = services
+        .validate_agent_action_evidence(&actor, &review("artifact://unknown-logical-key".into()))
+        .await
+        .unwrap_err();
+    assert!(
+        unknown.contains("points to missing durable content"),
+        "{unknown}"
+    );
+    let mut foreign_program = actor.clone();
+    foreign_program.program_id = "another-program".into();
+    let foreign = services
+        .validate_agent_action_evidence(&foreign_program, &review(alias.clone()))
+        .await
+        .unwrap_err();
+    assert!(
+        foreign.contains("points to missing durable content"),
+        "{foreign}"
+    );
+    let mut foreign_session = actor.clone();
+    foreign_session.session_id = "another-session".into();
+    let unreadable = services
+        .validate_agent_action_evidence(&foreign_session, &review(alias.clone()))
+        .await
+        .unwrap_err();
+    assert!(
+        unreadable.contains("not readable in Session"),
+        "{unreadable}"
+    );
+    services
+        .artifact_store()
+        .delete(&content, "session:session-1")
+        .unwrap();
+    let missing = services
+        .validate_agent_action_evidence(&actor, &review(alias))
+        .await
+        .unwrap_err();
+    assert!(
+        missing.contains("points to missing durable content"),
+        "{missing}"
+    );
+}
+
 #[test]
 fn negative_reviews_require_literal_operator_provenance_not_task_acceptance() {
     let service = AgentActionService::new(Arc::new(RuntimeEventStore::for_test()));
@@ -4939,14 +5154,24 @@ fn negative_reviews_require_literal_operator_provenance_not_task_acceptance() {
             ))
             .unwrap();
         assert_eq!(receipt.status, AgentActionStatus::Rejected);
+        let error = receipt.error.unwrap();
         assert_eq!(
-            receipt.error.unwrap().code,
+            error.code,
             if index < 2 {
                 "review_requirement_missing"
             } else {
                 "review_requirement_not_in_objective"
             }
         );
+        if index >= 2 {
+            assert!(error
+                .message
+                .contains("Bound original operator objective: \"test objective\""));
+            assert!(error.message.contains(requirement.unwrap()));
+            assert!(error
+                .message
+                .contains("not a translation or added Task acceptance"));
+        }
         assert_eq!(service.project("program-1").unwrap().revision, before);
         assert_eq!(
             service.project("program-1").unwrap().tasks[&task].status,

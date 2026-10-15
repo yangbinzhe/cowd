@@ -812,7 +812,13 @@ fn validate_task_submission(
                     || artifact.claim_generation != Some(task.claim_generation)
             })
     }) {
-        return Some(("artifact_not_bound_to_active_claim", unowned.clone()));
+        return Some((
+            "artifact_not_bound_to_active_claim",
+            format!(
+                "{unowned}: artifact_refs must contain only your own deliverables bound to this Task and active claim. Peer-produced dependency artifacts are supporting evidence, not your new deliverable. Read their retained content and cite the returned durable tool:// receipts or artifact:// content selectors in evidence_refs; keep depends_on for upstream work. {}",
+                super::super::order_contract::TASK_REPORT_SUBMISSION_CONTRACT
+            ),
+        ));
     }
     // A one-shot deliverable is an equally real Task result: the host has
     // already persisted its non-empty content, so the canonical artifact is
