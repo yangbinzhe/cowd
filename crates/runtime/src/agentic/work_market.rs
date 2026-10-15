@@ -256,12 +256,6 @@ fn objective_has_anchors(objective: &str) -> bool {
 
 /// What the operator actually asked for, quoted back so the author and the
 /// reviewer read the same comparison instead of an assertion.
-pub(crate) fn operator_requirement_summary_for_projection(
-    projection: &AgenticProgramProjection,
-) -> String {
-    operator_requirement_summary(projection)
-}
-
 fn operator_requirement_summary(projection: &AgenticProgramProjection) -> String {
     let summary = projection.objective_summary.trim();
     if summary.is_empty() {

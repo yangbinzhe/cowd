@@ -271,10 +271,7 @@ fn root_agent_action_actor(
             .and_then(|decision| decision.execution_graph_ref.clone()),
         required_team_count,
         exact_team_count,
-        objective_summary: binding
-            .execution_decision
-            .map(|decision| decision.user_intent_preview.clone())
-            .unwrap_or_default(),
+        objective_summary: String::new(),
         model_lease: binding.model_lease.unwrap_or("default").to_string(),
         permission_ceiling: Some(binding.permission_ceiling),
         resource_scopes,

@@ -710,7 +710,11 @@ impl GatewayToolExecutor {
                         .await
                         .map_err(ToolError::new)?
                 }
-                None => root_agent_action_actor(binding),
+                None => {
+                    return Err(ToolError::new(
+                        "Agent actions require an admitted execution graph and its authenticated parent binding",
+                    ));
+                }
             };
             let expected_revision = match value
                 .as_object_mut()

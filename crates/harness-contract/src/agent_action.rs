@@ -328,6 +328,8 @@ pub struct TaskReviewInput {
     pub task_ref: String,
     pub decision: TaskReviewDecision,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_requirement: Option<String>,
     /// Durable observations used for the independent verdict, normally the
     /// receipt returned after retrieving/inspecting the submitted artifact.
     /// Runtime already knows which artifacts belong to the Task.
@@ -1366,5 +1368,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn review_requirement_schema_is_additive_for_legacy_accepts() {
+        let accepted: TaskReviewInput = serde_json::from_value(serde_json::json!({
+            "task_ref": "task:submitted", "decision": "accept", "reason": "verified evidence"
+        }))
+        .expect("legacy review payload");
+        assert_eq!(accepted.operator_requirement, None);
+        assert_eq!(AgentAction::TaskReview(accepted.clone()).validate(), Ok(()));
+        let serialized = serde_json::to_value(accepted).unwrap();
+        assert!(serialized.get("operator_requirement").is_none());
+        let schema = serde_json::to_value(schemars::schema_for!(TaskReviewInput)).unwrap();
+        assert!(schema["properties"].get("operator_requirement").is_some());
+        assert!(!schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "operator_requirement"));
     }
 }

@@ -245,7 +245,11 @@ async fn root_actor_inherits_the_immutable_graph_delegation_scope() {
     let session_id = "session-root-scope";
     let turn_id = "turn-root-scope";
     let graph_id = "root-scope-execution";
-    let mut graph = ExecutionGraph::new("root scope authority");
+    let objective = format!(
+        "{}完整目标必须保留末尾的独立评审与只读约束",
+        "明确要求 ".repeat(60)
+    );
+    let mut graph = ExecutionGraph::new(&objective);
     graph.id = graph_id.to_string();
     graph.lineage = Some(ExecutionGraphLineage {
         session_id: session_id.to_string(),
@@ -307,6 +311,7 @@ async fn root_actor_inherits_the_immutable_graph_delegation_scope() {
         .expect("resolve root actor");
 
     assert_eq!(resolved.resource_scopes, ["network:*", "workspace:."]);
+    assert_eq!(resolved.objective_summary, objective);
 }
 
 #[tokio::test]
@@ -1186,6 +1191,7 @@ async fn exercise_reviewed_goal_delivery(
         actor: reviewer_actor,
         expected_revision: None,
         action: AgentAction::TaskReview(TaskReviewInput {
+            operator_requirement: None,
             task_ref: task_ref.clone(),
             decision: TaskReviewDecision::Accept,
             reason: "Read and checked the persisted artifact".into(),
@@ -3722,6 +3728,7 @@ async fn cross_team_reviewer_resolves_own_identity_and_can_accept() {
             actor: reviewer_actor,
             expected_revision: None,
             action: AgentAction::TaskReview(TaskReviewInput {
+                operator_requirement: None,
                 task_ref: task.clone(),
                 decision: TaskReviewDecision::Accept,
                 reason: "artifact evidence inspected".to_string(),

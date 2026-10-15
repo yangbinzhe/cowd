@@ -1355,6 +1355,7 @@ async fn action_evidence_validation_still_refuses_an_unmapped_logical_key() {
         agent_id: Some("agent:1".into()),
     };
     let action = AgentAction::TaskReview(harness_contract::agent_action::TaskReviewInput {
+        operator_requirement: None,
         task_ref: "task:1".into(),
         decision: harness_contract::agent_action::TaskReviewDecision::Accept,
         reason: "checked".into(),

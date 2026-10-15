@@ -1657,6 +1657,7 @@ mod tests {
                 &reviewer_id,
                 "execution-agentic-reviewer",
                 AgentAction::TaskReview(TaskReviewInput {
+                    operator_requirement: None,
                     task_ref: research_task_id.clone(),
                     decision: TaskReviewDecision::Accept,
                     reason: "source independently verified".to_string(),
@@ -1715,6 +1716,7 @@ mod tests {
                 &analyst_id,
                 "execution-agentic-analyst",
                 AgentAction::TaskReview(TaskReviewInput {
+                    operator_requirement: None,
                     task_ref: synthesis_task_id.clone(),
                     decision: TaskReviewDecision::Accept,
                     reason: "decision is traceable to source".to_string(),

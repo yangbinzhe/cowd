@@ -593,6 +593,18 @@ fn is_canonical_input_ref(value: &str) -> bool {
         "matrix://",
         "file://",
         "tool-output:",
+        "task:",
+        "agent:",
+        "team:",
+        "program:",
+        "objective:",
+        "run:",
+        "graph:",
+        "execution-graph:",
+        "session-ingress-graph:",
+        "mission:",
+        "session:",
+        "turn:",
     ]
     .iter()
     .any(|prefix| value.starts_with(prefix) && value.len() > prefix.len())
@@ -665,6 +677,53 @@ mod tests {
             crate::repetition_guard::is_dispatch_blocked(turn, "task_review", &stable_hash(input)),
             "the key the refusal derives must be the key the recorder wrote"
         );
+    }
+
+    #[test]
+    fn named_runtime_refs_allow_corrected_input_but_do_not_disable_failure_fuses() {
+        let input = r#"{"task_ref":"task:9ea7db69dc49d9e7","operator_requirement":"wrong quote"}"#;
+        let corrected =
+            r#"{"task_ref":"task:9ea7db69dc49d9e7","operator_requirement":"original wording"}"#;
+        let references = canonical_input_refs(input);
+        assert!(references
+            .iter()
+            .any(|reference| reference == "task:9ea7db69dc49d9e7"));
+        for (turn, message, expected_block) in [
+            (
+                "turn-named-review-source",
+                "Task `task:9ea7db69dc49d9e7` operator requirement is not in objective",
+                false,
+            ),
+            (
+                "turn-hidden-review-graph",
+                "graph `run:abc123` does not exist",
+                true,
+            ),
+        ] {
+            for _ in 0..crate::repetition_guard::repetition_bound() {
+                crate::repetition_guard::record_tool_failure(
+                    turn,
+                    "task_review",
+                    &stable_hash(input),
+                    &references,
+                    ToolFailureKind::ExecutionError,
+                    message,
+                );
+            }
+            assert!(crate::repetition_guard::is_dispatch_blocked(
+                turn,
+                "task_review",
+                &stable_hash(input)
+            ));
+            assert_eq!(
+                crate::repetition_guard::is_dispatch_blocked(
+                    turn,
+                    "task_review",
+                    &stable_hash(corrected)
+                ),
+                expected_block
+            );
+        }
     }
 
     #[test]

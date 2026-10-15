@@ -605,6 +605,7 @@ async fn rework_attempt_cannot_reuse_artifacts_from_an_earlier_claim() {
             &fixture.reviewer_ref,
             "review-attempt-one",
             AgentAction::TaskReview(TaskReviewInput {
+                operator_requirement: Some(fixture.root.objective_summary.clone()),
                 task_ref: fixture.task_ref.clone(),
                 decision: TaskReviewDecision::Rework,
                 reason: "the first attempt lacks a required acceptance item".to_string(),
@@ -953,6 +954,7 @@ async fn delegated_review_is_pending_only_until_its_durable_verdict() {
             &fixture.reviewer_ref,
             "agent-review-active",
             AgentAction::TaskReview(TaskReviewInput {
+                operator_requirement: None,
                 task_ref: fixture.task_ref.clone(),
                 decision: TaskReviewDecision::Accept,
                 reason: "the exact submitted artifact satisfies acceptance".to_string(),
@@ -1400,6 +1402,7 @@ async fn accepted_root_work_does_not_force_a_terminal_tool_or_promote_its_checkp
                 &fixture.reviewer_ref,
                 "root-check-reviewer",
                 AgentAction::TaskReview(TaskReviewInput {
+                    operator_requirement: None,
                     task_ref: fixture.task_ref.clone(),
                     decision: TaskReviewDecision::Accept,
                     reason: "source supports this task".into(),

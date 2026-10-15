@@ -626,7 +626,7 @@ fn agent_action_tool_definitions() -> Vec<RuntimeToolDefinition> {
         ),
         agent_action_definition::<action::TaskReviewInput>(
             action::TASK_REVIEW_TOOL_ID,
-            "Independently accept, challenge or request rework for one submitted Task using a concise reason and evidence references.",
+            "Independently accept, challenge or request rework for one submitted Task using a concise reason and evidence references. For challenge or rework, operator_requirement must quote the exact relevant wording from the original operator objective shown by state_inspect's Goal (or the frozen Program objective if no Goal is recorded). Explain the missing required deliverable in reason; added Task acceptance standards alone are not grounds for rework. Accept needs no operator_requirement.",
         ),
         agent_action_definition::<action::MessagePublishInput>(
             action::MESSAGE_PUBLISH_TOOL_ID,

@@ -1,3 +1,41 @@
+fn admitted_agent_action_root(
+    services: &runtime::RuntimeServices,
+    session_id: &str,
+) -> (
+    harness_contract::execution_graph::ExecutionParentBinding,
+    runtime::RuntimeExecutionDecision,
+) {
+    use harness_contract::execution_graph::*;
+    let objective = "prove authenticated native Agent actions";
+    let mut graph = ExecutionGraph::new(objective);
+    graph.lineage = Some(ExecutionGraphLineage {
+        session_id: session_id.to_string(),
+        turn_id: format!("turn:{session_id}"),
+        root_task_id: format!("task:{session_id}"),
+        task_id: format!("task:{session_id}"),
+        generation: 1,
+    });
+    let node = ExecutionNodeSpec::new(
+        ExecutionNodeKind::InlineModel,
+        "inline_model",
+        "payload:root-model",
+    );
+    let parent = ExecutionParentBinding {
+        execution_id: graph.id.clone(),
+        node_id: node.id.clone(),
+    };
+    let mut decision = runtime::build_runtime_execution_decision(objective, None);
+    decision.execution_graph_ref = Some(graph.id.clone());
+    decision.session_ref = Some(session_id.to_string());
+    decision.turn_ref = Some(format!("turn:{session_id}"));
+    graph.nodes.push(node);
+    services
+        .commit_service()
+        .register_graph(graph)
+        .expect("admitted root graph");
+    (parent, decision)
+}
+
 #[test]
 fn evidence_retrieve_request_matches_published_query_schema() {
     let request: EvidenceRetrieveToolRequest = serde_json::from_value(serde_json::json!({
@@ -582,6 +620,8 @@ async fn bound_root_model_bootstraps_program_and_inherits_evidence_scope() {
         .project(&program.program_id)
         .expect("continued durable Program");
     assert_eq!(continued.agents.len(), 1);
+    assert_eq!(program.objective_summary, "root Agent-first bootstrap");
+    assert_eq!(continued.objective_summary, program.objective_summary);
     assert_eq!(continued.model_lease, "deepseek-v4-flash");
     assert_eq!(continued.resource_scopes, program.resource_scopes);
 
@@ -624,6 +664,7 @@ async fn agent_action_gateway_commits_small_actions_and_rejects_fake_content() {
     executor
         .bind_runtime_services(Arc::clone(&services))
         .expect("bind runtime services");
+    let (parent, decision) = admitted_agent_action_root(&services, "session-agentic-gateway");
     let binding = RuntimeToolExecutionBinding {
         action_id: Some("create-team"),
         session_id: Some("session-agentic-gateway"),
@@ -631,8 +672,8 @@ async fn agent_action_gateway_commits_small_actions_and_rejects_fake_content() {
         memory_context: None,
         reality_context: None,
         model_lease: Some("default"),
-        parent_execution: None,
-        execution_decision: None,
+        parent_execution: Some(&parent),
+        execution_decision: Some(&decision),
         permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
     };
     let created = executor
@@ -823,6 +864,7 @@ async fn committed_agent_action_is_not_relabelled_failed_when_dispatch_is_deferr
     executor
         .bind_runtime_services(Arc::clone(&services))
         .expect("bind runtime services");
+    let (parent, decision) = admitted_agent_action_root(&services, "session-deferred-dispatch");
     let base = RuntimeToolExecutionBinding {
         action_id: Some("deferred-team"),
         session_id: Some("session-deferred-dispatch"),
@@ -830,8 +872,8 @@ async fn committed_agent_action_is_not_relabelled_failed_when_dispatch_is_deferr
         memory_context: None,
         reality_context: None,
         model_lease: Some("deepseek-v4-flash"),
-        parent_execution: None,
-        execution_decision: None,
+        parent_execution: Some(&parent),
+        execution_decision: Some(&decision),
         permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
     };
     let team: harness_contract::agent_action::AgentActionObservation = serde_json::from_str(
@@ -1325,6 +1367,7 @@ async fn context_program_discovery_uses_one_authorized_revision_and_real_request
         .unwrap();
     let executor = GatewayToolExecutor::new(None, false, registry);
     executor.bind_runtime_services(services.clone()).unwrap();
+    let (parent, decision) = admitted_agent_action_root(&services, "program-directory-session");
     let binding = RuntimeToolExecutionBinding {
         action_id: Some("program-discovery"),
         session_id: Some("program-directory-session"),
@@ -1332,11 +1375,14 @@ async fn context_program_discovery_uses_one_authorized_revision_and_real_request
         memory_context: None,
         reality_context: None,
         model_lease: Some("test-model"),
-        parent_execution: None,
-        execution_decision: None,
+        parent_execution: Some(&parent),
+        execution_decision: Some(&decision),
         permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
     };
-    let actor = root_agent_action_actor(binding);
+    let actor = services
+        .resolve_agent_action_actor(&parent, Some(root_agent_action_actor(binding)))
+        .await
+        .expect("authenticated actor");
     let actions = services.agent_action_service();
     for index in 0..35 {
         let result = services
@@ -1592,10 +1638,37 @@ async fn context_artifact_catalog_returns_readable_scoped_content_and_lossless_b
 
 /// PLAN M2: several Agent actions in ONE provider round, each on exactly the
 /// same validation/authorization/commit path a direct call takes.
+
+#[tokio::test]
+async fn native_agent_actions_reject_unadmitted_root_execution() {
+    let services = runtime::RuntimeServices::in_memory().expect("runtime services");
+    let registry = GatewayToolRegistry::builtin()
+        .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
+        .expect("Agent action tools");
+    let executor = GatewayToolExecutor::new(None, false, registry);
+    executor
+        .bind_runtime_services(services)
+        .expect("bind runtime services");
+    let error = executor
+        .execute_runtime_tool(
+            "team_create",
+            serde_json::json!({
+                "name": "Unbound", "mission": "must not open a Program without an admitted graph"
+            }),
+        )
+        .await
+        .expect_err("unadmitted root must be rejected");
+    assert!(error.to_string().contains("authenticated parent binding"));
+}
+
 #[tokio::test]
 async fn agent_action_batch_applies_every_action_through_the_same_path() {
     let services = runtime::RuntimeServices::in_memory().expect("runtime services");
-    let mut graph = harness_contract::execution_graph::ExecutionGraph::new("root batch bootstrap");
+    let objective = format!(
+        "{}保留第 180 字之后的精确事实和独立评审要求",
+        "建立两个团队并完成交付。".repeat(30)
+    );
+    let mut graph = harness_contract::execution_graph::ExecutionGraph::new(&objective);
     graph.id = "graph-root-batch".to_string();
     graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
         session_id: "session-root-batch".to_string(),
@@ -1617,7 +1690,8 @@ async fn agent_action_batch_applies_every_action_through_the_same_path() {
         .register_graph(graph)
         .expect("register root graph");
 
-    let mut decision = runtime::build_runtime_execution_decision("建立两个团队", None);
+    let mut decision = runtime::build_runtime_execution_decision(&objective, None);
+    assert_eq!(decision.user_intent_preview.chars().count(), 180);
     decision.execution_graph_ref = Some("graph-root-batch".to_string());
     decision.session_ref = Some("session-root-batch".to_string());
     decision.turn_ref = Some("turn-root-batch".to_string());
@@ -1670,6 +1744,7 @@ async fn agent_action_batch_applies_every_action_through_the_same_path() {
         ))
         .expect("durable Program");
     assert_eq!(program.teams.len(), 2, "both actions must have committed");
+    assert_eq!(program.objective_summary, objective);
 
     // The batch dispatches Agent actions only; anything else is refused
     // rather than silently routed to a different executor.

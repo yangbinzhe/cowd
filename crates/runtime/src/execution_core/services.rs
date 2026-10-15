@@ -2266,6 +2266,7 @@ impl RuntimeServices {
             );
             root.resource_scopes.sort();
             root.resource_scopes.dedup();
+            root.objective_summary.clone_from(&graph.objective);
 
             // The first accepted root action freezes the Program's semantic
             // and authorization binding. Dynamic model/replan nodes may carry

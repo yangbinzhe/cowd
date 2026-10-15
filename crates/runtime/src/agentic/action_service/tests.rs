@@ -1823,6 +1823,7 @@ fn legacy_goal_terminal_recovery_is_durable_and_idempotent() {
             &team_id,
             &reviewer_id,
             AgentAction::TaskReview(TaskReviewInput {
+                operator_requirement: None,
                 task_ref: task_id.clone(),
                 decision: TaskReviewDecision::Accept,
                 reason: "verified".to_string(),
@@ -2138,6 +2139,7 @@ async fn production_artifact_authority_closes_submit_review_and_completion_chain
                 &team,
                 &reviewer,
                 AgentAction::TaskReview(TaskReviewInput {
+                    operator_requirement: None,
                     task_ref: task.clone(),
                     decision: TaskReviewDecision::Accept,
                     reason: "content resolved and acceptance was met".to_string(),
@@ -3657,6 +3659,7 @@ async fn an_accepted_task_rejects_re_review_and_re_submit_but_allows_supersede()
             &team,
             &reviewer,
             AgentAction::TaskReview(TaskReviewInput {
+                operator_requirement: None,
                 task_ref: task.clone(),
                 decision: TaskReviewDecision::Accept,
                 reason: "acceptance met".to_string(),
@@ -3672,6 +3675,7 @@ async fn an_accepted_task_rejects_re_review_and_re_submit_but_allows_supersede()
             &team,
             &reviewer,
             AgentAction::TaskReview(TaskReviewInput {
+                operator_requirement: None,
                 task_ref: task.clone(),
                 decision: TaskReviewDecision::Accept,
                 reason: "again".to_string(),
@@ -4079,6 +4083,7 @@ fn a_task_action_reports_the_task_it_settled_as_the_entity_it_changed() {
             "e3-review",
             &reviewer,
             AgentAction::TaskReview(TaskReviewInput {
+                operator_requirement: None,
                 task_ref: task.clone(),
                 decision: TaskReviewDecision::Accept,
                 reason: "verified".into(),
@@ -4263,6 +4268,7 @@ fn a_rework_round_must_be_reviewable_again_in_its_own_graph() {
                 &team,
                 &reviewer,
                 AgentAction::TaskReview(TaskReviewInput {
+                    operator_requirement: Some("test objective".to_string()),
                     task_ref: task.clone(),
                     decision: TaskReviewDecision::Rework,
                     reason: "does not state one verifiable fact".to_string(),
@@ -4642,7 +4648,7 @@ fn a_resolved_reopen_advertises_the_exit_and_labels_the_record_as_history() {
     );
 }
 
-/// A Team with a worker and a distinct reviewer, plus a published Task. Returns
+/// A Team with a worker and a distinct reviewer, plus a submitted Task. Returns
 /// `(team_id, worker_id, reviewer_id, task_id)`.
 fn team_with_reviewer_and_task(
     service: &AgentActionService,
@@ -4719,6 +4725,47 @@ fn team_with_reviewer_and_task(
         .expect("task")
         .changed_refs[0]
         .clone();
+    let claim = service
+        .apply(&managed(
+            &format!("{tag}-claim"),
+            &team,
+            &worker,
+            AgentAction::TaskClaim(TaskClaimInput {
+                task_ref: task.clone(),
+                reason: None,
+            }),
+        ))
+        .expect("claim submitted review fixture");
+    assert_eq!(claim.status, AgentActionStatus::Applied);
+    let committed = service
+        .apply(&managed(
+            &format!("{tag}-artifact"),
+            &team,
+            &worker,
+            AgentAction::ArtifactCommit(ArtifactCommitInput {
+                content_ref: "artifact://review-fixture-body".to_string(),
+                kind: "report".to_string(),
+                title: "Review fixture".to_string(),
+                relates_to: vec![task.clone()],
+            }),
+        ))
+        .expect("commit review fixture");
+    assert_eq!(committed.status, AgentActionStatus::Applied);
+    let submitted = service
+        .apply(&managed(
+            &format!("{tag}-submit"),
+            &team,
+            &worker,
+            AgentAction::TaskSubmit(TaskSubmitInput {
+                task_ref: task.clone(),
+                deliverable: None,
+                artifact_refs: vec![committed.changed_refs[0].clone()],
+                evidence_refs: vec!["tool://review-fixture".to_string()],
+                unresolved: Vec::new(),
+            }),
+        ))
+        .expect("submit review fixture");
+    assert_eq!(submitted.status, AgentActionStatus::Applied);
     (team, worker, reviewer, task)
 }
 
@@ -4840,11 +4887,196 @@ fn invented_criterion_is_durably_labeled_for_author_and_reviewer() {
     );
 }
 
-/// The v5 dead case: three invented criteria, a reviewer enforcing them line by
-/// line, 300+ steps without a completion request. The rework is now refused at
-/// the action boundary instead of being accepted and paid for.
+fn create_bound_review_goal(store: Arc<RuntimeEventStore>, objective: &str, program_id: &str) {
+    let goal: GoalContract = serde_json::from_value(json!({
+        "id": "goal:root-execution-1", "session_id": "session-1", "objective": objective,
+        "criteria": [{"id": "user_intent", "statement": objective, "status": "open"}],
+        "phase": "executing", "scope": "user_objective", "completion": "open",
+        "user_intent_criterion_id": "user_intent", "source_intent_ref": "session_message:original",
+        "execution_binding": {"objective_id": "objective-1", "session_id": "session-1",
+            "turn_id": "turn-1", "root_execution_id": "root-execution-1",
+            "agentic_program_id": program_id},
+        "spec_revision": 1, "spec_digest": "original-intent-digest", "revision": 1,
+        "user_sequence": 1
+    }))
+    .expect("bound review goal");
+    crate::execution_core::GoalStore::new(store)
+        .create(goal)
+        .expect("persist review goal");
+}
+
 #[test]
-fn rework_on_an_invented_criterion_is_refused() {
+fn negative_reviews_require_literal_operator_provenance_not_task_acceptance() {
+    let service = AgentActionService::new(Arc::new(RuntimeEventStore::for_test()));
+    let (team, _, reviewer, task) = team_with_reviewer_and_task(
+        &service,
+        "literal-source",
+        "invented completeness threshold",
+        harness_contract::agent_action::CriterionSource::AgentInvented,
+    );
+    let before = service.project("program-1").unwrap().revision;
+    for (index, requirement) in [
+        None,
+        Some("   "),
+        Some("invented completeness threshold"),
+        Some("other objective"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let receipt = service
+            .apply(&managed(
+                &format!("literal-source-review-{index}"),
+                &team,
+                &reviewer,
+                AgentAction::TaskReview(TaskReviewInput {
+                    task_ref: task.clone(),
+                    decision: TaskReviewDecision::Challenge,
+                    reason: "report lacks the claimed result".into(),
+                    operator_requirement: requirement.map(str::to_string),
+                    evidence_refs: vec!["tool://independent-review-fixture".to_string()],
+                }),
+            ))
+            .unwrap();
+        assert_eq!(receipt.status, AgentActionStatus::Rejected);
+        assert_eq!(
+            receipt.error.unwrap().code,
+            if index < 2 {
+                "review_requirement_missing"
+            } else {
+                "review_requirement_not_in_objective"
+            }
+        );
+        assert_eq!(service.project("program-1").unwrap().revision, before);
+        assert_eq!(
+            service.project("program-1").unwrap().tasks[&task].status,
+            AgenticTaskStatus::Submitted
+        );
+    }
+    let receipt = service
+        .apply(&managed(
+            "literal-source-accept",
+            &team,
+            &reviewer,
+            AgentAction::TaskReview(TaskReviewInput {
+                task_ref: task.clone(),
+                decision: TaskReviewDecision::Accept,
+                reason: "independent evidence is complete".into(),
+                operator_requirement: None,
+                evidence_refs: vec!["tool://independent-review-fixture".to_string()],
+            }),
+        ))
+        .unwrap();
+    assert_eq!(receipt.status, AgentActionStatus::Applied);
+    assert_eq!(
+        service.project("program-1").unwrap().tasks[&task].status,
+        AgenticTaskStatus::Accepted
+    );
+}
+
+#[test]
+fn review_recovers_full_goal_wording_without_rewriting_historical_program() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = AgentActionService::new(Arc::clone(&store));
+    let (team, _, reviewer, task) = team_with_reviewer_and_task(
+        &service,
+        "full-goal",
+        "exact file path and extracted fact",
+        harness_contract::agent_action::CriterionSource::AgentInvented,
+    );
+    let requirement = "每个文件必须给出准确路径和提取的事实，并且完整读取全文";
+    let objective = format!(
+        "test objective {}{requirement}",
+        "保留原始要求。".repeat(100)
+    );
+    assert!(!objective
+        .chars()
+        .take(180)
+        .collect::<String>()
+        .contains(requirement));
+    create_bound_review_goal(Arc::clone(&store), &objective, "program-1");
+    let directory = service
+        .apply(&managed(
+            "full-goal-directory",
+            &team,
+            &reviewer,
+            AgentAction::StateInspect(serde_json::from_value(json!({})).unwrap()),
+        ))
+        .unwrap();
+    let request: StateInspectInput =
+        serde_json::from_value(directory.projection.unwrap()["goal"]["inspect_request"].clone())
+            .unwrap();
+    assert_eq!(request.entry_ref.as_deref(), Some("goal:root-execution-1"));
+    let exact_goal = service
+        .apply(&managed(
+            "full-goal-original",
+            &team,
+            &reviewer,
+            AgentAction::StateInspect(request),
+        ))
+        .unwrap();
+    assert_eq!(
+        exact_goal.projection.unwrap()["goal_entry"]["objective"],
+        objective
+    );
+    let action = managed("full-goal-review", &team, &reviewer,
+        AgentAction::TaskReview(TaskReviewInput {
+            task_ref: task.clone(), decision: TaskReviewDecision::Rework,
+            reason: "The report contains only raw source and no extracted fact. Read all 3 files in full as the operator requested.".into(),
+            operator_requirement: Some(requirement.into()), evidence_refs: vec!["tool://independent-review-fixture".to_string()],
+        }));
+    let receipt = service.apply(&action).unwrap();
+    assert_eq!(receipt.status, AgentActionStatus::Applied, "{receipt:?}");
+    let recovered = AgentActionService::new(Arc::clone(&store));
+    let projection = recovered.project("program-1").unwrap();
+    assert_eq!(projection.objective_summary, "test objective");
+    assert_eq!(projection.tasks[&task].status, AgenticTaskStatus::Rework);
+    let replay = recovered.apply(&action).unwrap();
+    assert!(replay.duplicate);
+    assert_eq!(replay.changed_refs, receipt.changed_refs);
+    let persisted = store.list_stream(&program_stream("program-1")).unwrap();
+    assert!(persisted.iter().any(|event| event
+        .payload
+        .pointer("/envelope/action/input/operator_requirement")
+        .and_then(Value::as_str)
+        == Some(requirement)));
+}
+
+#[test]
+fn review_rejects_a_goal_from_another_program_even_with_matching_wording() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = AgentActionService::new(Arc::clone(&store));
+    let (team, _, reviewer, task) = team_with_reviewer_and_task(
+        &service,
+        "wrong-goal",
+        "test objective",
+        harness_contract::agent_action::CriterionSource::OperatorDerived,
+    );
+    create_bound_review_goal(Arc::clone(&store), "test objective", "program-other");
+    let receipt = service
+        .apply(&managed(
+            "wrong-goal-review",
+            &team,
+            &reviewer,
+            AgentAction::TaskReview(TaskReviewInput {
+                task_ref: task.clone(),
+                decision: TaskReviewDecision::Rework,
+                reason: "missing evidence".into(),
+                operator_requirement: Some("test objective".into()),
+                evidence_refs: vec!["tool://independent-review-fixture".to_string()],
+            }),
+        ))
+        .unwrap();
+    assert_eq!(receipt.status, AgentActionStatus::Rejected);
+    assert_eq!(receipt.error.unwrap().code, "review_goal_binding_mismatch");
+    assert_eq!(
+        service.project("program-1").unwrap().tasks[&task].status,
+        AgenticTaskStatus::Submitted
+    );
+}
+
+#[test]
+fn rework_without_operator_wording_is_refused() {
     let store = Arc::new(RuntimeEventStore::for_test());
     let service = AgentActionService::new(Arc::clone(&store));
     let (team, _worker, reviewer, task) = team_with_reviewer_and_task(
@@ -4859,23 +5091,22 @@ fn rework_on_an_invented_criterion_is_refused() {
             &team,
             &reviewer,
             AgentAction::TaskReview(TaskReviewInput {
+                operator_requirement: None,
                 task_ref: task.clone(),
                 decision: TaskReviewDecision::Rework,
                 reason: "did not list every TODO/FIXME/unwrap".to_string(),
-                evidence_refs: Vec::new(),
+                evidence_refs: vec!["tool://independent-review-fixture".to_string()],
             }),
         ))
         .expect("review receipt");
     assert_eq!(refused.status, AgentActionStatus::Rejected);
     assert_eq!(
         refused.error.as_ref().map(|error| error.code.as_str()),
-        Some("rework_on_invented_criterion"),
+        Some("review_requirement_missing"),
         "{refused:?}"
     );
 }
 
-/// An operator-derived acceptance is exactly what a rework is for. Refusing the
-/// invented standard must not make a legitimate rework impossible.
 #[test]
 fn rework_on_an_operator_criterion_is_allowed() {
     let store = Arc::new(RuntimeEventStore::for_test());
@@ -4892,21 +5123,18 @@ fn rework_on_an_operator_criterion_is_allowed() {
             &team,
             &reviewer,
             AgentAction::TaskReview(TaskReviewInput {
+                operator_requirement: Some("test objective".to_string()),
                 task_ref: task.clone(),
                 decision: TaskReviewDecision::Rework,
                 reason: "the required fact is absent".to_string(),
-                evidence_refs: Vec::new(),
+                evidence_refs: vec!["tool://independent-review-fixture".to_string()],
             }),
         ))
         .expect("review receipt");
-    // The Task is not submitted yet, so a pre-existing admission rule refuses
-    // the review for that reason. What matters for this boundary is that the
-    // operator-derived standard is NOT refused as invented: the same call on an
-    // invented standard is rejected with `rework_on_invented_criterion`.
-    assert_ne!(
-        receipt.error.as_ref().map(|error| error.code.as_str()),
-        Some("rework_on_invented_criterion"),
-        "a rework on the operator's own standard must never be refused as invented: {receipt:?}"
+    assert_eq!(receipt.status, AgentActionStatus::Applied);
+    assert_eq!(
+        service.project("program-1").unwrap().tasks[&task].status,
+        AgenticTaskStatus::Rework
     );
 }
 
@@ -4943,97 +5171,8 @@ fn the_review_guidance_fires_on_the_prefixed_gap_the_runtime_actually_emits() {
     );
 }
 
-/// The provenance gate is not the only way a rework can be unfounded. Run one20's
-/// criterion was operator-derived and correctly passed `rework_on_invented_criterion`,
-/// yet the reviewer sent the work back because one of three cited paths was read as
-/// lines 1-1000 of 3084 - a reading the same objective had explicitly ruled out.
-/// Both gates have to exist, because they answer different questions: one asks
-/// whether the model invented the standard, the other whether the reading of a
-/// real standard contradicts the operator.
 #[test]
-fn rework_on_a_reading_the_operator_ruled_out_is_refused() {
-    let store = Arc::new(RuntimeEventStore::for_test());
-    let service = AgentActionService::new(Arc::clone(&store));
-    let (team, _worker, reviewer, task) = team_with_reviewer_and_task(
-        &service,
-        "reading",
-        "cites at least 3 complete crates/.../*.rs source paths actually read",
-        harness_contract::agent_action::CriterionSource::OperatorDerived,
-    );
-    let refused = service
-        .apply(&managed(
-            "rework-reading",
-            &team,
-            &reviewer,
-            AgentAction::TaskReview(TaskReviewInput {
-                task_ref: task.clone(),
-                decision: TaskReviewDecision::Rework,
-                reason: "第(1)条未满足：仅读取了前1000行（共3084行），未达到 complete 要求"
-                    .to_string(),
-                evidence_refs: Vec::new(),
-            }),
-        ))
-        .expect("review receipt");
-    assert_eq!(
-        refused.error.as_ref().map(|error| error.code.as_str()),
-        Some("rework_contradicts_operator_discipline"),
-        "{refused:?}"
-    );
-    // The conflict is durable in three places, and each reaches a different
-    // reader: the receipt reaches the reviewer that earned it, the event reaches
-    // anyone auditing the journal, and `program_warnings` reaches the root model
-    // and the monitoring layer for the rest of the Program's life.
-    let error = refused.error.expect("rejection error");
-    assert!(
-        error.message.contains("truncated"),
-        "the receipt must name the operator discipline it protects: {}",
-        error.message
-    );
-    assert!(
-        error.message.contains(&task),
-        "the receipt must name the Task: {}",
-        error.message
-    );
-    // The receipt restates the operator's own requirement, not only the discipline
-    // it protects - otherwise the reviewer is told what it may not read and never
-    // what was actually asked for. Asserted against whatever this fixture's
-    // objective says, so the check survives a change of fixture text.
-    assert!(
-        error.message.contains("The operator's requirement is:"),
-        "the receipt must restate the operator's own requirement: {}",
-        error.message
-    );
-    let events = store
-        .list_stream("agentic-program:program-1")
-        .expect("program stream");
-    assert!(
-        events.iter().any(|event| {
-            event.kind == "agentic.review_discipline_conflict"
-                && event.payload.get("task_ref").and_then(Value::as_str) == Some(task.as_str())
-                && event
-                    .payload
-                    .get("discipline")
-                    .and_then(Value::as_str)
-                    .is_some_and(|discipline| discipline.contains("truncated"))
-        }),
-        "the conflict must be a durable event, or a reviewer can repeat it once per \
-         attempt forever with nothing in the Program showing it: {events:?}"
-    );
-    // And it must be folded into the projection the root and monitoring read.
-    let projection = service.project("program-1").expect("projection");
-    assert!(
-        projection.program_warnings.iter().any(|warning| warning
-            .contains("a reading the operator ruled out")
-            && warning.contains(&task)),
-        "{:?}",
-        projection.program_warnings
-    );
-}
-
-/// The new gate refuses a refusal, so it must fail open on everything it does not
-/// recognise. A rework naming a deliverable the operator required is untouched.
-#[test]
-fn a_rework_naming_a_real_deliverable_is_not_refused_as_a_discipline_conflict() {
+fn a_rework_naming_a_real_deliverable_is_applied() {
     let store = Arc::new(RuntimeEventStore::for_test());
     let service = AgentActionService::new(Arc::clone(&store));
     let (team, _worker, reviewer, task) = team_with_reviewer_and_task(
@@ -5048,19 +5187,16 @@ fn a_rework_naming_a_real_deliverable_is_not_refused_as_a_discipline_conflict() 
             &team,
             &reviewer,
             AgentAction::TaskReview(TaskReviewInput {
+                operator_requirement: Some("test objective".to_string()),
                 task_ref: task.clone(),
                 decision: TaskReviewDecision::Rework,
                 reason: "the report never cites any source path, which the objective requires"
                     .to_string(),
-                evidence_refs: Vec::new(),
+                evidence_refs: vec!["tool://independent-review-fixture".to_string()],
             }),
         ))
         .expect("review receipt");
-    assert_ne!(
-        receipt.error.as_ref().map(|error| error.code.as_str()),
-        Some("rework_contradicts_operator_discipline"),
-        "a rework naming a real operator deliverable must not be refused: {receipt:?}"
-    );
+    assert_eq!(receipt.status, AgentActionStatus::Applied, "{receipt:?}");
 }
 
 /// A decline nobody can read is a decline nobody can diagnose.

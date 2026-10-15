@@ -539,75 +539,6 @@ impl AgentActionService {
                 "the Program is bound to a different Objective",
             ));
         }
-        // A rework may only rest on a standard the operator stated. One live run
-        // invented three acceptance criteria, a reviewer enforced them line by
-        // line, and the collaboration burned 300+ steps without a completion
-        // request. `accept` and any rework that cites operator-derived work are
-        // untouched: only the invented standard is refused.
-        if let AgentAction::TaskReview(input) = &envelope.action {
-            if matches!(
-                input.decision,
-                harness_contract::agent_action::TaskReviewDecision::Rework
-                    | harness_contract::agent_action::TaskReviewDecision::Challenge
-            ) {
-                if let Some(task) = projection.tasks.get(&input.task_ref) {
-                    if task.criterion_source
-                        == harness_contract::agent_action::CriterionSource::AgentInvented
-                    {
-                        return Ok(rejected(
-                            envelope,
-                            projection.revision,
-                            "rework_on_invented_criterion",
-                            &format!(
-                                "Task `{}` acceptance is model-invented, not an operator requirement. \
-                                 A reviewer must not send it back on that standard alone; \
-                                 accept it, or name a deliverable the operator's own objective requires.",
-                                input.task_ref
-                            ),
-                        ));
-                    }
-                }
-                // The criterion's provenance is not the only way a rework can be
-                // unfounded. A criterion the operator really did state can still be
-                // read in a way that contradicts the operator's own discipline, and
-                // `criterion_source` cannot see that: it answers "did the model
-                // invent this?", never "is this reading consistent with what else the
-                // operator said?". Run one20's criterion was operator-derived and
-                // correctly passed both gates, yet its rework demanded whole-file
-                // reads that the same objective had explicitly forbidden.
-                if let Some(discipline) =
-                    crate::agentic::order_contract::contradicted_reading_discipline(&input.reason)
-                {
-                    // The conflict has to outlive the receipt. The receipt reaches
-                    // the reviewer that earned it; the durable marker reaches
-                    // everyone who reads the Program later, and the fold turns it
-                    // into a `program_warnings` entry - the same field the authoring
-                    // side uses, so one place answers "what did the model add that
-                    // the operator never asked for".
-                    self.record_review_discipline_conflict(
-                        &projection,
-                        envelope,
-                        &input.task_ref,
-                        discipline,
-                        &input.reason,
-                    );
-                    return Ok(rejected(
-                        envelope,
-                        projection.revision,
-                        "rework_contradicts_operator_discipline",
-                        &format!(
-                            "Task `{}` was sent back on a reading the operator explicitly ruled out: \
-                             {discipline}. The operator's requirement is: {}. Accept the Task, or name \
-                             a deliverable that requirement itself asks for - not a stricter reading of it.",
-                            input.task_ref,
-                            crate::agentic::work_market::operator_requirement_summary_for_projection(
-                                &projection
-                            )
-                        ),
-                    ));
-                }
-            }
-        }
         if projection.session_id != envelope.actor.session_id
             || projection.turn_id != envelope.actor.turn_id
             || projection.root_execution_id != envelope.actor.root_execution_id
@@ -869,6 +800,66 @@ impl AgentActionService {
             );
             return Ok(rejected(envelope, projection.revision, code, &message));
         }
+        let mut review_source = None;
+        if let AgentAction::TaskReview(input) = &envelope.action {
+            if input.decision != harness_contract::agent_action::TaskReviewDecision::Accept {
+                let Some(requirement) = input
+                    .operator_requirement
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|quote| !quote.is_empty())
+                else {
+                    return Ok(rejected(
+                        envelope, projection.revision, "review_requirement_missing",
+                        "Rework or challenge requires operator_requirement: quote the exact relevant original operator wording from state_inspect's Goal objective, or the frozen Program objective if no Goal exists. Explain the missing deliverable in reason; do not accept incomplete work or invent a stricter requirement.",
+                    ));
+                };
+                let goal = projection
+                    .root_execution_id
+                    .as_ref()
+                    .map(|root| {
+                        crate::execution_core::goal::GoalStore::new(Arc::clone(&self.store))
+                            .projection(&format!("goal:{root}"))
+                    })
+                    .transpose()
+                    .map_err(AgentActionServiceError::Corrupt)?
+                    .flatten();
+                let objective = if let Some(goal) = goal.as_ref() {
+                    if !goal.goal.execution_binding.as_ref().is_some_and(|binding| {
+                        binding.agentic_program_id == projection.program_id
+                            && binding.objective_id == projection.objective_id
+                            && binding.session_id == projection.session_id
+                            && binding.turn_id == projection.turn_id
+                            && Some(&binding.root_execution_id)
+                                == projection.root_execution_id.as_ref()
+                    }) {
+                        return Ok(rejected(envelope, projection.revision,
+                            "review_goal_binding_mismatch",
+                            "The durable Goal is not bound to this Program, root execution, Session, and Turn; review cannot borrow another objective."));
+                    }
+                    review_source = Some(ExpectedStreamRevision {
+                        stream_id: format!("goal:{}", goal.goal.id),
+                        expected_revision: goal.stream_revision,
+                    });
+                    goal.goal.objective.as_str()
+                } else {
+                    review_source =
+                        projection
+                            .root_execution_id
+                            .as_ref()
+                            .map(|root| ExpectedStreamRevision {
+                                stream_id: format!("goal:goal:{root}"),
+                                expected_revision: 0,
+                            });
+                    projection.objective_summary.as_str()
+                };
+                if !objective.contains(requirement) {
+                    return Ok(rejected(envelope, projection.revision,
+                        "review_requirement_not_in_objective",
+                        "operator_requirement does not occur in the bound original operator objective. Copy its exact relevant wording from state_inspect; added Task acceptance alone is not an operator requirement."));
+                }
+            }
+        }
         // A Task may support several original Goal conditions, but it cannot
         // manufacture them. Keep the read revision in this same transaction so
         // a concurrent Goal change cannot admit a dangling reference.
@@ -1068,6 +1059,9 @@ impl AgentActionService {
                     expected_revision: *revision,
                 }),
         );
+        if let Some(source) = review_source {
+            expected_streams.push(source);
+        }
         if let Some(source) = obligation_source {
             expected_streams.push(source);
         }
@@ -1590,85 +1584,6 @@ impl AgentActionService {
         }
     }
 
-    /// Record a durable marker for a rework refused on a reading the operator
-    /// ruled out. Best-effort, like `record_completion_rejection`: a failed append
-    /// must not change the refusal the caller already computed.
-    ///
-    /// The marker is what makes the conflict visible after the fact. The refusal
-    /// receipt reaches the reviewer that earned it; this reaches everyone who
-    /// reads the Program later, including the root model deciding whether to trust
-    /// a rework and the operator auditing why work kept going back and forth.
-    fn record_review_discipline_conflict(
-        &self,
-        projection: &AgenticProgramProjection,
-        envelope: &AgentActionEnvelope,
-        task_ref: &str,
-        discipline: &str,
-        reviewer_reason: &str,
-    ) {
-        let stream_id = program_stream(&projection.program_id);
-        let event = RuntimeTransactionEventInput {
-            event: RuntimeEventInput {
-                stream_id,
-                scope: RuntimeEventScope::Program,
-                kind: REVIEW_DISCIPLINE_CONFLICT_EVENT_KIND.to_string(),
-                status: Some("rejected".to_string()),
-                actor: Some(envelope.actor.actor_id.clone()),
-                refs: vec![
-                    RuntimeEventRef {
-                        kind: "task".to_string(),
-                        id: task_ref.to_string(),
-                    },
-                    RuntimeEventRef {
-                        kind: "objective".to_string(),
-                        id: envelope.actor.objective_id.clone(),
-                    },
-                ],
-                payload: json!({
-                    "program_id": projection.program_id,
-                    "task_ref": task_ref,
-                    "review_action_id": envelope.action_id,
-                    "discipline": discipline,
-                    // The reason is recorded in full, not truncated. The first
-                    // version kept 240 characters, and when the gate produced a
-                    // false positive the truncated copy was all the journal held -
-                    // the marker that fired was past the cut, so the misfire could
-                    // not be diagnosed from the durable record at all.
-                    "reviewer_reason": reviewer_reason,
-                }),
-            },
-            idempotency_key: Some(format!("review-discipline-conflict:{}", envelope.action_id)),
-            schema_version: 1,
-        };
-        // `append_transaction_locked`, not `append_transaction`: the caller is
-        // already inside `with_stream_locks` for this stream, and the locking
-        // variant would re-acquire it. The expected revision is mandatory - an
-        // empty `expected_streams` is rejected outright, which is how the
-        // completion-rejection marker next door failed silently for its whole
-        // life behind a `let _ =`.
-        if let Err(error) = self
-            .store
-            .append_transaction_locked(AppendTransactionRequest {
-                transaction_id: format!(
-                    "review-discipline-conflict:{}:{}",
-                    projection.program_id, envelope.action_id
-                ),
-                expected_streams: vec![ExpectedStreamRevision {
-                    stream_id: program_stream(&projection.program_id),
-                    expected_revision: projection.revision,
-                }],
-                events: vec![event],
-            })
-        {
-            tracing::warn!(
-                target: "cowd::agentic",
-                program_id = %projection.program_id,
-                %error,
-                "review discipline-conflict marker not recorded; the conflict stays visible only in the receipt"
-            );
-        }
-    }
-
     /// Commit the Goal decision and the exact Program request disposition in
     /// one transaction. Neither domain can become terminal on its own here.
     pub(crate) fn commit_program_conclusion(
@@ -2077,8 +1992,8 @@ fn apply_projection_events(
                 .unwrap_or_default();
             if !task_ref.is_empty() && !discipline.is_empty() {
                 let warning = format!(
-                    "Task `{task_ref}` was sent back on a reading the operator ruled out: \
-                     {discipline}. The rework was refused; the operator's requirement stands."
+                    "Historical review discipline refusal for Task `{task_ref}`: \
+                     {discipline}. This legacy diagnostic is not a current review rule."
                 );
                 if !projection.program_warnings.contains(&warning) {
                     projection.program_warnings.push(warning);
@@ -2646,7 +2561,7 @@ fn goal_summary(goal: &harness_contract::goal::GoalContract) -> serde_json::Valu
         "spec_digest":goal.spec_digest,"source_intent_ref":goal.source_intent_ref,"completion":goal.completion,
         "participation_requirement":goal.participation_requirement,
         "criteria_count":goal.criteria.len(),"obligation_count":goal.obligations.len(),"review_count":goal.reviews.len(),
-        "inspect_request":{"query":goal.id}})
+        "inspect_request":{"entry_ref":goal.id}})
 }
 
 fn goal_directory_entries(goal: &harness_contract::goal::GoalContract) -> Vec<serde_json::Value> {
