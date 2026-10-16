@@ -1978,13 +1978,26 @@ impl ExecutionCommitService {
             idempotency_key: Some(format!("{}:revision:{}", graph.id, graph.revision)),
             schema_version: 1,
         };
-        let terminal = domain_events.iter().find_map(|event| {
-            (event.event.kind == "runtime.session.terminal_requested")
-                .then(|| {
-                    serde_json::from_value::<SessionTerminalInput>(event.event.payload.clone()).ok()
-                })
-                .flatten()
-        });
+        let mut terminal_events = domain_events
+            .iter()
+            .filter(|event| event.event.kind == "runtime.session.terminal_requested");
+        let terminal = terminal_events
+            .next()
+            .map(|event| {
+                serde_json::from_value::<SessionTerminalInput>(event.event.payload.clone()).map_err(
+                    |error| {
+                        ExecutionCommitError::InvalidCommand(format!(
+                            "invalid Session terminal input: {error}"
+                        ))
+                    },
+                )
+            })
+            .transpose()?;
+        if terminal_events.next().is_some() {
+            return Err(ExecutionCommitError::InvalidCommand(
+                "graph transition contains multiple Session terminal inputs".to_string(),
+            ));
+        }
         let mut events = vec![graph_input];
         events.extend(domain_events);
         // A concurrent writer of the same execution-lineage stream can move it

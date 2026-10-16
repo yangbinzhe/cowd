@@ -250,6 +250,16 @@ impl RawEvidenceStore for SessionPortRawEvidenceStore {
         write: RawEvidenceWrite,
         artifact: ArtifactRef,
     ) -> Result<EvidenceAccessRef, RawEvidenceError> {
+        match self.artifacts.resolve(&artifact.selector) {
+            Ok(current) if current == artifact => {}
+            Ok(_) => {
+                return Err(RawEvidenceError::InvalidReceipt(
+                    "cached artifact metadata differs from current store".to_string(),
+                ));
+            }
+            Err(crate::ArtifactError::NotFound) => return self.persist(write).await,
+            Err(error) => return Err(RawEvidenceError::Persistence(error.to_string())),
+        }
         self.publish_artifact_receipt(
             write.evidence_ref,
             write.session_id,
@@ -327,6 +337,19 @@ where
                         Some(&expected_media_type),
                         Some(&expected_visibility_scope),
                     )?;
+                    Self::read_receipt_index()
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(
+                            key.clone(),
+                            ArtifactRef::durable(
+                                access.retrieval_selector.clone(),
+                                access.sha256.clone(),
+                                access.bytes,
+                                access.media_type.clone(),
+                                access.visibility_scope.clone(),
+                            ),
+                        );
                     return Ok(access);
                 }
             }
@@ -586,6 +609,71 @@ mod tests {
         assert!(access.retrieval_selector.starts_with("artifact://"));
         let read = facade.retrieve(&access).await.expect("durable read");
         assert_eq!(read.payload, b"full raw output");
+    }
+
+    #[tokio::test]
+    async fn read_cache_does_not_borrow_another_artifact_store_receipt() {
+        let journal = Arc::new(crate::test_support::session_store());
+        journal
+            .create_session(&session::SessionRecord {
+                session_id: "s1".to_string(),
+                platform: "test".to_string(),
+                chat_id: "raw-cache-store-isolation".to_string(),
+                user_id: None,
+                model: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                last_activity: "2026-01-01T00:00:00Z".to_string(),
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                status: "active".to_string(),
+            })
+            .await
+            .unwrap();
+        let first_artifacts = Arc::new(
+            crate::ArtifactStore::for_test(
+                tempfile::tempdir().unwrap().keep(),
+                crate::ArtifactStoreConfig::default(),
+            )
+            .unwrap(),
+        );
+        let second_artifacts = Arc::new(
+            crate::ArtifactStore::for_test(
+                tempfile::tempdir().unwrap().keep(),
+                crate::ArtifactStoreConfig::default(),
+            )
+            .unwrap(),
+        );
+        let input_hash = format!("store-isolation-{}", uuid::Uuid::new_v4());
+        let read_write = || RawEvidenceWrite {
+            metadata: serde_json::json!({"tool_name": "read_file", "input_hash": input_hash}),
+            ..write()
+        };
+        let first = RawEvidenceFacade::new(SessionPortRawEvidenceStore::new(
+            crate::session_runtime_port::TestSessionPortAdapter::new(Arc::clone(&journal)),
+            first_artifacts,
+        ));
+        let first_access = first.persist(read_write()).await.unwrap();
+        let second = RawEvidenceFacade::new(SessionPortRawEvidenceStore::new(
+            crate::session_runtime_port::TestSessionPortAdapter::new(journal),
+            second_artifacts,
+        ));
+        let second_access = second.persist(read_write()).await.unwrap();
+        assert_ne!(
+            first_access.retrieval_selector,
+            second_access.retrieval_selector
+        );
+        assert_eq!(
+            second.retrieve(&second_access).await.unwrap().payload,
+            b"full raw output"
+        );
+        let repeated_access = second.persist(read_write()).await.unwrap();
+        assert_eq!(
+            repeated_access.retrieval_selector,
+            second_access.retrieval_selector
+        );
     }
 
     #[tokio::test]

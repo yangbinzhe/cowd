@@ -628,7 +628,7 @@ where
                 framework_authored: true,
             }));
         }
-        let (root_requires_action_channel, operator_forbids_tool_use) = {
+        let (root_requires_action_channel, required_effects_pending, operator_forbids_tool_use) = {
             let state = self.state.lock().await;
             let understanding =
                 state
@@ -658,9 +658,20 @@ where
             };
             (
                 root_program_requires_action_channel(state.execution_role, program_status),
+                state.execution_role.is_delegated_leaf()
+                    && (!state.focus_acceptance_pending_scopes.is_empty()
+                        || (state.required_write_for_completion
+                            && !write_obligation_satisfied(
+                                state.required_write_for_completion,
+                                &state.required_workspace_write_scopes,
+                                &state.committed_workspace_observed_evidence,
+                                state.committed_workspace_write_observed,
+                                self.services.path_identity_resolver(),
+                            ))),
                 understanding.forbids_tool_use,
             )
         };
+        let action_channel_required = root_requires_action_channel || required_effects_pending;
         let (
             content,
             first_step,
@@ -686,7 +697,7 @@ where
             );
             let mut clean_terminal_synthesis =
                 std::mem::take(&mut state.clean_terminal_synthesis_next)
-                    && !root_requires_action_channel;
+                    && !action_channel_required;
             if !pending_disposition_inputs.is_empty() {
                 // A terminal candidate produced for the pre-update topology is
                 // stale. Discard it and let the post-disposition graph decide
@@ -694,7 +705,7 @@ where
                 clean_terminal_synthesis = false;
                 state.clean_terminal_synthesis_attempted = false;
             }
-            if !root_requires_action_channel
+            if !action_channel_required
                 && !clean_terminal_synthesis
                 && !state.clean_terminal_synthesis_attempted
                 && state.successful_tool_calls > 0
@@ -961,7 +972,7 @@ where
                 (std::mem::take(&mut state.force_text_only_next_model)
                     | crate::repetition_guard::take_refusal_ignored(
                         &crate::repetition_guard::RepetitionScope::turn(&state.session_id, &state.turn_id)))
-                    && !root_requires_action_channel,
+                    && !action_channel_required,
                 state.force_tool_allowlist_next_model.take(),
                 state.force_reasoning_effort_next_model.take(),
                 clean_terminal_synthesis,
@@ -1233,9 +1244,10 @@ where
                 let owns_root = state.execution_role.owns_root_presentation();
                 (
                     state.execution_role,
-                    owns_root
-                        && (state.completion_gap_outstanding
-                            || !state.outstanding_closure_rungs.is_empty()),
+                    required_effects_pending
+                        || (owns_root
+                            && (state.completion_gap_outstanding
+                                || !state.outstanding_closure_rungs.is_empty())),
                     if owns_root {
                         state.outstanding_closure_rungs.clone()
                     } else {

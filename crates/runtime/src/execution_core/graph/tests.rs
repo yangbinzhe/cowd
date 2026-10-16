@@ -1903,6 +1903,136 @@ fn terminal_replan_is_one_transaction_and_survives_projection_restart() {
 }
 
 #[test]
+fn malformed_session_terminal_cannot_commit_a_graph_without_an_outbox_row() {
+    let event_store = Arc::new(RuntimeEventStore::for_test());
+    let commits = ExecutionCommitService::new(Arc::clone(&event_store));
+    let mut graph = test_graph("terminal must be typed before atomic commit");
+    graph.nodes.push(node("terminal"));
+    let graph = commits.register_graph(graph).unwrap().graph;
+    let graph = commits
+        .transition_node(
+            &graph,
+            "terminal",
+            ExecutionNodeStatus::Ready,
+            None,
+            Vec::new(),
+        )
+        .unwrap()
+        .graph;
+    let graph = commits
+        .transition_node(
+            &graph,
+            "terminal",
+            ExecutionNodeStatus::Running,
+            None,
+            Vec::new(),
+        )
+        .unwrap()
+        .graph;
+    let terminal_stream = format!("session-terminal:{}", graph.id);
+    let invalid = crate::runtime_event_store::RuntimeTransactionEventInput {
+        event: RuntimeEventInput {
+            stream_id: terminal_stream.clone(),
+            scope: RuntimeEventScope::SessionInput,
+            kind: "runtime.session.terminal_requested".to_string(),
+            status: Some("pending_delivery".to_string()),
+            actor: Some("SynthesizeNodeExecutor".to_string()),
+            refs: Vec::new(),
+            payload: serde_json::json!({"terminal_id":"missing_fields"}),
+        },
+        idempotency_key: Some("malformed-terminal".to_string()),
+        schema_version: 1,
+    };
+    let revision = graph.revision;
+    assert!(commits
+        .transition_node(
+            &graph,
+            "terminal",
+            ExecutionNodeStatus::Completed,
+            Some(completed_result("terminal")),
+            vec![invalid],
+        )
+        .is_err());
+    assert_eq!(event_store.stream_revision(&graph.id).unwrap(), revision);
+    assert_eq!(event_store.stream_revision(&terminal_stream).unwrap(), 0);
+    assert!(event_store
+        .session_terminal("missing_fields")
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn two_session_terminals_cannot_share_one_graph_transition() {
+    let event_store = Arc::new(RuntimeEventStore::for_test());
+    let commits = ExecutionCommitService::new(Arc::clone(&event_store));
+    let mut graph = test_graph("one terminal per graph transition");
+    graph.nodes.push(node("terminal"));
+    let graph = commits.register_graph(graph).unwrap().graph;
+    let graph = commits
+        .transition_node(
+            &graph,
+            "terminal",
+            ExecutionNodeStatus::Ready,
+            None,
+            Vec::new(),
+        )
+        .unwrap()
+        .graph;
+    let graph = commits
+        .transition_node(
+            &graph,
+            "terminal",
+            ExecutionNodeStatus::Running,
+            None,
+            Vec::new(),
+        )
+        .unwrap()
+        .graph;
+    let terminal_events = ["first", "second"]
+        .into_iter()
+        .map(
+            |name| crate::runtime_event_store::RuntimeTransactionEventInput {
+                event: RuntimeEventInput {
+                    stream_id: format!("session-terminal:{name}"),
+                    scope: RuntimeEventScope::SessionInput,
+                    kind: "runtime.session.terminal_requested".to_string(),
+                    status: Some("pending_delivery".to_string()),
+                    actor: Some("SynthesizeNodeExecutor".to_string()),
+                    refs: Vec::new(),
+                    payload: serde_json::json!({
+                        "terminal_id": format!("terminal:{name}"),
+                        "message_id": format!("message:{name}"),
+                        "session_id": "test-session",
+                        "payload_ref": format!("artifact://{name}"),
+                    }),
+                },
+                idempotency_key: Some(format!("terminal:{name}")),
+                schema_version: 1,
+            },
+        )
+        .collect();
+    let revision = graph.revision;
+    assert!(commits
+        .transition_node(
+            &graph,
+            "terminal",
+            ExecutionNodeStatus::Completed,
+            Some(completed_result("terminal")),
+            terminal_events,
+        )
+        .is_err());
+    assert_eq!(event_store.stream_revision(&graph.id).unwrap(), revision);
+    assert!(event_store
+        .session_terminal("terminal:first")
+        .unwrap()
+        .is_none());
+    assert!(event_store
+        .session_terminal("terminal:second")
+        .unwrap()
+        .is_none());
+}
+
+#[test]
 fn graph_admission_rejects_missing_canonical_business_lineage_without_panicking() {
     let event_store = Arc::new(RuntimeEventStore::for_test());
     let commits = ExecutionCommitService::new(event_store);
