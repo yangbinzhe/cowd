@@ -104,9 +104,7 @@ async fn external_decision_evidence_uses_runtime_source_and_authenticated_pagina
         )
         .unwrap();
     let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
-    executor
-        .bind_runtime_services(Arc::clone(&services))
-        .unwrap();
+    executor.bind_runtime_services(&services).unwrap();
     let request = || {
         serde_json::from_value::<EvidenceRetrieveToolRequest>(
             serde_json::json!({"evidence_ref":reference, "limit":1}),
@@ -295,7 +293,7 @@ async fn logical_tool_evidence_resolves_through_session_receipt_to_opaque_artifa
         .expect("raw evidence receipt");
     let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
     executor
-        .bind_runtime_services(Arc::clone(&services))
+        .bind_runtime_services(&services)
         .expect("bind Runtime services");
 
     // A durable Session selector publishes exactly the chosen block, never
@@ -535,7 +533,7 @@ async fn bound_root_model_bootstraps_program_and_inherits_evidence_scope() {
         .expect("Agent action tools");
     let executor = GatewayToolExecutor::new(None, false, registry);
     executor
-        .bind_runtime_services(Arc::clone(&services))
+        .bind_runtime_services(&services)
         .expect("bind runtime services");
     let binding = RuntimeToolExecutionBinding {
         tool_lease: None,
@@ -665,7 +663,7 @@ async fn agent_action_gateway_commits_small_actions_and_rejects_fake_content() {
         .expect("Agent action tools");
     let executor = GatewayToolExecutor::new(None, false, registry);
     executor
-        .bind_runtime_services(Arc::clone(&services))
+        .bind_runtime_services(&services)
         .expect("bind runtime services");
     let (parent, decision) = admitted_agent_action_root(&services, "session-agentic-gateway");
     let binding = RuntimeToolExecutionBinding {
@@ -866,7 +864,7 @@ async fn committed_agent_action_is_not_relabelled_failed_when_dispatch_is_deferr
         .expect("Agent action tools");
     let executor = GatewayToolExecutor::new(None, false, registry);
     executor
-        .bind_runtime_services(Arc::clone(&services))
+        .bind_runtime_services(&services)
         .expect("bind runtime services");
     let (parent, decision) = admitted_agent_action_root(&services, "session-deferred-dispatch");
     let base = RuntimeToolExecutionBinding {
@@ -957,7 +955,7 @@ fn successful_gateway_file_fact_has_typed_identity_and_digest() {
         .expect("workspace fixture");
     let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
     executor
-        .bind_runtime_services(Arc::clone(&services))
+        .bind_runtime_services(&services)
         .expect("bind runtime services");
     let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
         &runtime::tool_dispatch::ToolRequest {
@@ -1020,7 +1018,7 @@ fn gateway_windowed_read_never_mints_exact_content_evidence() {
     .expect("workspace fixture");
     let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
     executor
-        .bind_runtime_services(Arc::clone(&services))
+        .bind_runtime_services(&services)
         .expect("bind runtime services");
     let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
         &runtime::tool_dispatch::ToolRequest {
@@ -1078,7 +1076,7 @@ fn successful_gateway_edit_fact_hashes_exact_result_without_rereading_disk() {
     .expect("workspace fixture");
     let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
     executor
-        .bind_runtime_services(Arc::clone(&services))
+        .bind_runtime_services(&services)
         .expect("bind runtime services");
     let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
         &runtime::tool_dispatch::ToolRequest {
@@ -1134,7 +1132,7 @@ fn gateway_write_receipt_distinguishes_attested_absence_from_existing_preimage()
     let services = runtime::RuntimeServices::in_memory().expect("runtime services");
     let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
     executor
-        .bind_runtime_services(Arc::clone(&services))
+        .bind_runtime_services(&services)
         .expect("bind runtime services");
     let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
         &runtime::tool_dispatch::ToolRequest {
@@ -1189,7 +1187,7 @@ fn compact_write_receipt_keeps_typed_workspace_evidence_after_body_elision() {
     let services = runtime::RuntimeServices::in_memory().expect("runtime services");
     let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
     executor
-        .bind_runtime_services(Arc::clone(&services))
+        .bind_runtime_services(&services)
         .expect("bind runtime services");
     let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
         &runtime::tool_dispatch::ToolRequest {
@@ -1272,7 +1270,7 @@ async fn explicit_publication_roundtrip_and_scope_checks() {
         )))
         .build()
         .unwrap();
-    executor.bind_runtime_services(services.clone()).unwrap();
+    executor.bind_runtime_services(&services).unwrap();
     let body = "<html>中文\r\n完整正文</html>\r\n";
     std::fs::write(temp.path().join("source.html"), body).unwrap();
     let hash = format!("{:x}", Sha256::digest(body.as_bytes()));
@@ -1429,7 +1427,7 @@ async fn context_program_discovery_uses_one_authorized_revision_and_real_request
         .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
         .unwrap();
     let executor = GatewayToolExecutor::new(None, false, registry);
-    executor.bind_runtime_services(services.clone()).unwrap();
+    executor.bind_runtime_services(&services).unwrap();
     let (parent, decision) = admitted_agent_action_root(&services, "program-directory-session");
     let binding = RuntimeToolExecutionBinding {
         tool_lease: None,
@@ -1557,7 +1555,7 @@ async fn context_artifact_catalog_returns_readable_scoped_content_and_lossless_b
         .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
         .unwrap();
     let executor = GatewayToolExecutor::new(None, false, registry);
-    executor.bind_runtime_services(services.clone()).unwrap();
+    executor.bind_runtime_services(&services).unwrap();
     let binding = RuntimeToolExecutionBinding {
         tool_lease: None,
         action_id: Some("artifact-directory"),
@@ -1712,7 +1710,7 @@ async fn native_agent_actions_reject_unadmitted_root_execution() {
         .expect("Agent action tools");
     let executor = GatewayToolExecutor::new(None, false, registry);
     executor
-        .bind_runtime_services(services)
+        .bind_runtime_services(&services)
         .expect("bind runtime services");
     let error = executor
         .execute_runtime_tool(
@@ -1769,7 +1767,7 @@ async fn agent_action_batch_applies_every_action_through_the_same_path() {
         .expect("Agent action tools");
     let executor = GatewayToolExecutor::new(None, false, registry);
     executor
-        .bind_runtime_services(Arc::clone(&services))
+        .bind_runtime_services(&services)
         .expect("bind runtime services");
     let binding = RuntimeToolExecutionBinding {
         tool_lease: None,
@@ -1867,7 +1865,7 @@ async fn string_typed_actions_array_is_coerced_at_the_boundary() {
         .expect("Agent action tools");
     let executor = GatewayToolExecutor::new(None, false, registry);
     executor
-        .bind_runtime_services(Arc::clone(&services))
+        .bind_runtime_services(&services)
         .expect("bind runtime services");
     let binding = RuntimeToolExecutionBinding {
         tool_lease: None,
@@ -2246,9 +2244,7 @@ async fn a_refusal_names_the_missing_tool_field_rather_than_the_quoting() {
 async fn evidence_retrieve_still_fails_when_no_program_maps_the_key() {
     let services = runtime::RuntimeServices::in_memory().expect("runtime services");
     let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
-    executor
-        .bind_runtime_services(Arc::clone(&services))
-        .unwrap();
+    executor.bind_runtime_services(&services).unwrap();
     // The spelling a model produces when it copies Runtime's `artifact:<24 hex>`
     // and adds the separator itself. No Program holds this key.
     let request = serde_json::from_value::<EvidenceRetrieveToolRequest>(
@@ -2284,9 +2280,7 @@ async fn a_valid_artifact_selector_still_resolves() {
         .await
         .unwrap();
     let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
-    executor
-        .bind_runtime_services(Arc::clone(&services))
-        .unwrap();
+    executor.bind_runtime_services(&services).unwrap();
     let request = serde_json::from_value::<EvidenceRetrieveToolRequest>(
         serde_json::json!({"evidence_ref": artifact.selector}),
     )

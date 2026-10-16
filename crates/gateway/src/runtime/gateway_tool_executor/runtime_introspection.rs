@@ -161,7 +161,7 @@ impl GatewayToolExecutor {
             &active_model,
             Some(config.model_context_windows()),
         );
-        let services = self.runtime_services.get().cloned();
+        let services = self.upgrade_runtime_services();
         let usage = session_id.and_then(|sid| {
             services.as_ref().and_then(|services| {
                 services

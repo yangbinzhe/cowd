@@ -127,7 +127,7 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
             .with_runtime_permission_ceiling(execution_policy.permission_mode),
     );
     tool_executor
-        .bind_runtime_services(Arc::clone(&runtime_services))
+        .bind_runtime_services(&runtime_services)
         .map_err(std::io::Error::other)?;
     let runtime = runtime::StandardRuntimeHost::new(runtime::StandardRuntimeHostConfig {
         session,

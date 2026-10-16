@@ -142,7 +142,7 @@
         let services = runtime::RuntimeServices::in_memory().expect("runtime services");
         let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
         executor
-            .bind_runtime_services(Arc::clone(&services))
+            .bind_runtime_services(&services)
             .expect("bind runtime services");
         let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
             &runtime::tool_dispatch::ToolRequest {
@@ -195,7 +195,7 @@
         let services = runtime::RuntimeServices::in_memory().expect("runtime services");
         let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
         executor
-            .bind_runtime_services(Arc::clone(&services))
+            .bind_runtime_services(&services)
             .expect("bind runtime services");
         let request_for = |tool_name: &str| {
             let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
@@ -309,7 +309,7 @@
         let services = runtime::RuntimeServices::in_memory().expect("runtime services");
         let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
         executor
-            .bind_runtime_services(Arc::clone(&services))
+            .bind_runtime_services(&services)
             .expect("bind runtime services");
         let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
             &runtime::tool_dispatch::ToolRequest {
@@ -360,7 +360,7 @@
         let output = serde_json::to_string(&output).expect("canonical output JSON");
         let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
         executor
-            .bind_runtime_services(Arc::clone(&services))
+            .bind_runtime_services(&services)
             .expect("bind runtime services");
         let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
             &runtime::tool_dispatch::ToolRequest {
@@ -394,7 +394,7 @@
         let services = runtime::RuntimeServices::in_memory().expect("runtime services");
         let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
         executor
-            .bind_runtime_services(Arc::clone(&services))
+            .bind_runtime_services(&services)
             .expect("bind runtime services");
         let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
             &runtime::tool_dispatch::ToolRequest {

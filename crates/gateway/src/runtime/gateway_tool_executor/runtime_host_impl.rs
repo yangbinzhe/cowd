@@ -8,36 +8,58 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
         &self,
         request: &runtime::RuntimeToolExecutionRequest,
     ) -> runtime::RuntimeToolExecutionOutcome {
+        let runtime_services = self.upgrade_runtime_services();
         let evidence_ref = format!(
             "gateway-tool:{}:{}:{}",
             request.governed_plan_id, request.governed_plan_revision, request.tool_use_id
         );
-        let step_lease = match request.step_binding.as_ref().ok_or_else(|| {
-            "production_tool_origin_required".to_string()
-        }).and_then(|binding| {
-            let step = binding.resolve(Some(self.tool_host.pin_snapshot()))
+        let step_lease = match request
+            .step_binding
+            .as_ref()
+            .ok_or_else(|| "production_tool_origin_required".to_string())
+            .and_then(|binding| {
+                let step = binding
+                    .resolve(Some(self.tool_host.pin_snapshot()))
+                    .map_err(|error| error.to_string())?;
+                let session_id = request
+                    .session_id
+                    .as_deref()
+                    .ok_or_else(|| "step call requires session identity".to_string())?;
+                step.validate_call(
+                    &binding.origin,
+                    session_id,
+                    &request.tool_use_id,
+                    &request.tool_name,
+                    &request.input,
+                    chrono::Utc::now().timestamp_millis(),
+                )
                 .map_err(|error| error.to_string())?;
-            let session_id = request.session_id.as_deref().ok_or_else(|| "step call requires session identity".to_string())?;
-            step.validate_call(&binding.origin, session_id, &request.tool_use_id,
-                &request.tool_name, &request.input, chrono::Utc::now().timestamp_millis())
-                .map_err(|error| error.to_string())?;
-            if matches!(binding.origin.source, harness_contract::step::CallSource::SystemDerived { .. }) {
-                self.runtime_services.get().ok_or_else(|| "system call requires Runtime parent authority".to_string())?
-                    .commit_service().validate_system_tool_parent(request).map_err(|error| error.to_string())?;
-            }
-            Ok::<_, String>(step.lease().clone())
-        }) {
+                if matches!(
+                    binding.origin.source,
+                    harness_contract::step::CallSource::SystemDerived { .. }
+                ) {
+                    runtime_services
+                        .as_ref()
+                        .ok_or_else(|| "system call requires Runtime parent authority".to_string())?
+                        .commit_service()
+                        .validate_system_tool_parent(request)
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok::<_, String>(step.lease().clone())
+            }) {
             Ok(lease) => lease,
-            Err(error) => return runtime::RuntimeToolExecutionOutcome {
-                tool_use_id: request.tool_use_id.clone(),
-                tool_name: request.tool_name.clone(),
-                status: runtime::RuntimeToolExecutionStatus::BlockedPermission,
-                category: request.category,
-                output: None,
-                error: Some(error),
-                evidence_ref,
-                observed_evidence: Vec::new(),
-            },
+            Err(error) => {
+                return runtime::RuntimeToolExecutionOutcome {
+                    tool_use_id: request.tool_use_id.clone(),
+                    tool_name: request.tool_name.clone(),
+                    status: runtime::RuntimeToolExecutionStatus::BlockedPermission,
+                    category: request.category,
+                    output: None,
+                    error: Some(error),
+                    evidence_ref,
+                    observed_evidence: Vec::new(),
+                }
+            }
         };
         let Some(canonical_tool_name) =
             step_lease.snapshot().catalog.canonical_name(&request.tool_name)
@@ -112,8 +134,8 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
             };
         }
         let current_policy = request.session_id.as_deref().and_then(|session_id| {
-            self.runtime_services
-                .get()
+            runtime_services
+                .as_ref()
                 .and_then(|services| services.session_execution_policy(session_id))
         });
         if current_policy.as_ref().map(|policy| policy.revision) != Some(request.policy_revision) {
@@ -206,7 +228,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
         }
         let managed_effect = if request.category != runtime::ToolSafetyCategory::ReadOnly {
             if let Some(fence) = request.managed_invocation.as_ref() {
-                let Some(services) = self.runtime_services.get().cloned() else {
+                let Some(services) = runtime_services.as_ref().map(Arc::clone) else {
                     return runtime::RuntimeToolExecutionOutcome {
                         tool_use_id: request.tool_use_id.clone(),
                         tool_name: request.tool_name.clone(),

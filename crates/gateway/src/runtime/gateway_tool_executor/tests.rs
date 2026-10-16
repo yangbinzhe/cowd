@@ -56,4 +56,5 @@ mod tests {
     include!("tests/authorization.rs");
     include!("tests/context_retrieval.rs");
     include!("tests/receipts.rs");
+    include!("tests/runtime_binding_lifetime.rs");
 }

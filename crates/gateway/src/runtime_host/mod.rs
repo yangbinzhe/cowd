@@ -1925,9 +1925,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         let error = "failed to bind Runtime evolution evaluation executor".to_string();
         return Err(startup_registry.rollback(error).await);
     }
-    if let Err(error) =
-        gateway_runtime_tool_host.bind_runtime_services(Arc::clone(&runtime_services))
-    {
+    if let Err(error) = gateway_runtime_tool_host.bind_runtime_services(&runtime_services) {
         let error = format!("failed to bind runtime services: {error}");
         return Err(startup_registry.rollback(error).await);
     }

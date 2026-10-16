@@ -4,7 +4,7 @@ fn gateway_observed_evidence(
     output: &str,
     outcome_evidence_ref: &str,
 ) -> Vec<harness_contract::context::ObservedEvidence> {
-    let Some(services) = executor.runtime_services.get() else {
+    let Some(services) = executor.upgrade_runtime_services() else {
         return Vec::new();
     };
     // Only adapters whose successful structured output contains the actual

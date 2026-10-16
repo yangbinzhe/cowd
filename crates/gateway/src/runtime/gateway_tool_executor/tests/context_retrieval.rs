@@ -17,8 +17,9 @@ async fn context_retrieve_is_runtime_bound_and_degrades_explicitly() {
         }])
         .expect("runtime tool registry");
     let executor = GatewayToolExecutor::new(None, false, registry).with_runtime_session_id("s1");
+    let services = runtime::RuntimeServices::in_memory().expect("runtime services");
     executor
-        .bind_runtime_services(runtime::RuntimeServices::in_memory().unwrap())
+        .bind_runtime_services(&services)
         .expect("bind services");
 
     let output = executor
@@ -197,7 +198,7 @@ async fn context_retrieve_reads_the_exact_runtime_memory_binding() {
         .with_runtime_session_id("session-exact")
         .with_runtime_memory_context(context.clone());
     executor
-        .bind_runtime_services(Arc::clone(&services))
+        .bind_runtime_services(&services)
         .expect("bind services");
 
     let output = executor
@@ -642,7 +643,7 @@ async fn context_retrieve_follows_only_durable_session_relations() {
     let executor =
         GatewayToolExecutor::new(None, false, registry).with_runtime_session_id("session-current");
     executor
-        .bind_runtime_services(services)
+        .bind_runtime_services(&services)
         .expect("bind services");
 
     let output = executor
@@ -799,7 +800,7 @@ async fn context_fact_directory_and_exact_evidence_use_runtime_data_lease_and_re
         .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
         .unwrap();
     let executor = GatewayToolExecutor::new(None, false, registry);
-    executor.bind_runtime_services(services).unwrap();
+    executor.bind_runtime_services(&services).unwrap();
     let lease = harness_contract::agent::AgentDataLease {
         session_id: "session-facts".into(),
         task_id: "task-facts".into(),
@@ -1063,7 +1064,7 @@ async fn context_matrix_directory_reads_complete_scoped_json_and_rejects_changed
         .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
         .unwrap();
     let executor = GatewayToolExecutor::new(None, false, registry);
-    executor.bind_runtime_services(services).unwrap();
+    executor.bind_runtime_services(&services).unwrap();
     let lease = harness_contract::agent::AgentDataLease {
         session_id: "session-matrix".into(),
         task_id: "task-matrix".into(),
@@ -1361,7 +1362,7 @@ async fn context_session_discovery_pages_beyond_512_and_binds_exact_message_revi
         .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
         .unwrap();
     let executor = GatewayToolExecutor::new(None, false, registry);
-    executor.bind_runtime_services(services).unwrap();
+    executor.bind_runtime_services(&services).unwrap();
     let binding = RuntimeToolExecutionBinding {
         tool_lease: None,
         action_id: Some("session-discovery"),

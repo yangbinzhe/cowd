@@ -117,7 +117,7 @@ impl GatewayToolExecutor {
         session_id: Option<&str>,
         authorized_scopes: &[String],
     ) -> Result<String, ToolError> {
-        let services = self.runtime_services.get().cloned().ok_or_else(|| {
+        let services = self.upgrade_runtime_services().ok_or_else(|| {
             ToolError::new("evidence_retrieve requires the workspace RuntimeServices")
         })?;
         let selector = input.evidence_ref.clone();

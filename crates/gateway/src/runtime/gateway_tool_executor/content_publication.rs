@@ -42,8 +42,7 @@ impl GatewayToolExecutor {
         };
         use sha2::{Digest, Sha256};
         let services = self
-            .runtime_services
-            .get()
+            .upgrade_runtime_services()
             .ok_or_else(|| ToolError::new("publication requires RuntimeServices"))?;
         let session_id = binding
             .session_id

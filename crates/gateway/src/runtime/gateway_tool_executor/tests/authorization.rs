@@ -385,7 +385,7 @@
             ),
         );
         executor
-            .bind_runtime_services(Arc::clone(&services))
+            .bind_runtime_services(&services)
             .expect("bind security runtime services");
         let mut snapshot = executor.tool_host.pin_snapshot().snapshot().clone();
         let config_directory = tempfile::tempdir().expect("isolated MCP config");

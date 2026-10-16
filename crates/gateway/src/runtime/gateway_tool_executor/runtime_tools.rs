@@ -440,11 +440,15 @@ impl GatewayToolExecutor {
 
     pub(crate) fn bind_runtime_services(
         &self,
-        services: Arc<runtime::RuntimeServices>,
+        services: &Arc<runtime::RuntimeServices>,
     ) -> Result<(), String> {
         self.runtime_services
-            .set(services)
+            .set(Arc::downgrade(services))
             .map_err(|_| "runtime services already bound to gateway tool executor".to_string())
+    }
+
+    fn upgrade_runtime_services(&self) -> Option<Arc<runtime::RuntimeServices>> {
+        self.runtime_services.get().and_then(Weak::upgrade)
     }
 
     #[cfg(test)]
@@ -690,7 +694,7 @@ impl GatewayToolExecutor {
                 .await;
         }
         if is_agent_action_tool(tool_name) {
-            let services = self.runtime_services.get().cloned().ok_or_else(|| {
+            let services = self.upgrade_runtime_services().ok_or_else(|| {
                 ToolError::new("Agent action requires the workspace RuntimeServices")
             })?;
             let actor = match binding.parent_execution {
@@ -998,8 +1002,7 @@ impl GatewayToolExecutor {
                 return Err(ToolError::new("private note Session binding mismatch"));
             }
             let services = self
-                .runtime_services
-                .get()
+                .upgrade_runtime_services()
                 .ok_or_else(|| ToolError::new("private note Runtime unavailable"))?;
             let output = services
                 .private_note_command(context, binding.action_id.unwrap_or(""), input)
@@ -1019,8 +1022,7 @@ impl GatewayToolExecutor {
                 return Err(ToolError::new("working context Session binding mismatch"));
             }
             let services = self
-                .runtime_services
-                .get()
+                .upgrade_runtime_services()
                 .ok_or_else(|| ToolError::new("working context Runtime unavailable"))?;
             let output = services
                 .working_context_command(context, binding.action_id.unwrap_or(""), input)
@@ -1055,8 +1057,7 @@ impl GatewayToolExecutor {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             let agent_catalog = self
-                .runtime_services
-                .get()
+                .upgrade_runtime_services()
                 .and_then(|services| services.definition_registry().runnable_agent_catalog().ok());
             return serde_json::to_string_pretty(
                 &runtime::runtime_capabilities_response_with_leased_decision_and_tools(
@@ -1175,7 +1176,7 @@ impl GatewayToolExecutor {
     /// unified read design, so a collaborator can inspect one node in a single
     /// read instead of stitching several tools together.
     async fn read_graph_node(&self, graph_id: &str, node_id: &str) -> Result<String, ToolError> {
-        let services = self.runtime_services.get().cloned().ok_or_else(|| {
+        let services = self.upgrade_runtime_services().ok_or_else(|| {
             ToolError::new("`read_ref` node:// requires the workspace RuntimeServices")
         })?;
         let graph = services
@@ -1392,7 +1393,7 @@ impl GatewayToolExecutor {
                 ToolError::new("context_retrieve requires a Runtime-bound session identity")
             })?
             .to_string();
-        let services = self.runtime_services.get().cloned().ok_or_else(|| {
+        let services = self.upgrade_runtime_services().ok_or_else(|| {
             ToolError::new("context_retrieve requires the workspace RuntimeServices")
         })?;
         let limit = input.limit.unwrap_or(8).clamp(1, 16);

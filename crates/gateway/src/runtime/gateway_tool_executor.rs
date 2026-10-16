@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use runtime::{ConfigLoader, ToolError, ToolExecutor};
 use serde::Deserialize;
@@ -304,7 +304,7 @@ pub(crate) struct GatewayToolExecutor {
     runtime_model_lease: Option<String>,
     runtime_permission_ceiling: harness_contract::policy::PermissionMode,
     runtime_execution_decision: Arc<Mutex<Option<runtime::RuntimeExecutionDecision>>>,
-    runtime_services: Arc<OnceLock<Arc<runtime::RuntimeServices>>>,
+    runtime_services: Arc<OnceLock<Weak<runtime::RuntimeServices>>>,
 }
 
 include!("gateway_tool_executor/runtime_tools.rs");
