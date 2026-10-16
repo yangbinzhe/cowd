@@ -309,6 +309,39 @@ async fn one_shot_text_delivery_uses_the_same_independent_review_and_goal_verifi
     exercise_reviewed_goal_delivery_kind(false, false, DelegatedEffectCase::None, true).await;
 }
 
+#[tokio::test]
+async fn proven_text_goal_is_satisfied_while_original_workers_physically_drain() {
+    exercise_proven_goal_while_workers_drain(DelegatedEffectCase::None, true).await;
+}
+
+#[tokio::test]
+async fn proven_effect_goal_revokes_future_mutation_before_physical_worker_drain() {
+    exercise_proven_goal_while_workers_drain(DelegatedEffectCase::Review, false).await;
+}
+
+#[tokio::test]
+async fn proven_required_effect_cannot_be_reviewed_until_the_actual_write_receipt_settles() {
+    exercise_proven_goal_while_workers_drain(DelegatedEffectCase::PendingReview, false).await;
+}
+
+async fn exercise_proven_goal_while_workers_drain(
+    delegated_case: DelegatedEffectCase,
+    direct_text: bool,
+) {
+    let host = Arc::new(ReviewReadHost::default());
+    let services = RuntimeServices::in_memory_with_tool_host(host.clone()).unwrap();
+    Box::pin(exercise_reviewed_goal_delivery_with_drain(
+        services,
+        host,
+        false,
+        false,
+        delegated_case,
+        direct_text,
+        PhysicalDrainTiming::AfterGoal,
+    ))
+    .await;
+}
+
 async fn exercise_reviewed_goal_delivery_kind(
     with_disclosure: bool,
     with_effect: bool,
@@ -465,6 +498,7 @@ async fn market_offer_prefers_available_member_and_exit_reconciles_busy_work() {
                         task_ref: task_ref.clone(),
                         entered: tokio::sync::Notify::new(),
                         cancelled: std::sync::atomic::AtomicBool::new(false),
+                        finalized: Default::default(),
                     })
                 })
                 .collect(),

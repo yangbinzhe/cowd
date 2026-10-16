@@ -53,7 +53,54 @@ pub(super) fn agent(
 pub(super) enum DelegatedEffectCase {
     None,
     Review,
+    PendingReview,
     Withdraw,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum PhysicalDrainTiming {
+    BeforeGoal,
+    AfterGoal,
+}
+
+struct ReviewedFixtureServices(Arc<RuntimeServices>);
+
+impl std::ops::Deref for ReviewedFixtureServices {
+    type Target = Arc<RuntimeServices>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl ReviewedFixtureServices {
+    fn submit_agent_action<'fixture>(
+        &'fixture self,
+        envelope: &'fixture AgentActionEnvelope,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<harness_contract::agent_action::AgentActionObservation, String>,
+                > + Send
+                + 'fixture,
+        >,
+    > {
+        Box::pin(self.0.submit_agent_action(envelope))
+    }
+
+    fn dispatch_agentic_followups<'fixture>(
+        &'fixture self,
+        envelope: &'fixture AgentActionEnvelope,
+        context: AgenticDispatchContext,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Vec<AgenticDispatchReceipt>, String>>
+                + Send
+                + 'fixture,
+        >,
+    > {
+        Box::pin(self.0.dispatch_agentic_followups(envelope, context))
+    }
 }
 
 pub(super) async fn exercise_reviewed_goal_delivery_on(
@@ -64,7 +111,30 @@ pub(super) async fn exercise_reviewed_goal_delivery_on(
     delegated_case: DelegatedEffectCase,
     direct_text: bool,
 ) {
+    Box::pin(exercise_reviewed_goal_delivery_with_drain(
+        services,
+        read_host,
+        with_disclosure,
+        with_effect,
+        delegated_case,
+        direct_text,
+        PhysicalDrainTiming::BeforeGoal,
+    ))
+    .await;
+}
+
+pub(super) async fn exercise_reviewed_goal_delivery_with_drain(
+    services: Arc<RuntimeServices>,
+    read_host: Arc<ReviewReadHost>,
+    with_disclosure: bool,
+    with_effect: bool,
+    delegated_case: DelegatedEffectCase,
+    direct_text: bool,
+    drain_timing: PhysicalDrainTiming,
+) {
+    let services = ReviewedFixtureServices(services);
     let delegated_effect = delegated_case != DelegatedEffectCase::None;
+    let effect_host = Arc::clone(&read_host);
     read_host.services.set(Arc::downgrade(&services)).unwrap();
     let root_mission_id = "mission:auto:dispatch-regression";
     services
@@ -211,6 +281,7 @@ pub(super) async fn exercise_reviewed_goal_delivery_on(
             task_ref: task_ref.clone(),
             entered: tokio::sync::Notify::new(),
             cancelled: std::sync::atomic::AtomicBool::new(false),
+            finalized: Default::default(),
         })
     });
     if let Some(hold) = &producer_hold {
@@ -597,17 +668,20 @@ pub(super) async fn exercise_reviewed_goal_delivery_on(
         crate::agentic::program::AgenticTeamLifecycle::Retired
     );
 
+    let mut pending_effect = None;
     let writer = if delegated_effect {
-        let writer = crate::agent_in_process_worker::ProcessJsonlToolSession::prepare(
-            &services,
-            &packet,
-            &crate::agent_model_selector::AgentModelSelection {
-                model: "test".into(),
-                provider: "test".into(),
-                registry_revision: 0,
-            },
-        )
-        .unwrap();
+        let writer = Arc::new(
+            crate::agent_in_process_worker::ProcessJsonlToolSession::prepare(
+                &services,
+                &packet,
+                &crate::agent_model_selector::AgentModelSelection {
+                    model: "test".into(),
+                    provider: "test".into(),
+                    registry_revision: 0,
+                },
+            )
+            .unwrap(),
+        );
         writer
             .execute_tool(
                 "delegated-write",
@@ -681,6 +755,24 @@ pub(super) async fn exercise_reviewed_goal_delivery_on(
             std::fs::read_to_string(services.workspace_root().join("review-effect.txt")).unwrap(),
             "actual delegated write"
         );
+        if delegated_case == DelegatedEffectCase::PendingReview {
+            let gate = Arc::new(ReviewWriteHold::default());
+            read_host.held_write.set(Arc::clone(&gate)).unwrap();
+            let held_writer = Arc::clone(&writer);
+            let running = tokio::spawn(async move {
+                held_writer
+                    .execute_tool(
+                        "pending-required-write",
+                        "edit",
+                        r#"{"path":"review-effect.txt","content":"actual delegated write"}"#,
+                    )
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), gate.entered.notified())
+                .await
+                .unwrap();
+            pending_effect = Some((gate, running));
+        }
         Some(writer)
     } else {
         None
@@ -893,7 +985,7 @@ pub(super) async fn exercise_reviewed_goal_delivery_on(
             harness_contract::agent_action::AgentActionStatus::Applied
         );
     }
-    if let Some(writer) = &writer {
+    if let Some(writer) = writer.as_ref().filter(|_| pending_effect.is_none()) {
         let index = format!(
             "execution-agent-receipts:{}:{}:{}",
             packet.graph_id(),
@@ -973,6 +1065,45 @@ pub(super) async fn exercise_reviewed_goal_delivery_on(
             evidence_refs: vec![content.selector.clone()],
         }),
     };
+    if let Some((gate, running)) = pending_effect.take() {
+        let refused = services.submit_agent_action(&review_envelope).await;
+        let unsettled = action_service.project("program-dispatch").unwrap();
+        let source = format!(
+            "execution-agent-receipts:{}:{}:{}",
+            packet.graph_id(),
+            packet.node_id(),
+            packet.attempt
+        );
+        let events = services.event_store().list_stream(&source).unwrap();
+        let receipts = events
+            .iter()
+            .filter(|event| event.kind == "execution.agent_tool.receipt")
+            .filter_map(|event| event.payload["idempotency_key"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let pending = events
+            .iter()
+            .filter(|event| event.kind == "execution.agent_tool.intent")
+            .filter_map(|event| event.payload["idempotency_key"].as_str())
+            .filter(|key| !receipts.contains(key))
+            .count();
+        gate.release.notify_one();
+        running.await.unwrap().unwrap();
+        let error = refused.unwrap_err();
+        assert!(error.contains("effect_review_pending"), "{error}");
+        assert_eq!(pending, 1);
+        assert_eq!(
+            unsettled.tasks[&task_ref].status,
+            crate::AgenticTaskStatus::Submitted
+        );
+        assert!(unsettled.objective_verdict.is_none());
+        println!(
+            "V3_REQUIRED_PENDING_WITNESS {}",
+            serde_json::json!({
+                "effect_source": source, "unsettled_intents": pending,
+                "task": task_ref, "denial": error, "receipt_after_release": true,
+            })
+        );
+    }
     assert!(services
         .submit_agent_action(&review_envelope)
         .await
@@ -1060,41 +1191,69 @@ pub(super) async fn exercise_reviewed_goal_delivery_on(
         harness_contract::agent_action::AgentActionStatus::Applied,
         "{reviewed:?}"
     );
-    services
-        .cancel_execution_tree(
-            &review_graph.id,
-            "mechanical reviewer fixture finished after durable review",
-        )
-        .await
-        .unwrap();
-    services
-        .cancel_execution_tree(
-            packet.graph_id(),
-            "mechanical producer fixture finished after durable submission",
-        )
-        .await
-        .unwrap();
-    assert!(producer_hold
-        .unwrap()
-        .cancelled
-        .load(std::sync::atomic::Ordering::Acquire));
-    if let Some(writer) = writer {
-        let error = writer
-            .execute_tool(
-                "late-after-cancel",
-                "edit",
-                r#"{"path":"review-effect.txt","content":"cancelled write must not execute"}"#,
+    let drain_workers = || async {
+        services
+            .cancel_execution_tree(
+                &review_graph.id,
+                "mechanical reviewer fixture finished after durable review",
             )
             .await
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("tool_effect_authority"),
-            "{error}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(services.workspace_root().join("review-effect.txt")).unwrap(),
-            "actual delegated write"
-        );
+            .unwrap();
+        services
+            .cancel_execution_tree(
+                packet.graph_id(),
+                "mechanical producer fixture finished after durable submission",
+            )
+            .await
+            .unwrap();
+        assert!(producer_hold
+            .as_ref()
+            .unwrap()
+            .cancelled
+            .load(std::sync::atomic::Ordering::Acquire));
+        let finalized = producer_hold
+            .as_ref()
+            .unwrap()
+            .finalized
+            .lock()
+            .unwrap()
+            .clone();
+        for (execution_id, node_id) in [
+            (packet.graph_id(), packet.node_id()),
+            (review_graph.id.as_str(), review_graph.nodes[0].id.as_str()),
+        ] {
+            assert!(finalized.iter().any(|value| value == execution_id));
+            assert_eq!(
+                services
+                    .graph_state_store()
+                    .load(execution_id)
+                    .unwrap()
+                    .node_statuses[node_id],
+                ExecutionNodeStatus::Cancelled
+            );
+        }
+        if let Some(writer) = writer.as_ref() {
+            let error = writer
+                .execute_tool(
+                    "late-after-cancel",
+                    "edit",
+                    r#"{"path":"review-effect.txt","content":"cancelled write must not execute"}"#,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("tool_effect_authority"),
+                "{error}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(services.workspace_root().join("review-effect.txt"))
+                    .unwrap(),
+                "actual delegated write"
+            );
+        }
+    };
+    if drain_timing == PhysicalDrainTiming::BeforeGoal {
+        drain_workers().await;
     }
     use harness_contract::goal::{GoalCompletion, GoalContract};
     services
@@ -1364,6 +1523,7 @@ pub(super) async fn exercise_reviewed_goal_delivery_on(
             task_ref: work_receipt.changed_refs[0].clone(),
             entered: tokio::sync::Notify::new(),
             cancelled: std::sync::atomic::AtomicBool::new(false),
+            finalized: Default::default(),
         });
         services
             .agent_task_executor()
@@ -1786,6 +1946,117 @@ pub(super) async fn exercise_reviewed_goal_delivery_on(
         "program-dispatch",
     )
     .expect("verified Objective");
+    if drain_timing == PhysicalDrainTiming::AfterGoal {
+        let goal = services
+            .goal_store()
+            .get("goal:root-agentic-execution")
+            .unwrap()
+            .unwrap();
+        let program = action_service.project("program-dispatch").unwrap();
+        let manifest = crate::agentic::review_evidence::work_manifest_digest(&program);
+        assert_eq!(goal.completion, GoalCompletion::Satisfied);
+        assert_eq!(program.status, crate::AgenticProgramStatus::Verified);
+        assert_eq!(
+            program.tasks[&task_ref].status,
+            crate::AgenticTaskStatus::Accepted
+        );
+        assert!(!goal.reviews.is_empty());
+        assert!(goal
+            .reviews
+            .iter()
+            .all(|review| review
+                .verification
+                .as_ref()
+                .is_some_and(
+                    |proof| !proof.reads.is_empty() && proof.effect_manifest_digest.is_some()
+                )));
+        assert!(!producer_hold
+            .as_ref()
+            .unwrap()
+            .cancelled
+            .load(std::sync::atomic::Ordering::Acquire));
+        assert!(producer_hold
+            .as_ref()
+            .unwrap()
+            .finalized
+            .lock()
+            .unwrap()
+            .is_empty());
+        for (execution_id, node_id) in [
+            (packet.graph_id(), packet.node_id()),
+            (review_graph.id.as_str(), review_graph.nodes[0].id.as_str()),
+        ] {
+            assert_eq!(
+                services
+                    .graph_state_store()
+                    .load(execution_id)
+                    .unwrap()
+                    .node_statuses[node_id],
+                ExecutionNodeStatus::Running
+            );
+        }
+        if let Some(writer) = writer.as_ref() {
+            let source = format!(
+                "execution-agent-receipts:{}:{}:{}",
+                packet.graph_id(),
+                packet.node_id(),
+                packet.attempt
+            );
+            let revision = services.event_store().stream_revision(&source).unwrap();
+            let calls = effect_host.calls.lock().unwrap().len();
+            let error = writer.execute_tool("after-goal-before-drain", "edit", r#"{"path":"review-effect.txt","content":"must not overwrite verified target"}"#).await.unwrap_err();
+            assert!(
+                error.to_string().contains("tool_effect_authority"),
+                "{error}"
+            );
+            assert_eq!(
+                services.event_store().stream_revision(&source).unwrap(),
+                revision
+            );
+            assert_eq!(effect_host.calls.lock().unwrap().len(), calls);
+            assert_eq!(
+                std::fs::read_to_string(services.workspace_root().join("review-effect.txt"))
+                    .unwrap(),
+                "actual delegated write"
+            );
+        }
+        let mut late_semantic = task.clone();
+        late_semantic.action_id = "after-goal-before-drain-publish".into();
+        let refused = services.submit_agent_action(&late_semantic).await.unwrap();
+        assert_eq!(
+            refused.status,
+            harness_contract::agent_action::AgentActionStatus::Rejected
+        );
+        assert_eq!(refused.error.unwrap().code, "program_terminal");
+        println!(
+            "V3_DRAIN_WITNESS {}",
+            serde_json::json!({
+                "goal": goal.id, "goal_revision": goal.revision,
+                "program_revision": program.revision, "verdict": program.objective_verdict,
+                "producer": packet.graph_id(), "reviewer": review_graph.id,
+                "physical_before": "running", "effect_host_calls": effect_host.calls.lock().unwrap().len(),
+            })
+        );
+        drain_workers().await;
+        assert_eq!(
+            services
+                .goal_store()
+                .get("goal:root-agentic-execution")
+                .unwrap()
+                .unwrap(),
+            goal
+        );
+        let drained = action_service.project("program-dispatch").unwrap();
+        assert_eq!(drained.objective_verdict, program.objective_verdict);
+        assert_eq!(
+            crate::agentic::review_evidence::work_manifest_digest(&drained),
+            manifest
+        );
+        assert_eq!(
+            drained.tasks[&task_ref].status,
+            crate::AgenticTaskStatus::Accepted
+        );
+    }
     if delegated_effect {
         let goal = services
             .goal_store()
@@ -1839,7 +2110,7 @@ pub(super) async fn exercise_reviewed_goal_delivery_on(
         crate::evolution::collaboration_experience::CollaborationExperienceProjector::new(
             Arc::clone(services.event_store()),
             services.graph_state_store().clone(),
-            "test-workspace".into(),
+            services.workspace_key().to_owned(),
         );
     loop {
         let pass = projector
@@ -1885,6 +2156,7 @@ pub(super) struct ReviewWorkerHold {
     pub(super) task_ref: String,
     pub(super) entered: tokio::sync::Notify,
     pub(super) cancelled: std::sync::atomic::AtomicBool,
+    pub(super) finalized: std::sync::Mutex<Vec<String>>,
 }
 pub(super) struct ReviewWorkerResolver(Arc<ReviewWorkerHold>);
 impl crate::execution_core::graph::executors::AgentTaskBackendResolver for ReviewWorkerResolver {
@@ -1910,7 +2182,11 @@ impl crate::execution_core::graph::executors::AgentTaskBackend for ReviewWorkerH
     async fn cancel(&self, _: &AgentTaskPacket) -> Result<(), String> {
         Ok(())
     }
-    fn cancellation_finalized(&self, _: &AgentTaskPacket) {
+    fn cancellation_finalized(&self, packet: &AgentTaskPacket) {
+        self.finalized
+            .lock()
+            .unwrap()
+            .push(packet.graph_id().to_owned());
         self.cancelled
             .store(true, std::sync::atomic::Ordering::Release);
     }
@@ -1922,6 +2198,13 @@ impl crate::execution_core::graph::executors::AgentTaskBackend for ReviewWorkerH
 pub(super) struct ReviewReadHost {
     pub(super) services: std::sync::OnceLock<std::sync::Weak<RuntimeServices>>,
     pub(super) calls: std::sync::Mutex<Vec<crate::RuntimeToolExecutionRequest>>,
+    held_write: std::sync::OnceLock<Arc<ReviewWriteHold>>,
+}
+
+#[derive(Debug, Default)]
+struct ReviewWriteHold {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 impl ReviewReadHost {
     async fn tool_output(&self, name: &str, input: &str, scopes: &[String]) -> String {
@@ -1936,6 +2219,10 @@ impl ReviewReadHost {
         match name {
             "edit" => {
                 std::fs::write(&path, input["content"].as_str().unwrap()).unwrap();
+                if let Some(gate) = self.held_write.get() {
+                    gate.entered.notify_one();
+                    gate.release.notified().await;
+                }
                 serde_json::json!({"written":true,"path":path}).to_string()
             }
             "read_file" => std::fs::read_to_string(path).unwrap(),
@@ -2155,7 +2442,33 @@ pub(super) async fn root_reads_review_result(
     root_reads_generic_results(services, host, selector, false, false).await;
 }
 
-pub(super) async fn root_reads_generic_results(
+pub(super) fn root_reads_generic_results<'fixture>(
+    services: &'fixture Arc<RuntimeServices>,
+    host: Arc<ReviewReadHost>,
+    selector: &'fixture str,
+    read_tool_receipt: bool,
+    write_effect: bool,
+) -> std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = (
+                    Option<String>,
+                    crate::ConversationRuntime<NoReviewProvider, RootReviewReader>,
+                ),
+            > + Send
+            + 'fixture,
+    >,
+> {
+    Box::pin(execute_root_review_reads(
+        services,
+        host,
+        selector,
+        read_tool_receipt,
+        write_effect,
+    ))
+}
+
+async fn execute_root_review_reads(
     services: &Arc<RuntimeServices>,
     host: Arc<ReviewReadHost>,
     selector: &str,
