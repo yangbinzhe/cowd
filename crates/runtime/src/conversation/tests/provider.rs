@@ -2572,6 +2572,150 @@ async fn one_shot_reasoning_effort_is_request_local_and_survives_fallback() {
         .is_none());
 }
 
+struct ContextBudgetFixtureApi;
+
+impl ApiClient for ContextBudgetFixtureApi {
+    fn stream(&mut self, _: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+        Box::pin(futures::stream::empty())
+    }
+}
+
+#[tokio::test]
+async fn rendered_capacity_refusal_precedes_reservation_and_stream_dispatch() {
+    struct RefusingBudgetApi(Arc<AtomicUsize>);
+    impl ApiClient for RefusingBudgetApi {
+        fn prepare_request_budget(&self, _: &mut ApiRequest) -> Result<(), RuntimeError> {
+            Err(RuntimeError::context_capacity(crate::context_ledger::ContextCapacityFailure::RenderOverflow, "fixture full wire does not fit"))
+        }
+        fn stream(&mut self, _: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(futures::stream::empty())
+        }
+    }
+    let registry = Arc::new(EvaluationProviderTokenLeaseRegistry::default());
+    let guard = registry.install("precharge-session", "precharge-fixture", 1_000_000).unwrap();
+    let lease = guard.lease();
+    let before = lease.snapshot().unwrap();
+    let dispatches = Arc::new(AtomicUsize::new(0));
+    let mut runtime = ConversationRuntime::new(Session::new(), RefusingBudgetApi(dispatches.clone()),
+        StaticToolExecutor::new(), PermissionPolicy::new(PermissionMode::ReadOnly), vec!["system".into()])
+        .without_memory().with_model_context_window(128_000).with_evaluation_provider_token_lease(lease.clone());
+    runtime.set_active_model("private-fixture");
+    runtime.begin_turn_strategy("precharge-turn", "concise answer").unwrap();
+    let error = runtime.execute_model_step("concise answer", true).await.unwrap_err();
+    assert_eq!(error.context_capacity_failure(), Some(crate::context_ledger::ContextCapacityFailure::RenderOverflow));
+    assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+    assert_eq!(lease.snapshot().unwrap(), before);
+}
+
+#[tokio::test]
+async fn required_tool_choice_is_reapplied_to_a_calibrated_semantic_attempt() {
+    struct ChoiceApi {
+        pending: (bool, Option<String>),
+        requests: Arc<std::sync::Mutex<Vec<(bool, Option<String>)>>>,
+    }
+    impl ApiClient for ChoiceApi {
+        fn configure_tool_choice(&mut self, required: bool, name: Option<String>) { self.pending = (required, name); }
+        fn stream(&mut self, _: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(std::mem::take(&mut self.pending));
+            let first = requests.len() == 1;
+            drop(requests);
+            let events = if first {
+                vec![Err(RuntimeError::with_provider_context_window_limit("fixture limit 32768", Some(32_768)))]
+            } else {
+                vec![Ok(AssistantEvent::ToolUse { id: "read-after-calibration".into(), name: "read_file".into(), input: r#"{"path":"source.txt"}"#.into() }), Ok(AssistantEvent::MessageStop)]
+            };
+            Box::pin(futures::stream::iter(events))
+        }
+    }
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut runtime = ConversationRuntime::new(Session::new(), ChoiceApi { pending: (false, None), requests: requests.clone() },
+        StaticToolExecutor::new().register("read_file", |_| Ok("not dispatched".into())),
+        PermissionPolicy::new(PermissionMode::ReadOnly), vec!["system".into()])
+        .without_memory().with_model_context_window(128_000);
+    runtime.set_active_model("private-fixture");
+    runtime.begin_turn_strategy("choice-turn", "read the source").unwrap();
+    runtime.require_next_model_tool_call();
+    runtime.execute_model_step("read the source", true).await.unwrap();
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|(required, _)| *required));
+}
+
+#[test]
+fn stale_context_policy_is_refused_instead_of_relabelled_as_current() {
+    let runtime = ConversationRuntime::new(Session::new(), ContextBudgetFixtureApi, StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::ReadOnly), vec!["system".into()]).without_memory().with_model_context_window(128_000);
+    let mut prompt = PromptAssembly::new(vec!["private context".into()]);
+    prompt.context_policy_revision = Some(runtime.permission_policy.execution_policy_control().snapshot().revision.saturating_add(1));
+    let error = runtime.pack_provider_attempt(&prompt, &Vec::new().into(), "fixture", ProviderContextInventory::default()).unwrap_err();
+    assert!(error.to_string().contains("context_policy_changed_during_compilation"));
+    let required = PromptAssembly::new(vec!["must preserve this requirement ".repeat(30_000)]);
+    let error = runtime.pack_provider_attempt(&required, &Vec::new().into(), "fixture", ProviderContextInventory::default()).unwrap_err();
+    assert_eq!(error.context_capacity_failure(), Some(crate::context_ledger::ContextCapacityFailure::RequiredOverflow));
+}
+
+#[tokio::test]
+async fn a_second_provider_overflow_exits_after_one_calibrated_recompile() {
+    struct OverflowApi(Arc<AtomicUsize>);
+    impl ApiClient for OverflowApi {
+        fn stream(&mut self, _: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            let first = self.0.fetch_add(1, Ordering::SeqCst) == 0;
+            Box::pin(futures::stream::iter(vec![Err(RuntimeError::with_provider_context_window_limit(
+                "fixture still over context", Some(if first { 32_768 } else { 16_384 }),
+            ))]))
+        }
+    }
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let mut runtime = ConversationRuntime::new(Session::new(), OverflowApi(attempts.clone()), StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::ReadOnly), vec!["system".into()]).without_memory().with_model_context_window(128_000);
+    runtime.set_active_model("private-fixture");
+    runtime.begin_turn_strategy("overflow-turn", "concise answer").unwrap();
+    assert!(runtime.execute_model_step("concise answer", true).await.is_err());
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn selected_navigation_checks_durable_source_before_injecting_any_summary() {
+    let store = Arc::new(crate::test_support::session_store());
+    let session_id = "source-bound-navigation";
+    store.create_session(&session::SessionRecord {
+        session_id: session_id.into(), platform: "test".into(), chat_id: "navigation-fixture".into(),
+        user_id: None, model: None, created_at: "2026-10-16T00:00:00Z".into(),
+        last_activity: "2026-10-16T00:00:00Z".into(), message_count: 0,
+        reset_policy: "manual".into(), metadata_json: None, input_tokens: 0, output_tokens: 0, status: "active".into(),
+    }).await.unwrap();
+    store.insert_message(&session::SessionMessage {
+        stable_message_id: "immutable-deployment-result".into(), session_id: session_id.into(), sequence: 0,
+        role: "user".into(), content_json: r#"[{"type":"text","text":"deployment failed, retain the obligation"}]"#.into(),
+        blocks_count: 1, tool_use_id: None, tool_name: None, token_usage_json: None, created_at_ms: 1,
+    }).await.unwrap();
+    store.reconcile_session_context_index(session_id, 16, 4, 1).await.unwrap();
+    let page = store.page_in_session_context(session_id, 512).await.unwrap().unwrap();
+    let hot = Arc::new(crate::execution_core::hot_state::RuntimeHotStatePlane::new(Default::default()));
+    for corruption in ["none", "summary", "source"] {
+        hot.sessions().update(session_id, |snapshot| {
+            snapshot.context_manifest = Some(page.manifest.clone());
+            snapshot.context_cards = page.context_cards.clone();
+            if corruption == "summary" { snapshot.context_cards[0].summary = "deployment accepted every write without evidence".into(); }
+            if corruption == "source" { snapshot.context_cards[0].source_digest = "corrupt-digest".into(); }
+        });
+        let mut session = Session::new();
+        session.session_id = session_id.into();
+        let runtime = ConversationRuntime::new(session, ContextBudgetFixtureApi, StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::ReadOnly), vec!["system".into()])
+            .without_memory().with_hot_state(hot.clone()).with_session_history_reader(Arc::new(store.history_reader()));
+        let items = runtime.runtime_session_context_items("deployment").await;
+        if corruption == "none" {
+            assert!(!items.is_empty());
+            assert!(items.iter().any(|item| item.content.contains("deployment failed")));
+        } else {
+            assert!(items.is_empty(), "corrupt {corruption} must not enter even an orientation packet: {items:?}");
+        }
+    }
+}
+
 #[derive(Clone)]
 struct CalibrationRecordingApi {
     requests: Arc<std::sync::Mutex<Vec<CalibrationRequestRecord>>>,

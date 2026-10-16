@@ -872,6 +872,40 @@ fn build_provider_template(
 }
 
 impl ApiClient for ProviderRuntimeClient {
+    fn configured_context_window(&self, model: &str) -> Option<u32> {
+        self.registry.pin().configured_context_window(model)
+    }
+
+    fn prepare_request_budget(&self, request: &mut ApiRequest) -> Result<(), RuntimeError> {
+        if matches!(request.budget.context_window_source.as_str(), "unknown" | "assumed") {
+            return Err(RuntimeError::context_capacity(
+                crate::context_ledger::ContextCapacityFailure::UnknownProfile,
+                "context_capacity_unknown: configure a verified model window before dispatch",
+            ));
+        }
+        let snapshot = self.registry.pin();
+        let (entry, message_request) = self.prepare_message_request(request, &snapshot)?;
+        provider::preflight_message_request(&message_request).map_err(|error| {
+            request.budget.executable = false;
+            RuntimeError::context_capacity(crate::context_ledger::ContextCapacityFailure::RenderOverflow, error.to_string())
+        })?;
+        let wire = entry.client.wire_request(&message_request)
+            .map_err(|error| RuntimeError::new(format!("provider_render_failed: {error}")))?;
+        let bytes = serde_json::to_vec(&wire.body)
+            .map_err(|error| RuntimeError::new(error.to_string()))?.len();
+        request.budget.record_rendered_input(
+            (bytes as u64).saturating_add(3) / 4,
+            "provider_wire_utf8_bytes_div4_estimated_v1",
+        );
+        if !request.budget.executable {
+            return Err(RuntimeError::context_capacity(crate::context_ledger::ContextCapacityFailure::RenderOverflow, format!(
+                "context_capacity_exceeded: rendered estimate={} input_cap={} model={}",
+                request.budget.input_total_tokens(), request.budget.hard_input_cap_tokens, request.model,
+            )));
+        }
+        Ok(())
+    }
+
     fn step_tool_definitions(&self) -> Option<Vec<ProviderToolDefinition>> {
         Some(self.compiled_tool_schema().tools.to_vec())
     }
@@ -1001,128 +1035,17 @@ impl ProviderRuntimeClient {
                 };
             }
         }
-        let messages = self.provider_input_messages(&request);
-        let system = request.prompt.wire_system_text();
-        let cache_cohort_system = request.prompt.cache_cohort_system_text();
-        let cache_cohort_user_prefix = request.prompt.cache_cohort_user_prefix_messages();
-        debug_assert!(
-            system
-                .as_deref()
-                .unwrap_or_default()
-                .as_bytes()
-                .starts_with(
-                    request
-                        .prompt
-                        .stable_system_text()
-                        .unwrap_or_default()
-                        .as_bytes()
-                ),
-            "Provider wire must preserve the exact stable system prefix"
-        );
-        let active_tools = self.compiled_tool_schema().tools.to_vec();
-        let tool_choice_required = std::mem::take(&mut self.tool_choice_required);
-        let required_tool_name = std::mem::take(&mut self.tool_choice_required_tool_name);
-        if let Some(name) = required_tool_name.as_deref() {
-            if !active_tools.iter().any(|tool| tool.name == name) {
-                let name = name.to_string();
-                return ApiClientStream {
-                    events: Box::pin(futures::stream::once(async move {
-                        Err(RuntimeError::new(format!(
-                            "provider request requires named governed tool `{name}`, but it is not exposed"
-                        )))
-                    })),
-                    transport_activity: None,
-                };
-            }
-        }
-
-        // Runtime selects one candidate and owns the route/retry lifecycle.
-        // This adapter owns exactly one pinned wire-protocol attempt.
-        let mut entry = match self.template_cache.resolve(
-            &provider_snapshot,
-            &self.transport_pool,
-            &request.model,
-        ) {
-            Ok(entry) => entry,
-            Err(error) => {
-                tracing::warn!(
-                    model = %request.model,
-                    registry_revision = provider_snapshot.revision(),
-                    configured_providers = ?provider_snapshot.provider_names(),
-                    error = %error,
-                    "provider request could not resolve a configured runtime client"
-                );
-                return ApiClientStream {
-                    events: Box::pin(futures::stream::once(async move {
-                        Err(RuntimeError::new(format!(
-                            "provider candidate `{}` is unavailable: {error}",
-                            request.model
-                        )))
-                    })),
-                    transport_activity: None,
-                };
-            }
-        };
-        if self.transport_pool.provider_account_is_fenced(
-            entry.request_context.profile.registry_revision,
-            &entry.request_context.profile.provider_name,
-        ) {
-            let error = provider_account_fenced_error(&entry.request_context.profile.provider_name);
-            return ApiClientStream {
+        let (entry, message_request) = match self.prepare_message_request(&request, &provider_snapshot) {
+            Ok(prepared) => prepared,
+            Err(error) => return ApiClientStream {
                 events: Box::pin(futures::stream::once(async move { Err(error) })),
                 transport_activity: None,
-            };
-        }
-        let reasoning_effort = request_reasoning_effort(
-            &entry.model,
-            &entry.request_context.profile.model_capabilities,
-            request.reasoning_effort_override.clone(),
-            self.reasoning_effort.clone(),
-        );
-        // Capability facts are resolved after the exact model and reasoning
-        // mode are both known. The template cache is keyed by model only, so
-        // the request-local profile is re-derived here and never shared
-        // across requests with different reasoning modes.
-        if let Some(protocol) = entry
-            .request_context
-            .profile
-            .protocol
-            .as_deref()
-            .and_then(ProviderProtocol::parse)
-        {
-            entry.request_context.profile.capabilities =
-                ProviderCapabilityProfile::resolve_for_reasoning_mode(
-                    protocol,
-                    &entry.model,
-                    reasoning_effort.as_deref(),
-                );
-        }
-        let tool_choice = match provider_tool_choice_for_required_tool(
-            !active_tools.is_empty(),
-            tool_choice_required,
-            entry
-                .request_context
-                .profile
-                .capabilities
-                .supports_explicit_tool_choice
-                .state,
-            required_tool_name.as_deref(),
-        ) {
-            Ok(choice) => choice,
-            Err(error) => {
-                return ApiClientStream {
-                    events: Box::pin(futures::stream::once(async move {
-                        Err(RuntimeError::new(format!(
-                            "{error} (model={}, reasoning_effort={:?})",
-                            entry.model, reasoning_effort
-                        )))
-                    })),
-                    transport_activity: None,
-                };
-            }
+            },
         };
-        entry.request_context.attempt =
-            provider_attempt(request.provider_evidence_context.as_ref());
+        self.tool_choice_required = false;
+        self.tool_choice_required_tool_name = None;
+        let cache_cohort_system = request.prompt.cache_cohort_system_text();
+        let cache_cohort_user_prefix = request.prompt.cache_cohort_user_prefix_messages();
         let (sender, receiver) = tokio::sync::mpsc::channel(PROVIDER_EVENT_QUEUE_CAPACITY);
         let transport_activity = provider::TransportActivity::default();
         let producer = match tokio::runtime::Handle::try_current() {
@@ -1130,21 +1053,9 @@ impl ProviderRuntimeClient {
                 handle.spawn(forward_provider_attempt(
                     entry,
                     Some(request.prompt.composition()),
-                    messages,
-                    system,
+                    message_request,
                     cache_cohort_system,
                     cache_cohort_user_prefix,
-                    active_tools,
-                    tool_choice,
-                    request
-                        .budget
-                        .requested_output_tokens
-                        .min(u64::from(u32::MAX)) as u32,
-                    request
-                        .budget
-                        .context_window_tokens
-                        .min(u64::from(u32::MAX)) as u32,
-                    reasoning_effort,
                     self.emit_output,
                     self.stream_callback.clone(),
                     request.provider_evidence_context,
@@ -1182,6 +1093,71 @@ impl ProviderRuntimeClient {
 }
 
 impl ProviderRuntimeClient {
+    fn prepare_message_request(
+        &self,
+        request: &ApiRequest,
+        snapshot: &ProviderRegistrySnapshot,
+    ) -> Result<(ProviderEntry, MessageRequest), RuntimeError> {
+        if request.budget.compiled_provider_registry_revision
+            .is_some_and(|revision| revision != snapshot.revision())
+        {
+            return Err(RuntimeError::new("provider_profile_changed_after_compile"));
+        }
+        let active_tools = self.compiled_tool_schema().tools.to_vec();
+        let required_tool_name = self.tool_choice_required_tool_name.as_deref();
+        if required_tool_name.is_some_and(|name| !active_tools.iter().any(|tool| tool.name == name)) {
+            return Err(RuntimeError::new("required governed tool is not exposed"));
+        }
+        let mut entry = self.template_cache.resolve(snapshot, &self.transport_pool, &request.model)
+            .map_err(|error| RuntimeError::new(format!("provider candidate unavailable: {error}")))?;
+        if self.transport_pool.provider_account_is_fenced(
+            entry.request_context.profile.registry_revision,
+            &entry.request_context.profile.provider_name,
+        ) {
+            return Err(provider_account_fenced_error(&entry.request_context.profile.provider_name));
+        }
+        let reasoning_effort = request_reasoning_effort(
+            &entry.model,
+            &entry.request_context.profile.model_capabilities,
+            request.reasoning_effort_override.clone(),
+            self.reasoning_effort.clone(),
+        );
+        if let Some(protocol) = entry.request_context.profile.protocol.as_deref()
+            .and_then(ProviderProtocol::parse)
+        {
+            entry.request_context.profile.capabilities =
+                ProviderCapabilityProfile::resolve_for_reasoning_mode(
+                    protocol, &entry.model, reasoning_effort.as_deref(),
+                );
+        }
+        let tool_choice = provider_tool_choice_for_required_tool(
+            !active_tools.is_empty(),
+            self.tool_choice_required,
+            entry.request_context.profile.capabilities.supports_explicit_tool_choice.state,
+            required_tool_name,
+        ).map_err(|error| RuntimeError::new(format!(
+            "{error} (model={}, reasoning_effort={reasoning_effort:?})", entry.model,
+        )))?;
+        entry.request_context.attempt = provider_attempt(request.provider_evidence_context.as_ref());
+        let message_request = MessageRequest {
+            model: entry.model.clone(),
+            protocol_capabilities: entry.request_context.profile.model_capabilities.clone(),
+            max_tokens: request.budget.requested_output_tokens.min(u64::from(u32::MAX)) as u32,
+            context_window_limit: Some(request.budget.context_window_tokens.min(u64::from(u32::MAX)) as u32),
+            messages: self.provider_input_messages(request),
+            system: request.prompt.wire_system_text(),
+            system_cache_prefix: request.prompt.cache_cohort_system_text(),
+            tools: (!active_tools.is_empty()).then_some(active_tools),
+            tool_choice,
+            parallel_tool_calls: entry.request_context.profile.effective_parallel_tool_calls,
+            stream: true,
+            reasoning_effort,
+            temperature: evaluation_request_temperature(),
+            ..Default::default()
+        };
+        Ok((entry, message_request))
+    }
+
     fn provider_input_messages(&self, request: &ApiRequest) -> Vec<InputMessage> {
         let history = convert_messages(request.messages.iter());
         let immutable_prefix = request
@@ -1240,15 +1216,9 @@ fn compile_provider_input_messages(
 async fn forward_provider_attempt(
     entry: ProviderEntry,
     prompt_composition: Option<crate::PromptComposition>,
-    messages: Vec<InputMessage>,
-    system: Option<String>,
+    message_request: MessageRequest,
     cache_cohort_system: Option<String>,
     cache_cohort_user_prefix: Vec<String>,
-    active_tools: Vec<ToolDefinition>,
-    tool_choice: Option<ToolChoice>,
-    max_tokens: u32,
-    context_window_limit: u32,
-    reasoning_effort: Option<String>,
     emit_output: bool,
     stream_callback: Option<tokio::sync::mpsc::Sender<crate::CowdEvent>>,
     evidence_context: Option<ProviderRequestEvidenceContext>,
@@ -1268,22 +1238,6 @@ async fn forward_provider_attempt(
         attempt = request_context.attempt,
         "starting request-local provider attempt"
     );
-    let message_request = MessageRequest {
-        model: entry.model.clone(),
-        protocol_capabilities: entry.request_context.profile.model_capabilities.clone(),
-        max_tokens,
-        context_window_limit: Some(context_window_limit),
-        messages,
-        system,
-        system_cache_prefix: cache_cohort_system.clone(),
-        tools: (!active_tools.is_empty()).then_some(active_tools),
-        tool_choice,
-        parallel_tool_calls: entry.request_context.profile.effective_parallel_tool_calls,
-        stream: true,
-        reasoning_effort,
-        temperature: evaluation_request_temperature(),
-        ..Default::default()
-    };
     let wire_request = match entry.client.wire_request(&message_request) {
         Ok(wire_request) => wire_request,
         Err(error) => {
@@ -2904,6 +2858,43 @@ mod tests {
         (client, request)
     }
 
+    #[test]
+    fn wire_budget_preview_preserves_required_choice_and_counts_the_actual_adapter_body() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (mut client, mut request) = step_wire_fixture("http://127.0.0.1:1/v1".into(), workspace.path());
+        request.budget.set_context_window_source("configured");
+        request.budget.compiled_provider_registry_revision = Some(client.registry.revision());
+        client.configure_tool_choice(true, Some("read_file".into()));
+        client.prepare_request_budget(&mut request).unwrap();
+        client.prepare_request_budget(&mut request).unwrap();
+        assert!(client.tool_choice_required);
+        assert_eq!(client.tool_choice_required_tool_name.as_deref(), Some("read_file"));
+        let (entry, message) = client.prepare_message_request(&request, &client.registry.pin()).unwrap();
+        let wire = entry.client.wire_request(&message).unwrap();
+        let expected = (serde_json::to_vec(&wire.body).unwrap().len() as u64 + 3) / 4;
+        assert_eq!(request.budget.rendered_input_tokens, Some(expected));
+        assert!(expected > 0);
+        assert_eq!(request.budget.render_estimate_source.as_deref(), Some("provider_wire_utf8_bytes_div4_estimated_v1"));
+        assert!(message.tool_choice.is_some());
+        assert!(request.budget.executable);
+    }
+
+    #[test]
+    fn wire_budget_refuses_unknown_profile_overflow_and_changed_profile_without_network() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (client, mut request) = step_wire_fixture("http://127.0.0.1:1/v1".into(), workspace.path());
+        let error = client.prepare_request_budget(&mut request).unwrap_err();
+        assert_eq!(error.context_capacity_failure(), Some(crate::context_ledger::ContextCapacityFailure::UnknownProfile));
+        request.budget.set_context_window_source("configured");
+        request.budget.compiled_provider_registry_revision = Some(client.registry.revision().saturating_add(1));
+        assert!(client.prepare_request_budget(&mut request).unwrap_err().to_string().contains("profile_changed"));
+        request.budget.compiled_provider_registry_revision = Some(client.registry.revision());
+        request.budget.hard_input_cap_tokens = 1;
+        let error = client.prepare_request_budget(&mut request).unwrap_err();
+        assert_eq!(error.context_capacity_failure(), Some(crate::context_ledger::ContextCapacityFailure::RenderOverflow));
+        assert!(!request.budget.executable);
+    }
+
     #[tokio::test]
     async fn bound_step_wire_digest_matches_sent_bytes_and_is_recorded_before_http() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2931,7 +2922,9 @@ mod tests {
             body
         });
         let workspace = tempfile::tempdir().unwrap();
-        let (mut client, request) = step_wire_fixture(format!("http://{address}/v1"), workspace.path());
+        let (mut client, mut request) = step_wire_fixture(format!("http://{address}/v1"), workspace.path());
+        request.budget.set_context_window_source("configured");
+        client.prepare_request_budget(&mut request).unwrap();
         let snapshot = request.bound_step.as_ref().unwrap().snapshot().clone();
         client.configure_provider_wire_evidence(Some(recorder.clone()));
         let events = tokio::time::timeout(std::time::Duration::from_secs(5), client.stream(request).collect::<Vec<_>>()).await.unwrap();

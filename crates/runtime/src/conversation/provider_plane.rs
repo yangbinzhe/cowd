@@ -359,6 +359,15 @@ where
         request
     }
 
+    fn prepare_timed_provider_budget(&self, request: &mut ApiRequest) -> Result<(), RuntimeError> {
+        let started = Instant::now();
+        let result = self.api_client.prepare_request_budget(request);
+        crate::execution_core::performance::observe_duration(
+            "request_wire_budget_ms", started.elapsed(),
+        );
+        result
+    }
+
     fn active_step_goal(
         &self,
         execution: Option<&crate::CowdExecutionContext>,
@@ -421,6 +430,16 @@ where
         &self,
         request: &mut ApiRequest,
     ) -> Result<Option<Arc<crate::step_snapshot::BoundStep>>, RuntimeError> {
+        let started = Instant::now();
+        let result = self.bind_provider_step_inner(request);
+        crate::execution_core::performance::observe_duration("request_step_binding_ms", started.elapsed());
+        result
+    }
+
+    fn bind_provider_step_inner(
+        &self,
+        request: &mut ApiRequest,
+    ) -> Result<Option<Arc<crate::step_snapshot::BoundStep>>, RuntimeError> {
         let Some(lease) = self.tool_executor.pin_step_catalog() else {
             return Ok(None);
         };
@@ -432,7 +451,15 @@ where
         let turn_id = crate::step_snapshot::admitted_turn_id(execution.as_ref(),
             self.session_input_stream.active_turn_id().map(|turn| turn.to_string()))?;
         let policy = self.permission_policy.execution_policy_control().snapshot();
+        if request.budget.compiled_policy_revision.is_some_and(|revision| revision != policy.revision) {
+            return Err(RuntimeError::new("context_policy_changed_after_compilation"));
+        }
         let inventory = self.api_client.context_inventory();
+        if request.budget.compiled_provider_registry_revision
+            .is_some_and(|revision| revision != inventory.provider_registry_revision)
+        {
+            return Err(RuntimeError::new("provider_profile_changed_after_compile"));
+        }
         let identity = harness_contract::step::StepIdentity {
             step_id: uuid::Uuid::new_v4().to_string(),
             session_id: self.session_id().to_string(),
@@ -652,6 +679,10 @@ where
                         }
                     };
                 request.reasoning_effort_override = one_shot_reasoning_effort.clone();
+                if let Err(error) = self.prepare_timed_provider_budget(&mut request) {
+                    last_error = Some(error);
+                    break 'candidate_attempt;
+                }
                 let mut token_reservations = match ProviderTokenReservationSet::acquire(
                     self.evaluation_provider_token_lease.as_ref(),
                     self.delegated_provider_budget.as_ref(),
@@ -675,8 +706,7 @@ where
                         context_window_source: request.budget.context_window_source.clone(),
                         packed_input_tokens: request
                             .budget
-                            .fixed_input_tokens
-                            .saturating_add(request.budget.dynamic_input_tokens)
+                            .input_total_tokens()
                             .saturating_add(request.budget.protocol_overhead_tokens),
                     });
                 }
@@ -1160,8 +1190,7 @@ where
         let lease = if let Some(manager) = &self.provider_admission {
             let estimated_tokens = request
                 .budget
-                .fixed_input_tokens
-                .saturating_add(request.budget.dynamic_input_tokens)
+                .input_total_tokens()
                 .saturating_add(request.budget.protocol_overhead_tokens)
                 .saturating_add(request.budget.requested_output_tokens);
             let demands = self.api_client.provider_name_for_model(model).map_or_else(
@@ -1303,8 +1332,10 @@ where
         items: Vec<ContextItem>,
         clock_stamp: &crate::prompt::RuntimeClockStamp,
     ) -> PromptAssembly {
-        self.prepare_reality_context_with_budget_and_items(user_input, budget, items, clock_stamp)
-            .await
+        let policy_revision = self.permission_policy.execution_policy_control().snapshot().revision;
+        let mut prompt = self.prepare_reality_context_with_budget_and_items(user_input, budget, items, clock_stamp).await;
+        prompt.context_policy_revision = Some(policy_revision);
+        prompt
     }
 
     /// Execute one Provider step while optionally dispatching completed,
@@ -1571,9 +1602,6 @@ where
         } else {
             None
         };
-        self.api_client
-            .configure_tool_choice(tool_choice_required, tool_choice_required_tool_name);
-
         // Tool schemas are part of the request budget. Read their inventory
         // only after Runtime has made the exposure decision.
         let inventory = self.api_client.context_inventory();
@@ -1800,6 +1828,7 @@ where
         while let Some((model, provider_account_key)) =
             self.next_available_provider_candidate(&mut candidates)
         {
+            self.api_client.configure_tool_choice(tool_choice_required, tool_choice_required_tool_name.clone());
             let materialized =
                 self.pack_timed_provider_attempt(&prompt, &request_messages, &model, inventory);
             let mut request = match materialized {
@@ -1815,6 +1844,10 @@ where
                 }
             };
             request.reasoning_effort_override = one_shot_reasoning_effort.clone();
+            if let Err(error) = self.prepare_timed_provider_budget(&mut request) {
+                last_error = Some(error);
+                continue;
+            }
             let mut token_reservations = match ProviderTokenReservationSet::acquire(
                 self.evaluation_provider_token_lease.as_ref(),
                 self.delegated_provider_budget.as_ref(),
@@ -1838,8 +1871,7 @@ where
                     context_window_source: request.budget.context_window_source.clone(),
                     packed_input_tokens: request
                         .budget
-                        .fixed_input_tokens
-                        .saturating_add(request.budget.dynamic_input_tokens)
+                        .input_total_tokens()
                         .saturating_add(request.budget.protocol_overhead_tokens),
                 });
             }

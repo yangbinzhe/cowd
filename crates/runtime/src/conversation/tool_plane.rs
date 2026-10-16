@@ -141,14 +141,19 @@ where
             .map(|call| (call.id.clone(), call.name.clone(), call.input.clone()))
             .collect::<Vec<_>>();
         let mut prepared = Vec::with_capacity(requests.len());
+        let mut admission_rejections = BTreeMap::new();
         for request in &requests {
             if let Some(invocation) = replay_invocations.get(&request.tool_use_id) { prepared.push(invocation.clone()); }
-            else { prepared.extend(self.tool_executor.prepare_step_invocations(std::slice::from_ref(request), calls)
-                .map_err(|error| RuntimeError::new(error.to_string()))?); }
+            else {
+                match self.tool_executor.prepare_step_invocations(std::slice::from_ref(request), calls) {
+                    Ok(invocations) => prepared.extend(invocations),
+                    Err(error) => { admission_rejections.insert(request.tool_use_id.clone(), format!("step admission refused: {error}")); }
+                }
+            }
         }
         let workspace_root = self.governed_workspace_root()?;
         let compilation =
-            GovernedToolCompiler.compile_partial(&workspace_root, &requests, |name, input| {
+            GovernedToolCompiler.compile_partial_with_rejections(&workspace_root, &requests, &admission_rejections, |name, input| {
                 prepared
                     .iter()
                     .find(|invocation| {

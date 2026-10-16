@@ -3441,7 +3441,7 @@ mod tests {
             .load()
             .expect("runtime config should load");
         let registry = std::sync::Arc::new(
-            runtime::ProviderRegistry::new(config.providers().clone())
+            runtime::ProviderRegistry::new_with_context_windows(config.providers().clone(), config.model_context_windows().clone())
                 .expect("provider registry should initialize"),
         );
         let mut client = runtime::ProviderRuntimeClient::new(registry, model.clone(), Vec::new())

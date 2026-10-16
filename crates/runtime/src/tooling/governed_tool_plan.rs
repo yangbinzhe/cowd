@@ -282,8 +282,25 @@ impl GovernedToolCompiler {
     where
         F: Fn(&str, &Value) -> Option<(ToolEffectDescriptor, u64, String)>,
     {
+        self.compile_partial_with_rejections(
+            workspace_root, requests, &BTreeMap::new(), describe_registered_tool,
+        )
+    }
+
+    pub fn compile_partial_with_rejections<F>(
+        &self,
+        workspace_root: &Path,
+        requests: &[ToolRequest],
+        admission_rejections: &BTreeMap<String, String>,
+        describe_registered_tool: F,
+    ) -> Result<GovernedToolCompilation, GovernedToolCompileError>
+    where
+        F: Fn(&str, &Value) -> Option<(ToolEffectDescriptor, u64, String)>,
+    {
         let id_to_index = validate_task_ids(requests)?;
-        let mut rejected = BTreeMap::<usize, String>::new();
+        let mut rejected = requests.iter().enumerate().filter_map(|(index, request)| {
+            admission_rejections.get(&request.tool_use_id).map(|reason| (index, reason.clone()))
+        }).collect::<BTreeMap<_, _>>();
 
         for (index, request) in requests.iter().enumerate() {
             for dependency in &request.depends_on {

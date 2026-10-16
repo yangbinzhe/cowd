@@ -2415,6 +2415,14 @@ fn knowledge_hard_gate_active(system_prompt: &[String]) -> bool {
 /// For backward compatibility, a `collect()` call gathers all events
 /// into a Vec (same as the old sync signature).
 pub trait ApiClient {
+    fn configured_context_window(&self, _model: &str) -> Option<u32> {
+        None
+    }
+
+    fn prepare_request_budget(&self, _request: &mut ApiRequest) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
     fn step_tool_definitions(&self) -> Option<Vec<crate::ProviderToolDefinition>> {
         None
     }
@@ -3023,6 +3031,7 @@ impl std::error::Error for ToolError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeError {
     message: String,
+    context_capacity_failure: Option<crate::context_ledger::ContextCapacityFailure>,
     provider_failure_scope: model_protocol::provider_failure::ProviderFailureScope,
     provider_account_key: Option<String>,
     provider_context_window_limit: Option<u32>,
@@ -3040,9 +3049,25 @@ pub struct RuntimeError {
 
 impl RuntimeError {
     #[must_use]
+    pub fn context_capacity(
+        failure: crate::context_ledger::ContextCapacityFailure,
+        message: impl Into<String>,
+    ) -> Self {
+        let mut error = Self::new(message);
+        error.context_capacity_failure = Some(failure);
+        error
+    }
+
+    #[must_use]
+    pub const fn context_capacity_failure(&self) -> Option<crate::context_ledger::ContextCapacityFailure> {
+        self.context_capacity_failure
+    }
+
+    #[must_use]
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            context_capacity_failure: None,
             provider_failure_scope: model_protocol::provider_failure::ProviderFailureScope::Request,
             provider_account_key: None,
             provider_context_window_limit: None,
@@ -3064,6 +3089,7 @@ impl RuntimeError {
     ) -> Self {
         Self {
             message: message.into(),
+            context_capacity_failure: None,
             provider_failure_scope: model_protocol::provider_failure::ProviderFailureScope::Request,
             provider_account_key: None,
             provider_context_window_limit,
@@ -3127,6 +3153,7 @@ impl RuntimeError {
     ) -> Self {
         Self {
             message: message.into(),
+            context_capacity_failure: None,
             provider_failure_scope,
             provider_account_key: None,
             provider_context_window_limit,
@@ -3145,6 +3172,7 @@ impl RuntimeError {
     pub fn with_tool_exposure_miss(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            context_capacity_failure: None,
             provider_failure_scope: model_protocol::provider_failure::ProviderFailureScope::Request,
             provider_account_key: None,
             provider_context_window_limit: None,
@@ -4514,7 +4542,7 @@ fn initialize_automatic_memory_manager(
         .is_configured()
         .then(|| {
             let registry = Arc::new(
-                crate::ProviderRegistry::new(feature_config.providers().clone())
+                crate::ProviderRegistry::new_with_context_windows(feature_config.providers().clone(), feature_config.model_context_windows().clone())
                     .map_err(|rejected| rejected.diagnostics.errors.join("; "))?,
             );
             crate::RuntimeMemorySummarizer::new(

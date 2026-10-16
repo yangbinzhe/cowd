@@ -148,6 +148,7 @@ impl std::error::Error for PromptPackingError {}
 /// controls. Generic `ContextItem`s are intentionally never appended here.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PromptAssembly {
+    pub(crate) context_policy_revision: Option<u64>,
     /// Byte-stable policy/instruction prefix sent in the Provider system
     /// channel. Request-local data is never stored here.
     pub(crate) trusted_system: Vec<String>,
@@ -199,6 +200,7 @@ impl PromptAssembly {
         }
         let cache_cohort_segment_count = cache_cohort_segment_count.unwrap_or(stable.len());
         Self {
+            context_policy_revision: None,
             trusted_system: stable,
             cache_cohort_segment_count,
             cache_cohort_user_prefix: Vec::new(),
@@ -273,6 +275,7 @@ impl PromptAssembly {
         let cache_cohort_segment_count = cache_cohort_segment_count.min(trusted_system.len());
         Self {
             trusted_system,
+            context_policy_revision: None,
             cache_cohort_segment_count,
             cache_cohort_user_prefix: Vec::new(),
             immutable_user_prefix: Vec::new(),
@@ -511,6 +514,7 @@ impl PromptAssembly {
         hard_token_allowance: u64,
     ) -> Result<(Self, u64, Vec<String>, BTreeMap<String, String>), PromptPackingError> {
         let mut packed = Self {
+            context_policy_revision: self.context_policy_revision,
             trusted_system: self.trusted_system.clone(),
             cache_cohort_segment_count: self.cache_cohort_segment_count,
             cache_cohort_user_prefix: self.cache_cohort_user_prefix.clone(),

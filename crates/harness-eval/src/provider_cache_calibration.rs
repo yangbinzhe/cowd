@@ -92,7 +92,7 @@ pub fn run_provider_cache_calibration(
         .load()
         .map_err(|error| format!("runtime config load failed: {error}"))?;
     let registry = Arc::new(
-        runtime::ProviderRegistry::new(config.providers().clone())
+        runtime::ProviderRegistry::new_with_context_windows(config.providers().clone(), config.model_context_windows().clone())
             .map_err(|rejected| rejected.diagnostics.errors.join("; "))?,
     );
     let evidence = Arc::new(CalibrationEvidence::default());

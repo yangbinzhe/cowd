@@ -1978,6 +1978,28 @@
             .evidence_ref
             .as_ref()
             .is_some_and(harness_contract::context::EvidenceAccessRef::is_durable));
+        let repeated = runtime.prepare_governed_tool_result("governed-read-2", "read_file",
+            r#"{"path":"README.md"}"#, &raw, false).await.unwrap();
+        let observations = runtime.turn_tool_observations();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].output_envelope.as_ref().unwrap().artifact_ref.as_ref().unwrap().selector,
+            observations[1].output_envelope.as_ref().unwrap().artifact_ref.as_ref().unwrap().selector,
+            "same revision content reuses its durable body, not another invocation's identity");
+        assert_ne!(observations[0].raw_ref, observations[1].raw_ref);
+        let calls = ConversationMessage::assistant(["governed-read-1", "governed-read-2"].into_iter().map(|id|
+            ContentBlock::ToolUse { id: id.into(), name: "read_file".into(), input: r#"{"path":"README.md"}"#.into() }).collect());
+        let wire = crate::provider_runtime_client::convert_messages(&[calls, receipt, repeated]);
+        let mut call_ids = std::collections::BTreeSet::new();
+        let mut result_ids = std::collections::BTreeSet::new();
+        for block in wire.iter().flat_map(|message| &message.content) {
+            match block {
+                provider::InputContentBlock::ToolUse { id, .. } => { call_ids.insert(id.clone()); }
+                provider::InputContentBlock::ToolResult { tool_use_id, .. } => { result_ids.insert(tool_use_id.clone()); }
+                _ => {}
+            }
+        }
+        assert_eq!(call_ids.len(), 2);
+        assert_eq!(call_ids, result_ids, "body reuse must not orphan a provider call or result");
     }
 
     #[tokio::test]

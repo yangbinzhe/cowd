@@ -449,7 +449,9 @@ async fn episode_set_pair(real_skill: bool) {
     };
     let mut builder = RuntimeServices::test_builder(temp.path().join("home"), &workspace)
         .provider_registry(Arc::new(
-            crate::ProviderRegistry::new(providers).expect("providers"),
+            crate::ProviderRegistry::new_with_context_windows(providers,
+                std::collections::BTreeMap::from([("fast".into(), 128_000)]),
+            ).expect("providers"),
         ))
         .evolution_eval_runner(Arc::new(ReadinessOnlyEvolutionEvalRunner));
     if let Some(local) = &local {

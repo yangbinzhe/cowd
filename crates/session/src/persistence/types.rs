@@ -792,6 +792,27 @@ impl SessionRecoveryManifest {
     }
 }
 
+impl ContextIndexCard {
+    #[must_use]
+    pub fn matches_source(&self, messages: &[SessionMessage]) -> bool {
+        if messages.is_empty() || self.schema_version != CONTEXT_INDEX_CARD_SCHEMA_VERSION
+            || messages.iter().any(|message| message.session_id != self.session_id)
+            || messages.windows(2).any(|pair| pair[0].sequence >= pair[1].sequence)
+        {
+            return false;
+        }
+        let expected = build_leaf_context_card(&self.session_id, messages, self.generation, self.updated_at_ms);
+        self.card_id == expected.card_id
+            && self.source_start_sequence == expected.source_start_sequence
+            && self.source_end_sequence == expected.source_end_sequence
+            && self.source_message_count == expected.source_message_count
+            && self.source_digest == expected.source_digest
+            && self.summary == expected.summary
+            && self.scope == expected.scope
+            && self.authority == expected.authority
+    }
+}
+
 /// Explicit recovery signals whose source of truth is outside the transcript.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -222,7 +222,7 @@ async fn native_coordination_wire(supplement: bool, fail_input_request: bool) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let provider = Arc::new(
-        crate::ProviderRegistry::new(model_protocol::provider_config::ProvidersConfig {
+        crate::ProviderRegistry::new_with_context_windows(model_protocol::provider_config::ProvidersConfig {
             providers: std::collections::HashMap::from([(
                 "test".into(),
                 model_protocol::provider_config::ProviderConfig {
@@ -235,7 +235,7 @@ async fn native_coordination_wire(supplement: bool, fail_input_request: bool) {
                     early_tool_start: Default::default(),
                 },
             )]),
-        })
+        }, std::collections::BTreeMap::from([("test".into(), 128_000)]))
         .unwrap(),
     );
     let fixture = crate::agentic::coordination::tests::fixture_with_provider(provider).await;

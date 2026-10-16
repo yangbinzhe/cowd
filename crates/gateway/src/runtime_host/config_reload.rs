@@ -842,7 +842,7 @@ pub(crate) fn apply_runtime_providers(
             },
         });
     }
-    let update = match provider_registry.replace(providers) {
+    let update = match provider_registry.replace_with_context_windows(providers, runtime_config.model_context_windows().clone()) {
         Ok(update) => update,
         Err(rejected) => {
             tracing::warn!(

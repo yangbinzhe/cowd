@@ -4,7 +4,7 @@
 //! so a successful reload affects only requests that start after the revision is
 //! published. Invalid replacements never mutate the last valid snapshot.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -15,10 +15,17 @@ use model_protocol::provider_config::ParallelToolCallsMode;
 #[derive(Debug, Clone)]
 pub struct ProviderRegistrySnapshot {
     config: Arc<ProvidersConfig>,
+    model_context_windows: Arc<BTreeMap<String, u32>>,
     revision: u64,
 }
 
 impl ProviderRegistrySnapshot {
+    #[must_use]
+    pub fn configured_context_window(&self, model: &str) -> Option<u32> {
+        let resolution = provider::model_context_window_resolution(model, Some(&self.model_context_windows));
+        (resolution.source == provider::ModelContextWindowSource::Configured).then_some(resolution.tokens)
+    }
+
     #[must_use]
     pub fn revision(&self) -> u64 {
         self.revision
@@ -105,14 +112,28 @@ pub struct ProviderRegistryRejected {
 }
 
 #[derive(Debug)]
+struct ProviderConfiguration {
+    config: Arc<ProvidersConfig>,
+    model_context_windows: Arc<BTreeMap<String, u32>>,
+}
+
+#[derive(Debug)]
 pub struct ProviderRegistry {
-    snapshot: RwLock<Arc<ProvidersConfig>>,
+    snapshot: RwLock<ProviderConfiguration>,
     revision: AtomicU64,
 }
 
 impl ProviderRegistry {
     pub fn new(config: ProvidersConfig) -> Result<Self, ProviderRegistryRejected> {
-        let diagnostics = validate_provider_config(&config);
+        Self::new_with_context_windows(config, BTreeMap::new())
+    }
+
+    pub fn new_with_context_windows(
+        config: ProvidersConfig,
+        model_context_windows: BTreeMap<String, u32>,
+    ) -> Result<Self, ProviderRegistryRejected> {
+        let mut diagnostics = validate_provider_config(&config);
+        validate_context_windows(&model_context_windows, &mut diagnostics);
         if !diagnostics.is_valid() {
             return Err(ProviderRegistryRejected {
                 retained_revision: 0,
@@ -120,7 +141,9 @@ impl ProviderRegistry {
             });
         }
         Ok(Self {
-            snapshot: RwLock::new(Arc::new(config)),
+            snapshot: RwLock::new(ProviderConfiguration {
+                config: Arc::new(config), model_context_windows: Arc::new(model_context_windows),
+            }),
             revision: AtomicU64::new(1),
         })
     }
@@ -128,7 +151,9 @@ impl ProviderRegistry {
     #[must_use]
     pub fn empty() -> Self {
         Self {
-            snapshot: RwLock::new(Arc::new(ProvidersConfig::default())),
+            snapshot: RwLock::new(ProviderConfiguration {
+                config: Arc::new(ProvidersConfig::default()), model_context_windows: Arc::new(BTreeMap::new()),
+            }),
             revision: AtomicU64::new(1),
         }
     }
@@ -140,8 +165,9 @@ impl ProviderRegistry {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let revision = self.revision.load(Ordering::Acquire);
-        let config = guard.clone();
-        ProviderRegistrySnapshot { config, revision }
+        let config = guard.config.clone();
+        let model_context_windows = guard.model_context_windows.clone();
+        ProviderRegistrySnapshot { config, model_context_windows, revision }
     }
 
     #[must_use]
@@ -153,7 +179,26 @@ impl ProviderRegistry {
         &self,
         config: ProvidersConfig,
     ) -> Result<ProviderRegistryUpdate, ProviderRegistryRejected> {
-        let diagnostics = validate_provider_config(&config);
+        self.replace_inner(config, None)
+    }
+
+    pub fn replace_with_context_windows(
+        &self,
+        config: ProvidersConfig,
+        model_context_windows: BTreeMap<String, u32>,
+    ) -> Result<ProviderRegistryUpdate, ProviderRegistryRejected> {
+        self.replace_inner(config, Some(model_context_windows))
+    }
+
+    fn replace_inner(
+        &self,
+        config: ProvidersConfig,
+        model_context_windows: Option<BTreeMap<String, u32>>,
+    ) -> Result<ProviderRegistryUpdate, ProviderRegistryRejected> {
+        let mut diagnostics = validate_provider_config(&config);
+        if let Some(windows) = model_context_windows.as_ref() {
+            validate_context_windows(windows, &mut diagnostics);
+        }
         if !diagnostics.is_valid() {
             return Err(ProviderRegistryRejected {
                 retained_revision: self.revision(),
@@ -172,7 +217,8 @@ impl ProviderRegistry {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous_revision = self.revision.load(Ordering::Relaxed);
-        if **guard == config {
+        let windows = model_context_windows.map(Arc::new).unwrap_or_else(|| guard.model_context_windows.clone());
+        if *guard.config == config && *guard.model_context_windows == *windows {
             return Ok(ProviderRegistryUpdate {
                 changed: false,
                 previous_revision,
@@ -182,7 +228,7 @@ impl ProviderRegistry {
                 diagnostics,
             });
         }
-        *guard = Arc::new(config);
+        *guard = ProviderConfiguration { config: Arc::new(config), model_context_windows: windows };
         let revision = previous_revision.saturating_add(1);
         self.revision.store(revision, Ordering::Release);
 
@@ -194,6 +240,14 @@ impl ProviderRegistry {
             model_count,
             diagnostics,
         })
+    }
+}
+
+fn validate_context_windows(windows: &BTreeMap<String, u32>, diagnostics: &mut ProviderRegistryDiagnostics) {
+    for (model, tokens) in windows {
+        if model.trim().is_empty() || *tokens < 1_024 {
+            diagnostics.errors.push(format!("configured context window for `{model}` must have a nonempty model and at least 1024 tokens"));
+        }
     }
 }
 
@@ -294,6 +348,27 @@ mod tests {
         assert_eq!(update.revision, 2);
         assert!(update.changed);
         assert!(registry.pin().resolve("new").is_some());
+    }
+
+    #[test]
+    fn configured_windows_and_routes_share_one_atomic_revision_and_invalid_reload_retains_both() {
+        let registry = ProviderRegistry::new_with_context_windows(providers("private"),
+            BTreeMap::from([("private".into(), 128_000)])).unwrap();
+        let pinned = registry.pin();
+        let update = registry.replace_with_context_windows(providers("private"),
+            BTreeMap::from([("private".into(), 32_768)])).unwrap();
+        assert!(update.changed);
+        assert_eq!(pinned.configured_context_window("private"), Some(128_000));
+        assert_eq!(registry.pin().configured_context_window("private"), Some(32_768));
+        assert!(registry.replace_with_context_windows(providers("changed"),
+            BTreeMap::from([("changed".into(), 0)])).is_err());
+        let retained = registry.pin();
+        assert_eq!(retained.revision(), update.revision);
+        assert!(retained.resolve("private").is_some());
+        assert_eq!(retained.configured_context_window("private"), Some(32_768));
+        assert!(retained.resolve("changed").is_none());
+        assert!(registry.replace(providers("private")).is_ok());
+        assert_eq!(registry.pin().configured_context_window("private"), Some(32_768));
     }
 
     #[test]

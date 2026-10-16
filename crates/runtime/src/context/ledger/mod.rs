@@ -3,6 +3,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use harness_contract::context::{ContextComponentUsage, ContextLedgerProjection};
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextCapacityFailure {
+    UnknownProfile,
+    RequiredOverflow,
+    RenderOverflow,
+}
+
 /// Per-provider-attempt capacity contract. The hard cap is the only request
 /// packing limit; subsystem budgets never reserve an arbitrary percentage of
 /// a model window for the request itself.
@@ -31,6 +39,14 @@ pub struct RequestBudgetReport {
     #[serde(default)]
     pub required_input_tokens: u64,
     pub dynamic_input_tokens: u64,
+    #[serde(default)]
+    pub rendered_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub render_estimate_source: Option<String>,
+    #[serde(default)]
+    pub compiled_provider_registry_revision: Option<u64>,
+    #[serde(default)]
+    pub compiled_policy_revision: Option<u64>,
     pub omitted_packet_ids: Vec<String>,
     #[serde(default)]
     pub omitted_packet_reasons: BTreeMap<String, String>,
@@ -67,6 +83,10 @@ impl RequestBudgetReport {
             fixed_input_tokens,
             required_input_tokens: 0,
             dynamic_input_tokens: 0,
+            rendered_input_tokens: None,
+            render_estimate_source: None,
+            compiled_provider_registry_revision: None,
+            compiled_policy_revision: None,
             omitted_packet_ids: Vec::new(),
             omitted_packet_reasons: BTreeMap::new(),
             executable: fixed_input_tokens <= hard_input_cap_tokens,
@@ -118,6 +138,13 @@ impl RequestBudgetReport {
     pub fn input_total_tokens(&self) -> u64 {
         self.fixed_input_tokens
             .saturating_add(self.dynamic_input_tokens)
+            .max(self.rendered_input_tokens.unwrap_or_default())
+    }
+
+    pub fn record_rendered_input(&mut self, tokens: u64, source: impl Into<String>) {
+        self.rendered_input_tokens = Some(tokens);
+        self.render_estimate_source = Some(source.into());
+        self.executable = self.executable && self.input_total_tokens() <= self.hard_input_cap_tokens;
     }
 }
 

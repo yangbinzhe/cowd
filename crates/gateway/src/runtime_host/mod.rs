@@ -1507,7 +1507,9 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     let runtime_config = loaded.config;
     let config_diagnostics = loaded.diagnostics;
     emit_config_diagnostics(&config_diagnostics);
-    let provider_registry = match runtime::ProviderRegistry::new(runtime_config.providers().clone())
+    let provider_registry = match runtime::ProviderRegistry::new_with_context_windows(
+        runtime_config.providers().clone(), runtime_config.model_context_windows().clone(),
+    )
     {
         Ok(registry) => Arc::new(registry),
         Err(rejected) => {

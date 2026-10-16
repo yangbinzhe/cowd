@@ -181,6 +181,28 @@ async fn expired_replay_is_seeded_into_the_existing_dag_before_a_fresh_dependent
     assert_eq!(failed.failed, 2, "{:?}", failed.messages);
     assert_eq!(executed.load(Ordering::SeqCst), 1);
     assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 0);
+    let input = r#"{"path":"same-source.txt"}"#;
+    let expired_read = bind("expired-partial-read", "read_file", 10);
+    let fresh_read = bind("fresh-partial-read", "read_file", i64::MAX);
+    let partial_calls = [
+        ModelToolCall { id: "refused-read".into(), name: "read_file".into(), input: input.into(), depends_on: vec![],
+            binding: Some(crate::step_snapshot::StepCallBinding::provider(expired_read, "refused-read")) },
+        ModelToolCall { id: "blocked-read".into(), name: "read_file".into(), input: input.into(), depends_on: vec!["refused-read".into()],
+            binding: Some(crate::step_snapshot::StepCallBinding::provider(fresh_read.clone(), "blocked-read")) },
+        ModelToolCall { id: "independent-read".into(), name: "read_file".into(), input: input.into(), depends_on: vec![],
+            binding: Some(crate::step_snapshot::StepCallBinding::provider(fresh_read, "independent-read")) },
+    ];
+    let partial = runtime.execute_tool_batch_step(&partial_calls, &crate::SharedPrompter::none(), 0).await.unwrap();
+    assert_eq!(partial.messages.len(), 3);
+    assert_eq!(partial.failed, 2, "{:?}", partial.messages);
+    assert_eq!(executed.load(Ordering::SeqCst), 2, "only the independent sibling may execute");
+    assert!(partial.messages.iter().any(|message| message.blocks.iter().any(|block|
+        matches!(block, ContentBlock::ToolResult { tool_use_id, is_error: true, output, .. }
+            if tool_use_id == "blocked-read" && output.contains("refused-read")))));
+    let duplicate = runtime.execute_tool_batch_step(&[partial_calls[2].clone(), partial_calls[2].clone()],
+        &crate::SharedPrompter::none(), 0).await.unwrap();
+    assert_eq!(duplicate.failed, 2);
+    assert_eq!(executed.load(Ordering::SeqCst), 2, "ambiguous duplicate carrier must have zero effects");
 }
 
     #[test]

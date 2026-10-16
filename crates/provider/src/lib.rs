@@ -31,6 +31,7 @@ pub use providers::anthropic::{AnthropicClient, AnthropicClient as ApiClient, Au
 pub use providers::openai_compat::{OpenAiCompatClient, OpenAiCompatConfig, OpenAiWireProtocol};
 pub use providers::openai_compat::repair_truncated_json;
 pub use providers::{
+    preflight_message_request,
     detect_provider_kind, max_tokens_for_model, max_tokens_for_model_with_override,
     model_context_window, model_context_window_resolution, model_context_window_with_overrides,
     model_max_output_resolution, ModelContextWindowResolution, ModelContextWindowSource,

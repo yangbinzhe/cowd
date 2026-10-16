@@ -1480,6 +1480,12 @@ where
         } else {
             provider::model_context_window_resolution(model, Some(&self.model_context_windows))
         };
+        if let Some(tokens) = self.api_client.configured_context_window(model) {
+            resolution.tokens = if resolution.source == provider::ModelContextWindowSource::Configured {
+                resolution.tokens.min(tokens)
+            } else { tokens };
+            resolution.source = provider::ModelContextWindowSource::Configured;
+        }
         if let Ok(calibrated) = self.calibrated_model_context_windows.lock() {
             if let Some(&tokens) = calibrated
                 .get(model)
@@ -1759,6 +1765,10 @@ where
         model: &str,
         inventory: ProviderContextInventory,
     ) -> Result<ApiRequest, RuntimeError> {
+        let policy_revision = self.permission_policy.execution_policy_control().snapshot().revision;
+        if prompt.context_policy_revision.is_some_and(|revision| revision != policy_revision) {
+            return Err(RuntimeError::new("context_policy_changed_during_compilation"));
+        }
         let window_resolution = self.context_window_resolution_for_model(model);
         let context_window_tokens = u64::from(window_resolution.tokens);
         // Protocol framing is deliberately explicit and conservative. Schema
@@ -1779,7 +1789,7 @@ where
             prompt,
             messages,
             inventory,
-            self.permission_fingerprint,
+            model_protocol::fingerprint::hash_serializable(&(self.permission_fingerprint, policy_revision)),
             model,
         );
         let fixed_input_tokens = prepared.fixed_input_tokens;
@@ -1795,7 +1805,7 @@ where
             safety_margin_tokens,
         });
         if !output_budget.executable {
-            return Err(RuntimeError::new(format!(
+            return Err(RuntimeError::context_capacity(crate::context_ledger::ContextCapacityFailure::RequiredOverflow, format!(
                 "provider candidate `{model}` cannot fit fixed and required request components with a viable continuation: fixed={fixed_input_tokens} required={required_input_tokens} window={context_window_tokens} available_output={} output_floor={}",
                 output_budget.available_output_tokens, output_budget.floor_output_tokens,
             )));
@@ -1816,6 +1826,8 @@ where
             required_input_tokens,
         );
         budget.set_context_window_source(window_resolution.source.as_str());
+        budget.compiled_provider_registry_revision = Some(inventory.provider_registry_revision);
+        budget.compiled_policy_revision = Some(policy_revision);
         if !budget.executable {
             return Err(RuntimeError::new(format!(
                 "provider candidate `{model}` cannot fit fixed request components: fixed={} hard_input_cap={} window={} output_reserve={}",
@@ -1827,7 +1839,9 @@ where
         }
         let (packed_prompt, dynamic_tokens, omitted_packet_ids, omitted_packet_reasons) = prompt
             .pack_for_hard_cap(budget.dynamic_hard_remaining())
-            .map_err(|error| RuntimeError::new(error.to_string()))?;
+            .map_err(|error| RuntimeError::context_capacity(
+                crate::context_ledger::ContextCapacityFailure::RequiredOverflow, error.to_string(),
+            ))?;
         budget.record_dynamic_packets(dynamic_tokens, omitted_packet_ids, omitted_packet_reasons);
         if !budget.executable {
             return Err(RuntimeError::new(format!(
@@ -2216,7 +2230,6 @@ where
         scored.truncate(8);
         let exact_ranges = scored
             .iter()
-            .filter(|(score, _)| *score >= 0.45)
             .map(|(_, card)| (card.source_start_sequence, card.source_end_sequence))
             .collect::<Vec<_>>();
         let context_messages = if exact_ranges.is_empty() {
@@ -2240,6 +2253,15 @@ where
 
         let mut items = Vec::new();
         for (score, card) in scored {
+            let messages = context_messages.iter()
+                .filter(|message| message.sequence >= card.source_start_sequence
+                    && message.sequence < card.source_end_sequence)
+                .take(128).cloned().collect::<Vec<_>>();
+            if card.session_id != session_id || !card.matches_source(&messages) {
+                tracing::warn!(session_id, card_id = card.card_id, "Session navigation source or summary mismatch; suppressed");
+                self.degrade_context_source(ContextSourceKind::Conversation);
+                continue;
+            }
             let mut navigation = ContextItem::new(
                 card.card_id.clone(),
                 ContextSourceKind::Conversation,
@@ -2271,23 +2293,6 @@ where
             // A strong card match is expanded from the immutable transcript.
             // The card remains a locator; exact rows remain authoritative.
             if score < 0.45 {
-                continue;
-            }
-            let messages = context_messages
-                .iter()
-                .filter(|message| {
-                    message.sequence >= card.source_start_sequence
-                        && message.sequence < card.source_end_sequence
-                })
-                .take(128)
-                .cloned()
-                .collect::<Vec<_>>();
-            if session::context_index_source_digest(&messages) != card.source_digest {
-                tracing::warn!(
-                    session_id,
-                    card_id = card.card_id,
-                    "Session card source digest mismatch; exact expansion suppressed"
-                );
                 continue;
             }
             for message in messages {

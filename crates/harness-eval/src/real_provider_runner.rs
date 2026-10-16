@@ -94,7 +94,7 @@ pub(crate) fn run_deep_real_provider_review(
                 .map_err(|error| error.to_string())
         })
         .and_then(|config| {
-            runtime::ProviderRegistry::new(config.providers().clone())
+            runtime::ProviderRegistry::new_with_context_windows(config.providers().clone(), config.model_context_windows().clone())
                 .map(std::sync::Arc::new)
                 .map_err(|rejected| rejected.diagnostics.errors.join("; "))
         });

@@ -7,6 +7,8 @@ use crate::{HistoryView, PromptAssembly, ProviderContextInventory};
 struct RequestCompilationKey {
     context_fingerprint: u64,
     history_revision: u64,
+    history_position: usize,
+    history_tokens: u64,
     tool_schema_fingerprint: u64,
     permission_fingerprint: u64,
     provider_registry_revision: u64,
@@ -62,6 +64,8 @@ impl PreparedRequestCompiler {
         let key = RequestCompilationKey {
             context_fingerprint: prompt.revision_fingerprint(),
             history_revision: history.cursor().revision,
+            history_position: history.cursor().position,
+            history_tokens: history.weight().tokens,
             tool_schema_fingerprint: inventory.schema_fingerprint,
             permission_fingerprint,
             provider_registry_revision: inventory.provider_registry_revision,
