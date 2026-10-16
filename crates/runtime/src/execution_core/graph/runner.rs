@@ -88,6 +88,7 @@ pub(crate) struct ExecutionGraphPumpSnapshot {
 
 pub(crate) struct ExecutionPreparedPumpNode {
     pub(crate) node: harness_contract::execution_graph::ExecutionNodeSpec,
+    pub(crate) binding: Option<ExecutionNodeBinding>,
     startup_error: Option<ExecutionRunnerError>,
 }
 
@@ -99,12 +100,12 @@ struct ActiveNode {
     resource_started: std::time::Instant,
     effect_state: ExecutionEffectState,
     effect_receipt_required: bool,
-    wave_prepared: bool,
     _resources: NodeResourceGuards,
 }
 
 struct PendingTerminalCommit {
     transition: ExecutionTerminalCommit,
+    expected_binding: Option<ExecutionNodeBinding>,
     response: oneshot::Sender<TerminalCommitDisposition>,
 }
 
@@ -630,6 +631,7 @@ impl ExecutionGraphRunner {
             return Ok(nodes
                 .into_iter()
                 .map(|node| ExecutionPreparedPumpNode {
+                    binding: None,
                     startup_error: Some(ExecutionRunnerError::CommandSuperseded {
                         node_id: node.id.clone(),
                     }),
@@ -650,6 +652,7 @@ impl ExecutionGraphRunner {
                 Ok(value) => value,
                 Err(error) => {
                     output.push(ExecutionPreparedPumpNode {
+                        binding: None,
                         node,
                         startup_error: Some(error),
                     });
@@ -658,6 +661,7 @@ impl ExecutionGraphRunner {
             };
             if deadline_at_ms.is_some_and(|deadline| deadline <= now_ms()) {
                 output.push(ExecutionPreparedPumpNode {
+                    binding: None,
                     startup_error: Some(ExecutionRunnerError::DeadlineExceeded {
                         node_id: node.id.clone(),
                         deadline_at_ms: deadline_at_ms.unwrap_or_default(),
@@ -673,6 +677,7 @@ impl ExecutionGraphRunner {
                 Ok(resources) => resources,
                 Err(error) => {
                     output.push(ExecutionPreparedPumpNode {
+                        binding: None,
                         node,
                         startup_error: Some(error),
                     });
@@ -696,6 +701,7 @@ impl ExecutionGraphRunner {
                     crate::execution_core::graph::ResourceResultClass::Failed,
                 );
                 output.push(ExecutionPreparedPumpNode {
+                    binding: None,
                     startup_error: Some(
                         NodeExecutorError::Unavailable {
                             executor_kind: node.executor_kind.clone(),
@@ -731,6 +737,7 @@ impl ExecutionGraphRunner {
                         crate::execution_core::graph::ResourceResultClass::Failed,
                     );
                     output.push(ExecutionPreparedPumpNode {
+                        binding: None,
                         node,
                         startup_error: Some(error.into()),
                     });
@@ -793,6 +800,7 @@ impl ExecutionGraphRunner {
                 let mut active = self.active.lock().await;
                 for start in admitted.drain(..) {
                     output.push(ExecutionPreparedPumpNode {
+                        binding: bindings.get(&start.node.id).cloned(),
                         node: start.node.clone(),
                         startup_error: None,
                     });
@@ -806,7 +814,6 @@ impl ExecutionGraphRunner {
                             resource_started: start.resource_started,
                             effect_state: start.effect_state,
                             effect_receipt_required: start.effect_receipt_required,
-                            wave_prepared: true,
                             _resources: start.resources,
                         },
                     );
@@ -859,6 +866,7 @@ impl ExecutionGraphRunner {
                 crate::execution_core::graph::ResourceResultClass::Cancelled,
             );
             output.push(ExecutionPreparedPumpNode {
+                binding: Some(start.resources.binding(&start.ticket)),
                 startup_error: Some(ExecutionRunnerError::CommandSuperseded {
                     node_id: start.node.id.clone(),
                 }),
@@ -874,18 +882,65 @@ impl ExecutionGraphRunner {
         prepared: ExecutionPreparedPumpNode,
         durable_progress: Arc<Notify>,
     ) -> Result<(), ExecutionRunnerError> {
+        let expected_binding = prepared.binding.clone();
+        let node_id = prepared.node.id.clone();
         let result = match prepared.startup_error {
             Some(error) => Err(error),
-            None => self.start_and_execute_node(graph_id, prepared.node).await,
+            None => {
+                self.start_and_execute_node(graph_id, prepared.node, expected_binding.as_ref())
+                    .await
+            }
         };
-        self.finish_pump_node(graph_id, result, durable_progress)
+        if !self
+            .active_binding_matches(graph_id, &node_id, expected_binding.as_ref())
             .await
+        {
+            return Ok(());
+        }
+        self.finish_pump_node(graph_id, result, durable_progress, expected_binding)
+            .await
+    }
+
+    async fn active_binding_matches(
+        &self,
+        graph_id: &str,
+        node_id: &str,
+        expected_binding: Option<&ExecutionNodeBinding>,
+    ) -> bool {
+        self.active
+            .lock()
+            .await
+            .get(&(graph_id.to_string(), node_id.to_string()))
+            .map(|active| active._resources.binding(&active.ticket))
+            .as_ref()
+            == expected_binding
+    }
+
+    async fn take_bound_active_node(
+        &self,
+        graph_id: &str,
+        node_id: &str,
+        expected_binding: Option<&ExecutionNodeBinding>,
+    ) -> Option<ActiveNode> {
+        let key = (graph_id.to_string(), node_id.to_string());
+        let mut active = self.active.lock().await;
+        if active
+            .get(&key)
+            .map(|active| active._resources.binding(&active.ticket))
+            .as_ref()
+            == expected_binding
+        {
+            active.remove(&key)
+        } else {
+            None
+        }
     }
 
     async fn commit_terminal_wave(
         &self,
         graph_id: &str,
         transition: ExecutionTerminalCommit,
+        expected_binding: Option<&ExecutionNodeBinding>,
     ) -> Result<TerminalCommitDisposition, ExecutionRunnerError> {
         let (response, receiver) = oneshot::channel();
         let leader = {
@@ -893,6 +948,7 @@ impl ExecutionGraphRunner {
             let batch = batches.entry(graph_id.to_string()).or_default();
             batch.pending.push(PendingTerminalCommit {
                 transition,
+                expected_binding: expected_binding.cloned(),
                 response,
             });
             if batch.leader_active {
@@ -919,9 +975,25 @@ impl ExecutionGraphRunner {
                     let mut admitted = Vec::new();
                     let mut admitted_responses = Vec::new();
                     let mut superseded_responses = Vec::new();
+                    let active = self.active.lock().await;
                     for pending in pending {
                         if current.node_statuses.get(&pending.transition.node_id)
                             == Some(&ExecutionNodeStatus::Running)
+                            && pending.expected_binding.as_ref().is_some_and(|binding| {
+                                current
+                                    .recovery_cursor
+                                    .node_attempts
+                                    .get(&pending.transition.node_id)
+                                    == Some(&binding.attempt)
+                                    && active
+                                        .get(&(
+                                            graph_id.to_string(),
+                                            pending.transition.node_id.clone(),
+                                        ))
+                                        .is_some_and(|active| {
+                                            active._resources.binding(&active.ticket) == *binding
+                                        })
+                            })
                         {
                             admitted.push(pending.transition);
                             admitted_responses.push(pending.response);
@@ -929,6 +1001,7 @@ impl ExecutionGraphRunner {
                             superseded_responses.push(pending.response);
                         }
                     }
+                    drop(active);
                     let commit = if admitted.is_empty() {
                         Ok(())
                     } else {
@@ -996,14 +1069,29 @@ impl ExecutionGraphRunner {
         })
     }
 
+    #[cfg(test)]
+    pub(super) async fn pending_terminal_count(&self, graph_id: &str) -> usize {
+        self.terminal_batches
+            .lock()
+            .await
+            .get(graph_id)
+            .map_or(0, |batch| batch.pending.len())
+    }
+
     async fn finish_pump_node(
         &self,
         graph_id: &str,
         result: Result<(String, NodeExecutionOutcome), ExecutionRunnerError>,
         durable_progress: Arc<Notify>,
+        expected_binding: Option<ExecutionNodeBinding>,
     ) -> Result<(), ExecutionRunnerError> {
         let Some((node_id, outcome)) = self
-            .resolve_pump_result(graph_id, result, &durable_progress)
+            .resolve_pump_result(
+                graph_id,
+                result,
+                &durable_progress,
+                expected_binding.as_ref(),
+            )
             .await?
         else {
             return Ok(());
@@ -1019,16 +1107,18 @@ impl ExecutionGraphRunner {
                 .lock()
                 .await
                 .get(&(graph_id.to_string(), node_id.clone()))
+                .filter(|active| {
+                    Some(active._resources.binding(&active.ticket)).as_ref()
+                        == expected_binding.as_ref()
+                })
                 .map(|active| (Arc::clone(&active.executor), active.ticket.clone()));
             if let Some((executor, ticket)) = aborted {
                 let _ = executor
                     .after_abort(&ticket, "executor_outcome_validation_failed")
                     .await;
             }
-            self.active
-                .lock()
-                .await
-                .remove(&(graph_id.to_string(), node_id.clone()));
+            self.take_bound_active_node(graph_id, &node_id, expected_binding.as_ref())
+                .await;
             return Err(error);
         }
         if let Some(replan) = outcome.replan.as_ref() {
@@ -1038,16 +1128,18 @@ impl ExecutionGraphRunner {
                     .lock()
                     .await
                     .get(&(graph_id.to_string(), node_id.clone()))
+                    .filter(|active| {
+                        Some(active._resources.binding(&active.ticket)).as_ref()
+                            == expected_binding.as_ref()
+                    })
                     .map(|active| (Arc::clone(&active.executor), active.ticket.clone()));
                 if let Some((executor, ticket)) = aborted {
                     let _ = executor
                         .after_abort(&ticket, "executor_replan_validation_failed")
                         .await;
                 }
-                self.active
-                    .lock()
-                    .await
-                    .remove(&(graph_id.to_string(), node_id.clone()));
+                self.take_bound_active_node(graph_id, &node_id, expected_binding.as_ref())
+                    .await;
                 return Err(error.into());
             }
         }
@@ -1059,20 +1151,25 @@ impl ExecutionGraphRunner {
             .lock()
             .await
             .get(&(graph_id.to_string(), node_id.clone()))
+            .filter(|active| {
+                Some(active._resources.binding(&active.ticket)).as_ref()
+                    == expected_binding.as_ref()
+            })
             .map(|active| {
                 (
                     Arc::clone(&active.executor),
                     active.ticket.clone(),
-                    active.wave_prepared,
                     active.effect_receipt_required,
                 )
             });
-        let batchable = active_wave.as_ref().is_some_and(|(_, _, wave, _)| *wave)
-            && outcome.replan.is_none()
+        if active_wave.is_none() {
+            return Ok(());
+        }
+        let batchable = outcome.replan.is_none()
             && outcome.delivery_envelope.is_none()
             && outcome.terminal_presentation.is_none();
         if batchable {
-            let Some((executor, ticket, _, effect_receipt_required)) = active_wave.clone() else {
+            let Some((executor, ticket, effect_receipt_required)) = active_wave.clone() else {
                 return Err(ExecutionRunnerError::Driver(
                     "batchable active wave has no execution binding".to_string(),
                 ));
@@ -1085,6 +1182,7 @@ impl ExecutionGraphRunner {
                         outcome,
                         effect_ticket: effect_receipt_required.then_some(ticket.clone()),
                     },
+                    expected_binding.as_ref(),
                 )
                 .await?;
             match disposition {
@@ -1094,10 +1192,8 @@ impl ExecutionGraphRunner {
                     if deadline_terminal {
                         executor.cancellation_finalized(&ticket);
                     }
-                    self.active
-                        .lock()
-                        .await
-                        .remove(&(graph_id.to_string(), node_id));
+                    self.take_bound_active_node(graph_id, &node_id, expected_binding.as_ref())
+                        .await;
                     after_commit?;
                     return Ok(());
                 }
@@ -1105,31 +1201,27 @@ impl ExecutionGraphRunner {
                     executor
                         .after_abort(&ticket, "graph_command_superseded_before_terminal_wave")
                         .await?;
-                    self.active
-                        .lock()
-                        .await
-                        .remove(&(graph_id.to_string(), node_id));
+                    self.take_bound_active_node(graph_id, &node_id, expected_binding.as_ref())
+                        .await;
                     return Ok(());
                 }
                 TerminalCommitDisposition::Failed(reason) => {
                     let _ = executor
                         .after_abort(&ticket, "terminal_wave_commit_failed")
                         .await;
-                    self.active
-                        .lock()
-                        .await
-                        .remove(&(graph_id.to_string(), node_id));
+                    self.take_bound_active_node(graph_id, &node_id, expected_binding.as_ref())
+                        .await;
                     return Err(ExecutionRunnerError::Driver(reason));
                 }
             }
         }
-        if let Some((executor, ticket, true, true)) = active_wave {
+        if let Some((executor, ticket, true)) = active_wave.as_ref() {
             if let Err(error) = self
                 .commit_service
-                .commit_execution_effect(&ticket, &outcome)
+                .commit_execution_effect(ticket, &outcome)
             {
                 let _ = executor
-                    .after_abort(&ticket, "effect_receipt_commit_failed")
+                    .after_abort(ticket, "effect_receipt_commit_failed")
                     .await;
                 return Err(error.into());
             }
@@ -1139,23 +1231,25 @@ impl ExecutionGraphRunner {
         let committed_executor = {
             let _coordination = self.graph_coordination_without_command(graph_id).await;
             let mut current = self.state_store.load_async(graph_id).await?;
-            if current.node_statuses.get(&node_id) != Some(&ExecutionNodeStatus::Running) {
-                let aborted = self
-                    .active
-                    .lock()
+            if current.node_statuses.get(&node_id) != Some(&ExecutionNodeStatus::Running)
+                || !expected_binding.as_ref().is_some_and(|binding| {
+                    current.recovery_cursor.node_attempts.get(&node_id) == Some(&binding.attempt)
+                })
+                || !self
+                    .active_binding_matches(graph_id, &node_id, expected_binding.as_ref())
                     .await
-                    .get(&(graph_id.to_string(), node_id.clone()))
-                    .map(|active| (Arc::clone(&active.executor), active.ticket.clone()));
+            {
+                let aborted = active_wave
+                    .as_ref()
+                    .map(|(executor, ticket, _)| (Arc::clone(executor), ticket.clone()));
                 drop(_coordination);
                 if let Some((executor, ticket)) = aborted {
                     executor
                         .after_abort(&ticket, "graph_command_superseded_before_commit")
                         .await?;
                 }
-                self.active
-                    .lock()
-                    .await
-                    .remove(&(graph_id.to_string(), node_id.clone()));
+                self.take_bound_active_node(graph_id, &node_id, expected_binding.as_ref())
+                    .await;
                 return Ok(());
             }
             if let Some(envelope) = outcome.delivery_envelope.clone() {
@@ -1206,6 +1300,17 @@ impl ExecutionGraphRunner {
                         current = self.state_store.load_async(graph_id).await?;
                         if current.node_statuses.get(&node_id)
                             != Some(&ExecutionNodeStatus::Running)
+                            || !expected_binding.as_ref().is_some_and(|binding| {
+                                current.recovery_cursor.node_attempts.get(&node_id)
+                                    == Some(&binding.attempt)
+                            })
+                            || !self
+                                .active_binding_matches(
+                                    graph_id,
+                                    &node_id,
+                                    expected_binding.as_ref(),
+                                )
+                                .await
                         {
                             break Err(ExecutionCommitError::InvalidCommand(
                                 "node transition superseded by a concurrent writer".to_string(),
@@ -1221,6 +1326,10 @@ impl ExecutionGraphRunner {
                     .lock()
                     .await
                     .get(&(graph_id.to_string(), node_id.clone()))
+                    .filter(|active| {
+                        Some(active._resources.binding(&active.ticket)).as_ref()
+                            == expected_binding.as_ref()
+                    })
                     .map(|active| (Arc::clone(&active.executor), active.ticket.clone()));
                 drop(_coordination);
                 if let Some((executor, ticket)) = aborted {
@@ -1228,16 +1337,18 @@ impl ExecutionGraphRunner {
                         .after_abort(&ticket, "graph_transition_commit_failed")
                         .await;
                 }
-                self.active
-                    .lock()
-                    .await
-                    .remove(&(graph_id.to_string(), node_id.clone()));
+                self.take_bound_active_node(graph_id, &node_id, expected_binding.as_ref())
+                    .await;
                 return Err(error.into());
             }
             self.active
                 .lock()
                 .await
                 .get(&(graph_id.to_string(), node_id.clone()))
+                .filter(|active| {
+                    Some(active._resources.binding(&active.ticket)).as_ref()
+                        == expected_binding.as_ref()
+                })
                 .map(|active| (Arc::clone(&active.executor), active.ticket.clone()))
         };
         self.converge_after_terminal_commit(graph_id).await?;
@@ -1247,16 +1358,12 @@ impl ExecutionGraphRunner {
             if deadline_terminal {
                 executor.cancellation_finalized(&ticket);
             }
-            self.active
-                .lock()
-                .await
-                .remove(&(graph_id.to_string(), node_id));
+            self.take_bound_active_node(graph_id, &node_id, expected_binding.as_ref())
+                .await;
             after_commit?;
         } else {
-            self.active
-                .lock()
-                .await
-                .remove(&(graph_id.to_string(), node_id));
+            self.take_bound_active_node(graph_id, &node_id, expected_binding.as_ref())
+                .await;
         }
         Ok(())
     }
@@ -1266,18 +1373,24 @@ impl ExecutionGraphRunner {
         graph_id: &str,
         result: Result<(String, NodeExecutionOutcome), ExecutionRunnerError>,
         durable_progress: &Notify,
+        expected_binding: Option<&ExecutionNodeBinding>,
     ) -> Result<Option<(String, NodeExecutionOutcome)>, ExecutionRunnerError> {
         match result {
             Err(ExecutionRunnerError::CommandSuperseded { node_id }) => {
-                if let Some(active) = self
+                let running = self
                     .active
                     .lock()
                     .await
-                    .remove(&(graph_id.to_string(), node_id))
-                {
-                    let _ = active
-                        .executor
-                        .cancel_bounded(&active.ticket, Duration::from_secs(5))
+                    .get(&(graph_id.to_string(), node_id.clone()))
+                    .filter(|active| {
+                        Some(active._resources.binding(&active.ticket)).as_ref() == expected_binding
+                    })
+                    .map(|active| (Arc::clone(&active.executor), active.ticket.clone()));
+                if let Some((executor, ticket)) = running {
+                    executor
+                        .cancel_bounded(&ticket, Duration::from_secs(5))
+                        .await?;
+                    self.take_bound_active_node(graph_id, &node_id, expected_binding)
                         .await;
                 }
                 Ok(None)
@@ -1287,8 +1400,13 @@ impl ExecutionGraphRunner {
                 node_id,
                 deadline_at_ms,
             }) => {
-                self.terminalize_deadline_node(graph_id, &node_id, deadline_at_ms)
-                    .await?;
+                self.terminalize_deadline_node(
+                    graph_id,
+                    &node_id,
+                    deadline_at_ms,
+                    expected_binding,
+                )
+                .await?;
                 self.converge_after_terminal_commit(graph_id).await?;
                 durable_progress.notify_one();
                 Ok(None)
@@ -1304,8 +1422,18 @@ impl ExecutionGraphRunner {
             Err(ExecutionRunnerError::Executor(error)) => {
                 if matches!(error, NodeExecutorError::Start { .. }) {
                     let node_id = executor_error_node_id(&error).to_string();
-                    self.isolate_node_failure(graph_id, &node_id, error.to_string())
-                        .await?;
+                    match self
+                        .isolate_node_failure(
+                            graph_id,
+                            &node_id,
+                            expected_binding,
+                            error.to_string(),
+                        )
+                        .await
+                    {
+                        Err(ExecutionRunnerError::CommandSuperseded { .. }) => return Ok(None),
+                        result => result?,
+                    }
                     self.converge_after_terminal_commit(graph_id).await?;
                     durable_progress.notify_one();
                     return Ok(None);
@@ -1314,19 +1442,25 @@ impl ExecutionGraphRunner {
                 if let Some(waiter) = self.command_intent_waiter(graph_id) {
                     waiter.await;
                 }
-                self.active
-                    .lock()
-                    .await
-                    .remove(&(graph_id.to_string(), node_id.clone()));
                 let result = failed_result(&error);
                 let terminal_status = result.status;
                 let _coordination = self.graph_coordination_without_command(graph_id).await;
                 let current = self.state_store.load_async(graph_id).await?;
+                if !self
+                    .active_binding_matches(graph_id, &node_id, expected_binding)
+                    .await
+                    || expected_binding.is_some_and(|binding| {
+                        current.recovery_cursor.node_attempts.get(&node_id)
+                            != Some(&binding.attempt)
+                    })
+                {
+                    return Ok(None);
+                }
                 if current.node_statuses.get(&node_id) == Some(&ExecutionNodeStatus::Running) {
                     self.commit_service
                         .transition_node_async(
                             current,
-                            node_id,
+                            node_id.clone(),
                             terminal_status,
                             Some(result),
                             Vec::new(),
@@ -1336,6 +1470,8 @@ impl ExecutionGraphRunner {
                     self.converge_after_terminal_commit(graph_id).await?;
                     durable_progress.notify_one();
                 }
+                self.take_bound_active_node(graph_id, &node_id, expected_binding)
+                    .await;
                 // A Pause/Cancel command may have superseded the executor while
                 // it returned. The command's durable graph state remains truth.
                 Ok(None)
@@ -1348,10 +1484,8 @@ impl ExecutionGraphRunner {
         &self,
         graph_id: &str,
         node: harness_contract::execution_graph::ExecutionNodeSpec,
+        expected_binding: Option<&ExecutionNodeBinding>,
     ) -> Result<(String, NodeExecutionOutcome), ExecutionRunnerError> {
-        let leaf_effect_owner = node.kind
-            == harness_contract::execution_graph::ExecutionNodeKind::ToolBatch
-            && node.executor_kind == "tool_batch";
         let deadline_at_ms = execution_deadline_at_ms(&node)?;
         if deadline_at_ms.is_some_and(|deadline| deadline <= now_ms()) {
             return Err(ExecutionRunnerError::DeadlineExceeded {
@@ -1363,205 +1497,38 @@ impl ExecutionGraphRunner {
             waiter.await;
             return Err(ExecutionRunnerError::CommandSuperseded { node_id: node.id });
         }
-        let already_prepared = self
-            .active
-            .lock()
-            .await
-            .get(&(graph_id.to_string(), node.id.clone()))
-            .map(|active| {
-                (
-                    Arc::clone(&active.executor),
-                    active.ticket.clone(),
-                    active.resource_kind.clone(),
-                    active.resource_queue_wait,
-                    active.resource_started,
-                    active.effect_state.clone(),
-                )
-            });
-        let wave_prepared = already_prepared.is_some();
-        let (
-            executor,
-            ticket,
-            resource_kind,
-            resource_queue_wait,
-            resource_started,
-            prepared_effect_state,
-        ) = if let Some(prepared) = already_prepared {
-            prepared
-        } else {
-            let admission_graph = self.state_store.load_snapshot_async(graph_id).await?;
-            let resources = self
-                .acquire_node_resources(admission_graph.as_ref(), &node, deadline_at_ms, None)
-                .await?;
-            let resource_kind = resources
-                .resource
-                .as_ref()
-                .map(|resource| resource.kind().clone());
-            let resource_queue_wait = resources
-                .resource
-                .as_ref()
-                .map_or(Duration::ZERO, ExecutionResourceLease::queue_wait);
-            let resource_started = std::time::Instant::now();
-            let coordination = self.graph_coordination_without_command(graph_id).await;
-            let graph = self.state_store.load_snapshot_async(graph_id).await?;
-            if graph.node_statuses.get(&node.id) != Some(&ExecutionNodeStatus::Ready) {
-                self.record_resource_terminal(
-                    resource_kind.as_ref(),
-                    resource_queue_wait,
-                    resource_started,
-                    crate::execution_core::graph::ResourceResultClass::Cancelled,
-                );
-                return Err(ExecutionRunnerError::NodeMissing(node.id));
-            }
-            let executor = match self.registry.get(&node.executor_kind) {
-                Some(executor) => executor,
-                None => {
-                    self.record_resource_terminal(
-                        resource_kind.as_ref(),
-                        resource_queue_wait,
-                        resource_started,
-                        crate::execution_core::graph::ResourceResultClass::Failed,
-                    );
-                    return Err(NodeExecutorError::Unavailable {
-                        executor_kind: node.executor_kind.clone(),
-                        node_id: node.id.clone(),
-                    }
-                    .into());
-                }
-            };
-            let attempt = graph
-                .recovery_cursor
-                .node_attempts
-                .get(&node.id)
-                .copied()
-                .unwrap_or(0)
-                .saturating_add(1);
-            let ticket = match executor
-                .start(NodeExecutionContext {
-                    graph: Arc::clone(&graph),
-                    node,
-                    attempt,
-                })
-                .await
-            {
-                Ok(ticket) => ticket,
-                Err(error) => {
-                    self.record_resource_terminal(
-                        resource_kind.as_ref(),
-                        resource_queue_wait,
-                        resource_started,
-                        crate::execution_core::graph::ResourceResultClass::Failed,
-                    );
-                    return Err(error.into());
-                }
-            };
-            let binding = resources.binding(&ticket);
-            self.active.lock().await.insert(
-                (ticket.graph_id.clone(), ticket.node_id.clone()),
-                ActiveNode {
-                    executor: Arc::clone(&executor),
-                    ticket: ticket.clone(),
-                    resource_kind: resource_kind.clone(),
-                    resource_queue_wait,
-                    resource_started,
-                    effect_state: ExecutionEffectState::Fresh,
-                    effect_receipt_required: false,
-                    wave_prepared: false,
-                    _resources: resources,
-                },
-            );
-            if let Err(error) = self
-                .commit_service
-                .bind_and_start_node_async(graph.as_ref().clone(), ticket.node_id.clone(), binding)
-                .await
-            {
-                self.active
-                    .lock()
-                    .await
-                    .remove(&(ticket.graph_id.clone(), ticket.node_id.clone()));
-                let _ = executor
-                    .cancel_bounded(&ticket, Duration::from_secs(5))
-                    .await;
-                self.record_resource_terminal(
-                    resource_kind.as_ref(),
-                    resource_queue_wait,
-                    resource_started,
-                    crate::execution_core::graph::ResourceResultClass::Failed,
-                );
-                return Err(error.into());
-            }
-            drop(coordination);
-            (
-                executor,
-                ticket,
-                resource_kind,
-                resource_queue_wait,
-                resource_started,
-                ExecutionEffectState::Fresh,
-            )
+        let active = self.active.lock().await;
+        let prepared = active.get(&(graph_id.to_string(), node.id.clone()));
+        if prepared
+            .map(|active| active._resources.binding(&active.ticket))
+            .as_ref()
+            != expected_binding
+        {
+            return Err(ExecutionRunnerError::CommandSuperseded { node_id: node.id });
+        }
+        let Some(prepared) = prepared else {
+            return Err(ExecutionRunnerError::CommandSuperseded { node_id: node.id });
         };
-        // The coordination gate protects the state check and durable effect
-        // intent. It must not cover executor work: a ToolBatch may dispatch a
-        // child Agent execution graph, which
-        // correctly needs the same Runner to make progress. Holding the gate
-        // across that await creates a parent/child re-entrancy deadlock.
+        let (executor, ticket, resource_kind, resource_queue_wait, resource_started, effect_state) = (
+            Arc::clone(&prepared.executor),
+            prepared.ticket.clone(),
+            prepared.resource_kind.clone(),
+            prepared.resource_queue_wait,
+            prepared.resource_started,
+            prepared.effect_state.clone(),
+        );
+        drop(active);
         if let Some(waiter) = self.command_intent_waiter(graph_id) {
             waiter.await;
         }
-        if wave_prepared
-            && !self
-                .active
-                .lock()
-                .await
-                .contains_key(&(graph_id.to_string(), ticket.node_id.clone()))
+        if !self
+            .active_binding_matches(graph_id, &ticket.node_id, expected_binding)
+            .await
         {
             return Err(ExecutionRunnerError::CommandSuperseded {
                 node_id: ticket.node_id.clone(),
             });
         }
-        let effect_state = if wave_prepared {
-            // prepare_ready_wave committed both Running truth and, for
-            // non-leaf executors, the effect intent in one transaction. A
-            // second per-node graph read/lock here would recreate the very
-            // dispatch serialization the wave boundary removes.
-            prepared_effect_state
-        } else {
-            let _poll_gate = self.graph_coordination_without_command(graph_id).await;
-            let current = self.state_store.load_async(graph_id).await?;
-            if current.node_statuses.get(&ticket.node_id) != Some(&ExecutionNodeStatus::Running) {
-                self.active
-                    .lock()
-                    .await
-                    .remove(&(ticket.graph_id.clone(), ticket.node_id.clone()));
-                self.record_resource_terminal(
-                    resource_kind.as_ref(),
-                    resource_queue_wait,
-                    resource_started,
-                    crate::execution_core::graph::ResourceResultClass::Cancelled,
-                );
-                return Ok((
-                    ticket.node_id.clone(),
-                    NodeExecutionOutcome::new(ExecutionNodeResult {
-                        // This outcome is only an internal wake-up value. The command's
-                        // already-committed graph status remains authoritative and the
-                        // caller discards this result because the node is no longer running.
-                        status: ExecutionNodeStatus::Cancelled,
-                        result_ref: None,
-                        wait_class: None,
-                        summary: None,
-                        evidence_refs: Vec::new(),
-                        failure: None,
-                        usage: Default::default(),
-                        finished_at_ms: now_ms(),
-                    }),
-                ));
-            }
-            if leaf_effect_owner {
-                ExecutionEffectState::Fresh
-            } else {
-                self.commit_service.begin_execution_effect(&ticket)?
-            }
-        };
         match effect_state {
             ExecutionEffectState::Completed(outcome) => {
                 self.record_resource_terminal(
@@ -1666,17 +1633,6 @@ impl ExecutionGraphRunner {
             .usage
             .duration_ms
             .max(node_duration_ms.max(1));
-        if !leaf_effect_owner && !wave_prepared {
-            if let Err(error) = self
-                .commit_service
-                .commit_execution_effect(&ticket, &outcome)
-            {
-                let _ = executor
-                    .after_abort(&ticket, "effect_receipt_commit_failed")
-                    .await;
-                return Err(error.into());
-            }
-        }
         Ok((ticket.node_id.clone(), outcome))
     }
 
@@ -1921,9 +1877,33 @@ impl ExecutionGraphRunner {
         graph_id: &str,
         node_id: &str,
         deadline_at_ms: u64,
+        expected_binding: Option<&ExecutionNodeBinding>,
     ) -> Result<(), ExecutionRunnerError> {
+        let running = self
+            .active
+            .lock()
+            .await
+            .get(&(graph_id.to_string(), node_id.to_string()))
+            .filter(|active| {
+                Some(active._resources.binding(&active.ticket)).as_ref() == expected_binding
+            })
+            .map(|active| (Arc::clone(&active.executor), active.ticket.clone()));
+        if let Some((executor, ticket)) = running.as_ref() {
+            executor
+                .cancel_bounded(ticket, Duration::from_secs(5))
+                .await?;
+        }
         let _coordination = self.graph_coordination_without_command(graph_id).await;
         let current = self.state_store.load_async(graph_id).await?;
+        if !self
+            .active_binding_matches(graph_id, node_id, expected_binding)
+            .await
+            || expected_binding.is_some_and(|binding| {
+                current.recovery_cursor.node_attempts.get(node_id) != Some(&binding.attempt)
+            })
+        {
+            return Ok(());
+        }
         if !matches!(
             current.node_statuses.get(node_id),
             Some(ExecutionNodeStatus::Ready | ExecutionNodeStatus::Running)
@@ -1940,6 +1920,13 @@ impl ExecutionGraphRunner {
                 Vec::new(),
             )
             .await?;
+        drop(_coordination);
+        if let Some(finished) = self
+            .take_bound_active_node(graph_id, node_id, expected_binding)
+            .await
+        {
+            finished.executor.cancellation_finalized(&finished.ticket);
+        }
         Ok(())
     }
 
@@ -2030,10 +2017,46 @@ impl ExecutionGraphRunner {
         &self,
         graph_id: &str,
         node_id: &str,
+        expected_binding: Option<&ExecutionNodeBinding>,
         reason: String,
     ) -> Result<(), ExecutionRunnerError> {
+        let key = (graph_id.to_string(), node_id.to_string());
+        let running = self.active.lock().await.get(&key).map(|active| {
+            (
+                Arc::clone(&active.executor),
+                active.ticket.clone(),
+                active._resources.binding(&active.ticket),
+            )
+        });
+        if running.as_ref().map(|(_, _, binding)| binding) != expected_binding {
+            return Err(ExecutionRunnerError::CommandSuperseded {
+                node_id: node_id.to_owned(),
+            });
+        }
+        if let Some((executor, ticket, _)) = running.as_ref() {
+            executor
+                .cancel_bounded(ticket, Duration::from_secs(5))
+                .await?;
+            executor
+                .after_abort(ticket, "node_execution_isolated_failure")
+                .await?;
+        }
         let _coordination = self.graph_coordination_without_command(graph_id).await;
         let current = self.state_store.load_async(graph_id).await?;
+        if let Some(binding) = expected_binding {
+            if current.recovery_cursor.node_attempts.get(node_id) != Some(&binding.attempt)
+                || !self
+                    .active
+                    .lock()
+                    .await
+                    .get(&key)
+                    .is_some_and(|active| active._resources.binding(&active.ticket) == *binding)
+            {
+                return Err(ExecutionRunnerError::CommandSuperseded {
+                    node_id: node_id.to_owned(),
+                });
+            }
+        }
         let status = current.node_statuses.get(node_id).copied();
         if !matches!(
             status,
@@ -2043,6 +2066,8 @@ impl ExecutionGraphRunner {
                     | ExecutionNodeStatus::Planned
             )
         ) {
+            drop(_coordination);
+            self.release_isolated_node(&key, expected_binding).await;
             return Ok(());
         }
         // A failed start, executor panic, or node-local failure is a failure of
@@ -2075,7 +2100,38 @@ impl ExecutionGraphRunner {
                 Vec::new(),
             )
             .await?;
+        drop(_coordination);
+        self.release_isolated_node(&key, expected_binding).await;
         Ok(())
+    }
+
+    async fn release_isolated_node(
+        &self,
+        key: &(String, String),
+        expected_binding: Option<&ExecutionNodeBinding>,
+    ) {
+        let finished = {
+            let mut active = self.active.lock().await;
+            if active
+                .get(key)
+                .map(|active| active._resources.binding(&active.ticket))
+                .as_ref()
+                == expected_binding
+            {
+                active.remove(key)
+            } else {
+                None
+            }
+        };
+        if let Some(finished) = finished {
+            self.record_resource_terminal(
+                finished.resource_kind.as_ref(),
+                finished.resource_queue_wait,
+                finished.resource_started,
+                crate::execution_core::graph::ResourceResultClass::Failed,
+            );
+            finished.executor.cancellation_finalized(&finished.ticket);
+        }
     }
 
     pub(crate) async fn command(

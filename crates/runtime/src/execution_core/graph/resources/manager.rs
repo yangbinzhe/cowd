@@ -1640,9 +1640,15 @@ fn scheduling_precedence(
 ) -> (usize, u8, u64) {
     let age_steps = duration_millis(now.saturating_duration_since(waiter.enqueued_at))
         / duration_millis(aging_interval).max(1);
+    let effective_priority =
+        if age_steps >= service_class_index(ExecutionServiceClass::Maintenance) as u64 {
+            u8::MAX
+        } else {
+            waiter.requested_priority.unwrap_or(0)
+        };
     (
         service_class_index(waiter.resolved_service_class).saturating_sub(age_steps as usize),
-        u8::MAX.saturating_sub(waiter.requested_priority.unwrap_or(0)),
+        u8::MAX.saturating_sub(effective_priority),
         waiter.enqueue_sequence,
     )
 }
@@ -1658,10 +1664,7 @@ fn scheduler_recheck_after(
         .waiters
         .iter()
         .filter_map(|waiter| {
-            let rank = service_class_index(waiter.resolved_service_class);
-            if rank == 0 {
-                return None;
-            }
+            let rank = service_class_index(ExecutionServiceClass::Maintenance);
             let age = now.saturating_duration_since(waiter.enqueued_at);
             let elapsed_steps = duration_millis(age) / duration_millis(aging_interval).max(1);
             if elapsed_steps >= rank as u64 {
@@ -2398,7 +2401,9 @@ mod tests {
 
     #[tokio::test]
     async fn same_class_higher_requested_priority_runs_before_earlier_waiter() {
-        let manager = fair_manager(1, admission_policy(8, 4, 4));
+        let mut policy = admission_policy(8, 4, 4);
+        policy.aging_interval = Duration::from_secs(60);
+        let manager = fair_manager(1, policy);
         let occupied = manager
             .acquire(ExecutionResourceKind::Tool, None)
             .await
@@ -2450,6 +2455,72 @@ mod tests {
         let (low_lease, low_receipt) = granted(low_priority.await.unwrap());
         assert_eq!(low_receipt.requested_priority, Some(1));
         drop(low_lease);
+    }
+
+    #[tokio::test]
+    async fn bounded_aging_low_priority_session_precedes_fresh_high_priority_session() {
+        assert_aged_priority_session_precedes_fresh_high(ExecutionServiceClass::Background).await;
+    }
+
+    #[tokio::test]
+    async fn bounded_aging_low_interactive_priority_precedes_fresh_high_priority_session() {
+        assert_aged_priority_session_precedes_fresh_high(ExecutionServiceClass::Interactive).await;
+    }
+
+    async fn assert_aged_priority_session_precedes_fresh_high(older_class: ExecutionServiceClass) {
+        let policy = admission_policy(8, 4, 4);
+        let aging_budget = policy.aging_interval.saturating_mul(3);
+        let manager = fair_manager(1, policy);
+        let occupied = manager
+            .acquire(ExecutionResourceKind::Tool, None)
+            .await
+            .unwrap();
+        let mut requests = tokio::task::JoinSet::new();
+        let low_manager = manager.clone();
+        requests.spawn(async move {
+            low_manager
+                .admit(
+                    ResourceAdmissionRequest::new(older_class, [(ExecutionResourceKind::Tool, 1)])
+                        .with_priority(1)
+                        .with_fairness_key("session:aged-low"),
+                )
+                .await
+                .unwrap()
+        });
+        wait_for_pending(&manager, &ExecutionResourceKind::Tool, 1).await;
+        tokio::time::sleep(aging_budget).await;
+        let high_manager = manager.clone();
+        requests.spawn(async move {
+            high_manager
+                .admit(
+                    ResourceAdmissionRequest::new(
+                        ExecutionServiceClass::Interactive,
+                        [(ExecutionResourceKind::Tool, 1)],
+                    )
+                    .with_priority(200)
+                    .with_fairness_key("session:fresh-high"),
+                )
+                .await
+                .unwrap()
+        });
+        wait_for_pending(&manager, &ExecutionResourceKind::Tool, 2).await;
+        drop(occupied);
+        let first = tokio::time::timeout(Duration::from_secs(1), requests.join_next()).await;
+        requests.abort_all();
+        while requests.join_next().await.is_some() {}
+        let (lease, receipt) = granted(
+            first
+                .expect("contended capacity must admit a request")
+                .expect("one request must finish")
+                .expect("admission task must join"),
+        );
+        drop(lease);
+        let drained = manager.snapshot(&ExecutionResourceKind::Tool).unwrap();
+        assert_eq!(drained.active_leases, 0);
+        assert_eq!(drained.queued_waiters, 0);
+        assert_eq!(receipt.fairness_key, "session:aged-low");
+        assert_eq!(receipt.requested_priority, Some(1));
+        assert!(receipt.queue_age_ms >= aging_budget.as_millis() as u64);
     }
 
     #[tokio::test]

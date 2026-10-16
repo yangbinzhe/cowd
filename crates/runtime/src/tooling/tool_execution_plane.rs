@@ -683,7 +683,7 @@ mod tests {
 
     #[tokio::test]
     async fn abandoned_blocking_waiter_retains_physical_write_scope_and_quota() {
-        let plane = plane(2);
+        let plane = plane(1);
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("physical.txt");
         let demand = ResourceDemand {
@@ -718,6 +718,22 @@ mod tests {
         first.abort();
         assert!(first.await.unwrap_err().is_cancelled());
         assert_eq!(plane.stats().active, 1);
+        let probe_path = root.path().join("disjoint-probe.txt");
+        let attempted_path = probe_path.clone();
+        let probe = plane
+            .execute_classified(
+                &ResourceDemand::default(),
+                Some(Duration::from_millis(20)),
+                ExecutionServiceClass::Foreground,
+                None,
+                Some("other-session"),
+                move || std::fs::write(attempted_path, "must not cross retained Tool quota"),
+            )
+            .await;
+        let retained = plane
+            .resources
+            .snapshot(&ExecutionResourceKind::Tool)
+            .unwrap();
         let second_started = Arc::new(AtomicUsize::new(0));
         let second = {
             let plane = plane.clone();
@@ -745,9 +761,18 @@ mod tests {
             !crossed_unfinished_write,
             "a different request cannot acquire the abandoned writer's scope"
         );
+        assert!(matches!(probe, Err(ToolExecutionPlaneError::Admission(_))));
+        assert!(!probe_path.exists());
+        assert_eq!(retained.active_leases, 1);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "second-finished");
         assert_eq!(plane.stats().active, 0);
         assert_eq!(plane.stats().completed, 2);
+        let drained = plane
+            .resources
+            .snapshot(&ExecutionResourceKind::Tool)
+            .unwrap();
+        assert_eq!(drained.active_leases, 0);
+        assert_eq!(drained.queued_waiters, 0);
     }
 
     #[tokio::test]

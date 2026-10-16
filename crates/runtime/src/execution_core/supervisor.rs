@@ -1533,6 +1533,7 @@ async fn run_completion_pump(
             let graph_id = graph_id.to_string();
             let progress = Arc::clone(&durable_progress);
             active_nodes.spawn(async move {
+                let binding_for_panic = prepared.binding.clone();
                 let runner_for_panic = Arc::clone(&runner);
                 let graph_id_for_panic = graph_id.clone();
                 let node_id_for_panic = node_id.clone();
@@ -1547,14 +1548,19 @@ async fn run_completion_pump(
                     Ok(result) => (node_id, result),
                     Err(payload) => {
                         let reason = panic_message(payload);
-                        let _ = runner_for_panic
+                        let result = runner_for_panic
                             .isolate_node_failure(
                                 &graph_id_for_panic,
                                 &node_id_for_panic,
+                                binding_for_panic.as_ref(),
                                 format!("node panicked: {reason}"),
                             )
                             .await;
-                        (node_id_for_panic, Ok(()))
+                        let result = match result {
+                            Err(ExecutionRunnerError::CommandSuperseded { .. }) => Ok(()),
+                            result => result,
+                        };
+                        (node_id_for_panic, result)
                     }
                 }
             });
@@ -1819,6 +1825,7 @@ mod completion_pump_tests {
         release: Option<Arc<Notify>>,
         delays: BTreeMap<String, Duration>,
         panic_nodes: BTreeSet<String>,
+        cancel_error_nodes: BTreeSet<String>,
         running: AtomicUsize,
         max_running: AtomicUsize,
         slow_finished: AtomicBool,
@@ -1834,6 +1841,7 @@ mod completion_pump_tests {
                 release: None,
                 delays: delays.into_iter().collect(),
                 panic_nodes: BTreeSet::new(),
+                cancel_error_nodes: BTreeSet::new(),
                 running: AtomicUsize::new(0),
                 max_running: AtomicUsize::new(0),
                 slow_finished: AtomicBool::new(false),
@@ -1848,6 +1856,11 @@ mod completion_pump_tests {
             self
         }
 
+        fn with_cancel_error_node(mut self, node_id: &str) -> Self {
+            self.cancel_error_nodes.insert(node_id.to_owned());
+            self
+        }
+
         /// Register this fake executor under another node kind. Used by tests
         /// that must exercise a production-authorized `WaitingExternal` origin
         /// (see harness-contract `WAITING_EXTERNAL_EXECUTOR_KINDS` / PLAN C4).
@@ -1859,6 +1872,17 @@ mod completion_pump_tests {
 
     #[async_trait]
     impl NodeExecutor for PumpTestExecutor {
+        async fn cancel(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
+            if self.cancel_error_nodes.contains(&ticket.node_id) {
+                Err(NodeExecutorError::Cancel {
+                    node_id: ticket.node_id.clone(),
+                    reason: "injected cancellation failure".into(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+
         fn kind(&self) -> &str {
             self.kind
         }
@@ -2395,7 +2419,13 @@ mod completion_pump_tests {
     #[tokio::test]
     async fn foreground_terminal_wait_does_not_mistake_external_quiescence_for_completion() {
         let executor = Arc::new(PumpTestExecutor::new([]).with_kind("agentic_program_wait"));
-        let supervisor = Arc::new(test_supervisor(executor));
+        let unrelated_executor = Arc::new(PumpTestExecutor::new([]));
+        let supervisor = Arc::new(test_supervisor_with_executors(
+            vec![executor, unrelated_executor.clone()],
+            1,
+            1,
+            1,
+        ));
         let mut graph = ExecutionGraph::new("foreground waits for durable terminal truth");
         graph.id = "foreground-terminal-wait".to_string();
         crate::test_support::attach_execution_graph_lineage(&mut graph);
@@ -2434,6 +2464,29 @@ mod completion_pump_tests {
             "foreground completion must remain pending while the graph is only quiescent"
         );
 
+        let mut unrelated = ExecutionGraph::new("parked parent releases shared graph capacity");
+        crate::test_support::attach_execution_graph_lineage(&mut unrelated);
+        unrelated.lineage.as_mut().unwrap().session_id = "unrelated-session".to_string();
+        unrelated.nodes.push(test_node("unrelated-ready"));
+        let (_, unrelated_report) = tokio::time::timeout(
+            Duration::from_secs(2),
+            supervisor.submit_and_wait_terminal(
+                unrelated,
+                ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            ),
+        )
+        .await
+        .expect("unrelated Session must run while the foreground waiter remains parked")
+        .expect("unrelated graph completes");
+        assert_eq!(unrelated_report.completed, 1);
+        assert_eq!(
+            unrelated_executor.calls.lock().unwrap().as_slice(),
+            &["unrelated-ready"]
+        );
+        assert!(!waiting.is_finished());
+
         supervisor
             .command_graph(
                 &graph_id,
@@ -2454,6 +2507,189 @@ mod completion_pump_tests {
             .expect("terminal wait succeeds");
         assert_eq!(report.completed, 1);
         supervisor.shutdown().await;
+    }
+
+    fn panic_resource_fixture(
+        executor: Arc<PumpTestExecutor>,
+        workspace: &std::path::Path,
+    ) -> (
+        RuntimeExecutionSupervisor,
+        ExecutionGraphStateStore,
+        Arc<RuntimeEventStore>,
+        Arc<ExecutionResourceManager>,
+    ) {
+        let event_store = Arc::new(RuntimeEventStore::for_test());
+        let state = ExecutionGraphStateStore::new(Arc::clone(&event_store));
+        let resources = Arc::new(ExecutionResourceManager::new([(
+            ExecutionResourceKind::Tool,
+            ResourceQuota::new(1, 1, 1).unwrap(),
+        )]));
+        let registry = Arc::new(NodeExecutorRegistry::new());
+        registry.register(executor.clone()).unwrap();
+        let runner = ExecutionGraphRunner::new(
+            registry,
+            state.clone(),
+            ExecutionCommitService::new(event_store.clone()),
+            resources.clone(),
+            Arc::new(ScopeLockManager::new()),
+            Arc::new(WorktreeLeaseManager::open(workspace.join("leases.json")).unwrap()),
+            "panic-quota-workspace",
+            workspace,
+        );
+        let supervisor =
+            RuntimeExecutionSupervisor::with_limits(Arc::new(runner), 1, 1, Duration::from_secs(2));
+        (supervisor, state, event_store, resources)
+    }
+
+    #[tokio::test]
+    async fn node_panic_returns_materialize_quota_before_another_graph_needs_it() {
+        let workspace = tempfile::tempdir().unwrap();
+        let executor = Arc::new(PumpTestExecutor::new([]).with_panic_node("panic-node"));
+        let (supervisor, state, event_store, resources) =
+            panic_resource_fixture(executor.clone(), workspace.path());
+        let mut panicking = ExecutionGraph::new("panic under the real single Tool quota");
+        crate::test_support::attach_execution_graph_lineage(&mut panicking);
+        let mut panic_node = test_node("panic-node");
+        panic_node.kind = ExecutionNodeKind::Materialize;
+        panicking.nodes.push(panic_node);
+        let panic_graph_id = panicking.id.clone();
+        let panic_result = tokio::time::timeout(
+            Duration::from_secs(2),
+            supervisor.submit_and_wait_terminal(
+                panicking,
+                ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            ),
+        )
+        .await;
+        let panic_graph = state.load(&panic_graph_id);
+        let after_panic = resources.snapshot(&ExecutionResourceKind::Tool).unwrap();
+        let mut healthy = ExecutionGraph::new("another graph needs the returned Tool quota");
+        crate::test_support::attach_execution_graph_lineage(&mut healthy);
+        let mut healthy_node = test_node("healthy-after-panic");
+        healthy_node.kind = ExecutionNodeKind::Materialize;
+        healthy.nodes.push(healthy_node);
+        let healthy_result = tokio::time::timeout(
+            Duration::from_secs(2),
+            supervisor.submit_and_wait_terminal(
+                healthy,
+                ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            ),
+        )
+        .await;
+        supervisor.shutdown().await;
+        drop(supervisor);
+        let drained = resources.snapshot(&ExecutionResourceKind::Tool).unwrap();
+        assert_eq!(drained.active_leases, 0);
+        assert_eq!(drained.queued_waiters, 0);
+        let (_, panic_report) = panic_result.unwrap().unwrap();
+        assert_eq!(panic_report.failed, 1);
+        let effects = event_store
+            .list_stream("execution-effect:idempotency:panic-node:1")
+            .unwrap();
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|event| event.kind == "execution.effect.intent")
+                .count(),
+            1
+        );
+        assert!(effects
+            .iter()
+            .all(|event| event.kind != "execution.effect.receipt"));
+        println!(
+            "V3_PANIC_RESOURCE_WITNESS {}",
+            serde_json::json!({
+                "after_panic_active": after_panic.active_leases,
+                "after_shutdown_active": drained.active_leases,
+                "effect_intents": 1, "effect_receipts": 0,
+                "healthy_finished": matches!(&healthy_result, Ok(Ok((_, report))) if report.completed == 1),
+            })
+        );
+        let panic_graph = panic_graph.unwrap();
+        let failure = panic_graph.node_results["panic-node"]
+            .failure
+            .as_ref()
+            .unwrap();
+        assert!(failure
+            .message
+            .contains("injected node panic for panic-node"));
+        assert_eq!(after_panic.active_leases, 0);
+        let (_, healthy_report) = healthy_result
+            .expect("a node panic must not strand shared capacity until Runtime shutdown")
+            .expect("healthy graph completes");
+        assert_eq!(healthy_report.completed, 1);
+        assert_eq!(
+            executor.calls.lock().unwrap().as_slice(),
+            &["healthy-after-panic"]
+        );
+    }
+
+    #[tokio::test]
+    async fn node_panic_cleanup_failure_remains_unsettled_and_reaches_original_driver_error() {
+        let workspace = tempfile::tempdir().unwrap();
+        let executor = Arc::new(
+            PumpTestExecutor::new([])
+                .with_panic_node("panic-node")
+                .with_cancel_error_node("panic-node"),
+        );
+        let (supervisor, state, events, resources) =
+            panic_resource_fixture(executor, workspace.path());
+        let mut graph = ExecutionGraph::new("cleanup failure cannot be reported as settlement");
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
+        let mut work = test_node("panic-node");
+        work.kind = ExecutionNodeKind::Materialize;
+        graph.nodes.push(work);
+        let graph_id = graph.id.clone();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            supervisor.submit_and_wait_terminal(
+                graph,
+                ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            ),
+        )
+        .await;
+        let before_shutdown = resources.snapshot(&ExecutionResourceKind::Tool).unwrap();
+        let current = state.load(&graph_id).unwrap();
+        let health = supervisor.health();
+        let effects = events
+            .list_stream("execution-effect:idempotency:panic-node:1")
+            .unwrap();
+        supervisor.shutdown().await;
+        drop(supervisor);
+        let drained = resources.snapshot(&ExecutionResourceKind::Tool).unwrap();
+        let error = result
+            .expect("original driver must return its cleanup error")
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("injected cancellation failure"),
+            "{error}"
+        );
+        assert_eq!(
+            current.node_statuses["panic-node"],
+            ExecutionNodeStatus::Running
+        );
+        assert_eq!(before_shutdown.active_leases, 1);
+        assert!(health
+            .last_error
+            .is_some_and(|error| error.contains("injected cancellation failure")));
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|event| event.kind == "execution.effect.intent")
+                .count(),
+            1
+        );
+        assert!(effects
+            .iter()
+            .all(|event| event.kind != "execution.effect.receipt"));
+        assert_eq!(drained.active_leases, 0);
+        assert_eq!(drained.queued_waiters, 0);
     }
 
     #[tokio::test]

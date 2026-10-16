@@ -39,6 +39,7 @@ struct TestExecutor {
     max_running: AtomicUsize,
     recoveries: AtomicUsize,
     calls: Mutex<Vec<String>>,
+    held_outcome: Option<(Arc<Notify>, Arc<Notify>)>,
 }
 
 impl TestExecutor {
@@ -50,7 +51,13 @@ impl TestExecutor {
             max_running: AtomicUsize::new(0),
             recoveries: AtomicUsize::new(0),
             calls: Mutex::new(Vec::new()),
+            held_outcome: None,
         }
+    }
+
+    fn with_held_outcome(mut self, entered: Arc<Notify>, release: Arc<Notify>) -> Self {
+        self.held_outcome = Some((entered, release));
+        self
     }
 }
 
@@ -92,6 +99,10 @@ impl NodeExecutor for TestExecutor {
         let current = self.running.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_running.fetch_max(current, Ordering::SeqCst);
         tokio::time::sleep(self.delay).await;
+        if let Some((entered, release)) = self.held_outcome.as_ref() {
+            entered.notify_one();
+            release.notified().await;
+        }
         self.running.fetch_sub(1, Ordering::SeqCst);
         self.calls
             .lock()
@@ -2479,6 +2490,304 @@ async fn failure_blocks_only_dependent_branch() {
             ("independent".to_string(), ExecutionNodeStatus::Completed),
         ])
     );
+}
+
+#[tokio::test]
+async fn isolation_rejects_foreign_attempt_before_touching_current_resource_lease() {
+    let temporary = tempfile::tempdir().unwrap();
+    let (registry, state, commits) = harness();
+    registry
+        .register(Arc::new(TestExecutor::new(Vec::new(), Duration::ZERO)))
+        .unwrap();
+    let resources = Arc::new(ExecutionResourceManager::new([(
+        ExecutionResourceKind::Tool,
+        ResourceQuota::new(1, 1, 1).unwrap(),
+    )]));
+    let runner = ExecutionGraphRunner::new(
+        registry,
+        state.clone(),
+        commits.clone(),
+        resources.clone(),
+        Arc::new(ScopeLockManager::new()),
+        Arc::new(WorktreeLeaseManager::open(temporary.path().join("leases.json")).unwrap()),
+        "isolation-ticket-workspace",
+        temporary.path(),
+    );
+    let mut graph = test_graph("an old panic cannot release a current attempt");
+    let mut work = node("current-attempt");
+    work.kind = ExecutionNodeKind::Materialize;
+    graph.nodes.push(work);
+    let graph = runner.register(graph).await.unwrap();
+    let ready = runner
+        .pump_snapshot(&graph.id, &Default::default())
+        .await
+        .unwrap()
+        .ready;
+    let mut prepared = runner.prepare_ready_wave(&graph.id, ready).await.unwrap();
+    assert_eq!(prepared.len(), 1);
+    let prepared = prepared.pop().unwrap();
+    let binding = prepared.binding.unwrap();
+    let ticket = NodeExecutionTicket {
+        graph_id: graph.id.clone(),
+        node_id: prepared.node.id,
+        executor_kind: binding.executor_kind.clone(),
+        service_class: graph.service_class,
+        attempt: binding.attempt,
+        idempotency_key: binding.ticket_idempotency_key.clone(),
+        payload_ref: prepared.node.payload_ref,
+    };
+    let before = state.load(&graph.id).unwrap();
+    assert_eq!(
+        before.node_statuses[&ticket.node_id],
+        ExecutionNodeStatus::Running
+    );
+    assert_eq!(
+        resources
+            .snapshot(&ExecutionResourceKind::Tool)
+            .unwrap()
+            .active_leases,
+        1
+    );
+    let mut foreign = binding.clone();
+    foreign.attempt += 1;
+    let rejected = runner
+        .isolate_node_failure(
+            &graph.id,
+            &ticket.node_id,
+            Some(&foreign),
+            "foreign panic".into(),
+        )
+        .await;
+    let mut wrong_lease = binding.clone();
+    wrong_lease.resource_lease_refs = vec!["foreign-lease".into()];
+    let rejected_lease = runner
+        .isolate_node_failure(
+            &graph.id,
+            &ticket.node_id,
+            Some(&wrong_lease),
+            "foreign lease".into(),
+        )
+        .await;
+    let after = state.load(&graph.id).unwrap();
+    let retained = resources.snapshot(&ExecutionResourceKind::Tool).unwrap();
+    runner
+        .isolate_node_failure(
+            &graph.id,
+            &ticket.node_id,
+            Some(&binding),
+            "actual owner failure".into(),
+        )
+        .await
+        .unwrap();
+    let drained = resources.snapshot(&ExecutionResourceKind::Tool).unwrap();
+    assert!(matches!(
+        rejected,
+        Err(ExecutionRunnerError::CommandSuperseded { .. })
+    ));
+    assert!(matches!(
+        rejected_lease,
+        Err(ExecutionRunnerError::CommandSuperseded { .. })
+    ));
+    assert_eq!(after, before);
+    assert_eq!(retained.active_leases, 1);
+    assert_eq!(drained.active_leases, 0);
+    assert_eq!(drained.queued_waiters, 0);
+    assert_eq!(
+        state.load(&graph.id).unwrap().node_statuses[&ticket.node_id],
+        ExecutionNodeStatus::Failed
+    );
+    assert!(matches!(
+        commits.inspect_execution_effect(&ticket).unwrap(),
+        ExecutionEffectState::Uncertain
+    ));
+}
+
+#[tokio::test]
+async fn delayed_old_outcome_cannot_complete_or_release_a_resumed_attempt() {
+    assert_resumed_attempt_ignores_old_response(OldAttemptResponse::HeldSuccess).await;
+}
+
+#[tokio::test]
+async fn delayed_old_poll_error_cannot_fail_or_release_a_resumed_attempt() {
+    assert_resumed_attempt_ignores_old_response(OldAttemptResponse::HeldFailure).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn queued_old_terminal_wave_cannot_complete_or_release_a_resumed_attempt() {
+    assert_resumed_attempt_ignores_old_response(OldAttemptResponse::QueuedTerminal).await;
+}
+
+#[tokio::test]
+async fn old_prepared_node_cannot_poll_or_release_a_resumed_attempt() {
+    assert_resumed_attempt_ignores_old_response(OldAttemptResponse::NotStarted).await;
+}
+
+enum OldAttemptResponse {
+    HeldSuccess,
+    HeldFailure,
+    QueuedTerminal,
+    NotStarted,
+}
+
+async fn assert_resumed_attempt_ignores_old_response(response: OldAttemptResponse) {
+    let poll_fails = matches!(response, OldAttemptResponse::HeldFailure);
+    let queued_terminal = matches!(response, OldAttemptResponse::QueuedTerminal);
+    let not_started = matches!(response, OldAttemptResponse::NotStarted);
+    let temporary = tempfile::tempdir().unwrap();
+    let (registry, state, commits) = harness();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let failures = if poll_fails {
+        vec!["resumed-node".to_string()]
+    } else {
+        Vec::new()
+    };
+    let executor = Arc::new(
+        TestExecutor::new(failures, Duration::ZERO)
+            .with_held_outcome(entered.clone(), release.clone()),
+    );
+    registry.register(executor.clone()).unwrap();
+    let resources = Arc::new(ExecutionResourceManager::new([(
+        ExecutionResourceKind::Tool,
+        ResourceQuota::new(1, 1, 1).unwrap(),
+    )]));
+    let runner = ExecutionGraphRunner::new(
+        registry,
+        state.clone(),
+        commits,
+        resources.clone(),
+        Arc::new(ScopeLockManager::new()),
+        Arc::new(WorktreeLeaseManager::open(temporary.path().join("leases.json")).unwrap()),
+        "late-response-workspace",
+        temporary.path(),
+    );
+    let mut graph = test_graph("old response after original Pause and Resume");
+    let mut work = node("resumed-node");
+    work.kind = ExecutionNodeKind::Materialize;
+    graph.nodes.push(work);
+    let graph = runner.register(graph).await.unwrap();
+    let ready = runner
+        .pump_snapshot(&graph.id, &Default::default())
+        .await
+        .unwrap()
+        .ready;
+    let mut initial = runner.prepare_ready_wave(&graph.id, ready).await.unwrap();
+    let old = initial.pop().unwrap();
+    let old_binding = old.binding.clone().unwrap();
+    let mut execution = Some(Box::pin({
+        let runner = runner.clone();
+        let graph_id = graph.id.clone();
+        async move {
+            runner
+                .execute_prepared_pump_node(&graph_id, old, Arc::new(Notify::new()))
+                .await
+        }
+    }));
+    let pending = if not_started {
+        None
+    } else {
+        Some(tokio::spawn(execution.take().unwrap()))
+    };
+    if !not_started {
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+    }
+    if queued_terminal {
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while runner.pending_terminal_count(&graph.id).await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(runner.pending_terminal_count(&graph.id).await, 1);
+    }
+    let running = state.load(&graph.id).unwrap();
+    let paused = runner
+        .command(
+            &graph.id,
+            ExecutionGraphCommand::Pause {
+                expected_revision: running.revision,
+                reason: "explicit operator pause".into(),
+            },
+        )
+        .await
+        .unwrap();
+    runner
+        .command(
+            &graph.id,
+            ExecutionGraphCommand::Resume {
+                expected_revision: paused.revision,
+            },
+        )
+        .await
+        .unwrap();
+    let ready = runner
+        .pump_snapshot(&graph.id, &Default::default())
+        .await
+        .unwrap()
+        .ready;
+    let mut current = runner.prepare_ready_wave(&graph.id, ready).await.unwrap();
+    let current = current.pop().unwrap();
+    let current_binding = current.binding.clone().unwrap();
+    assert!(current_binding.attempt > old_binding.attempt);
+    assert_ne!(
+        current_binding.resource_lease_refs,
+        old_binding.resource_lease_refs
+    );
+    let before = state.load(&graph.id).unwrap();
+    let held = resources.snapshot(&ExecutionResourceKind::Tool).unwrap();
+    if !queued_terminal && !not_started {
+        release.notify_one();
+    }
+    let outcome = match pending {
+        Some(pending) => tokio::time::timeout(Duration::from_secs(2), pending)
+            .await
+            .unwrap()
+            .unwrap(),
+        None => tokio::time::timeout(Duration::from_secs(2), execution.take().unwrap())
+            .await
+            .unwrap(),
+    };
+    let after = state.load(&graph.id).unwrap();
+    let retained = resources.snapshot(&ExecutionResourceKind::Tool).unwrap();
+    let cleanup = runner
+        .command(
+            &graph.id,
+            ExecutionGraphCommand::Cancel {
+                expected_revision: after.revision,
+                reason: "fixture owner cleanup".into(),
+            },
+        )
+        .await;
+    drop(current);
+    drop(runner);
+    let drained = resources.snapshot(&ExecutionResourceKind::Tool).unwrap();
+    eprintln!(
+        "V3_LATE_ATTEMPT_WITNESS {}",
+        serde_json::json!({
+            "poll_fails": poll_fails, "queued_terminal": queued_terminal, "not_started": not_started,
+            "old_attempt": old_binding.attempt, "current_attempt": current_binding.attempt,
+            "revision_before": before.revision, "revision_after": after.revision,
+            "held_active": held.active_leases, "retained_active": retained.active_leases,
+            "drained_active": drained.active_leases,
+        })
+    );
+    assert_eq!(drained.active_leases, 0);
+    assert_eq!(drained.queued_waiters, 0);
+    cleanup.unwrap();
+    assert_eq!(held.active_leases, 1);
+    assert_eq!(
+        after, before,
+        "an old physical response cannot commit a current attempt outcome"
+    );
+    assert_eq!(retained.active_leases, 1);
+    if not_started {
+        assert!(executor.calls.lock().unwrap().is_empty());
+    }
+    outcome.unwrap();
 }
 
 #[tokio::test]
