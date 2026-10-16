@@ -446,6 +446,10 @@ impl RuntimeEventStore {
         *self.commit_signal.borrow()
     }
 
+    pub fn durable_commit_cursor(&self) -> RuntimeEventStoreResult<u64> {
+        self.backend.durable_commit_cursor()
+    }
+
     pub fn event_by_idempotency_key(
         &self,
         stream_id: &str,

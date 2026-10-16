@@ -49,6 +49,14 @@ impl PostgresRuntimeEventStore {
 }
 
 impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
+    fn durable_commit_cursor(&self) -> RuntimeEventStoreResult<u64> {
+        let mut connection = self.checkout_event_read()?;
+        let row = pg(connection.query_one(
+            "SELECT COALESCE(MAX(commit_cursor), 0) FROM runtime_commits", &[],
+        ))?;
+        from_i64(pg(row.try_get(0))?, "commit_cursor")
+    }
+
     fn background_projection_capacity_hint(&self) -> usize {
         self.executor
             .health()
@@ -1779,6 +1787,10 @@ fn append_transaction_in_tx(
         }
     }
 
+    pg(tx.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || ':cowd-runtime-publication', 0))",
+        &[],
+    ))?;
     let created_at_ms = now_ms();
     let row = pg(tx.query_one(
         "INSERT INTO runtime_commits(transaction_id, request_hash, created_at_ms)

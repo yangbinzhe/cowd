@@ -163,6 +163,189 @@ fn postgres_outbox_restart_reclaims_the_same_message_and_rejects_the_old_worker_
     assert_eq!(final_store.stream_revision("execution-graph:kernel").unwrap(), 2);
 }
 
+struct PublicationDelay {
+    connection: storage::PostgresConnection,
+    key: i64,
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn postgres_concurrent_publication_keeps_every_committed_event_recoverable() {
+    let fixture = PostgresTestScope::new();
+    let reader = connect(&fixture);
+    let barrier = Arc::new(std::sync::Barrier::new(5));
+    let mut workers = Vec::new();
+    for worker in 0..4 {
+        let store = connect(&fixture);
+        let barrier = barrier.clone();
+        workers.push(std::thread::spawn(move || {
+            let mut samples = Vec::new();
+            barrier.wait();
+            for sequence in 0..25 {
+                let started = std::time::Instant::now();
+                let event = store.append(RuntimeEventInput {
+                    stream_id: format!("kernel:publication-load:{worker}"),
+                    scope: RuntimeEventScope::Recovery, kind: "kernel.publication_sample".into(),
+                    status: None, actor: Some(format!("load-worker-{worker}")), refs: vec![],
+                    payload: serde_json::json!({"worker":worker,"sequence":sequence}),
+                }).unwrap();
+                samples.push((event.commit_cursor, started.elapsed().as_micros() as u64));
+            }
+            samples
+        }));
+    }
+    let started = std::time::Instant::now();
+    barrier.wait();
+    let mut samples = workers.into_iter().flat_map(|worker| worker.join().unwrap()).collect::<Vec<_>>();
+    let elapsed = started.elapsed();
+    assert_eq!(samples.len(), 100);
+    samples.sort_unstable();
+    assert!(samples.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    let recovered = reader.events_after_cursor(0, 128).unwrap();
+    assert_eq!(recovered.len(), 100);
+    assert_eq!(recovered.iter().map(|batch| batch.commit_cursor).collect::<Vec<_>>(),
+        samples.iter().map(|sample| sample.0).collect::<Vec<_>>());
+    assert_eq!(reader.durable_commit_cursor().unwrap(), samples.last().unwrap().0);
+    for worker in 0..4 {
+        assert_eq!(reader.list_stream(&format!("kernel:publication-load:{worker}")).unwrap().len(), 25);
+    }
+    let mut latency = samples.into_iter().map(|sample| sample.1).collect::<Vec<_>>();
+    latency.sort_unstable();
+    println!("kernel_publication_benchmark={}", serde_json::json!({
+        "workers":4,"commits":100,"elapsed_ms":elapsed.as_millis(),
+        "commits_per_second":100.0/elapsed.as_secs_f64(),
+        "p50_us":latency[49],"p95_us":latency[94],"max_us":latency[99],
+        "scope":"isolated local fixture only; no baseline improvement claim",
+    }));
+}
+
+impl Drop for PublicationDelay {
+    fn drop(&mut self) {
+        let _ = self.connection.query_one("SELECT pg_advisory_unlock($1)", &[&self.key]);
+    }
+}
+
+fn publication_request(label: &str) -> AppendTransactionRequest {
+    let mut request = conclusion();
+    request.transaction_id = format!("kernel-publication:{label}");
+    for expected in &mut request.expected_streams {
+        expected.stream_id = format!("{}:{label}", expected.stream_id);
+    }
+    for input in &mut request.events {
+        input.event.stream_id = format!("{}:{label}", input.event.stream_id);
+        input.event.actor = Some(format!("kernel-publish-{label}"));
+    }
+    request
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn postgres_visible_commit_order_cannot_skip_an_earlier_inflight_cursor() {
+    let fixture = PostgresTestScope::new();
+    let reader = connect(&fixture);
+    let slow = connect(&fixture);
+    let fast = connect(&fixture);
+    let executor = fixture.reconnect();
+    let mut connection = executor.checkout_critical().unwrap();
+    let key: i64 = connection.query_one(
+        "SELECT hashtextextended(current_schema() || ':kernel-publication-delay', 0)", &[],
+    ).unwrap().get(0);
+    connection.query_one("SELECT pg_advisory_lock($1)", &[&key]).unwrap();
+    let mut delay = PublicationDelay { connection, key };
+    delay.connection.batch_execute(&format!(
+        "CREATE FUNCTION kernel_delay_publication() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN PERFORM pg_advisory_xact_lock({key}::bigint); RETURN NEW; END $$;
+         CREATE TRIGGER kernel_delay_publication BEFORE INSERT ON runtime_events
+         FOR EACH ROW WHEN (NEW.actor = 'kernel-publish-slow') EXECUTE FUNCTION kernel_delay_publication()"
+    )).unwrap();
+    let slow_thread = std::thread::spawn(move || slow.append_transaction(publication_request("slow")));
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let upper_key = ((key as u64) >> 32) as i64;
+    let lower_key = ((key as u64) & u64::from(u32::MAX)) as i64;
+    let mut first_is_inflight = false;
+    while std::time::Instant::now() < deadline {
+        first_is_inflight = delay.connection.query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted
+             AND classid::bigint=$1 AND objid::bigint=$2 AND objsubid=1)",
+            &[&upper_key, &lower_key],
+        ).unwrap().get(0);
+        if first_is_inflight { break; }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (finished_sender, finished_receiver) = std::sync::mpsc::sync_channel(1);
+    let fast_thread = std::thread::spawn(move || {
+        let result = fast.append_transaction(publication_request("fast"));
+        finished_sender.send(()).unwrap();
+        result
+    });
+    let overtook = finished_receiver.recv_timeout(Duration::from_millis(250)).is_ok();
+    drop(delay);
+    let first = slow_thread.join().unwrap().unwrap();
+    let second = fast_thread.join().unwrap().unwrap();
+    assert!(first_is_inflight, "the trigger must really pause a cursor-owning transaction");
+    assert!(!overtook, "a later visible cursor can make a durable reader skip a late earlier commit");
+    assert!(first.commit_cursor < second.commit_cursor);
+    let batches = reader.events_after_cursor(0, 10).unwrap();
+    assert_eq!(batches.len(), 2);
+    assert_eq!(batches[0].transaction_id, "kernel-publication:slow");
+    assert_eq!(batches[1].transaction_id, "kernel-publication:fast");
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+async fn postgres_production_snapshot_and_delta_recover_a_separate_writers_goal_without_notify() {
+    let fixture = PostgresTestScope::new();
+    let reader = Arc::new(connect(&fixture));
+    let writer = Arc::new(connect(&fixture));
+    let temporary = tempfile::tempdir().unwrap();
+    let workspace = temporary.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let services = runtime::RuntimeServices::builder(temporary.path().join("home"), &workspace)
+        .non_durable_backends_for_testing(temporary.path())
+        .runtime_event_store(reader.clone()).build().unwrap();
+    let graph = harness_contract::execution_graph::ExecutionGraph::new("PG external Goal projection").with_lineage(
+        harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id: "pg-projection-session".into(), turn_id: "pg-projection-turn".into(),
+            root_task_id: "pg-projection-task".into(), task_id: "pg-projection-task".into(), generation: 1,
+        },
+    );
+    let graph_id = graph.id.clone();
+    services.execution_supervisor().submit_and_wait(graph,
+        harness_contract::execution_graph::ExecutionGraphCommand::Start { expected_revision: 0 },
+    ).await.unwrap();
+    let query = harness_contract::projection::ProjectionQueryContext {
+        principal: "kernel-pg-test".into(), workspace_id: services.workspace_key().into(),
+        session_scopes: vec![], mission_scopes: vec![],
+        visibility_grants: vec![format!("workspace:{}", services.workspace_key()), "resource:*".into()],
+        detail_scope: harness_contract::projection::ProjectionDetailScope::Full, authorization_revision: 1,
+    };
+    let initial = runtime::execution_projection::snapshot(&services, &graph_id, &query).await.unwrap();
+    assert!(initial.goals.is_empty());
+    services.shutdown_maintenance().await;
+    let hint = reader.current_commit_cursor();
+    let goal_id = format!("goal:{graph_id}");
+    let goal = serde_json::from_value(serde_json::json!({
+        "id":goal_id,"session_id":"pg-projection-session","objective":"Recover external Goal facts",
+        "criteria":[{"id":"pg-external-criterion","statement":"visible in snapshot and delta","status":"open"}],
+        "phase":"execution","scope":"internal","completion":"open","revision":1,"user_sequence":1,
+        "spec_revision":1,"spec_digest":"kernel-pg-external-goal-fixture-v1",
+    })).unwrap();
+    runtime::execution_core::GoalStore::new(writer).create(goal).unwrap();
+    assert_eq!(reader.current_commit_cursor(), hint);
+    let durable = reader.durable_commit_cursor().unwrap();
+    assert!(durable > initial.cursor);
+    let recovered = runtime::execution_projection::snapshot(&services, &graph_id, &query).await.unwrap();
+    assert_eq!(recovered.cursor, durable);
+    assert!(recovered.goals.iter().any(|goal| goal.id == goal_id));
+    let update = runtime::execution_projection::delta(&services, &graph_id, initial.revision, initial.cursor, &query).unwrap();
+    assert_eq!(update.target_cursor, durable);
+    assert!(update.operations.iter().any(|operation| matches!(operation,
+        harness_contract::projection::ProjectionOperation::UpsertEntity {
+            collection: harness_contract::projection::ProjectionEntityCollection::Goals, entity,
+        } if entity.id == goal_id)));
+    services.shutdown_execution().await;
+}
+
 #[tokio::test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 async fn postgres_external_commit_without_a_local_doorbell_is_recovered_by_durable_scan() {
@@ -197,6 +380,7 @@ async fn postgres_external_commit_without_a_local_doorbell_is_recovered_by_durab
     let initialized = tokio::time::timeout(Duration::from_secs(3), entered.notified()).await;
     let receipt = writer.append_transaction(conclusion()).unwrap();
     assert!(!local_signal.has_changed().unwrap());
+    assert_eq!(reader.durable_commit_cursor().unwrap(), receipt.commit_cursor);
     let result = tokio::time::timeout(Duration::from_secs(3), recovered.notified()).await;
     let shutdown = reactor.shutdown().await;
     assert!(initialized.is_ok());

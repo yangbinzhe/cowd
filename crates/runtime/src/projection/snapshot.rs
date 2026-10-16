@@ -9,8 +9,8 @@ pub async fn snapshot(
     // Freeze the durable consumption boundary before reading materialized
     // stores. Concurrent commits may be replayed once, but cannot be skipped
     // by advertising a cursor newer than the state observed below.
-    let cursor = *services.event_store().subscribe_commits().borrow();
     validate_context(services, context)?;
+    let cursor = services.event_store().durable_commit_cursor()?;
     let graph = services
         .execution_supervisor()
         .graph_projection(execution_id)

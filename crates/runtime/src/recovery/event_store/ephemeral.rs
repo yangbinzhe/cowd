@@ -183,6 +183,10 @@ fn terminal_record(input: &SessionTerminalInput, cursor: u64) -> RuntimeSessionO
 }
 
 impl RuntimeEventStoreBackend for EphemeralRuntimeEventStore {
+    fn durable_commit_cursor(&self) -> RuntimeEventStoreResult<u64> {
+        Ok(self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).next_cursor)
+    }
+
     fn append(&self, input: RuntimeEventInput) -> Result<DurableRuntimeEvent, String> {
         let stream = input.stream_id.clone();
         let revision = self.stream_revision(&stream).map_err(|e| e.to_string())?;

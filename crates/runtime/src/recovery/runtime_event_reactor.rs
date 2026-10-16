@@ -460,6 +460,19 @@ impl RuntimeEventReactor {
         &self,
         projection_id: &str,
     ) -> Result<Option<RuntimeProjectionLaneHealth>, String> {
+        if !self.lanes.contains_key(projection_id) {
+            return Ok(None);
+        }
+        let latest_commit_cursor = self.event_store.durable_commit_cursor()
+            .map_err(|error| error.to_string())?;
+        self.lane_health_at(projection_id, latest_commit_cursor)
+    }
+
+    fn lane_health_at(
+        &self,
+        projection_id: &str,
+        latest_commit_cursor: u64,
+    ) -> Result<Option<RuntimeProjectionLaneHealth>, String> {
         let Some(registered) = self.lanes.get(projection_id) else {
             return Ok(None);
         };
@@ -468,7 +481,6 @@ impl RuntimeEventReactor {
             .projection_checkpoint(projection_id)
             .map_err(|error| error.to_string())?
             .map_or(0, |checkpoint| checkpoint.source_cursor);
-        let latest_commit_cursor = self.event_store.current_commit_cursor();
         let last_success_at_ms = registered.state.last_success_at_ms.load(Ordering::Relaxed);
         Ok(Some(RuntimeProjectionLaneHealth {
             projection_id: projection_id.to_string(),
@@ -505,8 +517,10 @@ impl RuntimeEventReactor {
 
     pub fn health(&self) -> Result<RuntimeEventReactorHealth, String> {
         let mut lanes = Vec::with_capacity(self.lanes.len());
+        let latest_commit_cursor = self.event_store.durable_commit_cursor()
+            .map_err(|error| error.to_string())?;
         for projection_id in self.lanes.keys() {
-            if let Some(health) = self.lane_health(projection_id)? {
+            if let Some(health) = self.lane_health_at(projection_id, latest_commit_cursor)? {
                 lanes.push(health);
             }
         }

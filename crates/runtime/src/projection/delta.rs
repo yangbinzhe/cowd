@@ -10,7 +10,7 @@ pub fn delta(
     context: &ProjectionQueryContext,
 ) -> Result<ProjectionDelta, RuntimeServicesError> {
     validate_context(services, context)?;
-    let upper_bound = *services.event_store().subscribe_commits().borrow();
+    let upper_bound = services.event_store().durable_commit_cursor()?;
     let batches = services
         .event_store()
         .events_after_cursor(base_cursor, MAX_DELTA_BATCHES.saturating_add(1))?

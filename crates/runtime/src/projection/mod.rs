@@ -1048,6 +1048,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_cache_and_delta_recover_an_external_goal_without_a_local_commit_signal() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let backend = std::sync::Arc::new(crate::runtime_event_store::EphemeralRuntimeEventStore::new());
+        let reader = std::sync::Arc::new(crate::RuntimeEventStore::from_backend(backend.clone()));
+        let writer = std::sync::Arc::new(crate::RuntimeEventStore::from_backend(backend));
+        let services = RuntimeServices::test_builder(temporary.path().join("home"), &workspace)
+            .runtime_event_store(reader.clone()).build().unwrap();
+        let graph = graph_with_lineage("external Goal recovery", "external-session", "external-turn", "external-task");
+        let graph_id = graph.id.clone();
+        services.execution_supervisor().submit_and_wait(graph, ExecutionGraphCommand::Start {
+            expected_revision: 0,
+        }).await.unwrap();
+        let query = context(&services);
+        let initial = snapshot(&services, &graph_id, &query).await.unwrap();
+        assert!(initial.goals.is_empty());
+        services.shutdown_maintenance().await;
+        let hint = reader.current_commit_cursor();
+        let goal_id = format!("goal:{graph_id}");
+        let goal: GoalContract = serde_json::from_value(serde_json::json!({
+            "id": goal_id, "session_id": "external-session", "objective": "Externally committed Goal must be visible",
+            "criteria": [{"id":"external-criterion", "statement":"visible in snapshot and delta", "status":"open"}],
+            "phase":"execution", "scope":"internal", "completion":"open", "revision":1, "user_sequence":1,
+            "spec_revision":1,"spec_digest":"kernel-external-goal-fixture-v1",
+        })).unwrap();
+        crate::execution_core::GoalStore::new(writer).create(goal).unwrap();
+        assert_eq!(reader.current_commit_cursor(), hint);
+        let durable = reader.durable_commit_cursor().unwrap();
+        assert!(durable > initial.cursor);
+        let recovered = snapshot(&services, &graph_id, &query).await.unwrap();
+        assert_eq!(recovered.cursor, durable);
+        assert!(recovered.goals.iter().any(|goal| goal.id == goal_id));
+        let update = delta(&services, &graph_id, initial.revision, initial.cursor, &query).unwrap();
+        assert_eq!(update.target_cursor, durable);
+        assert!(update.operations.iter().any(|operation| matches!(operation,
+            ProjectionOperation::UpsertEntity { collection: ProjectionEntityCollection::Goals, entity }
+                if entity.id == goal_id)));
+        services.shutdown_execution().await;
+    }
+
+    #[tokio::test]
     async fn projection_snapshot_delta_and_command_share_one_graph_revision() {
         let services = RuntimeServices::in_memory().expect("runtime services");
         let graph = ExecutionGraph::new("projection contract graph").with_lineage(

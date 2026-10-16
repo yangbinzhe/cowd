@@ -391,7 +391,7 @@ fn outcome_source_lag(
     event_store: &RuntimeEventStore,
     source_cursor: u64,
 ) -> Result<(u64, u64), String> {
-    let upper_bound = *event_store.subscribe_commits().borrow();
+    let upper_bound = event_store.durable_commit_cursor().map_err(|error| error.to_string())?;
     let mut cursor = source_cursor;
     let mut latest_source_cursor = source_cursor;
     let mut lag_commits = 0_u64;

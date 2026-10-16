@@ -770,6 +770,12 @@ pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync {
         sequence: u64,
     ) -> RuntimeEventStoreResult<Vec<(String, Option<String>)>>;
     fn all_events(&self, limit: usize) -> Result<Vec<DurableRuntimeEvent>, String>;
+    fn durable_commit_cursor(&self) -> RuntimeEventStoreResult<u64> {
+        let events = self.all_events(1).map_err(|error| {
+            RuntimeEventStoreError::Io(std::io::Error::other(error))
+        })?;
+        Ok(events.into_iter().map(|event| event.commit_cursor).max().unwrap_or_default())
+    }
     fn latest_for_stream(&self, stream_id: &str) -> Result<Option<DurableRuntimeEvent>, String>;
     fn latest_for_stream_kind(
         &self,
