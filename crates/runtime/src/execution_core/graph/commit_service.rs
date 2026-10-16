@@ -1913,6 +1913,7 @@ impl ExecutionCommitService {
         domain_events: Vec<RuntimeTransactionEventInput>,
         expected_domain_revisions: &BTreeMap<String, u64>,
     ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
+        let mut domain_events = domain_events;
         validated_graph_lineage(graph)?;
         if domain_events
             .iter()
@@ -1997,6 +1998,166 @@ impl ExecutionCommitService {
             return Err(ExecutionCommitError::InvalidCommand(
                 "graph transition contains multiple Session terminal inputs".to_string(),
             ));
+        }
+        if let Some(terminal) = terminal.as_ref() {
+            let terminal_event = domain_events
+                .iter()
+                .find(|event| event.event.kind == "runtime.session.terminal_requested")
+                .ok_or_else(|| {
+                    ExecutionCommitError::InvalidCommand("Session terminal event disappeared".into())
+                })?;
+            if terminal_event.event.payload.get("objective_verdict").is_some() {
+                return Err(ExecutionCommitError::InvalidCommand(
+                    "Session terminal cannot supply its own Objective verdict".into(),
+                ));
+            }
+            let lineage = validated_graph_lineage(graph)?;
+            if terminal.session_id != lineage.session_id
+                || terminal.turn_id.as_deref() != Some(lineage.turn_id.as_str())
+                || terminal.execution_id.as_deref() != Some(graph.id.as_str())
+            {
+                return Err(ExecutionCommitError::InvalidCommand(
+                    "Session terminal does not match its Graph, Session and Turn".into(),
+                ));
+            }
+            let objective_id = harness_contract::agent_action::root_objective_id(
+                &lineage.session_id,
+                &lineage.turn_id,
+            );
+            let program_id =
+                harness_contract::agent_action::program_id_for_objective(&objective_id);
+            let actions = crate::AgentActionService::new(Arc::clone(&self.event_store));
+            if let Some(program) = actions
+                .project_if_exists(&program_id)
+                .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))?
+            {
+                let invalid = |reason: &str| {
+                    ExecutionCommitError::InvalidCommand(format!(
+                        "Session terminal Objective source is invalid: {reason}"
+                    ))
+                };
+                if program.objective_id != objective_id
+                    || program.session_id != lineage.session_id
+                    || program.turn_id != lineage.turn_id
+                    || program.root_execution_id.as_deref() != Some(graph.id.as_str())
+                {
+                    return Err(invalid("root, Session or Turn binding mismatch"));
+                }
+                let verdict = program
+                    .objective_verdict
+                    .as_ref()
+                    .ok_or_else(|| invalid("Program has no committed Objective verdict"))?;
+                let goals = crate::execution_core::GoalStore::new(Arc::clone(&self.event_store));
+                let goal = goals
+                    .projection(&verdict.goal_id)
+                    .map_err(ExecutionCommitError::InvalidCommand)?
+                    .ok_or_else(|| invalid("verdict Goal does not exist"))?;
+                let bound = goal.goal.execution_binding.as_ref().is_some_and(|binding| {
+                    binding.objective_id == objective_id
+                        && binding.agentic_program_id == program_id
+                        && binding.session_id == lineage.session_id
+                        && binding.turn_id == lineage.turn_id
+                        && binding.root_execution_id == graph.id
+                });
+                let matching_terminal = goal.goal.terminal.as_ref().is_some_and(|source| {
+                    source.terminal_fence == verdict.terminal_fence
+                        && source.authority_revision == verdict.authority_revision
+                        && source.kind == verdict.kind
+                });
+                let matching_completion = matches!(
+                    (verdict.kind, goal.goal.completion),
+                    (
+                        harness_contract::goal::ObjectiveTerminalKind::Satisfied,
+                        harness_contract::goal::GoalCompletion::Satisfied
+                    ) | (
+                        harness_contract::goal::ObjectiveTerminalKind::PartiallySatisfied,
+                        harness_contract::goal::GoalCompletion::Partial
+                    ) | (
+                        harness_contract::goal::ObjectiveTerminalKind::Blocked,
+                        harness_contract::goal::GoalCompletion::Blocked
+                    ) | (
+                        harness_contract::goal::ObjectiveTerminalKind::Failed,
+                        harness_contract::goal::GoalCompletion::Failed
+                    ) | (
+                        harness_contract::goal::ObjectiveTerminalKind::Cancelled,
+                        harness_contract::goal::GoalCompletion::Cancelled
+                    )
+                );
+                if !bound
+                    || !matching_terminal
+                    || !matching_completion
+                    || goal.goal.revision != verdict.goal_revision
+                {
+                    return Err(invalid("Goal terminal disagrees with Program verdict"));
+                }
+                let program_stream_id = format!("agentic-program:{program_id}");
+                let verdict_event = self
+                    .event_store
+                    .list_stream_page_desc(&program_stream_id, 1, 0)
+                    .map_err(ExecutionCommitError::InvalidCommand)?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| invalid("Program verdict has no durable event"))?;
+                if verdict_event.kind != "agentic.objective_verdict_bound"
+                    || verdict_event.payload["verdict"]
+                        != serde_json::to_value(verdict)
+                            .map_err(ExecutionCommitError::Serialization)?
+                {
+                    return Err(invalid("latest Program event is not this Objective verdict"));
+                }
+                for source in [
+                    ExpectedStreamRevision {
+                        stream_id: program_stream_id,
+                        expected_revision: program.revision,
+                    },
+                    ExpectedStreamRevision {
+                        stream_id: format!("goal:{}", verdict.goal_id),
+                        expected_revision: goal.stream_revision,
+                    },
+                ] {
+                    if expected_domain_revisions.get(&source.stream_id).is_some_and(|revision| {
+                        *revision != source.expected_revision
+                    }) {
+                        return Err(invalid("caller expected a different Objective source revision"));
+                    }
+                    if domain_events
+                        .iter()
+                        .any(|event| event.event.stream_id == source.stream_id)
+                    {
+                        return Err(invalid("Objective source stream collides with B writes"));
+                    }
+                    if seen.insert(source.stream_id.clone()) {
+                        expected_streams.push(source);
+                    }
+                }
+                let terminal_event = domain_events
+                    .iter_mut()
+                    .find(|event| event.event.kind == "runtime.session.terminal_requested")
+                    .ok_or_else(|| invalid("Session terminal event disappeared"))?;
+                terminal_event.event.payload["objective_verdict"] = serde_json::json!({
+                    "program_id": program_id,
+                    "program_stream_revision": program.revision,
+                    "goal_stream_revision": goal.stream_revision,
+                    "goal_spec_revision": goal.goal.spec_revision,
+                    "goal_spec_digest": goal.goal.spec_digest,
+                    "a_commit_cursor": verdict_event.commit_cursor,
+                    "verdict": verdict,
+                });
+                terminal_event.event.refs.extend([
+                    RuntimeEventRef {
+                        kind: "program".into(),
+                        id: program_id,
+                    },
+                    RuntimeEventRef {
+                        kind: "goal".into(),
+                        id: verdict.goal_id.clone(),
+                    },
+                    RuntimeEventRef {
+                        kind: "terminal_fence".into(),
+                        id: verdict.terminal_fence.clone(),
+                    },
+                ]);
+            }
         }
         let mut events = vec![graph_input];
         events.extend(domain_events);

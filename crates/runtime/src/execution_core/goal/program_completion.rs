@@ -933,12 +933,31 @@ mod tests {
         crate::AgentActionService,
         AgentActorBinding,
     ) {
+        fixture_with_ids(
+            reviewed,
+            request_completion,
+            "objective-completion".into(),
+            "program-completion".into(),
+        )
+    }
+
+    fn fixture_with_ids(
+        reviewed: bool,
+        request_completion: bool,
+        objective_id: String,
+        program_id: String,
+    ) -> (
+        Arc<RuntimeEventStore>,
+        GoalStore,
+        crate::AgentActionService,
+        AgentActorBinding,
+    ) {
         let events = Arc::new(RuntimeEventStore::for_test());
         let goals = GoalStore::new(Arc::clone(&events));
         let actions = crate::AgentActionService::new(Arc::clone(&events));
         let actor = AgentActorBinding {
-            objective_id: "objective-completion".into(),
-            program_id: "program-completion".into(),
+            objective_id,
+            program_id,
             session_id: "session-completion".into(),
             turn_id: "turn-completion".into(),
             root_execution_id: Some("root-completion".into()),
@@ -1569,6 +1588,158 @@ mod tests {
                 .terminal
                 .is_none()
         );
+    }
+
+    #[test]
+    fn real_a_verdict_is_bound_into_b_with_goal_and_program_source_fences() {
+        use harness_contract::execution_graph::{
+            ExecutionGraph, ExecutionGraphLineage, ExecutionNodeKind, ExecutionNodeResult,
+            ExecutionNodeSpec, ExecutionNodeStatus,
+        };
+
+        let objective_id = harness_contract::agent_action::root_objective_id(
+            "session-completion",
+            "turn-completion",
+        );
+        let program_id =
+            harness_contract::agent_action::program_id_for_objective(&objective_id);
+        let (events, goals, actions, actor) =
+            fixture_with_ids(true, true, objective_id, program_id);
+        let root_id = actor.root_execution_id.as_ref().unwrap();
+        let mut graph = ExecutionGraph::new("deliver verified Objective");
+        graph.id = root_id.clone();
+        graph = graph.with_lineage(ExecutionGraphLineage {
+            session_id: actor.session_id.clone(),
+            turn_id: actor.turn_id.clone(),
+            root_task_id: format!("task:{root_id}"),
+            task_id: format!("task:{root_id}"),
+            generation: 1,
+        });
+        graph.nodes.push(ExecutionNodeSpec {
+            id: "terminal".into(),
+            kind: ExecutionNodeKind::ToolBatch,
+            payload_ref: "payload:terminal".into(),
+            executor_kind: "test".into(),
+            idempotency_key: "idempotency:terminal".into(),
+            lease_ref: None,
+            acceptance: Default::default(),
+            retry_policy: Default::default(),
+            resource_scopes: vec![],
+            work: None,
+        });
+        let commits = crate::ExecutionCommitService::new(Arc::clone(&events));
+        let graph = commits.register_graph(graph).unwrap().graph;
+        let program = actions.project(&actor.program_id).unwrap();
+        let prepared = goals.prepare_program_conclusion(&program).unwrap();
+        assert!(prepared.gaps.is_empty());
+        let concluded = actions.commit_program_conclusion(&program, prepared).unwrap();
+        let verdict = concluded.objective_verdict.as_ref().unwrap();
+        let goal = goals.projection(&verdict.goal_id).unwrap().unwrap();
+        let a_cursor = events
+            .list_stream(&format!("agentic-program:{}", actor.program_id))
+            .unwrap()
+            .last()
+            .unwrap()
+            .commit_cursor;
+        let graph = commits
+            .transition_node(&graph, "terminal", ExecutionNodeStatus::Ready, None, vec![])
+            .unwrap()
+            .graph;
+        let graph = commits
+            .transition_node(&graph, "terminal", ExecutionNodeStatus::Running, None, vec![])
+            .unwrap()
+            .graph;
+        let terminal = crate::SessionTerminalInput {
+            terminal_id: "terminal:bound-a".into(),
+            message_id: "message:bound-a".into(),
+            session_id: actor.session_id.clone(),
+            execution_id: Some(root_id.clone()),
+            turn_id: Some(actor.turn_id.clone()),
+            request_id: Some("request:bound-a".into()),
+            session_generation: Some(1),
+            input_sequence: Some(1),
+            input_claim_owner: Some("claim:owner".into()),
+            input_claim_token: Some("claim:token".into()),
+            input_claim_revision: Some(1),
+            controlled_recovery_claim_fingerprints: vec![],
+            payload_ref: "artifact://terminal".into(),
+        };
+        let terminal_stream = "session-terminal:request:bound-a";
+        let terminal_event = RuntimeTransactionEventInput {
+            event: RuntimeEventInput {
+                stream_id: terminal_stream.into(),
+                scope: RuntimeEventScope::SessionInput,
+                kind: "runtime.session.terminal_requested".into(),
+                status: Some("pending_delivery".into()),
+                actor: Some("SynthesizeNodeExecutor".into()),
+                refs: vec![],
+                payload: serde_json::to_value(&terminal).unwrap(),
+            },
+            idempotency_key: Some("terminal:bound-a".into()),
+            schema_version: 1,
+        };
+        let completed = ExecutionNodeResult {
+            status: ExecutionNodeStatus::Completed,
+            result_ref: Some("result:terminal".into()),
+            wait_class: None,
+            summary: Some("terminal".into()),
+            evidence_refs: vec![],
+            failure: None,
+            usage: Default::default(),
+            finished_at_ms: 1,
+        };
+        let mut wrong_session = terminal_event.clone();
+        wrong_session.event.payload["session_id"] = serde_json::json!("foreign-session");
+        let rejected = commits
+            .transition_node(
+                &graph,
+                "terminal",
+                ExecutionNodeStatus::Completed,
+                Some(completed.clone()),
+                vec![wrong_session],
+            )
+            .err()
+            .expect("B cannot borrow another Session's A");
+        assert!(rejected
+            .to_string()
+            .contains("Session terminal does not match its Graph, Session and Turn"));
+        assert_eq!(events.stream_revision(terminal_stream).unwrap(), 0);
+        let receipt = commits
+            .transition_node(
+                &graph,
+                "terminal",
+                ExecutionNodeStatus::Completed,
+                Some(completed),
+                vec![terminal_event],
+            )
+            .unwrap();
+        let committed = events.list_stream(terminal_stream).unwrap();
+        assert_eq!(committed.len(), 1);
+        assert_eq!(
+            committed[0].payload["objective_verdict"]["a_commit_cursor"],
+            a_cursor
+        );
+        assert_eq!(
+            committed[0].payload["objective_verdict"]["verdict"],
+            serde_json::to_value(verdict).unwrap()
+        );
+        assert_eq!(
+            committed[0].payload["objective_verdict"]["goal_spec_revision"],
+            goal.goal.spec_revision
+        );
+        assert_eq!(
+            committed[0].payload["objective_verdict"]["goal_spec_digest"],
+            goal.goal.spec_digest
+        );
+        for (stream_id, revision) in [
+            (format!("agentic-program:{}", actor.program_id), concluded.revision),
+            (format!("goal:{}", verdict.goal_id), goal.stream_revision),
+        ] {
+            assert!(receipt.transaction.stream_revisions.iter().any(|source| {
+                source.stream_id == stream_id && source.expected_revision == revision
+            }));
+        }
+        assert!(events.session_terminal(&terminal.terminal_id).unwrap().is_some());
     }
 
     #[test]

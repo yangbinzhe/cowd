@@ -1962,6 +1962,89 @@ fn malformed_session_terminal_cannot_commit_a_graph_without_an_outbox_row() {
 }
 
 #[test]
+fn non_agentic_terminal_cannot_borrow_another_graphs_session() {
+    let event_store = Arc::new(RuntimeEventStore::for_test());
+    let commits = ExecutionCommitService::new(Arc::clone(&event_store));
+    let mut graph = test_graph("terminal Session belongs to Graph lineage");
+    graph.nodes.push(node("terminal"));
+    let graph = commits.register_graph(graph).unwrap().graph;
+    let graph = commits
+        .transition_node(&graph, "terminal", ExecutionNodeStatus::Ready, None, Vec::new())
+        .unwrap()
+        .graph;
+    let graph = commits
+        .transition_node(&graph, "terminal", ExecutionNodeStatus::Running, None, Vec::new())
+        .unwrap()
+        .graph;
+    let terminal_stream = format!("session-terminal:{}", graph.id);
+    let event = crate::runtime_event_store::RuntimeTransactionEventInput {
+        event: RuntimeEventInput {
+            stream_id: terminal_stream.clone(),
+            scope: RuntimeEventScope::SessionInput,
+            kind: "runtime.session.terminal_requested".into(),
+            status: Some("pending_delivery".into()),
+            actor: Some("SynthesizeNodeExecutor".into()),
+            refs: vec![],
+            payload: serde_json::json!({
+                "terminal_id": "terminal:foreign-session",
+                "message_id": "message:foreign-session",
+                "session_id": "foreign-session",
+                "execution_id": graph.id,
+                "turn_id": graph.lineage.as_ref().unwrap().turn_id,
+                "request_id": "request:foreign-session",
+                "session_generation": 1,
+                "input_sequence": 1,
+                "input_claim_owner": "claim:owner",
+                "input_claim_token": "claim:token",
+                "input_claim_revision": 1,
+                "payload_ref": "artifact://foreign-session",
+            }),
+        },
+        idempotency_key: Some("terminal:foreign-session".into()),
+        schema_version: 1,
+    };
+    let revision = graph.revision;
+    let rejected = commits
+        .transition_node(
+            &graph,
+            "terminal",
+            ExecutionNodeStatus::Completed,
+            Some(completed_result("terminal")),
+            vec![event.clone()],
+        )
+        .err()
+        .expect("foreign Session cannot be committed by this Graph");
+    assert!(rejected
+        .to_string()
+        .contains("Session terminal does not match its Graph, Session and Turn"));
+    assert_eq!(event_store.stream_revision(&graph.id).unwrap(), revision);
+    assert_eq!(event_store.stream_revision(&terminal_stream).unwrap(), 0);
+    assert!(event_store
+        .session_terminal("terminal:foreign-session")
+        .unwrap()
+        .is_none());
+    let mut local = event;
+    local.event.payload["terminal_id"] = serde_json::json!("terminal:local-session");
+    local.event.payload["message_id"] = serde_json::json!("message:local-session");
+    local.event.payload["session_id"] = serde_json::json!("test-session");
+    local.event.payload["request_id"] = serde_json::json!("request:local-session");
+    local.idempotency_key = Some("terminal:local-session".into());
+    commits
+        .transition_node(
+            &graph,
+            "terminal",
+            ExecutionNodeStatus::Completed,
+            Some(completed_result("terminal")),
+            vec![local],
+        )
+        .expect("same Graph and Session may commit a fenced terminal");
+    assert!(event_store
+        .session_terminal("terminal:local-session")
+        .unwrap()
+        .is_some());
+}
+
+#[test]
 fn two_session_terminals_cannot_share_one_graph_transition() {
     let event_store = Arc::new(RuntimeEventStore::for_test());
     let commits = ExecutionCommitService::new(Arc::clone(&event_store));
@@ -2030,6 +2113,125 @@ fn two_session_terminals_cannot_share_one_graph_transition() {
         .session_terminal("terminal:second")
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn agentic_root_terminal_requires_real_a_verdict_and_refuses_supplied_verdict() {
+    use harness_contract::agent_action::{
+        AgentAction, AgentActionEnvelope, AgentActionStatus, AgentActorBinding, AgentActorKind,
+        MessagePublishInput,
+    };
+
+    let event_store = Arc::new(RuntimeEventStore::for_test());
+    let commits = ExecutionCommitService::new(Arc::clone(&event_store));
+    let mut graph = test_graph("A must exist before B");
+    graph.nodes.push(node("terminal"));
+    let graph = commits.register_graph(graph).unwrap().graph;
+    let graph = commits
+        .transition_node(&graph, "terminal", ExecutionNodeStatus::Ready, None, Vec::new())
+        .unwrap()
+        .graph;
+    let graph = commits
+        .transition_node(&graph, "terminal", ExecutionNodeStatus::Running, None, Vec::new())
+        .unwrap()
+        .graph;
+    let lineage = graph.lineage.as_ref().unwrap();
+    let objective_id = harness_contract::agent_action::root_objective_id(
+        &lineage.session_id,
+        &lineage.turn_id,
+    );
+    let program_id = harness_contract::agent_action::program_id_for_objective(&objective_id);
+    let actions = crate::AgentActionService::new(Arc::clone(&event_store));
+    let observation = actions
+        .apply(&AgentActionEnvelope {
+            action_id: "open-root-program-before-b".into(),
+            actor: AgentActorBinding {
+                objective_id,
+                program_id: program_id.clone(),
+                session_id: lineage.session_id.clone(),
+                turn_id: lineage.turn_id.clone(),
+                root_execution_id: Some(graph.id.clone()),
+                required_team_count: 0,
+                exact_team_count: None,
+                objective_summary: "A must exist before B".into(),
+                model_lease: "test".into(),
+                permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
+                resource_scopes: vec![],
+                actor_id: "root".into(),
+                kind: AgentActorKind::Root,
+                execution_id: None,
+                team_id: None,
+                agent_id: None,
+            },
+            expected_revision: None,
+            action: AgentAction::MessagePublish(MessagePublishInput {
+                topic_ref: format!("topic:{program_id}"),
+                summary: Some("work began".into()),
+                content_ref: None,
+                refs: vec![],
+                recipients: vec![],
+                intent: None,
+                issue_dispositions: vec![],
+            }),
+        })
+        .unwrap();
+    assert_eq!(observation.status, AgentActionStatus::Applied);
+    let terminal_stream = format!("session-terminal:{}", graph.id);
+    let terminal_event = |payload| crate::runtime_event_store::RuntimeTransactionEventInput {
+        event: RuntimeEventInput {
+            stream_id: terminal_stream.clone(),
+            scope: RuntimeEventScope::SessionInput,
+            kind: "runtime.session.terminal_requested".into(),
+            status: Some("pending_delivery".into()),
+            actor: Some("SynthesizeNodeExecutor".into()),
+            refs: vec![],
+            payload,
+        },
+        idempotency_key: Some("no-a-terminal".into()),
+        schema_version: 1,
+    };
+    let payload = serde_json::json!({
+        "terminal_id": "terminal:no-a",
+        "message_id": "message:no-a",
+        "session_id": lineage.session_id,
+        "execution_id": graph.id,
+        "turn_id": lineage.turn_id,
+        "request_id": "request:no-a",
+        "session_generation": 1,
+        "input_sequence": 1,
+        "input_claim_owner": "claim:owner",
+        "input_claim_token": "claim:token",
+        "input_claim_revision": 1,
+        "payload_ref": "artifact://terminal",
+    });
+    let revision = graph.revision;
+    let rejected = commits
+        .transition_node(
+            &graph,
+            "terminal",
+            ExecutionNodeStatus::Completed,
+            Some(completed_result("terminal")),
+            vec![terminal_event(payload.clone())],
+        )
+        .err()
+        .expect("root B without A must be rejected");
+    assert!(rejected.to_string().contains("no committed Objective verdict"));
+    let mut forged = payload;
+    forged["objective_verdict"] = serde_json::json!({"kind":"satisfied"});
+    let rejected = commits
+        .transition_node(
+            &graph,
+            "terminal",
+            ExecutionNodeStatus::Completed,
+            Some(completed_result("terminal")),
+            vec![terminal_event(forged)],
+        )
+        .err()
+        .expect("caller-supplied A must be rejected");
+    assert!(rejected.to_string().contains("cannot supply its own Objective verdict"));
+    assert_eq!(event_store.stream_revision(&graph.id).unwrap(), revision);
+    assert_eq!(event_store.stream_revision(&terminal_stream).unwrap(), 0);
+    assert!(event_store.session_terminal("terminal:no-a").unwrap().is_none());
 }
 
 #[test]
