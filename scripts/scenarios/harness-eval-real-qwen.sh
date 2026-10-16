@@ -520,7 +520,13 @@ gateway:
         token: "$TOKEN"
 EOF
 
-env COWD_CONFIG_HOME="$CONFIG_HOME" "$BIN" storage upgrade
+if env COWD_CONFIG_HOME="$CONFIG_HOME" "$BIN" storage upgrade >/dev/null 2>&1; then
+  :
+else
+  status=$?
+  echo 'isolated storage upgrade failed (secretRef: env:COWD_TEST_POSTGRES_URL)' >&2
+  exit "$status"
+fi
 
 gateway_env=(
   COWD_CONFIG_HOME="$CONFIG_HOME"
@@ -552,7 +558,7 @@ for _ in {1..240}; do
     break
   fi
   kill -0 "$GATEWAY_PID" >/dev/null 2>&1 || {
-    sed -n '1,240p' "$GATEWAY_LOG" >&2 || true
+    echo "isolated Gateway exited; inspect protected diagnostics: $GATEWAY_LOG" >&2
     exit 1
   }
   sleep 0.25
@@ -616,7 +622,7 @@ while ((SECONDS < semantic_deadline)); do
     break
   fi
   kill -0 "$GATEWAY_PID" >/dev/null 2>&1 || {
-    sed -n '1,240p' "$GATEWAY_LOG" >&2 || true
+    echo "isolated Gateway exited; inspect protected diagnostics: $GATEWAY_LOG" >&2
     exit 1
   }
   sleep 0.25

@@ -49,7 +49,15 @@ command -v psql >/dev/null || { echo 'psql is required to provision the fresh ev
 REUSED_DB=0
 if [[ -n "${COWD_EVAL_REUSE_DB_URL:-}" ]]; then
   DB_URL="$COWD_EVAL_REUSE_DB_URL"
-  DB_NAME="${DB_URL##*/}"
+  DB_NAME="${DB_URL%%\?*}"
+  case "$DB_NAME" in
+    postgres://*/*|postgresql://*/*) DB_NAME="${DB_NAME##*/}" ;;
+    *) echo 'reused eval database requires a PostgreSQL URI with an explicit database path' >&2; exit 2 ;;
+  esac
+  if [[ ! "$DB_NAME" =~ ^[[:alnum:]_.-]+$ || "$DB_NAME" == . || "$DB_NAME" == .. ]]; then
+    echo 'reused eval database requires a safe explicit database identity' >&2
+    exit 2
+  fi
   REUSED_DB=1
 else
   DB_NAME="cowd_eval_$(date +%s)_$RANDOM"
@@ -61,16 +69,23 @@ cleanup() {
   trap - EXIT
   if [[ "$REUSED_DB" == "1" || "$COWD_EVAL_KEEP_DB" == "1" ]]; then
     echo "RETAINED eval database: $DB_NAME" >&2
-    echo "  url: $DB_URL" >&2
-    echo "  inspect: psql \"$DB_URL\"" >&2
-    echo "  resume : rerun with COWD_EVAL_REUSE_DB_URL=\"$DB_URL\"" >&2
+    if [[ "$REUSED_DB" == "1" ]]; then
+      echo '  database secretRef: env:COWD_EVAL_REUSE_DB_URL' >&2
+    else
+      echo '  database secretRef: env:COWD_PG_BASE_URL + retained database identity' >&2
+    fi
+    echo '  inspect: resolve the retained URL securely from the original secret source' >&2
+    echo '  resume : resolve COWD_EVAL_REUSE_DB_URL from the original secret source' >&2
     if [[ -n "${WORKSPACE_DIR:-}" && -d "$WORKSPACE_DIR" ]]; then
       echo "  workspace (artifacts + process content): $WORKSPACE_DIR" >&2
     fi
   else
-    psql "$COWD_PG_BASE_URL" -v ON_ERROR_STOP=0 \
-      -c "DROP DATABASE IF EXISTS \"$DB_NAME\" WITH (FORCE)" >/dev/null 2>&1 || true
-    echo "dropped fresh eval database: $DB_NAME" >&2
+    if psql "$COWD_PG_BASE_URL" -v ON_ERROR_STOP=0 \
+      -c "DROP DATABASE IF EXISTS \"$DB_NAME\" WITH (FORCE)" >/dev/null 2>&1; then
+      echo "dropped fresh eval database: $DB_NAME" >&2
+    else
+      echo "failed to drop fresh eval database: $DB_NAME; run owner must reconcile cleanup" >&2
+    fi
     if [[ -n "${WORKSPACE_DIR:-}" && -d "$WORKSPACE_DIR" ]]; then
       git -C "$ROOT" worktree remove --force "$WORKSPACE_DIR" >/dev/null 2>&1 \
         || rm -rf "$WORKSPACE_DIR"
@@ -82,9 +97,14 @@ cleanup() {
 trap cleanup EXIT
 
 if [[ "$REUSED_DB" == "0" ]]; then
-  psql "$COWD_PG_BASE_URL" -v ON_ERROR_STOP=1 \
-    -c "CREATE DATABASE \"$DB_NAME\"" >/dev/null
-  echo "created fresh eval database: $DB_NAME" >&2
+  if psql "$COWD_PG_BASE_URL" -v ON_ERROR_STOP=1 \
+    -c "CREATE DATABASE \"$DB_NAME\"" >/dev/null 2>&1; then
+    echo "created fresh eval database: $DB_NAME" >&2
+  else
+    status=$?
+    echo "failed to create fresh eval database: $DB_NAME (secretRef: env:COWD_PG_BASE_URL)" >&2
+    exit "$status"
+  fi
 else
   echo "reusing retained eval database: $DB_NAME" >&2
 fi
