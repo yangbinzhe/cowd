@@ -352,7 +352,7 @@ impl ProcessJsonlToolSession {
         self.execute_tool_bound(Some(&binding), request_id, tool_name, input).await
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub(crate) async fn execute_tool(
         &self,
         request_id: &str,

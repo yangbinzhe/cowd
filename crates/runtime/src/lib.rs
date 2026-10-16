@@ -501,6 +501,10 @@ pub use session_runtime_port::{
     SessionRuntimeQueryPort,
 };
 
+#[cfg(feature = "test-fixtures")]
+pub use agentic::execution::reviewed_goal_fixture::{
+    independently_reviewed_goal_fixture, ReviewedGoalFixture,
+};
 pub use artifact::{
     ARTIFACT_PERMANENT_PIN_UNTIL_MS, ARTIFACT_STAGING_PIN_TTL_MS, ArtifactCatalogPage,
     ArtifactCatalogQuery, ArtifactCatalogSnapshot, ArtifactDirectoryPage, ArtifactError,

@@ -56,6 +56,84 @@ fn services(
 
 #[tokio::test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+async fn real_independently_reviewed_satisfied_a_survives_postgres_adapter_restart() {
+    let fixture = PostgresTestScope::new();
+    let temporary = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temporary.path().join("workspace")).unwrap();
+    let events = connect(&fixture);
+    let session_store = Arc::new(session::UnifiedSessionStore::from_backend(Arc::new(
+        PostgresSessionStore::new(fixture.reconnect()).unwrap(),
+    )));
+    let witnessed = runtime::independently_reviewed_goal_fixture(
+        |host| {
+            RuntimeServices::builder(
+                temporary.path().join("home"),
+                temporary.path().join("workspace"),
+            )
+            .non_durable_backends_for_testing(temporary.path())
+            .runtime_event_store(events.clone())
+            .tool_execution_host(host)
+            .build()
+            .unwrap()
+        },
+        session_store,
+    )
+    .await;
+    assert_eq!(witnessed.goal.completion, GoalCompletion::Satisfied);
+    assert_eq!(
+        witnessed.program.status,
+        runtime::AgenticProgramStatus::Verified
+    );
+    assert!(!witnessed.goal.reviews.is_empty());
+    assert!(witnessed.goal.reviews.iter().all(|review| {
+        review
+            .verification
+            .as_ref()
+            .is_some_and(|proof| !proof.reads.is_empty())
+    }));
+    let delivered = witnessed
+        .program
+        .tasks
+        .values()
+        .find(|task| task.status == runtime::AgenticTaskStatus::Accepted)
+        .unwrap();
+    assert_ne!(delivered.claimant, delivered.reviewed_by);
+    assert!(!delivered.evidence_refs.is_empty());
+    let artifact = &witnessed.program.artifacts[&delivered.artifact_refs[0]];
+    let retained = witnessed
+        .services
+        .artifact_store()
+        .resolve(&artifact.content_ref)
+        .unwrap();
+    assert_eq!(
+        witnessed
+            .services
+            .artifact_store()
+            .read(&retained, "session:session-dispatch", None)
+            .await
+            .unwrap(),
+        b"Source-backed findings for independent review"
+    );
+    assert!(
+        witnessed
+            .program
+            .tasks
+            .values()
+            .all(|task| task.active_attempts.is_empty())
+    );
+    let stream = format!("agentic-program:{}", witnessed.program.program_id);
+    let before = events.list_stream(&stream).unwrap();
+    witnessed.services.shutdown_maintenance().await;
+    let goal = witnessed.goal;
+    drop(witnessed.services);
+    let (restored, events) = services(&fixture, temporary.path());
+    assert_eq!(restored.goal_store().get(&goal.id).unwrap().unwrap(), goal);
+    assert_eq!(events.list_stream(&stream).unwrap(), before);
+    restored.shutdown_maintenance().await;
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 async fn real_blocked_a_survives_restart_and_b_binds_exact_source_before_outbox_reclaim() {
     if std::env::var_os("COWD_V3_BUSINESS_RECOVERY_CHILD").is_none() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())

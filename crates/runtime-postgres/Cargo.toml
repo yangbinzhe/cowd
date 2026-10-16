@@ -15,6 +15,7 @@ storage = { path = "../storage", features = ["storage-postgres"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+runtime = { path = "../runtime", features = ["test-fixtures"] }
 async-trait = "0.1"
 harness-contract = { path = "../harness-contract" }
 session = { path = "../session" }

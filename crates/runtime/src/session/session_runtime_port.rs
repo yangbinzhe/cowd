@@ -323,20 +323,20 @@ pub trait SessionRuntimeJournalPort: Send + Sync {
     ) -> Result<bool, SessionError>;
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-fixtures"))]
 #[derive(Clone)]
 pub(crate) struct TestSessionPortAdapter {
     store: Arc<session::UnifiedSessionStore>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-fixtures"))]
 impl TestSessionPortAdapter {
     pub(crate) fn new(store: Arc<session::UnifiedSessionStore>) -> Arc<Self> {
         Arc::new(Self { store })
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-fixtures"))]
 #[async_trait]
 impl SessionRuntimeQueryPort for TestSessionPortAdapter {
     fn history_reader(&self) -> Option<Arc<session::SessionHistoryReader>> {
@@ -453,7 +453,7 @@ impl SessionRuntimeQueryPort for TestSessionPortAdapter {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-fixtures"))]
 #[async_trait]
 impl SessionRuntimeApplicationPort for TestSessionPortAdapter {
     async fn resolve_input_disposition_session_target(
@@ -500,7 +500,7 @@ impl SessionRuntimeApplicationPort for TestSessionPortAdapter {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-fixtures"))]
 #[async_trait]
 impl SessionRuntimeIngressPort for TestSessionPortAdapter {
     async fn append_ingress(
@@ -525,7 +525,7 @@ impl SessionRuntimeIngressPort for TestSessionPortAdapter {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-fixtures"))]
 #[async_trait]
 impl SessionRuntimeJournalPort for TestSessionPortAdapter {
     async fn append_event(
@@ -573,7 +573,7 @@ impl SessionRuntimeJournalPort for TestSessionPortAdapter {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-fixtures"))]
 fn to_session_event(event: &RuntimeSessionEvent) -> session::SessionDomainEvent {
     let mut domain_event = session::SessionDomainEvent::new(
         event.session_id.clone(),
@@ -603,7 +603,7 @@ fn to_session_event(event: &RuntimeSessionEvent) -> session::SessionDomainEvent 
     domain_event
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-fixtures"))]
 fn to_runtime_session_record(record: session::SessionRecord) -> RuntimeSessionRecord {
     RuntimeSessionRecord {
         session_id: record.session_id,
@@ -611,7 +611,7 @@ fn to_runtime_session_record(record: session::SessionRecord) -> RuntimeSessionRe
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-fixtures"))]
 fn to_session_ingress_request(
     request: &RuntimeSessionIngressCommand,
 ) -> session::SessionRuntimeOutboxRequest {
@@ -630,7 +630,7 @@ fn to_session_ingress_request(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-fixtures"))]
 pub(crate) fn to_runtime_input_record(
     record: session::SessionRuntimeOutboxRecord,
 ) -> RuntimeSessionInputRecord {

@@ -29,6 +29,8 @@ mod admission;
 pub(crate) mod dispatch;
 mod heartbeat;
 mod helpers;
+#[cfg(any(test, feature = "test-fixtures"))]
+pub(crate) mod reviewed_goal_fixture;
 #[cfg(test)]
 mod tests;
 
