@@ -6111,17 +6111,24 @@ where
                         && current.as_ref().is_some_and(|lease| binding.snapshot.tools.iter().all(|tool|
                             tool.semantic_revision == lease.implementation_revision()))
                 }) { continue; }
-                let mut query = crate::RuntimeToolExecutionRequest::from_tool_request(&crate::tool_dispatch::ToolRequest {
-                    tool_use_id: call.id.clone(), tool_name: call.name.clone(), input: call.input.clone(), depends_on: call.depends_on.clone(),
-                });
-                query.step_binding = call.binding.clone();
-                query.session_id = Some(session_id.clone());
-                query.policy_revision = policy_revision;
-                query.idempotency_key = call.binding.as_ref().map(crate::step_snapshot::StepCallBinding::effect_idempotency_key)
-                    .unwrap_or_else(|| format!("{}:{}", ticket.idempotency_key, call.id));
-                query.parent_execution = Some(harness_contract::execution_graph::ExecutionParentBinding {
-                    execution_id: ticket.graph_id.clone(), node_id: ticket.node_id.clone(),
-                });
+                let Some(binding) = call.binding.as_ref() else {
+                    continue;
+                };
+                let idempotency_key = binding.effect_idempotency_key();
+                let parent = harness_contract::execution_graph::ExecutionParentBinding {
+                    execution_id: ticket.graph_id.clone(),
+                    node_id: ticket.node_id.clone(),
+                };
+                let query = crate::execution_core::graph::ToolReceiptQuery {
+                    step_binding: binding,
+                    parent_execution: &parent,
+                    session_id: &session_id,
+                    policy_revision,
+                    idempotency_key: &idempotency_key,
+                    tool_use_id: &call.id,
+                    tool_name: &call.name,
+                    input: &call.input,
+                };
                 if let Some(replay) = self.services.commit_service().query_completed_tool_effect(&query)
                     .map_err(|error| NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason: error.to_string() })? {
                     let allowed = matches!(self.runtime.lock().await.permission_policy().authorize_required_with_context(

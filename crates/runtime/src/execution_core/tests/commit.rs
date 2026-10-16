@@ -92,8 +92,18 @@ fn mutation_effect(idempotency: ToolIdempotency) -> ToolEffectDescriptor {
     }
 }
 
-#[test]
-fn expired_serialized_step_queries_the_original_receipt_without_loading_an_adapter() {
+struct ReceiptQueryFixture {
+    store: Arc<RuntimeEventStore>,
+    service: ExecutionCommitService,
+    workspace: tempfile::TempDir,
+    host: tools::ToolHost,
+    step: Arc<crate::step_snapshot::BoundStep>,
+    graph: ExecutionGraph,
+    request: crate::RuntimeToolExecutionRequest,
+    completed: crate::RuntimeToolExecutionOutcome,
+}
+
+fn receipt_query_fixture() -> ReceiptQueryFixture {
     let store = Arc::new(RuntimeEventStore::for_test());
     let service = ExecutionCommitService::new(Arc::clone(&store));
     let workspace = tempfile::tempdir().unwrap();
@@ -188,6 +198,33 @@ fn expired_serialized_step_queries_the_original_receipt_without_loading_an_adapt
     service
         .commit_tool_effect(&request, &effect, &completed)
         .unwrap();
+    ReceiptQueryFixture {
+        store,
+        service,
+        workspace,
+        host,
+        step,
+        graph,
+        request,
+        completed,
+    }
+}
+
+#[test]
+fn expired_serialized_step_queries_the_original_receipt_without_loading_an_adapter() {
+    let ReceiptQueryFixture {
+        store,
+        service,
+        workspace,
+        host,
+        step,
+        graph,
+        request,
+        completed,
+    } = receipt_query_fixture();
+    let binding = request.step_binding.as_ref().unwrap();
+    let input = request.input.as_str();
+    let value = harness_contract::step::parse_strict_json(input).unwrap();
     let count = store
         .stream_event_count(&format!("execution-effect:{}", request.idempotency_key))
         .unwrap();
@@ -204,8 +241,18 @@ fn expired_serialized_step_queries_the_original_receipt_without_loading_an_adapt
     assert!(step
         .validate_call(&binding.origin, "session", "write-once", "edit", input, 10)
         .is_err());
+    let mut query = ToolReceiptQuery {
+        step_binding: recovered.step_binding.as_ref().unwrap(),
+        parent_execution: recovered.parent_execution.as_ref().unwrap(),
+        session_id: recovered.session_id.as_deref().unwrap(),
+        policy_revision: recovered.policy_revision,
+        idempotency_key: &recovered.idempotency_key,
+        tool_use_id: &recovered.tool_use_id,
+        tool_name: &recovered.tool_name,
+        input: &recovered.input,
+    };
     let replay = service
-        .query_completed_tool_effect(&recovered)
+        .query_completed_tool_effect(&query)
         .unwrap()
         .unwrap();
     assert_eq!(replay.outcome, completed);
@@ -220,17 +267,16 @@ fn expired_serialized_step_queries_the_original_receipt_without_loading_an_adapt
             .unwrap(),
         count
     );
-    recovered.input =
-        r#"{"content":"one physical write", "path":"proof.txt", "action":"write"}"#.into();
+    query.input = r#"{"content":"one physical write", "path":"proof.txt", "action":"write"}"#;
     assert!(service
-        .query_completed_tool_effect(&recovered)
+        .query_completed_tool_effect(&query)
         .unwrap()
         .is_some());
-    recovered.input = r#"{"action":"write","path":"proof.txt","content":"changed"}"#.into();
-    assert!(service.query_completed_tool_effect(&recovered).is_err());
-    recovered.input = input.into();
-    recovered.session_id = Some("another-session".into());
-    assert!(service.query_completed_tool_effect(&recovered).is_err());
+    query.input = r#"{"action":"write","path":"proof.txt","content":"changed"}"#;
+    assert!(service.query_completed_tool_effect(&query).is_err());
+    query.input = input;
+    query.session_id = "another-session";
+    assert!(service.query_completed_tool_effect(&query).is_err());
     assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 1);
     let system_step = Arc::new((*step).clone().with_parent("runtime-checkpoint"));
     let mut system = request.clone();
@@ -256,10 +302,199 @@ fn expired_serialized_step_queries_the_original_receipt_without_loading_an_adapt
         )
         .unwrap();
     assert!(service.validate_system_tool_parent(&system).is_err());
+    let query = ToolReceiptQuery {
+        step_binding: binding,
+        parent_execution: request.parent_execution.as_ref().unwrap(),
+        session_id: request.session_id.as_deref().unwrap(),
+        policy_revision: request.policy_revision,
+        idempotency_key: &request.idempotency_key,
+        tool_use_id: &request.tool_use_id,
+        tool_name: &request.tool_name,
+        input,
+    };
     assert!(service
-        .query_completed_tool_effect(&request)
+        .query_completed_tool_effect(&query)
         .unwrap()
         .is_some());
+}
+
+#[test]
+fn r1_receipt_query_wrong_parent_or_input_has_no_replay() {
+    let fixture = receipt_query_fixture();
+    let mut other_node =
+        ExecutionNodeSpec::new(ExecutionNodeKind::ToolBatch, "tool_batch", "other");
+    other_node.id = "node:other".into();
+    fixture
+        .service
+        .replan(
+            &fixture.graph,
+            vec![other_node],
+            vec![],
+            "query identity fixture".into(),
+        )
+        .unwrap();
+    let mut other_graph = ExecutionGraph::new("other receipt parent");
+    other_graph.id = "graph:other-parent".into();
+    other_graph.lineage = fixture.graph.lineage.clone();
+    other_graph.nodes = fixture.graph.nodes.clone();
+    fixture.service.register_graph(other_graph).unwrap();
+    let request = &fixture.request;
+    let original_parent = request.parent_execution.as_ref().unwrap();
+    let other_parent = harness_contract::execution_graph::ExecutionParentBinding {
+        execution_id: original_parent.execution_id.clone(),
+        node_id: "node:other".into(),
+    };
+    let wrong_graph = harness_contract::execution_graph::ExecutionParentBinding {
+        execution_id: "graph:other-parent".into(),
+        node_id: original_parent.node_id.clone(),
+    };
+    let missing_node = harness_contract::execution_graph::ExecutionParentBinding {
+        execution_id: original_parent.execution_id.clone(),
+        node_id: "node:missing".into(),
+    };
+    let mut wrong_origin = request.step_binding.as_ref().unwrap().clone();
+    wrong_origin.origin.call_id = "other-origin".into();
+    let mut query = ToolReceiptQuery {
+        step_binding: request.step_binding.as_ref().unwrap(),
+        parent_execution: original_parent,
+        session_id: request.session_id.as_deref().unwrap(),
+        policy_revision: request.policy_revision,
+        idempotency_key: &request.idempotency_key,
+        tool_use_id: &request.tool_use_id,
+        tool_name: &request.tool_name,
+        input: &request.input,
+    };
+    let cursor = fixture.store.durable_commit_cursor().unwrap();
+    assert!(fixture
+        .service
+        .query_completed_agent_tool_effect(&query)
+        .unwrap()
+        .is_some());
+    query.parent_execution = &other_parent;
+    assert!(fixture
+        .service
+        .query_completed_tool_effect(&query)
+        .unwrap()
+        .is_some());
+    assert!(fixture
+        .service
+        .query_completed_agent_tool_effect(&query)
+        .is_err());
+    for parent in [&wrong_graph, &missing_node] {
+        query.parent_execution = parent;
+        assert!(fixture.service.query_completed_tool_effect(&query).is_err());
+        assert!(fixture
+            .service
+            .query_completed_agent_tool_effect(&query)
+            .is_err());
+    }
+    query.parent_execution = original_parent;
+    for input in [
+        r#"{"action":"write","path":"proof.txt","content":"changed"}"#,
+        r#"{"action":"write","path":"proof.txt","content":"one physical write","content":"one physical write"}"#,
+    ] {
+        query.input = input;
+        assert!(fixture.service.query_completed_tool_effect(&query).is_err());
+        assert!(fixture
+            .service
+            .query_completed_agent_tool_effect(&query)
+            .is_err());
+    }
+    query.input = &request.input;
+    query.session_id = "another-session";
+    assert!(fixture.service.query_completed_tool_effect(&query).is_err());
+    query.session_id = request.session_id.as_deref().unwrap();
+    query.policy_revision = 0;
+    assert!(fixture.service.query_completed_tool_effect(&query).is_err());
+    query.policy_revision = request.policy_revision;
+    query.tool_use_id = "another-call";
+    assert!(fixture.service.query_completed_tool_effect(&query).is_err());
+    query.tool_use_id = &request.tool_use_id;
+    query.tool_name = "another-tool";
+    assert!(fixture.service.query_completed_tool_effect(&query).is_err());
+    query.tool_name = &request.tool_name;
+    query.step_binding = &wrong_origin;
+    assert!(fixture.service.query_completed_tool_effect(&query).is_err());
+    assert_eq!(fixture.store.durable_commit_cursor().unwrap(), cursor);
+    assert_eq!(
+        std::fs::read_to_string(fixture.workspace.path().join("proof.txt")).unwrap(),
+        "one physical write"
+    );
+}
+
+#[test]
+fn r1_receipt_query_is_readonly_and_does_not_dispatch() {
+    let ReceiptQueryFixture {
+        store,
+        service,
+        workspace,
+        host,
+        step,
+        graph,
+        mut request,
+        completed,
+    } = receipt_query_fixture();
+    request.step_binding = Some(
+        serde_json::from_value(
+            serde_json::to_value(request.step_binding.as_ref().unwrap()).unwrap(),
+        )
+        .unwrap(),
+    );
+    request.compiled_invocation = None;
+    drop(host);
+    drop(step);
+    let binding = request.step_binding.as_ref().unwrap();
+    assert!(binding.resolve(None).is_err());
+    let path = workspace.path().join("proof.txt");
+    std::fs::write(&path, "changed after the original write").unwrap();
+    let cursor = store.durable_commit_cursor().unwrap();
+    let events = store.all_events(usize::MAX).unwrap();
+    let mut query = ToolReceiptQuery {
+        step_binding: binding,
+        parent_execution: request.parent_execution.as_ref().unwrap(),
+        session_id: request.session_id.as_deref().unwrap(),
+        policy_revision: request.policy_revision,
+        idempotency_key: &request.idempotency_key,
+        tool_use_id: &request.tool_use_id,
+        tool_name: &request.tool_name,
+        input: &request.input,
+    };
+    for replay in [
+        service
+            .query_completed_tool_effect(&query)
+            .unwrap()
+            .unwrap(),
+        service
+            .query_completed_agent_tool_effect(&query)
+            .unwrap()
+            .unwrap(),
+    ] {
+        assert_eq!(replay.outcome, completed);
+        assert_eq!(
+            replay.invocation.intent.normalized_input,
+            harness_contract::step::parse_strict_json(&request.input).unwrap()
+        );
+    }
+    query.idempotency_key = "missing-effect";
+    assert!(service
+        .query_completed_tool_effect(&query)
+        .unwrap()
+        .is_none());
+    assert!(service
+        .query_completed_agent_tool_effect(&query)
+        .unwrap()
+        .is_none());
+    assert_eq!(store.durable_commit_cursor().unwrap(), cursor);
+    assert_eq!(store.all_events(usize::MAX).unwrap(), events);
+    assert_eq!(
+        service.effect_authority_graphs.load(&graph.id).unwrap(),
+        graph
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "changed after the original write"
+    );
+    assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 1);
 }
 
 fn readonly_effect() -> ToolEffectDescriptor {

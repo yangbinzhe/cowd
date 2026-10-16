@@ -529,17 +529,27 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
         harness_contract::step::parse_strict_json(&call.input).map_err(|error| ToolError::new(error.to_string()))?;
         let input = normalize_delegated_resource_paths(&call.name, &call.input, &self.workspace_root,
             &self.path_identity_resolver, self.resource_scopes.as_deref())?;
-        let mut request = RuntimeToolExecutionRequest::from_tool_request(&crate::tool_dispatch::ToolRequest {
-            tool_use_id: call.id.clone(), tool_name: call.name.clone(), input, depends_on: call.depends_on.clone(),
-        });
-        request.session_id = Some(self.session_id.clone());
-        request.policy_revision = self.policy_revision;
-        request.parent_execution = Some(harness_contract::execution_graph::ExecutionParentBinding {
-            execution_id: self.execution_id.clone(), node_id: self.node_id.clone(),
-        });
-        request.step_binding = Some(binding.clone());
-        request.idempotency_key = binding.effect_idempotency_key();
-        let Some(replay) = commit.query_completed_agent_tool_effect(&request).map_err(|error| ToolError::new(error.to_string()))? else { return Ok(None); };
+        let parent = harness_contract::execution_graph::ExecutionParentBinding {
+            execution_id: self.execution_id.clone(),
+            node_id: self.node_id.clone(),
+        };
+        let idempotency_key = binding.effect_idempotency_key();
+        let query = crate::execution_core::graph::ToolReceiptQuery {
+            step_binding: binding,
+            parent_execution: &parent,
+            session_id: &self.session_id,
+            policy_revision: self.policy_revision,
+            idempotency_key: &idempotency_key,
+            tool_use_id: &call.id,
+            tool_name: &call.name,
+            input: &input,
+        };
+        let Some(replay) = commit
+            .query_completed_agent_tool_effect(&query)
+            .map_err(|error| ToolError::new(error.to_string()))?
+        else {
+            return Ok(None);
+        };
         if let Some(scopes) = &self.resource_scopes {
             let requested = crate::governed_tool_plan::resource_scope_from_effect(&replay.invocation.effect);
             for path in &requested.paths {

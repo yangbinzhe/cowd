@@ -10,6 +10,7 @@ mod state_store;
 
 pub mod resources;
 
+pub(crate) use commit_service::ToolReceiptQuery;
 pub use commit_service::{
     DurableAgentToolReceipt, ExecutionCommitError, ExecutionCommitReceipt, ExecutionCommitService,
     ExecutionEffectState, ToolEffectState,

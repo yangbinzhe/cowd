@@ -234,7 +234,7 @@ pub(super) fn validate_readonly_tool_receipt(
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
     let input_matches =
-        receipt_payload_matches(request, payload)?.unwrap_or(actual_hash == expected_hash);
+        receipt_payload_matches(&request.input, payload)?.unwrap_or(actual_hash == expected_hash);
     if !input_matches || actual_tool != request.tool_name {
         return Err(ExecutionCommitError::InvalidCommand(format!(
             "read-only receipt collision for idempotency key `{}`",
@@ -265,7 +265,7 @@ pub(super) fn validate_mutation_tool_fingerprint(
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
     let input_matches =
-        receipt_payload_matches(request, payload)?.unwrap_or(actual_input == expected_input);
+        receipt_payload_matches(&request.input, payload)?.unwrap_or(actual_input == expected_input);
     if !input_matches
         || actual_tool != request.tool_name
         || actual_tool != effect.tool_id
@@ -306,13 +306,13 @@ pub(super) fn receipt_replay_contract(
 }
 
 pub(super) fn receipt_payload_matches(
-    request: &crate::RuntimeToolExecutionRequest,
+    input: &str,
     payload: &serde_json::Value,
 ) -> Result<Option<bool>, ExecutionCommitError> {
     payload
         .pointer("/replay/payload_digest")
         .and_then(serde_json::Value::as_str)
-        .map(|digest| canonical_tool_payload(&request.input).map(|actual| actual == digest))
+        .map(|digest| canonical_tool_payload(input).map(|actual| actual == digest))
         .transpose()
 }
 
