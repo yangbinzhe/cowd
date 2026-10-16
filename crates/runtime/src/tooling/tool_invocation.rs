@@ -656,7 +656,7 @@ mod tests {
     #[test]
     fn the_refusal_looks_up_the_key_the_recorder_actually_wrote() {
         let input = "{\"decision\":\"rework\",\"reason\":\"clause not met\"}";
-        let turn = "turn-hash-wiring";
+        let turn = &crate::repetition_guard::RepetitionScope::turn("invocation-test-session", "turn-hash-wiring");
         let record = ToolInvocationRecord::started(
             "session-1",
             1,
@@ -703,6 +703,7 @@ mod tests {
                 true,
             ),
         ] {
+            let turn = &crate::repetition_guard::RepetitionScope::turn("invocation-test-session", turn);
             for _ in 0..crate::repetition_guard::repetition_bound() {
                 crate::repetition_guard::record_tool_failure(
                     turn,
@@ -741,7 +742,7 @@ mod tests {
         assert!(!references
             .iter()
             .any(|reference| reference.starts_with("receipt:")));
-        let turn = "turn-nested-receipt-evidence";
+        let turn = &crate::repetition_guard::RepetitionScope::turn("invocation-test-session", "turn-nested-receipt-evidence");
         for _ in 0..crate::repetition_guard::repetition_bound() {
             crate::repetition_guard::record_tool_failure(
                 turn,

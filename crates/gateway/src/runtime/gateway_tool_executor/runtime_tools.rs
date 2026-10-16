@@ -1251,14 +1251,12 @@ impl GatewayToolExecutor {
         // Scoped to the session and the reading Agent, not the turn: a reference is
         // immutable and the answer does not become different because a turn ended.
         // The receipt names how to get the content again, so nothing is withheld.
-        let read_scope = format!(
-            "{}:{}",
-            binding.session_id.unwrap_or("no-session"),
+        let read_scope = runtime::repetition_guard::RepetitionScope::reader(
+            binding.session_id,
             binding
                 .memory_context
                 .as_ref()
                 .map(|context| context.agent_id.as_str())
-                .unwrap_or("no-agent")
         );
         // The key is the question itself, not a hash of it: it is short, and a hash
         // here would only obscure what is being compared.

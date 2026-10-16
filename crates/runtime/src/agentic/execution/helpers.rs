@@ -62,18 +62,6 @@ impl DispatchMode {
         }
     }
 
-    /// The single durable action that terminates this mode. Each dispatch mode
-    /// carries exactly one completion contract; a run that ends without it did
-    /// not complete. Getting Started's `agent-contracts` pins the same idea per
-    /// agent, and this keeps the three modes mutually unambiguous.
-    pub(super) const fn terminal_action(self) -> &'static str {
-        match self {
-            Self::Execute => "task_submit",
-            Self::Review => "task_review",
-            Self::Coordination(_) => "message_publish",
-        }
-    }
-
     pub(super) const fn attempt_mode(self) -> harness_contract::agent_action::AgentAttemptMode {
         use harness_contract::agent_action::AgentAttemptMode;
         match self {
@@ -253,28 +241,6 @@ pub(super) fn semantic_terms(value: &str) -> BTreeSet<String> {
     terms
 }
 
-/// Whether the frozen resource scopes admit authored workspace files. The
-/// scopes are the capability lease: a `read:` lease with no `workspace:`/`write:`
-/// scope means a worker must deliver through response text blocks instead of
-/// attempting a file write it is not authorized to perform.
-fn authored_file_write_allowed(resource_scopes: &[String]) -> bool {
-    resource_scopes.iter().any(|scope| {
-        let scope = scope.trim();
-        scope.starts_with("workspace:") || scope.starts_with("write:")
-    })
-}
-
-/// Step 5 of the Worker protocol card. Reads best for weak models and stays a
-/// *guide*: the only hard rules are objective boundaries (non-empty body, claim
-/// first, read-only lease writes nothing) and are stated separately.
-fn objective_delivery_instruction(writable: bool) -> &'static str {
-    if writable {
-        "5) 把正文写入 workspace 文件 → read_file 取 sha256 → artifact_publish → artifact_commit → task_submit(task_ref 为该 Task, artifact_refs=[artifact:...], evidence_refs=[真实回执], unresolved=[保留事项])。"
-    } else {
-        "5) task_submit(task_ref 为该 Task, deliverable={\"block_index\":<正文所在 Text 块号>,\"kind\":\"report\",\"title\":\"<标题>\"}, evidence_refs=[真实回执], unresolved=[保留事项])。一步即可：Runtime 会把它转成与该 Task 绑定的 artifact。"
-    }
-}
-
 pub(super) fn task_objective(
     projection: &AgenticProgramProjection,
     task: &AgenticTaskProjection,
@@ -298,17 +264,16 @@ pub(super) fn task_objective(
         || format!("topic:{}", task.team_id),
         |team| team.topic_ref.clone(),
     );
-    let delivery =
-        objective_delivery_instruction(authored_file_write_allowed(&projection.resource_scopes));
-    let hard_rules = if authored_file_write_allowed(&projection.resource_scopes) {
-        "硬规则：正文为空会被拒绝；未领取不得提交；不确定的写入 unresolved，不得编造。"
-    } else {
-        "硬规则：交付物必须是**你撰写的分析报告**（结论、发现、风险、file:line 引用），**绝对不能**是源码原文的粘贴或文件内容的复述；正文为空会被拒绝；未领取不得提交；本租约只读，勿写文件；不确定的写入 unresolved，不得编造。"
+    let purpose_contract = match task.purpose {
+        harness_contract::agent_action::TaskPurpose::Delivery =>
+            crate::agentic::order_contract::TASK_REPORT_SUBMISSION_CONTRACT,
+        harness_contract::agent_action::TaskPurpose::Exploration =>
+            crate::agentic::order_contract::EXPLORATION_CLOSEOUT_CONTRACT,
     };
     let mut objective = match mode {
         DispatchMode::Coordination(_) => unreachable!("coordination objective handled above"),
         DispatchMode::Execute => format!(
-            "你是 Agent `{}`（Team `{}`，角色 {}）。\n任务 `{}`：{}\n目标：{}\n验收：{}\n\n按序执行以下协议（不要增加其它步骤）：\n1) state_inspect 查看 Task 真相，确认可领取；\n2) task_claim 领取该确切 Task；\n3) 用只读工具取证（无依赖的调用放进同一批）；**当验收判据要求文件原文、精确字节或 file:line 时，用 `read_ref` 按范围读取完整内容——工具输出的预览摘要可能被截断，不足以支撑判据**；\n4) **撰写审查报告**：把你的结论、发现、风险和 file:line 证据引用写成一段完整正文——这是交付物，**不是**源码复制；\n{delivery}\n\n{hard_rules}\n可选：有对其它队有用的发现，可在 topic:{} 发布一条引用证据的摘要。",
+            "你是 Agent `{}`（Team `{}`，角色 {}）。\n任务 `{}`：{}\n目标：{}\n验收：{}\n\n在真实授权和资源边界内自主选择有效行动，不添加操作者没有要求的交付或报告格式。state_inspect 可查看 Task 真相；执行和提交前须 task_claim 领取该确切 Task。只有真实工具动作和持久回执改变协作状态，正文不是动作；不确定的保留在 unresolved，不得编造。当实际验收要求原文、精确字节或 file:line 时，用 read_ref 读取所需范围，预览摘要不等于完整证据。\n{purpose_contract}\n\n资源范围只说明能力，不代表必须写文件。普通正文、已有文件或多段产物按实际任务需要选择，不越过当前权限。需要协作时可在 topic:{} 发布有用的新事实；不要为了收口重复制造报告或消息。",
             member.agent_id,
             task.team_id,
             member.role,
@@ -319,7 +284,7 @@ pub(super) fn task_objective(
             topic_ref,
         ),
         DispatchMode::Review => format!(
-            "你是独立复核者 `{}`（不得复核自己）。任务 `{}`，验收判据：{}\n按序执行（勿增加步骤）：\n1) state_inspect 读取该 Task 与其已提交 artifact；\n2) 逐条检查验收判据：针对**每一条**给出“满足/不满足”，并引用你**亲自读取**到的证据（文件/行/字节或回执）；\n3) task_review 给出裁决，三种互斥结果：\n   - 当证据**确实支持**该条判据时，用 accept（不要因风格、篇幅或措辞拒绝）；\n   - 当作者已在 `unresolved` 中**显式披露**某条判据的缺口、且该判据在本轮授权下**确实无法取得**（例如判据要求外部文献/引用，而本 Task 未声明 network/search 能力、或隔离环境无外部来源）时，用 accept 并在 `reason` 里点名“第(N)条按 unresolved 披露接受，理由：<授权边界>”。披露过的缺口不是缺陷，卡它才是；\n   - 否则用 rework/challenge，且 `reason` **必须**写明：未满足的**具体条款** + 你实际读取到的**证据缺口**（例如“第(2)条要求 file:line，正文仅…，缺少…”）；禁止笼统拒绝。\n{scope_discipline}不要重做作者的工作；Runtime 已绑定 artifact，不要把内部存储选择器抄进 evidence_refs。你的 durable review 动作才是裁决。Program: {}。",
+            "你是独立复核者 `{}`（不得复核自己）。任务 `{}`，验收判据：{}\n按实际证据自主复核，不新增操作者未要求的步骤或报告格式。state_inspect 可读取 Task 与已提交 artifact；逐条检查实际验收判据，引用你亲自读取的证据。通过 task_review 明确裁决：证据确实支持原要求时 accept，不因风格或篇幅拒绝；缺口已披露不等于要求自动满足，只有原要求允许这种披露且本轮授权确实无法取得证据时才按原边界判断并写明原因；其余 rework/challenge 必须点名具体操作者条款和亲读证据缺口，不笼统拒绝。\n{scope_discipline}不要重做作者的工作；Runtime 已绑定 artifact，不要把内部存储选择器抄进 evidence_refs。真实 durable review 才是裁决。Program: {}。",
             member.agent_id,
             task.task_id,
             task.acceptance,
@@ -404,59 +369,66 @@ pub(super) fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod delivery_lease_tests {
-    use super::{authored_file_write_allowed, objective_delivery_instruction};
+    use super::*;
 
-    #[test]
-    fn read_only_leases_deliver_through_text_blocks() {
-        let read_only = vec!["provider".to_string(), "read:.".to_string()];
-        assert!(!authored_file_write_allowed(&read_only));
-        let writable = vec!["provider".to_string(), "workspace:.".to_string()];
-        assert!(authored_file_write_allowed(&writable));
-        let write_scoped = vec!["write:report.html".to_string()];
-        assert!(authored_file_write_allowed(&write_scoped));
+    fn card(purpose: harness_contract::agent_action::TaskPurpose, resource_scopes: Vec<String>) -> String {
+        let mut program = AgenticProgramProjection::empty("program:card", "objective:card");
+        program.resource_scopes = resource_scopes;
+        let task = serde_json::from_value(serde_json::json!({
+            "task_id":"task:card","team_id":"team:card","title":"Review-labelled delivery",
+            "objective":"Perform exactly the operator-requested work","acceptance":"Actual requested outcome",
+            "purpose":purpose,"required_capabilities":[],"depends_on":[],"status":"published",
+            "claim_generation":0,"artifact_refs":[],"evidence_refs":[],"unresolved":[],
+            "failed_attempts":0,"review_generation":0,"failed_review_attempts":0,
+        })).unwrap();
+        let member = serde_json::from_value(serde_json::json!({
+            "agent_id":"agent:card","role":"independent-looking name","mission":"real task",
+            "required_capabilities":[],"invited_by":"root",
+        })).unwrap();
+        task_objective(&program, &task, &member, DispatchMode::Execute)
     }
 
     #[test]
-    fn protocol_card_step_five_matches_the_lease() {
-        let read_only = objective_delivery_instruction(false);
-        assert!(read_only.contains("task_submit"));
-        assert!(read_only.contains("deliverable"));
-        assert!(!read_only.contains("artifact_publish"));
+    fn workspace_capability_does_not_turn_an_ordinary_task_into_a_file_report_pipeline() {
+        let read_only = card(harness_contract::agent_action::TaskPurpose::Delivery, vec!["read:.".into()]);
+        let writable = card(harness_contract::agent_action::TaskPurpose::Delivery, vec!["workspace:.".into()]);
+        assert_eq!(read_only, writable);
+        assert!(writable.contains(crate::agentic::order_contract::TASK_REPORT_SUBMISSION_CONTRACT));
+        assert!(!writable.contains("不要增加其它步骤"));
+        assert!(!writable.contains("撰写审查报告"));
+        assert!(!writable.contains("把正文写入 workspace 文件"));
+    }
 
-        let writable = objective_delivery_instruction(true);
-        assert!(writable.contains("artifact_publish"));
-        assert!(writable.contains("artifact_commit"));
+    #[test]
+    fn actual_typed_purpose_not_title_or_workspace_selects_the_control_exit_contract() {
+        let exploration = card(harness_contract::agent_action::TaskPurpose::Exploration, vec!["workspace:.".into()]);
+        let delivery = card(harness_contract::agent_action::TaskPurpose::Delivery, vec!["workspace:.".into()]);
+        assert!(exploration.contains(crate::agentic::order_contract::EXPLORATION_CLOSEOUT_CONTRACT));
+        assert!(!exploration.contains(crate::agentic::order_contract::TASK_REPORT_SUBMISSION_CONTRACT));
+        assert!(!delivery.contains(crate::agentic::order_contract::EXPLORATION_CLOSEOUT_CONTRACT));
+        assert!(exploration.contains("task_withdraw"));
+        assert!(exploration.contains("not acceptance"));
     }
 }
 
 #[cfg(test)]
 mod dispatch_mode_contract_tests {
-    use super::DispatchMode;
+    use crate::agentic::order_contract::worker_terminal_action_ids;
+    use harness_contract::agent_action::TaskPurpose;
 
     #[test]
-    fn every_dispatch_mode_has_exactly_one_terminating_action() {
-        assert_eq!(DispatchMode::Execute.terminal_action(), "task_submit");
-        assert_eq!(DispatchMode::Review.terminal_action(), "task_review");
-        assert_eq!(
-            DispatchMode::Coordination(0).terminal_action(),
-            "message_publish"
-        );
+    fn delivery_review_and_coordination_keep_their_actual_terminal_actions() {
+        assert_eq!(worker_terminal_action_ids("execute", TaskPurpose::Delivery), &["task_submit"]);
+        assert_eq!(worker_terminal_action_ids("review", TaskPurpose::Delivery), &["task_review"]);
+        assert_eq!(worker_terminal_action_ids("coordination", TaskPurpose::Delivery), &["message_publish"]);
     }
 
     #[test]
-    fn the_three_modes_are_mutually_unambiguous() {
-        let modes = [
-            DispatchMode::Execute.terminal_action(),
-            DispatchMode::Review.terminal_action(),
-            DispatchMode::Coordination(0).terminal_action(),
-        ];
-        let mut unique = modes.to_vec();
-        unique.sort_unstable();
-        unique.dedup();
-        assert_eq!(
-            unique.len(),
-            modes.len(),
-            "each mode must own a distinct exit"
-        );
+    fn exploration_allows_explicit_retirement_without_inventing_acceptance() {
+        let actions = worker_terminal_action_ids("execute", TaskPurpose::Exploration);
+        assert!(actions.contains(&"task_withdraw"));
+        assert!(actions.contains(&"task_submit"));
+        assert!(!actions.contains(&"task_review"));
+        assert!(!actions.contains(&"objective_complete_request"));
     }
 }

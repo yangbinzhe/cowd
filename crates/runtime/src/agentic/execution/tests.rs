@@ -351,6 +351,20 @@ async fn exercise_reviewed_goal_delivery(
     with_effect: bool,
     delegated_case: DelegatedEffectCase,
 ) {
+    exercise_reviewed_goal_delivery_kind(with_disclosure, with_effect, delegated_case, false).await;
+}
+
+#[tokio::test]
+async fn one_shot_text_delivery_uses_the_same_independent_review_and_goal_verifier() {
+    exercise_reviewed_goal_delivery_kind(false, false, DelegatedEffectCase::None, true).await;
+}
+
+async fn exercise_reviewed_goal_delivery_kind(
+    with_disclosure: bool,
+    with_effect: bool,
+    delegated_case: DelegatedEffectCase,
+    direct_text: bool,
+) {
     let delegated_effect = delegated_case != DelegatedEffectCase::None;
     let read_host = Arc::new(ReviewReadHost::default());
     let services = RuntimeServices::in_memory_with_tool_host(read_host.clone()).expect("runtime");
@@ -557,7 +571,7 @@ async fn exercise_reviewed_goal_delivery(
     assert_eq!(packet.deadline_at_ms, u64::MAX);
     assert!(packet.objective.contains("state_inspect"));
     assert!(packet.objective.contains("task_claim"));
-    assert!(packet.objective.contains("未领取不得提交"));
+    assert!(packet.objective.contains("执行和提交前须 task_claim 领取该确切 Task"));
     assert!(packet.objective.contains("Current work directory"));
     assert!(
         packet
@@ -1069,7 +1083,23 @@ async fn exercise_reviewed_goal_delivery(
             })
             .expect("author action")
     };
-    let artifact = apply_author(
+    let artifact = if direct_text {
+        let submitted = services.submit_agent_action(&AgentActionEnvelope {
+            action_id: "experience-text-submit".into(), actor: actor.clone(), expected_revision: None,
+            action: AgentAction::TaskSubmit(TaskSubmitInput {
+                task_ref: task_ref.clone(), artifact_refs: vec![], evidence_refs: vec![], unresolved: vec![],
+                deliverable: Some(TaskOneShotDeliverable {
+                    block_index: 0, kind: "report".into(), title: "Plain text findings".into(),
+                    resolved_content_ref: Some(content.selector.clone()),
+                }),
+            }),
+        }).await.unwrap();
+        assert_eq!(submitted.status, harness_contract::agent_action::AgentActionStatus::Applied, "{submitted:?}");
+        let program = action_service.project("program-dispatch").unwrap();
+        assert_eq!(program.tasks[&task_ref].status, crate::AgenticTaskStatus::Submitted);
+        assert!(program.objective_verdict.is_none());
+        program.tasks[&task_ref].artifact_refs[0].clone()
+    } else { apply_author(
         "experience-artifact",
         AgentAction::ArtifactCommit(ArtifactCommitInput {
             content_ref: content.selector.clone(),
@@ -1079,7 +1109,7 @@ async fn exercise_reviewed_goal_delivery(
         }),
     )
     .changed_refs[0]
-        .clone();
+        .clone() };
     let reviewer = action_service
         .apply(&bind_root(root(
             "experience-reviewer",
@@ -1114,10 +1144,10 @@ async fn exercise_reviewed_goal_delivery(
             },
         }),
     };
-    assert_eq!(
-        action_service.apply(&submit).unwrap().status,
-        harness_contract::agent_action::AgentActionStatus::Applied
-    );
+    if !direct_text {
+        assert_eq!(action_service.apply(&submit).unwrap().status,
+            harness_contract::agent_action::AgentActionStatus::Applied);
+    }
     if let Some(writer) = &writer {
         let index = format!(
             "execution-agent-receipts:{}:{}:{}",
@@ -1657,6 +1687,11 @@ async fn exercise_reviewed_goal_delivery(
         };
         let physical: AgentTaskPacket =
             serde_json::from_str(&effect_graph.nodes[0].payload_ref).unwrap();
+        assert_eq!(
+            physical.agentic_binding.as_ref().unwrap().task_purpose,
+            Some(harness_contract::agent_action::TaskPurpose::Exploration)
+        );
+        assert!(physical.objective.contains(crate::agentic::order_contract::EXPLORATION_CLOSEOUT_CONTRACT));
         let reader = crate::agent_in_process_worker::ProcessJsonlToolSession::prepare(
             &services,
             &physical,
@@ -1821,14 +1856,17 @@ async fn exercise_reviewed_goal_delivery(
         );
 
         let manifest = proof.work_manifest_digest.clone();
-        let withdrawn = bind_root(root(
-            "effect-review-finished",
-            AgentAction::TaskWithdraw(harness_contract::agent_action::TaskWithdrawInput {
+        let artifact_count_before_retirement = action_service.project("program-dispatch").unwrap().artifacts.len();
+        let withdrawn = AgentActionEnvelope {
+            action_id: "effect-review-finished".into(),
+            actor: check_effect.actor.clone(),
+            expected_revision: None,
+            action: AgentAction::TaskWithdraw(harness_contract::agent_action::TaskWithdrawInput {
                 task_ref: work_receipt.changed_refs[0].clone(),
                 reason_ref: content.selector.clone(),
                 evidence_refs: vec![content.selector.clone()],
             }),
-        ));
+        };
         assert_eq!(
             services
                 .submit_agent_action(&withdrawn)
@@ -1855,6 +1893,7 @@ async fn exercise_reviewed_goal_delivery(
                 .is_empty()
         );
         assert!(hold.cancelled.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(drained.artifacts.len(), artifact_count_before_retirement);
         assert_eq!(
             crate::agentic::review_evidence::work_manifest_digest(&drained),
             manifest

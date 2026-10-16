@@ -1793,6 +1793,7 @@ mod tests {
             team_id: "team:topic".into(),
             task_team_id: "team:topic".into(),
             source_spec_revision: 1,
+            task_purpose: None,
             focus: harness_contract::agent::AgenticExecutionFocus::TaskExecute {
                 task_ref: "task:topic".into(),
             },
@@ -3155,6 +3156,7 @@ mod tests {
             team_id: team.clone(),
             task_team_id: team,
             source_spec_revision: 1,
+            task_purpose: None,
             focus: AgenticExecutionFocus::TaskExecute {
                 task_ref: packet.task_id().into(),
             },

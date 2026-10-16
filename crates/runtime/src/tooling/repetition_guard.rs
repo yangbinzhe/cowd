@@ -38,6 +38,29 @@ use std::sync::OnceLock;
 
 use crate::tool_invocation::ToolFailureKind;
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RepetitionScope(String);
+
+impl RepetitionScope {
+    pub fn turn(session_id: &str, turn_id: &str) -> Self {
+        Self(serde_json::json!(["turn", session_id, turn_id]).to_string())
+    }
+
+    pub fn execution(session_id: &str, execution_id: &str) -> Self {
+        Self(serde_json::json!(["execution", session_id, execution_id]).to_string())
+    }
+
+    pub fn reader(session_id: Option<&str>, agent_id: Option<&str>) -> Self {
+        Self(serde_json::json!(["reader", session_id, agent_id]).to_string())
+    }
+}
+
+impl std::fmt::Display for RepetitionScope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 /// Consecutive identical failures tolerated before the breaker trips. The
 /// second failure is already evidence that retrying changes nothing, so the
 /// default is deliberately lower than the dispatch-starvation bound.
@@ -101,13 +124,13 @@ impl LedgerNamespace {
 
     /// Assemble one key. The discriminator is an input hash, an error signature, or
     /// whatever else separates two entries inside the namespace.
-    pub(crate) fn key(self, turn_id: &str, tool_name: &str, discriminator: &str) -> String {
+    pub(crate) fn key(self, turn_id: &RepetitionScope, tool_name: &str, discriminator: &str) -> String {
         format!("{}{turn_id}:{tool_name}:{discriminator}", self.prefix())
     }
 
     /// The prefix every key of one namespace under one turn and tool shares, for
     /// range scans.
-    pub(crate) fn scan_prefix(self, turn_id: &str, tool_name: &str) -> String {
+    pub(crate) fn scan_prefix(self, turn_id: &RepetitionScope, tool_name: &str) -> String {
         format!("{}{turn_id}:{tool_name}:", self.prefix())
     }
 
@@ -145,7 +168,7 @@ const PATTERN_WINDOW: usize = 12;
 const PATTERN_DOMINANCE: usize = 9;
 
 /// Recent tool names for one turn, oldest first.
-fn pattern_window(turn_id: &str) -> &'static std::sync::Mutex<BTreeMap<String, Vec<String>>> {
+fn pattern_window(turn_id: &RepetitionScope) -> &'static std::sync::Mutex<BTreeMap<String, Vec<String>>> {
     static WINDOWS: OnceLock<std::sync::Mutex<BTreeMap<String, Vec<String>>>> = OnceLock::new();
     WINDOWS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
@@ -155,7 +178,7 @@ fn pattern_window(turn_id: &str) -> &'static std::sync::Mutex<BTreeMap<String, V
 ///
 /// Dominance, not identity: the inputs may all differ and the turn is still
 /// going nowhere, which is precisely the case the per-input ledger is blind to.
-pub fn observe_call_pattern(turn_id: &str, tool_name: &str) -> bool {
+pub fn observe_call_pattern(turn_id: &RepetitionScope, tool_name: &str) -> bool {
     let mut windows = pattern_window(turn_id)
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -191,7 +214,7 @@ fn inspection_memory() -> &'static std::sync::Mutex<BTreeMap<String, String>> {
     LAST_REVISION.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
 
-pub fn record_unchanged_inspection(turn_id: &str, input_hash: &str, state_token: &str) -> bool {
+pub fn record_unchanged_inspection(turn_id: &RepetitionScope, input_hash: &str, state_token: &str) -> bool {
     let seen = inspection_memory();
     let key = format!("inspect:{turn_id}:{input_hash}");
     let mut seen = seen
@@ -223,7 +246,7 @@ fn served_reads() -> &'static std::sync::Mutex<BTreeMap<String, usize>> {
 ///
 /// This is not the revision-based stall check: an immutable reference has no
 /// revision to compare, so "already served" is the whole observation.
-pub fn record_repeated_read(scope: &str, key: &str) -> bool {
+pub fn record_repeated_read(scope: &RepetitionScope, key: &str) -> bool {
     served_read_count(scope, key) > 1
 }
 
@@ -233,7 +256,7 @@ pub fn record_repeated_read(scope: &str, key: &str) -> bool {
 /// the second is told it already has it, and the third and later are served again.
 /// Answering every repeat is what trapped a model - a hint is not a substitute for
 /// content it needs in order to write what it is writing.
-pub fn served_read_count(scope: &str, key: &str) -> usize {
+pub fn served_read_count(scope: &RepetitionScope, key: &str) -> usize {
     let entry_key = format!("served:{scope}:{key}");
     let mut served = served_reads()
         .lock()
@@ -244,7 +267,7 @@ pub fn served_read_count(scope: &str, key: &str) -> usize {
 }
 
 /// Forget one scope's served reads, so a later turn or Agent starts clean.
-pub fn clear_served_reads(scope: &str) {
+pub fn clear_served_reads(scope: &RepetitionScope) {
     let needle = format!("served:{scope}:");
     served_reads()
         .lock()
@@ -253,7 +276,7 @@ pub fn clear_served_reads(scope: &str) {
 }
 
 /// Forget one turn's inspection memory, so a later turn starts clean.
-pub fn clear_inspection_memory(turn_id: &str) {
+pub fn clear_inspection_memory(turn_id: &RepetitionScope) {
     let seen = inspection_memory();
     let needle = format!("inspect:{turn_id}:");
     seen.lock()
@@ -262,11 +285,11 @@ pub fn clear_inspection_memory(turn_id: &str) {
 }
 
 /// Forget one turn's pattern window, so a later turn starts clean.
-pub fn clear_call_pattern(turn_id: &str) {
+pub fn clear_call_pattern(turn_id: &RepetitionScope) {
     pattern_window(turn_id)
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(turn_id);
+        .remove(&turn_id.0);
 }
 
 /// Consecutive identical **successful** calls tolerated before the model is told
@@ -344,15 +367,15 @@ pub(crate) fn repeated_call_block_bound_for(tool_name: &str, input: &str) -> usi
 /// breaker is blind to the very loop it exists to stop, and nothing in the run
 /// says so. This makes the disagreement loud instead of silent.
 pub fn trace_repeated_call_key_mismatch(
-    writer_turn_id: &str,
-    reader_turn_id: &str,
+    writer_turn_id: &RepetitionScope,
+    reader_turn_id: &RepetitionScope,
     tool_name: &str,
     input_hash: &str,
 ) {
     if writer_turn_id != reader_turn_id {
         tracing::warn!(
-            writer_turn_id,
-            reader_turn_id,
+            %writer_turn_id,
+            %reader_turn_id,
             tool_name,
             input_hash,
             "repeated-call key mismatch: the counter is written under one turn and read under another, so this loop cannot be bounded"
@@ -383,7 +406,7 @@ fn input_declares_wait_for_workers(input: &str) -> bool {
 /// a live run showed the same `read_ref` dispatched eight times, refused, then
 /// dispatched again eighty milliseconds later. One assembly makes that drift
 /// impossible rather than merely unlikely.
-fn repeated_call_key(turn_id: &str, tool_name: &str, input_hash: &str) -> String {
+fn repeated_call_key(turn_id: &RepetitionScope, tool_name: &str, input_hash: &str) -> String {
     LedgerNamespace::Repeat.key(turn_id, tool_name, input_hash)
 }
 
@@ -395,7 +418,7 @@ fn repeated_call_key(turn_id: &str, tool_name: &str, input_hash: &str) -> String
 /// identical refusal is answered, the second fails closed. It deliberately does
 /// not share the per-input ledger - a frame that was never dispatched has no
 /// business consuming the bound of a call that might later succeed.
-pub fn record_refused_frame(turn_id: &str, tool_name: &str, input: &str) -> usize {
+pub fn record_refused_frame(turn_id: &RepetitionScope, tool_name: &str, input: &str) -> usize {
     let key = LedgerNamespace::Refused.key(
         turn_id,
         tool_name,
@@ -414,7 +437,7 @@ pub fn record_refused_frame(turn_id: &str, tool_name: &str, input: &str) -> usiz
 }
 
 /// The cumulative count so far, without recording a new call.
-pub fn repeated_call_count(turn_id: &str, tool_name: &str, input_hash: &str) -> usize {
+pub fn repeated_call_count(turn_id: &RepetitionScope, tool_name: &str, input_hash: &str) -> usize {
     let key = repeated_call_key(turn_id, tool_name, input_hash);
     repetition_ledger()
         .lock()
@@ -423,7 +446,7 @@ pub fn repeated_call_count(turn_id: &str, tool_name: &str, input_hash: &str) -> 
         .map_or(0, |entry| entry.count)
 }
 
-pub fn record_repeated_call(turn_id: &str, tool_name: &str, input_hash: &str) -> Option<usize> {
+pub fn record_repeated_call(turn_id: &RepetitionScope, tool_name: &str, input_hash: &str) -> Option<usize> {
     let key = repeated_call_key(turn_id, tool_name, input_hash);
     let mut ledger = repetition_ledger()
         .lock()
@@ -515,7 +538,7 @@ pub(crate) const SCOPED_RECOVERY_GUIDANCE: &str = "Use a different valid action 
 /// diagnosis names what did not change, because that is the fact the model was
 /// missing when it retried.
 pub fn record_tool_failure(
-    turn_id: &str,
+    turn_id: &RepetitionScope,
     tool_name: &str,
     input_hash: &str,
     input_refs: &[String],
@@ -625,7 +648,7 @@ pub struct RefusalRecord {
     pub state_derived: bool,
 }
 
-pub fn refusal_for(turn_id: &str, tool_name: &str, input_hash: &str) -> Option<RefusalRecord> {
+pub fn refusal_for(turn_id: &RepetitionScope, tool_name: &str, input_hash: &str) -> Option<RefusalRecord> {
     // A poller legitimately re-issues identical calls while waiting on external
     // progress (`host_backend.rs:2876-2879` exempts them from the loop guard), and
     // the closure tools are the model's last exit - the diagnosis itself directs
@@ -659,7 +682,7 @@ pub fn refusal_for(turn_id: &str, tool_name: &str, input_hash: &str) -> Option<R
         })
 }
 
-pub fn is_dispatch_blocked(turn_id: &str, tool_name: &str, input_hash: &str) -> bool {
+pub fn is_dispatch_blocked(turn_id: &RepetitionScope, tool_name: &str, input_hash: &str) -> bool {
     refusal_for(turn_id, tool_name, input_hash).is_some()
 }
 
@@ -671,7 +694,7 @@ pub fn is_dispatch_blocked(turn_id: &str, tool_name: &str, input_hash: &str) -> 
 /// deterministic cause in this turn. The protocol-closure rule needs exactly this, because
 /// when the closure action is cause-blocked the protocol cannot be closed by it and
 /// re-dispatching it only re-produces the refusal.
-pub fn cause_blocked_for_tool(turn_id: &str, tool_name: &str) -> bool {
+pub fn cause_blocked_for_tool(turn_id: &RepetitionScope, tool_name: &str) -> bool {
     if is_exempt_tool(tool_name) {
         return false;
     }
@@ -777,7 +800,7 @@ fn state_derived_cause(message: &str, input_refs: &[String]) -> bool {
 ///
 /// Progress invalidates a conclusion about failure. It does not invalidate the
 /// observation that the same call keeps returning the same bytes.
-pub fn clear_failure_breakers(turn_id: &str) {
+pub fn clear_failure_breakers(turn_id: &RepetitionScope) {
     let needle = format!(":{turn_id}:");
     repetition_ledger()
         .lock()
@@ -804,7 +827,7 @@ fn ignored_refusal_turns() -> &'static std::sync::Mutex<BTreeSet<String>> {
     TURNS.get_or_init(|| std::sync::Mutex::new(BTreeSet::new()))
 }
 
-pub fn mark_refusal_ignored(turn_id: &str) {
+pub fn mark_refusal_ignored(turn_id: &RepetitionScope) {
     ignored_refusal_turns()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -813,21 +836,21 @@ pub fn mark_refusal_ignored(turn_id: &str) {
 
 /// Read and clear the mark: the escalation applies to exactly one step, like
 /// every other one-request override in the turn state.
-pub fn take_refusal_ignored(turn_id: &str) -> bool {
+pub fn take_refusal_ignored(turn_id: &RepetitionScope) -> bool {
     ignored_refusal_turns()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(turn_id)
+        .remove(&turn_id.0)
 }
 
-fn clear_ignored_refusal(turn_id: &str) {
+fn clear_ignored_refusal(turn_id: &RepetitionScope) {
     ignored_refusal_turns()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(turn_id);
+        .remove(&turn_id.0);
 }
 
-pub fn clear_turn(turn_id: &str) {
+pub fn clear_turn(turn_id: &RepetitionScope) {
     // Keys carry a type prefix (`call:` / `cause:`) before the turn, so the turn
     // is not at the start of the key.
     let needle = format!(":{turn_id}:");
@@ -852,7 +875,7 @@ pub fn clear_turn(turn_id: &str) {
 /// turn: the count never grew past the bound, the same failing call was refused 62
 /// times, and the loop never closed. Returns whether the clear happened so the
 /// boundary can be asserted.
-pub fn clear_breakers_for_role(turn_id: &str, owns_root_presentation: bool) -> bool {
+pub fn clear_breakers_for_role(turn_id: &RepetitionScope, owns_root_presentation: bool) -> bool {
     if !owns_root_presentation {
         return false;
     }
@@ -896,7 +919,7 @@ mod repetition_guard_tests {
     /// called it once gave every test the same turn and the tests interfered again.
     macro_rules! turn {
         () => {
-            concat!("turn-", line!(), "-", column!())
+            &RepetitionScope::turn("guard-test-session", concat!("turn-", line!(), "-", column!()))
         };
     }
 
@@ -914,7 +937,59 @@ mod repetition_guard_tests {
         );
         // Another turn is unaffected.
         mark_refusal_ignored(t);
-        assert!(take_refusal_ignored(&format!("{t}-other")) == false);
+        assert!(take_refusal_ignored(&RepetitionScope::turn("guard-test-session", &format!("{t}-other"))) == false);
+    }
+
+    #[test]
+    fn different_sessions_cannot_consume_or_clear_each_others_guard_state() {
+        let first = RepetitionScope::turn("scope-session-first", "same-turn");
+        let second = RepetitionScope::turn("scope-session-second", "same-turn");
+        for _ in 0..repetition_bound() {
+            record_tool_failure(&first, "read_file", "scope-input", &[], ToolFailureKind::ExecutionError,
+                "graph run:abc123 is missing");
+        }
+        assert!(cause_blocked_for_tool(&first, "read_file"));
+        assert!(!cause_blocked_for_tool(&second, "read_file"));
+        assert!(refusal_for(&second, "read_file", "scope-input").is_none());
+        record_repeated_call(&first, "read_file", "scope-input");
+        assert_eq!(repeated_call_count(&second, "read_file", "scope-input"), 0);
+        assert_eq!(record_refused_frame(&first, "read_file", "{}"), 1);
+        assert_eq!(record_refused_frame(&first, "read_file", "{}"), 2);
+        assert_eq!(record_refused_frame(&second, "read_file", "{}"), 1);
+        for _ in 0..PATTERN_DOMINANCE {
+            observe_call_pattern(&first, "read_file");
+        }
+        assert!(observe_call_pattern(&first, "read_file"));
+        assert!(!observe_call_pattern(&second, "read_file"));
+        assert!(!record_unchanged_inspection(&first, "scope-input", "revision-1"));
+        assert!(record_unchanged_inspection(&first, "scope-input", "revision-1"));
+        assert!(!record_unchanged_inspection(&second, "scope-input", "revision-1"));
+        mark_refusal_ignored(&first);
+        assert!(!take_refusal_ignored(&second));
+        clear_failure_breakers(&second);
+        clear_turn(&second);
+        assert!(take_refusal_ignored(&first));
+        assert!(cause_blocked_for_tool(&first, "read_file"));
+        assert_eq!(repeated_call_count(&first, "read_file", "scope-input"), 1);
+        assert_eq!(record_refused_frame(&first, "read_file", "{}"), 3);
+        assert!(record_unchanged_inspection(&first, "scope-input", "revision-1"));
+        clear_turn(&first);
+        assert!(!cause_blocked_for_tool(&first, "read_file"));
+    }
+
+    #[test]
+    fn reader_scope_distinguishes_missing_ids_domains_and_ambiguous_delimiters() {
+        let first = RepetitionScope::reader(Some("reader:session"), Some("agent"));
+        let second = RepetitionScope::reader(Some("reader"), Some("session:agent"));
+        assert_ne!(first, second);
+        assert_ne!(RepetitionScope::reader(None, None), RepetitionScope::reader(Some("no-session"), Some("no-agent")));
+        assert_ne!(RepetitionScope::turn("same-session", "same-id"), RepetitionScope::execution("same-session", "same-id"));
+        assert_eq!(served_read_count(&first, "reference"), 1);
+        assert_eq!(served_read_count(&first, "reference"), 2);
+        assert_eq!(served_read_count(&second, "reference"), 1);
+        clear_served_reads(&second);
+        assert_eq!(served_read_count(&first, "reference"), 3);
+        clear_served_reads(&first);
     }
 
     #[test]
@@ -927,7 +1002,7 @@ mod repetition_guard_tests {
         assert!(!take_refusal_ignored(t));
     }
 
-    fn err(turn: &str, kind: ToolFailureKind, msg: &str) -> Option<String> {
+    fn err(turn: &RepetitionScope, kind: ToolFailureKind, msg: &str) -> Option<String> {
         record_tool_failure(turn, "task_review", "hash-1", &[], kind, msg)
     }
 
@@ -1138,7 +1213,7 @@ mod repetition_guard_tests {
         let input = "hash-cross-turn";
         let message = "execution graph `run:abc123` does not exist";
         for turn_index in 0..19 {
-            let turn = format!("turn-cross-{turn_index}");
+            let turn = RepetitionScope::turn("guard-test-session", &format!("turn-cross-{turn_index}"));
             record_tool_failure(
                 &turn,
                 tool,
@@ -1306,10 +1381,10 @@ mod repetition_guard_tests {
     /// turn - by delegated graph turns that share the root turn's key.
     #[test]
     fn a_delegated_graph_turn_does_not_clear_the_root_turns_breaker() {
-        const ROOT: &str = "turn-delegated-clear";
+        let root = &RepetitionScope::turn("guard-test-session", "turn-delegated-clear");
         let fail = |msg: &str| {
             record_tool_failure(
-                ROOT,
+                root,
                 "task_review",
                 "h-delegated",
                 &[],
@@ -1320,19 +1395,19 @@ mod repetition_guard_tests {
         fail("graph `run:4f9a2b` does not exist");
         assert!(fail("graph `run:7c1e08` does not exist").is_some());
         assert!(
-            !clear_breakers_for_role(ROOT, false),
+            !clear_breakers_for_role(root, false),
             "a delegated graph turn is inside the root turn and must not clear its ledger"
         );
         assert!(
-            is_dispatch_blocked(ROOT, "task_review", "h-delegated"),
+            is_dispatch_blocked(root, "task_review", "h-delegated"),
             "the breaker the delegated turn could not clear must still refuse"
         );
         assert!(
-            clear_breakers_for_role(ROOT, true),
+            clear_breakers_for_role(root, true),
             "the root turn owns the clear"
         );
         assert!(
-            !is_dispatch_blocked(ROOT, "task_review", "h-delegated"),
+            !is_dispatch_blocked(root, "task_review", "h-delegated"),
             "at the boundary the breaker is stale and must be released"
         );
     }
@@ -1341,10 +1416,10 @@ mod repetition_guard_tests {
     fn durable_progress_clears_the_breaker() {
         // This test owns a turn nobody else uses, because it is the one test that
         // clears - and clearing is scoped to a turn.
-        const TURN: &str = "turn-clearing-case";
+        let turn = &RepetitionScope::turn("guard-test-session", "turn-clearing-case");
         let fail = |msg: &str| {
             record_tool_failure(
-                TURN,
+                turn,
                 "task_review",
                 "h1",
                 &[],
@@ -1355,7 +1430,7 @@ mod repetition_guard_tests {
         // Real ids always contain a digit, which is what marks them as ids.
         fail("graph `run:4f9a2b` does not exist");
         assert!(fail("graph `run:7c1e08` does not exist").is_some());
-        clear_turn(TURN);
+        clear_turn(turn);
         assert!(
             fail("graph `run:9b3d55` does not exist").is_none(),
             "after progress the same call must be attempted again"
@@ -1376,7 +1451,7 @@ mod repetition_guard_tests {
         );
         assert!(
             record_tool_failure(
-                "turn-other",
+                &RepetitionScope::turn("guard-test-session", "turn-other"),
                 "task_review",
                 "h1",
                 &[],
@@ -1461,7 +1536,7 @@ mod repetition_guard_tests {
     /// interleaved so nothing was ever consecutive. A total count sees all of it.
     #[test]
     fn a_repeated_call_is_counted_in_total_not_as_a_streak() {
-        let turn = "v22-repeat-cumulative";
+        let turn = &RepetitionScope::turn("guard-test-session", "v22-repeat-cumulative");
         clear_turn(turn);
         let bound = repeated_call_bound();
         // Below the bound: silent. The first repeat is not yet evidence.
@@ -1482,7 +1557,7 @@ mod repetition_guard_tests {
 
     #[test]
     fn a_different_input_is_a_different_call() {
-        let turn = "v22-repeat-distinct-inputs";
+        let turn = &RepetitionScope::turn("guard-test-session", "v22-repeat-distinct-inputs");
         clear_turn(turn);
         // One below the bound stays silent; the bound-th call is the one that speaks.
         for _ in 1..repeated_call_bound() {
@@ -1503,8 +1578,8 @@ mod repetition_guard_tests {
         // Cross-turn repetition can be the operator retrying with the same input,
         // which is not a loop. The counter dies with the turn, like every other
         // guard here.
-        let first = "v22-repeat-first";
-        let second = "v22-repeat-second";
+        let first = &RepetitionScope::turn("guard-test-session", "v22-repeat-first");
+        let second = &RepetitionScope::turn("guard-test-session", "v22-repeat-second");
         clear_turn(first);
         clear_turn(second);
         for _ in 1..repeated_call_bound() {
@@ -1531,7 +1606,7 @@ mod repetition_guard_tests {
 
     #[test]
     fn the_cumulative_count_is_readable_without_recording_a_call() {
-        let turn = "v22-repeat-count-read";
+        let turn = &RepetitionScope::turn("guard-test-session", "v22-repeat-count-read");
         clear_turn(turn);
         assert_eq!(repeated_call_count(turn, "read_ref", "hash"), 0);
         for _ in 1..repeated_call_bound() {
@@ -1559,7 +1634,7 @@ mod repetition_guard_tests {
     /// refused - the model was diagnosed seven times and kept going.
     #[test]
     fn an_accept_clears_failure_breakers_but_not_the_repeat_count() {
-        let turn = "v22-clear-scope";
+        let turn = &RepetitionScope::turn("guard-test-session", "v22-clear-scope");
         clear_turn(turn);
         // A failure breaker filed under this turn. The breaker needs
         // `repetition_bound()` consecutive identical failures before it trips, so
@@ -1607,25 +1682,26 @@ mod repetition_guard_tests {
     /// them turns "someone renames a prefix" from a silent reset into a test failure.
     #[test]
     fn every_namespace_key_is_stable_and_unambiguous() {
+        let scope = RepetitionScope::turn("session-1", "t1");
         assert_eq!(
-            LedgerNamespace::Call.key("t1", "read_file", "h1"),
-            "call:t1:read_file:h1"
+            LedgerNamespace::Call.key(&scope, "read_file", "h1"),
+            format!("call:{scope}:read_file:h1")
         );
         assert_eq!(
-            LedgerNamespace::Cause.key("t1", "read_file", "sig"),
-            "cause:t1:read_file:sig"
+            LedgerNamespace::Cause.key(&scope, "read_file", "sig"),
+            format!("cause:{scope}:read_file:sig")
         );
         assert_eq!(
-            LedgerNamespace::Repeat.key("t1", "read_file", "h1"),
-            "repeat:t1:read_file:h1"
+            LedgerNamespace::Repeat.key(&scope, "read_file", "h1"),
+            format!("repeat:{scope}:read_file:h1")
         );
         assert_eq!(
-            LedgerNamespace::Refused.key("t1", "read_file", "h1"),
-            "refused:t1:read_file:h1"
+            LedgerNamespace::Refused.key(&scope, "read_file", "h1"),
+            format!("refused:{scope}:read_file:h1")
         );
         assert_eq!(
-            LedgerNamespace::Cause.scan_prefix("t1", "read_file"),
-            "cause:t1:read_file:"
+            LedgerNamespace::Cause.scan_prefix(&scope, "read_file"),
+            format!("cause:{scope}:read_file:")
         );
         // No namespace may be a prefix of another, or a range scan over one would
         // silently read another's entries.
@@ -1655,7 +1731,7 @@ mod repetition_guard_tests {
     /// having to be remembered.
     #[test]
     fn an_accept_preserves_the_refused_frame_count() {
-        let turn = "v23-refused-accept";
+        let turn = &RepetitionScope::turn("guard-test-session", "v23-refused-accept");
         clear_turn(turn);
         // A failure breaker, which the accept must clear.
         for _ in 0..repetition_bound() {
@@ -1728,7 +1804,7 @@ mod repetition_guard_tests {
     /// and another ten, each time re-sending the full state.
     #[test]
     fn an_unchanged_revision_is_reported_so_the_model_can_wait_cheaply() {
-        let turn = "v17-inspect-stall";
+        let turn = &RepetitionScope::execution("guard-test-session", "v17-inspect-stall");
         clear_turn(turn);
         assert!(
             !record_unchanged_inspection(turn, "hash-a", "rev-7"),
@@ -1762,7 +1838,7 @@ mod repetition_guard_tests {
     /// times against exactly that blind spot.
     #[test]
     fn an_immutable_reference_read_twice_is_a_repeat() {
-        let scope = "v17-served-reads";
+        let scope = &RepetitionScope::reader(Some("guard-test-session"), Some("v17-served-reads"));
         clear_served_reads(scope);
         assert!(
             !record_repeated_read(scope, "artifact://a|64|"),
@@ -1850,7 +1926,7 @@ mod pattern_window_tests {
     /// stopped the run because the framework's own guard would not.
     #[test]
     fn a_rotating_model_is_caught_by_the_pattern_window() {
-        let turn = "pattern-rotate";
+        let turn = &RepetitionScope::turn("guard-test-session", "pattern-rotate");
         clear_call_pattern(turn);
         let mut tripped = false;
         for index in 0..PATTERN_DOMINANCE {
@@ -1874,7 +1950,7 @@ mod pattern_window_tests {
     /// for work it never did.
     #[test]
     fn the_window_slides_and_a_turn_starts_clean() {
-        let turn = "pattern-slide";
+        let turn = &RepetitionScope::turn("guard-test-session", "pattern-slide");
         clear_call_pattern(turn);
         for issued in 1..PATTERN_DOMINANCE {
             assert!(
@@ -1910,7 +1986,7 @@ mod pattern_window_tests {
     /// window exists so the guard that measures progress can see the pattern.
     #[test]
     fn dominance_alone_does_not_refuse_a_call() {
-        let turn = "pattern-reviewer";
+        let turn = &RepetitionScope::turn("guard-test-session", "pattern-reviewer");
         clear_call_pattern(turn);
         // A reviewer's legitimate sequence: the same tool, nine *different*
         // artifacts. Every input is seen once, so no per-input bound is anywhere
@@ -1943,7 +2019,7 @@ mod pattern_window_tests {
     /// A healthy mix of work never trips the window.
     #[test]
     fn a_healthy_mix_never_trips() {
-        let turn = "pattern-healthy";
+        let turn = &RepetitionScope::turn("guard-test-session", "pattern-healthy");
         clear_call_pattern(turn);
         let tools = [
             "read_file",

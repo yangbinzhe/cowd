@@ -124,6 +124,15 @@
     }
     #[tokio::test(flavor = "multi_thread")]
     async fn model_step_only_plans_then_runner_executes_dependent_tool_wave_once() {
+        exercise_dependency_wave_with_foreign_refusal(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn foreign_session_refusal_does_not_disable_dependency_tools_for_same_turn_id() {
+        exercise_dependency_wave_with_foreign_refusal(true).await;
+    }
+
+    async fn exercise_dependency_wave_with_foreign_refusal(foreign_refusal: bool) {
         let services = crate::RuntimeServices::in_memory().expect("runtime services");
         let executed = Arc::new(AtomicUsize::new(0));
         let executions_seen_before_second_model = Arc::new(AtomicUsize::new(0));
@@ -183,10 +192,16 @@
                 generation: 1,
             }),
         );
+        if foreign_refusal {
+            crate::repetition_guard::mark_refusal_ignored(&crate::repetition_guard::RepetitionScope::turn(
+                "foreign-refusal-session", "turn-test"));
+        }
         let runtime = crate::ConversationRuntime::new(
             session,
             TwoToolClient {
                 requests: 0,
+                event_store: Arc::clone(services.event_store()),
+                exposure: None,
                 executed: Arc::clone(&executed),
                 executions_seen_before_second_model: Arc::clone(
                     &executions_seen_before_second_model,

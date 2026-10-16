@@ -310,6 +310,8 @@ pub struct AgenticExecutionBinding {
     pub team_id: String,
     pub task_team_id: String,
     pub source_spec_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_purpose: Option<crate::agent_action::TaskPurpose>,
     pub focus: AgenticExecutionFocus,
 }
 
@@ -336,6 +338,12 @@ impl AgenticExecutionBinding {
                     field: field.to_string(),
                 });
             }
+        }
+        if self.task_purpose.is_some() && !matches!(self.focus,
+            AgenticExecutionFocus::TaskExecute { .. } | AgenticExecutionFocus::TaskReview { .. }) {
+            return Err(ValidationError::InvalidContract {
+                message: "typed Task purpose requires a Task-bound focus".into(),
+            });
         }
         match &self.focus {
             AgenticExecutionFocus::TaskExecute { task_ref }

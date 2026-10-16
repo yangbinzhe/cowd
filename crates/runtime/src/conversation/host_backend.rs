@@ -959,7 +959,8 @@ where
                 // also forces this step to be text-only: the model must
                 // conclude instead of paying for another refused round.
                 (std::mem::take(&mut state.force_text_only_next_model)
-                    | crate::repetition_guard::take_refusal_ignored(&state.turn_id))
+                    | crate::repetition_guard::take_refusal_ignored(
+                        &crate::repetition_guard::RepetitionScope::turn(&state.session_id, &state.turn_id)))
                     && !root_requires_action_channel,
                 state.force_tool_allowlist_next_model.take(),
                 state.force_reasoning_effort_next_model.take(),
@@ -4065,7 +4066,7 @@ fn is_loop_nudge_repeatable_tool(call: &ModelToolCall) -> bool {
 /// Both exclusions are the difference between a diagnosis that helps and one that
 /// trains the model to ignore it.
 pub(super) fn record_repeated_calls(
-    turn_id: &str,
+    turn_id: &crate::repetition_guard::RepetitionScope,
     calls: &[ModelToolCall],
     successful_call_ids: &std::collections::BTreeSet<String>,
 ) -> Vec<(String, usize)> {
@@ -4434,11 +4435,14 @@ fn closure_drive_grace_period_defaults_to_three_steps() {
     assert!(closure_drive_after_steps() >= 1);
 }
 
+#[cfg(test)]
 fn protocol_state(mode: &str, artifact_refs: Vec<&str>) -> DelegatedAgenticProtocolState {
     DelegatedAgenticProtocolState {
         program_id: "program-1".to_string(),
         task_id: "task-1".to_string(),
         mode: mode.to_string(),
+        purpose: harness_contract::agent_action::TaskPurpose::Delivery,
+        tool_ceiling: test_protocol_tool_ceiling(),
         status: crate::AgenticTaskStatus::Submitted,
         artifact_refs: artifact_refs.into_iter().map(str::to_string).collect(),
         artifact_evidence_refs: Vec::new(),
@@ -4485,13 +4489,12 @@ fn closure_tool_ids_includes_the_read_only_evidence_tools() {
     }
 }
 
-/// Closure narrows the request to force a commit. Admitting a write tool or an
-/// Agent Action would let the Agent keep opening work instead of closing it.
 #[test]
-fn closure_tool_ids_never_admits_a_write_or_agent_action_tool() {
+fn delivery_closure_preserves_submission_paths_without_opening_new_work_or_mutation() {
     let ids = protocol_state("execute", vec!["artifact:a"]).closure_tool_ids();
-    // `task_submit` is this mode's own closing action, so it is expected; every
-    // other Agent Action and every write tool is not.
+    assert!(ids.contains("task_submit"));
+    assert!(ids.contains("artifact_commit"));
+    assert!(ids.contains("artifact_publish"));
     for forbidden in [
         "write_file",
         "edit",
@@ -4502,8 +4505,6 @@ fn closure_tool_ids_never_admits_a_write_or_agent_action_tool() {
         "task_withdraw",
         "agent_invite",
         "team_create",
-        "artifact_commit",
-        "artifact_publish",
         "message_publish",
         "objective_review",
         "objective_complete_request",
@@ -4979,6 +4980,8 @@ pub(super) struct DelegatedAgenticProtocolState {
     pub(super) program_id: String,
     pub(super) task_id: String,
     pub(super) mode: String,
+    pub(super) purpose: harness_contract::agent_action::TaskPurpose,
+    pub(super) tool_ceiling: BTreeSet<String>,
     pub(super) status: crate::AgenticTaskStatus,
     pub(super) artifact_refs: Vec<String>,
     pub(super) artifact_evidence_refs: Vec<String>,
@@ -4990,7 +4993,9 @@ pub(super) struct DelegatedAgenticProtocolState {
 
 impl DelegatedAgenticProtocolState {
     pub(super) fn is_terminal(&self) -> bool {
-        if !self.owns_active_attempt {
+        if !self.owns_active_attempt || matches!(self.status,
+            crate::AgenticTaskStatus::CancelRequested | crate::AgenticTaskStatus::Withdrawn
+                | crate::AgenticTaskStatus::Superseded) {
             return true;
         }
         match self.mode.as_str() {
@@ -5020,6 +5025,11 @@ impl DelegatedAgenticProtocolState {
                 self.artifact_evidence_refs.join(", "),
                 crate::agentic::order_contract::REVIEWER_SCOPE_DISCIPLINE,
                 self.program_id
+            ),
+            _ if self.purpose == harness_contract::agent_action::TaskPurpose::Exploration => format!(
+                "Runtime collaboration protocol: exploration Task `{}` is still {:?}. {} Program `{}`.{}",
+                self.task_id, self.status, crate::agentic::order_contract::EXPLORATION_CLOSEOUT_CONTRACT,
+                self.program_id, rework_note,
             ),
             _ if self.artifact_refs.is_empty() => format!(
                 "Runtime collaboration protocol: execute Task `{}` is still {:?}. {} Program `{}`.{}",
@@ -5055,42 +5065,24 @@ impl DelegatedAgenticProtocolState {
         }
     }
 
-    /// The durable protocol action that closes the current Agent boundary, plus
-    /// the read-only tools that boundary still needs.
-    ///
-    /// This set becomes the next request's tool-activation ceiling, so it must
-    /// not be narrower than the work the Agent still owes. One live run was
-    /// blocked with `tool_protocol_violation: ... [grep_search]` because the
-    /// set held exactly one action tool: the Agent could neither search nor
-    /// read the file its own objective named, and after the single governed
-    /// retry the whole Agent graph was declared blocked. Closure narrows the
-    /// request to force a commit; it must not forbid verifying the object the
-    /// Agent has to report on. Everything added here is a read, so further
-    /// exploration commits remain closed.
     pub(super) fn closure_tool_ids(&self) -> BTreeSet<String> {
-        let tool = match self.mode.as_str() {
-            "review" => harness_contract::agent_action::TASK_REVIEW_TOOL_ID,
-            _ if self.artifact_refs.is_empty() => {
-                harness_contract::agent_action::ARTIFACT_COMMIT_TOOL_ID
-            }
-            _ => harness_contract::agent_action::TASK_SUBMIT_TOOL_ID,
-        };
-        std::iter::once(tool.to_string())
+        crate::agentic::order_contract::worker_closeout_action_ids(&self.mode, self.purpose)
+            .into_iter().map(str::to_string)
             .chain(
                 CLOSURE_READ_ONLY_EVIDENCE_TOOLS
                     .iter()
                     .map(|name| name.to_string()),
             )
+            .filter(|tool| self.tool_ceiling.contains(tool))
             .collect()
+    }
+
+    pub(super) fn terminal_action_ids(&self) -> impl Iterator<Item = &str> {
+        crate::agentic::order_contract::worker_terminal_action_ids(&self.mode, self.purpose)
+            .iter().copied().filter(|tool| self.tool_ceiling.contains(*tool))
     }
 }
 
-/// Read-only tools a closure-phase Agent may still call. Each of these reads
-/// durable state or bytes and writes nothing, so admitting them cannot reopen
-/// exploration: the Agent still cannot publish, claim, invite or submit a new
-/// piece of work. They are here because the closure action's own evidence
-/// obligation frequently requires reading the object under review, and a
-/// ceiling of one action tool made that impossible.
 const CLOSURE_READ_ONLY_EVIDENCE_TOOLS: [&str; 6] = [
     "read_file",
     "read_ref",
@@ -5100,13 +5092,22 @@ const CLOSURE_READ_ONLY_EVIDENCE_TOOLS: [&str; 6] = [
     "state_inspect",
 ];
 
+#[cfg(test)]
+pub(super) fn test_protocol_tool_ceiling() -> BTreeSet<String> {
+    harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.iter().copied()
+        .chain(CLOSURE_READ_ONLY_EVIDENCE_TOOLS).chain(["artifact_publish"])
+        .map(str::to_string).collect()
+}
+
 pub(super) fn pending_delegated_action_is_ready(
     protocol: Option<&DelegatedAgenticProtocolState>,
     repeated_evidence_saturation: bool,
     has_successful_tool_evidence: bool,
+    required_effects_pending: bool,
 ) -> bool {
     repeated_evidence_saturation
         && has_successful_tool_evidence
+        && !required_effects_pending
         && protocol.is_some_and(|protocol| !protocol.is_terminal())
 }
 
@@ -5164,11 +5165,19 @@ pub(super) fn delegated_agentic_protocol_state(
         .agent_action_service()
         .project(&program_id)
         .map_err(|error| protocol_error(format!("project Agent-first Program: {error}")))?;
+    if packet.graph_id() != parent_graph.id || packet.node_id() != parent.node_id
+        || packet.session_id() != projection.session_id
+        || graph.lineage.as_ref().is_some_and(|lineage| lineage.session_id != packet.session_id()) {
+        return Err(protocol_error("packet purpose source has mismatched execution or Session identity".into()));
+    }
     let task = projection.tasks.get(&task_id).ok_or_else(|| {
         protocol_error(format!(
             "Agent-first Program `{program_id}` has no Task `{task_id}`"
         ))
     })?;
+    if agentic.task_purpose.is_some_and(|purpose| purpose != task.purpose) {
+        return Err(protocol_error("packet purpose does not match the bound Task".into()));
+    }
     // `AgentTaskPacket::agent_id()` is the physical Binding instance identity
     // (for run locks, cancellation and process isolation). Agent-first
     // Program state is instead owned by the immutable logical identity that
@@ -5217,6 +5226,8 @@ pub(super) fn delegated_agentic_protocol_state(
         program_id,
         task_id,
         mode: mode.to_string(),
+        purpose: task.purpose,
+        tool_ceiling: packet.allowed_tools.iter().cloned().collect(),
         status: task.status,
         artifact_refs: artifacts
             .iter()
@@ -6733,8 +6744,13 @@ where
                     .name
                     .eq_ignore_ascii_case(harness_contract::agent_action::ARTIFACT_COMMIT_TOOL_ID)
         });
-        let delegated_protocol_for_batch =
+        let mut delegated_protocol_for_batch =
             delegated_agentic_protocol_state(self.services.as_ref(), ticket)?;
+        if let Some(protocol) = delegated_protocol_for_batch.as_mut() {
+            let available = self.runtime.lock().await.tool_executor().available_tool_names()
+                .into_iter().collect::<BTreeSet<_>>();
+            protocol.tool_ceiling.retain(|tool| available.contains(tool));
+        }
         let delegated_protocol_after_batch = if committed_agentic_artifact {
             delegated_protocol_for_batch
                 .clone()
@@ -6914,7 +6930,7 @@ where
         }
         state.consecutive_tool_failure_batches = next_consecutive_tool_failure_batches(
             state.consecutive_tool_failure_batches,
-            executed_failures(failed, &calls, &turn_id),
+            executed_failures(failed, &calls, &crate::repetition_guard::RepetitionScope::turn(&session_id, &turn_id)),
             false,
         );
         if failed == 0 && (low_novelty || scope_saturated || evidence_saturated) {
@@ -6956,7 +6972,7 @@ where
         // Diagnose only. The model keeps the decision; it is told the one fact it
         // was missing - that the call has been made before and produced this
         // result - and where the same bytes can be had without another call.
-        let repeat_turn = state.turn_id.clone();
+        let repeat_turn = crate::repetition_guard::RepetitionScope::turn(&state.session_id, &state.turn_id);
         let repeated_calls = record_repeated_calls(&repeat_turn, &calls, &successful_call_ids);
         if let Some((tool, count)) = repeated_calls.first() {
             let repeated_tools = repeated_calls
@@ -7082,11 +7098,24 @@ where
         let repeated_local_failures = state.consecutive_tool_failure_batches >= 2;
         let repeated_evidence_saturation = state.consecutive_low_novelty_batches
             >= evidence_saturation_limit(bounded_evidence_role);
+        let successful_write_observed = write_obligation_satisfied(
+            state.required_write_for_completion,
+            &state.required_workspace_write_scopes,
+            &state.committed_workspace_observed_evidence,
+            state.committed_workspace_write_observed,
+            self.services.path_identity_resolver(),
+        );
+        let required_effects_pending = !focus_acceptance_pending_scopes.is_empty()
+            || (state.required_write_for_completion && !successful_write_observed);
         let pending_delegated_action = pending_delegated_action_is_ready(
             delegated_protocol_for_batch.as_ref(),
             repeated_evidence_saturation,
             state.successful_tool_calls > 0,
-        );
+            required_effects_pending,
+        ) && delegated_protocol_for_batch.as_ref().is_some_and(|protocol|
+            protocol.terminal_action_ids().any(|tool|
+                !crate::repetition_guard::cause_blocked_for_tool(
+                    &crate::repetition_guard::RepetitionScope::turn(&state.session_id, &state.turn_id), tool)));
         // A stalled/failing turn gets an explicit, advisory notice before the
         // existing forced-synthesis or fail-closed paths engage. Delegated
         // protocol closure has its own authoritative continuation, so it is
@@ -7159,13 +7188,6 @@ where
                 has_retained_focus_terminal_candidate,
                 exact_workspace_evidence,
             );
-        let successful_write_observed = write_obligation_satisfied(
-            state.required_write_for_completion,
-            &state.required_workspace_write_scopes,
-            &state.committed_workspace_observed_evidence,
-            state.committed_workspace_write_observed,
-            self.services.path_identity_resolver(),
-        );
         let required_write_recovery = should_recover_missing_required_write(
             state.required_write_for_completion,
             bounded_evidence_role,
@@ -7565,10 +7587,10 @@ where
         // same claimed work in a fresh graph. Preserve all model-led research
         // until this exact boundary, then require only the irreducible durable
         // closure action instead of synthesizing text.
-        let protocol_closure_required = protocol_closure_can_be_required(
+        let protocol_closure_required = !required_effects_pending && protocol_closure_can_be_required(
             delegated_protocol_for_batch.as_ref(),
             intervention.as_ref(),
-            &turn_id,
+            &crate::repetition_guard::RepetitionScope::turn(&session_id, &turn_id),
         );
         if protocol_closure_required {
             let protocol = delegated_protocol_for_batch

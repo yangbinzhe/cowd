@@ -345,7 +345,7 @@ fn the_repeat_counter_skips_waits_and_failed_calls() {
         }
     }
 
-    let turn = "v22-repeat-filter";
+    let turn = &crate::repetition_guard::RepetitionScope::turn("host-guard-test-session", "v22-repeat-filter");
     crate::repetition_guard::clear_turn(turn);
     let bound = crate::repetition_guard::repeated_call_bound();
 
@@ -409,7 +409,7 @@ fn the_repeat_count_survives_a_re_dispatch_that_opens_a_new_graph() {
         }
     }
 
-    let turn = "v22-repeat-across-graphs";
+    let turn = &crate::repetition_guard::RepetitionScope::turn("host-guard-test-session", "v22-repeat-across-graphs");
     crate::repetition_guard::clear_turn(turn);
     let bound = crate::repetition_guard::repeated_call_bound();
     let query = r#"{"query":"task:77fb8340a3eb5091224bb31d"}"#;

@@ -2298,7 +2298,7 @@ where
                         let mut repeated_refusal = false;
                         for refusal in &refusals {
                             let refused_times = crate::repetition_guard::record_refused_frame(
-                                &self.active_turn_id(),
+                                &self.active_repetition_scope(),
                                 &refusal.call.name,
                                 &refusal.call.input,
                             );
@@ -2443,7 +2443,7 @@ where
                         continue;
                     }
                     let refused_times = crate::repetition_guard::record_refused_frame(
-                        &self.active_turn_id(),
+                        &self.active_repetition_scope(),
                         &rejected.name,
                         &rejected.input,
                     );

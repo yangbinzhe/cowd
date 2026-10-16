@@ -615,6 +615,7 @@ fn agentic_prompt_names_only_the_actions_owned_by_its_bound_focus() {
         team_id: "team:test".into(),
         task_team_id: "team:test".into(),
         source_spec_revision: 1,
+        task_purpose: None,
         focus: AgenticExecutionFocus::TaskExecute {
             task_ref: "task:execute-only".into(),
         },
@@ -663,6 +664,7 @@ fn review_and_coordination_prompts_preserve_their_bound_action_owner() {
             team_id: "team:test".into(),
             task_team_id: "team:test".into(),
             source_spec_revision: 1,
+            task_purpose: None,
             focus,
         });
         packet.allowed_tools = vec!["task_submit".into(), "task_review".into()];
@@ -3289,6 +3291,7 @@ async fn native_checkpoint_closes_only_after_its_typed_decline() {
         team_id: team.clone(),
         task_team_id: team.clone(),
         source_spec_revision: 1,
+        task_purpose: None,
         focus: AgenticExecutionFocus::TaskExecute {
             task_ref: task.clone(),
         },
@@ -3641,6 +3644,7 @@ async fn cross_team_review_checkpoint_is_valid_but_cross_team_execution_is_fence
         team_id: author_team.clone(),
         task_team_id: author_team.clone(),
         source_spec_revision: 1,
+        task_purpose: None,
         focus: AgenticExecutionFocus::TaskExecute {
             task_ref: task.clone(),
         },
@@ -3724,6 +3728,7 @@ async fn cross_team_review_checkpoint_is_valid_but_cross_team_execution_is_fence
         team_id: review_team,
         task_team_id: author_team,
         source_spec_revision: 1,
+        task_purpose: None,
         focus: AgenticExecutionFocus::TaskReview {
             task_ref: task.clone(),
         },

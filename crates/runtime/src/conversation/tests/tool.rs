@@ -230,7 +230,7 @@ async fn expired_replay_is_seeded_into_the_existing_dag_before_a_fresh_dependent
         .without_memory();
         // The ledger is keyed by the active turn; with no turn admitted yet this
         // runtime falls back to its session id, which is unique per test.
-        let turn = runtime.active_turn_id();
+        let turn = runtime.active_repetition_scope();
         let hash = "hash-completed-call".to_string();
         let mut output = String::new();
 
@@ -1863,11 +1863,17 @@ async fn expired_replay_is_seeded_into_the_existing_dag_before_a_fresh_dependent
     #[derive(Clone)]
     struct TwoToolClient {
         requests: usize,
+        event_store: Arc<crate::RuntimeEventStore>,
+        exposure: Option<harness_contract::tool::ToolExposureProjection>,
         executed: Arc<AtomicUsize>,
         executions_seen_before_second_model: Arc<AtomicUsize>,
     }
 
     impl ApiClient for TwoToolClient {
+        fn configure_tool_exposure(&mut self, projection: harness_contract::tool::ToolExposureProjection) {
+            self.exposure = Some(projection);
+        }
+
         fn stream(
             &mut self,
             request: ApiRequest,
@@ -1875,6 +1881,12 @@ async fn expired_replay_is_seeded_into_the_existing_dag_before_a_fresh_dependent
             self.requests += 1;
             if self.requests == 1 {
                 assert_eq!(self.executed.load(Ordering::SeqCst), 0);
+                let exposure = self.exposure.as_ref().unwrap();
+                assert!(exposure.active_ids.iter().chain(&exposure.bootstrap_ids).any(|active| active == "tool_search"),
+                    "another Session must not disarm this real Host request: {exposure:?}; durable decisions={:?}",
+                    self.event_store.all_events(256).unwrap().into_iter()
+                        .filter(|event| event.kind.contains("text_only") || event.kind.contains("intervention"))
+                        .collect::<Vec<_>>());
                 Box::pin(stream::iter(vec![
                     Ok(AssistantEvent::ToolUse {
                         id: "discover-tools".to_string(),
@@ -1885,6 +1897,13 @@ async fn expired_replay_is_seeded_into_the_existing_dag_before_a_fresh_dependent
                 ]))
             } else if self.requests == 2 {
                 assert_eq!(self.executed.load(Ordering::SeqCst), 0);
+                let exposure = self.exposure.as_ref().unwrap();
+                assert!(["read_file", "edit"].iter().all(|tool|
+                    exposure.active_ids.iter().chain(&exposure.bootstrap_ids).any(|active| active == tool)),
+                    "discovered dependency tools were hidden: {exposure:?}; durable decisions={:?}",
+                    self.event_store.all_events(256).unwrap().into_iter()
+                        .filter(|event| event.kind.contains("text_only") || event.kind.contains("intervention"))
+                        .collect::<Vec<_>>());
                 Box::pin(stream::iter(vec![
                     Ok(AssistantEvent::ToolUse {
                         id: "read-1".to_string(),
@@ -1917,7 +1936,11 @@ async fn expired_replay_is_seeded_into_the_existing_dag_before_a_fresh_dependent
                         |(tool, output)| *tool == "read_file"
                             && output.contains("read_file complete")
                     ),
-                    "the dependent model request must observe the committed read receipt: {committed_results:?}"
+                    "the dependent model request must observe the committed read receipt: {committed_results:?}; actual guidance={:?}; durable observations={:?}",
+                    request.prompt.contextual_packets,
+                    self.event_store.all_events(256).unwrap().into_iter()
+                        .filter(|event| event.kind.contains("observation") || event.kind.contains("failed") || event.kind.contains("text_only"))
+                        .collect::<Vec<_>>()
                 );
                 assert!(
                     committed_results.iter().any(
@@ -2598,7 +2621,7 @@ async fn expired_replay_is_seeded_into_the_existing_dag_before_a_fresh_dependent
             vec!["complete the bound Task".to_string()],
         )
         .without_memory();
-        let turn = runtime.active_turn_id();
+        let turn = runtime.active_repetition_scope();
         let input =
             r#"{"task_ref":"task:12345678","evidence_refs":["receipt:program:12345678:claim-7"]}"#;
         let record = crate::ToolInvocationRecord::started(
@@ -2663,7 +2686,7 @@ async fn expired_replay_is_seeded_into_the_existing_dag_before_a_fresh_dependent
         )
         .without_memory();
 
-        let turn = runtime.active_turn_id();
+        let turn = runtime.active_repetition_scope();
         let input = serde_json::json!({"query": "task:be3f9b4582fb9f712fa8ed66"}).to_string();
         let hash = crate::tool_invocation::stable_hash(&input);
         let bound = crate::repetition_guard::repeated_call_block_bound_for("state_inspect", "{}");
@@ -2717,7 +2740,7 @@ async fn expired_replay_is_seeded_into_the_existing_dag_before_a_fresh_dependent
         )
         .without_memory();
 
-        let turn = runtime.active_turn_id();
+        let turn = runtime.active_repetition_scope();
         let bound = crate::repetition_guard::repeated_call_block_bound_for("state_inspect", "{}");
         for index in 0..bound {
             let input = serde_json::json!({"query": format!("task:{index}")}).to_string();
@@ -3736,7 +3759,7 @@ async fn expired_replay_is_seeded_into_the_existing_dag_before_a_fresh_dependent
             vec!["bounded read".to_string()],
         )
         .without_memory();
-        let turn = runtime.active_turn_id();
+        let turn = runtime.active_repetition_scope();
         let call = ModelToolCall {
             binding: None,
             id: "call-refusal-streak".to_string(),
@@ -3791,11 +3814,13 @@ async fn expired_replay_is_seeded_into_the_existing_dag_before_a_fresh_dependent
             vec!["bounded read".to_string()],
         )
         .without_memory();
-        let turn = runtime.active_turn_id();
-        let protocol = super::host_backend::DelegatedAgenticProtocolState {
+        let turn = runtime.active_repetition_scope();
+        let mut protocol = super::host_backend::DelegatedAgenticProtocolState {
             program_id: "program:closure-test".to_string(),
             task_id: "task:closure-test".to_string(),
             mode: "review".to_string(),
+            purpose: harness_contract::agent_action::TaskPurpose::Delivery,
+            tool_ceiling: super::host_backend::test_protocol_tool_ceiling(),
             status: crate::AgenticTaskStatus::Submitted,
             artifact_refs: vec!["artifact:closure-test".to_string()],
             artifact_evidence_refs: vec![],
@@ -3842,6 +3867,28 @@ async fn expired_replay_is_seeded_into_the_existing_dag_before_a_fresh_dependent
             ..synthesize.clone()
         };
         assert!(!protocol_closure_can_be_required(Some(&protocol), Some(&terminal), &turn));
+
+        protocol.mode = "execute".into();
+        protocol.purpose = harness_contract::agent_action::TaskPurpose::Exploration;
+        protocol.status = crate::AgenticTaskStatus::Claimed;
+        protocol.tool_ceiling = ["task_submit", "task_withdraw", "read_file"]
+            .into_iter().map(str::to_string).collect();
+        for name in ["read_file", "task_submit"] {
+            for _ in 0..2 {
+                runtime.append_repetition_diagnosis(name, &format!("blocked-{name}"), &[], true,
+                    crate::ToolFailureKind::ExecutionError, &mut "physical Agent packet missing:run:abc123".into());
+            }
+        }
+        assert!(protocol_closure_can_be_required(Some(&protocol), Some(&synthesize), &turn),
+            "a blocked read or submit cannot hide the authorized retirement alternative");
+        for _ in 0..2 {
+            runtime.append_repetition_diagnosis("task_withdraw", "blocked-withdraw", &[], true,
+                crate::ToolFailureKind::ExecutionError, &mut "physical Agent packet missing:run:abc123".into());
+        }
+        assert!(!protocol_closure_can_be_required(Some(&protocol), Some(&synthesize), &turn),
+            "all authorized exits blocked must not force another impossible closure round");
+        protocol.tool_ceiling.clear();
+        assert!(!protocol_closure_can_be_required(Some(&protocol), Some(&synthesize), &turn));
     }
 
     /// The gain measure reads the tool result block, and that block carries the

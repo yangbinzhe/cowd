@@ -1301,6 +1301,61 @@ async fn explicit_publication_roundtrip_and_scope_checks() {
     .unwrap();
     assert_eq!(published["bytes"], body.len());
     assert_eq!(published["sha256"], format!("sha256:{hash}"));
+    let (parent, decision) = admitted_agent_action_root(&services, "publication-session");
+    let root_actor = root_agent_action_actor(RuntimeToolExecutionBinding {
+        parent_execution: Some(&parent), execution_decision: Some(&decision), ..binding
+    });
+    let root_action = |action_id: &str, action| harness_contract::agent_action::AgentActionEnvelope {
+        action_id: action_id.into(), actor: root_actor.clone(), expected_revision: None, action,
+    };
+    let team = services.submit_agent_action(&root_action("file-team",
+        harness_contract::agent_action::AgentAction::TeamCreate(serde_json::from_value(json!({
+            "name":"File delivery", "mission":"deliver the exact required HTML file"
+        })).unwrap()))).await.unwrap().changed_refs[0].clone();
+    let author = services.submit_agent_action(&root_action("file-author",
+        harness_contract::agent_action::AgentAction::AgentInvite(serde_json::from_value(json!({
+            "team_ref":team,"role":"Author","mission":"deliver the HTML file","required_capabilities":["read"]
+        })).unwrap()))).await.unwrap().changed_refs[0].clone();
+    let task = services.submit_agent_action(&root_action("file-task",
+        harness_contract::agent_action::AgentAction::TaskPublish(serde_json::from_value(json!({
+            "team_ref":team,"title":"HTML deliverable","objective":"deliver the original HTML file",
+            "acceptance":"exact HTML bytes retained as a readable file artifact", "purpose":"delivery"
+        })).unwrap()))).await.unwrap().changed_refs[0].clone();
+    let mut worker = root_actor.clone();
+    worker.kind = harness_contract::agent_action::AgentActorKind::Agent;
+    worker.actor_id = author.clone();
+    worker.agent_id = Some(author.clone());
+    worker.team_id = Some(team);
+    worker.execution_id = Some("file-worker-claim".into());
+    let worker_action = |action_id: &str, action| harness_contract::agent_action::AgentActionEnvelope {
+        action_id: action_id.into(), actor: worker.clone(), expected_revision: None, action,
+    };
+    assert_eq!(services.submit_agent_action(&worker_action("file-claim",
+        harness_contract::agent_action::AgentAction::TaskClaim(harness_contract::agent_action::TaskClaimInput {
+            task_ref: task.clone(), reason: None,
+        }))).await.unwrap().status, harness_contract::agent_action::AgentActionStatus::Applied);
+    let committed = services.submit_agent_action(&worker_action("file-commit",
+        harness_contract::agent_action::AgentAction::ArtifactCommit(harness_contract::agent_action::ArtifactCommitInput {
+            content_ref: published["content_ref"].as_str().unwrap().into(), kind: "file".into(),
+            title: "Original HTML".into(), relates_to: vec![task.clone()],
+        }))).await.unwrap();
+    assert_eq!(committed.status, harness_contract::agent_action::AgentActionStatus::Applied);
+    let submitted = services.submit_agent_action(&worker_action("file-submit",
+        harness_contract::agent_action::AgentAction::TaskSubmit(harness_contract::agent_action::TaskSubmitInput {
+            task_ref: task.clone(), artifact_refs: committed.changed_refs.clone(),
+            evidence_refs: vec![published["content_ref"].as_str().unwrap().into()],
+            unresolved: vec![], deliverable: None,
+        }))).await.unwrap();
+    assert_eq!(submitted.status, harness_contract::agent_action::AgentActionStatus::Applied);
+    let program = services.agent_action_service().project(&root_actor.program_id).unwrap();
+    assert_eq!(program.tasks[&task].status, runtime::AgenticTaskStatus::Submitted);
+    assert_eq!(program.tasks[&task].artifact_refs, committed.changed_refs);
+    let result = &program.artifacts[&program.tasks[&task].artifact_refs[0]];
+    assert_eq!(result.committed_by, author);
+    assert_eq!(result.claim_execution_id.as_deref(), Some("file-worker-claim"));
+    let artifact = services.artifact_store().resolve(&result.content_ref).unwrap();
+    assert_eq!(services.artifact_store().read(&artifact, "session:publication-session", None).await.unwrap(), body.as_bytes());
+    assert!(program.objective_verdict.is_none());
     let export = serde_json::json!({"content_ref": published["content_ref"], "sha256": published["sha256"], "path":"result.html"});
     host.pin_snapshot()
         .validate_input("artifact_materialize", &export)

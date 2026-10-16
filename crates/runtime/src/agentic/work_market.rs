@@ -751,7 +751,8 @@ pub(crate) fn apply_task_review(
                 // the cumulative repeat counts, so a call issued ten times never
                 // reached its block bound and was never refused - run one25 was
                 // diagnosed seven times and issued the call ten times anyway.
-                crate::repetition_guard::clear_failure_breakers(&envelope.actor.turn_id);
+                crate::repetition_guard::clear_failure_breakers(&crate::repetition_guard::RepetitionScope::turn(
+                    &envelope.actor.session_id, &envelope.actor.turn_id));
             }
             TaskReviewDecision::Challenge | TaskReviewDecision::Rework => {
                 task.claimant = None;

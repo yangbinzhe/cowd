@@ -1516,6 +1516,10 @@ where
             .unwrap_or_else(|| self.session_id().to_string())
     }
 
+    pub(crate) fn active_repetition_scope(&self) -> crate::repetition_guard::RepetitionScope {
+        crate::repetition_guard::RepetitionScope::turn(self.session_id(), &self.active_turn_id())
+    }
+
     /// Append the repetition diagnosis when this exact call has already failed.
     ///
     /// Extracted from the tool path so it does not lengthen a function that is
@@ -1547,7 +1551,7 @@ where
         };
         let input_hash = crate::tool_invocation::stable_hash(input);
         let repeated = crate::repetition_guard::repeated_call_count(
-            &self.active_turn_id(),
+            &self.active_repetition_scope(),
             tool_name,
             &input_hash,
         );
@@ -1559,7 +1563,7 @@ where
         // ConversationRuntime, the state lives with the turn backend - so the
         // escalation is recorded turn-scoped in the guard the refusal path
         // already keys on, and the model-step preparation consumes it.
-        crate::repetition_guard::mark_refusal_ignored(&self.active_turn_id());
+        crate::repetition_guard::mark_refusal_ignored(&self.active_repetition_scope());
         tracing::warn!(
             %tool_name,
             repeated,
@@ -1577,6 +1581,7 @@ where
         iterations: usize,
     ) -> Option<ConversationMessage> {
         let turn_id = self.active_turn_id();
+        let repetition_scope = self.active_repetition_scope();
         let input_hash = crate::tool_invocation::stable_hash(input);
         // A call that keeps succeeding is still a call that keeps producing the
         // same bytes. The failure ledger cannot see it, and the cumulative counter
@@ -1584,7 +1589,7 @@ where
         // `read_ref` twenty-one times. Past the block bound the call is not
         // dispatched at all, which is the only mechanism here that has ever
         // actually stopped a loop.
-        let repeated = crate::repetition_guard::repeated_call_count(&turn_id, tool_name, &input_hash);
+        let repeated = crate::repetition_guard::repeated_call_count(&repetition_scope, tool_name, &input_hash);
         let repeated_refusal =
             repeated >= crate::repetition_guard::repeated_call_block_bound_for(tool_name, input);
         // Measure the call pattern, but do not refuse on it alone.
@@ -1602,7 +1607,7 @@ where
         // that verdict belongs to the guard that already measures progress. This
         // records the measurement so that guard - and the operator - can see it.
         let pattern_dominant =
-            crate::repetition_guard::observe_call_pattern(&turn_id, tool_name);
+            crate::repetition_guard::observe_call_pattern(&repetition_scope, tool_name);
         if pattern_dominant {
             self.append_execution_runtime_event(
                 RuntimeEventScope::Tool,
@@ -1627,7 +1632,7 @@ where
                 }),
             );
         }
-        let Some(refusal) = crate::repetition_guard::refusal_for(&turn_id, tool_name, &input_hash)
+        let Some(refusal) = crate::repetition_guard::refusal_for(&repetition_scope, tool_name, &input_hash)
         else {
             if !repeated_refusal {
                 return None;
@@ -1794,7 +1799,7 @@ where
         if !is_error {
             return;
         }
-        let turn_id = self.active_turn_id();
+        let turn_id = self.active_repetition_scope();
         if let Some(diagnosis) = crate::repetition_guard::record_tool_failure(
             &turn_id,
             tool_name,

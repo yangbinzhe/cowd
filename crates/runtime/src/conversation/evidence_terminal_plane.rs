@@ -1742,7 +1742,7 @@ where
             .ok_or_else(|| RuntimeError::new("early stop has no turn strategy"))?;
         // An early stop ends the turn without a normal completion, so the breakers
         // filed under it must not survive into the next turn.
-        crate::repetition_guard::clear_turn(&self.active_turn_id());
+        crate::repetition_guard::clear_turn(&self.active_repetition_scope());
         self.revise_active_turn_strategy(
             active.selected_candidate,
             active.decision.pattern(),

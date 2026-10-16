@@ -2202,7 +2202,7 @@ where
             // guard keys on (`host.rs:644` begins the input stream's active turn
             // from the same `turn_ref` this state stores).
             crate::repetition_guard::clear_breakers_for_role(
-                &state.turn_id,
+                &crate::repetition_guard::RepetitionScope::turn(&state.session_id, &state.turn_id),
                 state.execution_role.owns_root_presentation(),
             );
             state.summary = Some(summary);

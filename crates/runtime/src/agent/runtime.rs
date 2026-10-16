@@ -1345,7 +1345,7 @@ impl AgentRuntime {
     /// New executable packets are compiled before graph registration; Runtime
     /// intentionally rejects an unbound payload rather than selecting a
     /// default Definition during execution or recovery.
-    fn ensure_runtime_binding(&self, packet: AgentTaskPacket) -> Result<AgentTaskPacket, String> {
+    fn ensure_runtime_binding(&self, mut packet: AgentTaskPacket) -> Result<AgentTaskPacket, String> {
         packet
             .assignment
             .validate()
@@ -1417,6 +1417,26 @@ impl AgentRuntime {
                 );
             }
             verify_binding_against_definition(binding, &resolved.revision.manifest)?;
+            let session_id = packet.session_id().to_string();
+            if let Some(agentic) = packet.agentic_binding.as_mut() {
+                let task_ref = match &agentic.focus {
+                    harness_contract::agent::AgenticExecutionFocus::TaskExecute { task_ref }
+                    | harness_contract::agent::AgenticExecutionFocus::TaskReview { task_ref } => Some(task_ref),
+                    _ => None,
+                };
+                if let Some(task_ref) = task_ref {
+                    let program = services.agent_action_service().project(&agentic.program_id)
+                        .map_err(|error| format!("AgentTaskPacket purpose source unavailable: {error}"))?;
+                    if program.session_id != session_id {
+                        return Err("AgentTaskPacket purpose source belongs to another Session".into());
+                    }
+                    let task = program.tasks.get(task_ref).ok_or("AgentTaskPacket purpose source Task missing")?;
+                    if agentic.task_purpose.is_some_and(|purpose| purpose != task.purpose) {
+                        return Err("AgentTaskPacket purpose differs from its immutable Task".into());
+                    }
+                    agentic.task_purpose = Some(task.purpose);
+                }
+            }
         }
         Ok(packet)
     }
@@ -2697,6 +2717,7 @@ mod tests {
                     team_id: team.clone(),
                     task_team_id: team.clone(),
                     source_spec_revision: 1,
+                    task_purpose: None,
                     focus: AgenticExecutionFocus::TaskExecute {
                         task_ref: work.clone(),
                     },
@@ -2817,6 +2838,12 @@ mod tests {
                     configured_registry(),
                 ));
                 runtime.bind_services(services.clone());
+                let normalized = runtime.ensure_runtime_binding(packet.clone()).unwrap();
+                assert_eq!(normalized.agentic_binding.as_ref().unwrap().task_purpose,
+                    Some(harness_contract::agent_action::TaskPurpose::Delivery));
+                let mut tampered = packet.clone();
+                tampered.agentic_binding.as_mut().unwrap().task_purpose = Some(harness_contract::agent_action::TaskPurpose::Exploration);
+                assert!(runtime.ensure_runtime_binding(tampered).unwrap_err().contains("purpose differs"));
                 runtime.register_backend(Arc::new(ClaimLifetimeBackend {
                     kind,
                     services: services.clone(),

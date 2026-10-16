@@ -198,6 +198,13 @@ fn delegated_inspection_and_action_receipts_keep_root_closure_as_background() {
             observation.actionable,
             actionable_for_actor(&program, &request.actor, false)
         );
+        if mode == AgentAttemptMode::Execute {
+            program.tasks.get_mut(&task_ref).unwrap().purpose = harness_contract::agent_action::TaskPurpose::Exploration;
+            let exploration = inspected_observation(&request, &program, None);
+            assert!(exploration.actionable.iter().any(|hint| hint.contains(super::super::order_contract::EXPLORATION_CLOSEOUT_CONTRACT)));
+            assert!(!exploration.actionable.iter().any(|hint| hint.contains("Prefer one `task_submit`")));
+            program.tasks.get_mut(&task_ref).unwrap().purpose = harness_contract::agent_action::TaskPurpose::Delivery;
+        }
         assert!(!observation
             .actionable
             .iter()

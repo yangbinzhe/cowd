@@ -2525,8 +2525,9 @@ fn inspected_observation(
         let inspection_scope = envelope
             .actor
             .execution_id
-            .clone()
-            .unwrap_or_else(|| envelope.actor.turn_id.clone());
+            .as_deref()
+            .map_or_else(|| crate::repetition_guard::RepetitionScope::turn(&envelope.actor.session_id, &envelope.actor.turn_id),
+                |execution_id| crate::repetition_guard::RepetitionScope::execution(&envelope.actor.session_id, execution_id));
         if crate::repetition_guard::record_unchanged_inspection(
             &inspection_scope,
             &input_hash,
@@ -2959,6 +2960,11 @@ fn actionable_for_actor(
     if let Some((task, attempt)) = bound_attempt {
         use harness_contract::agent_action::AgentAttemptMode;
         actions.push(match attempt.mode {
+            AgentAttemptMode::Execute if task.purpose == harness_contract::agent_action::TaskPurpose::Exploration => format!(
+                "Complete only your bound Task `{}`. {}",
+                task.task_id,
+                super::order_contract::EXPLORATION_CLOSEOUT_CONTRACT,
+            ),
             AgentAttemptMode::Execute => format!(
                 "Complete only your bound Task `{}`. Prefer one `task_submit` with `deliverable` selecting this response's report or the latest saved report from this same Task, Agent, claim and attempt. Use `artifact_commit` only for file-backed or multi-part deliverables. Include real durable evidence and disclose genuine gaps in `unresolved`.",
                 task.task_id,

@@ -1835,6 +1835,7 @@ impl RuntimeServices {
                     team_id: member_team_id.to_string(),
                     task_team_id: task.team_id.clone(),
                     source_spec_revision: projection.revision,
+                    task_purpose: (!matches!(mode, DispatchMode::Coordination(_))).then_some(task.purpose),
                     focus: match mode {
                         DispatchMode::Execute => AgenticExecutionFocus::TaskExecute {
                             task_ref: task.task_id.clone(),

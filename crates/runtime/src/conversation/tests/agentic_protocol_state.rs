@@ -171,6 +171,13 @@ fn protocol_fixture() -> AgenticProtocolFixture {
 }
 
 fn protocol_fixture_for_root(root: AgentActorBinding) -> AgenticProtocolFixture {
+    protocol_fixture_for_purpose(root, harness_contract::agent_action::TaskPurpose::Delivery)
+}
+
+fn protocol_fixture_for_purpose(
+    root: AgentActorBinding,
+    purpose: harness_contract::agent_action::TaskPurpose,
+) -> AgenticProtocolFixture {
     let services = crate::RuntimeServices::in_memory().expect("Runtime services");
     let envelope = |action_id: &str, action: AgentAction| AgentActionEnvelope {
         action_id: action_id.to_string(),
@@ -238,7 +245,7 @@ fn protocol_fixture_for_root(root: AgentActorBinding) -> AgenticProtocolFixture 
                 depends_on: Vec::new(),
 
                 obligation_refs: Vec::new(),
-                purpose: Default::default(),
+                purpose,
                 execution_requirements: Vec::new(),
                 expertise_hints: Vec::new(),
             }),
@@ -261,6 +268,22 @@ fn register_protocol_graph(
     parent_graph_id: &str,
     conversation_graph_id: &str,
     attempt: u32,
+) -> NodeExecutionTicket {
+    let purpose = fixture.services.agent_action_service().project(&fixture.root.program_id)
+        .unwrap().tasks[&fixture.task_ref].purpose;
+    register_protocol_graph_with_purpose(
+        fixture, mode, agent_ref, parent_graph_id, conversation_graph_id, attempt, Some(purpose),
+    )
+}
+
+fn register_protocol_graph_with_purpose(
+    fixture: &AgenticProtocolFixture,
+    mode: &str,
+    agent_ref: &str,
+    parent_graph_id: &str,
+    conversation_graph_id: &str,
+    attempt: u32,
+    purpose: Option<harness_contract::agent_action::TaskPurpose>,
 ) -> NodeExecutionTicket {
     let lineage = ExecutionGraphLineage {
         session_id: fixture.root.session_id.clone(),
@@ -299,9 +322,11 @@ fn register_protocol_graph(
             harness_contract::agent_action::TASK_SUBMIT_TOOL_ID.to_string(),
             harness_contract::agent_action::TASK_REVIEW_TOOL_ID.to_string(),
             "evidence_retrieve".to_string(),
-        ],
+            "read_file".to_string(),
+        ].into_iter().chain((fixture.root.permission_ceiling == Some(PermissionMode::WorkspaceWrite))
+            .then(|| "edit".to_string())).collect(),
         allowed_skills: Vec::new(),
-        permission_ceiling: PermissionMode::ReadOnly,
+        permission_ceiling: fixture.root.permission_ceiling.unwrap_or(PermissionMode::ReadOnly),
         model_lease: "test-model".to_string(),
         budget_lease: ChildExecutionBudgetReservation::single(
             format!("budget:{parent_graph_id}"),
@@ -322,6 +347,7 @@ fn register_protocol_graph(
             team_id: fixture.team_ref.clone(),
             task_team_id: fixture.team_ref.clone(),
             source_spec_revision: 1,
+            task_purpose: purpose,
             focus: match mode {
                 "execute" => AgenticExecutionFocus::TaskExecute {
                     task_ref: fixture.task_ref.clone(),
@@ -431,6 +457,242 @@ async fn delegated_content_uses_parent_agent_task_session_visibility() {
         )
         .await
         .expect("same-Session reviewer can read committed content");
+}
+
+#[test]
+fn worker_purpose_is_bound_to_the_real_task_for_new_and_legacy_packets() {
+    use harness_contract::agent_action::TaskPurpose;
+    for purpose in [TaskPurpose::Delivery, TaskPurpose::Exploration] {
+        let fixture = protocol_fixture_for_purpose(protocol_fixture().root, purpose);
+        for (suffix, carried, valid) in [
+            ("typed", Some(purpose), true),
+            ("legacy", None, true),
+            ("tampered", Some(if purpose == TaskPurpose::Delivery {
+                TaskPurpose::Exploration
+            } else {
+                TaskPurpose::Delivery
+            }), false),
+        ] {
+            let ticket = register_protocol_graph_with_purpose(
+                &fixture, "execute", &fixture.author_ref, &format!("purpose-parent-{suffix}"),
+                &format!("purpose-conversation-{suffix}"), 1, carried,
+            );
+            let loaded = delegated_agentic_protocol_state(fixture.services.as_ref(), &ticket);
+            if valid {
+                let state = loaded.unwrap().unwrap();
+                assert_eq!(state.purpose, purpose);
+                assert_eq!(state.continuation_instruction().contains("typed purpose=exploration"),
+                    purpose == TaskPurpose::Exploration);
+                assert!(!state.closure_tool_ids().contains("task_withdraw"),
+                    "a typed purpose is not an additional tool grant");
+            } else {
+                assert!(loaded.unwrap_err().to_string().contains("purpose"));
+            }
+        }
+    }
+}
+
+#[test]
+fn worker_closeout_intersects_the_packet_grant_and_preserves_honest_retirement() {
+    use harness_contract::agent_action::TaskPurpose;
+    let fixture = protocol_fixture_for_purpose(protocol_fixture().root, TaskPurpose::Exploration);
+    let ticket = register_protocol_graph(&fixture, "execute", &fixture.author_ref,
+        "ceiling-parent", "ceiling-conversation", 1);
+    let mut state = delegated_agentic_protocol_state(fixture.services.as_ref(), &ticket).unwrap().unwrap();
+    state.status = crate::AgenticTaskStatus::Claimed;
+    state.owns_active_attempt = true;
+    state.tool_ceiling = ["task_withdraw", "objective_review", "read_file", "write_file", "task_publish"]
+        .into_iter().map(str::to_string).collect();
+    assert_eq!(state.closure_tool_ids(), ["task_withdraw", "objective_review", "read_file"]
+        .into_iter().map(str::to_string).collect());
+    assert_eq!(state.terminal_action_ids().collect::<Vec<_>>(), vec!["task_withdraw"]);
+    assert!(!state.is_terminal());
+    state.status = crate::AgenticTaskStatus::CancelRequested;
+    assert!(state.is_terminal());
+    assert_ne!(state.status, crate::AgenticTaskStatus::Accepted);
+    state.status = crate::AgenticTaskStatus::Withdrawn;
+    assert!(state.is_terminal());
+    state.tool_ceiling.clear();
+    assert!(state.closure_tool_ids().is_empty());
+    assert_eq!(state.terminal_action_ids().count(), 0);
+}
+
+#[tokio::test]
+async fn worker_normal_text_submits_through_the_real_bridge_without_a_file_or_commit_call() {
+    let fixture = protocol_fixture();
+    let parent_id = "worker-text-parent";
+    let ticket = register_protocol_graph(&fixture, "execute", &fixture.author_ref,
+        parent_id, "worker-text-conversation", 1);
+    let claimed = fixture.services.agent_action_service().apply(&fixture.agent_envelope(
+        "worker-text-claim", &fixture.author_ref, parent_id,
+        AgentAction::TaskClaim(TaskClaimInput { task_ref: fixture.task_ref.clone(), reason: None }),
+    )).unwrap();
+    assert_eq!(claimed.status, AgentActionStatus::Applied);
+    let report = "This ordinary response is the claimant's durable deliverable.";
+    let mut calls = vec![ModelToolCall {
+        binding: None,
+        id: "worker-text-submit".into(),
+        name: "task_submit".into(),
+        input: serde_json::json!({
+            "task_ref": fixture.task_ref, "artifact_refs": [], "evidence_refs": [],
+            "unresolved": [], "deliverable": {"block_index":0,"kind":"report","title":"Plain response"}
+        }).to_string(),
+        depends_on: vec![],
+    }];
+    super::host_backend::resolve_explicit_agentic_content_refs(
+        fixture.services.as_ref(), &ticket,
+        &ConversationMessage::assistant(vec![ContentBlock::Text { text: report.into() }]),
+        &mut calls,
+    ).await.unwrap();
+    let submit = fixture.agent_envelope("worker-text-submit", &fixture.author_ref, parent_id,
+        AgentAction::TaskSubmit(serde_json::from_str(&calls[0].input).unwrap()));
+    let submitted = fixture.services.submit_agent_action(&submit).await.unwrap();
+    assert_eq!(submitted.status, AgentActionStatus::Applied, "{submitted:?}");
+    let program = fixture.services.agent_action_service().project(&fixture.root.program_id).unwrap();
+    let task = &program.tasks[&fixture.task_ref];
+    assert_eq!(task.status, crate::AgenticTaskStatus::Submitted);
+    assert_eq!(task.artifact_refs.len(), 1);
+    assert_eq!(program.artifacts.len(), 1);
+    assert!(program.objective_verdict.is_none());
+    let artifact = &program.artifacts[&task.artifact_refs[0]];
+    let content = fixture.services.artifact_store().resolve(&artifact.content_ref).unwrap();
+    let bytes = fixture.services.artifact_store().read(&content,
+        &format!("session:{}", fixture.root.session_id), None).await.unwrap();
+    assert_eq!(bytes, report.as_bytes());
+    let replayed = fixture.services.submit_agent_action(&submit).await.unwrap();
+    assert!(replayed.duplicate);
+    assert_eq!(replayed.receipt_id, submitted.receipt_id);
+    assert_eq!(replayed.changed_refs, submitted.changed_refs);
+    assert_eq!(replayed.revision, submitted.revision);
+    assert_eq!(fixture.services.agent_action_service().project(&fixture.root.program_id).unwrap().artifacts.len(), 1);
+    let unobserved_review = fixture.agent_envelope("worker-text-unread-review", &fixture.reviewer_ref,
+        "worker-text-review-parent", AgentAction::TaskReview(TaskReviewInput {
+            task_ref: fixture.task_ref.clone(), decision: TaskReviewDecision::Accept,
+            evidence_refs: vec![artifact.content_ref.clone()],
+            reason: "claiming acceptance without an independent physical read".into(),
+            operator_requirement: None,
+        }));
+    assert!(fixture.services.submit_agent_action(&unobserved_review).await.is_err());
+    assert_eq!(fixture.services.agent_action_service().project(&fixture.root.program_id).unwrap().tasks[&fixture.task_ref].status,
+        crate::AgenticTaskStatus::Submitted);
+}
+
+#[tokio::test]
+async fn worker_submit_withdraw_race_keeps_one_revision_fenced_disposition_and_no_false_acceptance() {
+    let fixture = protocol_fixture();
+    let parent_id = "worker-disposition-parent";
+    register_protocol_graph(&fixture, "execute", &fixture.author_ref,
+        parent_id, "worker-disposition-conversation", 1);
+    let claimed = fixture.services.agent_action_service().apply(&fixture.agent_envelope(
+        "worker-disposition-claim", &fixture.author_ref, parent_id,
+        AgentAction::TaskClaim(TaskClaimInput { task_ref: fixture.task_ref.clone(), reason: None }),
+    )).unwrap();
+    assert_eq!(claimed.status, AgentActionStatus::Applied);
+    let content = fixture.services.artifact_store().write_bytes(ArtifactWriteDescriptor {
+        media_type: "text/plain".into(), visibility_scope: format!("session:{}", fixture.root.session_id),
+        expected_bytes: None, original_name: None,
+    }, b"Retained disposition evidence").await.unwrap();
+    let before = fixture.services.agent_action_service().project(&fixture.root.program_id).unwrap();
+    let mut submit = fixture.agent_envelope("worker-racing-submit", &fixture.author_ref, parent_id,
+        AgentAction::TaskSubmit(TaskSubmitInput {
+            task_ref: fixture.task_ref.clone(), artifact_refs: vec![], evidence_refs: vec![], unresolved: vec![],
+            deliverable: Some(harness_contract::agent_action::TaskOneShotDeliverable {
+                block_index: 0, kind: "report".into(), title: "Disposition body".into(),
+                resolved_content_ref: Some(content.selector.clone()),
+            }),
+        }));
+    submit.expected_revision = Some(before.revision);
+    let mut withdraw = fixture.agent_envelope("worker-racing-withdraw", &fixture.author_ref, parent_id,
+        AgentAction::TaskWithdraw(harness_contract::agent_action::TaskWithdrawInput {
+            task_ref: fixture.task_ref.clone(), reason_ref: content.selector.clone(),
+            evidence_refs: vec![content.selector.clone()],
+        }));
+    withdraw.expected_revision = Some(before.revision);
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let spawn_action = |envelope: AgentActionEnvelope| {
+        let services = Arc::clone(&fixture.services);
+        let barrier = Arc::clone(&barrier);
+        tokio::spawn(async move {
+            barrier.wait().await;
+            services.submit_agent_action(&envelope).await
+        })
+    };
+    let submitted = spawn_action(submit.clone());
+    let withdrawn = spawn_action(withdraw);
+    let results = [submitted.await.unwrap(), withdrawn.await.unwrap()];
+    assert_eq!(results.iter().filter(|result|
+        result.as_ref().is_ok_and(|receipt| receipt.status == AgentActionStatus::Applied)).count(), 1,
+        "{results:?}");
+    let after = fixture.services.agent_action_service().project(&fixture.root.program_id).unwrap();
+    let task = &after.tasks[&fixture.task_ref];
+    assert!(matches!(task.status, crate::AgenticTaskStatus::Submitted | crate::AgenticTaskStatus::Withdrawn));
+    assert_ne!(task.status, crate::AgenticTaskStatus::Accepted);
+    assert!(after.objective_verdict.is_none());
+    assert_eq!(after.artifacts.len(), usize::from(task.status == crate::AgenticTaskStatus::Submitted));
+    submit.action_id = "worker-late-second-submit".into();
+    submit.expected_revision = None;
+    let late = fixture.services.submit_agent_action(&submit).await.unwrap();
+    assert_eq!(late.status, AgentActionStatus::Rejected);
+    assert_eq!(fixture.services.agent_action_service().project(&fixture.root.program_id).unwrap().artifacts.len(), after.artifacts.len());
+}
+
+#[tokio::test]
+async fn worker_reconstructed_runtime_recovers_saved_draft_action_receipt_and_retired_protocol() {
+    let fixture = protocol_fixture();
+    let parent_id = "worker-recovered-parent";
+    let ticket = register_protocol_graph(&fixture, "execute", &fixture.author_ref,
+        parent_id, "worker-recovered-conversation", 1);
+    let claim = fixture.agent_envelope("worker-recovered-claim", &fixture.author_ref, parent_id,
+        AgentAction::TaskClaim(TaskClaimInput { task_ref: fixture.task_ref.clone(), reason: None }));
+    assert_eq!(fixture.services.agent_action_service().apply(&claim).unwrap().status, AgentActionStatus::Applied);
+    let draft = persist_agentic_content_draft(fixture.services.as_ref(), &ticket,
+        &ConversationMessage::assistant(vec![ContentBlock::Text { text: "Saved response before Runtime reconstruction".into() }]))
+        .await.unwrap().unwrap();
+    let reconstruct = || crate::RuntimeServices::test_builder(
+        fixture.services.workspace_root().join("reconstructed-runtime-home"), fixture.services.workspace_root())
+        .runtime_event_store(Arc::clone(fixture.services.event_store()))
+        .artifact_store(Arc::clone(fixture.services.artifact_store()))
+        .build().unwrap();
+    let recovered = reconstruct();
+    assert!(delegated_agentic_protocol_state(recovered.as_ref(), &ticket).unwrap().unwrap().owns_active_attempt);
+    let mut calls = vec![ModelToolCall {
+        binding: None, id: "worker-recovered-submit".into(), name: "task_submit".into(),
+        input: serde_json::json!({"task_ref":fixture.task_ref,"artifact_refs":[],"evidence_refs":[],"unresolved":[],
+            "deliverable":{"block_index":0,"kind":"report","title":"Recovered response"}}).to_string(),
+        depends_on: vec![],
+    }];
+    super::host_backend::resolve_explicit_agentic_content_refs(recovered.as_ref(), &ticket,
+        &ConversationMessage::assistant(vec![]), &mut calls).await.unwrap();
+    let input: TaskSubmitInput = serde_json::from_str(&calls[0].input).unwrap();
+    let resolved = input.deliverable.as_ref().unwrap().resolved_content_ref.as_ref().unwrap();
+    let source = recovered.artifact_store().resolve(&draft).unwrap();
+    let selected = recovered.artifact_store().resolve(resolved).unwrap();
+    assert_eq!(source.sha256, selected.sha256);
+    assert_eq!(source.bytes, selected.bytes);
+    let scope = format!("session:{}", fixture.root.session_id);
+    assert_eq!(recovered.artifact_store().read(&selected, &scope, None).await.unwrap(),
+        recovered.artifact_store().read(&source, &scope, None).await.unwrap());
+    let submit = fixture.agent_envelope("worker-recovered-submit", &fixture.author_ref, parent_id,
+        AgentAction::TaskSubmit(input));
+    let receipt = recovered.submit_agent_action(&submit).await.unwrap();
+    assert_eq!(receipt.status, AgentActionStatus::Applied);
+    let after_action = reconstruct();
+    let replay = after_action.submit_agent_action(&submit).await.unwrap();
+    assert!(replay.duplicate);
+    assert_eq!(replay.receipt_id, receipt.receipt_id);
+    let withdrawn = fixture.agent_envelope("worker-recovered-retirement", &fixture.author_ref, parent_id,
+        AgentAction::TaskWithdraw(harness_contract::agent_action::TaskWithdrawInput {
+            task_ref: fixture.task_ref.clone(), reason_ref: draft.clone(), evidence_refs: vec![draft],
+        }));
+    assert_eq!(after_action.submit_agent_action(&withdrawn).await.unwrap().status, AgentActionStatus::Applied);
+    let after_retirement = reconstruct();
+    let protocol = delegated_agentic_protocol_state(after_retirement.as_ref(), &ticket).unwrap().unwrap();
+    assert_eq!(protocol.status, crate::AgenticTaskStatus::Withdrawn);
+    assert!(protocol.is_terminal());
+    assert!(!protocol.owns_active_attempt);
+    let program = after_retirement.agent_action_service().project(&fixture.root.program_id).unwrap();
+    assert_eq!(program.artifacts.len(), 1);
+    assert!(program.objective_verdict.is_none());
 }
 
 async fn commit_protocol_artifact(
@@ -680,6 +942,8 @@ fn delegated_protocol_terminal_classification_is_mode_and_fence_aware() {
         program_id: "program".to_string(),
         task_id: "task".to_string(),
         mode: mode.to_string(),
+        purpose: harness_contract::agent_action::TaskPurpose::Delivery,
+        tool_ceiling: super::host_backend::test_protocol_tool_ceiling(),
         status,
         artifact_refs: Vec::new(),
         artifact_evidence_refs: Vec::new(),
@@ -705,6 +969,8 @@ fn rework_reason_is_surfaced_to_the_worker() {
         program_id: "program".to_string(),
         task_id: "task".to_string(),
         mode: "execute".to_string(),
+        purpose: harness_contract::agent_action::TaskPurpose::Delivery,
+        tool_ceiling: super::host_backend::test_protocol_tool_ceiling(),
         status: crate::AgenticTaskStatus::Rework,
         artifact_refs: Vec::new(),
         artifact_evidence_refs: Vec::new(),
@@ -725,6 +991,8 @@ fn saturated_delegated_work_commits_its_next_action_without_text_only_detour() {
         program_id: "program".to_string(),
         task_id: "task".to_string(),
         mode: mode.to_string(),
+        purpose: harness_contract::agent_action::TaskPurpose::Delivery,
+        tool_ceiling: super::host_backend::test_protocol_tool_ceiling(),
         status,
         artifact_refs: vec!["artifact:one".to_string()],
         artifact_evidence_refs: vec!["artifact://content".to_string()],
@@ -736,15 +1004,18 @@ fn saturated_delegated_work_commits_its_next_action_without_text_only_detour() {
         Some(&pending_review),
         true,
         true,
+        false,
     ));
     assert!(!pending_delegated_action_is_ready(
         Some(&pending_review),
         false,
         true,
+        false,
     ));
     assert!(!pending_delegated_action_is_ready(
         Some(&pending_review),
         true,
+        false,
         false,
     ));
 
@@ -753,14 +1024,17 @@ fn saturated_delegated_work_commits_its_next_action_without_text_only_detour() {
         Some(&accepted_review),
         true,
         true,
+        false,
     ));
     let executing = state("execute", crate::AgenticTaskStatus::Claimed, true);
     assert!(pending_delegated_action_is_ready(
         Some(&executing),
         true,
         true,
+        false,
     ));
-    assert!(!pending_delegated_action_is_ready(None, true, true));
+    assert!(!pending_delegated_action_is_ready(Some(&executing), true, true, true));
+    assert!(!pending_delegated_action_is_ready(None, true, true, false));
 }
 
 #[test]
@@ -769,6 +1043,8 @@ fn active_delegated_protocol_exposes_its_closure_action_and_the_reads_it_needs()
         program_id: "program".to_string(),
         task_id: "task".to_string(),
         mode: mode.to_string(),
+        purpose: harness_contract::agent_action::TaskPurpose::Delivery,
+        tool_ceiling: super::host_backend::test_protocol_tool_ceiling(),
         status: crate::AgenticTaskStatus::Claimed,
         artifact_refs,
         artifact_evidence_refs: Vec::new(),
@@ -1080,6 +1356,175 @@ struct TopicSafePointClient {
     services: Arc<crate::RuntimeServices>,
     publication: AgentActionEnvelope,
     fail_first: bool,
+}
+
+#[derive(Clone)]
+struct WorkerClosureSurfaceClient {
+    requests: Arc<Mutex<Vec<(ApiRequest, harness_contract::tool::ToolExposureProjection)>>>,
+    exposure: Option<harness_contract::tool::ToolExposureProjection>,
+    required_write: bool,
+}
+
+impl ApiClient for WorkerClosureSurfaceClient {
+    fn configure_tool_exposure(&mut self, projection: harness_contract::tool::ToolExposureProjection) {
+        self.exposure = Some(projection);
+    }
+
+    fn stream(&mut self, request: ApiRequest)
+        -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+        let mut captured = self.requests.lock().unwrap();
+        captured.push((request, self.exposure.clone().unwrap()));
+        let closure_exposed = captured.last().unwrap().1.reason.starts_with("governed focus checkpoint");
+        if !closure_exposed && captured.len() < if self.required_write { 5 } else { 8 } {
+            Box::pin(stream::iter(vec![
+                Ok(AssistantEvent::TextDelta("The ordinary response is ready for durable submission.".into())),
+                Ok(AssistantEvent::ToolUse { id: format!("worker-surface-read-{}", captured.len()),
+                    name: "read_file".into(), input: r#"{"path":"same-source.txt"}"#.into() }),
+                Ok(AssistantEvent::MessageStop),
+            ]))
+        } else {
+            Box::pin(stream::iter(vec![Err(RuntimeError::new("HTTP 402 Payment Required: deterministic closure surface probe complete"))]))
+        }
+    }
+}
+
+struct WorkerClosureSurfaceTools {
+    required_write: bool,
+}
+
+#[async_trait::async_trait]
+impl ToolExecutor for WorkerClosureSurfaceTools {
+    async fn execute_authorized_output(&self, _authorization: &harness_contract::tool::ToolExecutionAuthorization,
+        name: &str, input: &str) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+        self.execute_output(name, input).await
+    }
+
+    async fn execute_output(&self, name: &str, input: &str)
+        -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+        TopicSafePointReader.execute_output(name, input).await
+    }
+
+    fn available_tool_names(&self) -> Vec<String> {
+        ["task_submit", "artifact_commit", "task_review", "evidence_retrieve", "read_file"]
+            .into_iter().map(str::to_string).chain(self.required_write.then(|| "edit".to_string())).collect()
+    }
+
+    fn registered_tool_effect(&self, name: &str, input: &serde_json::Value)
+        -> Option<harness_contract::tool::ToolEffectDescriptor> {
+        RootPresentationRecoveryReader.registered_tool_effect(name, input)
+    }
+}
+
+#[tokio::test]
+async fn worker_real_host_closure_request_keeps_text_submission_with_no_existing_artifact() {
+    exercise_worker_closure_surface(false).await;
+}
+
+#[tokio::test]
+async fn worker_real_host_keeps_required_file_write_tools_after_read_saturation() {
+    exercise_worker_closure_surface(true).await;
+}
+
+async fn exercise_worker_closure_surface(required_write: bool) {
+    let mut root = protocol_fixture().root;
+    if required_write {
+        root.permission_ceiling = Some(PermissionMode::WorkspaceWrite);
+        root.resource_scopes.push("workspace:.".into());
+    }
+    let mut fixture = protocol_fixture_for_root(root);
+    if required_write {
+        fixture.author_ref = applied_ref(fixture.services.as_ref(), &fixture.envelope("worker-file-author",
+            AgentAction::AgentInvite(serde_json::from_value(serde_json::json!({
+                "team_ref":fixture.team_ref,"role":"File author","mission":"create the required file",
+                "required_capabilities":["read","write"]
+            })).unwrap())));
+        fixture.task_ref = applied_ref(fixture.services.as_ref(), &fixture.envelope("worker-file-task",
+            AgentAction::TaskPublish(serde_json::from_value(serde_json::json!({
+                "team_ref":fixture.team_ref,"title":"Create required-report.txt",
+                "objective":"Create required-report.txt with the required file contents",
+                "acceptance":"The required file actually exists with the correct contents", "purpose":"delivery"
+            })).unwrap())));
+    }
+    let parent_id = "worker-surface-parent";
+    register_protocol_graph(&fixture, "execute", &fixture.author_ref,
+        parent_id, "worker-surface-unused", 1);
+    let claimed = fixture.services.agent_action_service().apply(&fixture.agent_envelope(
+        "worker-surface-claim", &fixture.author_ref, parent_id,
+        AgentAction::TaskClaim(TaskClaimInput { task_ref: fixture.task_ref.clone(), reason: None }),
+    )).unwrap();
+    assert_eq!(claimed.status, AgentActionStatus::Applied);
+    let services = Arc::clone(&fixture.services);
+    services.publish_session_execution_policy(&fixture.root.session_id,
+        crate::permissions::SessionExecutionPolicyControl::from_policy(
+            harness_contract::policy::SessionExecutionPolicy::from_profile(
+                harness_contract::policy::AutonomyProfileId::Supervised, 1,
+                harness_contract::policy::SessionExecutionPolicyOrigin::SessionExplicit)));
+    let content = if required_write { "Create required-report.txt with the required file contents" }
+        else { "Return the assigned ordinary response" };
+    let permission = fixture.root.permission_ceiling.unwrap();
+    let spec = services.task_runtime_port().bind_task_spec(&fixture.root.session_id,
+        Some(permission), harness_contract::task::TaskSpec::new(content))
+        .unwrap();
+    services.task_runtime_port().create(harness_contract::task::TaskCreateCommand {
+        task_id: fixture.task_ref.clone(), mission_id: services.mission_runtime().default_mission_id().into(),
+        kind: harness_contract::task::TaskKind::Root, origin: harness_contract::task::TaskOrigin::User,
+        origin_session_id: fixture.root.session_id.clone(), origin_turn_id: fixture.root.turn_id.clone(),
+        root_task_id: fixture.task_ref.clone(), parent_task_id: None, predecessor_task_id: None,
+        mission_assignment: harness_contract::task::TaskMissionAssignment::Default,
+        mission_assigned_by: "worker-surface-probe".into(), spec, evidence_refs: vec![],
+    }).unwrap();
+    let captured = Arc::new(Mutex::new(vec![]));
+    let mut session = Session::new();
+    session.session_id = fixture.root.session_id.clone();
+    let session_store = Arc::new(crate::test_support::session_store());
+    session_store.create_session(&session::SessionRecord {
+        session_id: session.session_id.clone(), platform: "test".into(), chat_id: "worker-surface".into(),
+        user_id: None, model: None, created_at: "2026-10-16T00:00:00Z".into(),
+        last_activity: "2026-10-16T00:00:00Z".into(), message_count: 0,
+        reset_policy: "manual".into(), metadata_json: None, input_tokens: 0, output_tokens: 0,
+        status: "active".into(),
+    }).await.unwrap();
+    let mut runtime = crate::ConversationRuntime::new(session,
+        WorkerClosureSurfaceClient { requests: Arc::clone(&captured), exposure: None, required_write },
+        WorkerClosureSurfaceTools { required_write }, PermissionPolicy::new(permission),
+        canonical_host_system_prompt(vec![])).without_memory()
+        .with_session_journal_port(crate::session_runtime_port::TestSessionPortAdapter::new(session_store))
+        .with_artifact_store(Arc::clone(services.artifact_store()));
+    runtime.set_active_model("test-model");
+    runtime.set_context_profile(ContextProfile::SubAgent);
+    if required_write {
+        runtime.set_delegated_focus_policy(7500, vec!["write:required-report.txt".into()], vec![]);
+    }
+    let parent = services.graph_state_store().load(parent_id).unwrap();
+    let (_, result) = submit_owned_conversation_turn_with_ingress(runtime, Arc::clone(&services),
+        content, &SharedPrompter::none(), None,
+        Some(ExecutionParentBinding { execution_id: parent_id.into(), node_id: parent.nodes[0].id.clone() }),
+        parent.lineage.clone(), TurnExecutionRole::DelegatedLeaf, 0, false).await.unwrap();
+    let requests = captured.lock().unwrap();
+    assert!(requests.len() >= 2 && requests.len() <= 10, "request count={}: {result:?}", requests.len());
+    if required_write {
+        assert!(requests.len() >= 3);
+        assert!(requests.iter().all(|(_, exposure)| exposure.active_ids.iter()
+            .chain(&exposure.bootstrap_ids).any(|tool| tool == "edit")),
+            "the actual required file is still unwritten, so authorized edit cannot be hidden: {:?}",
+            requests.iter().map(|(_, exposure)| exposure).collect::<Vec<_>>());
+        assert!(!services.workspace_root().join("required-report.txt").exists());
+        assert!(services.agent_action_service().project(&fixture.root.program_id).unwrap().objective_verdict.is_none());
+        return;
+    }
+    let (request, exposure) = requests.iter().find(|(_, exposure)|
+        exposure.reason.starts_with("governed focus checkpoint"))
+        .unwrap_or_else(|| panic!("real Host never reached its closeout overlay: {:?}; result={result:?}",
+            requests.iter().map(|(_, exposure)| exposure).collect::<Vec<_>>()));
+    assert!(exposure.active_ids.iter().any(|tool| tool == "task_submit"), "{exposure:?}");
+    assert!(exposure.active_ids.iter().any(|tool| tool == "artifact_commit"));
+    assert!(!exposure.active_ids.iter().any(|tool| tool == "task_review"));
+    assert!(!exposure.active_ids.iter().any(|tool| tool == "artifact_publish"));
+    assert!(format!("{:?}", request.prompt.contextual_packets).contains("task_submit.deliverable"));
+    let program = services.agent_action_service().project(&fixture.root.program_id).unwrap();
+    assert!(program.artifacts.is_empty());
+    assert_eq!(program.tasks[&fixture.task_ref].status, crate::AgenticTaskStatus::Claimed);
+    assert!(program.objective_verdict.is_none());
 }
 impl ApiClient for TopicSafePointClient {
     fn stream(
@@ -1501,6 +1946,8 @@ fn execution_continuation_and_commit_refusal_share_the_saved_report_contract() {
         program_id: "program:delivery".into(),
         task_id: "task:delivery".into(),
         mode: "execute".into(),
+        purpose: harness_contract::agent_action::TaskPurpose::Delivery,
+        tool_ceiling: super::host_backend::test_protocol_tool_ceiling(),
         status: crate::AgenticTaskStatus::Claimed,
         artifact_refs: Vec::new(),
         artifact_evidence_refs: Vec::new(),
@@ -1663,7 +2110,8 @@ impl ApiClient for RootPresentationRecoveryClient {
                     }),
                 },
             );
-            crate::repetition_guard::mark_refusal_ignored(&lineage.turn_id);
+            crate::repetition_guard::mark_refusal_ignored(&crate::repetition_guard::RepetitionScope::turn(
+                &lineage.session_id, &lineage.turn_id));
             return Box::pin(stream::iter(vec![
                 Ok(AssistantEvent::TextDelta("{".into())),
                 Ok(AssistantEvent::MessageStop),

@@ -107,7 +107,7 @@ fn next_consecutive_tool_failure_batches(
 /// and the guard refused it again.
 ///
 /// The predicate is the guard's own, so it cannot disagree with the dispatch decision.
-fn executed_failures(failed: usize, calls: &[ModelToolCall], turn_id: &str) -> usize {
+fn executed_failures(failed: usize, calls: &[ModelToolCall], turn_id: &crate::repetition_guard::RepetitionScope) -> usize {
     failed.saturating_sub(
         calls
             .iter()
@@ -137,7 +137,7 @@ fn executed_failures(failed: usize, calls: &[ModelToolCall], turn_id: &str) -> u
 fn protocol_closure_can_be_required(
     protocol: Option<&host_backend::DelegatedAgenticProtocolState>,
     intervention: Option<&RuntimeIntervention>,
-    turn_id: &str,
+    turn_id: &crate::repetition_guard::RepetitionScope,
 ) -> bool {
     let Some(protocol) = protocol.filter(|protocol| !protocol.is_terminal()) else {
         return false;
@@ -147,9 +147,8 @@ fn protocol_closure_can_be_required(
         return false;
     }
     protocol
-        .closure_tool_ids()
-        .iter()
-        .all(|tool| !crate::repetition_guard::cause_blocked_for_tool(turn_id, tool))
+        .terminal_action_ids()
+        .any(|tool| !crate::repetition_guard::cause_blocked_for_tool(turn_id, tool))
 }
 
 fn cold_start_tool_failure_replan_available(
