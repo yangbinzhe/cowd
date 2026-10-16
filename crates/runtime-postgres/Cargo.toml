@@ -17,6 +17,8 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 async-trait = "0.1"
 harness-contract = { path = "../harness-contract" }
+session = { path = "../session" }
+session-postgres = { path = "../session-postgres" }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 

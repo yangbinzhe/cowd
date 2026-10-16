@@ -14,12 +14,18 @@ use harness_contract::{
         GoalScope, ObjectiveTerminalKind,
     },
     policy::PermissionMode,
+    turn::InputRoutingDecision,
 };
 use runtime::{
     RuntimeEventInput, RuntimeEventScope, RuntimeEventStore, RuntimeServices,
     RuntimeTransactionEventInput, SessionTerminalInput,
 };
 use runtime_postgres::PostgresRuntimeEventStore;
+use session::{
+    SessionMessage, SessionRecord, SessionRuntimeInputStatus, SessionRuntimeOutboxRequest,
+    SessionTerminalExecutionFence, SessionTerminalTranscriptCommit,
+};
+use session_postgres::PostgresSessionStore;
 
 #[path = "../../storage/test-support/postgres_scope.rs"]
 mod postgres_scope;
@@ -76,6 +82,63 @@ async fn real_blocked_a_survives_restart_and_b_binds_exact_source_before_outbox_
     let root_id = "root:pg-business-recovery";
     let session_id = "session:pg-business-recovery";
     let turn_id = "turn:pg-business-recovery";
+    let session_store = PostgresSessionStore::new(fixture.reconnect()).unwrap();
+    session_store
+        .create_session(&SessionRecord {
+            session_id: session_id.into(),
+            platform: "test".into(),
+            chat_id: "pg-business-recovery".into(),
+            user_id: Some("fixture-user".into()),
+            model: None,
+            created_at: "2026-10-16T00:00:00Z".into(),
+            last_activity: "2026-10-16T00:00:00Z".into(),
+            message_count: 0,
+            reset_policy: "manual".into(),
+            metadata_json: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            status: "active".into(),
+        })
+        .unwrap();
+    let ingress = SessionRuntimeOutboxRequest {
+        input_id: "input:pg-business".into(),
+        request_id: "request:pg-business".into(),
+        turn_id: turn_id.into(),
+        message_id: "ingress:pg-business".into(),
+        session_generation: 1,
+        decision: InputRoutingDecision::StartNewTurn,
+        target_turn_id: None,
+        classification_json: None,
+        task_route_hint: None,
+        created_at_ms: 100,
+        runtime_options_json: None,
+    };
+    session_store
+        .append_ingress_with_runtime_outbox(
+            session_id,
+            "user",
+            Some(r#"[{"type":"text","text":"complete only with independent review"}]"#),
+            100,
+            &ingress,
+        )
+        .unwrap();
+    let claimed = session_store
+        .claim_session_runtime_outbox("session-worker", 101, 10_000, 1)
+        .unwrap()
+        .remove(0);
+    let claim_token = claimed.claim_token.clone().unwrap();
+    let running = session_store
+        .mark_session_runtime_outbox_running(
+            &ingress.request_id,
+            "session-worker",
+            1,
+            &claim_token,
+            claimed.revision,
+            102,
+        )
+        .unwrap();
+    let claim_epoch = running.claim_fence_epoch.unwrap();
+    drop(session_store);
     let objective_id = root_objective_id(session_id, turn_id);
     let program_id = program_id_for_objective(&objective_id);
     let mut graph = ExecutionGraph::new("reconcile a blocked Objective after restart");
@@ -297,12 +360,12 @@ async fn real_blocked_a_survives_restart_and_b_binds_exact_source_before_outbox_
         session_id: session_id.into(),
         execution_id: Some(root_id.into()),
         turn_id: Some(turn_id.into()),
-        request_id: Some("request:pg-business".into()),
+        request_id: Some(ingress.request_id.clone()),
         session_generation: Some(1),
-        input_sequence: Some(1),
-        input_claim_owner: Some("claim:owner".into()),
-        input_claim_token: Some("claim:token".into()),
-        input_claim_revision: Some(1),
+        input_sequence: Some(running.sequence as u64),
+        input_claim_owner: Some("session-worker".into()),
+        input_claim_token: Some(claim_token.clone()),
+        input_claim_revision: Some(claim_epoch),
         controlled_recovery_claim_fingerprints: vec![],
         payload_ref: "artifact://terminal".into(),
     };
@@ -407,11 +470,66 @@ async fn real_blocked_a_survives_restart_and_b_binds_exact_source_before_outbox_
             .commit_cursor,
         a_cursor
     );
+    drop(second);
+    drop(events);
+
+    let session_store = PostgresSessionStore::new(fixture.reconnect()).unwrap();
+    let transcript = SessionTerminalTranscriptCommit {
+        terminal_message_id: terminal.message_id.clone(),
+        ingress_message_id: ingress.message_id,
+        session_id: session_id.into(),
+        turn_id: turn_id.into(),
+        messages: vec![SessionMessage {
+            stable_message_id: terminal.message_id.clone(),
+            session_id: session_id.into(),
+            sequence: 0,
+            role: "assistant".into(),
+            content_json:
+                r#"[{"type":"text","text":"The Goal is blocked: independent review is missing."}]"#
+                    .into(),
+            blocks_count: 1,
+            tool_use_id: None,
+            tool_name: None,
+            token_usage_json: None,
+            created_at_ms: 0,
+        }],
+        runtime_commit_cursor: receipt.transaction.commit_cursor,
+        consumed_input_sequence: running.sequence,
+        created_at_ms: 103,
+        fence: SessionTerminalExecutionFence {
+            request_id: terminal.request_id.clone().unwrap(),
+            input_sequence: running.sequence,
+            session_generation: 1,
+            claim_owner: "session-worker".into(),
+            claim_token,
+            claim_fence_epoch: claim_epoch,
+        },
+    };
+    let mut stale = transcript.clone();
+    stale.fence.claim_fence_epoch += 1;
+    assert!(matches!(
+        session_store.commit_terminal_transcript_if_fenced(&stale),
+        Err(session::SessionError::StaleExecutionFence(_))
+    ));
+    assert_eq!(session_store.get_message_count(session_id).unwrap(), 1);
+    let committed = session_store
+        .commit_terminal_transcript_if_fenced(&transcript)
+        .unwrap();
+    assert!(committed.inserted);
+    assert_eq!(committed.input.status, SessionRuntimeInputStatus::Completed);
+    assert_eq!(session_store.get_message_count(session_id).unwrap(), 2);
+    let duplicate = session_store
+        .commit_terminal_transcript_if_fenced(&transcript)
+        .unwrap();
+    assert!(!duplicate.inserted);
+    assert_eq!(session_store.get_message_count(session_id).unwrap(), 2);
+    drop(session_store);
+
+    let events = connect(&fixture);
     let first_claim = events
         .claim_session_terminals("lost-worker", 100, 10, 1)
         .unwrap()
         .remove(0);
-    drop(second);
     drop(events);
 
     let reopened = connect(&fixture);

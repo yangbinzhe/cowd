@@ -2606,6 +2606,8 @@ dependencies = [
  "runtime",
  "serde",
  "serde_json",
+ "session",
+ "session-postgres",
  "sha2 0.10.9",
  "storage",
  "tempfile",
