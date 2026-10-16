@@ -2168,6 +2168,7 @@ dependencies = [
 name = "provider"
 version = "0.9.791"
 dependencies = [
+ "harness-contract",
  "httpdate",
  "model-protocol",
  "reqwest",
@@ -3495,6 +3496,7 @@ dependencies = [
  "tokio",
  "tracing",
  "urlencoding",
+ "uuid",
  "walkdir",
 ]
 

@@ -29,6 +29,7 @@
         ];
         let admitted_scopes = ["session:session-root".to_string()];
         let binding = RuntimeToolExecutionBinding {
+            tool_lease: None,
             action_id: Some("root-action"),
             session_id: Some("session-root"),
             authorized_scopes: &admitted_scopes,
@@ -316,6 +317,38 @@
     }
 
     #[tokio::test]
+    async fn bound_mcp_dispatch_retains_the_original_service_after_host_replacement() {
+        let registry = GatewayToolRegistry::builtin().with_runtime_tools(vec![RuntimeToolDefinition {
+            name: "mcp_tool".into(), description: None, input_schema: json!({"type":"object","additionalProperties":true}),
+            required_permission: ToolPermissionMode::DangerFullAccess,
+            effect_resolver: crate::runtime_bootstrap::runtime_effect_resolver("runtime.external_danger"),
+        }]).unwrap();
+        let executor = GatewayToolExecutor::new(None, false, registry);
+        let config_directory = tempfile::tempdir().unwrap();
+        let config = runtime::ConfigLoader::new(config_directory.path(), config_directory.path()).load().unwrap();
+        let service = Arc::new(crate::runtime_host::RuntimeMcpServiceAdapter::from_runtime_config(&config).await);
+        assert!(mcp::McpService::list_servers(service.as_ref()).unwrap().is_empty());
+        let mut original = executor.tool_host.pin_snapshot().snapshot().clone();
+        original.mcp = Some(service);
+        executor.tool_host.replace_snapshot(original);
+        let input = json!({"qualifiedName":"mcp__fixture__write","arguments":{}});
+        let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(&runtime::tool_dispatch::ToolRequest {
+            tool_use_id: "pinned-mcp".into(), tool_name: "mcp_tool".into(), input: input.to_string(), depends_on: vec![],
+        });
+        request.session_id = Some("security-session".into()); request.policy_revision = 7;
+        attach_gateway_step(&executor, &mut request);
+        let authorization = signed_test_authorization(&executor, "mcp_tool", &input, 7);
+        let mut replacement = executor.tool_host.pin_snapshot().snapshot().clone();
+        replacement.mcp = None;
+        executor.tool_host.replace_snapshot(replacement);
+        let error = executor.execute_step_authorized_invocation_output(request.step_binding.as_ref(), &request.tool_use_id,
+            &authorization, "mcp_tool", &request.input).await.unwrap_err().to_string();
+        assert!(error.contains("fixture"), "{error}");
+        assert!(!error.contains("without configured MCP servers"), "{error}");
+        assert_eq!(std::fs::read_dir(config_directory.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
     async fn external_writes_require_runtime_authorization() {
         let registry = GatewayToolRegistry::builtin()
             .with_runtime_tools(vec![
@@ -354,6 +387,12 @@
         executor
             .bind_runtime_services(Arc::clone(&services))
             .expect("bind security runtime services");
+        let mut snapshot = executor.tool_host.pin_snapshot().snapshot().clone();
+        let config_directory = tempfile::tempdir().expect("isolated MCP config");
+        let mcp_config = runtime::ConfigLoader::new(config_directory.path(), config_directory.path()).load().expect("empty MCP fixture config");
+        snapshot.mcp = Some(Arc::new(crate::runtime_host::RuntimeMcpServiceAdapter::from_runtime_config(
+            &mcp_config).await));
+        executor.tool_host.replace_snapshot(snapshot);
 
         let make_request = |tool_name: &str, input: serde_json::Value| {
             let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
@@ -368,6 +407,7 @@
             request.session_id = Some("security-session".to_string());
             request.policy_revision = 7;
             request.sandbox_posture = harness_contract::policy::SandboxPosture::HostFullAccess;
+            attach_gateway_step(&executor, &mut request);
             request
         };
         for (tool_name, input) in [
@@ -385,6 +425,11 @@
                 .to_string()
                 .contains("requires Runtime authorization"));
             let request = make_request(tool_name, input);
+            let mut unbound = request.clone();
+            unbound.step_binding = None;
+            let denied = runtime::RuntimeExecutionHost::execute_runtime_tool(&executor, &unbound).await;
+            assert_eq!(denied.status, runtime::RuntimeToolExecutionStatus::BlockedPermission);
+            assert_eq!(denied.error.as_deref(), Some("production_tool_origin_required"));
             let outcome =
                 runtime::RuntimeExecutionHost::execute_runtime_tool(&executor, &request).await;
             assert_eq!(

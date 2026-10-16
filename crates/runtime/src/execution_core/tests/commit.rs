@@ -35,6 +35,8 @@ fn controlled_recovery_terminal_is_the_only_tool_scope_graph_event() {
 
 fn request(id: &str) -> crate::RuntimeToolExecutionRequest {
     crate::RuntimeToolExecutionRequest {
+        compiled_invocation: None,
+        step_binding: None,
         governed_plan_id: "plan".to_string(),
         governed_plan_revision: 1,
         observation_wave_sequence: 1,
@@ -88,6 +90,176 @@ fn mutation_effect(idempotency: ToolIdempotency) -> ToolEffectDescriptor {
         mutates_system: false,
         assessment: harness_contract::policy::EffectAssessment::default(),
     }
+}
+
+#[test]
+fn expired_serialized_step_queries_the_original_receipt_without_loading_an_adapter() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = ExecutionCommitService::new(Arc::clone(&store));
+    let workspace = tempfile::tempdir().unwrap();
+    let host = tools::ToolHost::builtin("receipt-recovery-fixture", workspace.path());
+    let lease = host.pin_snapshot();
+    let advertised = lease
+        .snapshot()
+        .catalog
+        .definitions(None)
+        .into_iter()
+        .filter(|definition| definition.name == "edit")
+        .map(|definition| crate::ProviderToolDefinition {
+            name: definition.name,
+            description: definition.description,
+            input_schema: definition.input_schema,
+        })
+        .collect::<Vec<_>>();
+    let step = Arc::new(
+        crate::step_snapshot::BoundStep::bind(
+            harness_contract::step::StepIdentity {
+                step_id: "step:receipt-recovery".into(),
+                session_id: "session".into(),
+                turn_id: "turn".into(),
+                execution_id: Some("graph:receipt-recovery".into()),
+                actor_ref: Some("fixture".into()),
+                run_ref: None,
+                attempt: Some(1),
+                epoch: Some("1".into()),
+                goal_ref: None,
+                program_ref: None,
+                task_ref: None,
+                build_ref: "isolated-fixture".into(),
+            },
+            lease,
+            &advertised,
+            &json!({}),
+            &json!({}),
+            BTreeMap::new(),
+            10,
+        )
+        .unwrap(),
+    );
+    let binding = crate::step_snapshot::StepCallBinding::provider(step.clone(), "write-once");
+    let input = r#"{"action":"write","path":"proof.txt","content":"one physical write"}"#;
+    let value = step
+        .validate_call(&binding.origin, "session", "write-once", "edit", input, 1)
+        .unwrap();
+    let mut graph = ExecutionGraph::new("receipt recovery fixture");
+    graph.id = "graph:receipt-recovery".into();
+    graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+        session_id: "session".into(),
+        turn_id: "turn".into(),
+        root_task_id: "task".into(),
+        task_id: "task".into(),
+        generation: 1,
+    });
+    let mut node = ExecutionNodeSpec::new(ExecutionNodeKind::ToolBatch, "tool_batch", "fixture");
+    node.id = "node:write".into();
+    graph.nodes.push(node);
+    graph = service.register_graph(graph).unwrap().graph;
+    for status in [ExecutionNodeStatus::Ready, ExecutionNodeStatus::Running] {
+        graph = service
+            .transition_node(&graph, "node:write", status, None, vec![])
+            .unwrap()
+            .graph;
+    }
+    let mut request = request("write-once");
+    request.tool_name = "edit".into();
+    request.input = input.into();
+    request.policy_revision = 1;
+    request.category = crate::ToolSafetyCategory::WriteLocal;
+    request.parent_execution = Some(harness_contract::execution_graph::ExecutionParentBinding {
+        execution_id: "graph:receipt-recovery".into(),
+        node_id: "node:write".into(),
+    });
+    request.idempotency_key = binding.effect_idempotency_key();
+    request.compiled_invocation = Some(
+        binding
+            .prepare_invocation(Some(host.pin_snapshot()), "edit", &value)
+            .unwrap(),
+    );
+    request.step_binding = Some(binding.clone());
+    let effect = request.compiled_invocation.as_ref().unwrap().effect.clone();
+    assert_eq!(
+        service.begin_tool_effect(&request, &effect).unwrap(),
+        ToolEffectState::Fresh
+    );
+    std::fs::write(workspace.path().join("proof.txt"), "one physical write").unwrap();
+    let mut completed = outcome("write-once", "original durable result");
+    completed.tool_name = "edit".into();
+    completed.category = crate::ToolSafetyCategory::WriteLocal;
+    service
+        .commit_tool_effect(&request, &effect, &completed)
+        .unwrap();
+    let count = store
+        .stream_event_count(&format!("execution-effect:{}", request.idempotency_key))
+        .unwrap();
+    let mut recovered: crate::RuntimeToolExecutionRequest =
+        serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
+    recovered.compiled_invocation = None;
+    host.replace_snapshot(host.pin_snapshot().snapshot().clone());
+    assert!(recovered
+        .step_binding
+        .as_ref()
+        .unwrap()
+        .resolve(Some(host.pin_snapshot()))
+        .is_err());
+    assert!(step
+        .validate_call(&binding.origin, "session", "write-once", "edit", input, 10)
+        .is_err());
+    let replay = service
+        .query_completed_tool_effect(&recovered)
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay.outcome, completed);
+    assert_eq!(replay.invocation.intent.normalized_input, value);
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("proof.txt")).unwrap(),
+        "one physical write"
+    );
+    assert_eq!(
+        store
+            .stream_event_count(&format!("execution-effect:{}", request.idempotency_key))
+            .unwrap(),
+        count
+    );
+    recovered.input =
+        r#"{"content":"one physical write", "path":"proof.txt", "action":"write"}"#.into();
+    assert!(service
+        .query_completed_tool_effect(&recovered)
+        .unwrap()
+        .is_some());
+    recovered.input = r#"{"action":"write","path":"proof.txt","content":"changed"}"#.into();
+    assert!(service.query_completed_tool_effect(&recovered).is_err());
+    recovered.input = input.into();
+    recovered.session_id = Some("another-session".into());
+    assert!(service.query_completed_tool_effect(&recovered).is_err());
+    assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 1);
+    let system_step = Arc::new((*step).clone().with_parent("runtime-checkpoint"));
+    let mut system = request.clone();
+    system.step_binding = Some(crate::step_snapshot::StepCallBinding::system(
+        system_step,
+        "runtime-checkpoint",
+        "write-once",
+    ));
+    service.validate_system_tool_parent(&system).unwrap();
+    system.parent_execution = None;
+    assert!(service.validate_system_tool_parent(&system).is_err());
+    system.parent_execution = request.parent_execution.clone();
+    system.session_id = Some("another-session".into());
+    assert!(service.validate_system_tool_parent(&system).is_err());
+    system.session_id = request.session_id.clone();
+    service
+        .transition_node(
+            &graph,
+            "node:write",
+            ExecutionNodeStatus::Completed,
+            None,
+            vec![],
+        )
+        .unwrap();
+    assert!(service.validate_system_tool_parent(&system).is_err());
+    assert!(service
+        .query_completed_tool_effect(&request)
+        .unwrap()
+        .is_some());
 }
 
 fn readonly_effect() -> ToolEffectDescriptor {
@@ -331,6 +503,7 @@ fn delegated_agent_receipts_are_indexed_atomically_and_reload_without_scanning_e
     let store = Arc::new(RuntimeEventStore::for_test());
     let service = ExecutionCommitService::new(Arc::clone(&store));
     let request = crate::RuntimeToolExecutionRequest {
+        compiled_invocation: None,
         parent_execution: Some(harness_contract::execution_graph::ExecutionParentBinding {
             execution_id: "graph-agent-receipts".to_string(),
             node_id: "agent-node".to_string(),

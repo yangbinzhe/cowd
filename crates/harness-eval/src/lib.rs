@@ -3447,6 +3447,7 @@ mod tests {
         let mut client = runtime::ProviderRuntimeClient::new(registry, model.clone(), Vec::new())
             .expect("provider client should initialize when real eval is enabled");
         let request = runtime::ApiRequest {
+            bound_step: None,
             prompt: runtime::PromptAssembly::new(vec![
                 "You are a strict health-check responder. Return exactly: OK".to_string(),
             ]),

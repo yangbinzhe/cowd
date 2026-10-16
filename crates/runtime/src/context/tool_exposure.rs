@@ -171,7 +171,7 @@ fn activation_decision(
     descriptor: &ToolDescriptorRef,
     policy: &ToolExposurePolicy,
 ) -> (ToolActivationStatus, &'static str) {
-    if descriptor.health != ToolDescriptorHealth::Healthy {
+    if descriptor.health == ToolDescriptorHealth::Unavailable {
         return (
             ToolActivationStatus::Unavailable,
             "tool source is not healthy",
@@ -190,7 +190,14 @@ fn activation_decision(
             "tool requires a higher permission mode",
         );
     }
-    (ToolActivationStatus::Activated, "activation accepted")
+    (
+        ToolActivationStatus::Activated,
+        if descriptor.health == ToolDescriptorHealth::Degraded {
+            "source health is unknown or degraded; dispatch must recheck live readiness"
+        } else {
+            "activation accepted"
+        },
+    )
 }
 
 fn permission_rank(permission: ToolPermissionMode) -> u8 {
@@ -223,6 +230,31 @@ mod tests {
             permission_source: "builtin".to_string(),
             health: ToolDescriptorHealth::Healthy,
         }
+    }
+
+    #[test]
+    fn degraded_readiness_remains_visible_but_missing_configuration_does_not() {
+        let mut unknown = descriptor("read_file", ToolPermissionMode::ReadOnly);
+        unknown.health = ToolDescriptorHealth::Degraded;
+        let mut unavailable = descriptor("mcp_tool", ToolPermissionMode::ReadOnly);
+        unavailable.health = ToolDescriptorHealth::Unavailable;
+        let discovery = ToolDiscoveryReceipt {
+            query: "fixture".into(),
+            catalog_revision: 1,
+            descriptors: vec![unknown, unavailable],
+            activation_candidates: vec![],
+        };
+        let policy = ToolExposurePolicy {
+            allowed_ids: BTreeSet::new(),
+            maximum_permission: ToolPermissionMode::ReadOnly,
+            supports_dynamic_exposure: true,
+        };
+        let state =
+            ToolExposurePlanner.plan(&discovery, ["read_file".into(), "mcp_tool".into()], &policy);
+        assert!(state.bootstrap.contains("read_file"));
+        assert!(!state.bootstrap.contains("mcp_tool"));
+        assert!(!state.active.contains("mcp_tool"));
+        assert!(!state.deferred.contains("mcp_tool"));
     }
 
     #[test]

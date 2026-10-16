@@ -28,6 +28,10 @@ impl PartialEq for ToolProgressSink {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeToolExecutionRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compiled_invocation: Option<harness_contract::tool::GovernedToolInvocation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_binding: Option<crate::step_snapshot::StepCallBinding>,
     pub governed_plan_id: String,
     pub governed_plan_revision: u64,
     /// Stable causal wave allocated before execution. Parallel calls in one
@@ -112,6 +116,8 @@ impl RuntimeToolExecutionRequest {
     #[must_use]
     pub fn from_tool_request(request: &ToolRequest) -> Self {
         Self {
+            compiled_invocation: None,
+            step_binding: None,
             governed_plan_id: "offline-unknown".to_string(),
             governed_plan_revision: 0,
             observation_wave_sequence: 0,
@@ -170,6 +176,10 @@ pub struct RuntimeToolExecutionOutcome {
 /// commits are deliberately outside this contract and belong to the Runner.
 #[async_trait::async_trait]
 pub trait RuntimeExecutionHost: Send + Sync {
+    fn pin_step_catalog(&self) -> Option<tools::ToolHostLease> {
+        None
+    }
+
     async fn execute_runtime_tool(
         &self,
         request: &RuntimeToolExecutionRequest,

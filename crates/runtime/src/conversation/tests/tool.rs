@@ -5,7 +5,183 @@
 
     use futures::stream::{self, Stream};
 
-    use super::*;
+use super::*;
+
+#[tokio::test]
+async fn expired_replay_is_seeded_into_the_existing_dag_before_a_fresh_dependent_read() {
+    let workspace = tempfile::tempdir().unwrap();
+    let host = tools::ToolHost::builtin("replay-dag-fixture", workspace.path());
+    let bind = |step_id: &str, tool_name: &str, expires_at_ms| {
+        let lease = host.pin_snapshot();
+        let advertised = lease
+            .snapshot()
+            .catalog
+            .definitions(None)
+            .into_iter()
+            .filter(|definition| definition.name == tool_name)
+            .map(|definition| crate::ProviderToolDefinition {
+                name: definition.name,
+                description: definition.description,
+                input_schema: definition.input_schema,
+            })
+            .collect::<Vec<_>>();
+        Arc::new(crate::step_snapshot::BoundStep::bind(serde_json::from_value(serde_json::json!({
+                "step_id":step_id,"session_id":"replay-session","turn_id":"replay-turn","build_ref":"isolated-fixture"
+            })).unwrap(), lease, &advertised, &serde_json::json!({}), &serde_json::json!({}), std::collections::BTreeMap::new(), expires_at_ms).unwrap())
+    };
+    let old = bind("old-step", "edit", 10);
+    let input = r#"{"action":"write","path":"proof.txt","content":"original write"}"#;
+    let binding = crate::step_snapshot::StepCallBinding::provider(old.clone(), "write-once");
+    let mut invocation = old.lease().prepare_governed_invocation(
+        "write-once",
+        "edit",
+        &serde_json::from_str(input).unwrap(),
+        &[],
+    );
+    invocation.origin = Some(binding.origin.clone());
+    let call = ModelToolCall {
+        id: "write-once".into(),
+        name: "edit".into(),
+        input: input.into(),
+        depends_on: vec![],
+        binding: Some(serde_json::from_value(serde_json::to_value(binding).unwrap()).unwrap()),
+    };
+    host.replace_snapshot(host.pin_snapshot().snapshot().clone());
+    assert!(call
+        .binding
+        .as_ref()
+        .unwrap()
+        .resolve(Some(host.pin_snapshot()))
+        .is_err());
+    let fresh = bind("fresh-step", "read_file", i64::MAX);
+    let dependent = ModelToolCall {
+        id: "read-after-replay".into(),
+        name: "read_file".into(),
+        input: r#"{"path":"proof.txt"}"#.into(),
+        depends_on: vec![call.id.clone()],
+        binding: Some(crate::step_snapshot::StepCallBinding::provider(
+            fresh,
+            "read-after-replay",
+        )),
+    };
+    let receipt = crate::conversation::EarlyToolExecutionReceipt {
+        call: call.clone(),
+        ready_at_ms: 1,
+        started_at_ms: 1,
+        completed_at_ms: 2,
+        outcome: crate::RuntimeToolExecutionOutcome {
+            tool_use_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            status: crate::RuntimeToolExecutionStatus::Executed,
+            category: crate::ToolSafetyCategory::WriteLocal,
+            output: Some("original durable result".into()),
+            error: None,
+            evidence_ref: "original-receipt".into(),
+            observed_evidence: vec![],
+        },
+    };
+    let executed = Arc::new(AtomicUsize::new(0));
+    let mut session = Session::new();
+    session.session_id = "replay-session".into();
+    let store = Arc::new(crate::test_support::session_store());
+    store
+        .create_session(&session::SessionRecord {
+            session_id: session.session_id.clone(),
+            platform: "test".into(),
+            chat_id: "receipt-replay".into(),
+            user_id: None,
+            model: None,
+            created_at: "2026-10-16T00:00:00Z".into(),
+            last_activity: "2026-10-16T00:00:00Z".into(),
+            message_count: 0,
+            reset_policy: "manual".into(),
+            metadata_json: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            status: "active".into(),
+        })
+        .await
+        .unwrap();
+    let artifact_directory = tempfile::tempdir().unwrap();
+    let runtime = crate::ConversationRuntime::new(
+        session,
+        FinalAnswerClient,
+        RecordingToolExecutor {
+            executed: executed.clone(),
+            order: Arc::new(Mutex::new(vec![])),
+        },
+        PermissionPolicy::new(crate::PermissionMode::ReadOnly),
+        vec!["read existing results".into()],
+    )
+    .without_memory()
+    .with_session_journal_port(crate::session_runtime_port::TestSessionPortAdapter::new(
+        store,
+    ))
+    .with_artifact_store(Arc::new(
+        crate::ArtifactStore::for_test(
+            artifact_directory.path(),
+            crate::ArtifactStoreConfig::default(),
+        )
+        .unwrap(),
+    ));
+    runtime
+        .begin_turn_strategy("replay-turn", "read the existing durable result")
+        .unwrap();
+    runtime.session_input_stream().set_active_turn(Some(harness_contract::turn::TurnId::from_string("replay-turn")));
+    for field in ["session", "turn"] {
+        let mut foreign = call.clone();
+        let binding = foreign.binding.as_mut().unwrap();
+        let snapshot = Arc::make_mut(&mut binding.snapshot);
+        if field == "session" { snapshot.identity.session_id = "foreign-session".into(); }
+        else { snapshot.identity.turn_id = "foreign-turn".into(); }
+        let refused = runtime.execute_tool_batch_step_with_replays(&[foreign], &crate::SharedPrompter::none(), 0,
+            &std::collections::BTreeMap::new(), &std::collections::BTreeMap::new()).await.unwrap_err();
+        assert!(refused.to_string().contains("session_or_turn_mismatch"));
+    }
+    assert_eq!(executed.load(Ordering::SeqCst), 0);
+    let mut failed_receipt = receipt.clone();
+    let mut failed_invocation = invocation.clone();
+    let mut blocked = dependent.clone();
+    let result = runtime
+        .execute_tool_batch_step_with_replays(
+            &[call.clone(), dependent],
+            &crate::SharedPrompter::none(),
+            1,
+            &std::collections::BTreeMap::from([(call.id.clone(), receipt)]),
+            &std::collections::BTreeMap::from([(call.id.clone(), invocation)]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.failed, 0, "{:?}", result.messages);
+    assert_eq!(result.messages.len(), 2);
+    assert_eq!(executed.load(Ordering::SeqCst), 1);
+    failed_receipt.call.id = "failed-write".into();
+    failed_receipt.call.binding.as_mut().unwrap().origin.call_id = "failed-write".into();
+    failed_receipt.outcome.tool_use_id = "failed-write".into();
+    failed_receipt.outcome.status = crate::RuntimeToolExecutionStatus::Failed;
+    failed_receipt.outcome.output = None;
+    failed_receipt.outcome.error =
+        Some("retained failed or uncertain effect; do not repeat".into());
+    failed_invocation.invocation_id = "failed-write".into();
+    failed_invocation.origin.as_mut().unwrap().call_id = "failed-write".into();
+    blocked.id = "blocked-read".into();
+    blocked.binding.as_mut().unwrap().origin.call_id = "blocked-read".into();
+    blocked.depends_on = vec!["failed-write".into()];
+    let failed_call = failed_receipt.call.clone();
+    let failed = runtime
+        .execute_tool_batch_step_with_replays(
+            &[failed_call, blocked],
+            &crate::SharedPrompter::none(),
+            2,
+            &std::collections::BTreeMap::from([("failed-write".into(), failed_receipt)]),
+            &std::collections::BTreeMap::from([("failed-write".into(), failed_invocation)]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(failed.failed, 2, "{:?}", failed.messages);
+    assert_eq!(executed.load(Ordering::SeqCst), 1);
+    assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 0);
+}
 
     #[test]
     fn delegated_leaf_never_owns_root_terminal_presentation() {
@@ -101,6 +277,7 @@
     #[test]
     fn early_lane_accepts_only_dependency_free_bounded_idempotent_reads() {
         let read_call = ModelToolCall {
+            binding: None,
             id: "read".to_string(),
             name: "read_file".to_string(),
             input: r#"{"path":"README.md","limit":20}"#.to_string(),
@@ -134,6 +311,7 @@
         );
 
         let write_call = ModelToolCall {
+            binding: None,
             id: "write".to_string(),
             name: "edit".to_string(),
             input: r#"{"path":"README.md","content":"changed"}"#.to_string(),
@@ -2423,6 +2601,7 @@
         let result = runtime
             .execute_tool_batch_step(
                 &[crate::conversation::ModelToolCall {
+                    binding: None,
                     id: "refusal-role".into(),
                     name: "task_submit".into(),
                     input: input.into(),
@@ -2473,6 +2652,7 @@
         let result = runtime
             .execute_tool_batch_step(
                 &[crate::conversation::ModelToolCall {
+                    binding: None,
                     id: "repeat-1".to_string(),
                     name: "state_inspect".to_string(),
                     input,
@@ -2529,6 +2709,7 @@
         let result = runtime
             .execute_tool_batch_step(
                 &[crate::conversation::ModelToolCall {
+                    binding: None,
                     id: "distinct-1".to_string(),
                     name: "state_inspect".to_string(),
                     input: serde_json::json!({"query": "task:fresh"}).to_string(),
@@ -3535,6 +3716,7 @@
         .without_memory();
         let turn = runtime.active_turn_id();
         let call = ModelToolCall {
+            binding: None,
             id: "call-refusal-streak".to_string(),
             name: "task_review".to_string(),
             input: "{\"task_ref\":\"task:refusal-streak\"}".to_string(),

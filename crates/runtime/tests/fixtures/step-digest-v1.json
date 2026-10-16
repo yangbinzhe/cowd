@@ -1,0 +1,37 @@
+[
+  {
+    "name": "null",
+    "json": "null",
+    "digest": "sha256:a19b4c4e70f63b566e93fb5bd37e1385e3ae334f94c9818c9054d8fe7d5c1a82"
+  },
+  {
+    "name": "scalars",
+    "json": "[true,false,null,\"\",1,-2.5,0.0000001]",
+    "digest": "sha256:22c87fcc432dce5957458b50f061b739487c598055b6adc1986c3935558cb546"
+  },
+  {
+    "name": "key-order",
+    "json": "{\"中\":1.0,\"a\":[-0.0,1e0]}",
+    "digest": "sha256:619c69ab21bc6c37e95d286fa44f9a60ca019114f4561d9d9ba2beac31b83ba1"
+  },
+  {
+    "name": "equivalent-key-order",
+    "json": "{\"a\":[0,1],\"中\":1}",
+    "digest": "sha256:619c69ab21bc6c37e95d286fa44f9a60ca019114f4561d9d9ba2beac31b83ba1"
+  },
+  {
+    "name": "utf8-not-utf16-order",
+    "json": "{\"😀\":\"astral\",\"\":\"bmp\",\"é\":\"unicode\"}",
+    "digest": "sha256:42624822a2909da2d6736971a697d18aded76d08453f111d6172ad521fe97f31"
+  },
+  {
+    "name": "nested",
+    "json": "{\"a\":[{\"z\":[],\"b\":{}},\"001\",1]}",
+    "digest": "sha256:51c03c9eeb5694b160656e7735cae77744a92671ec16caff34360c4db60bb717"
+  },
+  {
+    "name": "safe-boundary",
+    "json": "[9007199254740991,-9007199254740991,\"18446744073709551615\"]",
+    "digest": "sha256:512649cc21ebaa213ea8d3482e4a9020e47a90231a8cbe70601f8bd3ad556bdc"
+  }
+]

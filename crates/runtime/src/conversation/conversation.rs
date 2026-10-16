@@ -778,6 +778,7 @@ fn is_agent_collaboration_action(call: &ModelToolCall) -> bool {
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiRequest {
+    pub bound_step: Option<Arc<crate::step_snapshot::BoundStep>>,
     pub prompt: PromptAssembly,
     pub messages: HistoryView,
     /// Runtime-selected primary model ID.
@@ -909,6 +910,7 @@ struct ModelStreamItemState {
 }
 
 struct ModelStreamReducer {
+    bound_step: Option<Arc<crate::step_snapshot::BoundStep>>,
     bus: Option<Arc<crate::CowdEventBus>>,
     event_store: Option<Arc<RuntimeEventStore>>,
     session_id: String,
@@ -1054,6 +1056,7 @@ impl ModelStreamReducer {
         }
         Self {
             bus,
+            bound_step: None,
             event_store,
             session_id,
             model_step_id,
@@ -1082,6 +1085,11 @@ impl ModelStreamReducer {
         attempt_id: impl Into<String>,
     ) -> Self {
         self.terminal_presentation = Some((presentation_id.into(), attempt_id.into()));
+        self
+    }
+
+    fn with_bound_step(mut self, step: Option<Arc<crate::step_snapshot::BoundStep>>) -> Self {
+        self.bound_step = step;
         self
     }
 
@@ -1428,6 +1436,9 @@ impl ModelStreamReducer {
                     item.identity.tool_call_id = Some(id.clone());
                 }
                 self.calls.push(ModelToolCall {
+                    binding: self.bound_step.as_ref().map(|step| {
+                        crate::step_snapshot::StepCallBinding::provider(Arc::clone(step), &id)
+                    }),
                     id,
                     name,
                     input,
@@ -2404,6 +2415,10 @@ fn knowledge_hard_gate_active(system_prompt: &[String]) -> bool {
 /// For backward compatibility, a `collect()` call gathers all events
 /// into a Vec (same as the old sync signature).
 pub trait ApiClient {
+    fn step_tool_definitions(&self) -> Option<Vec<crate::ProviderToolDefinition>> {
+        None
+    }
+
     fn stream(
         &mut self,
         request: ApiRequest,
@@ -2559,6 +2574,113 @@ struct GeneratedModelReceipt {
 /// threads.
 #[async_trait::async_trait]
 pub trait ToolExecutor: Send + Sync + 'static {
+    fn pin_step_catalog(&self) -> Option<tools::ToolHostLease> {
+        None
+    }
+
+    async fn recover_step_tool_receipt(
+        &self,
+        _call: &ModelToolCall,
+    ) -> Result<
+        Option<(
+            harness_contract::tool::GovernedToolInvocation,
+            crate::RuntimeToolExecutionOutcome,
+            u64,
+        )>,
+        ToolError,
+    > {
+        Ok(None)
+    }
+
+    fn validate_step_tool_input(
+        &self,
+        binding: Option<&crate::step_snapshot::StepCallBinding>,
+        tool_name: &str,
+        input: &str,
+    ) -> Result<String, ToolError> {
+        let Some(binding) = binding else {
+            if self.pin_step_catalog().is_some() {
+                return Err(ToolError::new("production_tool_origin_required"));
+            }
+            return self.validate_tool_input(tool_name, input);
+        };
+        let step = binding
+            .resolve(self.pin_step_catalog())
+            .map_err(|error| ToolError::new(error.to_string()))?;
+        let value = step
+            .validate_call(
+                &binding.origin,
+                &binding.snapshot.identity.session_id,
+                &binding.origin.call_id,
+                tool_name,
+                input,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .map_err(|error| ToolError::new(error.to_string()))?;
+        serde_json::to_string(&value).map_err(|error| ToolError::new(error.to_string()))
+    }
+
+    fn prepare_step_invocations(
+        &self,
+        requests: &[crate::tool_dispatch::ToolRequest],
+        calls: &[ModelToolCall],
+    ) -> Result<Vec<harness_contract::tool::GovernedToolInvocation>, ToolError> {
+        let mut invocations = Vec::with_capacity(requests.len());
+        for request in requests {
+            let binding = calls
+                .iter()
+                .find(|call| call.id == request.tool_use_id)
+                .and_then(|call| call.binding.as_ref());
+            if let Some(binding) = binding {
+                let step = binding
+                    .resolve(self.pin_step_catalog())
+                    .map_err(|error| ToolError::new(error.to_string()))?;
+                let input = step
+                    .validate_call(
+                        &binding.origin,
+                        &binding.snapshot.identity.session_id,
+                        &request.tool_use_id,
+                        &request.tool_name,
+                        &request.input,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .map_err(|error| ToolError::new(error.to_string()))?;
+                let mut invocation = step.lease().prepare_governed_invocation(
+                    &request.tool_use_id,
+                    &request.tool_name,
+                    &input,
+                    &request.depends_on,
+                );
+                invocation.origin = Some(binding.origin.clone());
+                invocations.push(invocation);
+            } else {
+                if self.pin_step_catalog().is_some() {
+                    return Err(ToolError::new("production_tool_origin_required"));
+                }
+                invocations
+                    .extend(self.prepare_governed_invocations(std::slice::from_ref(request)));
+            }
+        }
+        Ok(invocations)
+    }
+
+    async fn execute_step_authorized_invocation_output(
+        &self,
+        _binding: Option<&crate::step_snapshot::StepCallBinding>,
+        provider_invocation_id: &str,
+        authorization: &harness_contract::tool::ToolExecutionAuthorization,
+        tool_name: &str,
+        input: &str,
+    ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+        self.execute_authorized_invocation_output(
+            provider_invocation_id,
+            authorization,
+            tool_name,
+            input,
+        )
+        .await
+    }
+
     /// Execute a Tool using the bounded-output contract consumed by Runtime.
     async fn execute_output(
         &self,
@@ -2676,6 +2798,7 @@ pub trait ToolExecutor: Send + Sync + 'static {
                 let input = serde_json::from_str::<serde_json::Value>(&request.input).ok()?;
                 let effect = self.registered_tool_effect(&request.tool_name, &input)?;
                 Some(harness_contract::tool::GovernedToolInvocation {
+                    origin: None,
                     contract_version: 1,
                     invocation_id: request.tool_use_id.clone(),
                     intent: harness_contract::tool::ToolIntent {
@@ -3181,6 +3304,7 @@ pub enum ModelStepIntent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelToolCall {
+    pub binding: Option<crate::step_snapshot::StepCallBinding>,
     pub id: String,
     pub name: String,
     pub input: String,
@@ -3763,6 +3887,7 @@ impl crate::ProviderWireEvidenceWriter for SessionProviderWireEvidenceWriter {
                 "model": evidence.request_context.profile.model,
                 "protocol": evidence.wire_request.protocol,
                 "body_sha256": evidence.wire_request.body_sha256,
+                "step_render": evidence.step_render,
                 "cache_identity_sha256": evidence.prefix_observation.cache_identity_sha256,
                 "prefix_predecessor_request_id": evidence.prefix_observation.predecessor_request_id,
                 "model_visible_prompt_bytes": evidence.prefix_observation.prompt_bytes,
@@ -4171,6 +4296,7 @@ struct ConversationGovernedToolContext<'a, C, T> {
     iterations: usize,
     plan_id: &'a str,
     plan_revision: u64,
+    precompleted: &'a BTreeMap<String, (ConversationMessage, Option<String>)>,
 }
 
 impl<C, T> GovernedToolExecutionContext for ConversationGovernedToolContext<'_, C, T>
@@ -4184,6 +4310,22 @@ where
 
     fn local_ceiling(&self) -> usize {
         crate::governed_tool_plan::default_parallel_tool_concurrency()
+    }
+
+    fn precompleted(
+        &self,
+        task: &crate::GovernedToolPlanTask,
+    ) -> Option<(GovernedToolTaskTerminal<Self::Output>, Self::Receipt)> {
+        let output = self.precompleted.get(&task.tool_call_id)?.clone();
+        let terminal = if conversation_tool_result_is_error(&output.0) {
+            GovernedToolTaskTerminal::FailedOutput {
+                error: conversation_tool_result_text(&output.0),
+                output: output.clone(),
+            }
+        } else {
+            GovernedToolTaskTerminal::Succeeded(output.clone())
+        };
+        Some((terminal, output))
     }
 
     fn is_cancelled(&self) -> bool {

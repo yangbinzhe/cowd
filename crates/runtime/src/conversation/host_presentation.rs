@@ -422,7 +422,11 @@ pub(super) async fn execute_governed_runtime_tool_batch(
             parallel_batches: 0,
         };
     };
-    let validation = plan.validate_against_execution_decision(decision);
+    let mut admission_plan = plan.clone();
+    admission_plan
+        .tasks
+        .retain(|task| !precompleted.contains_key(&task.tool_call_id));
+    let validation = admission_plan.validate_against_execution_decision(decision);
     if !validation.allowed {
         let reason = format!(
             "runtime strategy lease `{}` denied tool batch: {}",
@@ -4448,6 +4452,7 @@ pub(super) fn evaluation_scope_rejection_outcome(
     path_identity_resolver: &crate::path_identity::WorkspacePathIdentityResolver,
     replan_node_suffix: &str,
     reason: String,
+    services: Option<&crate::RuntimeServices>,
 ) -> (RuntimeIntervention, Vec<ExecutionNodeSpec>) {
     state.evaluation_scope_rejections = state.evaluation_scope_rejections.saturating_add(1);
     if state.evaluation_scope_rejections == 1 {
@@ -4487,6 +4492,8 @@ pub(super) fn evaluation_scope_rejection_outcome(
                 &state.session_id,
                 calls,
                 workspace_root,
+                services,
+                true,
             ) {
                 return (
                     RuntimeIntervention {
@@ -4560,6 +4567,8 @@ pub(super) fn evaluation_scope_rejection_outcome(
                 &state.session_id,
                 calls,
                 workspace_root,
+                services,
+                true,
             ) {
                 return (
                     RuntimeIntervention {
@@ -4653,6 +4662,7 @@ pub(super) fn evaluation_scope_recovery_tool_calls(
             .into_iter()
             .enumerate()
             .map(|(index, path)| ModelToolCall {
+                binding: None,
                 id: format!("runtime-eval-exact-read-{iteration}-{index}"),
                 name: "read_file".to_string(),
                 input: serde_json::json!({"path": path}).to_string(),
@@ -4701,6 +4711,7 @@ pub(super) fn focus_verification_tool_calls(
             let (_, path) = normalize_workspace_scope(&format!("read:{path}"))?;
             let path = focus_verification_read_path(&path, workspace_root)?;
             (path != ".").then(|| ModelToolCall {
+                binding: None,
                 id: format!("runtime-focus-verify-{iteration}-{index}"),
                 name: "read_file".to_string(),
                 // ExactContent is a whole-object evidence contract. The

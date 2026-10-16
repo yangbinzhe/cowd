@@ -1835,6 +1835,7 @@ where
             )));
         }
         Ok(ApiRequest {
+            bound_step: None,
             prompt: packed_prompt,
             messages: prepared.history,
             model: model.to_string(),

@@ -362,7 +362,10 @@ pub enum OutputContentBlock {
         name: String,
         // Streaming Anthropic-compatible adapters may defer tool arguments to
         // subsequent `input_json_delta` frames and omit `input` here.
-        #[serde(default)]
+        #[serde(
+            default,
+            deserialize_with = "harness_contract::step::deserialize_strict_json_value"
+        )]
         input: Value,
     },
     Thinking {
@@ -813,6 +816,23 @@ mod tests {
             StreamEvent::ContentBlockStart(start)
                 if matches!(&start.content_block, OutputContentBlock::ToolUse { input, .. } if input.is_null())
         ));
+    }
+
+    #[test]
+    fn complete_tool_start_rejects_duplicate_keys_and_unsafe_numbers_before_value_conversion() {
+        for input in [
+            r#"{"x":1,"x":2}"#,
+            r#"{"nested":{"x":1,"x":2}}"#,
+            r#"{"id":9007199254740992}"#,
+        ] {
+            let encoded = format!(
+                r#"{{"type":"content_block_start","index":1,"content_block":{{"type":"tool_use","id":"call","name":"read_file","input":{input}}}}}"#
+            );
+            assert!(
+                serde_json::from_str::<StreamEvent>(&encoded).is_err(),
+                "{input}"
+            );
+        }
     }
 
     #[test]

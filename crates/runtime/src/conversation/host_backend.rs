@@ -185,6 +185,7 @@ fn the_same_question_counts_as_a_repeat_even_when_the_answer_moved() {
 #[test]
 fn only_a_genuine_wait_is_exempt_from_the_identical_call_streak() {
     let call = |name: &str, input: &str| ModelToolCall {
+        binding: None,
         id: "call-1".to_string(),
         name: name.to_string(),
         input: input.to_string(),
@@ -614,7 +615,7 @@ where
                 &session_id,
                 calls,
                 self.services.workspace_root(),
-            )?;
+             Some(self.services.as_ref()), true, )?;
             return Ok(NodeExecutionOutcome::new(completed_result(
                 Some(format!("{}:runtime-review-prefetch", ticket.graph_id)),
                 ExecutionUsage::default(),
@@ -2422,7 +2423,7 @@ where
                                         &state.session_id,
                                         calls,
                                         self.services.workspace_root(),
-                                    )?)
+                                     Some(self.services.as_ref()), true, )?)
                                 } else {
                                     Some(vec![dynamic_node(
                                         ticket,
@@ -2939,7 +2940,7 @@ where
                                 format!(
                                     "the pre-registered evaluation resource ceiling rejected `{violation}`; authorized exact scopes are [{authorized_scopes}]. Do not use broad workspace, shell, execute-code, glob, or pathless search calls. Use exact-path file tools for those scopes, including the authorized write tool when the objective requires mutation"
                                 ),
-                            );
+                             Some(self.services.as_ref()), );
                             model_intervention = Some(intervention);
                             next
                         } else {
@@ -2949,7 +2950,7 @@ where
                                 &state.session_id,
                                 calls,
                                 self.services.workspace_root(),
-                            )?
+                             Some(self.services.as_ref()), false, )?
                         }
                     }
                     ModelStepIntent::Replan { reason } => {
@@ -6043,13 +6044,18 @@ where
                 node_id: ticket.node_id.clone(),
                 reason: format!("tool batch persistent payload is invalid: {error}"),
             })?;
+        let admitted_turn = self.state.lock().await.turn_id.clone();
+        if calls.iter().any(|call| call.binding.as_ref().is_some_and(|binding|
+            binding.snapshot.identity.session_id != session_id || binding.snapshot.identity.turn_id != admitted_turn)) {
+            return Err(NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason: "tool_step_session_or_turn_mismatch".into() });
+        }
         if calls.is_empty() {
             return Err(NodeExecutorError::Poll {
                 node_id: ticket.node_id.clone(),
                 reason: "tool batch has no model-requested calls".to_string(),
             });
         }
-        let precompleted = {
+        let mut precompleted = {
             let state = self.state.lock().await;
             calls
                 .iter()
@@ -6057,6 +6063,10 @@ where
                     state
                         .early_tool_receipts
                         .get(&call.id)
+                        .filter(|receipt| receipt.call.id == call.id && receipt.call.name == call.name
+                            && receipt.call.binding == call.binding && receipt.call.depends_on == call.depends_on
+                            && harness_contract::step::parse_strict_json(&call.input).ok().is_some_and(|input|
+                                harness_contract::step::parse_strict_json(&receipt.call.input).ok() == Some(input)))
                         .cloned()
                         .map(|receipt| (call.id.clone(), receipt))
                 })
@@ -6067,6 +6077,70 @@ where
         } else {
             self.services.tool_execution_host()
         };
+        let mut receipt_invocations = BTreeMap::new();
+        if governed_host.is_some() {
+            let policy_revision = self.runtime.lock().await.permission_policy().execution_policy_control().snapshot().revision;
+            let current = governed_host.and_then(|host| host.pin_step_catalog());
+            for call in &calls {
+                if call.binding.as_ref().is_some_and(|binding| {
+                    binding.snapshot.expires_at_ms > chrono::Utc::now().timestamp_millis()
+                        && binding.snapshot.related_revisions.get("policy") == Some(&policy_revision.to_string())
+                        && current.as_ref().is_some_and(|lease| binding.snapshot.tools.iter().all(|tool|
+                            tool.semantic_revision == lease.implementation_revision()))
+                }) { continue; }
+                let mut query = crate::RuntimeToolExecutionRequest::from_tool_request(&crate::tool_dispatch::ToolRequest {
+                    tool_use_id: call.id.clone(), tool_name: call.name.clone(), input: call.input.clone(), depends_on: call.depends_on.clone(),
+                });
+                query.step_binding = call.binding.clone();
+                query.session_id = Some(session_id.clone());
+                query.policy_revision = policy_revision;
+                query.idempotency_key = call.binding.as_ref().map(crate::step_snapshot::StepCallBinding::effect_idempotency_key)
+                    .unwrap_or_else(|| format!("{}:{}", ticket.idempotency_key, call.id));
+                query.parent_execution = Some(harness_contract::execution_graph::ExecutionParentBinding {
+                    execution_id: ticket.graph_id.clone(), node_id: ticket.node_id.clone(),
+                });
+                if let Some(replay) = self.services.commit_service().query_completed_tool_effect(&query)
+                    .map_err(|error| NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason: error.to_string() })? {
+                    let allowed = matches!(self.runtime.lock().await.permission_policy().authorize_required_with_context(
+                        &call.name, &call.input, crate::permissions::PermissionMode::ReadOnly,
+                        &crate::permissions::PermissionContext::default(), None,
+                    ), crate::permissions::PermissionOutcome::Allow);
+                    if !allowed {
+                        return Err(NodeExecutorError::Poll { node_id: ticket.node_id.clone(),
+                            reason: "tool_receipt_read_permission_revoked".to_string() });
+                    }
+                    receipt_invocations.insert(call.id.clone(), replay.invocation);
+                    precompleted.insert(call.id.clone(), crate::conversation::EarlyToolExecutionReceipt {
+                        call: call.clone(), outcome: replay.outcome, ready_at_ms: replay.completed_at_ms,
+                        started_at_ms: replay.completed_at_ms, completed_at_ms: replay.completed_at_ms,
+                    });
+                }
+            }
+        }
+        if delegated_agent_role {
+            let runtime = self.runtime.lock().await;
+            let current = runtime.tool_executor().pin_step_catalog();
+            let policy_revision = runtime.permission_policy().execution_policy_control().snapshot().revision;
+            for call in &calls {
+                if call.binding.as_ref().is_some_and(|binding| binding.snapshot.expires_at_ms > chrono::Utc::now().timestamp_millis()
+                    && binding.snapshot.related_revisions.get("policy") == Some(&policy_revision.to_string())
+                    && current.as_ref().is_some_and(|lease| binding.snapshot.tools.iter().all(|tool| tool.semantic_revision == lease.implementation_revision()))) {
+                    continue;
+                }
+                if let Some((invocation, outcome, completed_at_ms)) = runtime.tool_executor().recover_step_tool_receipt(call).await
+                    .map_err(|error| NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason: error.to_string() })? {
+                    if !matches!(runtime.permission_policy().authorize_required_with_context(&call.name, &call.input,
+                        crate::permissions::PermissionMode::ReadOnly, &crate::permissions::PermissionContext::default(), None),
+                        crate::permissions::PermissionOutcome::Allow) {
+                        return Err(NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason: "tool_receipt_read_permission_revoked".into() });
+                    }
+                    receipt_invocations.insert(call.id.clone(), invocation);
+                    precompleted.insert(call.id.clone(), crate::conversation::EarlyToolExecutionReceipt {
+                        call: call.clone(), outcome, ready_at_ms: completed_at_ms, started_at_ms: completed_at_ms, completed_at_ms,
+                    });
+                }
+            }
+        }
         // Only the ToolHost graph path prepares and compiles here. Delegated
         // agents use execute_tool_batch_step(), which owns the same work for
         // that path; doing both would duplicate policy revision and approval.
@@ -6092,7 +6166,12 @@ where
                         depends_on: call.depends_on.clone(),
                     })
                     .collect::<Vec<_>>();
-                let prepared = tool_exec.prepare_governed_invocations(&requests);
+                let prepared = requests.iter().map(|request| {
+                    if let Some(invocation) = receipt_invocations.get(&request.tool_use_id) { return Ok(invocation.clone()); }
+                    tool_exec.prepare_step_invocations(std::slice::from_ref(request), &calls)
+                        .map_err(|error| error.to_string())?.into_iter().next().ok_or_else(|| "missing prepared invocation".to_string())
+                }).collect::<Result<Vec<_>, String>>()
+                    .map_err(|reason| NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason })?;
                 let prepared_by_id = prepared
                     .iter()
                     .map(|invocation| (invocation.invocation_id.clone(), invocation.clone()))
@@ -6112,7 +6191,7 @@ where
                             .understanding
                             .forbids_workspace_write
                     });
-                let governed_compilation = crate::GovernedToolCompiler.compile_partial(
+                let mut governed_compilation = crate::GovernedToolCompiler.compile_partial(
                     self.services.workspace_root(),
                     &requests,
                     |name, input| {
@@ -6129,13 +6208,20 @@ where
                         })
                     },
                 );
+                if let Ok(compilation) = governed_compilation.as_mut() {
+                    if let Some(plan) = compilation.plan.as_mut() {
+                        crate::step_snapshot::bind_plan_calls(plan, &calls);
+                    }
+                }
                 let execution_decision = match governed_compilation
                     .as_ref()
                     .ok()
                     .and_then(|compilation| compilation.plan.as_ref())
                 {
                     Some(plan) => {
-                        runtime.retarget_active_turn_strategy_for_governed_plan(plan, &calls)
+                        let mut admission_plan = plan.clone();
+                        admission_plan.tasks.retain(|task| !receipt_invocations.contains_key(&task.tool_call_id));
+                        runtime.retarget_active_turn_strategy_for_governed_plan(&admission_plan, &calls)
                     }
                     None => runtime
                         .active_turn_strategy()
@@ -6151,6 +6237,7 @@ where
                 let mut auths = std::collections::HashMap::new();
                 let mut gaps = std::collections::HashMap::new();
                 for call in &calls {
+                    if receipt_invocations.contains_key(&call.id) { continue; }
                     if let Some(invocation) = prepared
                         .iter()
                         .find(|invocation| invocation.invocation_id == call.id)
@@ -6336,14 +6423,17 @@ where
                     depends_on: call.depends_on.clone(),
                 })
                 .collect::<Vec<_>>();
-            let prepared_tool_invocations = runtime
-                .tool_executor()
-                .prepare_governed_invocations(&requests)
-                .into_iter()
+            let mut prepared_invocations = Vec::new();
+            for request in &requests {
+                if let Some(invocation) = receipt_invocations.get(&request.tool_use_id) { prepared_invocations.push(invocation.clone()); }
+                else { prepared_invocations.extend(runtime.tool_executor().prepare_step_invocations(std::slice::from_ref(request), &calls)
+                    .map_err(|error| NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason: error.to_string() })?); }
+            }
+            let prepared_tool_invocations = prepared_invocations.into_iter()
                 .map(|invocation| (invocation.invocation_id.clone(), invocation))
                 .collect::<std::collections::HashMap<_, _>>();
             let result = runtime
-                .execute_tool_batch_step(&calls, &prompter, iteration)
+                .execute_tool_batch_step_with_replays(&calls, &prompter, iteration, &precompleted, &receipt_invocations)
                 .await;
             let observed_evidence = runtime.tool_executor().observed_evidence_snapshot();
             // The legacy conversation engine writes tool messages eagerly. Roll them
@@ -7512,7 +7602,7 @@ where
                     &session_id,
                     calls,
                     self.services.workspace_root(),
-                )?;
+                 Some(self.services.as_ref()), true, )?;
                 (nodes.len() == 1).then(|| nodes.remove(0))
             } else {
                 None

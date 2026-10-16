@@ -4005,6 +4005,7 @@ async fn root_review_target_tool(
     let written = runtime
         .execute_tool_batch_step(
             &[crate::conversation::ModelToolCall {
+                binding: None,
                 id: id.into(),
                 name: tool_name.into(),
                 input: serde_json::json!({"path":target,"content":content}).to_string(),
@@ -4135,6 +4136,7 @@ async fn root_reads_generic_results(
     let result = runtime
         .execute_tool_batch_step(
             &[crate::conversation::ModelToolCall {
+                binding: None,
                 id: "root-read-result".into(),
                 name: "evidence_retrieve".into(),
                 input: serde_json::json!({"evidence_ref":selector}).to_string(),
@@ -4151,6 +4153,7 @@ async fn root_reads_generic_results(
     }
     if write_effect {
         let written = runtime.execute_tool_batch_step(&[crate::conversation::ModelToolCall {
+            binding: None,
             id: "root-write-effect".into(), name: "edit".into(),
             input: serde_json::json!({"path":"review-effect.txt","content":"actually persisted revised content"}).to_string(),
             depends_on: vec![],
@@ -4184,6 +4187,7 @@ async fn root_reads_generic_results(
     let second = runtime
         .execute_tool_batch_step(
             &[crate::conversation::ModelToolCall {
+                binding: None,
                 id: "root-read-tool-receipt".into(),
                 name: "evidence_retrieve".into(),
                 input: serde_json::json!({"evidence_ref":reference}).to_string(),
@@ -4451,6 +4455,7 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
         let read = runtime
             .execute_tool_batch_step(
                 &[crate::conversation::ModelToolCall {
+                    binding: None,
                     id: "read-current-external-decision".into(),
                     name: "evidence_retrieve".into(),
                     input: serde_json::json!({"evidence_ref":reference}).to_string(),
@@ -4767,6 +4772,7 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
             None,
         );
         let late = runtime.execute_tool_batch_step(&[crate::conversation::ModelToolCall {
+            binding: None,
             id: "late-root-write-after-verification".into(),
             name: "edit".into(),
             input: serde_json::json!({"path":"review-effect.txt","content":"forbidden late mutation"}).to_string(),

@@ -28,6 +28,7 @@ libc = "0.2"
 urlencoding = "2"
 thiserror = "2"
 tracing.workspace = true
+uuid.workspace = true
 walkdir = "2"
 
 [lints]

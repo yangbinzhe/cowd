@@ -27,7 +27,7 @@ use crate::{RuntimeServices, agent_in_process_worker::ProcessJsonlToolSession};
 /// V2 permits arbitrarily large business content only through the content
 /// plane. Control/action JSONL frames stay bounded so one broken worker cannot
 /// consume unbounded Runtime memory while a pipe is being drained.
-const PROCESS_JSONL_PROTOCOL_VERSION: u32 = 2;
+const PROCESS_JSONL_PROTOCOL_VERSION: u32 = 3;
 #[cfg(test)]
 const MAX_PROCESS_FRAME_BYTES: usize = 256 * 1024;
 /// Bounds simultaneous staging files/handles, not total content or completed uploads.
@@ -234,6 +234,8 @@ struct ProcessEnvelope {
     #[serde(default)]
     request_id: Option<String>,
     #[serde(default)]
+    step_id: Option<String>,
+    #[serde(default)]
     command_id: Option<String>,
     #[serde(default)]
     expected_run_revision: Option<u64>,
@@ -272,6 +274,8 @@ struct ProcessFocus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ProcessCapabilities {
+    #[serde(default)]
+    features: BTreeSet<String>,
     #[serde(default)]
     commands: BTreeSet<String>,
     #[serde(default)]
@@ -1083,7 +1087,9 @@ fn process_focus(packet: &AgentTaskPacket) -> ProcessFocus {
 
 fn runtime_process_capabilities() -> ProcessCapabilities {
     ProcessCapabilities {
+        features: BTreeSet::from(["step_binding_v1".to_string()]),
         commands: BTreeSet::from([
+            "step_bound".to_string(),
             "start".to_string(),
             "tool_result".to_string(),
             "action_result".to_string(),
@@ -1120,6 +1126,8 @@ fn read_process_ready(
         .capabilities
         .ok_or_else(|| "ProcessJsonl ready frame omitted required capabilities".to_string())?;
     if !capabilities.commands.contains("result")
+        || !capabilities.features.contains("step_binding_v1")
+        || !AgentBackendCapabilities::process_jsonl().declares_step_binding_v1
         || !capabilities.commands.contains("error")
         || capabilities.supports_recovery
         || capabilities.evidence_mode.as_deref() != Some("runtime_receipts")
@@ -1142,9 +1150,11 @@ fn process_tool_request_fingerprint(
     tool_name: &str,
     input: &serde_json::Value,
 ) -> Result<String, String> {
-    use sha2::{Digest, Sha256};
-    let bytes = serde_json::to_vec(&(kind, tool_name, input)).map_err(|error| error.to_string())?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
+    harness_contract::step::canonical_digest(
+        "process-tool-call",
+        &serde_json::json!([kind, tool_name, input]),
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn read_process_exchange(
@@ -1193,6 +1203,17 @@ fn read_process_exchange(
                 .acknowledge_command(&envelope)?;
             continue;
         }
+        if kind == "step_begin" {
+            let binding = tool_session
+                .ok_or("Process step_begin requires the Runtime bridge")?
+                .begin_step()?;
+            write_process_message(
+                active.ok_or("Process step_begin requires an active worker")?,
+                &serde_json::json!({"kind":"step_bound","run_id":packet.run_id(),
+                    "agent_id":packet.agent_id(),"binding":binding}),
+            )?;
+            continue;
+        }
         if matches!(Some(kind), Some("tool_request") | Some("action_request")) {
             let response_kind = if kind == "action_request" {
                 "action_result"
@@ -1209,6 +1230,11 @@ fn read_process_exchange(
                 "ProcessJsonl action/tool request is missing tool_name".to_string()
             })?;
             let input_value = envelope.input.unwrap_or_default();
+            let step_id = envelope
+                .step_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .ok_or("Process action/tool request omitted runtime step_id")?;
             let fingerprint =
                 process_tool_request_fingerprint(response_kind, &tool_name, &input_value)?;
             let response = if let Some((_, prior_fingerprint, response)) = handled_tool_requests
@@ -1237,7 +1263,9 @@ fn read_process_exchange(
                 {
                     response
                 } else {
-                    let response = match runtime_handle.block_on(session.execute_tool(
+                    let response = match runtime_handle.block_on(session.execute_step_tool(
+                        step_id,
+                        envelope.sequence,
                         &request_id,
                         &tool_name,
                         &input,
@@ -1247,6 +1275,7 @@ fn read_process_exchange(
                             "run_id": packet.run_id(),
                             "agent_id": packet.agent_id(),
                             "request_id": request_id.clone(),
+                            "origin_step_id": step_id,
                             "output": output,
                         }),
                         Err(error) => serde_json::json!({
@@ -1254,6 +1283,7 @@ fn read_process_exchange(
                             "run_id": packet.run_id(),
                             "agent_id": packet.agent_id(),
                             "request_id": request_id.clone(),
+                            "origin_step_id": step_id,
                             "error": error,
                         }),
                     };
@@ -1529,7 +1559,9 @@ fn read_process_envelope(
         if line.trim().is_empty() {
             continue;
         }
-        return serde_json::from_str(&line)
+        let value = harness_contract::step::parse_strict_json(&line)
+            .map_err(|error| format!("malformed ProcessJsonl V3 envelope: {error}"))?;
+        return serde_json::from_value(value)
             .map(Some)
             .map_err(|error| format!("malformed ProcessJsonl V2 envelope: {error}"));
     }
@@ -1770,7 +1802,7 @@ mod tests {
             "protocol_version": PROCESS_JSONL_PROTOCOL_VERSION, "sequence": 1, "kind":"ready",
             "run_id":packet.run_id(), "agent_id":packet.agent_id(), "manifest_digest":spec.command_digest,
             "focus":process_focus(&packet), "model_control":"external_configured",
-            "capabilities":{"commands":["result","error"],"supports_recovery":false,
+            "capabilities":{"features":["step_binding_v1"],"commands":["result","error"],"supports_recovery":false,
                 "evidence_mode":"runtime_receipts","model_control":"external_configured"}
         });
         let bytes = format!("{ready}\n");
@@ -1785,6 +1817,14 @@ mod tests {
             .push(serde_json::json!("context_ack"));
         let bytes = format!("{ready}\n");
         assert!(read_process_ready(&mut BufReader::new(bytes.as_bytes()), &packet, &spec).is_ok());
+        let mut unsupported = ready.clone();
+        unsupported["capabilities"]["features"] = serde_json::json!([]);
+        let bytes = format!("{unsupported}\n");
+        assert!(read_process_ready(&mut BufReader::new(bytes.as_bytes()), &packet, &spec).is_err());
+        let mut legacy = ready.clone();
+        legacy["protocol_version"] = serde_json::json!(2);
+        let bytes = format!("{legacy}\n");
+        assert!(read_process_ready(&mut BufReader::new(bytes.as_bytes()), &packet, &spec).is_err());
         let mut forged = ready.clone();
         forged["agent_id"] = serde_json::json!("another-worker");
         let bytes = format!("{forged}\n");
@@ -1809,6 +1849,7 @@ mod tests {
             "focus": process_focus(&packet),
             "model_control": "external_configured",
             "capabilities": {
+                "features": ["step_binding_v1"],
                 "commands": ["result", "error", "tool_request"],
                 "supports_recovery": false,
                 "evidence_mode": "runtime_receipts",
@@ -1839,7 +1880,7 @@ mod tests {
     #[test]
     fn process_v2_rejects_identity_sequence_truncation_and_buffered_duplicate_terminal() {
         let packet = task();
-        let valid = serde_json::json!({"protocol_version":2,"sequence":2,"kind":"result",
+        let valid = serde_json::json!({"protocol_version":3,"sequence":2,"kind":"result",
             "run_id":packet.run_id(),"agent_id":packet.agent_id(),"result":completed_return(&packet)});
         for (field, value) in [
             ("run_id", serde_json::json!("foreign-run")),
@@ -1944,7 +1985,7 @@ mod tests {
             assert!(public.contains("dropped_bytes="));
         }
         let packet = task();
-        let frame = serde_json::json!({"protocol_version":2,"sequence":2,"kind":"error",
+        let frame = serde_json::json!({"protocol_version":3,"sequence":2,"kind":"error",
             "run_id":packet.run_id(),"agent_id":packet.agent_id(),"error":marker});
         let error = read_process_result(format!("{frame}\n").as_bytes(), &packet).unwrap_err();
         assert!(error.contains("worker reported error"));
@@ -2288,7 +2329,7 @@ mod tests {
         active.command_ack_supported.store(true, Ordering::Release);
         let ack = |id: &str, revision: u64, accepted: bool| -> ProcessEnvelope {
             serde_json::from_value(serde_json::json!({
-                "protocol_version": 2, "sequence": 2, "run_id": packet.run_id(),
+                "protocol_version": 3, "sequence": 2, "run_id": packet.run_id(),
                 "agent_id": packet.agent_id(), "kind": "command_ack",
                 "command_id": id, "expected_run_revision": revision, "accepted": accepted
             }))
@@ -2372,21 +2413,22 @@ mod tests {
             let packet = task();
             let spec = ProcessJsonlSpec::new("command:ack-worker", "worker.sh", vec![]);
             let ready = serde_json::json!({
-                "protocol_version": 2, "sequence": 1, "kind": "ready",
+                "protocol_version": 3, "sequence": 1, "kind": "ready",
                 "run_id": packet.run_id(), "agent_id": packet.agent_id(),
                 "manifest_digest": spec.command_digest, "focus": process_focus(&packet),
                 "model_control": "external_configured", "capabilities": {
+                "features": ["step_binding_v1"],
                     "commands": ["result", "error", "command_ack"], "supports_recovery": false,
                     "evidence_mode": "runtime_receipts", "model_control": "external_configured"
                 }
             });
             let ack = serde_json::json!({
-                "protocol_version": 2, "sequence": 2, "kind": "command_ack",
+                "protocol_version": 3, "sequence": 2, "kind": "command_ack",
                 "run_id": packet.run_id(), "agent_id": packet.agent_id(),
                 "command_id": "real-ack", "expected_run_revision": 17, "accepted": true
             });
             let result = serde_json::json!({
-                "protocol_version": 2, "sequence": 3, "kind": "result",
+                "protocol_version": 3, "sequence": 3, "kind": "result",
                 "run_id": packet.run_id(), "agent_id": packet.agent_id(), "result": completed_return(&packet)
             });
             let worker = workspace.path().join("worker.sh");
@@ -2542,7 +2584,7 @@ mod tests {
         assert!(
             result
                 .expect_err("malformed worker cannot complete")
-                .contains("malformed ProcessJsonl V2 envelope")
+                .contains("malformed ProcessJsonl V3 envelope")
         );
     }
 
@@ -2679,6 +2721,7 @@ mod tests {
             "focus": process_focus(&packet),
             "model_control": "external_configured",
             "capabilities": {
+                "features": ["step_binding_v1"],
                 "commands": ["result", "error"],
                 "supports_recovery": false,
                 "evidence_mode": "runtime_receipts",
@@ -2768,6 +2811,7 @@ mod tests {
     }
 
     struct TopicBridgeReadHost {
+        catalog: tools::ToolHost,
         source: PathBuf,
         publication: Mutex<
             Option<(
@@ -2779,6 +2823,9 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl crate::RuntimeExecutionHost for TopicBridgeReadHost {
+        fn pin_step_catalog(&self) -> Option<tools::ToolHostLease> {
+            Some(self.catalog.pin_snapshot())
+        }
         async fn execute_runtime_tool(
             &self,
             request: &crate::RuntimeToolExecutionRequest,
@@ -2941,6 +2988,7 @@ mod tests {
         let source = workspace.join("source.txt");
         std::fs::write(&source, "actual-source-body").unwrap();
         let host = Arc::new(TopicBridgeReadHost {
+            catalog: tools::ToolHost::builtin("process-topic-fixture", &workspace),
             source,
             publication: Mutex::new(None),
             reads: std::sync::atomic::AtomicUsize::new(0),
@@ -3145,6 +3193,26 @@ mod tests {
         };
         let bridge =
             Arc::new(ProcessJsonlToolSession::prepare(&services, &packet, &selection).unwrap());
+        let first = bridge.begin_step().unwrap();
+        assert_eq!(first["claim"], "runtime_boundary_only");
+        let first_step = first["step"]["identity"]["step_id"].as_str().unwrap();
+        assert_eq!(first["tools"][0]["name"], "read_file");
+        for _index in 0..16 {
+            bridge.begin_step().unwrap();
+        }
+        for step_id in ["another-run-step", first_step] {
+            assert!(bridge
+                .execute_step_tool(
+                    step_id,
+                    2,
+                    "not-admitted",
+                    "read_file",
+                    r#"{"path":"source.txt"}"#
+                )
+                .await
+                .is_err());
+        }
+        assert_eq!(host.reads.load(Ordering::SeqCst), 0);
         let read_fingerprint = process_tool_request_fingerprint(
             "tool_result",
             "read_file",
@@ -3206,12 +3274,18 @@ mod tests {
 import sys,json
 hello=json.loads(sys.stdin.readline());seq=0
 assert hello['transport_limits']==json.loads(LIMITS_JSON)
-identity={'run_id':hello['run_id'],'agent_id':hello['agent_id'],'protocol_version':2}
+identity={'run_id':hello['run_id'],'agent_id':hello['agent_id'],'protocol_version':3}
 def send(kind,**fields):
  global seq
+ if kind in ('tool_request','action_request'):
+  if not hasattr(send,'step_id'):
+   send('step_begin');bound=receive();assert bound['kind']=='step_bound',bound
+   assert bound['binding']['claim']=='runtime_boundary_only',bound
+   send.step_id=bound['binding']['step']['identity']['step_id']
+  fields['step_id']=send.step_id
  seq+=1;print(json.dumps(dict(identity,sequence=seq,kind=kind,**fields)),flush=True)
 def receive():return json.loads(sys.stdin.readline())
-send('ready',manifest_digest=hello['manifest_digest'],focus=hello['focus'],model_control='external_configured',capabilities={'commands':['result','error','tool_request','context_ack'],'supports_recovery':False,'evidence_mode':'runtime_receipts','model_control':'external_configured'})
+send('ready',manifest_digest=hello['manifest_digest'],focus=hello['focus'],model_control='external_configured',capabilities={'features':['step_binding_v1'],'commands':['step_begin','result','error','tool_request','context_ack'],'supports_recovery':False,'evidence_mode':'runtime_receipts','model_control':'external_configured'})
 start=receive();delta=start['context_delta'];assert 'initial-peer-context' in json.dumps(delta)
 assert 'process-working-context-source' in json.dumps(start['working_context'])
 for ident,tool,args in [('denied-tool','write_file',{'path':'source.txt','content':'forbidden'}),('internal','checkpoint_create',{}),('escape','read_file',{'path':'../outside.txt'})]:
@@ -3225,6 +3299,8 @@ send('context_ack',delivery_id=delta['delivery_id']);assert receive()['kind']=='
 for index in range(CACHE_SIZE+1):
  send('tool_request',request_id='cache-eviction-'+str(index),tool_name='write_file',input={'path':'source.txt','content':'forbidden'})
  assert 'error' in receive()
+send('tool_request',request_id='read-new-identity',tool_name='read_file',input={'path':'source.txt'})
+fresh=receive();assert 'error' not in fresh and 'actual-source-body' in fresh['output'],fresh
 send('tool_request',request_id='read-1',tool_name='read_file',input={'path':'source.txt'})
 reply=receive();assert reply.get('context_delta') is None,reply
 assert 'process-working-context-source' in json.dumps(reply['working_context'])
@@ -3489,7 +3565,7 @@ else:
                 .unwrap_err()
                 .contains("policy revision is stale")
         );
-        assert_eq!(host.reads.load(Ordering::SeqCst), 1);
+        assert_eq!(host.reads.load(Ordering::SeqCst), 2);
         assert!(
             actions
                 .topic_observations(
@@ -3523,12 +3599,18 @@ mod coordination_tests {
         let script=r###"#!/usr/bin/env python3
 import sys,json
 hello=json.loads(sys.stdin.readline());seq=0
-identity={'run_id':hello['run_id'],'agent_id':hello['agent_id'],'protocol_version':2}
+identity={'run_id':hello['run_id'],'agent_id':hello['agent_id'],'protocol_version':3}
 def send(kind,**fields):
  global seq
+ if kind in ('tool_request','action_request'):
+  if not hasattr(send,'step_id'):
+   send('step_begin');bound=receive();assert bound['kind']=='step_bound',bound
+   assert bound['binding']['claim']=='runtime_boundary_only',bound
+   send.step_id=bound['binding']['step']['identity']['step_id']
+  fields['step_id']=send.step_id
  seq+=1;print(json.dumps(dict(identity,sequence=seq,kind=kind,**fields)),flush=True)
 def receive(): return json.loads(sys.stdin.readline())
-send('ready',manifest_digest=hello['manifest_digest'],focus=hello['focus'],model_control='external_configured',capabilities={'commands':['result','error','action_request','context_ack'],'supports_recovery':False,'evidence_mode':'runtime_receipts','model_control':'external_configured'})
+send('ready',manifest_digest=hello['manifest_digest'],focus=hello['focus'],model_control='external_configured',capabilities={'features':['step_binding_v1'],'commands':['step_begin','result','error','action_request','context_ack'],'supports_recovery':False,'evidence_mode':'runtime_receipts','model_control':'external_configured'})
 start=receive();packet=start['packet'];binding=packet['agentic_binding'];wake=binding['focus']['wake_ref']
 assert 'Check the boundary condition in source A' in packet['objective']
 delta=start.get('context_delta')
@@ -3628,13 +3710,19 @@ send('result',result=json.loads(RESULT_JSON))
         let script = r###"#!/usr/bin/env python3
 import sys,json,traceback
 hello=json.loads(sys.stdin.readline());seq=0
-identity={'run_id':hello['run_id'],'agent_id':hello['agent_id'],'protocol_version':2}
+identity={'run_id':hello['run_id'],'agent_id':hello['agent_id'],'protocol_version':3}
 def send(kind,**fields):
  global seq
+ if kind in ('tool_request','action_request'):
+  if not hasattr(send,'step_id'):
+   send('step_begin');bound=receive();assert bound['kind']=='step_bound',bound
+   assert bound['binding']['claim']=='runtime_boundary_only',bound
+   send.step_id=bound['binding']['step']['identity']['step_id']
+  fields['step_id']=send.step_id
  seq+=1;print(json.dumps(dict(identity,sequence=seq,kind=kind,**fields)),flush=True)
 def receive(): return json.loads(sys.stdin.readline())
 try:
- send('ready',manifest_digest=hello['manifest_digest'],focus=hello['focus'],model_control='external_configured',capabilities={'commands':['result','error','action_request','context_ack'],'supports_recovery':False,'evidence_mode':'runtime_receipts','model_control':'external_configured'})
+ send('ready',manifest_digest=hello['manifest_digest'],focus=hello['focus'],model_control='external_configured',capabilities={'features':['step_binding_v1'],'commands':['step_begin','result','error','action_request','context_ack'],'supports_recovery':False,'evidence_mode':'runtime_receipts','model_control':'external_configured'})
  start=receive();packet=start['packet']
  delta=start.get('context_delta')
  if delta:

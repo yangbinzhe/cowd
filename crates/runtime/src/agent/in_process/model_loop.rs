@@ -7,15 +7,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
     }
 
     fn capabilities(&self) -> AgentBackendCapabilities {
-        AgentBackendCapabilities {
-            backend: AgentBackendKind::InProcess,
-            supports_input: true,
-            supports_interrupt: true,
-            supports_pause: false,
-            supports_resume: false,
-            supports_cancel: true,
-            supports_shutdown: true,
-        }
+        AgentBackendCapabilities::in_process()
     }
 
     async fn execute(

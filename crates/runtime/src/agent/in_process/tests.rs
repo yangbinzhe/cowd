@@ -11,6 +11,198 @@ use harness_contract::turn::TurnId;
 use sha2::{Digest, Sha256};
 
 #[tokio::test]
+async fn scoped_expired_receipt_replays_without_loading_or_dispatching_an_adapter() {
+    struct ReceiptOnlyHost;
+    #[async_trait::async_trait]
+    impl crate::RuntimeExecutionHost for ReceiptOnlyHost {
+        fn pin_step_catalog(&self) -> Option<tools::ToolHostLease> {
+            panic!("receipt query must not load an adapter");
+        }
+        async fn execute_runtime_tool(
+            &self,
+            _: &crate::RuntimeToolExecutionRequest,
+        ) -> crate::RuntimeToolExecutionOutcome {
+            panic!("receipt query must not dispatch");
+        }
+    }
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("proof.txt"), "original proof").unwrap();
+    let host = tools::ToolHost::builtin("receipt-fixture", workspace.path())
+        .with_authorization_lease_verifier(Arc::new(|_| true));
+    let lease = host.pin_snapshot();
+    let definitions = lease
+        .snapshot()
+        .catalog
+        .definitions(None)
+        .into_iter()
+        .filter(|definition| definition.name == "read_file")
+        .map(|definition| crate::ProviderToolDefinition {
+            name: definition.name,
+            description: definition.description,
+            input_schema: definition.input_schema,
+        })
+        .collect::<Vec<_>>();
+    let step = Arc::new(crate::step_snapshot::BoundStep::bind(serde_json::from_value(serde_json::json!({
+        "step_id":"native-receipt-step", "session_id":"session", "turn_id":"turn", "execution_id":"graph", "build_ref":"isolated-fixture"
+    })).unwrap(), lease, &definitions, &serde_json::json!({}), &serde_json::json!({}), BTreeMap::new(), 10).unwrap());
+    let binding = crate::step_snapshot::StepCallBinding::provider(step.clone(), "read-once");
+    let commits =
+        crate::ExecutionCommitService::new(Arc::new(crate::RuntimeEventStore::for_test()));
+    let mut graph = harness_contract::execution_graph::ExecutionGraph::new("receipt fixture");
+    graph.id = "graph".into();
+    graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+        session_id: "session".into(),
+        turn_id: "turn".into(),
+        root_task_id: "task".into(),
+        task_id: "task".into(),
+        generation: 1,
+    });
+    for node_id in ["reader", "other"] {
+        let mut node = harness_contract::execution_graph::ExecutionNodeSpec::new(
+            harness_contract::execution_graph::ExecutionNodeKind::InlineModel,
+            "inline_model",
+            "fixture",
+        );
+        node.id = node_id.into();
+        graph.nodes.push(node);
+    }
+    commits.register_graph(graph).unwrap();
+    let mut executor = ScopedRuntimeToolExecutor {
+        tool_batch: None,
+        host: Arc::new(ReceiptOnlyHost),
+        allowed_tools: BTreeSet::from(["read_file".into()]),
+        session_id: "session".into(),
+        sandbox_posture: harness_contract::policy::SandboxPosture::ReadOnlySandbox,
+        policy_revision: 1,
+        memory_context: memory::MemoryTurnContext::new("session", "agent"),
+        reality_context: None,
+        model_lease: "fixture".into(),
+        execution_id: "graph".into(),
+        node_id: "reader".into(),
+        attempt: 1,
+        workspace_root: workspace.path().into(),
+        path_identity_resolver: Arc::new(
+            crate::path_identity::WorkspacePathIdentityResolver::discover(workspace.path())
+                .unwrap(),
+        ),
+        scope_locks: Arc::new(ScopeLockManager::new()),
+        commit_service: Some(commits.clone()),
+        resource_scopes: Some(vec!["read:.".into()]),
+        managed_invocation: None,
+        next_receipt_sequence: AtomicU64::new(0),
+        receipts: Mutex::new(vec![]),
+        provider_model_obligations: vec![],
+    };
+    let raw = r#"{"path":"proof.txt"}"#;
+    let input = normalize_delegated_resource_paths(
+        "read_file",
+        raw,
+        workspace.path(),
+        &executor.path_identity_resolver,
+        executor.resource_scopes.as_deref(),
+    )
+    .unwrap();
+    let value = step
+        .validate_call(
+            &binding.origin,
+            "session",
+            "read-once",
+            "read_file",
+            &input,
+            1,
+        )
+        .unwrap();
+    let descriptor = step.lease().describe_effect("read_file", &value);
+    let effective =
+        crate::AuthorizationNegotiator::compile_effective_descriptor(&descriptor, &input);
+    let authorization = crate::ToolPolicy
+        .authorize(
+            &effective,
+            &test_capability_assessment(&descriptor, PermissionMode::ReadOnly),
+            "read-once",
+            test_authorization_lease(&descriptor, PermissionMode::ReadOnly, "read-once"),
+            30,
+        )
+        .unwrap()
+        .authorization;
+    let output = step
+        .lease()
+        .execute(&authorization, "read_file", &value)
+        .unwrap();
+    assert!(output.contains("original proof"));
+    let mut request =
+        crate::RuntimeToolExecutionRequest::from_tool_request(&crate::tool_dispatch::ToolRequest {
+            tool_use_id: "read-once".into(),
+            tool_name: "read_file".into(),
+            input: input.clone(),
+            depends_on: vec![],
+        });
+    request.session_id = Some("session".into());
+    request.policy_revision = 1;
+    request.idempotency_key = binding.effect_idempotency_key();
+    request.parent_execution = Some(harness_contract::execution_graph::ExecutionParentBinding {
+        execution_id: "graph".into(),
+        node_id: "reader".into(),
+    });
+    request.compiled_invocation = Some(
+        binding
+            .prepare_invocation(Some(host.pin_snapshot()), "read_file", &value)
+            .unwrap(),
+    );
+    request.step_binding = Some(binding.clone());
+    commits
+        .commit_readonly_tool_receipts(&[(
+            request,
+            crate::RuntimeToolExecutionOutcome {
+                tool_use_id: "read-once".into(),
+                tool_name: "read_file".into(),
+                status: crate::RuntimeToolExecutionStatus::Executed,
+                category: crate::ToolSafetyCategory::ReadOnly,
+                output: Some(output.clone()),
+                error: None,
+                evidence_ref: "fixture-read".into(),
+                observed_evidence: vec![],
+            },
+        )])
+        .unwrap();
+    let mut call = crate::conversation::ModelToolCall {
+        id: "read-once".into(),
+        name: "read_file".into(),
+        input: raw.into(),
+        depends_on: vec![],
+        binding: Some(serde_json::from_value(serde_json::to_value(binding).unwrap()).unwrap()),
+    };
+    host.replace_snapshot(host.pin_snapshot().snapshot().clone());
+    assert!(call
+        .binding
+        .as_ref()
+        .unwrap()
+        .resolve(Some(host.pin_snapshot()))
+        .is_err());
+    std::fs::write(
+        workspace.path().join("proof.txt"),
+        "changed after the original read",
+    )
+    .unwrap();
+    let replay = executor
+        .recover_step_tool_receipt(&call)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay.1.output.as_deref(), Some(output.as_str()));
+    executor.node_id = "other".into();
+    assert!(executor.recover_step_tool_receipt(&call).await.is_err());
+    executor.node_id = "reader".into();
+    call.input = r#"{"path":"other.txt"}"#.into();
+    assert!(executor.recover_step_tool_receipt(&call).await.is_err());
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("proof.txt")).unwrap(),
+        "changed after the original read"
+    );
+    assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 1);
+}
+
+#[tokio::test]
 async fn native_coordination_model_loop_consumes_wake_once() {
     native_coordination_wire(false, false).await;
 }
@@ -1202,13 +1394,18 @@ async fn runtime_artifact_materialization_uses_registered_write_classification()
         .authorization;
     assert_eq!(
         executor
-            .execute_delegated_runtime_tool("artifact_materialize", input, authorization.clone())
+            .execute_delegated_runtime_tool(
+                "artifact_materialize",
+                input,
+                authorization.clone(),
+                None
+            )
             .await
             .unwrap(),
         "authorized:artifact_materialize"
     );
     assert!(executor
-        .execute_delegated_runtime_tool("unregistered", input, authorization.clone())
+        .execute_delegated_runtime_tool("unregistered", input, authorization.clone(), None)
         .await
         .unwrap_err()
         .to_string()
@@ -1226,7 +1423,7 @@ async fn runtime_artifact_materialization_uses_registered_write_classification()
     // With a production dispatcher, an absent parent fails admission. The
     // compatibility Echo host must no longer return a successful direct call.
     assert!(executor
-        .execute_delegated_runtime_tool("artifact_materialize", input, authorization)
+        .execute_delegated_runtime_tool("artifact_materialize", input, authorization, None)
         .await
         .is_err());
 }

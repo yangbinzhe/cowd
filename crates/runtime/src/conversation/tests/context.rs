@@ -687,6 +687,7 @@
         let mut api = RuntimeAwareApi(Arc::clone(&observed_runtime));
         let events = api
             .stream_collect(ApiRequest {
+                bound_step: None,
                 prompt: PromptAssembly::default(),
                 messages: Vec::new().into(),
                 model: "test".to_string(),
@@ -1827,6 +1828,7 @@
     fn stable_prefix_metrics_track_wire_identity_and_provider_native_cache() {
         let mut metrics = TurnStablePrefixMetrics::default();
         let request = |dynamic: &str, cache_hit| ApiRequest {
+            bound_step: None,
             prompt: PromptAssembly::new(vec![
                 "stable identity".to_string(),
                 "stable policy".to_string(),
@@ -3377,7 +3379,16 @@
     #[tokio::test]
     async fn provider_interruption_retains_completed_early_read_receipt() {
         let dispatcher = Arc::new(RecordingEarlyDispatcher::default());
+        let dispatch_counter = Arc::clone(&dispatcher);
         let store = Arc::new(RuntimeEventStore::for_test());
+        let workspace = tempfile::tempdir().unwrap();
+        let host = tools::ToolHost::builtin("early-fixture", workspace.path());
+        let lease = host.pin_snapshot();
+        let definitions = lease.snapshot().catalog.definitions(None).into_iter().filter(|definition| definition.name == "read_file")
+            .map(|definition| crate::ProviderToolDefinition { name: definition.name, description: definition.description, input_schema: definition.input_schema }).collect::<Vec<_>>();
+        let bound = Arc::new(crate::step_snapshot::BoundStep::bind(serde_json::from_value(serde_json::json!({
+            "step_id":"early-origin", "session_id":"session-interrupted-early", "turn_id":"early-turn", "build_ref":"isolated-fixture"
+        })).unwrap(), lease, &definitions, &serde_json::json!({}), &serde_json::json!({}), std::collections::BTreeMap::new(), i64::MAX).unwrap());
         let events = vec![
             Ok(early_enabled_provider_event()),
             Ok(AssistantEvent::ItemStarted {
@@ -3391,6 +3402,9 @@
                 input: r#"{"path":"README.md","limit":20}"#.to_string(),
             }),
             Ok(AssistantEvent::ItemCompleted { index: 0 }),
+            Ok(AssistantEvent::ItemStarted {
+                index: 1, provider_item_id: Some("incomplete-call".to_string()), kind: AssistantItemKind::ToolCall,
+            }),
             Err(RuntimeError::new("provider transport interrupted")),
         ];
 
@@ -3402,13 +3416,18 @@
                 None,
                 Some(Arc::clone(&store)),
                 "session-interrupted-early".to_string(),
-            ),
+            ).with_bound_step(Some(Arc::clone(&bound))),
             Some(dispatcher),
         )
         .await;
 
         assert!(result.failure.is_some());
         assert_eq!(result.collected.early_tool_receipts.len(), 1);
+        assert_eq!(dispatch_counter.dispatches.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let binding = result.collected.early_tool_receipts[0].call.binding.as_ref().unwrap();
+        assert_eq!(binding.snapshot.identity.step_id, "early-origin");
+        assert_eq!(binding.origin, bound.provider_origin("read-before-interrupt"));
+        assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 0);
         assert_eq!(
             result.collected.early_tool_receipts[0].call.id,
             "read-before-interrupt"
@@ -3539,6 +3558,7 @@
         };
         let candidate = EarlyToolCandidate {
             call: ModelToolCall {
+                binding: None,
                 id: "call".to_string(),
                 name: "read_file".to_string(),
                 input: r#"{"path":"README.md"}"#.to_string(),

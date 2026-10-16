@@ -516,6 +516,41 @@ pub(super) fn agent_autonomy_checkpoint(
 
 #[async_trait::async_trait]
 impl ToolExecutor for ScopedRuntimeToolExecutor {
+    fn pin_step_catalog(&self) -> Option<tools::ToolHostLease> {
+        self.host.pin_step_catalog()
+    }
+
+    async fn recover_step_tool_receipt(
+        &self,
+        call: &crate::conversation::ModelToolCall,
+    ) -> Result<Option<(harness_contract::tool::GovernedToolInvocation, crate::RuntimeToolExecutionOutcome, u64)>, ToolError> {
+        let Some((binding, commit)) = call.binding.as_ref().zip(self.commit_service.as_ref()) else { return Ok(None); };
+        if !self.allowed_tools.contains(&call.name) { return Err(ToolError::new("receipt tool is outside the bound Agent allow-list")); }
+        harness_contract::step::parse_strict_json(&call.input).map_err(|error| ToolError::new(error.to_string()))?;
+        let input = normalize_delegated_resource_paths(&call.name, &call.input, &self.workspace_root,
+            &self.path_identity_resolver, self.resource_scopes.as_deref())?;
+        let mut request = RuntimeToolExecutionRequest::from_tool_request(&crate::tool_dispatch::ToolRequest {
+            tool_use_id: call.id.clone(), tool_name: call.name.clone(), input, depends_on: call.depends_on.clone(),
+        });
+        request.session_id = Some(self.session_id.clone());
+        request.policy_revision = self.policy_revision;
+        request.parent_execution = Some(harness_contract::execution_graph::ExecutionParentBinding {
+            execution_id: self.execution_id.clone(), node_id: self.node_id.clone(),
+        });
+        request.step_binding = Some(binding.clone());
+        request.idempotency_key = binding.effect_idempotency_key();
+        let Some(replay) = commit.query_completed_agent_tool_effect(&request).map_err(|error| ToolError::new(error.to_string()))? else { return Ok(None); };
+        if let Some(scopes) = &self.resource_scopes {
+            let requested = crate::governed_tool_plan::resource_scope_from_effect(&replay.invocation.effect);
+            for path in &requested.paths {
+                if !resource_path_is_authorized(&self.path_identity_resolver, path, scopes, false) {
+                    return Err(ToolError::new("receipt read is outside the bound Agent resource lease"));
+                }
+            }
+        }
+        Ok(Some((replay.invocation, replay.outcome, replay.completed_at_ms)))
+    }
+
     async fn execute_output(
         &self,
         tool_name: &str,
@@ -661,7 +696,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
         }
         if tool_name == "checkpoint" {
             return self
-                .execute_internal_checkpoint(input, authorization.clone())
+                .execute_internal_checkpoint(input, authorization.clone(), None)
                 .await
                 .map(|output| delegated_tool_draft(output, None));
         }
@@ -684,7 +719,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
                 ));
             }
             return self
-                .execute_delegated_runtime_tool(tool_name, input, authorization.clone())
+                .execute_delegated_runtime_tool(tool_name, input, authorization.clone(), None)
                 .await
                 .map(|output| delegated_tool_draft(output, None));
         }
@@ -768,8 +803,28 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
         tool_name: &str,
         input: &str,
     ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
-        if tool_name == "checkpoint"
-            || matches!(
+        self.execute_step_authorized_invocation_output(None, provider_invocation_id, authorization, tool_name, input).await
+    }
+
+    async fn execute_step_authorized_invocation_output(
+        &self,
+        binding: Option<&crate::step_snapshot::StepCallBinding>,
+        provider_invocation_id: &str,
+        authorization: &harness_contract::tool::ToolExecutionAuthorization,
+        tool_name: &str,
+        input: &str,
+    ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+        if binding.is_none() && self.host.pin_step_catalog().is_some() {
+            return Err(ToolError::new("production_tool_origin_required"));
+        }
+        if tool_name == "checkpoint" {
+            if binding.is_some_and(|binding| !matches!(binding.origin.source, harness_contract::step::CallSource::SystemDerived { .. })) {
+                return Err(ToolError::new("checkpoint requires a Runtime SystemDerived origin"));
+            }
+            return self.execute_internal_checkpoint(input, authorization.clone(), binding).await
+                .map(|output| delegated_tool_draft(output, None));
+        }
+        if matches!(
                 tool_name,
                 "evidence_retrieve"
                     | "working_context"
@@ -782,9 +837,14 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
             // Pointer-based tools (working_context / evidence_retrieve /
             // artifact_publish) already hand the model a ref, so the generic
             // retrieval hint is correct for them.
-            return self
-                .execute_authorized_output(authorization, tool_name, input)
-                .await;
+            if binding.is_some() && tool_name != "checkpoint" {
+                if authorization.tool_id != tool_name || !self.allowed_tools.contains(tool_name) {
+                    return Err(ToolError::new("agent tool authorization does not match the allowed tool request"));
+                }
+                return self.execute_delegated_runtime_tool(tool_name, input, authorization.clone(), binding)
+                    .await.map(|output| delegated_tool_draft(output, Some(provider_invocation_id)));
+            }
+            return self.execute_authorized_output(authorization, tool_name, input).await;
         }
         if authorization.tool_id != tool_name || !self.allowed_tools.contains(tool_name) {
             return Err(ToolError::new(
@@ -800,11 +860,12 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
             self.resource_scopes.as_deref(),
         )?;
         self.enforce_resource_ceiling(tool_name, &normalized_input)?;
-        self.execute_scoped(
+        self.execute_scoped_bound(
             tool_name,
             &normalized_input,
             Some(authorization.clone()),
             Some(provider_invocation_id),
+            binding,
         )
         .await
         .map(|output| delegated_tool_draft(output, Some(provider_invocation_id)))

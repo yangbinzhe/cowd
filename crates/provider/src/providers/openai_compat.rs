@@ -413,7 +413,7 @@ impl OpenAiCompatClient {
                             error,
                         )
                     })?;
-                normalize_responses_response(&request.model, payload)
+                normalize_responses_response(&request.model, payload)?
             }
         };
         if normalized.request_id.is_none() {
@@ -2348,7 +2348,7 @@ fn normalize_chat_completion_response(
         content.push(OutputContentBlock::ToolUse {
             id: tool_call.id,
             name: tool_call.function.name,
-            input: parse_tool_arguments(&tool_call.function.arguments),
+            input: parse_tool_arguments(&tool_call.function.arguments)?,
         });
     }
 
@@ -2391,7 +2391,7 @@ fn normalize_chat_completion_response(
     })
 }
 
-fn normalize_responses_response(model: &str, response: ResponsesApiResponse) -> MessageResponse {
+fn normalize_responses_response(model: &str, response: ResponsesApiResponse) -> Result<MessageResponse, ApiError> {
     let usage_observed = response.usage.is_some();
     let cache_dimensions_observed = response
         .usage
@@ -2418,7 +2418,7 @@ fn normalize_responses_response(model: &str, response: ResponsesApiResponse) -> 
                         .or(item.id)
                         .unwrap_or_else(|| "call_0".to_string()),
                     name: item.name.unwrap_or_else(|| "unknown_tool".to_string()),
-                    input: parse_tool_arguments(item.arguments.as_deref().unwrap_or("{}")),
+                    input: parse_tool_arguments(item.arguments.as_deref().unwrap_or("{}"))?,
                 });
             }
             "reasoning" => {
@@ -2435,7 +2435,7 @@ fn normalize_responses_response(model: &str, response: ResponsesApiResponse) -> 
             _ => {}
         }
     }
-    MessageResponse {
+    Ok(MessageResponse {
         id: response.id,
         kind: "message".to_string(),
         role: "assistant".to_string(),
@@ -2459,14 +2459,12 @@ fn normalize_responses_response(model: &str, response: ResponsesApiResponse) -> 
         usage_observed,
         cache_dimensions_observed,
         request_id: None,
-    }
+    })
 }
 
-fn parse_tool_arguments(arguments: &str) -> Value {
-    match serde_json::from_str(arguments) {
-        Ok(value) => value,
-        Err(_) => repair_truncated_json(arguments).unwrap_or_else(|| json!({ "raw": arguments })),
-    }
+fn parse_tool_arguments(arguments: &str) -> Result<Value, ApiError> {
+    harness_contract::step::parse_strict_json(arguments).map_err(|_| ApiError::CompatibilityToolProtocol(
+        crate::CompatibilityToolProtocolFailure::MalformedFrame))
 }
 
 /// Repair an unbalanced/truncated JSON object or array left open by a stream
@@ -2661,7 +2659,7 @@ fn parse_dsml_tool_calls(
             let value = if is_string {
                 Value::String(value.to_string())
             } else {
-                serde_json::from_str(value).map_err(|_| CompatToolFrameError::InvalidArguments)?
+                harness_contract::step::parse_strict_json(value).map_err(|_| CompatToolFrameError::InvalidArguments)?
             };
             if input.insert(parameter_name, value).is_some() {
                 return Err(CompatToolFrameError::DuplicateParameter);
@@ -2728,24 +2726,22 @@ fn parse_legacy_parameter_attributes(source: &str) -> Result<(String, bool), Com
 /// One legacy parameter value. A declared string stays literal; otherwise
 /// a value that opens an object or array is decoded as JSON so a batch of
 /// actions survives the frame, and anything else stays a plain string.
-fn decode_legacy_parameter_value(raw: &str, is_string: bool) -> serde_json::Value {
+fn decode_legacy_parameter_value(raw: &str, is_string: bool) -> Result<serde_json::Value, CompatToolFrameError> {
     if is_string {
-        return serde_json::Value::String(raw.to_string());
+        return Ok(serde_json::Value::String(raw.to_string()));
     }
     let trimmed = raw.trim();
     if trimmed.starts_with('{') || trimmed.starts_with('[') {
-        if let Ok(value) = serde_json::from_str(trimmed) {
-            return value;
-        }
+        return harness_contract::step::parse_strict_json(trimmed).map_err(|_| CompatToolFrameError::InvalidArguments);
     }
-    serde_json::Value::String(raw.to_string())
+    Ok(serde_json::Value::String(raw.to_string()))
 }
 
 /// The single JSON object body some models emit inside the legacy envelope.
 /// Returns None when the body is not one object so the caller can fall
 /// through to the element form.
 fn legacy_json_body_call(body: &str) -> Option<DsmlToolCall> {
-    let value: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+    let value = harness_contract::step::parse_strict_json(body.trim()).ok()?;
     let object = value.as_object()?;
     let name = object
         .get("name")
@@ -2822,7 +2818,7 @@ fn parse_legacy_tool_calls(
                     .split_once(LEGACY_PARAMETER_CLOSE)
                     .ok_or(CompatToolFrameError::Unterminated)?;
                 if input
-                    .insert(parameter_name, decode_legacy_parameter_value(value, is_string))
+                    .insert(parameter_name, decode_legacy_parameter_value(value, is_string)?)
                     .is_some()
                 {
                     return Err(CompatToolFrameError::DuplicateParameter);
@@ -4323,22 +4319,26 @@ mod tests {
     #[test]
     fn parses_tool_arguments_fallback() {
         assert_eq!(
-            parse_tool_arguments("{\"city\":\"Paris\"}"),
+            parse_tool_arguments("{\"city\":\"Paris\"}").unwrap(),
             json!({"city": "Paris"})
         );
-        assert_eq!(parse_tool_arguments("not-json"), json!({"raw": "not-json"}));
-        // Truncated-but-recoverable stream cuts are repaired conservatively.
-        assert_eq!(
-            parse_tool_arguments("{\"city\":\"Par"),
-            json!({"city": "Par"})
-        );
-        assert_eq!(parse_tool_arguments("{\"a\":[1,2"), json!({"a": [1, 2]}));
-        assert_eq!(parse_tool_arguments("{\"a\":1,"), json!({"a": 1}));
-        // Balanced-but-invalid input is never guessed.
-        assert_eq!(
-            parse_tool_arguments("{\"a\":}"),
-            json!({"raw": "{\"a\":}"})
-        );
+        for input in ["not-json", "{\"city\":\"Par", "{\"a\":[1,2", "{\"a\":1,", "{\"a\":}",
+            "{\"a\":1,\"a\":2}", "{\"a\":9007199254740992}"] {
+            assert!(parse_tool_arguments(input).is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn compatibility_frames_do_not_launder_nested_duplicate_keys_or_truncated_arguments() {
+        let exposed = std::collections::BTreeSet::from(["fixture".to_string()]);
+        for body in [r#"{"x":1,"x":2}"#, r#"{"id":9007199254740992}"#, r#"{"x":1"#] {
+            for frame in [
+                format!(r#"<tool_call>{{"name":"fixture","arguments":{body}}}</tool_call>"#),
+                format!(r#"<tool_call><function=fixture><parameter=payload>{body}</parameter></function></tool_call>"#),
+            ] {
+                assert!(parse_compat_tool_calls(&frame, &exposed).is_err(), "{frame}");
+            }
+        }
     }
 
     #[test]

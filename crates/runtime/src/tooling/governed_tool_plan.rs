@@ -142,6 +142,8 @@ pub struct ToolConflict {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GovernedToolPlanTask {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_binding: Option<crate::step_snapshot::StepCallBinding>,
     pub original_call_index: usize,
     pub contract_version: u32,
     pub tool_call_id: String,
@@ -598,6 +600,7 @@ impl ValidatedGovernedToolDag {
             }
             let resource_demand = resource_demand_from_effect(&effect);
             let invocation = GovernedToolInvocation {
+                origin: None,
                 contract_version: GOVERNED_TOOL_PLAN_CONTRACT_VERSION,
                 invocation_id: request.tool_use_id.clone(),
                 intent: ToolIntent {
@@ -622,6 +625,7 @@ impl ValidatedGovernedToolDag {
                 idempotency_key: tool_plan_idempotency_key(request),
             };
             tasks.push(GovernedToolPlanTask {
+                step_binding: None,
                 original_call_index,
                 contract_version: GOVERNED_TOOL_PLAN_CONTRACT_VERSION,
                 tool_call_id: request.tool_use_id.clone(),

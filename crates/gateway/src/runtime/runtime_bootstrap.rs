@@ -425,39 +425,7 @@ pub(crate) fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition
         effect_resolver: runtime_effect_resolver("runtime.agent_action"),
     });
     definitions.extend(agent_action_tool_definitions());
-    attach_input_examples(definitions)
-}
-
-/// Append a schema-derived example to every tool that has fields to fill in.
-///
-/// A contract that only *describes* its input asks the model to synthesize a
-/// shape, and that is the thing it does least reliably: one live run emitted
-/// `{"actions": "[{\"input\": {...}}]"}` four times - every mission and
-/// acceptance present, the `{tool, input}` envelope never - and being told
-/// "each entry must be {tool, input}" did not fix it. codex and opencode both
-/// put a complete literal example in their patch-tool contract for exactly this
-/// reason.
-///
-/// The example is generated from the schema the tool already advertises, so it
-/// cannot drift from the contract it illustrates, and adding a field or a
-/// variant needs no edit here. Tools with nothing to fill in are left alone: an
-/// example of `{}` is noise a model learns to skip.
-fn attach_input_examples(definitions: Vec<RuntimeToolDefinition>) -> Vec<RuntimeToolDefinition> {
-    definitions
-        .into_iter()
-        .map(|mut definition| {
-            if let Some(example) =
-                harness_contract::tool_input_contract::input_example(&definition.input_schema)
-            {
-                let rendered =
-                    serde_json::to_string(&example).unwrap_or_else(|_| example.to_string());
-                let description = definition.description.unwrap_or_default();
-                definition.description =
-                    Some(format!("{description}\n\nExample input: {rendered}"));
-            }
-            definition
-        })
-        .collect()
+    runtime::tool_contracts::attach_input_examples(definitions)
 }
 
 /// The batch tool's schema, with one contract line per dispatchable action.
@@ -817,6 +785,36 @@ fn runtime_hook_config_from_plugin_hooks(hooks: PluginHooks) -> runtime::Runtime
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn advertised_examples_satisfy_the_pinned_syntactic_contract() {
+        let mut definitions = runtime_capability_tool_definitions();
+        definitions.extend(mcp_wrapper_tool_definitions());
+        let catalog = GatewayToolRegistry::builtin().with_runtime_tools(definitions).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let host = tools::ToolHost::new("example-contract-fixture", workspace.path(), tools::ToolHostSnapshot::new(
+            Arc::new(catalog), Arc::new(tools::lsp_client::LspRegistry::default()), None,
+        ));
+        let lease = host.pin_snapshot();
+        let unavailable = lease.catalog_receipt().descriptors.into_iter().filter(|descriptor|
+            descriptor.health == harness_contract::tool::ToolDescriptorHealth::Unavailable)
+            .map(|descriptor| descriptor.canonical_id).collect::<std::collections::BTreeSet<_>>();
+        let advertised = lease.snapshot().catalog.definitions(None).into_iter().filter(|definition| !unavailable.contains(&definition.name)).map(|definition| runtime::ProviderToolDefinition {
+            name: definition.name, description: definition.description, input_schema: definition.input_schema,
+        }).collect::<Vec<_>>();
+        runtime::step_snapshot::BoundStep::bind(harness_contract::step::StepIdentity {
+            step_id: "step:all-registered-tools".into(), session_id: "session:fixture".into(), turn_id: "turn:fixture".into(),
+            execution_id: None, actor_ref: Some("fixture".into()), run_ref: None, attempt: None, epoch: None,
+            goal_ref: None, program_ref: None, task_ref: None, build_ref: "isolated-test-fixture".into(),
+        }, lease.clone(), &advertised, &json!({}), &json!({}), Default::default(), i64::MAX).unwrap();
+        let failures = lease.snapshot().catalog.definitions(None).into_iter().filter_map(|definition| {
+            let example = harness_contract::tool_input_contract::input_example(&definition.input_schema)?;
+            lease.validate_input(&definition.name, &example).err()
+                .map(|error| format!("{}: {error}; example={example}", definition.name))
+        }).collect::<Vec<_>>();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
 
     #[test]
     fn runtime_capability_tool_is_always_registered_as_readonly() {

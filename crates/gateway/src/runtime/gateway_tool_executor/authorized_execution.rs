@@ -22,8 +22,14 @@ impl GatewayToolExecutor {
         tool_name: &str,
         input: &str,
         progress: Option<&std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
+        step_lease: Option<tools::ToolHostLease>,
     ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
-        let tool_name = <Self as ToolExecutor>::resolve_tool_name(self, tool_name)
+        let is_step_bound = step_lease.is_some();
+        let lease = step_lease.unwrap_or_else(|| self.tool_host.pin_snapshot());
+        let tool_name = lease
+            .snapshot()
+            .catalog
+            .canonical_name(tool_name)
             .ok_or_else(|| ToolError::new(format!("tool `{tool_name}` is not registered")))?;
         let value: serde_json::Value = serde_json::from_str(input)
             .map_err(|error| self.input_contract_error(&tool_name, error))?;
@@ -33,8 +39,7 @@ impl GatewayToolExecutor {
             || is_gateway_context_tool(&tool_name)
         {
             if tool_name != "tool_search" {
-                self.tool_host
-                    .pin_snapshot()
+                lease
                     .validate_authorization(authorization, &tool_name, &value)
                     .map_err(|error| ToolError::new(error.to_string()))?;
             }
@@ -43,6 +48,7 @@ impl GatewayToolExecutor {
                     &tool_name,
                     value,
                     RuntimeToolExecutionBinding {
+                        tool_lease: is_step_bound.then_some(&lease),
                         action_id: None,
                         session_id: self.runtime_session_id.as_deref(),
                         authorized_scopes: &[],
@@ -57,12 +63,10 @@ impl GatewayToolExecutor {
                 .await
                 .map(harness_contract::context::ToolOutputDraft::bounded_inline);
         }
-        let tool_host = Arc::clone(&self.tool_host);
         let authorization = authorization.clone();
         let output = if tool_name == "bash" {
             let progress = progress.cloned();
-            tool_host
-                .pin_snapshot()
+            lease
                 .execute_async_with_progress(
                     &authorization,
                     &tool_name,
@@ -83,8 +87,7 @@ impl GatewayToolExecutor {
                 .map_err(|error| ToolError::new(error.to_string()))?
         } else {
             runtime::ToolExecutionPlane::adapt_blocking(move || {
-                tool_host
-                    .pin_snapshot()
+                lease
                     .execute(&authorization, &tool_name, &value)
                     .map_err(|error| ToolError::new(error.to_string()))
             })

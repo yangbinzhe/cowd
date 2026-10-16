@@ -66,6 +66,7 @@ pub(crate) fn run_deep_real_provider_review(
         "user_prompt_summary": summarize_text(&prompt, 1200)
     });
     let request = runtime::ApiRequest {
+        bound_step: None,
         prompt: runtime::PromptAssembly::new(vec![
             "You are the AI reviewer for Cowd AI Harness deep-real evaluation.".to_string(),
             "Generate concise but evidence-based Markdown. Do not claim capabilities not supported by the report seed.".to_string(),

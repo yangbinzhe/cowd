@@ -133,6 +133,7 @@ pub fn run_provider_cache_calibration(
             0,
         );
         let request = runtime::ApiRequest {
+            bound_step: None,
             prompt: runtime::PromptAssembly::new(stable_sections.clone()),
             messages: history.clone().into(),
             model: options.model.clone(),

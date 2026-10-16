@@ -41,7 +41,7 @@ provider = { path = "../provider" }
 tools = { path = "../tools" }
 sandbox-launcher = { path = "../sandbox-launcher" }
 regex = "1"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json.workspace = true
 serde_yaml.workspace = true
 schemars.workspace = true

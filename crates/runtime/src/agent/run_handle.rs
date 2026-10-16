@@ -8,9 +8,20 @@ pub enum AgentBackendKind {
     ProcessJsonl,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepRenderAssurance {
+    NativeWireEvidence,
+    RuntimeBoundaryOnly,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentBackendCapabilities {
     pub backend: AgentBackendKind,
+    #[serde(default)]
+    pub declares_step_binding_v1: bool,
+    #[serde(default)]
+    pub declared_render_assurance: Option<StepRenderAssurance>,
     pub supports_input: bool,
     pub supports_interrupt: bool,
     pub supports_pause: bool,
@@ -24,6 +35,8 @@ impl AgentBackendCapabilities {
     pub const fn in_process() -> Self {
         Self {
             backend: AgentBackendKind::InProcess,
+            declares_step_binding_v1: true,
+            declared_render_assurance: Some(StepRenderAssurance::NativeWireEvidence),
             // Supplemental input enters the child SessionInputStream and is
             // consumed at the same checkpoints as a primary turn. Pause and
             // resume remain unavailable until a persisted checkpoint can be
@@ -41,6 +54,8 @@ impl AgentBackendCapabilities {
     pub const fn process_jsonl() -> Self {
         Self {
             backend: AgentBackendKind::ProcessJsonl,
+            declares_step_binding_v1: true,
+            declared_render_assurance: Some(StepRenderAssurance::RuntimeBoundaryOnly),
             supports_input: true,
             supports_interrupt: true,
             supports_pause: false,

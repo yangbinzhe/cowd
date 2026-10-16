@@ -135,6 +135,12 @@ pub enum ToolEffectState {
     Uncertain,
 }
 
+pub(crate) struct ToolReceiptReplay {
+    pub invocation: harness_contract::tool::GovernedToolInvocation,
+    pub outcome: crate::RuntimeToolExecutionOutcome,
+    pub completed_at_ms: u64,
+}
+
 /// Canonical ToolHost receipt indexed by the immutable delegated Agent
 /// attempt.  The effect stream remains the idempotency/fencing owner; this
 /// compact index only gives recovery an exact, bounded way to reload the
@@ -160,6 +166,67 @@ pub struct ExecutionCommitService {
 }
 
 impl ExecutionCommitService {
+    pub(crate) fn query_completed_tool_effect(
+        &self,
+        request: &crate::RuntimeToolExecutionRequest,
+    ) -> Result<Option<ToolReceiptReplay>, ExecutionCommitError> {
+        self.query_completed_tool_effect_scoped(request, false)
+    }
+
+    pub(crate) fn query_completed_agent_tool_effect(
+        &self,
+        request: &crate::RuntimeToolExecutionRequest,
+    ) -> Result<Option<ToolReceiptReplay>, ExecutionCommitError> {
+        self.query_completed_tool_effect_scoped(request, true)
+    }
+
+    fn query_completed_tool_effect_scoped(
+        &self,
+        request: &crate::RuntimeToolExecutionRequest,
+        exact_parent_node: bool,
+    ) -> Result<Option<ToolReceiptReplay>, ExecutionCommitError> {
+        let Some(binding) = &request.step_binding else { return Ok(None); };
+        let parent = request.parent_execution.as_ref().ok_or_else(||
+            ExecutionCommitError::InvalidCommand("receipt read requires a Runtime-owned parent".into()))?;
+        let stream = format!("execution-effect:{}", request.idempotency_key);
+        for suffix in ["receipt", "read-receipt"] {
+            let Some(receipt) = self.event_store.event_by_idempotency_key(&stream,
+                &format!("{}:{suffix}", request.idempotency_key))? else { continue; };
+            let Some(replay) = receipt.payload.get("replay").filter(|value| !value.is_null()) else { return Ok(None); };
+            let graph = self.effect_authority_graphs.load(&parent.execution_id)
+                .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))?;
+            if graph.lineage.as_ref().is_none_or(|lineage| Some(lineage.session_id.as_str()) != request.session_id.as_deref()
+                || lineage.turn_id != binding.snapshot.identity.turn_id)
+                || !graph.nodes.iter().any(|node| node.id == parent.node_id)
+            {
+                return Err(ExecutionCommitError::InvalidCommand("receipt reader parent lineage mismatch".into()));
+            }
+            if request.policy_revision == 0
+                || request.session_id.as_deref() != Some(binding.snapshot.identity.session_id.as_str())
+                || replay["session_id"] != json!(request.session_id)
+                || replay["parent_execution"]["execution_id"] != json!(parent.execution_id)
+                || (exact_parent_node && replay["parent_execution"]["node_id"] != json!(parent.node_id))
+                || replay["call_id"] != request.tool_use_id
+                || replay["origin"] != json!(binding.origin)
+                || receipt.payload["tool_name"] != request.tool_name
+                || receipt_payload_matches(request, &receipt.payload)? != Some(true)
+            {
+                return Err(ExecutionCommitError::InvalidCommand("tool receipt read identity or canonical payload conflict".into()));
+            }
+            let mut invocation: harness_contract::tool::GovernedToolInvocation = serde_json::from_value(replay["invocation"].clone())?;
+            if invocation.origin.as_ref() != Some(&binding.origin) || invocation.invocation_id != request.tool_use_id {
+                return Err(ExecutionCommitError::InvalidCommand("stored receipt invocation identity conflict".into()));
+            }
+            invocation.intent.normalized_input = harness_contract::step::parse_strict_json(&request.input)
+                .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))?;
+            let mut outcome: crate::RuntimeToolExecutionOutcome = serde_json::from_value(receipt.payload["outcome"].clone())?;
+            for evidence in &mut outcome.observed_evidence {
+                evidence.provenance = harness_contract::context::ObservedEvidenceProvenance::RetainedReplay;
+            }
+            return Ok(Some(ToolReceiptReplay { invocation, outcome, completed_at_ms: receipt.created_at_ms }));
+        }
+        Ok(None)
+    }
     /// Reload the exact ToolHost receipts for one delegated Agent attempt.
     /// The stream name is a durable parent graph/node/attempt key, so restart
     /// never scans unrelated effect streams or reconstructs facts from the
@@ -311,6 +378,7 @@ impl ExecutionCommitService {
                         "idempotency_key": request.idempotency_key,
                         "tool_use_id": request.tool_use_id,
                         "tool_name": request.tool_name,
+                        "replay": receipt_replay_contract(request)?,
                         "input_sha256": format!(
                             "sha256:{:x}",
                             Sha256::digest(request.input.as_bytes())
@@ -383,6 +451,7 @@ impl ExecutionCommitService {
                 .event_store
                 .event_by_idempotency_key(&stream_id, &receipt_key)?
             else {
+                self.validate_system_tool_parent_scoped(request, root)?;
                 return Ok(ToolEffectState::NotRequired);
             };
             validate_readonly_tool_receipt(request, &receipt.payload)?;
@@ -423,6 +492,7 @@ impl ExecutionCommitService {
             }
         }
         let authority = || {
+            self.validate_system_tool_parent_scoped(request, root)?;
             if let Some(root) = root {
                 if request.session_id.as_deref() != Some(root.session_id.as_str())
                     || request.parent_execution.is_some()
@@ -478,6 +548,7 @@ impl ExecutionCommitService {
                     payload: json!({
                         "idempotency_key": request.idempotency_key,
                         "tool_use_id": request.tool_use_id, "tool_name": request.tool_name,
+                        "replay": receipt_replay_contract(request)?,
                         "input_sha256": format!("sha256:{:x}", Sha256::digest(request.input.as_bytes())),
                         "effect": effect,
                     }),
@@ -576,6 +647,7 @@ impl ExecutionCommitService {
                 payload: json!({
                     "idempotency_key": request.idempotency_key,
                     "tool_name": request.tool_name,
+                    "replay": receipt_replay_contract(request)?,
                     "input_sha256": format!(
                         "sha256:{:x}",
                         Sha256::digest(request.input.as_bytes())

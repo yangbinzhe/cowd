@@ -538,6 +538,7 @@ impl GatewayToolExecutor {
             tool_name,
             value,
             RuntimeToolExecutionBinding {
+                tool_lease: None,
                 action_id: None,
                 session_id: self.runtime_session_id.as_deref(),
                 authorized_scopes: &[],
@@ -670,10 +671,9 @@ impl GatewayToolExecutor {
         mut value: serde_json::Value,
         binding: RuntimeToolExecutionBinding<'_>,
     ) -> Result<String, ToolError> {
-        // Absorb the text-protocol shape corruption (S1) before any dispatch:
-        // a string-declared array/object field is coerced to its JSON form so
-        // the plan survives instead of dying at the contract boundary.
-        let repaired_fields = self.coerce_string_typed_structured_fields(tool_name, &mut value);
+        let repaired_fields = if binding.tool_lease.is_some() { Vec::new() } else {
+            self.coerce_string_typed_structured_fields(tool_name, &mut value)
+        };
         if !repaired_fields.is_empty() {
             tracing::info!(
                 tool_name,
@@ -1084,12 +1084,8 @@ impl GatewayToolExecutor {
                 }
             }
         }
-        let service = self
-            .tool_host
-            .pin_snapshot()
-            .snapshot()
-            .mcp
-            .clone()
+        let service = binding.tool_lease.map(|lease| lease.snapshot().mcp.clone())
+            .unwrap_or_else(|| self.tool_host.pin_snapshot().snapshot().mcp.clone())
             .ok_or_else(|| {
                 ToolError::new(format!(
                     "runtime tool `{tool_name}` is unavailable without configured MCP servers"

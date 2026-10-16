@@ -7,6 +7,53 @@ use harness_contract::agent::AgenticExecutionFocus;
 use harness_contract::agent_action::AgentAttemptMode;
 
 impl ExecutionCommitService {
+    pub fn validate_system_tool_parent(
+        &self,
+        request: &crate::RuntimeToolExecutionRequest,
+    ) -> Result<(), ExecutionCommitError> {
+        self.validate_system_tool_parent_scoped(request, None)
+    }
+
+    pub(super) fn validate_system_tool_parent_scoped(
+        &self,
+        request: &crate::RuntimeToolExecutionRequest,
+        root: Option<&crate::CowdExecutionContext>,
+    ) -> Result<(), ExecutionCommitError> {
+        let Some(binding) = request.step_binding.as_ref().filter(|binding|
+            matches!(binding.origin.source, harness_contract::step::CallSource::SystemDerived { .. })) else { return Ok(()); };
+        let denied = || ExecutionCommitError::InvalidCommand("system_tool_parent_fence_rejected".into());
+        let execution_id = request.parent_execution.as_ref().map(|parent| parent.execution_id.as_str())
+            .or_else(|| root.map(|root| root.execution_id.as_str())).ok_or_else(denied)?;
+        if request.session_id.as_deref() != Some(binding.snapshot.identity.session_id.as_str()) {
+            return Err(denied());
+        }
+        let graph = self.effect_authority_graphs.load(execution_id).map_err(|_| denied())?;
+        let lineage = graph.lineage.as_ref().ok_or_else(denied)?;
+        if lineage.session_id != binding.snapshot.identity.session_id || lineage.turn_id != binding.snapshot.identity.turn_id {
+            return Err(denied());
+        }
+        let source_id = binding.snapshot.identity.execution_id.as_deref().ok_or_else(denied)?;
+        if source_id != execution_id {
+            let source = self.effect_authority_graphs.load(source_id).map_err(|_| denied())?;
+            if source.parent_execution.as_ref() != request.parent_execution.as_ref()
+                || request.parent_execution.is_none()
+                || source.lineage.as_ref().is_none_or(|source_lineage| source_lineage.session_id != lineage.session_id
+                    || source_lineage.turn_id != lineage.turn_id)
+                || !source.nodes.iter().any(|node| source.node_statuses.get(&node.id) == Some(&ExecutionNodeStatus::Running)) {
+                return Err(denied());
+            }
+        }
+        if let Some(parent) = &request.parent_execution {
+            if graph.node_statuses.get(&parent.node_id) != Some(&ExecutionNodeStatus::Running) { return Err(denied()); }
+        } else if root.is_none_or(|root| root.session_id != lineage.session_id || root.turn_id != lineage.turn_id) {
+            return Err(denied());
+        }
+        if !graph.nodes.iter().any(|node| graph.node_statuses.get(&node.id) == Some(&ExecutionNodeStatus::Running)) {
+            return Err(denied());
+        }
+        Ok(())
+    }
+
     pub(super) fn tool_effect_authority(
         &self,
         request: &crate::RuntimeToolExecutionRequest,

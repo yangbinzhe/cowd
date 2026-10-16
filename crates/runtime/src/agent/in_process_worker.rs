@@ -65,6 +65,7 @@ pub(crate) struct ProcessJsonlToolSession {
     permission_policy: PermissionPolicy,
     authorization_negotiator: crate::AuthorizationNegotiator,
     event_store: Arc<crate::RuntimeEventStore>,
+    steps: Mutex<VecDeque<Arc<crate::step_snapshot::BoundStep>>>,
 }
 
 impl ProcessJsonlToolSession {
@@ -239,6 +240,7 @@ impl ProcessJsonlToolSession {
             permission_policy: process_permission_policy,
             authorization_negotiator: crate::AuthorizationNegotiator::new(),
             event_store: Arc::clone(services.event_store()),
+            steps: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -279,8 +281,90 @@ impl ProcessJsonlToolSession {
         Ok(())
     }
 
+    pub(crate) fn begin_step(&self) -> Result<serde_json::Value, String> {
+        self.validate_current_policy()?;
+        let lease = self.executor.pin_step_catalog().ok_or("Process step requires a pinned ToolHost")?;
+        let definitions = lease.snapshot().catalog.definitions(None).into_iter()
+            .filter(|definition| self.executor.allowed_tools.contains(&definition.name))
+            .map(|definition| crate::ProviderToolDefinition {
+                name: definition.name, description: definition.description, input_schema: definition.input_schema,
+            }).collect::<Vec<_>>();
+        if definitions.len() != self.executor.allowed_tools.len() {
+            return Err("Process advertised tools do not match the pinned catalog".into());
+        }
+        let binding = self.topic_packet.agentic_binding.as_ref();
+        let identity = harness_contract::step::StepIdentity {
+            step_id: uuid::Uuid::new_v4().to_string(),
+            session_id: self.executor.session_id.clone(),
+            turn_id: self.topic_packet.assignment.execution_identity.turn_id()
+                .ok_or("Process step requires an admitted turn identity")?.to_string(),
+            execution_id: Some(self.executor.execution_id.clone()),
+            actor_ref: Some(self.topic_packet.agent_id().to_string()),
+            run_ref: Some(self.topic_packet.run_id().to_string()),
+            attempt: Some(self.executor.attempt),
+            epoch: Some(self.topic_packet.expected_graph_revision.to_string()),
+            goal_ref: None,
+            program_ref: binding.map(|binding| binding.program_id.clone()),
+            task_ref: binding.and_then(|binding| match &binding.focus {
+                harness_contract::agent::AgenticExecutionFocus::TaskExecute { task_ref } => Some(task_ref.clone()),
+                _ => None,
+            }),
+            build_ref: option_env!("COWD_GIT_SHA").unwrap_or("unverified").to_string(),
+        };
+        let step = Arc::new(crate::step_snapshot::BoundStep::bind(
+            identity, lease, &definitions,
+            &serde_json::json!({"model":self.external_model_profile,"control":"external_configured"}),
+            &serde_json::json!({"claim":"runtime_boundary_only","worker_run":self.topic_packet.run_id()}),
+            BTreeMap::from([
+                ("worker_run".to_string(), self.topic_packet.run_id().to_string()),
+                ("policy".to_string(), self.executor.policy_revision.to_string()),
+                ("attempt".to_string(), self.executor.attempt.to_string()),
+            ]), chrono::Utc::now().timestamp_millis().saturating_add(3_600_000),
+        ).map_err(|error| error.to_string())?);
+        self.event_store.append(crate::runtime_event_store::RuntimeEventInput {
+            stream_id: format!("session:{}", self.executor.session_id),
+            scope: crate::runtime_event_store::RuntimeEventScope::Session,
+            kind: "process.step_bound".to_string(), status: Some("prepared".to_string()),
+            actor: Some(self.topic_packet.agent_id().to_string()), refs: vec![],
+            payload: serde_json::to_value(step.snapshot()).map_err(|error| error.to_string())?,
+        }).map_err(|error| error.to_string())?;
+        let response = serde_json::json!({"step":step.snapshot(),"tools":definitions,"claim":"runtime_boundary_only"});
+        let mut steps = self.steps.lock().map_err(|_| "Process step registry poisoned")?;
+        if steps.len() == 16 { steps.pop_front(); }
+        steps.push_back(step);
+        Ok(response)
+    }
+
+    pub(crate) async fn execute_step_tool(
+        &self,
+        step_id: &str,
+        sequence: u64,
+        request_id: &str,
+        tool_name: &str,
+        input: &str,
+    ) -> Result<String, String> {
+        let step = self.steps.lock().map_err(|_| "Process step registry poisoned")?
+            .iter().find(|step| step.snapshot().identity.step_id == step_id).cloned()
+            .ok_or("Process step is missing, foreign, expired or evicted")?;
+        let binding = crate::step_snapshot::StepCallBinding::process(step.clone(), self.topic_packet.run_id(), sequence, request_id);
+        step.validate_call(&binding.origin, &self.executor.session_id, request_id, tool_name, input,
+            chrono::Utc::now().timestamp_millis()).map_err(|error| error.to_string())?;
+        self.execute_tool_bound(Some(&binding), request_id, tool_name, input).await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn execute_tool(
         &self,
+        request_id: &str,
+        tool_name: &str,
+        input: &str,
+    ) -> Result<String, String> {
+        self.execute_tool_bound(None, request_id, tool_name, input).await
+    }
+
+    async fn execute_tool_bound(
+        &self,
+        binding: Option<&crate::step_snapshot::StepCallBinding>,
         request_id: &str,
         tool_name: &str,
         input: &str,
@@ -366,7 +450,8 @@ impl ProcessJsonlToolSession {
             )
             .map_err(|e| e.to_string())?;
         self.executor
-            .execute_authorized_invocation_output(
+            .execute_step_authorized_invocation_output(
+                binding,
                 &authorization_id,
                 &decision.authorization,
                 tool_name,

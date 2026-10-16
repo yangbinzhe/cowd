@@ -321,6 +321,7 @@ async fn logical_tool_evidence_resolves_through_session_receipt_to_opaque_artifa
         .await
         .expect("durable source blocks");
     let binding = RuntimeToolExecutionBinding {
+        tool_lease: None,
         action_id: None,
         session_id: Some(session_id),
         authorized_scopes: &[],
@@ -417,6 +418,7 @@ async fn logical_tool_evidence_resolves_through_session_receipt_to_opaque_artifa
     );
 
     let actor = root_agent_action_actor(RuntimeToolExecutionBinding {
+        tool_lease: None,
         action_id: None,
         session_id: Some(session_id),
         authorized_scopes: &[],
@@ -536,6 +538,7 @@ async fn bound_root_model_bootstraps_program_and_inherits_evidence_scope() {
         .bind_runtime_services(Arc::clone(&services))
         .expect("bind runtime services");
     let binding = RuntimeToolExecutionBinding {
+        tool_lease: None,
         action_id: Some("bound-root-create-team"),
         session_id: Some("session-root-agent-first"),
         authorized_scopes: &[],
@@ -666,6 +669,7 @@ async fn agent_action_gateway_commits_small_actions_and_rejects_fake_content() {
         .expect("bind runtime services");
     let (parent, decision) = admitted_agent_action_root(&services, "session-agentic-gateway");
     let binding = RuntimeToolExecutionBinding {
+        tool_lease: None,
         action_id: Some("create-team"),
         session_id: Some("session-agentic-gateway"),
         authorized_scopes: &[],
@@ -866,6 +870,7 @@ async fn committed_agent_action_is_not_relabelled_failed_when_dispatch_is_deferr
         .expect("bind runtime services");
     let (parent, decision) = admitted_agent_action_root(&services, "session-deferred-dispatch");
     let base = RuntimeToolExecutionBinding {
+        tool_lease: None,
         action_id: Some("deferred-team"),
         session_id: Some("session-deferred-dispatch"),
         authorized_scopes: &[],
@@ -901,6 +906,7 @@ async fn committed_agent_action_is_not_relabelled_failed_when_dispatch_is_deferr
                 "required_capabilities": ["custom_domain_operation"]
             }),
             RuntimeToolExecutionBinding {
+                tool_lease: None,
                 action_id: Some("deferred-agent"),
                 ..base
             },
@@ -920,6 +926,7 @@ async fn committed_agent_action_is_not_relabelled_failed_when_dispatch_is_deferr
                     "depends_on": []
                 }),
                 RuntimeToolExecutionBinding {
+                    tool_lease: None,
                     action_id: Some("deferred-task"),
                     ..base
                 },
@@ -1274,6 +1281,7 @@ async fn explicit_publication_roundtrip_and_scope_checks() {
         .validate_input("artifact_publish", &input)
         .unwrap();
     let binding = RuntimeToolExecutionBinding {
+        tool_lease: None,
         action_id: Some("publish"),
         session_id: Some("publication-session"),
         authorized_scopes: &[],
@@ -1369,6 +1377,7 @@ async fn context_program_discovery_uses_one_authorized_revision_and_real_request
     executor.bind_runtime_services(services.clone()).unwrap();
     let (parent, decision) = admitted_agent_action_root(&services, "program-directory-session");
     let binding = RuntimeToolExecutionBinding {
+        tool_lease: None,
         action_id: Some("program-discovery"),
         session_id: Some("program-directory-session"),
         authorized_scopes: &[],
@@ -1495,6 +1504,7 @@ async fn context_artifact_catalog_returns_readable_scoped_content_and_lossless_b
     let executor = GatewayToolExecutor::new(None, false, registry);
     executor.bind_runtime_services(services.clone()).unwrap();
     let binding = RuntimeToolExecutionBinding {
+        tool_lease: None,
         action_id: Some("artifact-directory"),
         session_id: Some("artifact-directory-session"),
         authorized_scopes: &[],
@@ -1707,6 +1717,7 @@ async fn agent_action_batch_applies_every_action_through_the_same_path() {
         .bind_runtime_services(Arc::clone(&services))
         .expect("bind runtime services");
     let binding = RuntimeToolExecutionBinding {
+        tool_lease: None,
         action_id: Some("bound-root-batch"),
         session_id: Some("session-root-batch"),
         authorized_scopes: &[],
@@ -1804,6 +1815,7 @@ async fn string_typed_actions_array_is_coerced_at_the_boundary() {
         .bind_runtime_services(Arc::clone(&services))
         .expect("bind runtime services");
     let binding = RuntimeToolExecutionBinding {
+        tool_lease: None,
         action_id: Some("bound-root-coercion"),
         session_id: Some("session-root-coercion"),
         authorized_scopes: &[],

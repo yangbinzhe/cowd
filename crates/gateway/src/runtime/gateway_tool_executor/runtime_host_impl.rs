@@ -1,5 +1,9 @@
 #[async_trait::async_trait]
 impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
+    fn pin_step_catalog(&self) -> Option<tools::ToolHostLease> {
+        Some(self.tool_host.pin_snapshot())
+    }
+
     async fn execute_runtime_tool(
         &self,
         request: &runtime::RuntimeToolExecutionRequest,
@@ -8,8 +12,35 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
             "gateway-tool:{}:{}:{}",
             request.governed_plan_id, request.governed_plan_revision, request.tool_use_id
         );
+        let step_lease = match request.step_binding.as_ref().ok_or_else(|| {
+            "production_tool_origin_required".to_string()
+        }).and_then(|binding| {
+            let step = binding.resolve(Some(self.tool_host.pin_snapshot()))
+                .map_err(|error| error.to_string())?;
+            let session_id = request.session_id.as_deref().ok_or_else(|| "step call requires session identity".to_string())?;
+            step.validate_call(&binding.origin, session_id, &request.tool_use_id,
+                &request.tool_name, &request.input, chrono::Utc::now().timestamp_millis())
+                .map_err(|error| error.to_string())?;
+            if matches!(binding.origin.source, harness_contract::step::CallSource::SystemDerived { .. }) {
+                self.runtime_services.get().ok_or_else(|| "system call requires Runtime parent authority".to_string())?
+                    .commit_service().validate_system_tool_parent(request).map_err(|error| error.to_string())?;
+            }
+            Ok::<_, String>(step.lease().clone())
+        }) {
+            Ok(lease) => lease,
+            Err(error) => return runtime::RuntimeToolExecutionOutcome {
+                tool_use_id: request.tool_use_id.clone(),
+                tool_name: request.tool_name.clone(),
+                status: runtime::RuntimeToolExecutionStatus::BlockedPermission,
+                category: request.category,
+                output: None,
+                error: Some(error),
+                evidence_ref,
+                observed_evidence: Vec::new(),
+            },
+        };
         let Some(canonical_tool_name) =
-            <Self as ToolExecutor>::resolve_tool_name(self, &request.tool_name)
+            step_lease.snapshot().catalog.canonical_name(&request.tool_name)
         else {
             return runtime::RuntimeToolExecutionOutcome {
                 tool_use_id: request.tool_use_id.clone(),
@@ -134,7 +165,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
         if is_gateway_runtime_control_tool(&request.tool_name)
             || is_gateway_context_tool(&request.tool_name)
         {
-            let host_lease = self.tool_host.pin_snapshot();
+            let host_lease = step_lease.clone();
             let effect = host_lease.describe_effect(&request.tool_name, &value);
             match request.authorization.as_ref() {
                 Some(authorization) => {
@@ -249,6 +280,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                 &request.tool_name,
                 value,
                 RuntimeToolExecutionBinding {
+                    tool_lease: Some(&step_lease),
                     action_id: Some(request.idempotency_key.as_str()),
                     session_id: request.session_id.as_deref(),
                     authorized_scopes: &request.authorized_scopes,
@@ -283,6 +315,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                 &request.tool_name,
                 &effective_input,
                 request.tool_progress.0.as_ref(),
+                Some(step_lease),
             )
             .await
             .map(|output| output.model_text().to_string())

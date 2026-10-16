@@ -635,6 +635,7 @@ mod tests {
             revision: 1,
             catalog_revision: 7,
             invocations: vec![harness_contract::tool::GovernedToolInvocation {
+                origin: None,
                 contract_version: 1,
                 invocation_id: "tool-1".to_string(),
                 intent: harness_contract::tool::ToolIntent {

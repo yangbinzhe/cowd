@@ -24,6 +24,7 @@ use crate::ToolCatalog;
 /// Immutable implementation snapshot pinned for one request.
 #[derive(Clone)]
 pub struct ToolHostSnapshot {
+    implementation_revision: String,
     pub catalog: Arc<ToolCatalog>,
     pub lsp: Arc<LspRegistry>,
     pub mcp: Option<Arc<dyn McpService>>,
@@ -51,6 +52,7 @@ impl ToolHostSnapshot {
     ) -> Self {
         let descriptor_set_hash = descriptor_set_hash(&catalog);
         Self {
+            implementation_revision: uuid::Uuid::new_v4().to_string(),
             catalog,
             lsp,
             mcp,
@@ -158,12 +160,13 @@ impl ToolHost {
     }
 
     /// Atomically publish a fully built snapshot. Existing requests retain their lease.
-    pub fn replace_snapshot(&self, snapshot: ToolHostSnapshot) -> u64 {
+    pub fn replace_snapshot(&self, mut snapshot: ToolHostSnapshot) -> u64 {
         let mut current = self
             .snapshot
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let descriptor_changed = current.descriptor_set_hash != snapshot.descriptor_set_hash;
+        snapshot.implementation_revision = uuid::Uuid::new_v4().to_string();
         let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
         *current = Arc::new(snapshot);
         drop(current);
@@ -229,6 +232,7 @@ impl ToolHostLease {
         scopes.sort();
         scopes.dedup();
         let identity = serde_json::to_vec(&(
+            self.implementation_revision(),
             authorization.policy_revision,
             &authorization.scope,
             &scopes,
@@ -272,6 +276,11 @@ impl ToolHostLease {
     }
 
     #[must_use]
+    pub fn implementation_revision(&self) -> &str {
+        &self.snapshot.implementation_revision
+    }
+
+    #[must_use]
     pub fn cache(&self) -> &ToolCache {
         &self.cache
     }
@@ -282,7 +291,7 @@ impl ToolHostLease {
         let ids = self.snapshot.catalog.search_ids(&query, max_results);
         let descriptors = ids
             .iter()
-            .filter_map(|id| self.snapshot.catalog.descriptor_ref(id))
+            .filter_map(|id| self.descriptor_ref(id))
             .collect();
         ToolDiscoveryReceipt {
             query,
@@ -290,6 +299,27 @@ impl ToolHostLease {
             descriptors,
             activation_candidates: ids,
         }
+    }
+
+    pub fn known_unavailability(&self, tool_id: &str) -> Option<&'static str> {
+        (self.snapshot.mcp.is_none()
+            && (parse_mcp_runtime_id(tool_id).is_some()
+                || matches!(
+                    tool_id,
+                    "mcp_tool" | "list_mcp_resources_tool" | "read_mcp_resource_tool"
+                )))
+        .then_some("mcp_not_configured")
+    }
+
+    fn descriptor_ref(&self, tool_id: &str) -> Option<harness_contract::tool::ToolDescriptorRef> {
+        let mut descriptor = self.snapshot.catalog.descriptor_ref(tool_id)?;
+        if self
+            .known_unavailability(&descriptor.canonical_id)
+            .is_some()
+        {
+            descriptor.health = harness_contract::tool::ToolDescriptorHealth::Unavailable;
+        }
+        Some(descriptor)
     }
 
     /// Metadata for the complete catalog pinned by this lease. Runtime uses
@@ -302,7 +332,7 @@ impl ToolHostLease {
             .catalog
             .definitions(None)
             .into_iter()
-            .filter_map(|definition| self.snapshot.catalog.descriptor_ref(&definition.name))
+            .filter_map(|definition| self.descriptor_ref(&definition.name))
             .collect::<Vec<_>>();
         let activation_candidates = descriptors
             .iter()
@@ -399,6 +429,7 @@ impl ToolHostLease {
             })
             .collect();
         GovernedToolInvocation {
+            origin: None,
             contract_version: 1,
             invocation_id: invocation_id.clone(),
             intent: ToolIntent {

@@ -337,6 +337,7 @@ fn the_repeat_counter_skips_waits_and_failed_calls() {
 
     fn call(id: &str, name: &str, input: &str) -> ModelToolCall {
         ModelToolCall {
+            binding: None,
             id: id.to_string(),
             name: name.to_string(),
             input: input.to_string(),
@@ -400,6 +401,7 @@ fn the_repeat_count_survives_a_re_dispatch_that_opens_a_new_graph() {
 
     fn call(id: &str, input: &str) -> ModelToolCall {
         ModelToolCall {
+            binding: None,
             id: id.to_string(),
             name: "state_inspect".to_string(),
             input: input.to_string(),

@@ -43,6 +43,7 @@ pub mod refs;
 pub mod security;
 pub mod skill;
 pub mod strategy;
+pub mod step;
 pub mod task;
 pub mod tool;
 pub mod tool_input_contract;

@@ -56,6 +56,27 @@ where
     where
         C: Sync,
     {
+        self.execute_tool_batch_step_with_replays(calls, prompter, iteration, &BTreeMap::new(), &BTreeMap::new()).await
+    }
+
+    pub(crate) async fn execute_tool_batch_step_with_replays(
+        &self,
+        calls: &[ModelToolCall],
+        prompter: &crate::permissions::SharedPrompter,
+        iteration: usize,
+        replays: &BTreeMap<String, EarlyToolExecutionReceipt>,
+        replay_invocations: &BTreeMap<String, harness_contract::tool::GovernedToolInvocation>,
+    ) -> Result<ToolBatchStepResult, RuntimeError>
+    where C: Sync,
+    {
+        let execution = self.cowd_bus.as_ref().and_then(|bus| bus.current_execution_context());
+        let admitted_turn = execution.as_ref().map(|context| context.turn_id.clone())
+            .or_else(|| self.session_input_stream.active_turn_id().map(|turn| turn.to_string()));
+        if calls.iter().any(|call| call.binding.as_ref().is_some_and(|binding|
+            binding.snapshot.identity.session_id != self.session_id() || admitted_turn.as_ref().is_some_and(|turn|
+                binding.snapshot.identity.turn_id != *turn))) {
+            return Err(RuntimeError::new("tool_step_session_or_turn_mismatch"));
+        }
         if self.cancellation_token.is_cancelled() {
             return Err(RuntimeError::new("turn cancelled before tool execution"));
         }
@@ -72,6 +93,7 @@ where
         let mut refused_ids = std::collections::BTreeSet::new();
         let mut refusal_messages = Vec::new();
         for call in calls {
+            if replays.contains_key(&call.id) { continue; }
             let Some(refusal) =
                 self.blocked_repeated_call(&call.name, &call.id, &call.input, iteration)
             else {
@@ -118,7 +140,12 @@ where
             .filter(|call| !refused_ids.contains(&call.id))
             .map(|call| (call.id.clone(), call.name.clone(), call.input.clone()))
             .collect::<Vec<_>>();
-        let prepared = self.tool_executor.prepare_governed_invocations(&requests);
+        let mut prepared = Vec::with_capacity(requests.len());
+        for request in &requests {
+            if let Some(invocation) = replay_invocations.get(&request.tool_use_id) { prepared.push(invocation.clone()); }
+            else { prepared.extend(self.tool_executor.prepare_step_invocations(std::slice::from_ref(request), calls)
+                .map_err(|error| RuntimeError::new(error.to_string()))?); }
+        }
         let workspace_root = self.governed_workspace_root()?;
         let compilation =
             GovernedToolCompiler.compile_partial(&workspace_root, &requests, |name, input| {
@@ -126,7 +153,9 @@ where
                     .iter()
                     .find(|invocation| {
                         invocation.intent.tool_name == name
-                            && invocation.intent.normalized_input == *input
+                            && (invocation.intent.normalized_input == *input || (replay_invocations.contains_key(&invocation.invocation_id)
+                                && requests.iter().any(|request| request.tool_use_id == invocation.invocation_id
+                                    && harness_contract::step::parse_strict_json(&request.input).ok().as_ref() == Some(input))))
                     })
                     .map(|invocation| {
                         (
@@ -136,7 +165,7 @@ where
                         )
                     })
             });
-        let compilation = match compilation {
+        let mut compilation = match compilation {
             Ok(compilation) => compilation,
             Err(error) => {
                 let reason = format!("governed tool DAG rejected before execution: {error}");
@@ -182,6 +211,9 @@ where
                 });
             }
         };
+        if let Some(plan) = compilation.plan.as_mut() {
+            crate::step_snapshot::bind_plan_calls(plan, calls);
+        }
         let mut preflight_messages = Vec::with_capacity(compilation.rejected.len());
         for rejected in &compilation.rejected {
             let message = ConversationMessage::tool_result(
@@ -286,9 +318,11 @@ where
             self.remember_tool_trace_from_message(&message);
             preflight_messages.push(message);
         }
-        let decision = self.retarget_active_turn_strategy_for_governed_plan(&plan, calls)?;
+        let mut admission_plan = plan.clone();
+        admission_plan.tasks.retain(|task| !replays.contains_key(&task.tool_call_id));
+        let decision = self.retarget_active_turn_strategy_for_governed_plan(&admission_plan, calls)?;
         self.tool_executor.bind_execution_decision(decision.clone());
-        let mut validation = plan.validate_against_execution_decision(&decision);
+        let mut validation = admission_plan.validate_against_execution_decision(&decision);
         if validation.allowed {
             self.satisfy_tool_strategy_gates(&decision, &mut validation, prompter)
                 .await;
@@ -300,6 +334,15 @@ where
         messages.extend(preflight_messages);
         if validation.allowed {
             self.record_tool_schedule(&plan, &requests, self.session_head().await.message_count);
+            let mut precompleted = BTreeMap::new();
+            for call in calls {
+                if let Some(receipt) = replays.get(&call.id) {
+                    let output = receipt.outcome.output.as_deref().or(receipt.outcome.error.as_deref()).unwrap_or_default();
+                    let message = self.prepare_governed_tool_result_with_invocation(&call.id, &call.name, &call.input, output,
+                        receipt.outcome.status != crate::RuntimeToolExecutionStatus::Executed, None).await?;
+                    precompleted.insert(call.id.clone(), self.collect_tool_result_message(message).1);
+                }
+            }
             let context = ConversationGovernedToolContext {
                 runtime: self,
                 pending_tool_uses: &pending,
@@ -307,6 +350,7 @@ where
                 iterations: iteration,
                 plan_id: &plan.plan_id,
                 plan_revision: plan.revision,
+                precompleted: &precompleted,
             };
             let report = GovernedToolExecutor.execute(&plan, &context).await;
             max_concurrency_observed = report.max_active;
@@ -561,6 +605,7 @@ where
         }
 
         let checkpoint_input = serde_json::json!({
+            "action": "create",
             "label": format!(
                 "runtime strategy lease {} before high-risk mutation",
                 execution_decision.lease.lease_id
@@ -575,6 +620,14 @@ where
                 validation
                     .findings
                     .push(format!("checkpoint_input_invalid:{error}"));
+                return;
+            }
+        };
+        let binding = match self.bind_system_tool_call("checkpoint", &checkpoint_value, &format!("strategy:{}", execution_decision.lease.lease_id)) {
+            Ok(binding) => binding,
+            Err(error) => {
+                validation.allowed = false;
+                validation.findings.push(format!("checkpoint_origin_rejected:{error}"));
                 return;
             }
         };
@@ -636,8 +689,10 @@ where
                 Some(self.execution_service_class),
                 Some(self.session_id()),
                 async move {
+                    let call_id = binding.as_ref().map(|binding| binding.origin.call_id.as_str()).unwrap_or("offline-checkpoint");
                     executor
-                        .execute_authorized_output(
+                        .execute_step_authorized_invocation_output(
+                            binding.as_ref(), call_id,
                             &authorization.authorization,
                             "checkpoint",
                             &checkpoint_input,
@@ -781,13 +836,15 @@ where
                 let executor_owns_admission =
                     self.tool_executor.owns_tool_resource_admission(tool_name);
                 let effect_request = crate::RuntimeToolExecutionRequest {
+                    compiled_invocation: Some(task.invocation.clone()),
+                    step_binding: task.step_binding.clone(),
                     governed_plan_id: plan_id.to_string(),
                     governed_plan_revision: plan_revision,
                     observation_wave_sequence: u64::try_from(iterations).unwrap_or(u64::MAX).max(1),
-                    idempotency_key: format!(
+                    idempotency_key: task.step_binding.as_ref().map(crate::step_snapshot::StepCallBinding::effect_idempotency_key).unwrap_or_else(|| format!(
                         "{}:{plan_id}:{plan_revision}:{tool_use_id}:{iterations}",
                         self.session_id()
-                    ),
+                    )),
                     tool_use_id: tool_use_id.to_string(),
                     tool_name: tool_name.to_string(),
                     input: effective_input.clone(),
@@ -878,6 +935,7 @@ where
                         crate::execution_core::graph::ToolEffectState::Fresh
                         | crate::execution_core::graph::ToolEffectState::NotRequired,
                     ) => {
+                        let step_binding = effect_request.step_binding.clone();
                         let operation = async move {
                             if is_evidence_retrieve {
                                 if let Ok(output) = retrieve_tool_evidence_from_sandbox(
@@ -907,7 +965,8 @@ where
                                     .await
                             } else {
                                 tool_exec
-                                    .execute_authorized_invocation_output(
+                                    .execute_step_authorized_invocation_output(
+                                        step_binding.as_ref(),
                                         &provider_invocation_id,
                                         &authorization.authorization,
                                         &tname,

@@ -4620,6 +4620,8 @@ struct PendingTerminalArtifact {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedModelToolCall {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin: Option<harness_contract::step::CallOrigin>,
     id: String,
     name: String,
     input: String,
@@ -4628,6 +4630,8 @@ struct PersistedModelToolCall {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedToolBatch {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    step_snapshots: BTreeMap<String, Arc<harness_contract::step::StepSnapshot>>,
     session_id: String,
     calls: Vec<PersistedModelToolCall>,
     /// A subsequent ToolBatch is already present in the same graph. This
@@ -4643,10 +4647,14 @@ fn encode_tool_calls_with_continuation(
     continue_with_tool_batch: bool,
 ) -> Result<String, serde_json::Error> {
     serde_json::to_string(&PersistedToolBatch {
+        step_snapshots: calls.iter().filter_map(|call| call.binding.as_ref()).map(|binding| {
+            (binding.snapshot.identity.step_id.clone(), Arc::clone(&binding.snapshot))
+        }).collect(),
         session_id: session_id.to_string(),
         calls: calls
             .iter()
             .map(|call| PersistedModelToolCall {
+                origin: call.binding.as_ref().map(|binding| binding.origin.clone()),
                 id: call.id.clone(),
                 name: call.name.clone(),
                 input: call.input.clone(),
@@ -4658,21 +4666,23 @@ fn encode_tool_calls_with_continuation(
 }
 
 fn decode_tool_batch(payload: &str) -> Result<(Vec<ModelToolCall>, bool), serde_json::Error> {
-    serde_json::from_str::<PersistedToolBatch>(payload).map(|batch| {
-        (
-            batch
-                .calls
-                .into_iter()
-                .map(|call| ModelToolCall {
-                    id: call.id,
-                    name: call.name,
-                    input: call.input,
-                    depends_on: call.depends_on,
-                })
-                .collect(),
-            batch.continue_with_tool_batch,
-        )
-    })
+    let batch = serde_json::from_str::<PersistedToolBatch>(payload)?;
+    let calls = batch.calls.into_iter().map(|call| {
+        let binding = call.origin.map(|origin| {
+            let snapshot = batch.step_snapshots.get(&origin.origin_step_id).ok_or_else(|| {
+                serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::InvalidData, "persisted tool origin has no step snapshot"))
+            })?;
+            Ok::<_, serde_json::Error>(crate::step_snapshot::StepCallBinding::persisted(origin, Arc::clone(snapshot)))
+        }).transpose()?;
+        Ok(ModelToolCall {
+            binding,
+            id: call.id,
+            name: call.name,
+            input: call.input,
+            depends_on: call.depends_on,
+        })
+    }).collect::<Result<Vec<_>, serde_json::Error>>()?;
+    Ok((calls, batch.continue_with_tool_batch))
 }
 
 fn ticket_session_id(payload: &str) -> Option<String> {
@@ -4869,11 +4879,8 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                 input: candidate.call.input.clone(),
                 depends_on: Vec::new(),
             };
-            // Dispatch the bytes the contract boundary hands back, not the raw
-            // frame: the repair for a string-typed array/object field happens
-            // here, so everything downstream sees the same input.
             let request =
-                match tool_executor.validate_tool_input(&request.tool_name, &request.input) {
+                match tool_executor.validate_step_tool_input(candidate.call.binding.as_ref(), &request.tool_name, &request.input) {
                     Ok(repaired) => crate::tool_dispatch::ToolRequest {
                         input: repaired,
                         ..request
@@ -4882,8 +4889,10 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                         return defer(format!("input_contract_rejected:{error}"));
                     }
                 };
-            let prepared =
-                tool_executor.prepare_governed_invocations(std::slice::from_ref(&request));
+            let prepared = match tool_executor.prepare_step_invocations(std::slice::from_ref(&request), std::slice::from_ref(&candidate.call)) {
+                Ok(prepared) => prepared,
+                Err(error) => return defer(format!("step_binding_rejected:{error}")),
+            };
             let Some(invocation) = prepared
                 .iter()
                 .find(|invocation| invocation.invocation_id == candidate.call.id)
@@ -4891,7 +4900,7 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
             else {
                 return defer("registered_effect_descriptor_unavailable".to_string());
             };
-            let plan = match crate::GovernedToolCompiler.compile(
+            let mut plan = match crate::GovernedToolCompiler.compile(
                 services.workspace_root(),
                 std::slice::from_ref(&request),
                 |_name, _input| {
@@ -4905,6 +4914,7 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                 Ok(plan) => plan,
                 Err(error) => return defer(format!("governed_candidate_rejected:{error}")),
             };
+            crate::step_snapshot::bind_plan_calls(&mut plan, std::slice::from_ref(&candidate.call));
             let task = &plan.tasks[0];
             let effect = &invocation.effect;
             if let Some(reason) = early_tool_rejection_reason(&candidate.call, task, effect) {
@@ -5019,7 +5029,7 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
             let mut idempotency_keys = std::collections::HashMap::new();
             idempotency_keys.insert(
                 candidate.call.id.clone(),
-                format!("{}:early-read:{early_fingerprint}", ticket.graph_id),
+                format!("{}:early-read:{}:{early_fingerprint}", ticket.graph_id, candidate.call.id),
             );
             let calls = [candidate.call.clone()];
             let early_ticket = ticket;
@@ -5125,9 +5135,49 @@ fn tool_nodes_for_calls(
     ticket: &NodeExecutionTicket,
     iteration: usize,
     session_id: &str,
-    calls: Vec<ModelToolCall>,
+    mut calls: Vec<ModelToolCall>,
     _workspace_root: &std::path::Path,
+    services: Option<&crate::RuntimeServices>,
+    system_authored: bool,
 ) -> Result<Vec<ExecutionNodeSpec>, NodeExecutorError> {
+    if system_authored {
+        if let Some((services, lease)) = services.and_then(|services| services.tool_execution_host()
+            .and_then(|host| host.pin_step_catalog()).map(|lease| (services, lease))) {
+            let bind = || -> Result<crate::step_snapshot::BoundStep, String> {
+                let graph = services.graph_state_store().load(&ticket.graph_id).map_err(|error| error.to_string())?;
+                let lineage = graph.lineage.as_ref().ok_or("system origin parent lineage missing")?;
+                if lineage.session_id != session_id { return Err("system origin parent session mismatch".into()); }
+                let names = calls.iter().map(|call| call.name.clone()).collect::<BTreeSet<_>>();
+                let definitions = lease.snapshot().catalog.definitions(Some(&names)).into_iter().map(|definition| ProviderToolDefinition {
+                    name: definition.name, description: definition.description, input_schema: definition.input_schema,
+                }).collect::<Vec<_>>();
+                let step = crate::step_snapshot::BoundStep::bind(harness_contract::step::StepIdentity {
+                    step_id: uuid::Uuid::new_v4().to_string(), session_id: session_id.to_string(), turn_id: lineage.turn_id.clone(),
+                    execution_id: Some(ticket.graph_id.clone()), goal_ref: None, program_ref: None, task_ref: Some(lineage.task_id.clone()),
+                    actor_ref: Some("runtime:bounded-verification".to_string()), run_ref: None,
+                    attempt: Some(ticket.attempt), epoch: Some(lineage.generation.to_string()),
+                    build_ref: option_env!("COWD_GIT_SHA").unwrap_or("unverified").to_string(),
+                }, lease, &definitions, &serde_json::json!({"source":"runtime_system"}),
+                    &serde_json::json!({"parent_node":ticket.node_id,"attempt":ticket.attempt}),
+                    BTreeMap::from([("parent_attempt".to_string(), ticket.attempt.to_string()),
+                        ("parent_generation".to_string(), lineage.generation.to_string())]),
+                    chrono::Utc::now().timestamp_millis().saturating_add(3_600_000))
+                    .map_err(|error| error.to_string())?.with_parent(&format!("{}:{}:{}", ticket.graph_id, ticket.node_id, ticket.attempt));
+                services.event_store().append(crate::runtime_event_store::RuntimeEventInput {
+                    stream_id: format!("session:{session_id}"), scope: crate::runtime_event_store::RuntimeEventScope::Session,
+                    kind: "system.step_bound".to_string(), status: Some("prepared".to_string()), actor: Some("runtime".to_string()), refs: vec![],
+                    payload: serde_json::to_value(step.snapshot()).map_err(|error| error.to_string())?,
+                }).map_err(|error| error.to_string())?;
+                Ok(step)
+            };
+            let step = Arc::new(bind().map_err(|reason| NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason })?);
+            let parent = format!("{}:{}:{}", ticket.graph_id, ticket.node_id, ticket.attempt);
+            for call in &mut calls {
+                if call.binding.is_some() { return Err(NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason: "system compiler cannot relabel a provider call".into() }); }
+                call.binding = Some(crate::step_snapshot::StepCallBinding::system(step.clone(), &parent, &call.id));
+            }
+        }
+    }
     let batches = tool_batches_for_turn(&calls).map_err(|reason| NodeExecutorError::Poll {
         node_id: ticket.node_id.clone(),
         reason,
@@ -5174,8 +5224,8 @@ fn tool_nodes_for_calls(
 fn runtime_authored_tool_batch(calls: &[ModelToolCall]) -> bool {
     !calls.is_empty()
         && calls.iter().all(|call| {
-            call.id.starts_with("runtime-focus-verify-")
-                || call.id.starts_with("runtime-eval-exact-read-")
+            call.binding.as_ref().is_some_and(|binding| matches!(binding.origin.source,
+                harness_contract::step::CallSource::SystemDerived { .. }))
         })
 }
 
@@ -5497,11 +5547,13 @@ fn bound_runtime_tool_request(
     idempotency_key: Option<&String>,
 ) -> crate::RuntimeToolExecutionRequest {
     crate::RuntimeToolExecutionRequest {
+        compiled_invocation: Some(task.invocation.clone()),
+        step_binding: call.binding.clone(),
         governed_plan_id: plan_id.to_string(),
         governed_plan_revision: plan_revision,
         observation_wave_sequence,
-        idempotency_key: idempotency_key
-            .cloned()
+        idempotency_key: call.binding.as_ref().map(crate::step_snapshot::StepCallBinding::effect_idempotency_key)
+            .or_else(|| idempotency_key.cloned())
             .unwrap_or_else(|| format!("{}:{}", ticket.idempotency_key, call.id)),
         tool_use_id: call.id.clone(),
         tool_name: call.name.clone(),

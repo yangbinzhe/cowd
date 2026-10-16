@@ -57,7 +57,10 @@ pub(crate) mod tests {
     }
 
     #[derive(Default)]
-    struct ActionHost(std::sync::OnceLock<std::sync::Weak<crate::RuntimeServices>>);
+    struct ActionHost(
+        std::sync::OnceLock<std::sync::Weak<crate::RuntimeServices>>,
+        Option<tools::ToolHost>,
+    );
     // The test controls the decision/Process exchange explicitly. Keep the
     // real Runner's backend pending so it cannot race that exchange by trying
     // the unconfigured test model (or a fixture script not yet written).
@@ -87,6 +90,9 @@ pub(crate) mod tests {
     }
     #[async_trait::async_trait]
     impl crate::RuntimeExecutionHost for ActionHost {
+        fn pin_step_catalog(&self) -> Option<tools::ToolHostLease> {
+            self.1.as_ref().map(tools::ToolHost::pin_snapshot)
+        }
         async fn execute_runtime_tool(
             &self,
             request: &crate::RuntimeToolExecutionRequest,
@@ -255,7 +261,34 @@ pub(crate) mod tests {
                 vec!["read".to_string()],
             )
         };
-        let host = Arc::new(ActionHost::default());
+        let process_catalog = process.as_ref().map(|_| {
+            let actions = harness_contract::agent_action::AGENT_ACTION_TOOL_IDS
+                .iter()
+                .map(|name| tools::RuntimeToolDefinition {
+                    name: name.to_string(),
+                    description: Some("Isolated coordination test adapter".into()),
+                    input_schema: serde_json::json!({"type":"object"}),
+                    required_permission: harness_contract::policy::PermissionMode::ReadOnly,
+                    effect_resolver: harness_contract::tool::ToolEffectResolverSpec {
+                        resolver_id: "runtime.agent_action".into(),
+                        resolver_version: 1,
+                    },
+                })
+                .collect();
+            let catalog = tools::ToolCatalog::builtin()
+                .with_runtime_tools(actions)
+                .unwrap();
+            tools::ToolHost::new(
+                "process-coordination-fixture",
+                workspace.path(),
+                tools::ToolHostSnapshot::new(
+                    Arc::new(catalog),
+                    Arc::new(tools::lsp_client::LspRegistry::default()),
+                    None,
+                ),
+            )
+        });
+        let host = Arc::new(ActionHost(Default::default(), process_catalog));
         let mut builder =
             crate::RuntimeServices::test_builder(workspace.path().join("home"), workspace.path())
                 .tool_execution_host(host.clone());

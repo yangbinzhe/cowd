@@ -246,6 +246,7 @@ async fn context_retrieve_reads_the_exact_runtime_memory_binding() {
     }
     assert_eq!(restored, exact_content);
     let binding = RuntimeToolExecutionBinding {
+        tool_lease: None,
         action_id: Some("working-memory-pin"),
         session_id: Some("session-exact"),
         authorized_scopes: &[],
@@ -293,6 +294,7 @@ async fn context_retrieve_reads_the_exact_runtime_memory_binding() {
             "private_note",
             note_input.clone(),
             RuntimeToolExecutionBinding {
+                tool_lease: None,
                 session_id: Some("other-session"),
                 ..note_binding
             }
@@ -809,6 +811,7 @@ async fn context_fact_directory_and_exact_evidence_use_runtime_data_lease_and_re
         matrix_snapshot_refs: vec![],
     };
     let binding = RuntimeToolExecutionBinding {
+        tool_lease: None,
         action_id: Some("fact-discovery"),
         session_id: Some("session-facts"),
         authorized_scopes: &[],
@@ -1072,6 +1075,7 @@ async fn context_matrix_directory_reads_complete_scoped_json_and_rejects_changed
         matrix_snapshot_refs: vec!["matrix:source_snapshot:allowed".into()],
     };
     let binding = RuntimeToolExecutionBinding {
+        tool_lease: None,
         action_id: Some("matrix-discovery"),
         session_id: Some("session-matrix"),
         authorized_scopes: &[],
@@ -1359,6 +1363,7 @@ async fn context_session_discovery_pages_beyond_512_and_binds_exact_message_revi
     let executor = GatewayToolExecutor::new(None, false, registry);
     executor.bind_runtime_services(services).unwrap();
     let binding = RuntimeToolExecutionBinding {
+        tool_lease: None,
         action_id: Some("session-discovery"),
         session_id: Some("session-000"),
         authorized_scopes: &[],

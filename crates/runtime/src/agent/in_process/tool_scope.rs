@@ -82,6 +82,7 @@ impl ScopedRuntimeToolExecutor {
             .as_object()
             .cloned()
             .ok_or_else(|| ToolError::new("Runtime checkpoint input must be a JSON object"))?;
+        object.insert("action".to_string(), serde_json::json!("create"));
         if let Some(scopes) = self.resource_scopes.as_deref() {
             let mut paths = scopes
                 .iter()
@@ -118,6 +119,7 @@ impl ScopedRuntimeToolExecutor {
         &self,
         input: &str,
         authorization: harness_contract::tool::ToolExecutionAuthorization,
+        binding: Option<&crate::step_snapshot::StepCallBinding>,
     ) -> Result<String, ToolError> {
         let input = serde_json::from_str::<serde_json::Value>(input).map_err(|error| {
             ToolError::new(format!("invalid Runtime checkpoint input: {error}"))
@@ -133,14 +135,17 @@ impl ScopedRuntimeToolExecutor {
             ));
         }
         let request = RuntimeToolExecutionRequest {
+            compiled_invocation: binding.map(|binding| binding.prepare_invocation(self.host.pin_step_catalog(), "checkpoint", &input))
+                .transpose().map_err(|error| ToolError::new(error.to_string()))?,
+            step_binding: binding.cloned(),
             governed_plan_id: self.execution_id.clone(),
             governed_plan_revision: 1,
             observation_wave_sequence: 0,
-            idempotency_key: authorization
+            idempotency_key: binding.map(crate::step_snapshot::StepCallBinding::effect_idempotency_key).or_else(|| authorization
                 .idempotency_key
-                .clone()
+                .clone())
                 .unwrap_or_else(|| format!("agent-checkpoint:{}", uuid::Uuid::new_v4())),
-            tool_use_id: format!("agent-checkpoint:{}", uuid::Uuid::new_v4()),
+            tool_use_id: binding.map(|binding| binding.origin.call_id.clone()).unwrap_or_else(|| format!("agent-checkpoint:{}", uuid::Uuid::new_v4())),
             tool_name: "checkpoint".to_string(),
             input: serde_json::to_string(&input).map_err(|error| {
                 ToolError::new(format!("serialize Runtime checkpoint input: {error}"))
@@ -189,13 +194,15 @@ impl ScopedRuntimeToolExecutor {
         tool_name: &str,
         input: &str,
         authorization: harness_contract::tool::ToolExecutionAuthorization,
+        step_binding: Option<&crate::step_snapshot::StepCallBinding>,
     ) -> Result<String, ToolError> {
         let input = serde_json::from_str::<serde_json::Value>(input).map_err(|error| {
             ToolError::new(format!("invalid Runtime delegated tool input: {error}"))
         })?;
-        let descriptor = self
-            .host
-            .delegated_tool_effect_descriptor(tool_name, &input)
+        let descriptor = step_binding.map(|binding| {
+            binding.resolve(self.host.pin_step_catalog()).map(|step| step.lease().describe_effect(tool_name, &input))
+        }).transpose().map_err(|error| ToolError::new(error.to_string()))?
+            .or_else(|| self.host.delegated_tool_effect_descriptor(tool_name, &input))
             .ok_or_else(|| {
                 ToolError::new("Runtime delegated tool has no registered effect descriptor")
             })?;
@@ -208,14 +215,18 @@ impl ScopedRuntimeToolExecutor {
             0
         };
         let request = RuntimeToolExecutionRequest {
+            compiled_invocation: step_binding.map(|binding| binding.prepare_invocation(self.host.pin_step_catalog(), tool_name, &input))
+                .transpose().map_err(|error| ToolError::new(error.to_string()))?,
+            step_binding: step_binding.cloned(),
             governed_plan_id: self.execution_id.clone(),
             governed_plan_revision: 1,
             observation_wave_sequence: read_sequence,
-            idempotency_key: authorization
+            idempotency_key: step_binding.map(crate::step_snapshot::StepCallBinding::effect_idempotency_key).or_else(|| authorization
                 .idempotency_key
-                .clone()
+                .clone())
                 .unwrap_or_else(|| format!("agent-runtime-tool:{}", uuid::Uuid::new_v4())),
-            tool_use_id: format!("agent-runtime-tool:{}:{}", tool_name, uuid::Uuid::new_v4()),
+            tool_use_id: step_binding.map(|binding| binding.origin.call_id.clone())
+                .unwrap_or_else(|| format!("agent-runtime-tool:{}:{}", tool_name, uuid::Uuid::new_v4())),
             tool_name: tool_name.to_string(),
             input: serde_json::to_string(&input).map_err(|error| {
                 ToolError::new(format!("serialize Runtime delegated tool input: {error}"))
@@ -400,11 +411,23 @@ impl ScopedRuntimeToolExecutor {
         authorization: Option<harness_contract::tool::ToolExecutionAuthorization>,
         provider_invocation_id: Option<&str>,
     ) -> Result<String, ToolError> {
+        self.execute_scoped_bound(tool_name, input, authorization, provider_invocation_id, None).await
+    }
+
+    pub(super) async fn execute_scoped_bound(
+        &self,
+        tool_name: &str,
+        input: &str,
+        authorization: Option<harness_contract::tool::ToolExecutionAuthorization>,
+        provider_invocation_id: Option<&str>,
+        step_binding: Option<&crate::step_snapshot::StepCallBinding>,
+    ) -> Result<String, ToolError> {
         let parsed_input = serde_json::from_str::<serde_json::Value>(input)
             .map_err(|error| ToolError::new(format!("invalid scoped tool input: {error}")))?;
-        let descriptor = self
-            .host
-            .delegated_tool_effect_descriptor(tool_name, &parsed_input)
+        let descriptor = step_binding.map(|binding| {
+            binding.resolve(self.host.pin_step_catalog()).map(|step| step.lease().describe_effect(tool_name, &parsed_input))
+        }).transpose().map_err(|error| ToolError::new(error.to_string()))?
+            .or_else(|| self.host.delegated_tool_effect_descriptor(tool_name, &parsed_input))
             .ok_or_else(|| ToolError::new("tool has no enforceable Runtime effect descriptor"))?;
         let requested = crate::governed_tool_plan::resource_scope_from_effect(&descriptor);
         let bounded_sandbox_process = descriptor.spawns_process
@@ -430,9 +453,8 @@ impl ScopedRuntimeToolExecutor {
             .next_receipt_sequence
             .fetch_add(1, Ordering::SeqCst)
             .saturating_add(1);
-        let idempotency_key = authorization
-            .as_ref()
-            .and_then(|value| value.idempotency_key.clone())
+        let idempotency_key = step_binding.map(crate::step_snapshot::StepCallBinding::effect_idempotency_key)
+            .or_else(|| authorization.as_ref().and_then(|value| value.idempotency_key.clone()))
             .unwrap_or_else(|| {
                 deterministic_scoped_tool_idempotency_key(
                     &self.execution_id,
@@ -444,14 +466,17 @@ impl ScopedRuntimeToolExecutor {
                 )
             });
         let request = RuntimeToolExecutionRequest {
+            compiled_invocation: step_binding.map(|binding| binding.prepare_invocation(self.host.pin_step_catalog(), tool_name, &parsed_input))
+                .transpose().map_err(|error| ToolError::new(error.to_string()))?,
+            step_binding: step_binding.cloned(),
             governed_plan_id: self.execution_id.clone(),
             governed_plan_revision: sequence,
             observation_wave_sequence: sequence,
             idempotency_key,
-            tool_use_id: format!(
+            tool_use_id: step_binding.map(|binding| binding.origin.call_id.clone()).unwrap_or_else(|| format!(
                 "agent-tool:{}:{}:{}:{tool_name}",
                 self.node_id, self.attempt, sequence
-            ),
+            )),
             tool_name: tool_name.to_string(),
             input: input.to_string(),
             category: crate::ToolSafetyCategory::from_effect(&descriptor),

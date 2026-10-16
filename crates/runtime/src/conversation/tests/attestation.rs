@@ -50,7 +50,7 @@
             .with_artifact_store(services.artifact_store().clone());
         runtime.begin_turn_strategy("single-slot", "read current file").unwrap();
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), runtime.execute_tool_batch_step(
-            &[ModelToolCall { id: "read".into(), name: "read_file".into(), input: "{\"path\":\"README.md\"}".into(), depends_on: vec![] }],
+            &[ModelToolCall { binding: None, id: "read".into(), name: "read_file".into(), input: "{\"path\":\"README.md\"}".into(), depends_on: vec![] }],
             &crate::SharedPrompter::none(), 1,
         )).await.expect("outer conversation cannot hold the slot needed by its delegated leaf").unwrap();
         assert_eq!(result.failed, 0, "{:?}", result.messages);
@@ -299,6 +299,7 @@
         };
         let calls = (0..50)
             .map(|index| ModelToolCall {
+                binding: None,
                 id: format!("read-{index}"),
                 name: "read_file".to_string(),
                 input: format!(r#"{{"path":"{index}"}}"#),
@@ -352,6 +353,7 @@
                 (
                     call.id.clone(),
                     harness_contract::tool::GovernedToolInvocation {
+                        origin: None,
                         contract_version: 1,
                         invocation_id: call.id.clone(),
                         intent: harness_contract::tool::ToolIntent {
@@ -541,12 +543,14 @@
     fn dynamic_tool_nodes_preserve_file_resource_scopes() {
         let same_file = resource_scopes_for_tool_calls(&[
             ModelToolCall {
+                binding: None,
                 id: "write-a".into(),
                 name: "edit".into(),
                 input: r#"{"path":"src/lib.rs","content":"a"}"#.into(),
                 depends_on: Vec::new(),
             },
             ModelToolCall {
+                binding: None,
                 id: "write-b".into(),
                 name: "edit".into(),
                 input: r#"{"path":"src/lib.rs","old_string":"a","new_string":"b"}"#.into(),
@@ -557,12 +561,14 @@
 
         let different_files = resource_scopes_for_tool_calls(&[
             ModelToolCall {
+                binding: None,
                 id: "write-a".into(),
                 name: "edit".into(),
                 input: r#"{"path":"src/a.rs","content":"a"}"#.into(),
                 depends_on: Vec::new(),
             },
             ModelToolCall {
+                binding: None,
                 id: "write-b".into(),
                 name: "edit".into(),
                 input: r#"{"path":"src/b.rs","content":"b"}"#.into(),
@@ -606,12 +612,14 @@
         let outside = root.path().with_file_name("mistyped-workspace/src/lib.rs");
         let calls = [
             ModelToolCall {
+                binding: None,
                 id: "valid".into(),
                 name: "grep_search".into(),
                 input: serde_json::json!({"path": inside, "pattern": "Runtime"}).to_string(),
                 depends_on: Vec::new(),
             },
             ModelToolCall {
+                binding: None,
                 id: "typo".into(),
                 name: "read_file".into(),
                 input: serde_json::json!({"path": outside}).to_string(),
@@ -630,12 +638,14 @@
         let root = tempfile::tempdir().expect("workspace");
         let calls = [
             ModelToolCall {
+                binding: None,
                 id: "write".into(),
                 name: "edit".into(),
                 input: r#"{"path":"src/lib.rs","content":"updated"}"#.into(),
                 depends_on: Vec::new(),
             },
             ModelToolCall {
+                binding: None,
                 id: "typo".into(),
                 name: "read_file".into(),
                 input: r#"{"path":"../other/src/lib.rs"}"#.into(),
@@ -663,12 +673,14 @@
         };
         let calls = vec![
             ModelToolCall {
+                binding: None,
                 id: "capabilities".to_string(),
                 name: "runtime_capabilities".to_string(),
                 input: "{}".to_string(),
                 depends_on: Vec::new(),
             },
             ModelToolCall {
+                binding: None,
                 id: "mistyped-read".to_string(),
                 name: "tool_orchestrate".to_string(),
                 input: serde_json::json!({
@@ -682,7 +694,7 @@
             },
         ];
 
-        let nodes = tool_nodes_for_calls(&ticket, 1, "session", calls, workspace.path())
+        let nodes = tool_nodes_for_calls(&ticket, 1, "session", calls, workspace.path(), None, false, )
             .expect("tool batch nodes");
 
         assert!(
@@ -826,6 +838,7 @@
         let root = tempfile::tempdir().expect("workspace");
         let target = root.path().join("fixtures/target.txt");
         let calls = [ModelToolCall {
+            binding: None,
             id: "write".into(),
             name: "edit".into(),
             input: serde_json::json!({"path": target, "content": "updated"}).to_string(),
@@ -936,7 +949,7 @@
             "session",
             calls,
             workspace.path(),
-        )
+         None, false, )
         .expect("verification nodes");
 
         assert_eq!(nodes.len(), 1);
@@ -998,6 +1011,7 @@
     #[test]
     fn runtime_prefetched_exact_read_closes_only_its_matching_focus_scope() {
         let calls = vec![ModelToolCall {
+            binding: None,
             id: "runtime-focus-verify-2-0".to_string(),
             name: "read_file".to_string(),
             input: serde_json::json!({"path": "fixtures/target.txt", "complete": true}).to_string(),
@@ -1021,6 +1035,7 @@
         );
 
         let bounded_calls = vec![ModelToolCall {
+            binding: None,
             id: "runtime-focus-verify-2-0".to_string(),
             name: "read_file".to_string(),
             input: serde_json::json!({"path": "fixtures/target.txt"}).to_string(),
@@ -1232,6 +1247,7 @@
         std::fs::create_dir_all(target.parent().expect("target parent")).expect("fixture parent");
         std::fs::write(&target, "seed\n").expect("fixture target");
         let calls = [ModelToolCall {
+            binding: None,
             id: "read-target".into(),
             name: "read_file".into(),
             input: serde_json::json!({"path": target}).to_string(),

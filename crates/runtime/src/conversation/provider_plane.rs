@@ -359,6 +359,129 @@ where
         request
     }
 
+    fn active_step_goal(
+        &self,
+        execution: Option<&crate::CowdExecutionContext>,
+    ) -> Result<Option<harness_contract::goal::GoalContract>, RuntimeError> {
+        let execution_id = execution.map(|context| context.execution_id.as_str())
+            .or_else(|| self.execution_identity.as_ref().and_then(|identity| identity.graph_id()));
+        let Some((execution_id, store)) = execution_id.zip(self.runtime_event_store.as_ref()) else { return Ok(None); };
+        let goal = crate::execution_core::GoalStore::new(Arc::clone(store)).get(&format!("goal:{execution_id}"))
+            .map_err(RuntimeError::new)?;
+        if let Some(goal) = &goal {
+            if goal.session_id != self.session_id() || goal.execution_binding.as_ref().is_some_and(|binding|
+                binding.root_execution_id != execution_id || binding.session_id != self.session_id()
+                    || execution.is_some_and(|execution| binding.turn_id != execution.turn_id)) {
+                return Err(RuntimeError::new("step_goal_lineage_mismatch"));
+            }
+        }
+        Ok(goal)
+    }
+
+    pub(crate) fn bind_system_tool_call(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+        parent_step_id: &str,
+    ) -> Result<Option<crate::step_snapshot::StepCallBinding>, RuntimeError> {
+        let Some(lease) = self.tool_executor.pin_step_catalog() else { return Ok(None); };
+        let execution = self.cowd_bus.as_ref().and_then(|bus| bus.current_execution_context());
+        let goal = self.active_step_goal(execution.as_ref())?;
+        let execution_id = execution.as_ref().map(|context| context.execution_id.clone())
+            .or_else(|| self.execution_identity.as_ref().and_then(|identity| identity.graph_id().map(str::to_string)))
+            .ok_or_else(|| RuntimeError::new("system tool call requires a live parent execution"))?;
+        let turn_id = crate::step_snapshot::admitted_turn_id(execution.as_ref(),
+            self.session_input_stream.active_turn_id().map(|turn| turn.to_string()))?;
+        let definitions = lease.snapshot().catalog.definitions(None).into_iter().filter(|definition| definition.name == tool_name)
+            .map(|definition| crate::ProviderToolDefinition { name: definition.name, description: definition.description, input_schema: definition.input_schema })
+            .collect::<Vec<_>>();
+        if definitions.len() != 1 { return Err(RuntimeError::new("system tool contract is unavailable")); }
+        let step = Arc::new(crate::step_snapshot::BoundStep::bind(harness_contract::step::StepIdentity {
+            step_id: uuid::Uuid::new_v4().to_string(), session_id: self.session_id().to_string(), turn_id,
+            execution_id: Some(execution_id), actor_ref: Some("runtime:checkpoint-guard".into()), run_ref: None, attempt: None,
+            epoch: execution.as_ref().map(|context| context.turn_id.clone()), goal_ref: goal.as_ref().map(|goal| goal.id.clone()),
+            program_ref: goal.as_ref().and_then(|goal| goal.execution_binding.as_ref().map(|binding| binding.agentic_program_id.clone())),
+            task_ref: self.execution_identity.as_ref().and_then(|identity| identity.task_id().map(str::to_string)),
+            build_ref: option_env!("COWD_GIT_SHA").unwrap_or("unverified").to_string(),
+        }, lease, &definitions, &serde_json::json!({"source":"runtime_system"}), input,
+            BTreeMap::from([("policy".to_string(), self.permission_policy.execution_policy_control().snapshot().revision.to_string())])
+                .into_iter().chain(goal.as_ref().map(|goal| ("goal_spec_observed".to_string(), format!("{}:{}", goal.spec_revision, goal.spec_digest)))).collect(),
+            chrono::Utc::now().timestamp_millis().saturating_add(3_600_000))?.with_parent(parent_step_id));
+        self.runtime_event_store.as_ref().ok_or_else(|| RuntimeError::new("system tool requires durable origin"))?
+            .append(crate::runtime_event_store::RuntimeEventInput {
+                stream_id: format!("session:{}", self.session_id()), scope: crate::runtime_event_store::RuntimeEventScope::Session,
+                kind: "system.step_bound".to_string(), status: Some("prepared".into()), actor: Some("runtime".into()), refs: vec![],
+                payload: serde_json::to_value(step.snapshot()).map_err(|error| RuntimeError::new(error.to_string()))?,
+            }).map_err(|error| RuntimeError::new(error.to_string()))?;
+        let call_id = format!("system:{}:{tool_name}", step.snapshot().identity.step_id);
+        Ok(Some(crate::step_snapshot::StepCallBinding::system(step, parent_step_id, &call_id)))
+    }
+
+    fn bind_provider_step(
+        &self,
+        request: &mut ApiRequest,
+    ) -> Result<Option<Arc<crate::step_snapshot::BoundStep>>, RuntimeError> {
+        let Some(lease) = self.tool_executor.pin_step_catalog() else {
+            return Ok(None);
+        };
+        let advertised = self.api_client.step_tool_definitions().ok_or_else(|| {
+            RuntimeError::new("production provider does not expose its actual step tool contracts")
+        })?;
+        let execution = self.cowd_bus.as_ref().and_then(|bus| bus.current_execution_context());
+        let goal = self.active_step_goal(execution.as_ref())?;
+        let turn_id = crate::step_snapshot::admitted_turn_id(execution.as_ref(),
+            self.session_input_stream.active_turn_id().map(|turn| turn.to_string()))?;
+        let policy = self.permission_policy.execution_policy_control().snapshot();
+        let inventory = self.api_client.context_inventory();
+        let identity = harness_contract::step::StepIdentity {
+            step_id: uuid::Uuid::new_v4().to_string(),
+            session_id: self.session_id().to_string(),
+            turn_id,
+            execution_id: execution.as_ref().map(|context| context.execution_id.clone()),
+            actor_ref: self.execution_identity.as_ref().map(|identity| identity.principal_id().to_string()),
+            run_ref: self.execution_identity.as_ref().and_then(|identity| identity.agent_run_id().map(str::to_string)),
+            attempt: None,
+            epoch: execution.as_ref().map(|context| context.turn_id.clone()),
+            goal_ref: goal.as_ref().map(|goal| goal.id.clone()),
+            program_ref: goal.as_ref().and_then(|goal| goal.execution_binding.as_ref().map(|binding| binding.agentic_program_id.clone())),
+            task_ref: self.execution_identity.as_ref().and_then(|identity| identity.task_id().map(str::to_string)),
+            build_ref: option_env!("COWD_GIT_SHA").unwrap_or("unverified").to_string(),
+        };
+        let mut revisions = std::collections::BTreeMap::from([
+            ("policy".to_string(), policy.revision.to_string()),
+            ("provider_registry".to_string(), inventory.provider_registry_revision.to_string()),
+            ("history".to_string(), request.messages.cursor().revision.to_string()),
+        ]);
+        if let Some(goal) = goal { revisions.insert("goal_spec_observed".to_string(), format!("{}:{}", goal.spec_revision, goal.spec_digest)); }
+        let request_material = crate::step_snapshot::request_material(request);
+        let step = Arc::new(crate::step_snapshot::BoundStep::bind(
+            identity,
+            lease,
+            &advertised,
+            &serde_json::json!({"model": request.model, "reasoning_effort": request.reasoning_effort_override}),
+            &request_material,
+            revisions,
+            chrono::Utc::now().timestamp_millis().saturating_add(3_600_000),
+        )?);
+        let store = self.runtime_event_store.as_ref().ok_or_else(|| {
+            RuntimeError::new("production step requires durable request binding before provider dispatch")
+        })?;
+        store.append(crate::runtime_event_store::RuntimeEventInput {
+            stream_id: format!("session:{}", self.session_id()),
+            scope: crate::runtime_event_store::RuntimeEventScope::Session,
+            kind: "model.step_bound".to_string(),
+            status: Some("prepared".to_string()),
+            actor: Some("conversation_runtime".to_string()),
+            refs: vec![crate::runtime_event_store::RuntimeEventRef {
+                kind: "step".to_string(),
+                id: step.snapshot().identity.step_id.clone(),
+            }],
+            payload: serde_json::to_value(step.snapshot()).map_err(|error| RuntimeError::new(error.to_string()))?,
+        }).map_err(|error| RuntimeError::new(format!("persist step binding before provider dispatch: {error}")))?;
+        request.bound_step = Some(Arc::clone(&step));
+        Ok(Some(step))
+    }
+
     fn observe_provider_downstream_overload(
         result: crate::execution_core::graph::ResourceResultClass,
     ) {
@@ -636,11 +759,12 @@ where
                     }
                     attempt_id
                 });
+                let bound_step = self.bind_provider_step(&mut request)?;
                 let mut reducer = ModelStreamReducer::new(
                     self.cowd_bus.clone(),
                     self.runtime_event_store.clone(),
                     self.session_id().to_string(),
-                );
+                ).with_bound_step(bound_step);
                 if let (Some((presentation_id, _, _, _)), Some(attempt_id)) =
                     (presentation, terminal_attempt_id.as_deref())
                 {
@@ -1766,11 +1890,12 @@ where
                 self.acquire_provider_capacity(&model, &request).await?;
             let provider_started = Instant::now();
             let stream_started = Instant::now();
+            let bound_step = self.bind_provider_step(&mut request)?;
             let reducer = ModelStreamReducer::new(
                 self.cowd_bus.clone(),
                 self.runtime_event_store.clone(),
                 self.session_id().to_string(),
-            );
+            ).with_bound_step(bound_step);
             token_reservations.mark_dispatched();
             let ApiClientStream {
                 events,
@@ -1944,7 +2069,7 @@ where
             // frame regardless of what is inserted between here and there.
             for call in &mut calls {
                 if let Ok(repaired) =
-                    self.tool_executor.validate_tool_input(&call.name, &call.input)
+                    self.tool_executor.validate_step_tool_input(call.binding.as_ref(), &call.name, &call.input)
                 {
                     if repaired != call.input {
                         // A repair that only closes a cut-off frame is not the
@@ -2235,7 +2360,7 @@ where
                 .iter()
                 .filter_map(|call| {
                     self.tool_executor
-                        .validate_tool_input(&call.name, &call.input)
+                        .validate_step_tool_input(call.binding.as_ref(), &call.name, &call.input)
                         .err()
                         .map(|error| (call.id.clone(), error.to_string()))
                 })

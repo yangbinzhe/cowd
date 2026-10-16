@@ -188,6 +188,8 @@ impl Default for ResourceDemand {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GovernedToolInvocation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<crate::step::CallOrigin>,
     pub contract_version: u32,
     pub invocation_id: String,
     pub intent: ToolIntent,

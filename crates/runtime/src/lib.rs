@@ -298,6 +298,8 @@ pub mod session_relation_graph;
 pub mod session_runtime_port;
 #[path = "skill/mod.rs"]
 pub mod skill;
+#[path = "conversation/step_snapshot.rs"]
+pub mod step_snapshot;
 #[path = "recovery/source_self_audit.rs"]
 pub mod source_self_audit;
 #[path = "conversation/sse.rs"]
@@ -316,6 +318,8 @@ pub mod surface_contract;
 pub mod task;
 #[path = "team/l4_promotion.rs"]
 pub mod team_l4_promotion;
+#[path = "tooling/tool_contracts.rs"]
+pub mod tool_contracts;
 #[path = "tooling/tool_dispatch.rs"]
 pub mod tool_dispatch;
 #[path = "tooling/tool_execution_plane.rs"]

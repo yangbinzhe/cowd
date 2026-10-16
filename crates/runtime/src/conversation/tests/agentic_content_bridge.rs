@@ -114,6 +114,7 @@ fn agentic_content_bridge_ticket(
 
 fn explicit_content_commit_call(id: &str) -> ModelToolCall {
     ModelToolCall {
+        binding: None,
         id: id.to_string(),
         name: harness_contract::agent_action::ARTIFACT_COMMIT_TOOL_ID.to_string(),
         input: serde_json::json!({
@@ -129,6 +130,7 @@ fn explicit_content_commit_call(id: &str) -> ModelToolCall {
 
 fn explicit_task_submit_call(id: &str) -> ModelToolCall {
     ModelToolCall {
+        binding: None,
         id: id.to_string(),
         name: harness_contract::agent_action::TASK_SUBMIT_TOOL_ID.to_string(),
         input: serde_json::json!({

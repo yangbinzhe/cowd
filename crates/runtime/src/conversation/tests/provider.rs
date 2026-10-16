@@ -553,6 +553,7 @@ async fn exact_provider_wire_evidence_is_artifact_backed_and_durably_pinned() {
         attempt: 7,
     };
     let evidence = crate::ProviderWireEvidence {
+        step_render: None,
         request_context: crate::ProviderRequestContext {
             request_id: "request-provider-evidence".to_string(),
             profile: crate::ResolvedProviderProfile {
@@ -885,6 +886,7 @@ fn model_observation_promotes_only_a_matching_packed_provider_result() {
     assert!(runtime.turn_model_observations().is_empty());
 
     let request = ApiRequest {
+        bound_step: None,
         prompt: PromptAssembly::new(vec!["system".to_string()]),
         messages: vec![ConversationMessage::tool_result(
             "tool-call-1".to_string(),
@@ -1180,18 +1182,21 @@ fn sequential_team_artifact_request_materializes_a_write_capable_followup_team()
 fn model_tool_calls_are_bounded_by_the_current_exposure_lease() {
     let calls = vec![
         ModelToolCall {
+            binding: None,
             id: "read".to_string(),
             name: "read_file".to_string(),
             input: "{}".to_string(),
             depends_on: Vec::new(),
         },
         ModelToolCall {
+            binding: None,
             id: "hidden".to_string(),
             name: "shell".to_string(),
             input: "{}".to_string(),
             depends_on: Vec::new(),
         },
         ModelToolCall {
+            binding: None,
             id: "missing".to_string(),
             name: "invented_tool".to_string(),
             input: "{}".to_string(),
@@ -1209,12 +1214,14 @@ fn model_tool_calls_are_bounded_by_the_current_exposure_lease() {
 fn provider_tool_name_aliases_only_resolve_inside_the_current_exposure_lease() {
     let mut calls = vec![
         ModelToolCall {
+            binding: None,
             id: "search".to_string(),
             name: "web_search".to_string(),
             input: "{}".to_string(),
             depends_on: Vec::new(),
         },
         ModelToolCall {
+            binding: None,
             id: "hidden".to_string(),
             name: "shell-command".to_string(),
             input: "{}".to_string(),
@@ -1227,6 +1234,7 @@ fn provider_tool_name_aliases_only_resolve_inside_the_current_exposure_lease() {
     assert_eq!(calls[1].name, "shell-command");
 
     let mut ambiguous = vec![ModelToolCall {
+        binding: None,
         id: "ambiguous".to_string(),
         name: "web search".to_string(),
         input: "{}".to_string(),
@@ -1301,6 +1309,7 @@ fn explicit_team_requirement_does_not_preempt_first_step_model_tool_calls() {
     let classified = classify_model_step_intent(
         String::new(),
         vec![ModelToolCall {
+            binding: None,
             id: "provider-agent-helper".to_string(),
             name: "agent_helper".to_string(),
             input: "{}".to_string(),
@@ -1323,6 +1332,7 @@ fn ordinary_tool_names_never_create_runtime_control_intents() {
         let intent = classify_model_step_intent(
             String::new(),
             vec![ModelToolCall {
+                binding: None,
                 id: format!("call-{name}"),
                 name: name.to_string(),
                 input: "{}".to_string(),
@@ -1484,6 +1494,7 @@ fn image_user_message_from_path_reads_image_as_structured_block() {
 #[test]
 fn provider_transport_policy_scales_with_actual_request_size() {
     let small = ApiRequest {
+        bound_step: None,
         prompt: PromptAssembly::new(vec!["system".to_string()]),
         messages: vec![ConversationMessage::user_text("status".to_string())].into(),
         model: "test".to_string(),
@@ -1495,6 +1506,7 @@ fn provider_transport_policy_scales_with_actual_request_size() {
         provider_evidence_context: None,
     };
     let large = ApiRequest {
+        bound_step: None,
         prompt: PromptAssembly::new(vec!["system".repeat(5_000)]),
         messages: vec![ConversationMessage::user_text("evidence".repeat(10_000))].into(),
         model: "test".to_string(),
@@ -1514,6 +1526,7 @@ fn provider_transport_policy_scales_with_actual_request_size() {
 
 fn token_reservation_request() -> ApiRequest {
     ApiRequest {
+        bound_step: None,
         prompt: PromptAssembly::new(vec!["system".to_string()]),
         messages: vec![ConversationMessage::user_text("bounded".to_string())].into(),
         model: "test".to_string(),
@@ -2120,6 +2133,7 @@ async fn stale_session_fence_blocks_tool_before_executor_side_effect() {
     let result = runtime
         .execute_tool_batch_step(
             &[ModelToolCall {
+                binding: None,
                 id: "read-fenced".to_string(),
                 name: "read_file".to_string(),
                 input: r#"{"path":"README.md"}"#.to_string(),
@@ -3405,6 +3419,7 @@ fn governed_plan_retargets_one_strategy_from_research_to_approved_write() {
             .expect("governed plan")
     };
     let search = ModelToolCall {
+        binding: None,
         id: "search".to_string(),
         name: "web_search".to_string(),
         input: r#"{"query":"tokio cancellation token"}"#.to_string(),
@@ -3422,6 +3437,7 @@ fn governed_plan_retargets_one_strategy_from_research_to_approved_write() {
     );
 
     let write = ModelToolCall {
+        binding: None,
         id: "write".to_string(),
         name: "edit".to_string(),
         input: r#"{"path":"target/report.md","content":"verified"}"#.to_string(),
@@ -3487,12 +3503,14 @@ fn collaboration_strategy_admits_agent_inspection_with_bounded_workspace_work() 
 
     let calls = vec![
         ModelToolCall {
+            binding: None,
             id: "inspect".to_string(),
             name: harness_contract::agent_action::STATE_INSPECT_TOOL_ID.to_string(),
             input: "{}".to_string(),
             depends_on: Vec::new(),
         },
         ModelToolCall {
+            binding: None,
             id: "write".to_string(),
             name: "edit".to_string(),
             input: r#"{"path":"target/report.md","content":"verified"}"#.to_string(),
@@ -3576,6 +3594,7 @@ fn explicit_team_obligation_survives_a_non_collaboration_setup_batch() {
         .expect("bind graph");
 
     let calls = vec![ModelToolCall {
+        binding: None,
         id: "setup-write".to_string(),
         name: "edit".to_string(),
         input: r#"{"path":"target/setup.md","content":"prepared"}"#.to_string(),
@@ -3674,6 +3693,7 @@ async fn parallel_network_tool_batch_is_admitted_by_the_retargeted_strategy_leas
     .into_iter()
     .enumerate()
     .map(|(index, query)| ModelToolCall {
+        binding: None,
         id: format!("search-{index}"),
         name: "web_search".to_string(),
         input: serde_json::json!({ "query": query }).to_string(),
@@ -3788,6 +3808,7 @@ async fn evidence_index_miss_falls_through_to_the_durable_tool_host() {
         .begin_turn_strategy("turn-durable-evidence", "retrieve retained evidence")
         .expect("admit evidence turn");
     let calls = vec![ModelToolCall {
+        binding: None,
         id: "retrieve".to_string(),
         name: "evidence_retrieve".to_string(),
         input: r#"{"evidence_ref":"tool://small-output-not-indexed","query":"fact"}"#.to_string(),

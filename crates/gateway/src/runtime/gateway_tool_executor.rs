@@ -156,6 +156,7 @@ struct ContextRetrieveRequest {
 
 #[derive(Debug, Clone, Copy)]
 struct RuntimeToolExecutionBinding<'a> {
+    tool_lease: Option<&'a tools::ToolHostLease>,
     action_id: Option<&'a str>,
     session_id: Option<&'a str>,
     authorized_scopes: &'a [String],

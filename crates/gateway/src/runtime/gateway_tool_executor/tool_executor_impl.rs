@@ -1,5 +1,9 @@
 #[async_trait::async_trait]
 impl ToolExecutor for GatewayToolExecutor {
+    fn pin_step_catalog(&self) -> Option<tools::ToolHostLease> {
+        Some(self.tool_host.pin_snapshot())
+    }
+
     fn tool_discovery_receipt(&self) -> harness_contract::tool::ToolDiscoveryReceipt {
         let lease = self.tool_host.pin_snapshot();
         let mut receipt = lease.catalog_receipt();
@@ -222,8 +226,42 @@ impl ToolExecutor for GatewayToolExecutor {
         tool_name: &str,
         input: &str,
     ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
-        self.execute_authorized_output_with_progress(authorization, tool_name, input, None)
+        self.execute_authorized_output_with_progress(authorization, tool_name, input, None, None)
             .await
+    }
+
+    async fn execute_step_authorized_invocation_output(
+        &self,
+        binding: Option<&runtime::step_snapshot::StepCallBinding>,
+        provider_invocation_id: &str,
+        authorization: &harness_contract::tool::ToolExecutionAuthorization,
+        tool_name: &str,
+        input: &str,
+    ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+        let binding = binding.ok_or_else(|| ToolError::new("production_tool_origin_required"))?;
+        let lease = {
+            let step = binding
+                .resolve(Some(self.tool_host.pin_snapshot()))
+                .map_err(|error| ToolError::new(error.to_string()))?;
+            step.validate_call(
+                &binding.origin,
+                &binding.snapshot.identity.session_id,
+                provider_invocation_id,
+                tool_name,
+                input,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .map_err(|error| ToolError::new(error.to_string()))?;
+            step.lease().clone()
+        };
+        self.execute_authorized_output_with_progress(
+            authorization,
+            tool_name,
+            input,
+            None,
+            Some(lease),
+        )
+        .await
     }
 
     fn available_tool_names(&self) -> Vec<String> {

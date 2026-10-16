@@ -233,7 +233,9 @@ pub(super) fn validate_readonly_tool_receipt(
         .get("tool_name")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
-    if actual_hash != expected_hash || actual_tool != request.tool_name {
+    let input_matches =
+        receipt_payload_matches(request, payload)?.unwrap_or(actual_hash == expected_hash);
+    if !input_matches || actual_tool != request.tool_name {
         return Err(ExecutionCommitError::InvalidCommand(format!(
             "read-only receipt collision for idempotency key `{}`",
             request.idempotency_key
@@ -262,7 +264,9 @@ pub(super) fn validate_mutation_tool_fingerprint(
         .or_else(|| payload.pointer("/effect/descriptor_hash"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
-    if actual_input != expected_input
+    let input_matches =
+        receipt_payload_matches(request, payload)?.unwrap_or(actual_input == expected_input);
+    if !input_matches
         || actual_tool != request.tool_name
         || actual_tool != effect.tool_id
         || actual_descriptor != effect.descriptor_hash
@@ -273,6 +277,54 @@ pub(super) fn validate_mutation_tool_fingerprint(
         )));
     }
     Ok(())
+}
+
+pub(super) fn receipt_replay_contract(
+    request: &crate::RuntimeToolExecutionRequest,
+) -> Result<serde_json::Value, ExecutionCommitError> {
+    let (Some(binding), Some(invocation)) = (&request.step_binding, &request.compiled_invocation)
+    else {
+        return Ok(serde_json::Value::Null);
+    };
+    let payload = canonical_tool_payload(&request.input)?;
+    if invocation.invocation_id != request.tool_use_id
+        || invocation.intent.tool_name != request.tool_name
+        || invocation.origin.as_ref() != Some(&binding.origin)
+        || request.session_id.as_deref() != Some(binding.snapshot.identity.session_id.as_str())
+        || canonical_tool_value(&invocation.intent.normalized_input)? != payload
+    {
+        return Err(ExecutionCommitError::InvalidCommand(
+            "compiled invocation disagrees with receipt identity".into(),
+        ));
+    }
+    let mut stored_invocation = invocation.clone();
+    stored_invocation.intent.normalized_input = serde_json::Value::Null;
+    Ok(
+        json!({"session_id":request.session_id,"parent_execution":request.parent_execution,
+        "call_id":request.tool_use_id,"origin":binding.origin,"payload_digest":payload,"invocation":stored_invocation}),
+    )
+}
+
+pub(super) fn receipt_payload_matches(
+    request: &crate::RuntimeToolExecutionRequest,
+    payload: &serde_json::Value,
+) -> Result<Option<bool>, ExecutionCommitError> {
+    payload
+        .pointer("/replay/payload_digest")
+        .and_then(serde_json::Value::as_str)
+        .map(|digest| canonical_tool_payload(&request.input).map(|actual| actual == digest))
+        .transpose()
+}
+
+fn canonical_tool_value(input: &serde_json::Value) -> Result<String, ExecutionCommitError> {
+    harness_contract::step::canonical_digest("tool-effect-payload", input)
+        .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))
+}
+
+fn canonical_tool_payload(input: &str) -> Result<String, ExecutionCommitError> {
+    let value = harness_contract::step::parse_strict_json(input)
+        .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))?;
+    canonical_tool_value(&value)
 }
 
 pub(super) fn now_ms() -> u64 {

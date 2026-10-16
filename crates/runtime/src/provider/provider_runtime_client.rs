@@ -264,6 +264,8 @@ pub struct ProviderRequestEvidenceContext {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProviderWireEvidence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_render: Option<harness_contract::step::StepRenderRef>,
     pub request_context: ProviderRequestContext,
     pub wire_request: provider::ProviderWireRequest,
     pub prefix_observation: crate::ProviderWirePrefixObservation,
@@ -870,6 +872,10 @@ fn build_provider_template(
 }
 
 impl ApiClient for ProviderRuntimeClient {
+    fn step_tool_definitions(&self) -> Option<Vec<ProviderToolDefinition>> {
+        Some(self.compiled_tool_schema().tools.to_vec())
+    }
+
     fn stream(
         &mut self,
         request: ApiRequest,
@@ -981,6 +987,20 @@ impl ProviderRuntimeClient {
         request: ApiRequest,
         provider_snapshot: ProviderRegistrySnapshot,
     ) -> ApiClientStream<'_> {
+        if let Some(step) = request.bound_step.as_ref() {
+            if step.snapshot().related_revisions.get("provider_registry") != Some(&provider_snapshot.revision().to_string()) {
+                return ApiClientStream {
+                    events: Box::pin(futures::stream::once(async { Err(RuntimeError::new("provider_registry_changed_after_step_binding")) })),
+                    transport_activity: None,
+                };
+            }
+            if let Err(error) = step.validate_provider_request(&request, self.compiled_tool_schema().tools.as_ref()) {
+                return ApiClientStream {
+                    events: Box::pin(futures::stream::once(async move { Err(error) })),
+                    transport_activity: None,
+                };
+            }
+        }
         let messages = self.provider_input_messages(&request);
         let system = request.prompt.wire_system_text();
         let cache_cohort_system = request.prompt.cache_cohort_system_text();
@@ -1129,6 +1149,7 @@ impl ProviderRuntimeClient {
                     self.stream_callback.clone(),
                     request.provider_evidence_context,
                     self.provider_wire_evidence_writer.clone(),
+                    request.bound_step.clone(),
                     Arc::clone(&self.transport_pool),
                     transport_activity.clone(),
                     sender,
@@ -1232,6 +1253,7 @@ async fn forward_provider_attempt(
     stream_callback: Option<tokio::sync::mpsc::Sender<crate::CowdEvent>>,
     evidence_context: Option<ProviderRequestEvidenceContext>,
     evidence_writer: Option<Arc<dyn ProviderWireEvidenceWriter>>,
+    bound_step: Option<Arc<crate::step_snapshot::BoundStep>>,
     transport_pool: Arc<crate::ProviderTransportPool>,
     transport_activity: provider::TransportActivity,
     sender: tokio::sync::mpsc::Sender<Result<AssistantEvent, RuntimeError>>,
@@ -1278,6 +1300,26 @@ async fn forward_provider_attempt(
     // reusable prefix, so its size is what decides whether "append a contract
     // summary" can reduce reuse at all. Measured from the wire body rather than from
     // the definitions, so it is comparable with `model_visible_prompt_bytes`.
+    let step_render = if let Some(step) = &bound_step {
+        let snapshot = step.snapshot();
+        if evidence_context.as_ref().is_none_or(|context| context.session_id != snapshot.identity.session_id
+            || context.turn_id != snapshot.identity.turn_id) || evidence_writer.is_none() {
+            let _ = sender.send(Err(RuntimeError::new("bound provider step requires matching durable wire evidence"))).await;
+            return;
+        }
+        let value = match serde_json::to_value(&wire_request) {
+            Ok(value) => value,
+            Err(error) => { let _ = sender.send(Err(RuntimeError::new(error.to_string()))).await; return; }
+        };
+        let render_digest = match harness_contract::step::canonical_digest("provider-wire-render", &value) {
+            Ok(digest) => digest,
+            Err(error) => { let _ = sender.send(Err(RuntimeError::new(error.to_string()))).await; return; }
+        };
+        Some(harness_contract::step::StepRenderRef {
+            step_id: snapshot.identity.step_id.clone(), attempt_id: snapshot.provider_attempt.attempt_id.clone(),
+            catalog_digest: snapshot.catalog_digest.clone(), render_digest,
+        })
+    } else { None };
     let tool_array_bytes = wire_request.body.get("tools").map_or(0, |tools| {
         serde_json::to_vec(tools).unwrap_or_default().len()
     });
@@ -1324,6 +1366,7 @@ async fn forward_provider_attempt(
             .persist(
                 context,
                 ProviderWireEvidence {
+                    step_render,
                     request_context: entry.request_context.clone(),
                     wire_request,
                     prefix_observation,
@@ -2066,7 +2109,7 @@ async fn flush_pending_text(
     .await
 }
 
-fn convert_messages<'a>(
+pub(crate) fn convert_messages<'a>(
     messages: impl IntoIterator<Item = &'a ConversationMessage>,
 ) -> Vec<InputMessage> {
     messages
@@ -2812,6 +2855,128 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct StepWireRecorder {
+        records: std::sync::Mutex<Vec<super::ProviderWireEvidence>>,
+        refuse: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl super::ProviderWireEvidenceWriter for StepWireRecorder {
+        async fn persist(&self, _: &super::ProviderRequestEvidenceContext, evidence: super::ProviderWireEvidence) -> Result<(), crate::RuntimeError> {
+            if self.refuse.load(Ordering::SeqCst) { return Err(crate::RuntimeError::new("fixture durable write refused")); }
+            self.records.lock().unwrap().push(evidence);
+            Ok(())
+        }
+        async fn persist_outcome(&self, _: &super::ProviderRequestEvidenceContext, _: super::ProviderAttemptOutcomeEvidence) -> Result<(), crate::RuntimeError> { Ok(()) }
+    }
+
+    fn step_wire_fixture(endpoint: String, workspace: &std::path::Path) -> (ProviderRuntimeClient, ApiRequest) {
+        let registry = Arc::new(ProviderRegistry::new(ProvidersConfig {
+            providers: HashMap::from([("fixture".into(), ProviderConfig {
+                name: "fixture".into(), base_url: endpoint, api_key: "fixture-secret".into(),
+                models: vec!["fixture-model".into()], protocol: Some("completions".into()),
+                parallel_tool_calls: Default::default(), early_tool_start: Default::default(),
+            })]),
+        }).unwrap());
+        let host = tools::ToolHost::builtin("wire-fixture", workspace);
+        let lease = host.pin_snapshot();
+        let definitions = lease.snapshot().catalog.definitions(None).into_iter().filter(|definition| definition.name == "read_file")
+            .map(|definition| ToolDefinition { name: definition.name, description: definition.description, input_schema: definition.input_schema }).collect();
+        let mut client = ProviderRuntimeClient::new(registry, "fixture-model".into(), definitions).unwrap();
+        client.configure_tool_exposure(exposure(&["read_file"], &[], 1));
+        let budget = crate::context_ledger::RequestBudgetReport::for_attempt("fixture-model", 32_768, 4_096, 0, 0, 0);
+        let mut request = ApiRequest {
+            bound_step: None, prompt: PromptAssembly::new(vec!["fixture system".into()]), messages: Vec::new().into(),
+            model: "fixture-model".into(), reasoning_effort_override: None, request_compiler_cache_hit: false,
+            budget: budget.clone(), provider_evidence_context: Some(super::ProviderRequestEvidenceContext {
+                session_id: "wire-session".into(), execution_id: "wire-execution".into(), turn_id: "wire-turn".into(),
+                request_sequence: 1, request_compiler_cache_hit: false, budget, attempt: 1,
+            }),
+        };
+        let step = crate::step_snapshot::BoundStep::bind(harness_contract::step::StepIdentity {
+            step_id: "wire-step".into(), session_id: "wire-session".into(), turn_id: "wire-turn".into(), execution_id: Some("wire-execution".into()),
+            actor_ref: None, run_ref: None, attempt: Some(1), epoch: None, goal_ref: None, program_ref: None, task_ref: None,
+            build_ref: "isolated-wire-fixture".into(),
+        }, lease, &client.step_tool_definitions().unwrap(), &json!({}), &crate::step_snapshot::request_material(&request),
+            BTreeMap::from([("provider_registry".into(), client.context_inventory().provider_registry_revision.to_string())]), i64::MAX).unwrap();
+        request.bound_step = Some(Arc::new(step));
+        (client, request)
+    }
+
+    #[tokio::test]
+    async fn bound_step_wire_digest_matches_sent_bytes_and_is_recorded_before_http() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let recorder = Arc::new(StepWireRecorder::default());
+        let observed = Arc::clone(&recorder);
+        let fixture = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            assert_eq!(observed.records.lock().unwrap().len(), 1);
+            let mut request_bytes = Vec::new();
+            let body = loop {
+                let mut buffer = [0_u8; 4096];
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0 && request_bytes.len() < 1024 * 1024);
+                request_bytes.extend_from_slice(&buffer[..count]);
+                if let Some(offset) = request_bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request_bytes[..offset]);
+                    let length = headers.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:")
+                        .map(|value| value.trim().parse::<usize>().unwrap())).unwrap();
+                    if request_bytes.len() >= offset + 4 + length { break serde_json::from_slice::<serde_json::Value>(&request_bytes[offset + 4..offset + 4 + length]).unwrap(); }
+                }
+            };
+            let response = "data: {\"id\":\"fixture\",\"object\":\"chat.completion.chunk\",\"model\":\"fixture-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"fixture\",\"object\":\"chat.completion.chunk\",\"model\":\"fixture-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
+            body
+        });
+        let workspace = tempfile::tempdir().unwrap();
+        let (mut client, request) = step_wire_fixture(format!("http://{address}/v1"), workspace.path());
+        let snapshot = request.bound_step.as_ref().unwrap().snapshot().clone();
+        client.configure_provider_wire_evidence(Some(recorder.clone()));
+        let events = tokio::time::timeout(std::time::Duration::from_secs(5), client.stream(request).collect::<Vec<_>>()).await.unwrap();
+        assert!(events.iter().all(Result::is_ok), "{events:?}");
+        assert!(events.iter().any(|event| matches!(event, Ok(AssistantEvent::MessageStop))));
+        let sent_body = fixture.await.unwrap();
+        let records = recorder.records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].wire_request.body, sent_body);
+        let render = records[0].step_render.as_ref().unwrap();
+        assert_eq!(render.step_id, snapshot.identity.step_id);
+        assert_eq!(render.catalog_digest, snapshot.catalog_digest);
+        assert_eq!(render.render_digest, harness_contract::step::canonical_digest("provider-wire-render", &serde_json::to_value(&records[0].wire_request).unwrap()).unwrap());
+        assert!(!serde_json::to_string(&records[0]).unwrap().contains("fixture-secret"));
+        assert_eq!(client.transport_pool.stats().in_flight, 0);
+        assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn missing_mismatched_or_failed_step_evidence_refuses_before_http() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        for condition in ["missing_writer", "wrong_session", "persist_failed", "changed_request", "stale_registry"] {
+            let (mut client, mut request) = step_wire_fixture(format!("http://{address}/v1"), workspace.path());
+            let recorder = Arc::new(StepWireRecorder::default());
+            if condition != "missing_writer" { client.configure_provider_wire_evidence(Some(recorder.clone())); }
+            if condition == "wrong_session" { request.provider_evidence_context.as_mut().unwrap().session_id = "other-session".into(); }
+            if condition == "persist_failed" { recorder.refuse.store(true, Ordering::SeqCst); }
+            if condition == "changed_request" { request.prompt = PromptAssembly::new(vec!["changed system".into()]); }
+            if condition == "stale_registry" {
+                let step = request.bound_step.as_ref().unwrap();
+                let mut snapshot = step.snapshot().clone();
+                snapshot.related_revisions.insert("provider_registry".into(), "999999".into());
+                request.bound_step = Some(Arc::new(crate::step_snapshot::BoundStep::restore(snapshot, step.lease().clone()).unwrap()));
+            }
+            let events = tokio::time::timeout(std::time::Duration::from_secs(2), client.stream(request).collect::<Vec<_>>()).await.unwrap();
+            assert!(events.iter().any(Result::is_err), "{condition}: {events:?}");
+            assert_eq!(recorder.records.lock().unwrap().len(), 0, "{condition}");
+            assert_eq!(client.transport_pool.stats().in_flight, 0);
+        }
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept()).await.is_err());
+        assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 0);
+    }
+
     fn exposure(bootstrap: &[&str], active: &[&str], revision: u64) -> ToolExposureProjection {
         ToolExposureProjection {
             catalog_revision: 7,
@@ -3030,6 +3195,7 @@ mod tests {
         assert!(control_error.contains("temporarily fenced"));
 
         let request = ApiRequest {
+            bound_step: None,
             prompt: PromptAssembly::new(vec!["system".to_string()]),
             messages: Vec::new().into(),
             model: "qwen3.8-max".to_string(),
@@ -3118,6 +3284,7 @@ mod tests {
         assert!(pool.provider_account_is_fenced(registry.revision(), "token-plan"));
 
         let request = ApiRequest {
+            bound_step: None,
             prompt: PromptAssembly::new(vec!["system".to_string()]),
             messages: Vec::new().into(),
             model: "qwen3.8-max".to_string(),
