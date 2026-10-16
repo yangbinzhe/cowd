@@ -30,7 +30,7 @@ fn parse_completion_reopen_bound(value: &str) -> Result<u64, String> {
 fn completion_reopen_count(event_store: &crate::RuntimeEventStore, program_id: &str) -> Result<u64, String> {
     let stream_id = format!("agentic-program:{program_id}");
     event_store
-        .list_stream_after(&stream_id, 0, u64::MAX, usize::MAX, usize::MAX)
+        .list_stream(&stream_id)
         .map(|events| events.iter().filter(|event| {
             event.kind == COMPLETION_REOPENED_EVENT_KIND || event.kind == COMPLETION_REJECTED_EVENT_KIND
         }).count() as u64)
