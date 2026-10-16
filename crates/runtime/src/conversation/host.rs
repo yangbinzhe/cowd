@@ -3178,13 +3178,6 @@ fn compact_agentic_program_checkpoint(
         "terminal_action": terminal_action.as_ref().map(RootAgenticTerminalAction::checkpoint_detail),
         "closure": agentic_closure_view(program, completion_gap.as_deref()),
         "instruction": "Use this Runtime projection as current truth. You may continue planning, publish dependent or independent Tasks, and coordinate while members execute. When ready to wait for active workers, call state_inspect with wait_for_workers=true; Runtime waits without provider polling. Do not recreate committed entities. Completion is rejected while any entry remains in `unclassified_issue_refs`: classify EVERY issue_ref there through one message_publish.issue_dispositions (must_resolve, disclose, or resolved) with durable reasons/evidence (a tool://artifact:// receipt OR the issue's own source_ref, its Runtime-created anchor). Keep estimates and assumptions labelled; only the Goal verifier can certify the original objective. When `closure.exit_ready` is true every Runtime condition already holds: call `objective_complete_request` yourself to close out the Objective - Runtime verifies it and rejects it if any condition regressed, so you never risk a premature or unverifiable exit. Tasks named in `closure.satisfied` are finished; do not re-review, re-submit or re-commit them. Your job at that point is the exit decision, not more work.",
-        // E1-E4: reads are durable receipts, not conversations. A reviewer
-        // verifies a delivered fact by opening the claimant's receipt with
-        // `evidence_retrieve` (same bytes, Runtime-bound hash), never by
-        // re-reading the source file; one live run re-read a single lib.rs 40
-        // times across agents this way. Independent reads go in ONE batch or
-        // one `tool_orchestrate` program per round, and prefer ranged reads.
-        "efficiency": crate::agentic::order_contract::EVIDENCE_ECONOMY,
     })
     .to_string()
 }

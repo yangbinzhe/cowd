@@ -296,17 +296,39 @@ async fn one_shot_task_submit_recovers_the_previous_same_attempt_report_draft() 
     let services = crate::RuntimeServices::in_memory().expect("runtime services");
     let ticket = agentic_content_bridge_ticket("one-shot-submit-graph", "agent", 1);
     let report = "# Research report\n\nThis is the exact authored report.";
+    let input = recover_one_shot_report_draft(
+        services.as_ref(),
+        &ticket,
+        "task:bound-report",
+        "execution:one-shot-submit-graph",
+        report,
+    )
+    .await;
+    assert_eq!(input.task_ref, "task:bound-report");
+}
+
+async fn recover_one_shot_report_draft(
+    services: &crate::RuntimeServices,
+    ticket: &NodeExecutionTicket,
+    task_ref: &str,
+    visibility_scope: &str,
+    report: &str,
+) -> harness_contract::agent_action::TaskSubmitInput {
     let previous_message = ConversationMessage::assistant(vec![ContentBlock::Text {
         text: report.to_string(),
     }]);
-    persist_agentic_content_draft(services.as_ref(), &ticket, &previous_message)
+    persist_agentic_content_draft(services, ticket, &previous_message)
         .await
         .expect("persist report draft");
     let mut calls = vec![explicit_task_submit_call("submit-previous-report")];
+    let mut input: serde_json::Value = serde_json::from_str(&calls[0].input).expect("submit input");
+    input["task_ref"] = task_ref.into();
+    input["evidence_refs"] = serde_json::json!([]);
+    calls[0].input = input.to_string();
 
     resolve_explicit_agentic_content_refs(
-        services.as_ref(),
-        &ticket,
+        services,
+        ticket,
         &ConversationMessage::assistant(vec![]),
         &mut calls,
     )
@@ -323,11 +345,12 @@ async fn one_shot_task_submit_recovers_the_previous_same_attempt_report_draft() 
         .expect("durable report artifact");
     let content = services
         .artifact_store()
-        .read(&artifact, "execution:one-shot-submit-graph", None)
+        .read(&artifact, visibility_scope, None)
         .await
         .expect("read committed report");
     assert_eq!(String::from_utf8(content).expect("UTF-8"), report);
-    assert_eq!(input["task_ref"], "task:bound-report");
+    assert_eq!(input["task_ref"], task_ref);
+    serde_json::from_value(input).expect("typed one-shot submission")
 }
 
 #[tokio::test]

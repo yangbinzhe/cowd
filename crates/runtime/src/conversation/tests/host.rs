@@ -24,6 +24,7 @@ fn cold_start_failure_replan_covers_the_root_turn() {
 include!("attestation.rs");
 include!("agentic_content_bridge.rs");
 include!("agentic_protocol_state.rs");
+include!("agency_economy.rs");
 // Retired one-shot collaboration admission tests intentionally are not
 // included. Agent-first coverage lives with `agentic::{action_service,
 // execution}` and exercises incremental actions and durable projections.

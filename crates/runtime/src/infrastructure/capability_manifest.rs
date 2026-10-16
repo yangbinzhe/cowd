@@ -196,10 +196,9 @@ pub fn runtime_capability_primer() -> String {
         "## Agent-first collaboration contract",
         "You own semantic decisions: Team purpose, roles, Tasks, dependencies, discussion, challenge, replanning, synthesis, and WHEN to close the Objective. Runtime owns actor identity, authorization, revisions, idempotency, leases, concurrent execution, durable artifacts, recovery, and terminal truth. Publish independent Tasks without artificial dependencies so Runtime can execute them concurrently. A Task is complete only after a real claimant submits durable evidence and a different Agent accepts it.",
         "## Shortest path first",
-        "Decide the whole answer before the first call, then make the calls. Reach the result in the FEWEST provider round-trips: every call you can issue in this response, issue now. Batch independent work into ONE response, or into one `tool_orchestrate` program (batch / map / compute) instead of a chain of single calls.",
+        "Prefer parallelizing independent tool calls.",
         "## Text tool-call frame (only if you emit calls as text markup)",
         "Some deployments cannot use native function calls and emit tool calls as a text frame. When you do, use exactly: <｜｜DSML｜｜tool_calls> wrapping one <｜｜DSML｜｜invoke name=\"TOOL\"> per action, each wrapping one <｜｜DSML｜｜parameter name=\"FIELD\" string=\"false\">VALUE</｜｜DSML｜｜parameter> for arrays/objects and string=\"true\" for plain text. Batch by putting SEVERAL invoke blocks in ONE frame - never nest actions inside another tool (no agent_action_batch wrapper): every parameter that the schema types as array or object must be emitted with string=\"false\" and raw JSON inside.",
-        "Prefer parallelizing independent tool calls.",
         "Never move large file bodies into context: read only the range you need, and run counting/aggregation/filtering inside `tool_orchestrate` compute/collect or `execute_code`, returning only a summary plus a `tool://` ref.",
         "## Closure discipline",
         "Runtime tells you what is satisfied and what remains. Finish the outstanding rungs; do not redo finished ones. When `closure.exit_ready` holds, YOU call `objective_complete_request` and Runtime verifies it. If you judge the goal unreachable after repeated attempts with no new progress, use the `blocked` form with a reason, human review and next steps.",
@@ -212,11 +211,10 @@ pub fn runtime_capability_primer() -> String {
         "## Collaboration rules (Agent-first)",
         "1. Sub-agents run the work. While any sub-task is in flight your only role is to coordinate: WAIT for it before yielding, and DO NOT redo its work yourself.",
         "2. Wait with `state_inspect(wait_for_workers=true)`; scale the wait to the outstanding work rather than guessing a fixed timeout.",
-        "3. Parallelize independent work: publish independent Tasks concurrently and issue independent calls in the same response.",
-        "4. Close what you finished: release a claim you no longer own, and withdraw a Task that is no longer needed. Dangling work keeps the Objective open.",
-        "5. When you delegate, tell the delegate explicitly: (a) it is NOT alone and must not revert or overwrite others' committed work; (b) whether it may spawn further agents (default: it may NOT, to prevent unbounded recursion).",
-        "6. Spawn a Team or a Task only when the work is genuinely large, spans independent responsibility domains, or needs an independent reviewer. For simple or straightforward work you do not need to spawn anything at all.",
-        "7. Before each batch of calls send at most one short sentence naming the grouped action; skip it for a single trivial read.",
+        "3. Close what you finished: release a claim you no longer own, and withdraw a Task that is no longer needed. Dangling work keeps the Objective open.",
+        "4. When you delegate, tell the delegate explicitly: (a) it is NOT alone and must not revert or overwrite others' committed work; (b) whether it may spawn further agents (default: it may NOT, to prevent unbounded recursion).",
+        "5. Spawn a Team or a Task only when the work is genuinely large, spans independent responsibility domains, or needs an independent reviewer. For simple or straightforward work you do not need to spawn anything at all.",
+        "6. Before each batch of calls send at most one short sentence naming the grouped action; skip it for a single trivial read.",
     ]
     .join("\n")
 }
@@ -473,7 +471,6 @@ mod prompt_core_tests {
         let rules = [
             order_contract::TASK_AUTHORING_DISCIPLINE,
             order_contract::REVIEWER_SCOPE_DISCIPLINE,
-            order_contract::EVIDENCE_ECONOMY,
             order_contract::OBJECTIVE_REVIEW_SCOPE_DISCIPLINE,
         ];
         for rule in rules {
