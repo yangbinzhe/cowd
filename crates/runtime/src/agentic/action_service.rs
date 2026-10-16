@@ -1625,6 +1625,9 @@ impl AgentActionService {
                 }),
             )
         };
+        let program_is_proof_source = prepared.policy_sources.iter().any(|source| {
+            source.stream_id == program_stream_id
+        });
         let mut expected_streams = prepared.policy_sources;
         expected_streams.extend([
             ExpectedStreamRevision {
@@ -1636,7 +1639,7 @@ impl AgentActionService {
                 expected_revision: prepared.expected_stream_revision,
             },
         ]);
-        self.store.append_transaction(AppendTransactionRequest {
+        let mut transaction = AppendTransactionRequest {
             transaction_id: format!(
                 "program-conclusion:{}:{}",
                 projection.program_id, request.program_revision
@@ -1664,6 +1667,37 @@ impl AgentActionService {
                     schema_version: 1,
                 },
             ],
+        };
+        let stream_ids = transaction.expected_streams.iter()
+            .map(|source| source.stream_id.clone()).collect::<Vec<_>>();
+        self.store.with_stream_locks(&stream_ids, || {
+            let stream_id = program_stream(&projection.program_id);
+            let actual = self.store.stream_revision(&stream_id)?;
+            if actual != projection.revision {
+                let delta = self.store.list_stream_after(
+                    &stream_id, projection.revision, actual, 1_024, 4 * 1024 * 1024,
+                ).map_err(AgentActionServiceError::EventStore)?;
+                let renewal_only = !program_is_proof_source
+                    && actual > projection.revision
+                    && actual - projection.revision == delta.len() as u64
+                    && delta.iter().enumerate().all(|(offset, event)| {
+                        event.sequence == projection.revision + offset as u64 + 1
+                            && event.scope == RuntimeEventScope::Program
+                            && event.kind == TASK_LEASE_RENEWED_EVENT_KIND
+                    });
+                if !renewal_only {
+                    return Err(RuntimeEventStoreError::StaleRevision {
+                        stream_id, expected: projection.revision, actual,
+                    }.into());
+                }
+                for source in &mut transaction.expected_streams {
+                    if source.stream_id == stream_id {
+                        source.expected_revision = actual;
+                    }
+                }
+            }
+            self.store.append_transaction_locked(transaction)?;
+            Ok::<_, AgentActionServiceError>(())
         })?;
         self.project(&projection.program_id)
     }

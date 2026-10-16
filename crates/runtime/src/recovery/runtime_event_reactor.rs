@@ -339,6 +339,7 @@ impl RuntimeEventReactor {
                     if cancellation.is_cancelled() {
                         break;
                     }
+                    let _ = commits.borrow_and_update();
                     // A maintenance lane is throughput-oriented, so debounce
                     // every pass, including the first commit-triggered pass.
                     // Sleeping only after a pass lets the first scan race a
@@ -398,7 +399,6 @@ impl RuntimeEventReactor {
                                 .last_error
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-                            let _ = commits.borrow_and_update();
                             if pass.backlog {
                                 match lane.descriptor.latency_class {
                                     RuntimeProjectionLatencyClass::ReadModel => {
@@ -601,6 +601,52 @@ mod tests {
             Duration::from_millis(10),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_commit_during_a_scan_triggers_another_pass_without_waiting_for_the_safety_tick() {
+        let store = Arc::new(RuntimeEventStore::for_test());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let rescanned = Arc::new(tokio::sync::Notify::new());
+        let passes = Arc::new(AtomicUsize::new(0));
+        let mut descriptor = descriptor("projector:scan-doorbell-race");
+        descriptor.safety_tick = Duration::from_secs(30);
+        let lane_store = store.clone();
+        let lane_entered = entered.clone();
+        let lane_release = release.clone();
+        let lane_rescanned = rescanned.clone();
+        let lane_passes = passes.clone();
+        let lane = RuntimeProjectionLane::asynchronous(descriptor, move |_| {
+            let store = lane_store.clone();
+            let entered = lane_entered.clone();
+            let release = lane_release.clone();
+            let rescanned = lane_rescanned.clone();
+            let passes = lane_passes.clone();
+            Box::pin(async move {
+                let scanned_cursor = store.current_commit_cursor();
+                if passes.fetch_add(1, Ordering::SeqCst) == 0 {
+                    assert_eq!(scanned_cursor, 0);
+                    entered.notify_one();
+                    release.notified().await;
+                } else {
+                    assert!(scanned_cursor > 0);
+                    rescanned.notify_one();
+                }
+                Ok(RuntimeProjectionPass::default())
+            })
+        });
+        let reactor = Arc::new(RuntimeEventReactor::sealed(store.clone(), [lane]).unwrap());
+        reactor.start().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), entered.notified()).await.unwrap();
+        store.append(crate::RuntimeEventInput {
+            stream_id: "scan-doorbell-race".into(), scope: RuntimeEventScope::Task,
+            kind: "test.event".into(), status: None, actor: None, refs: vec![], payload: serde_json::json!({}),
+        }).unwrap();
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), rescanned.notified()).await.unwrap();
+        assert_eq!(passes.load(Ordering::SeqCst), 2);
+        assert!(reactor.shutdown().await.timed_out_lanes.is_empty());
     }
 
     #[test]

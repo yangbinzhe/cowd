@@ -10,44 +10,31 @@ pub(crate) struct PreparedProgramConclusion {
     pub policy_sources: Vec<crate::ExpectedStreamRevision>,
 }
 
-/// Durable Program event emitted when the completion gate rejects a request and
-/// re-opens the Program. Mirrors the Projection constant; the Goal owner reads
-/// it only to bound an unbounded re-open loop.
 const COMPLETION_REOPENED_EVENT_KIND: &str = "agentic.completion_reopened";
 
-/// A completion request rejected at authorization (never applied). Counted with
-/// reopens so the bounded-convergence terminus also covers a root that keeps
-/// requesting completion and is rejected before a reopen can be recorded.
 const COMPLETION_REJECTED_EVENT_KIND: &str = "agentic.completion_rejected";
 
-/// After this many rejected completion requests a Program stops re-opening and
-/// terminates as an honest Blocked result instead of looping. Configurable via
-/// `COWD_COMPLETION_REOPEN_BOUND` (default 6). This complements the progress
-/// fuse: it bounds a loop that keeps *requesting* completion without ever
-/// producing a final answer, which the no-progress fuse alone cannot see.
-fn completion_reopen_bound() -> usize {
-    std::env::var("COWD_COMPLETION_REOPEN_BOUND")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(6)
+fn completion_reopen_bound() -> Result<Option<u64>, String> {
+    match std::env::var("COWD_COMPLETION_REOPEN_BOUND") {
+        Ok(value) => parse_completion_reopen_bound(&value).map(Some),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(format!("invalid operator completion resource limit: {error}")),
+    }
 }
 
-/// Count the durable completion-reopen events already recorded for a Program.
-fn completion_reopen_count(event_store: &crate::RuntimeEventStore, program_id: &str) -> usize {
+fn parse_completion_reopen_bound(value: &str) -> Result<u64, String> {
+    value.trim().parse::<u64>().ok().filter(|limit| *limit > 0)
+        .ok_or_else(|| "COWD_COMPLETION_REOPEN_BOUND must be an explicit positive resource limit".to_string())
+}
+
+fn completion_reopen_count(event_store: &crate::RuntimeEventStore, program_id: &str) -> Result<u64, String> {
     let stream_id = format!("agentic-program:{program_id}");
     event_store
         .list_stream_after(&stream_id, 0, u64::MAX, usize::MAX, usize::MAX)
-        .map(|events| {
-            events
-                .iter()
-                .filter(|event| {
-                    event.kind == COMPLETION_REOPENED_EVENT_KIND
-                        || event.kind == COMPLETION_REJECTED_EVENT_KIND
-                })
-                .count()
-        })
-        .unwrap_or(0)
+        .map(|events| events.iter().filter(|event| {
+            event.kind == COMPLETION_REOPENED_EVENT_KIND || event.kind == COMPLETION_REJECTED_EVENT_KIND
+        }).count() as u64)
+        .map_err(|error| error.to_string())
 }
 
 /// The delivered result set: the artifacts accepted work produced. The
@@ -513,7 +500,9 @@ impl GoalStore {
             "agentic-objective:{}:request:{}",
             program.program_id, request.program_revision
         );
-        let reopen_count = completion_reopen_count(&self.event_store, &program.program_id);
+        let reopen_budget = completion_reopen_bound()?.map(|limit|
+            completion_reopen_count(&self.event_store, &program.program_id).map(|count| (limit, count))
+        ).transpose()?;
         let (kind, status) = if gaps.is_empty() {
             goal.completion = GoalCompletion::Satisfied;
             goal.phase = "completed".into();
@@ -528,7 +517,7 @@ impl GoalStore {
                 committed_at_ms: crate::tool_invocation::now_ms(),
             });
             ("goal.completed", "satisfied")
-        } else if reopen_count < completion_reopen_bound() {
+        } else if reopen_budget.is_none_or(|(limit, count)| count < limit) {
             goal.phase = "waiting".into();
             goal.waiting = Some(harness_contract::goal::WaitDescriptor {
                 reason_code: "completion_gap".into(),
@@ -538,10 +527,7 @@ impl GoalStore {
             });
             ("goal.completion_waiting", "open")
         } else {
-            // Bounded convergence: the completion gate has reopened this
-            // Program repeatedly without the gaps resolving. Terminate as an
-            // honest blocked result instead of re-opening without end. The
-            // Goal owner still authors the terminal; the Program only binds it.
+            let (limit, reopen_count) = reopen_budget.ok_or("missing explicit completion resource limit")?;
             goal.completion = GoalCompletion::Blocked;
             goal.phase = "completed".into();
             goal.waiting = None;
@@ -550,7 +536,7 @@ impl GoalStore {
                 terminal_fence: fence.clone(),
                 authority_revision: request.program_revision,
                 reason: format!(
-                    "completion gate reopened {reopen_count} time(s) without resolving the recorded gaps: {}",
+                    "operator-configured completion resource limit {limit} exhausted after {reopen_count} rejection(s); objective remains unmet: {}",
                     gaps.join("; ")
                 ),
                 evidence_refs: goal.evidence_refs.clone(),
@@ -1619,6 +1605,50 @@ mod tests {
     }
 
     #[test]
+    fn lease_renewals_do_not_starve_an_already_verified_current_goal() {
+        let (events, goals, actions, actor) = fixture(true);
+        let before = actions.project(&actor.program_id).unwrap();
+        let prepared = goals.prepare_program_conclusion(&before).unwrap();
+        assert!(prepared.gaps.is_empty());
+        for renewal in 0..25 {
+            events.append(RuntimeEventInput {
+                stream_id: format!("agentic-program:{}", actor.program_id),
+                scope: RuntimeEventScope::Program,
+                kind: "agentic.task_lease_renewed".into(),
+                status: Some("renewed".into()), actor: Some("worker".into()), refs: vec![],
+                payload: serde_json::json!({"task_ref":"optional-task", "agent_id":"worker", "execution_id":format!("worker-{renewal}")}),
+            }).unwrap();
+        }
+        let committed = actions.commit_program_conclusion(&before, prepared).unwrap();
+        assert_eq!(committed.status, crate::AgenticProgramStatus::Verified);
+        assert_eq!(committed.revision, before.revision + 26);
+        assert_eq!(goals.get("goal:root-completion").unwrap().unwrap().completion,
+            GoalCompletion::Satisfied);
+    }
+
+    #[test]
+    fn lease_renewal_rebase_cannot_bypass_a_new_goal_revision() {
+        let (events, goals, actions, actor) = fixture(true);
+        let before = actions.project(&actor.program_id).unwrap();
+        let prepared = goals.prepare_program_conclusion(&before).unwrap();
+        events.append(RuntimeEventInput {
+            stream_id: format!("agentic-program:{}", actor.program_id),
+            scope: RuntimeEventScope::Program, kind: "agentic.task_lease_renewed".into(),
+            status: Some("renewed".into()), actor: None, refs: vec![],
+            payload: serde_json::json!({"task_ref":"task", "agent_id":"worker", "execution_id":"run"}),
+        }).unwrap();
+        goals.revise("goal:root-completion", 1, 2, "new user requirement", |goal| {
+            goal.objective = "A revised objective must be reviewed again".into();
+            vec!["objective".into()]
+        }).unwrap();
+        assert!(actions.commit_program_conclusion(&before, prepared).is_err());
+        let current = goals.get("goal:root-completion").unwrap().unwrap();
+        assert_eq!(current.revision, 2);
+        assert!(current.terminal.is_none());
+        assert!(actions.project(&actor.program_id).unwrap().objective_verdict.is_none());
+    }
+
+    #[test]
     fn ordinary_goal_writers_cannot_bypass_the_program_atomic_conclusion() {
         let (events, goals, actions, actor) = fixture(true);
         let goal_id = "goal:root-completion";
@@ -1757,15 +1787,40 @@ mod tests {
     }
 
     #[test]
-    fn completion_reopen_bound_is_positive_by_default() {
-        // A malformed or unset override must still yield a usable bound so the
-        // reopen loop is always bounded.
-        assert!(completion_reopen_bound() >= 1);
+    fn repeated_completion_rejections_do_not_invent_a_default_business_round_terminal() {
+        let (events, goals, actions, actor) = fixture(false);
+        assert_eq!(completion_reopen_bound().unwrap(), None);
+        for attempt in 0..20 {
+            events.append(RuntimeEventInput {
+                stream_id: format!("agentic-program:{}", actor.program_id), scope: RuntimeEventScope::Program,
+                kind: COMPLETION_REJECTED_EVENT_KIND.into(), status: Some("rejected".into()), actor: Some(actor.actor_id.clone()),
+                refs: vec![], payload: serde_json::json!({"program_id":actor.program_id,"gap":"review still required","request_action_id":format!("rejection-{attempt}")}),
+            }).unwrap();
+        }
+        let program = actions.project(&actor.program_id).unwrap();
+        let prepared = goals.prepare_program_conclusion(&program).unwrap();
+        assert!(prepared.goal.terminal.is_none());
+        assert_eq!(prepared.goal.completion, GoalCompletion::Open);
+        assert!(prepared.goal.waiting.is_some());
+        assert!(!prepared.gaps.is_empty());
+        actions.commit_program_conclusion(&program, prepared).unwrap();
+        let goal = goals.get("goal:root-completion").unwrap().unwrap();
+        assert_eq!(goal.completion, GoalCompletion::Open);
+        assert!(goal.terminal.is_none());
+        assert!(actions.project(&actor.program_id).unwrap().completion_request.is_none());
+    }
+
+    #[test]
+    fn completion_reopen_resource_limit_is_explicit_and_invalid_values_do_not_fail_open() {
+        assert_eq!(parse_completion_reopen_bound("7").unwrap(), 7);
+        assert!(parse_completion_reopen_bound("0").is_err());
+        assert!(parse_completion_reopen_bound("invalid").is_err());
+        assert!(parse_completion_reopen_bound("-1").is_err());
     }
 
     #[test]
     fn completion_reopen_count_is_zero_without_reopen_events() {
         let store = crate::RuntimeEventStore::for_test();
-        assert_eq!(completion_reopen_count(&store, "absent-program"), 0);
+        assert_eq!(completion_reopen_count(&store, "absent-program").unwrap(), 0);
     }
 }

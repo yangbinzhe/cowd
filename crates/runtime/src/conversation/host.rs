@@ -4195,7 +4195,7 @@ struct TurnGraphState {
     /// because a real Objective completion gap remained. Replans change the
     /// root graph node statuses, so the generic no-progress bound cannot fence
     /// this loop; this counter does.
-    completion_gap_continuations: u8,
+    completion_gap_continuations: u64,
     /// When this turn's model loop started. Used only for the objective-level
     /// wall-clock budget that bounds a required-Team collaboration turn, which
     /// the no-progress fuse cannot bound while nominal progress continues.
@@ -4278,7 +4278,7 @@ struct TurnGraphState {
     /// had already reached instead of taking the one action that closed the gap.
     /// These two fields are the observer for that failure mode.
     last_terminal_answer_digest: String,
-    repeated_terminal_answers: u8,
+    repeated_terminal_answers: u64,
     /// Whether the Goal verifier currently records a completion gap. Set by the
     /// completion-gap continuation so the model step can refuse to go tool-less
     /// while an action is still owed.

@@ -551,10 +551,10 @@ where
         &self,
         ticket: &NodeExecutionTicket,
         gap: &str,
-        idle_answers: u8,
+        idle_answers: u64,
     ) -> NodeExecutionOutcome {
         let disclosure = format!(
-            "Execution stopped safely: the model concluded {idle_answers} times in a row without taking \
+            "Execution stopped at the operator-configured no-action resource limit: the model concluded {idle_answers} times in a row without taking \
              an action, so Runtime stopped asking rather than spending the remaining budget on \
              restatements. The durable work already committed stays visible in the Program projection. \
              The outstanding completion gap is: {gap}. Close it with the action that gap names, then \
@@ -967,24 +967,22 @@ where
     }
 }
 
-/// Whether a business-completeness rollback may continue, advancing the shared
-/// continuation bound.
-///
-/// Both rollback paths - a recorded completion gap and an outstanding closure
-/// rung - draw on one counter, so the loop is bounded as a whole: a run cannot
-/// obtain a fresh budget by alternating between the two. Sharing the accounting
-/// is the part that must not diverge; the guidance each path injects genuinely
-/// differs, so it stays inline.
 fn claim_continuation_budget(state: &mut TurnGraphState, stage: &str) -> bool {
-    let bound = completion_gap_continuation_bound();
-    if state.completion_gap_continuations < bound {
+    let bound = match completion_gap_continuation_bound() {
+        Ok(bound) => bound,
+        Err(error) => {
+            tracing::warn!(stage, %error, "invalid explicit operator continuation resource limit");
+            return false;
+        }
+    };
+    if bound.is_none_or(|limit| state.completion_gap_continuations < limit) {
         state.completion_gap_continuations = state.completion_gap_continuations.saturating_add(1);
         return true;
     }
     tracing::warn!(
         stage,
-        bound,
-        "continuation bound reached; presenting the honest terminal instead of continuing"
+        bound = ?bound,
+        "explicit operator continuation resource limit reached; objective remains unmet"
     );
     false
 }
@@ -1596,7 +1594,7 @@ where
                     let state = self.state.lock().await;
                     state.repeated_terminal_answers
                 };
-                if let Some(bound) = consecutive_answer_stop_bound() {
+                if let Some(bound) = consecutive_answer_stop_bound()? {
                     if idle_answers >= bound {
                         tracing::warn!(
                             target: "cowd::consecutive_answer_stop",
@@ -2456,53 +2454,34 @@ pub(super) fn terminal_answer_digest(answer: &str) -> String {
     format!("{:x}", Sha256::digest(normalized.as_bytes()))
 }
 
-/// Consecutive conclusions with no tool call after which Runtime stops asking.
-///
-/// The first version of this bound did not exist: the only stop was
-/// `completion_gap_continuation_bound()` at 5, which counts how many times the
-/// gap was shown rather than whether the model did anything about it. Run one30
-/// was shown the gap five times, concluded seven times, and never acted once.
-///
-/// Override with `COWD_CONSECUTIVE_ANSWER_STOP`; `0` disables the stop entirely,
-/// and a value that does not parse falls back to the default rather than
-/// silently removing the stop.
-fn consecutive_answer_stop_bound() -> Option<u8> {
-    consecutive_answer_stop_bound_from(
-        std::env::var("COWD_CONSECUTIVE_ANSWER_STOP")
-            .ok()
-            .as_deref(),
-    )
-}
-
-/// The bound as a pure function of the configured value, so the contract is
-/// testable without mutating the process environment.
-///
-/// The first spelling returned `u8` with `unwrap_or(3)`, which made the
-/// documented `0 disables` behave as the exact opposite: `idle_answers >= 0` is
-/// true on the first conclusion, so the documented off switch stopped the run
-/// immediately. An operator who reads the contract must get the behavior the
-/// contract states.
-fn consecutive_answer_stop_bound_from(raw: Option<&str>) -> Option<u8> {
-    match raw {
-        None => Some(3),
-        Some(value) => match value.trim().parse::<u8>() {
-            Ok(0) => None,
-            Ok(bound) => Some(bound),
-            Err(_) => Some(3),
-        },
+fn consecutive_answer_stop_bound() -> Result<Option<u64>, String> {
+    match std::env::var("COWD_CONSECUTIVE_ANSWER_STOP") {
+        Ok(value) => consecutive_answer_stop_bound_from(Some(&value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(format!("invalid operator no-action resource limit: {error}")),
     }
 }
 
-/// Bounded number of times a success presentation is returned to continue
-/// because a real Objective completion gap remains. Defaults to 5; override
-/// with `COWD_COMPLETION_GAP_CONTINUATIONS`. Beyond the bound the turn presents
-/// its honest terminal instead of looping.
-fn completion_gap_continuation_bound() -> u8 {
-    std::env::var("COWD_COMPLETION_GAP_CONTINUATIONS")
-        .ok()
-        .and_then(|value| value.trim().parse::<u8>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(5)
+fn consecutive_answer_stop_bound_from(raw: Option<&str>) -> Result<Option<u64>, String> {
+    match raw {
+        None => Ok(None),
+        Some(value) => value.trim().parse::<u64>()
+            .map(|limit| (limit > 0).then_some(limit))
+            .map_err(|_| "COWD_CONSECUTIVE_ANSWER_STOP must be an explicit nonnegative resource limit".to_string()),
+    }
+}
+
+fn completion_gap_continuation_bound() -> Result<Option<u64>, String> {
+    match std::env::var("COWD_COMPLETION_GAP_CONTINUATIONS") {
+        Ok(value) => parse_continuation_resource_limit(&value).map(Some),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(format!("invalid operator continuation resource limit: {error}")),
+    }
+}
+
+fn parse_continuation_resource_limit(value: &str) -> Result<u64, String> {
+    value.trim().parse::<u64>().ok().filter(|limit| *limit > 0)
+        .ok_or_else(|| "COWD_COMPLETION_GAP_CONTINUATIONS must be an explicit positive resource limit".to_string())
 }
 
 /// Resolve terminal ownership before emitting a Goal event. Agent-first
@@ -2963,22 +2942,15 @@ mod terminal_usage_tests {
     }
 
     #[test]
-    fn consecutive_answer_stop_defaults_to_three_and_honors_the_documented_off_switch() {
-        // Unset means the default.
-        assert_eq!(consecutive_answer_stop_bound_from(None), Some(3));
-        // A configured bound is honored as written.
-        assert_eq!(consecutive_answer_stop_bound_from(Some("5")), Some(5));
-        assert_eq!(consecutive_answer_stop_bound_from(Some(" 2 ")), Some(2));
-        // The documented `0 disables` must disable, not mean "stop on the first
-        // conclusion": the first spelling parsed 0 into the same u8 as any other
-        // value, and `idle_answers >= 0` is true immediately.
-        assert_eq!(consecutive_answer_stop_bound_from(Some("0")), None);
-        // A value that does not parse falls back to the default rather than
-        // silently removing the stop.
-        assert_eq!(consecutive_answer_stop_bound_from(Some("")), Some(3));
-        assert_eq!(consecutive_answer_stop_bound_from(Some("abc")), Some(3));
-        assert_eq!(consecutive_answer_stop_bound_from(Some("-1")), Some(3));
-        assert_eq!(consecutive_answer_stop_bound_from(Some("300")), Some(3));
+    fn consecutive_answer_stop_requires_an_explicit_resource_limit_and_preserves_zero_disable() {
+        assert_eq!(consecutive_answer_stop_bound_from(None).unwrap(), None);
+        assert_eq!(consecutive_answer_stop_bound_from(Some("5")).unwrap(), Some(5));
+        assert_eq!(consecutive_answer_stop_bound_from(Some(" 2 ")).unwrap(), Some(2));
+        assert_eq!(consecutive_answer_stop_bound_from(Some("1000")).unwrap(), Some(1000));
+        assert_eq!(consecutive_answer_stop_bound_from(Some("0")).unwrap(), None);
+        for value in ["", "abc", "-1", "18446744073709551616"] {
+            assert!(consecutive_answer_stop_bound_from(Some(value)).is_err());
+        }
     }
 }
 
@@ -5446,11 +5418,11 @@ pub(super) fn completed_result(
     }
 }
 
-/// The bound is positive: zero would refuse the first rollback and present an
-/// honest terminal for a gap that has never been given a chance to close.
 #[test]
-fn continuation_bound_is_positive() {
-    assert!(completion_gap_continuation_bound() >= 1);
+fn continuation_resource_limit_is_explicit_and_supports_long_tasks() {
+    assert_eq!(parse_continuation_resource_limit("1000").unwrap(), 1000);
+    assert!(parse_continuation_resource_limit("0").is_err());
+    assert!(parse_continuation_resource_limit("invalid").is_err());
 }
 
 /// Both business-completeness rollbacks must draw on the same budget. They used
