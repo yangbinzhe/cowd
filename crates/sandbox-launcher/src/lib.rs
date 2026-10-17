@@ -26,7 +26,10 @@ use landlock::{
     Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI,
 };
 #[cfg(target_os = "linux")]
-use seccompiler::{BpfProgram, SeccompAction, SeccompFilter};
+use seccompiler::{
+    BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
+    SeccompRule,
+};
 use thiserror::Error;
 
 const SYSTEM_READ_ONLY_ROOTS: &[&str] = &["/usr", "/bin", "/lib", "/lib64", "/etc"];
@@ -34,7 +37,7 @@ const SANDBOX_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/s
 const BOOTSTRAP_SHELL: &str = "/bin/bash";
 const INNER_LAUNCHER_PATH: &str = "/run/cowd-sandbox-inner";
 const LAUNCHER_PROTOCOL: &str =
-    concat!("sandbox-launcher/", env!("CARGO_PKG_VERSION"), "/kernel-v1");
+    concat!("sandbox-launcher/", env!("CARGO_PKG_VERSION"), "/kernel-v2");
 const INTERNAL_DISPATCH: &str = "__cowd_internal";
 const INTERNAL_ROLE: &str = "sandbox-launcher";
 static COWD_PROCESS_HOST: AtomicBool = AtomicBool::new(false);
@@ -130,6 +133,7 @@ pub fn internal_process_entry(args: &[String]) -> ExitCode {
 fn inner_process_entry(args: &[String]) -> ExitCode {
     let mut workspace = None;
     let mut workspace_access = SandboxWorkspaceAccess::ReadWrite;
+    let mut network_isolated = false;
     let mut writable = Vec::new();
     let mut command = None;
     let mut index = 0;
@@ -141,6 +145,10 @@ fn inner_process_entry(args: &[String]) -> ExitCode {
             }
             "--workspace-read-only" => {
                 workspace_access = SandboxWorkspaceAccess::ReadOnly;
+                index += 1;
+            }
+            "--network-isolated" => {
+                network_isolated = true;
                 index += 1;
             }
             "--writable" if index + 1 < args.len() => {
@@ -171,7 +179,7 @@ fn inner_process_entry(args: &[String]) -> ExitCode {
         eprintln!("failed to install Landlock: {error}");
         return ExitCode::from(125);
     }
-    if let Err(error) = install_seccomp() {
+    if let Err(error) = install_seccomp(network_isolated) {
         eprintln!("failed to install seccomp: {error}");
         return ExitCode::from(125);
     }
@@ -222,7 +230,7 @@ fn install_landlock(writable: &[PathBuf]) -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-fn install_seccomp() -> Result<(), String> {
+fn install_seccomp(network_isolated: bool) -> Result<(), String> {
     let syscalls = [
         libc::SYS_ptrace,
         libc::SYS_process_vm_readv,
@@ -249,7 +257,68 @@ fn install_seccomp() -> Result<(), String> {
     .map_err(|error| error.to_string())?
     .try_into()
     .map_err(|error: seccompiler::BackendError| error.to_string())?;
-    seccompiler::apply_filter(&filter).map_err(|error| error.to_string())
+    seccompiler::apply_filter(&filter).map_err(|error| error.to_string())?;
+    if network_isolated {
+        let filter = isolated_network_filter()?;
+        seccompiler::apply_filter(&filter).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn isolated_network_filter() -> Result<BpfProgram, String> {
+    let not_equal = |argument, value: i32| {
+        SeccompCondition::new(
+            argument,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Ne,
+            value as u32 as u64,
+        )
+        .map_err(|error| error.to_string())
+    };
+    let socket_rule = SeccompRule::new(vec![
+        not_equal(0, libc::AF_INET)?,
+        not_equal(0, libc::AF_INET6)?,
+    ])
+    .map_err(|error| error.to_string())?;
+    let mut invalid_pair_types = Vec::new();
+    for socket_type in [libc::SOCK_STREAM, libc::SOCK_SEQPACKET] {
+        for flags in [
+            0,
+            libc::SOCK_CLOEXEC,
+            libc::SOCK_NONBLOCK,
+            libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+        ] {
+            invalid_pair_types.push(not_equal(1, socket_type | flags)?);
+        }
+    }
+    let pair_rules = vec![
+        SeccompRule::new(vec![not_equal(0, libc::AF_UNIX)?]).map_err(|error| error.to_string())?,
+        SeccompRule::new(vec![not_equal(2, 0)?]).map_err(|error| error.to_string())?,
+        SeccompRule::new(invalid_pair_types).map_err(|error| error.to_string())?,
+    ];
+    let mut rules = BTreeMap::from([
+        (libc::SYS_socket, vec![socket_rule]),
+        (libc::SYS_socketpair, pair_rules),
+        (libc::SYS_io_uring_setup, Vec::new()),
+        (libc::SYS_io_uring_enter, Vec::new()),
+        (libc::SYS_io_uring_register, Vec::new()),
+    ]);
+    #[cfg(target_arch = "x86_64")]
+    for (syscall, syscall_rules) in rules.clone() {
+        rules.insert(syscall | 0x4000_0000, syscall_rules);
+    }
+    SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::EACCES as u32),
+        std::env::consts::ARCH
+            .try_into()
+            .map_err(|error| format!("unsupported seccomp architecture: {error}"))?,
+    )
+    .map_err(|error| error.to_string())?
+    .try_into()
+    .map_err(|error: seccompiler::BackendError| error.to_string())
 }
 
 /// The hardening features which have actually been installed in a child.
@@ -746,6 +815,9 @@ fn bwrap_args(
     if spec.workspace_access == SandboxWorkspaceAccess::ReadOnly {
         args.push("--workspace-read-only".to_string());
     }
+    if !spec.network_enabled {
+        args.push("--network-isolated".to_string());
+    }
     for root in &spec.writable_roots {
         args.push("--writable".to_string());
         args.push(canonical(root)?.display().to_string());
@@ -1059,7 +1131,7 @@ fn normalize_absolute(path: &Path) -> Result<PathBuf, SandboxError> {
                 normalized.pop();
             }
             Component::Prefix(_) => {
-                return Err(SandboxError::RelativePath(path.display().to_string()))
+                return Err(SandboxError::RelativePath(path.display().to_string()));
             }
         }
     }
@@ -1161,12 +1233,405 @@ impl Drop for ProbeFixture {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use std::io::{BufRead, Write};
     use std::process::Stdio;
 
     use super::*;
 
     fn bwrap_available() -> bool {
         bwrap_path().is_some()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sandbox_python(spec: &SandboxLaunchSpec, script: &str) -> Output {
+        let command = format!("exec /usr/bin/python3 -c {}", shell_quote(script));
+        let prepared = shell_command(&command, spec).expect("prepare actual hardened Python child");
+        let output = prepared.into_command().output().expect("run actual child");
+        assert!(output.status.success(), "{}", render_output(&output));
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+        output
+    }
+
+    #[cfg(target_os = "linux")]
+    struct HostSeqpacket {
+        child: std::process::Child,
+        output: std::io::BufReader<std::process::ChildStdout>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl HostSeqpacket {
+        fn new(path: &Path) -> Self {
+            let script = r#"
+import socket, sys
+server = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+server.bind(sys.argv[1])
+server.listen(8)
+server.setblocking(False)
+print('ready', flush=True)
+for expected in ['positive', 'negative']:
+    assert sys.stdin.readline().strip() == expected
+    try:
+        connection, _ = server.accept()
+    except BlockingIOError:
+        assert expected == 'negative'
+    else:
+        assert expected == 'positive'
+        connection.settimeout(2)
+        assert connection.recv(64) == b'seqpacket-positive'
+        connection.close()
+    print(expected + '-ok', flush=True)
+server.close()
+"#;
+            let mut child = Command::new("/usr/bin/python3")
+                .args(["-u", "-c", script])
+                .arg(path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("start private host SEQPACKET fixture");
+            let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+            let mut ready = String::new();
+            output
+                .read_line(&mut ready)
+                .expect("host fixture readiness");
+            assert_eq!(ready.trim(), "ready");
+            Self { child, output }
+        }
+
+        fn check(&mut self, expected: &str) {
+            let input = self.child.stdin.as_mut().unwrap();
+            writeln!(input, "{expected}").unwrap();
+            input.flush().unwrap();
+            let mut response = String::new();
+            self.output.read_line(&mut response).unwrap();
+            assert_eq!(response.trim(), format!("{expected}-ok"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for HostSeqpacket {
+        fn drop(&mut self) {
+            self.child.stdin.take();
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn r1_sandbox_no_network_blocks_host_filesystem_unix_sockets() {
+        use std::os::unix::net::{UnixDatagram, UnixListener};
+        use std::time::Duration;
+
+        for access in [
+            SandboxWorkspaceAccess::ReadOnly,
+            SandboxWorkspaceAccess::ReadWrite,
+        ] {
+            for network_enabled in [false, true] {
+                let root = ProbeFixture::new().expect("fixture");
+                let stream = UnixListener::bind(root.workspace.join("host.stream"))
+                    .expect("host stream listener");
+                stream.set_nonblocking(true).expect("nonblocking listener");
+                let datagram = UnixDatagram::bind(root.workspace.join("host.dgram"))
+                    .expect("host datagram listener");
+                datagram
+                    .set_nonblocking(true)
+                    .expect("nonblocking datagram");
+                let mut spec = SandboxLaunchSpec::workspace(&root.workspace);
+                spec.workspace_access = access;
+                spec.network_enabled = network_enabled;
+                sandbox_python(
+                    &spec,
+                    &format!(
+                        r#"
+import errno, socket
+enabled = {network_enabled}
+for kind, path in [(socket.SOCK_STREAM, 'host.stream'), (socket.SOCK_DGRAM, 'host.dgram')]:
+    try:
+        client = socket.socket(socket.AF_UNIX, kind)
+    except OSError as error:
+        assert not enabled and error.errno == errno.EACCES, repr(error)
+    else:
+        assert enabled, 'isolated child created named Unix socket'
+        client.settimeout(2)
+        client.connect(path)
+        client.sendall(b'kernel-ipc-positive')
+        client.close()
+print('named-unix-positive' if enabled else 'named-unix-denied')
+"#,
+                        network_enabled = if network_enabled { "True" } else { "False" }
+                    ),
+                );
+                if network_enabled {
+                    let (mut connection, _) = stream.accept().expect("positive stream received");
+                    connection
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut received = Vec::new();
+                    connection
+                        .read_to_end(&mut received)
+                        .expect("read stream nonce");
+                    assert_eq!(received, b"kernel-ipc-positive");
+                    let mut received = [0; 64];
+                    let count = datagram
+                        .recv(&mut received)
+                        .expect("positive datagram received");
+                    assert_eq!(&received[..count], b"kernel-ipc-positive");
+                } else {
+                    assert!(
+                        matches!(stream.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+                    );
+                    let mut received = [0; 64];
+                    assert!(
+                        matches!(datagram.recv(&mut received), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn isolated_socketpairs_preserve_local_ipc_without_named_peer_redirection() {
+        use std::os::unix::net::{UnixDatagram, UnixListener};
+
+        let root = ProbeFixture::new().expect("fixture");
+        let stream = UnixListener::bind(root.workspace.join("host.stream")).unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let datagram = UnixDatagram::bind(root.workspace.join("host.dgram")).unwrap();
+        datagram.set_nonblocking(true).unwrap();
+        let mut seqpacket = HostSeqpacket::new(&root.workspace.join("host.seqpacket"));
+        let mut spec = SandboxLaunchSpec::workspace(&root.workspace);
+        spec.workspace_access = SandboxWorkspaceAccess::ReadOnly;
+        spec.network_enabled = true;
+        sandbox_python(
+            &spec,
+            r#"
+import socket
+with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
+    client.settimeout(2)
+    client.connect('host.seqpacket')
+    client.sendall(b'seqpacket-positive')
+"#,
+        );
+        seqpacket.check("positive");
+        spec.network_enabled = false;
+        sandbox_python(
+            &spec,
+            r#"
+import asyncio, array, ctypes, errno, os, socket
+libc = ctypes.CDLL(None, use_errno=True)
+libc.connect.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint]
+for flags in [0, socket.SOCK_CLOEXEC, socket.SOCK_NONBLOCK, socket.SOCK_CLOEXEC | socket.SOCK_NONBLOCK]:
+    for family, kind, protocol in [(socket.AF_UNIX, socket.SOCK_DGRAM | flags, 0),
+                                   (socket.AF_TIPC, socket.SOCK_STREAM | flags, 0),
+                                   (socket.AF_UNIX, socket.SOCK_STREAM | flags, 1)]:
+        try:
+            socket.socketpair(family, kind, protocol)
+        except OSError as error:
+            assert error.errno == errno.EACCES, repr(error)
+        else:
+            raise AssertionError('unsafe pair was created')
+    for kind in [socket.SOCK_STREAM, socket.SOCK_SEQPACKET]:
+        left, right = socket.socketpair(socket.AF_UNIX, kind | flags, 0)
+        left.settimeout(2)
+        right.settimeout(2)
+        left.sendall(b'local-left')
+        assert right.recv(64) == b'local-left'
+        right.sendall(b'local-right')
+        assert left.recv(64) == b'local-right'
+        descriptor = os.open('/dev/null', os.O_RDONLY)
+        left.sendmsg([b'fd'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [descriptor]))])
+        body, ancillary, _, _ = right.recvmsg(64, socket.CMSG_SPACE(array.array('i').itemsize))
+        assert body == b'fd' and ancillary
+        for level, tag, data in ancillary:
+            assert level == socket.SOL_SOCKET and tag == socket.SCM_RIGHTS
+            received = array.array('i')
+            received.frombytes(data[:len(data) - len(data) % received.itemsize])
+            for value in received:
+                os.close(value)
+        os.close(descriptor)
+        left.close()
+        right.close()
+        for endpoint_index in [0, 1]:
+            for disconnect in [False, True]:
+                for path in ['host.stream', 'host.dgram', 'host.seqpacket']:
+                    for operation in ['connect', 'sendto', 'sendmsg']:
+                        pair = socket.socketpair(socket.AF_UNIX, kind | flags, 0)
+                        endpoint = pair[endpoint_index]
+                        endpoint.settimeout(2)
+                        if disconnect:
+                            unspec = (ctypes.c_ushort * 1)(socket.AF_UNSPEC)
+                            libc.connect(endpoint.fileno(), ctypes.byref(unspec), ctypes.sizeof(unspec))
+                        try:
+                            if operation == 'connect':
+                                endpoint.connect(path)
+                                endpoint.sendall(b'forbidden')
+                            elif operation == 'sendto':
+                                endpoint.sendto(b'forbidden', path)
+                            else:
+                                endpoint.sendmsg([b'forbidden'], [], 0, path)
+                        except OSError:
+                            pass
+                        finally:
+                            pair[0].close()
+                            pair[1].close()
+async def local_async():
+    await asyncio.sleep(0)
+    return 'asyncio-ok'
+assert asyncio.run(local_async()) == 'asyncio-ok'
+print('pair-types-flags-fd-passing-redirection-asyncio-checked')
+"#,
+        );
+        seqpacket.check("negative");
+        assert!(
+            matches!(stream.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        let mut received = [0; 64];
+        assert!(
+            matches!(datagram.recv(&mut received), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn isolated_network_denies_alternate_creation_and_preserves_namespace_local_ip() {
+        let root = ProbeFixture::new().expect("fixture");
+        let mut spec = SandboxLaunchSpec::workspace(&root.workspace);
+        spec.network_enabled = false;
+        let (socket_number, pair_number, uring_numbers, aliases) = if cfg!(target_arch = "x86_64") {
+            (41, 53, [425, 426, 427], "[0, 0x40000000]")
+        } else if cfg!(any(target_arch = "aarch64", target_arch = "riscv64")) {
+            (198, 199, [425, 426, 427], "[0]")
+        } else {
+            panic!("network syscall test needs explicit supported architecture");
+        };
+        sandbox_python(
+            &spec,
+            &format!(
+                r#"
+import ctypes, errno, socket
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+for alias in {aliases}:
+    requests = [({socket_number}, socket.AF_UNIX, socket.SOCK_STREAM, 0),
+                ({socket_number}, socket.AF_VSOCK, socket.SOCK_STREAM, 0),
+                ({socket_number}, socket.AF_ALG, socket.SOCK_SEQPACKET, 0),
+                ({pair_number}, socket.AF_UNIX, socket.SOCK_DGRAM, 0, 0),
+                ({pair_number}, socket.AF_TIPC, socket.SOCK_STREAM, 0, 0)]
+    for number in {uring_numbers:?}:
+        requests.append((number, 0, 0, 0, 0, 0, 0))
+    for number, *arguments in requests:
+        ctypes.set_errno(0)
+        result = libc.syscall(number | alias, *arguments)
+        assert result == -1 and ctypes.get_errno() == errno.EACCES, (number, alias, result, ctypes.get_errno())
+    for kind in [socket.SOCK_STREAM, socket.SOCK_SEQPACKET]:
+        for flags in [0, socket.SOCK_CLOEXEC, socket.SOCK_NONBLOCK, socket.SOCK_CLOEXEC | socket.SOCK_NONBLOCK]:
+            for high in [0, 0xabcdef0000000000]:
+                ctypes.set_errno(0)
+                result = libc.syscall({pair_number} | alias, ctypes.c_uint64(high | socket.AF_UNIX),
+                                      ctypes.c_uint64(high | kind | flags), ctypes.c_uint64(high), 0)
+                expected_errors = [errno.EFAULT] if alias == 0 else [errno.EFAULT, errno.ENOSYS]
+                assert result == -1 and ctypes.get_errno() in expected_errors, (alias, kind, flags, high, ctypes.get_errno())
+                if alias != 0 and kind == socket.SOCK_STREAM and flags == 0 and high == 0:
+                    print('x32-allowed-pair-kernel-errno=' + str(ctypes.get_errno()))
+    for arguments in [(socket.AF_UNIX, socket.SOCK_STREAM | 0x10000000, 0, 0),
+                      (socket.AF_UNIX, socket.SOCK_STREAM, 1, 0)]:
+        ctypes.set_errno(0)
+        result = libc.syscall({pair_number} | alias, *arguments)
+        assert result == -1 and ctypes.get_errno() == errno.EACCES, (alias, arguments, ctypes.get_errno())
+for family in [socket.AF_INET, socket.AF_INET6]:
+    with socket.socket(family, socket.SOCK_STREAM):
+        pass
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+    server.settimeout(2)
+    server.bind(('0.0.0.0', 0))
+    server.listen(1)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
+        client.settimeout(2)
+        client.connect(('127.0.0.1', server.getsockname()[1]))
+        connection, _ = server.accept()
+        with connection:
+            connection.settimeout(2)
+            client.sendall(b'isolated-loopback')
+            assert connection.recv(64) == b'isolated-loopback'
+print('native-x32-alternate-creation-denied-local-ip-preserved')
+"#
+            ),
+        );
+    }
+
+    #[test]
+    fn network_axis_is_forwarded_only_before_the_inner_command_boundary() {
+        let root = ProbeFixture::new().expect("fixture");
+        for network_enabled in [false, true] {
+            let mut spec = SandboxLaunchSpec::workspace(&root.workspace);
+            spec.network_enabled = network_enabled;
+            let args = bwrap_args(
+                Path::new("/usr/bin/bwrap"),
+                Path::new("/proc/self/exe"),
+                &spec,
+                "printf '%s' --network-isolated".into(),
+            )
+            .unwrap();
+            assert_eq!(
+                args.iter().any(|arg| arg == "--unshare-net"),
+                !network_enabled
+            );
+            assert_eq!(
+                args.iter().any(|arg| arg == "--network-isolated"),
+                !network_enabled
+            );
+            assert_eq!(args.last().unwrap(), "printf '%s' --network-isolated");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn isolated_network_filter_preserves_original_native_traps_and_foreign_arch_kill() {
+        let root = ProbeFixture::new().expect("fixture");
+        let mut spec = SandboxLaunchSpec::workspace(&root.workspace);
+        spec.network_enabled = false;
+        let syscalls = [
+            libc::SYS_ptrace,
+            libc::SYS_process_vm_readv,
+            libc::SYS_process_vm_writev,
+            libc::SYS_keyctl,
+            libc::SYS_open_by_handle_at,
+            libc::SYS_mount,
+            libc::SYS_umount2,
+            libc::SYS_bpf,
+            libc::SYS_kexec_load,
+        ];
+        sandbox_python(
+            &spec,
+            &format!(
+                r#"
+import signal, subprocess, sys
+for number in {syscalls:?}:
+    program = 'import ctypes; ctypes.CDLL(None).syscall(' + str(number) + ',0,0,0,0,0,0)'
+    child = subprocess.run([sys.executable, '-c', program], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2)
+    assert child.returncode == -signal.SIGSYS, (number, child.returncode, child.stderr)
+if {test_compat}:
+    program = '''import ctypes, mmap
+memory = mmap.mmap(-1, 4096, prot=mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC)
+memory.write(bytes.fromhex('b86600000031db31c9cd80c3'))
+function = ctypes.CFUNCTYPE(ctypes.c_long)(ctypes.addressof(ctypes.c_char.from_buffer(memory)))
+function()
+'''
+    child = subprocess.run([sys.executable, '-c', program], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2)
+    assert child.returncode == -signal.SIGSYS, (child.returncode, child.stderr)
+print('original-native-traps-and-supported-foreign-abi-checked')
+"#,
+                test_compat = if cfg!(target_arch = "x86_64") {
+                    "True"
+                } else {
+                    "False"
+                }
+            ),
+        );
     }
 
     #[test]
