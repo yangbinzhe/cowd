@@ -92,6 +92,88 @@ fn canonical_digest(domain: &str, value: &serde_json::Value) -> Result<String, S
         .map_err(|error| error.to_string())
 }
 
+/// Mint the durable host-process closure evidence for a process-class effect.
+///
+/// The Runtime kernel is the only authority that may publish this fact: the
+/// tool host adapter is rejected when it claims a process terminal of its
+/// own. The fact carries the host executor's own quiescence report (exit code
+/// or signal, the child reaped, the process group without a live member) and
+/// never claims a hardening, network isolation or private namespace the host
+/// path cannot prove.
+///
+/// Returns `false` when the effect does not need a host process terminal (the
+/// caller then keeps its normal commit path).
+pub(crate) async fn mint_host_process_evidence(
+    service: &ExecutionCommitService,
+    request: &crate::RuntimeToolExecutionRequest,
+    descriptor: &ToolEffectDescriptor,
+    outcome: &mut crate::RuntimeToolExecutionOutcome,
+) -> Result<bool, String> {
+    if !descriptor.spawns_process {
+        return Ok(false);
+    }
+    if outcome.observed_evidence.iter().any(|observed| {
+        matches!(
+            observed.target,
+            EvidenceTargetIdentity::ToolExecution { .. }
+        )
+    }) {
+        return Err("tool host adapter may not publish a process terminal fact".into());
+    }
+    let Ok(artifacts) = service.bounded_process_artifacts() else {
+        // Without the original ArtifactStore the closure cannot be archived,
+        // and an unarchived closure is no closure: the caller keeps its normal
+        // commit path and the witness keeps failing closed.
+        return Ok(false);
+    };
+    let report = read_host_process_report(outcome.output.as_deref());
+    let source_bytes = source_bundle_bytes(request)?;
+    let body_bytes = body_bytes(request, &report)?;
+    let scope = format!(
+        "session:{}",
+        request
+            .session_id
+            .as_deref()
+            .ok_or_else(|| "host process Session missing".to_string())?
+    );
+    let source_bundle = artifacts
+        .write_bytes(
+            harness_contract::context::ArtifactWriteDescriptor {
+                media_type: "application/octet-stream".into(),
+                visibility_scope: scope.clone(),
+                expected_bytes: Some(source_bytes.len() as u64),
+                original_name: None,
+            },
+            &source_bytes,
+        )
+        .await
+        .map_err(|error| format!("host process source archive failed: {error}"))?;
+    let body = artifacts
+        .write_bytes(
+            harness_contract::context::ArtifactWriteDescriptor {
+                media_type: "application/json".into(),
+                visibility_scope: scope,
+                expected_bytes: Some(body_bytes.len() as u64),
+                original_name: None,
+            },
+            &body_bytes,
+        )
+        .await
+        .map_err(|error| format!("host process closure archive failed: {error}"))?;
+    artifacts
+        .pin(
+            &body,
+            &format!("execution-effect:{}", request.idempotency_key),
+            i64::MAX as u64,
+        )
+        .map_err(|error| format!("host process closure pin failed: {error}"))?;
+    let fact = build_host_process_fact(request, descriptor, &report, body, source_bundle)?;
+    outcome
+        .observed_evidence
+        .push(host_process_observation(request, fact));
+    Ok(true)
+}
+
 /// Read the honest closure report out of a host executor result.
 ///
 /// The host executor serializes its whole result object, so the quiescence

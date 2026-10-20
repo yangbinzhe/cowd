@@ -307,11 +307,19 @@ pub(crate) mod scope_admission_tests {
     fn bounded_fixture_rejects_low_mode_before_issuing_human_approval() {
         let workspace = tempfile::tempdir().unwrap();
         let host = tools::ToolHost::builtin("Own848-effective-floor", workspace.path());
-        let mut request = bound_request(&host, "execute_code", json!({
-            "language":"python", "code":"print(1)", "input_files":[], "timeout_ms":1000,
-        }));
-        authorize_bounded_fixture(&host, &mut request, Arc::new(crate::RuntimeEventStore::for_test()),
-            harness_contract::policy::PermissionMode::WorkspaceWrite);
+        let mut request = bound_request(
+            &host,
+            "execute_code",
+            json!({
+                "language":"python", "code":"print(1)", "input_files":[], "timeout_ms":1000,
+            }),
+        );
+        authorize_bounded_fixture(
+            &host,
+            &mut request,
+            Arc::new(crate::RuntimeEventStore::for_test()),
+            harness_contract::policy::PermissionMode::WorkspaceWrite,
+        );
     }
 
     pub(crate) fn authorize_bounded_fixture(
@@ -487,8 +495,13 @@ pub(crate) mod scope_admission_tests {
         assert!(crate::AuthorizationNegotiator::verify_lease_signature(
             &signed
         ));
-        assert!(signed.ceiling.permits(evaluated.effective.descriptor.required_permission));
-        assert_eq!(approved.required_mode, evaluated.effective.descriptor.required_permission);
+        assert!(signed
+            .ceiling
+            .permits(evaluated.effective.descriptor.required_permission));
+        assert_eq!(
+            approved.required_mode,
+            evaluated.effective.descriptor.required_permission
+        );
         let authorization = crate::ToolPolicy
             .authorize(
                 &evaluated.effective,
@@ -677,8 +690,7 @@ pub(crate) mod scope_admission_tests {
             &self,
             request: &RuntimeToolExecutionRequest,
         ) -> RuntimeToolExecutionOutcome {
-            self.calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             RuntimeToolExecutionOutcome {
                 tool_use_id: request.tool_use_id.clone(),
                 tool_name: request.tool_name.clone(),
@@ -703,6 +715,135 @@ pub(crate) mod scope_admission_tests {
         }
     }
 
+    /// The Runtime kernel mints the host process terminal from the executor's
+    /// own report, and the physical closure witness then judges the effect
+    /// closed. This is the path a real Session tool call takes: the tool
+    /// result is the executor's structured output, and the durable receipt
+    /// must carry the honest quiescence proof.
+    #[tokio::test]
+    async fn r1_892_a_conversation_style_tool_output_mints_the_closure_evidence() {
+        use harness_contract::context::{EvidenceTargetIdentity, ToolExecutionTerminal};
+        let workspace = tempfile::tempdir().unwrap();
+        let tools = tools::ToolHost::builtin("r1-892-host-process", workspace.path());
+        let store = Arc::new(crate::RuntimeEventStore::for_test());
+        let artifacts = Arc::new(crate::ArtifactStore::for_test_default(
+            workspace.path().join("artifacts"),
+        ));
+        let service =
+            ExecutionCommitService::new(Arc::clone(&store)).with_artifact_store(artifacts);
+        let request = bound_request(&tools, "bash", json!({"command": "printf 892"}));
+        let descriptor = request
+            .compiled_invocation
+            .as_ref()
+            .expect("compiled invocation")
+            .effect
+            .clone();
+        assert!(descriptor.spawns_process);
+        let mut outcome = crate::RuntimeToolExecutionOutcome {
+            tool_use_id: request.tool_use_id.clone(),
+            tool_name: request.tool_name.clone(),
+            status: crate::RuntimeToolExecutionStatus::Executed,
+            category: request.category,
+            output: Some(
+                json!({
+                    "stdout": "892",
+                    "stderr": "",
+                    "processClosure": {
+                        "exitCode": 0,
+                        "signal": null,
+                        "initReaped": true,
+                        "allChildrenReaped": true,
+                    },
+                })
+                .to_string(),
+            ),
+            error: None,
+            evidence_ref: format!("tool-effect:{}", request.idempotency_key),
+            observed_evidence: Vec::new(),
+        };
+        let minted = crate::host_process_closure::mint_host_process_evidence(
+            &service,
+            &request,
+            &descriptor,
+            &mut outcome,
+        )
+        .await
+        .expect("mint the host process closure");
+        assert!(
+            minted,
+            "a process-class effect must mint its closure evidence"
+        );
+        let facts = outcome
+            .observed_evidence
+            .iter()
+            .filter_map(|observed| match &observed.target {
+                EvidenceTargetIdentity::ToolExecution { execution } => Some(execution),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(facts.len(), 1, "exactly one process terminal");
+        assert!(
+            matches!(
+                &facts[0].terminal,
+                ToolExecutionTerminal::Settled {
+                    exit_code: Some(0),
+                    signal: None,
+                    closure,
+                    ..
+                } if closure.all_children_reaped && closure.init_reaped
+            ),
+            "{:?}",
+            facts[0].terminal
+        );
+        assert!(crate::execution_projection::settlement::process_closed(
+            &outcome,
+            &descriptor
+        ));
+    }
+
+    /// A report that does not prove the exit never becomes a closure: the
+    /// witness keeps failing closed.
+    #[tokio::test]
+    async fn r1_892_a_host_process_report_without_proof_never_closes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let tools = tools::ToolHost::builtin("r1-892-host-process-unproven", workspace.path());
+        let store = Arc::new(crate::RuntimeEventStore::for_test());
+        let artifacts = Arc::new(crate::ArtifactStore::for_test_default(
+            workspace.path().join("artifacts"),
+        ));
+        let service =
+            ExecutionCommitService::new(Arc::clone(&store)).with_artifact_store(artifacts);
+        let request = bound_request(&tools, "bash", json!({"command": "printf 892"}));
+        let descriptor = request
+            .compiled_invocation
+            .as_ref()
+            .expect("compiled invocation")
+            .effect
+            .clone();
+        let mut outcome = crate::RuntimeToolExecutionOutcome {
+            tool_use_id: request.tool_use_id.clone(),
+            tool_name: request.tool_name.clone(),
+            status: crate::RuntimeToolExecutionStatus::Executed,
+            category: request.category,
+            output: Some(json!({"stdout": "892"}).to_string()),
+            error: None,
+            evidence_ref: format!("tool-effect:{}", request.idempotency_key),
+            observed_evidence: Vec::new(),
+        };
+        crate::host_process_closure::mint_host_process_evidence(
+            &service,
+            &request,
+            &descriptor,
+            &mut outcome,
+        )
+        .await
+        .expect("mint the honest unknown");
+        assert!(
+            !crate::execution_projection::settlement::process_closed(&outcome, &descriptor),
+            "an unproven process exit must never close"
+        );
+    }
+
     /// F2: a host process effect publishes its quiescence fact into the
     /// durable receipt, and the historical replay keeps that evidence.
     #[tokio::test]
@@ -720,10 +861,11 @@ pub(crate) mod scope_admission_tests {
         let service =
             ExecutionCommitService::new(Arc::clone(&store)).with_artifact_store(artifacts.clone());
         let mut request = bound_request(&tools, "bash", json!({"command": "printf 890"}));
-        request.parent_execution = Some(harness_contract::execution_graph::ExecutionParentBinding {
-            execution_id: "scope2-graph".into(),
-            node_id: "scope2-node".into(),
-        });
+        request.parent_execution =
+            Some(harness_contract::execution_graph::ExecutionParentBinding {
+                execution_id: "scope2-graph".into(),
+                node_id: "scope2-node".into(),
+            });
         request.parent_execution_attempt = Some(1);
         let effect = request.compiled_invocation.as_ref().unwrap().effect.clone();
         assert!(effect.spawns_process);
@@ -749,7 +891,11 @@ pub(crate) mod scope_admission_tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(facts.len(), 1, "the fresh outcome must carry one process terminal");
+        assert_eq!(
+            facts.len(),
+            1,
+            "the fresh outcome must carry one process terminal"
+        );
         assert!(
             matches!(
                 &facts[0].terminal,
@@ -1505,9 +1651,12 @@ pub(crate) async fn execute_bound_agent_tool_observed(
                 outcome.observed_evidence.push(observed);
             }
         } else if tool_name == "tool_orchestrate"
-            && outcome.observed_evidence.iter().all(|observed| matches!(
-                observed.target, harness_contract::context::EvidenceTargetIdentity::LocalNetwork { .. }
-            ))
+            && outcome.observed_evidence.iter().all(|observed| {
+                matches!(
+                    observed.target,
+                    harness_contract::context::EvidenceTargetIdentity::LocalNetwork { .. }
+                )
+            })
         {
             outcome.observed_evidence.extend(
                 parsed
@@ -1542,126 +1691,47 @@ pub(crate) async fn execute_bound_agent_tool_observed(
     // that report into the durable evidence the physical closure witness
     // reads, and never into a security posture the host path cannot prove.
     let mut host_process_terminal = false;
-    if fresh_execution && descriptor.spawns_process {
-        if outcome.observed_evidence.iter().any(|observed| {
-            matches!(
-                observed.target,
-                harness_contract::context::EvidenceTargetIdentity::ToolExecution { .. }
-            )
-        }) {
-            return Err(ToolError::new(
-                "tool host adapter may not publish a process terminal fact",
-            ));
-        }
+    if fresh_execution {
         if let Some(service) = commit_service {
-            if let Some(artifacts) = service.bounded_process_artifacts().ok() {
-                let report = crate::host_process_closure::read_host_process_report(
-                    outcome.output.as_deref(),
-                );
-                let source_bytes =
-                    crate::host_process_closure::source_bundle_bytes(request).map_err(|error| {
-                        ToolError::new(format!(
-                            "tool `{tool_name}` host process source bundle failed: {error}"
-                        ))
-                    })?;
-                let body_bytes =
-                    crate::host_process_closure::body_bytes(request, &report).map_err(|error| {
-                        ToolError::new(format!(
-                            "tool `{tool_name}` host process closure document failed: {error}"
-                        ))
-                    })?;
-                let scope = format!(
-                    "session:{}",
-                    request
-                        .session_id
-                        .as_deref()
-                        .ok_or_else(|| ToolError::new("host process Session missing"))?
-                );
-                let descriptor_write =
-                    harness_contract::context::ArtifactWriteDescriptor {
-                        media_type: "application/octet-stream".into(),
-                        visibility_scope: scope.clone(),
-                        expected_bytes: Some(source_bytes.len() as u64),
-                        original_name: None,
-                    };
-                let source_bundle = artifacts
-                    .write_bytes(descriptor_write, &source_bytes)
-                    .await
-                    .map_err(|error| {
-                        ToolError::new(format!(
-                            "tool `{tool_name}` host process source archive failed: {error}"
-                        ))
-                    })?;
-                let body = artifacts
-                    .write_bytes(
-                        harness_contract::context::ArtifactWriteDescriptor {
-                            media_type: "application/json".into(),
-                            visibility_scope: scope,
-                            expected_bytes: Some(body_bytes.len() as u64),
-                            original_name: None,
-                        },
-                        &body_bytes,
-                    )
-                    .await
-                    .map_err(|error| {
-                        ToolError::new(format!(
-                            "tool `{tool_name}` host process closure archive failed: {error}"
-                        ))
-                    })?;
-                artifacts
-                    .pin(
-                        &body,
-                        &format!("execution-effect:{}", request.idempotency_key),
-                        i64::MAX as u64,
-                    )
-                    .map_err(|error| {
-                        ToolError::new(format!(
-                            "tool `{tool_name}` host process closure pin failed: {error}"
-                        ))
-                    })?;
-                let fact = crate::host_process_closure::build_host_process_fact(
-                    request,
-                    descriptor,
-                    &report,
-                    body,
-                    source_bundle,
-                )
-                .map_err(|error| {
-                    ToolError::new(format!(
-                        "tool `{tool_name}` host process terminal failed: {error}"
-                    ))
-                })?;
-                outcome
-                    .observed_evidence
-                    .push(crate::host_process_closure::host_process_observation(request, fact));
-                host_process_terminal = true;
-            }
+            host_process_terminal = crate::host_process_closure::mint_host_process_evidence(
+                service,
+                request,
+                descriptor,
+                &mut outcome,
+            )
+            .await
+            .map_err(|error| {
+                ToolError::new(format!(
+                    "tool `{tool_name}` host process terminal failed: {error}"
+                ))
+            })?;
         }
     }
     if fresh_execution {
         if let Some(commit_service) = commit_service {
-            let committed =
-                if descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Read {
-                    if host_process_terminal {
-                        commit_service.commit_bound_readonly_tool_receipt_with_host_process(
-                            request,
-                            &outcome,
-                            descriptor,
-                            &resolved_scope,
-                        )
-                    } else {
-                        commit_service.commit_bound_readonly_tool_receipt(
-                            request,
-                            &outcome,
-                            descriptor,
-                            &resolved_scope,
-                        )
-                    }
-                } else if host_process_terminal {
-                    commit_service.commit_tool_effect_with_host_process(request, &descriptor, &outcome)
+            let committed = if descriptor.effect_kind
+                == harness_contract::tool::ToolEffectKind::Read
+            {
+                if host_process_terminal {
+                    commit_service.commit_bound_readonly_tool_receipt_with_host_process(
+                        request,
+                        &outcome,
+                        descriptor,
+                        &resolved_scope,
+                    )
                 } else {
-                    commit_service.commit_tool_effect(&request, &descriptor, &outcome)
-                };
+                    commit_service.commit_bound_readonly_tool_receipt(
+                        request,
+                        &outcome,
+                        descriptor,
+                        &resolved_scope,
+                    )
+                }
+            } else if host_process_terminal {
+                commit_service.commit_tool_effect_with_host_process(request, &descriptor, &outcome)
+            } else {
+                commit_service.commit_tool_effect(&request, &descriptor, &outcome)
+            };
             if let Err(error) = committed {
                 return Err(ToolError::new(format!(
                     "tool `{tool_name}` completed but durable receipt commit failed: {error}"

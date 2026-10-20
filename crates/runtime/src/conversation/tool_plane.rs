@@ -373,8 +373,13 @@ async fn lock_root_effect_scope(
 fn model_tool_output_feedback(
     tool_name: &str,
     output: harness_contract::context::ToolOutputDraft,
-) -> (harness_contract::context::ToolOutputDraft, bool, Option<ToolFailureKind>) {
-    let is_error = crate::tool_host::bounded_process_feedback_is_error(tool_name, output.observations());
+) -> (
+    harness_contract::context::ToolOutputDraft,
+    bool,
+    Option<ToolFailureKind>,
+) {
+    let is_error =
+        crate::tool_host::bounded_process_feedback_is_error(tool_name, output.observations());
     let failure = is_error.then_some(ToolFailureKind::ExecutionError);
     (output, is_error, failure)
 }
@@ -1630,7 +1635,8 @@ where
             .await?;
             return replay_tool_output(outcome);
         }
-        if root.is_none() && descriptor.effect_kind != harness_contract::tool::ToolEffectKind::Read {
+        if root.is_none() && descriptor.effect_kind != harness_contract::tool::ToolEffectKind::Read
+        {
             commit.preflight_fresh_bound_tool(request, descriptor)?;
         }
         let locked = lock_root_effect_scope(
@@ -1694,7 +1700,7 @@ where
             .ok()
             .map(|output| output.model_text().to_string());
         let error = execution.as_ref().err().map(ToString::to_string);
-        let outcome = crate::RuntimeToolExecutionOutcome {
+        let mut outcome = crate::RuntimeToolExecutionOutcome {
             tool_use_id: request.tool_use_id.clone(),
             tool_name: request.tool_name.clone(),
             status: if execution.is_ok() {
@@ -1712,8 +1718,37 @@ where
                 .map(|draft| draft.observations().to_vec())
                 .unwrap_or_default(),
         };
+        // A process-class effect owns a physical process tree, so its durable
+        // receipt must carry the honest quiescence proof. The host shell is
+        // not a sandbox process: it can prove that the command is gone and
+        // that nothing of it is still alive, and nothing more. The Runtime
+        // kernel is the only authority that may publish that fact.
+        let host_process_terminal = if execution.is_ok() {
+            crate::host_process_closure::mint_host_process_evidence(
+                commit,
+                request,
+                descriptor,
+                &mut outcome,
+            )
+            .await
+            .map_err(|error| {
+                ToolError::new(format!(
+                    "tool `{}` host process terminal failed: {error}",
+                    request.tool_name
+                ))
+            })?
+        } else {
+            false
+        };
         let committed = if descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Read {
-            if let Some(root) = root {
+            if host_process_terminal {
+                commit.commit_bound_readonly_tool_receipt_with_host_process(
+                    request,
+                    &outcome,
+                    descriptor,
+                    &locked.scope,
+                )
+            } else if let Some(root) = root {
                 commit.commit_root_read_acquisition(
                     request,
                     &outcome,
@@ -1729,6 +1764,8 @@ where
                     &locked.scope,
                 )
             }
+        } else if host_process_terminal {
+            commit.commit_tool_effect_with_host_process(request, descriptor, &outcome)
         } else {
             commit.commit_tool_effect(request, descriptor, &outcome)
         };
@@ -3418,7 +3455,10 @@ mod agentic_action_body_tests {
         for (fresh, replayed) in original_observations.iter().zip(replay.observations()) {
             assert_eq!(fresh.target, replayed.target);
             assert_eq!(fresh.observed_at_sequence, replayed.observed_at_sequence);
-            assert_eq!(replayed.provenance, harness_contract::context::ObservedEvidenceProvenance::RetainedReplay);
+            assert_eq!(
+                replayed.provenance,
+                harness_contract::context::ObservedEvidenceProvenance::RetainedReplay
+            );
         }
     }
 
@@ -3465,81 +3505,203 @@ mod agentic_action_body_tests {
     #[tokio::test]
     async fn r1_708_actual_timeout_and_capture_limit_are_payload_errors_not_unknown() {
         use crate::execution_core::graph::bounded_process_tests::{owned_fixture, request};
-        use harness_contract::context::{EvidenceTargetIdentity, ToolExecutionTerminal, ToolExecutionStopReason};
+        use harness_contract::context::{
+            EvidenceTargetIdentity, ToolExecutionStopReason, ToolExecutionTerminal,
+        };
         for (code, timeout, stop) in [
-            ("import time; time.sleep(30)", 2500, ToolExecutionStopReason::Timeout),
-            ("import sys; sys.stdout.write('x'*2097153); sys.stdout.flush()", 5000, ToolExecutionStopReason::CaptureLimit),
+            (
+                "import time; time.sleep(30)",
+                2500,
+                ToolExecutionStopReason::Timeout,
+            ),
+            (
+                "import sys; sys.stdout.write('x'*2097153); sys.stdout.flush()",
+                5000,
+                ToolExecutionStopReason::CaptureLimit,
+            ),
         ] {
             let fixture = owned_fixture();
-            let request = request(&fixture.host, serde_json::json!({"language":"python","code":code,"input_files":[],"timeout_ms":timeout}));
+            let request = request(
+                &fixture.host,
+                serde_json::json!({"language":"python","code":code,"input_files":[],"timeout_ms":timeout}),
+            );
             let effect = request.compiled_invocation.as_ref().unwrap().effect.clone();
-            let authority = crate::tool_host::BoundedProcessAuthority::bind(fixture.services.clone(), request.clone()).unwrap();
+            let authority = crate::tool_host::BoundedProcessAuthority::bind(
+                fixture.services.clone(),
+                request.clone(),
+            )
+            .unwrap();
             let outcome = crate::bound_tool_batch::execute_bounded_process_owned(
-                fixture.host.pin_snapshot(), fixture.services.tool_execution_plane().clone(), authority,
-                fixture.services.commit_service().clone(), request.clone(), effect.clone(), Some(fixture.root.clone()), Some((fixture.owner.clone(), 1)),
-            ).await.unwrap();
-            let EvidenceTargetIdentity::ToolExecution { execution } = &outcome.observed_evidence[0].target else { panic!("missing original fact") };
-            assert!(matches!(&execution.terminal, ToolExecutionTerminal::Settled { stop_reason, .. } if *stop_reason == stop), "{:?}", execution.terminal);
-            assert!(crate::execution_projection::settlement::process_closed(&outcome, &effect));
+                fixture.host.pin_snapshot(),
+                fixture.services.tool_execution_plane().clone(),
+                authority,
+                fixture.services.commit_service().clone(),
+                request.clone(),
+                effect.clone(),
+                Some(fixture.root.clone()),
+                Some((fixture.owner.clone(), 1)),
+            )
+            .await
+            .unwrap();
+            let EvidenceTargetIdentity::ToolExecution { execution } =
+                &outcome.observed_evidence[0].target
+            else {
+                panic!("missing original fact")
+            };
+            assert!(
+                matches!(&execution.terminal, ToolExecutionTerminal::Settled { stop_reason, .. } if *stop_reason == stop),
+                "{:?}",
+                execution.terminal
+            );
+            assert!(crate::execution_projection::settlement::process_closed(
+                &outcome, &effect
+            ));
             assert_original_process_feedback_708(outcome.clone(), true);
-            assert_eq!(fixture.services.commit_service().completed_tool_effect(&request, &effect).unwrap().unwrap(), outcome);
+            assert_eq!(
+                fixture
+                    .services
+                    .commit_service()
+                    .completed_tool_effect(&request, &effect)
+                    .unwrap()
+                    .unwrap(),
+                outcome
+            );
         }
     }
 
     #[tokio::test]
     async fn r1_708_actual_prelaunch_cancellation_is_error_without_forged_start() {
-        use crate::execution_core::graph::bounded_process_tests::{owned_fixture, request, marker_processes};
-        use harness_contract::context::{ArtifactWriteDescriptor, EvidenceTargetIdentity, ToolExecutionTerminal, ToolExecutionStopReason};
-        for started in [false, true] {
-        let fixture = owned_fixture();
-        let marker = format!("cowd-feedback-cancel-708-{}", uuid::Uuid::new_v4());
-        let code = if started { format!("import os\nos.execl('/bin/sleep','{marker}','30')") } else { "print('must not run')".into() };
-        let input = serde_json::json!({"language":"python","code":code,"input_files":[],"timeout_ms":5000});
-        let request = request(&fixture.host, input.clone());
-        let effect = request.compiled_invocation.as_ref().unwrap().effect.clone();
-        let service = fixture.services.commit_service();
-        let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(fixture.host.pin_snapshot().workspace_root()).unwrap();
-        let scope = crate::bound_tool_batch::admitted_effect_scope(&request, &effect, Some(fixture.host.pin_snapshot()), &resolver).unwrap();
-        service.begin_root_tool_effect(&request, &effect, &fixture.root, &scope, &fixture.owner, 1).unwrap();
-        let prepared = fixture.host.pin_snapshot().prepare_bounded_process(
-            request.authorization.as_ref().unwrap(), &input, service.bounded_process_binding(&request, &effect).unwrap(),
-        ).unwrap();
-        let artifacts = fixture.services.artifact_store();
-        let source = artifacts.write_bytes(ArtifactWriteDescriptor {
-            media_type:"application/octet-stream".into(), visibility_scope:"session:scope2-session".into(),
-            expected_bytes:Some(prepared.source_bundle_bytes().len() as u64), original_name:None,
-        }, prepared.source_bundle_bytes()).await.unwrap();
-        let admission = service.admit_bounded_process(&request, &effect, &prepared, &source).unwrap();
-        let cancellation = tools::ToolExecutionCancellation::new();
-        let completed = if started {
-            let signal = cancellation.clone();
-            let worker = tokio::task::spawn_blocking(move || prepared.run(admission, &signal));
-            tokio::time::timeout(std::time::Duration::from_secs(4), async {
-                while marker_processes(&marker).is_empty() {
-                    assert!(!worker.is_finished(), "must witness actual start before cancellation");
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-            }).await.unwrap();
-            cancellation.cancel();
-            let completed = tokio::time::timeout(std::time::Duration::from_secs(10), worker).await.unwrap().unwrap();
-            assert!(marker_processes(&marker).is_empty(), "actual payload must disappear before model feedback");
-            assert!(matches!(completed.terminal(), ToolExecutionTerminal::Settled { stop_reason: ToolExecutionStopReason::Cancelled, .. }));
-            completed
-        } else {
-            cancellation.cancel();
-            let completed = prepared.run(admission, &cancellation);
-            assert!(matches!(completed.terminal(), ToolExecutionTerminal::NotStarted { reason_code } if reason_code == "bounded_cancelled_before_spawn"));
-            completed
+        use crate::execution_core::graph::bounded_process_tests::{
+            marker_processes, owned_fixture, request,
         };
-        let authority = crate::tool_host::BoundedProcessAuthority::bind(fixture.services.clone(), request.clone()).unwrap();
-        let outcome = authority.with_commit_context(service.commit_bounded_process(&request, &effect, completed, artifacts)).await.unwrap();
-        let EvidenceTargetIdentity::ToolExecution { execution } = &outcome.observed_evidence[0].target else { panic!("missing original fact") };
-        assert_eq!(execution.stdout_bytes, 0);
-        assert_eq!(execution.stderr_bytes, 0);
-        assert_eq!(matches!(execution.terminal, ToolExecutionTerminal::NotStarted { .. }), !started);
-        assert!(crate::execution_projection::settlement::process_closed(&outcome, &effect));
-        assert_original_process_feedback_708(outcome.clone(), true);
-        assert_eq!(service.completed_tool_effect(&request, &effect).unwrap().unwrap(), outcome);
+        use harness_contract::context::{
+            ArtifactWriteDescriptor, EvidenceTargetIdentity, ToolExecutionStopReason,
+            ToolExecutionTerminal,
+        };
+        for started in [false, true] {
+            let fixture = owned_fixture();
+            let marker = format!("cowd-feedback-cancel-708-{}", uuid::Uuid::new_v4());
+            let code = if started {
+                format!("import os\nos.execl('/bin/sleep','{marker}','30')")
+            } else {
+                "print('must not run')".into()
+            };
+            let input = serde_json::json!({"language":"python","code":code,"input_files":[],"timeout_ms":5000});
+            let request = request(&fixture.host, input.clone());
+            let effect = request.compiled_invocation.as_ref().unwrap().effect.clone();
+            let service = fixture.services.commit_service();
+            let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(
+                fixture.host.pin_snapshot().workspace_root(),
+            )
+            .unwrap();
+            let scope = crate::bound_tool_batch::admitted_effect_scope(
+                &request,
+                &effect,
+                Some(fixture.host.pin_snapshot()),
+                &resolver,
+            )
+            .unwrap();
+            service
+                .begin_root_tool_effect(&request, &effect, &fixture.root, &scope, &fixture.owner, 1)
+                .unwrap();
+            let prepared = fixture
+                .host
+                .pin_snapshot()
+                .prepare_bounded_process(
+                    request.authorization.as_ref().unwrap(),
+                    &input,
+                    service.bounded_process_binding(&request, &effect).unwrap(),
+                )
+                .unwrap();
+            let artifacts = fixture.services.artifact_store();
+            let source = artifacts
+                .write_bytes(
+                    ArtifactWriteDescriptor {
+                        media_type: "application/octet-stream".into(),
+                        visibility_scope: "session:scope2-session".into(),
+                        expected_bytes: Some(prepared.source_bundle_bytes().len() as u64),
+                        original_name: None,
+                    },
+                    prepared.source_bundle_bytes(),
+                )
+                .await
+                .unwrap();
+            let admission = service
+                .admit_bounded_process(&request, &effect, &prepared, &source)
+                .unwrap();
+            let cancellation = tools::ToolExecutionCancellation::new();
+            let completed = if started {
+                let signal = cancellation.clone();
+                let worker = tokio::task::spawn_blocking(move || prepared.run(admission, &signal));
+                tokio::time::timeout(std::time::Duration::from_secs(4), async {
+                    while marker_processes(&marker).is_empty() {
+                        assert!(
+                            !worker.is_finished(),
+                            "must witness actual start before cancellation"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                cancellation.cancel();
+                let completed = tokio::time::timeout(std::time::Duration::from_secs(10), worker)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    marker_processes(&marker).is_empty(),
+                    "actual payload must disappear before model feedback"
+                );
+                assert!(matches!(
+                    completed.terminal(),
+                    ToolExecutionTerminal::Settled {
+                        stop_reason: ToolExecutionStopReason::Cancelled,
+                        ..
+                    }
+                ));
+                completed
+            } else {
+                cancellation.cancel();
+                let completed = prepared.run(admission, &cancellation);
+                assert!(
+                    matches!(completed.terminal(), ToolExecutionTerminal::NotStarted { reason_code } if reason_code == "bounded_cancelled_before_spawn")
+                );
+                completed
+            };
+            let authority = crate::tool_host::BoundedProcessAuthority::bind(
+                fixture.services.clone(),
+                request.clone(),
+            )
+            .unwrap();
+            let outcome = authority
+                .with_commit_context(
+                    service.commit_bounded_process(&request, &effect, completed, artifacts),
+                )
+                .await
+                .unwrap();
+            let EvidenceTargetIdentity::ToolExecution { execution } =
+                &outcome.observed_evidence[0].target
+            else {
+                panic!("missing original fact")
+            };
+            assert_eq!(execution.stdout_bytes, 0);
+            assert_eq!(execution.stderr_bytes, 0);
+            assert_eq!(
+                matches!(execution.terminal, ToolExecutionTerminal::NotStarted { .. }),
+                !started
+            );
+            assert!(crate::execution_projection::settlement::process_closed(
+                &outcome, &effect
+            ));
+            assert_original_process_feedback_708(outcome.clone(), true);
+            assert_eq!(
+                service
+                    .completed_tool_effect(&request, &effect)
+                    .unwrap()
+                    .unwrap(),
+                outcome
+            );
         }
     }
 
@@ -3547,14 +3709,21 @@ mod agentic_action_body_tests {
     async fn r1_708_actual_control_loss_remains_unknown_and_blocks_physical_closure() {
         use crate::execution_core::graph::bounded_process_tests::{owned_fixture, request};
         use harness_contract::context::{EvidenceTargetIdentity, ToolExecutionTerminal};
-        use std::os::fd::{FromRawFd, OwnedFd, AsRawFd};
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         let fixture = owned_fixture();
         let marker = format!("cowd-feedback-control-loss-708-{}", uuid::Uuid::new_v4());
-        let request = request(&fixture.host, serde_json::json!({"language":"python", "input_files":[], "timeout_ms":5000,
-            "code":format!("import os\nos.execl('/bin/sleep','{marker}','30')")}));
+        let request = request(
+            &fixture.host,
+            serde_json::json!({"language":"python", "input_files":[], "timeout_ms":5000,
+            "code":format!("import os\nos.execl('/bin/sleep','{marker}','30')")}),
+        );
         let effect = request.compiled_invocation.as_ref().unwrap().effect.clone();
         let service = fixture.services.commit_service().clone();
-        let authority = crate::tool_host::BoundedProcessAuthority::bind(fixture.services.clone(), request.clone()).unwrap();
+        let authority = crate::tool_host::BoundedProcessAuthority::bind(
+            fixture.services.clone(),
+            request.clone(),
+        )
+        .unwrap();
         let worker = {
             let plane = fixture.services.tool_execution_plane().clone();
             let lease = fixture.host.pin_snapshot();
@@ -3564,51 +3733,129 @@ mod agentic_action_body_tests {
             let request = request.clone();
             let effect = effect.clone();
             tokio::spawn(async move {
-                crate::bound_tool_batch::execute_bounded_process_owned(lease, plane, authority, service, request, effect, Some(root), Some((owner, 1))).await
+                crate::bound_tool_batch::execute_bounded_process_owned(
+                    lease,
+                    plane,
+                    authority,
+                    service,
+                    request,
+                    effect,
+                    Some(root),
+                    Some((owner, 1)),
+                )
+                .await
             })
         };
         let parent_pid = |process: u32| -> Option<u32> {
-            std::fs::read_to_string(format!("/proc/{process}/status")).ok()?.lines()
+            std::fs::read_to_string(format!("/proc/{process}/status"))
+                .ok()?
+                .lines()
                 .find_map(|line| line.strip_prefix("PPid:")?.trim().parse().ok())
         };
         tokio::time::timeout(std::time::Duration::from_secs(4), async {
             loop {
                 for entry in std::fs::read_dir("/proc").unwrap().filter_map(Result::ok) {
-                    let Ok(payload) = entry.file_name().to_string_lossy().parse::<u32>() else { continue };
-                    let Ok(command) = std::fs::read(entry.path().join("cmdline")) else { continue };
-                    if command.split(|byte| *byte == 0).next() != Some(marker.as_bytes()) { continue; }
-                    let Some(init) = parent_pid(payload) else { continue };
-                    let init_command = std::fs::read(format!("/proc/{init}/cmdline")).unwrap_or_default();
-                    if !init_command.split(|byte| *byte == 0).any(|argument| argument == b"--bounded-inner") { continue; }
-                    let namespace_pid1 = std::fs::read_to_string(format!("/proc/{init}/status")).unwrap_or_default().lines()
-                        .any(|line| line.strip_prefix("NSpid:").is_some_and(|ids| ids.split_whitespace().last() == Some("1")));
+                    let Ok(payload) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                        continue;
+                    };
+                    let Ok(command) = std::fs::read(entry.path().join("cmdline")) else {
+                        continue;
+                    };
+                    if command.split(|byte| *byte == 0).next() != Some(marker.as_bytes()) {
+                        continue;
+                    }
+                    let Some(init) = parent_pid(payload) else {
+                        continue;
+                    };
+                    let init_command =
+                        std::fs::read(format!("/proc/{init}/cmdline")).unwrap_or_default();
+                    if !init_command
+                        .split(|byte| *byte == 0)
+                        .any(|argument| argument == b"--bounded-inner")
+                    {
+                        continue;
+                    }
+                    let namespace_pid1 = std::fs::read_to_string(format!("/proc/{init}/status"))
+                        .unwrap_or_default()
+                        .lines()
+                        .any(|line| {
+                            line.strip_prefix("NSpid:")
+                                .is_some_and(|ids| ids.split_whitespace().last() == Some("1"))
+                        });
                     assert!(namespace_pid1);
                     let mut ancestor = init;
                     for _ in 0..16 {
-                        if ancestor == std::process::id() { break; }
+                        if ancestor == std::process::id() {
+                            break;
+                        }
                         ancestor = parent_pid(ancestor).unwrap_or(0);
-                        if ancestor == 0 { break; }
+                        if ancestor == 0 {
+                            break;
+                        }
                     }
-                    assert_eq!(ancestor, std::process::id(), "fault injection must own the original process tree");
-                    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, init as libc::pid_t, 0) };
+                    assert_eq!(
+                        ancestor,
+                        std::process::id(),
+                        "fault injection must own the original process tree"
+                    );
+                    let descriptor =
+                        unsafe { libc::syscall(libc::SYS_pidfd_open, init as libc::pid_t, 0) };
                     assert!(descriptor >= 0);
                     let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor as i32) };
                     assert_eq!(parent_pid(payload), Some(init));
-                    assert_eq!(std::fs::read(format!("/proc/{init}/cmdline")).unwrap(), init_command);
-                    assert_eq!(unsafe { libc::syscall(libc::SYS_pidfd_send_signal, descriptor.as_raw_fd(), libc::SIGKILL, std::ptr::null::<libc::siginfo_t>(), 0) }, 0);
+                    assert_eq!(
+                        std::fs::read(format!("/proc/{init}/cmdline")).unwrap(),
+                        init_command
+                    );
+                    assert_eq!(
+                        unsafe {
+                            libc::syscall(
+                                libc::SYS_pidfd_send_signal,
+                                descriptor.as_raw_fd(),
+                                libc::SIGKILL,
+                                std::ptr::null::<libc::siginfo_t>(),
+                                0,
+                            )
+                        },
+                        0
+                    );
                     return;
                 }
-                assert!(!worker.is_finished(), "original producer ended before controlled fault");
+                assert!(
+                    !worker.is_finished(),
+                    "original producer ended before controlled fault"
+                );
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
-        }).await.expect("must witness original payload before control loss");
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), worker).await.unwrap().unwrap().unwrap();
-        let EvidenceTargetIdentity::ToolExecution { execution } = &outcome.observed_evidence[0].target else { panic!("missing original fact") };
-        assert!(matches!(&execution.terminal, ToolExecutionTerminal::Unknown { .. }));
-        assert!(!crate::execution_projection::settlement::process_closed(&outcome, &effect));
+        })
+        .await
+        .expect("must witness original payload before control loss");
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let EvidenceTargetIdentity::ToolExecution { execution } =
+            &outcome.observed_evidence[0].target
+        else {
+            panic!("missing original fact")
+        };
+        assert!(matches!(
+            &execution.terminal,
+            ToolExecutionTerminal::Unknown { .. }
+        ));
+        assert!(!crate::execution_projection::settlement::process_closed(
+            &outcome, &effect
+        ));
         assert_eq!(outcome.status, crate::RuntimeToolExecutionStatus::Executed);
         assert_original_process_feedback_708(outcome.clone(), true);
-        assert_eq!(service.completed_tool_effect(&request, &effect).unwrap().unwrap(), outcome);
+        assert_eq!(
+            service
+                .completed_tool_effect(&request, &effect)
+                .unwrap()
+                .unwrap(),
+            outcome
+        );
     }
 
     #[test]
@@ -3689,7 +3936,9 @@ mod agentic_action_body_tests {
         assert!(missing.model_feedback_is_error());
         assert!(super::replay_tool_output(missing).is_err());
         let mut ambiguous = failed.clone();
-        ambiguous.observed_evidence.extend(failed.observed_evidence.clone());
+        ambiguous
+            .observed_evidence
+            .extend(failed.observed_evidence.clone());
         assert!(ambiguous.model_feedback_is_error());
         failed.status = crate::RuntimeToolExecutionStatus::Failed;
         assert!(super::replay_tool_output(failed).is_err());
