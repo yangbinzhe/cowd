@@ -33,8 +33,27 @@ mod effect_authority;
 #[path = "tool_receipt_query.rs"]
 mod tool_receipt_query;
 pub(crate) use commit_pipeline::execution_lineage_stream_id;
+pub(crate) use commit_pipeline::receipt_replay_contract;
 use commit_pipeline::*;
 pub(crate) use tool_receipt_query::ToolReceiptQuery;
+
+/// Which authority published the process terminal that a receipt carries.
+///
+/// A process terminal is a physical claim about a process tree, so exactly one
+/// authority may publish it:
+///
+/// - `BoundedProcess` — the private bounded process published its own closure
+///   envelope while it still holds the live authority for that process.
+/// - `HostProcess` — the Runtime kernel minted the fact itself from the
+///   trusted host executor's quiescence report. A host shell is not a sandbox
+///   process, so it carries no private capability and no closure publication.
+/// - `Absent` — the receipt carries no process terminal at all.
+#[derive(Clone, Copy)]
+pub(crate) enum ProcessTerminalAuthority<'a> {
+    Absent,
+    BoundedProcess(&'a serde_json::Value),
+    HostProcess,
+}
 
 
 #[cfg(any(test, feature = "test-fixtures"))]
@@ -1476,11 +1495,10 @@ pub(crate) mod bounded_process_tests {
                 assert!(crate::execution_projection::settlement::process_closed(
                     &outcome, effect
                 ));
-                for closure_flag in [
-                    "all_children_reaped",
-                    "init_reaped",
-                    "kernel_hardening_applied",
-                ] {
+                // Physical closure is quiescence: the reaped facts are the
+                // criterion. The hardening flag is an audit fact, and it is
+                // enforced where the bounded process publishes its terminal.
+                for closure_flag in ["all_children_reaped", "init_reaped"] {
                     let mut raw = serde_json::to_value(&outcome).unwrap();
                     raw["observed_evidence"][0]["target"]["execution"]["terminal"]["closure"]
                         [closure_flag] = json!(false);
@@ -2953,7 +2971,7 @@ impl ExecutionCommitService {
             crate::RuntimeToolExecutionOutcome,
         )],
     ) -> Result<(), ExecutionCommitError> {
-        self.commit_readonly_tool_receipts_scoped(receipts, None, None)
+        self.commit_readonly_tool_receipts_scoped(receipts, None, None, false)
     }
 
     pub(crate) fn commit_bound_readonly_tool_receipt(
@@ -2968,6 +2986,27 @@ impl ExecutionCommitService {
             &[(request.clone(), outcome.clone())],
             Some(scope),
             None,
+            false,
+        )
+    }
+
+    /// Commit a read-class receipt that carries the Runtime-minted host
+    /// process closure fact. The host shell proves quiescence only; it never
+    /// carries the private bounded-process capability.
+    pub(crate) fn commit_bound_readonly_tool_receipt_with_host_process(
+        &self,
+        request: &crate::RuntimeToolExecutionRequest,
+        outcome: &crate::RuntimeToolExecutionOutcome,
+        effect: &ToolEffectDescriptor,
+        scope: &harness_contract::goal::ProofEffectScope,
+    ) -> Result<(), ExecutionCommitError> {
+        Self::validate_bound_effect_scope(effect, scope)?;
+        Self::validate_host_process_outcome(outcome)?;
+        self.commit_readonly_tool_receipts_scoped(
+            &[(request.clone(), outcome.clone())],
+            Some(scope),
+            None,
+            true,
         )
     }
 
@@ -2979,9 +3018,10 @@ impl ExecutionCommitService {
         )],
         scope: Option<&harness_contract::goal::ProofEffectScope>,
         root_intent: Option<&crate::DurableRuntimeEvent>,
+        host_process: bool,
     ) -> Result<(), ExecutionCommitError> {
         for (_, outcome) in receipts {
-            Self::reject_public_process_facts(outcome)?;
+            Self::reject_public_process_facts(outcome, host_process)?;
         }
         if receipts.is_empty() {
             return Ok(());
@@ -3694,7 +3734,12 @@ impl ExecutionCommitService {
             .map_err(|error| invalid(error.to_string()))?;
         let closure = json!({"content_schema":2,"sha256":proof.sha256,"bytes":proof.bytes,
             "body":{"kind":"artifact_ref","artifact":proof}});
-        self.commit_tool_effect_trusted(request, effect, &outcome, Some(&closure))?;
+        self.commit_tool_effect_trusted(
+            request,
+            effect,
+            &outcome,
+            ProcessTerminalAuthority::BoundedProcess(&closure),
+        )?;
         Ok(outcome)
     }
 
@@ -4408,6 +4453,7 @@ impl ExecutionCommitService {
             &[(request.clone(), outcome.clone())],
             Some(scope),
             Some(&intent),
+            false,
         )
     }
 
@@ -4699,13 +4745,66 @@ impl ExecutionCommitService {
         effect: &ToolEffectDescriptor,
         outcome: &crate::RuntimeToolExecutionOutcome,
     ) -> Result<(), ExecutionCommitError> {
-        Self::reject_public_process_facts(outcome)?;
+        Self::reject_public_process_facts(outcome, false)?;
         local_network::validate_outcome(request, effect, outcome)?;
-        self.commit_tool_effect_trusted(request, effect, outcome, None)
+        self.commit_tool_effect_trusted(
+            request,
+            effect,
+            outcome,
+            ProcessTerminalAuthority::Absent,
+        )
+    }
+
+    /// Commit a receipt whose outcome carries the Runtime-minted host process
+    /// closure fact.
+    ///
+    /// The host shell is not a sandbox process. It can only prove
+    /// *quiescence*, and it proves it by reporting it in its own structured
+    /// result. This path is the one place where such a fact may enter a
+    /// durable receipt; the public path above still refuses every process
+    /// terminal fact.
+    pub(crate) fn commit_tool_effect_with_host_process(
+        &self,
+        request: &crate::RuntimeToolExecutionRequest,
+        effect: &ToolEffectDescriptor,
+        outcome: &crate::RuntimeToolExecutionOutcome,
+    ) -> Result<(), ExecutionCommitError> {
+        Self::validate_host_process_outcome(outcome)?;
+        local_network::validate_outcome(request, effect, outcome)?;
+        self.commit_tool_effect_trusted(
+            request,
+            effect,
+            outcome,
+            ProcessTerminalAuthority::HostProcess,
+        )
+    }
+
+    /// The honest shape of a Runtime-minted host process terminal.
+    fn validate_host_process_outcome(
+        outcome: &crate::RuntimeToolExecutionOutcome,
+    ) -> Result<(), ExecutionCommitError> {
+        let facts = outcome
+            .observed_evidence
+            .iter()
+            .filter_map(|observed| match &observed.target {
+                harness_contract::context::EvidenceTargetIdentity::ToolExecution { execution } => {
+                    Some(execution)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if facts.len() != 1 {
+            return Err(ExecutionCommitError::InvalidCommand(
+                "host process receipt requires exactly one host process terminal fact".into(),
+            ));
+        }
+        crate::host_process_closure::validate_host_process_fact(facts[0])
+            .map_err(ExecutionCommitError::InvalidCommand)
     }
 
     fn reject_public_process_facts(
         outcome: &crate::RuntimeToolExecutionOutcome,
+        allow_host_process: bool,
     ) -> Result<(), ExecutionCommitError> {
         if outcome.observed_evidence.iter().any(|observed| {
             matches!(
@@ -4713,6 +4812,9 @@ impl ExecutionCommitService {
                 harness_contract::context::EvidenceTargetIdentity::ToolExecution { .. }
             )
         }) {
+            if allow_host_process {
+                return Self::validate_host_process_outcome(outcome);
+            }
             return Err(ExecutionCommitError::InvalidCommand(
                 "public ToolExecution observations are not an execution capability".into(),
             ));
@@ -4725,7 +4827,7 @@ impl ExecutionCommitService {
         request: &crate::RuntimeToolExecutionRequest,
         effect: &ToolEffectDescriptor,
         outcome: &crate::RuntimeToolExecutionOutcome,
-        closure: Option<&serde_json::Value>,
+        authority: ProcessTerminalAuthority<'_>,
     ) -> Result<(), ExecutionCommitError> {
         if effect.effect_kind == ToolEffectKind::Read {
             return Ok(());
@@ -4737,7 +4839,7 @@ impl ExecutionCommitService {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            match self.commit_tool_effect_once(request, effect, outcome, closure) {
+            match self.commit_tool_effect_once(request, effect, outcome, authority) {
                 Ok(()) => return Ok(()),
                 Err(ExecutionCommitError::EventStore(RuntimeEventStoreError::StaleRevision {
                     ..
@@ -4752,7 +4854,7 @@ impl ExecutionCommitService {
         request: &crate::RuntimeToolExecutionRequest,
         effect: &ToolEffectDescriptor,
         outcome: &crate::RuntimeToolExecutionOutcome,
-        closure: Option<&serde_json::Value>,
+        authority: ProcessTerminalAuthority<'_>,
     ) -> Result<(), ExecutionCommitError> {
         if effect.effect_kind == ToolEffectKind::Read {
             return Ok(());
@@ -4817,15 +4919,26 @@ impl ExecutionCommitService {
                 harness_contract::context::EvidenceTargetIdentity::ToolExecution { .. }
             )
         }) {
-            if closure.is_none() {
-                return Err(ExecutionCommitError::InvalidCommand(
-                    "process terminal requires original owner closure publication".into(),
-                ));
-            }
-            crate::tool_host::check_bounded_process_commit_authority(request)
-                .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))?;
-            for source in self.bounded_process_sources(request, effect, &intent)? {
-                expected_streams.insert(source.stream_id, source.expected_revision);
+            match authority {
+                ProcessTerminalAuthority::BoundedProcess(_) => {
+                    crate::tool_host::check_bounded_process_commit_authority(request)
+                        .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))?;
+                    for source in self.bounded_process_sources(request, effect, &intent)? {
+                        expected_streams.insert(source.stream_id, source.expected_revision);
+                    }
+                }
+                ProcessTerminalAuthority::HostProcess => {
+                    // The Runtime kernel minted this fact itself from the
+                    // trusted host executor's quiescence report. It carries no
+                    // private sandbox capability, so it needs no private
+                    // closure publication and no live process authority.
+                    Self::validate_host_process_outcome(outcome)?;
+                }
+                ProcessTerminalAuthority::Absent => {
+                    return Err(ExecutionCommitError::InvalidCommand(
+                        "process terminal requires original owner closure publication".into(),
+                    ));
+                }
             }
         }
         expected_streams.insert(
@@ -4856,14 +4969,14 @@ impl ExecutionCommitService {
                     ),
                     "descriptor_hash": effect.descriptor_hash,
                     "outcome": bounded_tool_effect_outcome(outcome),
-                    "process_admission_ref":outcome.observed_evidence.iter().any(|observed| matches!(observed.target, harness_contract::context::EvidenceTargetIdentity::ToolExecution { .. })).then(|| format!("{}:process-admission", request.idempotency_key)),
+                    "process_admission_ref":matches!(authority, ProcessTerminalAuthority::BoundedProcess(_)).then(|| format!("{}:process-admission", request.idempotency_key)),
                     "resolved_effect_scope":intent.payload["resolved_effect_scope"],
                 }))?,
             },
             idempotency_key: Some(format!("{}:receipt", request.idempotency_key)),
             schema_version: 1,
         }];
-        if let Some(closure) = closure {
+        if let ProcessTerminalAuthority::BoundedProcess(closure) = authority {
             events[0].event.payload["process_closure"] = closure.clone();
         }
         if let Some(mut agent_receipt) =
@@ -4877,7 +4990,7 @@ impl ExecutionCommitService {
                 intent.payload["root_effect_context"].clone();
             agent_receipt.event.payload["process_admission_ref"] =
                 events[0].event.payload["process_admission_ref"].clone();
-            if let Some(closure) = closure {
+            if let ProcessTerminalAuthority::BoundedProcess(closure) = authority {
                 agent_receipt.event.payload["process_closure"] = closure.clone();
             }
             agent_receipt.event.payload["root_effect_owner"] =
@@ -4903,7 +5016,7 @@ impl ExecutionCommitService {
             });
         if let Err(error) = appended {
             if self.completed_tool_effect(request, effect)?.is_some() {
-                return self.commit_tool_effect_once(request, effect, outcome, closure);
+                return self.commit_tool_effect_once(request, effect, outcome, authority);
             }
             return Err(error.into());
         }
@@ -7628,12 +7741,18 @@ impl ExecutionCommitService {
                     closure,
                     ..
                 } => {
+                    // Physical closure is *quiescence*: the process tree this
+                    // node owns was reaped and nothing of it is still alive.
+                    // It is not a security posture. The hardening, network
+                    // isolation and status-channel flags stay in the evidence
+                    // for audit, but they are enforced where the evidence is
+                    // produced (an unhardened process never reaches a
+                    // `Settled` terminal in the first place), so requiring
+                    // them here would only forbid honest host-shell work
+                    // from ever closing.
                     exit_code.is_some() != signal.is_some()
                         && closure.all_children_reaped
                         && closure.init_reaped
-                        && closure.kernel_hardening_applied
-                        && closure.network_disabled
-                        && closure.status_channel_protected
                 }
                 _ => false,
             }
@@ -8816,7 +8935,10 @@ impl ExecutionCommitService {
         Ok(true)
     }
 
-    #[cfg(test)]
+    /// Bounded, one-shot snapshot of why a physical closure could not be
+    /// proven. It is production-reachable on purpose: an unproven closure
+    /// must name its missing proof in the log of the run that failed, not
+    /// only inside the test harness.
     pub(crate) fn physical_closure_diagnostic(
         &self,
         graph: &ExecutionGraph,
@@ -11189,15 +11311,15 @@ mod recovery_physical_450_tests {
         assert!(ExecutionCommitService::lease_recovery_process_closed(
             &original, &effect
         ));
+        // Physical closure is quiescence. The hardening / network isolation /
+        // status-channel flags are audit facts that the evidence producer
+        // already enforces, so they are deliberately *not* closure criteria.
         for fault in [
             "unknown",
             "missing_exit",
             "both_exit",
             "children",
             "init",
-            "hardening",
-            "network",
-            "status_channel",
             "missing_fact",
         ] {
             let mut altered = original.clone();
@@ -11233,10 +11355,7 @@ mod recovery_physical_450_tests {
                             *signal = Some(9);
                         }
                         "children" => closure.all_children_reaped = false,
-                        "init" => closure.init_reaped = false,
-                        "hardening" => closure.kernel_hardening_applied = false,
-                        "network" => closure.network_disabled = false,
-                        _ => closure.status_channel_protected = false,
+                        _ => closure.init_reaped = false,
                     }
                 }
             }
@@ -11245,5 +11364,296 @@ mod recovery_physical_450_tests {
                 "{fault}"
             );
         }
+    }
+}
+
+/// F2: a host-shell process effect closes physical closure on quiescence
+/// alone, and stays open when the quiescence fact is missing.
+#[cfg(test)]
+mod host_process_quiescence_tests {
+    use super::*;
+    use crate::host_process_closure::{
+        build_host_process_fact, host_process_observation, read_host_process_report,
+        HOST_PROCESS_BACKEND,
+    };
+    use harness_contract::context::{
+        ArtifactRef, EvidenceTargetIdentity, ToolExecutionStopReason, ToolExecutionTerminal,
+    };
+
+    fn bash_effect() -> ToolEffectDescriptor {
+        let effect = tools::ToolHost::builtin("r1-890-host-process", std::env::temp_dir())
+            .pin_snapshot()
+            .describe_effect("bash", &json!({"command": "printf r1-890"}));
+        assert!(effect.spawns_process && !effect.uses_network);
+        effect
+    }
+
+    fn request() -> crate::RuntimeToolExecutionRequest {
+        crate::RuntimeToolExecutionRequest {
+            compiled_invocation: None,
+            step_binding: None,
+            governed_plan_id: "plan".to_string(),
+            governed_plan_revision: 1,
+            observation_wave_sequence: 7,
+            idempotency_key: "r1-890-host-process-call".to_string(),
+            tool_use_id: "r1-890-host-process-call".to_string(),
+            tool_name: "bash".to_string(),
+            input: json!({"command": "printf r1-890"}).to_string(),
+            category: crate::ToolSafetyCategory::Destructive,
+            authorization: None,
+            session_id: Some("r1-890-session".to_string()),
+            sandbox_posture: harness_contract::policy::SandboxPosture::HostFullAccess,
+            policy_revision: 1,
+            authorized_scopes: Vec::new(),
+            memory_context: None,
+            reality_context: None,
+            model_lease: None,
+            parent_execution: None,
+            parent_execution_attempt: None,
+            execution_decision: None,
+            evaluation_isolated: false,
+            managed_invocation: None,
+            tool_progress: crate::ToolProgressSink::default(),
+        }
+    }
+
+    fn artifact(selector: &str) -> ArtifactRef {
+        ArtifactRef::durable(
+            selector,
+            format!("sha256:{}", "a".repeat(64)),
+            12,
+            "application/json",
+            "session:r1-890-session",
+        )
+    }
+
+    /// A host executor result that reports a fully reaped foreground command.
+    fn bash_output(closure: serde_json::Value) -> String {
+        json!({
+            "stdout": "r1-890",
+            "stderr": "",
+            "returnTruncated": false,
+            "processClosure": closure,
+        })
+        .to_string()
+    }
+
+    fn host_outcome(closure: serde_json::Value) -> crate::RuntimeToolExecutionOutcome {
+        host_outcome_from(bash_output(closure))
+    }
+
+    /// A host executor result that reports no closure slot at all.
+    fn host_outcome_without_closure() -> crate::RuntimeToolExecutionOutcome {
+        host_outcome_from(
+            json!({"stdout": "r1-890", "stderr": "", "returnTruncated": false}).to_string(),
+        )
+    }
+
+    fn host_outcome_from(output: String) -> crate::RuntimeToolExecutionOutcome {
+        let request = request();
+        let effect = bash_effect();
+        let report = read_host_process_report(Some(&output));
+        let fact = build_host_process_fact(
+            &request,
+            &effect,
+            &report,
+            artifact("artifact://r1-890-body"),
+            artifact("artifact://r1-890-source"),
+        )
+        .expect("host process fact");
+        crate::RuntimeToolExecutionOutcome {
+            tool_use_id: request.tool_use_id.clone(),
+            tool_name: request.tool_name.clone(),
+            status: crate::RuntimeToolExecutionStatus::Executed,
+            category: request.category,
+            output: Some(output),
+            error: None,
+            evidence_ref: "tool-effect:r1-890-host-process-call".to_string(),
+            observed_evidence: vec![host_process_observation(&request, fact)],
+        }
+    }
+
+    #[test]
+    fn r1_890_host_process_quiescence_closes_physical_closure_without_hardening() {
+        let effect = bash_effect();
+        let outcome = host_outcome(json!({
+            "exitCode": 0, "signal": null, "initReaped": true, "allChildrenReaped": true,
+        }));
+        let EvidenceTargetIdentity::ToolExecution { execution } = &outcome.observed_evidence[0].target
+        else {
+            panic!("host process evidence missing")
+        };
+        assert!(matches!(
+            &execution.terminal,
+            ToolExecutionTerminal::Settled {
+                exit_code: Some(0),
+                signal: None,
+                stop_reason: ToolExecutionStopReason::CommandExit,
+                closure,
+            } if closure.backend == HOST_PROCESS_BACKEND
+                && closure.all_children_reaped
+                && closure.init_reaped
+                // The host shell proves no isolation of any kind.
+                && !closure.kernel_hardening_applied
+                && !closure.network_disabled
+                && !closure.project_read_only
+                && !closure.status_channel_protected
+        ));
+        assert!(execution.capture_complete);
+        assert!(
+            ExecutionCommitService::lease_recovery_process_closed(&outcome, &effect),
+            "a reaped host shell with quiescence facts must close"
+        );
+        assert!(crate::execution_projection::settlement::process_closed(
+            &outcome, &effect
+        ));
+        // A non-zero exit is still quiescent: the process tree is still gone.
+        let failed = host_outcome(json!({
+            "exitCode": 7, "signal": null, "initReaped": true, "allChildrenReaped": true,
+        }));
+        assert!(ExecutionCommitService::lease_recovery_process_closed(
+            &failed, &effect
+        ));
+        // A signal-terminated command is quiescent as well.
+        let signalled = host_outcome(json!({
+            "exitCode": null, "signal": 9, "initReaped": true, "allChildrenReaped": true,
+        }));
+        assert!(matches!(
+            &signalled.observed_evidence[0].target,
+            EvidenceTargetIdentity::ToolExecution { execution }
+                if matches!(&execution.terminal, ToolExecutionTerminal::Settled {
+                    exit_code: None,
+                    signal: Some(9),
+                    ..
+                })
+        ));
+        assert!(ExecutionCommitService::lease_recovery_process_closed(
+            &signalled, &effect
+        ));
+    }
+
+    #[test]
+    fn r1_890_host_process_without_quiescence_facts_never_closes() {
+        let effect = bash_effect();
+        for (case, outcome) in [
+            ("absent", host_outcome_without_closure()),
+            ("null", host_outcome(serde_json::Value::Null)),
+        ] {
+            let EvidenceTargetIdentity::ToolExecution { execution } =
+                &outcome.observed_evidence[0].target
+            else {
+                panic!("host process evidence missing")
+            };
+            assert!(
+                matches!(&execution.terminal, ToolExecutionTerminal::Unknown { reason_code } if !reason_code.is_empty()),
+                "{case}"
+            );
+            assert!(
+                !ExecutionCommitService::lease_recovery_process_closed(&outcome, &effect),
+                "{case}"
+            );
+            assert!(
+                !crate::execution_projection::settlement::process_closed(&outcome, &effect),
+                "{case}"
+            );
+        }
+        // A report that cannot prove quiescence stays open.
+        for (case, closure) in [
+            (
+                "children_not_reaped",
+                json!({"exitCode": 0, "signal": null, "initReaped": true, "allChildrenReaped": false}),
+            ),
+            (
+                "init_not_reaped",
+                json!({"exitCode": 0, "signal": null, "initReaped": false, "allChildrenReaped": true}),
+            ),
+            (
+                "ambiguous_exit",
+                json!({"exitCode": 0, "signal": 9, "initReaped": true, "allChildrenReaped": true}),
+            ),
+            (
+                "no_exit_at_all",
+                json!({"exitCode": null, "signal": null, "initReaped": true, "allChildrenReaped": true}),
+            ),
+        ] {
+            let outcome = host_outcome(closure);
+            assert!(
+                !ExecutionCommitService::lease_recovery_process_closed(&outcome, &effect),
+                "{case}"
+            );
+            assert!(
+                !crate::execution_projection::settlement::process_closed(&outcome, &effect),
+                "{case}"
+            );
+        }
+        // No process terminal at all is not a closure either.
+        let mut missing = host_outcome(json!({
+            "exitCode": 0, "signal": null, "initReaped": true, "allChildrenReaped": true,
+        }));
+        missing.observed_evidence.clear();
+        assert!(!ExecutionCommitService::lease_recovery_process_closed(
+            &missing, &effect
+        ));
+        assert!(!crate::execution_projection::settlement::process_closed(
+            &missing, &effect
+        ));
+    }
+
+    #[test]
+    fn r1_890_host_process_security_flags_are_audit_only_for_closure() {
+        let effect = bash_effect();
+        let mut outcome = host_outcome(json!({
+            "exitCode": 0, "signal": null, "initReaped": true, "allChildrenReaped": true,
+        }));
+        for observed in &mut outcome.observed_evidence {
+            let EvidenceTargetIdentity::ToolExecution { execution } = &mut observed.target else {
+                panic!("host process evidence missing")
+            };
+            let ToolExecutionTerminal::Settled { closure, .. } = &mut execution.terminal else {
+                panic!("host process terminal missing")
+            };
+            // The audit flags may change freely: they are enforced where the
+            // evidence is produced, never by the closure criterion.
+            closure.kernel_hardening_applied = true;
+            closure.network_disabled = true;
+            closure.project_read_only = true;
+            closure.status_channel_protected = true;
+        }
+        assert!(ExecutionCommitService::lease_recovery_process_closed(
+            &outcome, &effect
+        ));
+        assert!(crate::execution_projection::settlement::process_closed(
+            &outcome, &effect
+        ));
+    }
+
+    #[test]
+    fn r1_890_host_process_fact_may_not_claim_the_private_bounded_capability() {
+        let effect = bash_effect();
+        let request = request();
+        let report = read_host_process_report(Some(&bash_output(json!({
+            "exitCode": 0, "signal": null, "initReaped": true, "allChildrenReaped": true,
+        }))));
+        let fact = build_host_process_fact(
+            &request,
+            &effect,
+            &report,
+            artifact("artifact://r1-890-body"),
+            artifact("artifact://r1-890-source"),
+        )
+        .expect("host process fact");
+        let mut forged = fact.clone();
+        let ToolExecutionTerminal::Settled { closure, .. } = &mut forged.terminal else {
+            panic!("host process terminal missing")
+        };
+        closure.kernel_hardening_applied = true;
+        assert!(crate::host_process_closure::validate_host_process_fact(&forged).is_err());
+        let mut foreign = fact;
+        let ToolExecutionTerminal::Settled { closure, .. } = &mut foreign.terminal else {
+            panic!("host process terminal missing")
+        };
+        closure.backend = "bubblewrap+landlock+seccomp+pid1".into();
+        closure.namespace_inode = 7;
+        assert!(crate::host_process_closure::validate_host_process_fact(&foreign).is_err());
     }
 }

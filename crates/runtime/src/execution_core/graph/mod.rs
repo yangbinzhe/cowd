@@ -24,7 +24,7 @@ pub mod resources;
 /// retirement can share one bound.
 pub(crate) const PHYSICAL_CLOSURE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
-pub(crate) use commit_service::{process_closure_document, TerminalScopeReader};
+pub(crate) use commit_service::{process_closure_document, receipt_replay_contract, TerminalScopeReader};
 pub use commit_service::{
     DurableAgentToolReceipt, ExecutionCommitError, ExecutionCommitReceipt, ExecutionCommitService,
     ExecutionEffectState, ProcessClosurePublicationAuthority, ToolEffectState,

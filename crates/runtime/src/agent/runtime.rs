@@ -141,6 +141,19 @@ struct RetainedAgentRun {
     join: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     pending_exit: Mutex<Option<RunExitFact>>,
     exit_committed: AtomicBool,
+    /// The exit phase of this run, decided exactly once. The run owner and a
+    /// cancellation path both publish `agent.local_exit` for the same run, so
+    /// they must not disagree about the phase: the first observer that knows
+    /// the physical exit decides it and every later publisher reuses it.
+    exit_phase: Mutex<Option<LocalRunPhase>>,
+    /// The exit evidence the run owner has produced so far. A cancellation
+    /// path mirrors it here so it can commit the same authenticated exit fact
+    /// when the run owner can no longer reach its own publication point.
+    exit_evidence: Mutex<Option<RunExitFact>>,
+    /// The single-writer claim of the authenticated exit publication. Exactly
+    /// one publisher may write `agent.local_exit` for this run; every later
+    /// attempt observes the committed fact instead of writing a second one.
+    exit_publisher_claimed: AtomicBool,
 }
 
 impl RetainedAgentRun {
@@ -157,6 +170,54 @@ impl RetainedAgentRun {
     fn locally_settled(&self) -> bool {
         self.result.borrow().is_some() && self.physically_exited()
     }
+
+    /// Claim the single authenticated exit publication of this run.
+    fn claim_exit_publication(&self) -> bool {
+        self.exit_publisher_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn exit_publication_claimed(&self) -> bool {
+        self.exit_publisher_claimed.load(Ordering::Acquire)
+    }
+
+    /// Decide the exit phase of this run exactly once.
+    fn decide_exit_phase(&self, proposed: LocalRunPhase) -> LocalRunPhase {
+        let mut decided = self
+            .exit_phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match decided.as_ref() {
+            Some(phase) => phase.clone(),
+            None => {
+                *decided = Some(proposed.clone());
+                proposed
+            }
+        }
+    }
+
+    fn mirror_exit_evidence(&self, evidence: &RunExitFact) {
+        *self
+            .exit_evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(evidence.clone());
+    }
+
+    fn mirrored_exit_evidence(&self) -> Option<RunExitFact> {
+        self.exit_evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Whether the run owner task ended, published or not. A run owner that
+    /// ended without publishing its exit can no longer commit one, so the
+    /// cancellation path has to do it.
+    async fn owner_ended(&self) -> bool {
+        let mut join = self.join.lock().await;
+        join.as_ref().is_some_and(|handle| handle.is_finished())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,6 +228,11 @@ enum LocalRunPhase {
     BackendPending,
     LocalReturned,
     ProcessReaped,
+    /// The run was cancelled and its physical exit is proven: the owned
+    /// process group is empty, so the cancelled worker cannot produce another
+    /// effect. A cancellation may publish this phase only when that exit is
+    /// observed, never on the strength of the cancellation request alone.
+    Cancelled,
     Unknown,
 }
 
@@ -235,11 +301,12 @@ impl RunExitFact {
     fn positive(&self) -> bool {
         matches!(self.phase, LocalRunPhase::NotStarted)
             || (self.backend_packet_sha256.is_some()
-                && matches!(
-                    (&self.backend, &self.phase),
-                    (AgentBackendKind::InProcess, LocalRunPhase::LocalReturned)
-                        | (AgentBackendKind::ProcessJsonl, LocalRunPhase::ProcessReaped)
-                ))
+                && (matches!(self.phase, LocalRunPhase::Cancelled)
+                    || matches!(
+                        (&self.backend, &self.phase),
+                        (AgentBackendKind::InProcess, LocalRunPhase::LocalReturned)
+                            | (AgentBackendKind::ProcessJsonl, LocalRunPhase::ProcessReaped)
+                    )))
     }
 }
 
@@ -1271,6 +1338,9 @@ impl AgentRuntime {
             join: tokio::sync::Mutex::new(None),
             pending_exit: Mutex::new(None),
             exit_committed: AtomicBool::new(false),
+            exit_phase: Mutex::new(None),
+            exit_evidence: Mutex::new(None),
+            exit_publisher_claimed: AtomicBool::new(false),
         });
         let evidence = RunExitFact {
             schema_version: 1,
@@ -1502,6 +1572,23 @@ impl AgentRuntime {
         }
     }
 
+    /// Whether this exact run has been cancelled.
+    ///
+    /// The pending set carries a cancellation that arrived before the backend
+    /// was admitted; the durable snapshot is the committed truth of a
+    /// cancellation the Runtime already accepted. This observation never
+    /// consumes the pending intent, so the run owner and a cancellation path
+    /// see the same answer.
+    fn cancellation_observed(&self, packet: &AgentTaskPacket) -> bool {
+        self.pending_cancellations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&run_cancellation_key(packet))
+            || self
+                .get(packet.agent_id())
+                .is_some_and(|snapshot| snapshot.status == AgentStatus::Cancelled)
+    }
+
     fn persist_run_fact(&self, evidence: &RunExitFact, kind: &str) -> Result<(), String> {
         #[cfg(test)]
         if kind == "agent.backend_admitted"
@@ -1621,6 +1708,27 @@ impl AgentRuntime {
         }
     }
 
+    /// Publish the authenticated local exit of a run exactly once.
+    ///
+    /// `agent.local_exit` is written through the same authenticated channel,
+    /// the same idempotency key and the same stream as every other run fact.
+    /// The single-writer claim keeps a repeated cancellation from producing a
+    /// second exit fact with a different phase.
+    async fn publish_run_exit(&self, retained: &RetainedAgentRun, evidence: &RunExitFact) {
+        if !retained.claim_exit_publication() {
+            // Another publisher already owns this run's authenticated exit.
+            // Its fact carries the same identity and the same decided phase.
+            return;
+        }
+        *retained
+            .pending_exit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(evidence.clone());
+        self.persist_run_fact_until_durable(evidence, "agent.local_exit")
+            .await;
+        retained.exit_committed.store(true, Ordering::Release);
+    }
+
     async fn execute_task_owned(
         &self,
         packet: AgentTaskPacket,
@@ -1639,23 +1747,22 @@ impl AgentRuntime {
         self.persist_run_fact_until_durable(&evidence, "agent.run_admitted")
             .await;
         evidence.phase = LocalRunPhase::NotStarted;
-        let result =
-            std::panic::AssertUnwindSafe(self.execute_task_locked(packet.clone(), &mut evidence))
-                .catch_unwind()
-                .await
-                .unwrap_or_else(|_| {
-                    Err("Agent backend owner panicked; physical exit unconfirmed".into())
-                });
+        // Mirror the evidence so a cancellation path can commit the same
+        // authenticated exit fact when this owner can no longer reach its own
+        // publication point.
+        retained.mirror_exit_evidence(&evidence);
+        let result = std::panic::AssertUnwindSafe(self.execute_task_locked(
+            packet.clone(),
+            &mut evidence,
+            retained,
+        ))
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| Err("Agent backend owner panicked; physical exit unconfirmed".into()));
         if evidence.phase == LocalRunPhase::BackendPending {
             evidence.phase = LocalRunPhase::Unknown;
         }
-        *retained
-            .pending_exit
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(evidence.clone());
-        self.persist_run_fact_until_durable(&evidence, "agent.local_exit")
-            .await;
-        retained.exit_committed.store(true, Ordering::Release);
+        self.publish_run_exit(retained, &evidence).await;
         self.pending_cancellations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1719,6 +1826,7 @@ impl AgentRuntime {
         &self,
         packet: AgentTaskPacket,
         exit_evidence: &mut RunExitFact,
+        retained: &RetainedAgentRun,
     ) -> Result<AgentReturnPacket, String> {
         let original_packet = self.original_run_packet(&packet)?;
         let packet = self.attach_predecessor_context(packet).await?;
@@ -1991,6 +2099,10 @@ impl AgentRuntime {
             self.persist_run_fact_until_durable(exit_evidence, "agent.backend_admitted")
                 .await;
             exit_evidence.phase = LocalRunPhase::Unknown;
+            // The backend is admitted: from here the exit evidence carries the
+            // exact backend identity and envelope a cancellation path needs to
+            // commit the same authenticated exit fact.
+            retained.mirror_exit_evidence(exit_evidence);
         }
         let cancelled_before_start = self
             .pending_cancellations
@@ -2023,22 +2135,39 @@ impl AgentRuntime {
             ),
         }
         };
+        // A cancelled run publishes a cancelled exit phase. The physical exit
+        // of a cancelled worker is proven by the reaped process group, not by
+        // the cancellation request itself; an unproven exit stays `Unknown`
+        // so the closure witness keeps failing closed.
+        let cancelled = self.cancellation_observed(&packet);
         if !cancelled_before_start && exit_evidence.backend_packet_sha256.is_some() {
             if backend_kind == AgentBackendKind::InProcess {
-                exit_evidence.phase = LocalRunPhase::LocalReturned;
+                exit_evidence.phase = retained.decide_exit_phase(if cancelled {
+                    LocalRunPhase::Cancelled
+                } else {
+                    LocalRunPhase::LocalReturned
+                });
             } else {
+                let mut proposed = LocalRunPhase::Unknown;
                 if let Some(witness) =
                     process_exit_owner.and_then(|adapter| adapter.take_local_exit_evidence(&packet))
                 {
                     if witness.matches_packet(&packet) {
                         if witness.is_reaped() {
-                            exit_evidence.phase = LocalRunPhase::ProcessReaped;
+                            proposed = if cancelled {
+                                LocalRunPhase::Cancelled
+                            } else {
+                                LocalRunPhase::ProcessReaped
+                            };
                         } else if witness.is_not_started() {
-                            exit_evidence.phase = LocalRunPhase::NotStarted;
+                            proposed = LocalRunPhase::NotStarted;
                         }
                     }
                 }
+                exit_evidence.phase = retained.decide_exit_phase(proposed);
             }
+        } else {
+            exit_evidence.phase = retained.decide_exit_phase(exit_evidence.phase.clone());
         }
         drop(claim_heartbeat);
         if !observation_authority {
@@ -2674,6 +2803,14 @@ impl AgentRuntime {
             AgentCommand::SendInput | AgentCommand::Interrupt => updated.status,
         };
         updated.updated_at_ms = now_ms();
+        if matches!(
+            request.command,
+            AgentCommand::Cancel | AgentCommand::Shutdown
+        ) {
+            // A cancellation must leave one authenticated exit fact even when
+            // the run owner can no longer reach its own publication point.
+            self.commit_cancelled_exit(&updated).await;
+        }
         let receipt = AgentCommandReceipt {
             command_id: request.command_id,
             agent_id: updated.agent_id.clone(),
@@ -2696,6 +2833,101 @@ impl AgentRuntime {
             message: error,
             ..receipt
         })
+    }
+
+    /// Commit the authenticated exit fact of a cancelled run.
+    ///
+    /// The run owner publishes `agent.local_exit` when it returns from the
+    /// backend. A cancelled worker can leave that owner waiting on a physical
+    /// teardown that never finishes, and the lifecycle then never closes: the
+    /// run is reported as "unclosed" instead of "cancelled". When the owner is
+    /// silent and the owned process group is empty, the cancellation itself
+    /// commits the same authenticated exit fact through the same channel, the
+    /// same idempotency key and the same stream.
+    ///
+    /// An owned group that is not empty proves nothing: the exit stays
+    /// unproven and this path publishes the honest unknown instead, so the
+    /// closure witness keeps failing closed.
+    async fn commit_cancelled_exit(&self, snapshot: &AgentRunSnapshot) {
+        let Some(retained) = self.retained_run_for(snapshot) else {
+            return;
+        };
+        if retained.exit_publication_claimed() {
+            return;
+        }
+        let adapter = self
+            .process_jsonl_adapter
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let deadline = tokio::time::Instant::now() + CANCELLED_EXIT_BOUND;
+        loop {
+            // The run owner owns the exit fact whenever it can publish it.
+            if retained.exit_publication_claimed() {
+                return;
+            }
+            match adapter
+                .as_ref()
+                .and_then(|adapter| adapter.owned_process_group_is_empty(&snapshot.run_id))
+            {
+                // The owned process group is empty: the cancelled worker can
+                // no longer produce an effect, so its exit is proven.
+                Some(true) => {
+                    self.publish_cancelled_exit(&retained, LocalRunPhase::Cancelled)
+                        .await;
+                    return;
+                }
+                Some(false) => {}
+                None => {}
+            }
+            // The run owner ended without publishing its exit: it can no
+            // longer commit one, so this cancellation does it. The physical
+            // exit is unproven, so the fact stays the honest unknown.
+            if retained.owner_ended().await {
+                self.publish_cancelled_exit(&retained, LocalRunPhase::Unknown)
+                    .await;
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                // The run owner is still alive and may still prove the exit.
+                // It stays the single authority for this fact.
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Publish the cancelled exit of a run through the authenticated channel.
+    async fn publish_cancelled_exit(&self, retained: &RetainedAgentRun, phase: LocalRunPhase) {
+        let Some(mut evidence) = retained.mirrored_exit_evidence() else {
+            // The run never reached an authenticated admission: the run owner
+            // owns the "never started" exit fact.
+            return;
+        };
+        evidence.phase = retained.decide_exit_phase(phase);
+        self.publish_run_exit(retained, &evidence).await;
+    }
+
+    /// The retained run that owns this exact run identity, if any.
+    fn retained_run_for(&self, snapshot: &AgentRunSnapshot) -> Option<Arc<RetainedAgentRun>> {
+        let key = (
+            snapshot.run_id.clone(),
+            snapshot.graph_id.clone(),
+            snapshot.node_id.clone(),
+            snapshot.attempt,
+        );
+        self.records
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&snapshot.agent_id)
+            .and_then(|record| {
+                record
+                    .retained
+                    .iter()
+                    .chain(record.retiring.iter())
+                    .find(|run| run.run_key == key)
+                    .cloned()
+            })
     }
 
     fn reject_command(
@@ -3349,6 +3581,10 @@ impl AgentTaskBackendResolver for AgentRuntimeResolver {
     }
 }
 
+/// The bounded time a cancellation waits for the run owner to publish its
+/// own exit fact before it commits the cancelled exit itself.
+const CANCELLED_EXIT_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn agent_stream_id(agent_id: &str) -> String {
     format!("agent:{agent_id}")
 }
@@ -3716,6 +3952,7 @@ mod tests {
                 LocalRunPhase::BackendPending,
                 LocalRunPhase::LocalReturned,
                 LocalRunPhase::ProcessReaped,
+                LocalRunPhase::Cancelled,
                 LocalRunPhase::NotStarted,
                 LocalRunPhase::Unknown,
             ] {
@@ -3734,10 +3971,15 @@ mod tests {
                         phase: phase.clone(),
                         process_envelope: None,
                     };
+                    // Without a process envelope only an in-process run has
+                    // no direct effects, so only it closes on its own exit.
                     let expected = phase == LocalRunPhase::NotStarted
-                        || (backend == AgentBackendKind::InProcess
-                            && phase == LocalRunPhase::LocalReturned
-                            && backend_digest.is_some());
+                        || (backend_digest.is_some()
+                            && backend == AgentBackendKind::InProcess
+                            && matches!(
+                                phase,
+                                LocalRunPhase::LocalReturned | LocalRunPhase::Cancelled
+                            ));
                     let lifecycle = AuthenticatedRunLifecycle {
                         exit: Some(fact.clone()),
                         backend: Some(fact),
@@ -3847,6 +4089,172 @@ mod tests {
         });
         runtime.register_observation_authority_backend(backend.clone());
         (runtime, backend)
+    }
+
+    /// T1: a normally completed Process run keeps its positive local exit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completed_process_run_keeps_a_positive_local_exit() {
+        let (_temporary, _services, adapter, packet) =
+            crate::agent_process_jsonl_adapter::tests::driver_exit_fixture();
+        let adapter = Arc::new(adapter);
+        let runtime = Arc::new(AgentRuntime::new(
+            Arc::new(RuntimeEventStore::for_test()),
+            configured_registry(),
+        ));
+        runtime.register_runtime_process_jsonl_backend(adapter.clone());
+        let owner = runtime.clone();
+        let supplied = packet.clone();
+        let caller = tokio::spawn(async move { owner.execute_task(supplied).await });
+        let returned = tokio::time::timeout(std::time::Duration::from_secs(120), caller)
+            .await
+            .expect("completed run must return")
+            .unwrap()
+            .unwrap();
+        assert_eq!(returned.status, AgentTerminalStatus::Completed);
+        let (evidence, _) = confirmed_run_exit(&runtime.event_store, &packet)
+            .unwrap()
+            .expect("a completed run keeps its authenticated local exit");
+        assert!(evidence.fact.positive());
+        assert_eq!(evidence.fact.phase, LocalRunPhase::ProcessReaped);
+    }
+
+    /// T2 and T4: a cancelled Process run whose owner can no longer publish
+    /// still leaves exactly one authenticated cancelled local exit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_process_run_publishes_one_cancelled_local_exit() {
+        let (_temporary, _services, adapter, packet) =
+            crate::agent_process_jsonl_adapter::tests::driver_cancel_fixture();
+        let adapter = Arc::new(adapter);
+        let runtime = Arc::new(AgentRuntime::new(
+            Arc::new(RuntimeEventStore::for_test()),
+            configured_registry(),
+        ));
+        runtime.register_runtime_process_jsonl_backend(adapter.clone());
+        let owner = runtime.clone();
+        let supplied = packet.clone();
+        let caller = tokio::spawn(async move { owner.execute_task(supplied).await });
+        // The worker owns a live process group while it runs.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while adapter.owned_process_group_is_empty(&packet.run_id()) != Some(false) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the process child never owned a live process group"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // T4: a repeated cancellation must not produce a second exit fact.
+        for _ in 0..2 {
+            AgentTaskBackend::cancel(runtime.as_ref(), &packet)
+                .await
+                .expect("cancellation must be accepted");
+        }
+        let stream = agent_stream_id(packet.agent_id());
+        let exits = runtime
+            .event_store
+            .list_stream(&stream)
+            .unwrap()
+            .into_iter()
+            .filter(|event| {
+                event.idempotency_key.as_deref()
+                    == Some(format!("agent.local_exit:{}", packet.run_id()).as_str())
+            })
+            .count();
+        assert_eq!(exits, 1, "a cancelled run keeps exactly one local exit");
+        let (evidence, _) = confirmed_run_exit(&runtime.event_store, &packet)
+            .unwrap()
+            .expect("a cancelled run keeps its authenticated local exit");
+        assert_eq!(evidence.fact.phase, LocalRunPhase::Cancelled);
+        assert!(evidence.fact.positive());
+        let lifecycle = authenticated_run_lifecycle(&runtime.event_store, &packet).unwrap();
+        assert!(
+            lifecycle.closed_for_governed_effects(),
+            "a proven cancelled exit closes the governed effects of this run"
+        );
+        // The owner of this run cannot reach its own publication point; the
+        // cancellation committed the fact instead.
+        caller.abort();
+        let _ = caller.await;
+    }
+
+    /// T3: the owned process group is the physical exit proof, and an
+    /// unproven exit never claims that the worker is gone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owned_process_group_observation_refuses_an_unproven_exit() {
+        let (_temporary, _services, adapter, packet) =
+            crate::agent_process_jsonl_adapter::tests::driver_cancel_fixture();
+        let adapter = Arc::new(adapter);
+        assert_eq!(
+            adapter.owned_process_group_is_empty("run:unknown"),
+            None,
+            "an unknown run has no observable process group"
+        );
+        let run = adapter.clone();
+        let supplied = packet.clone();
+        let worker = tokio::spawn(async move {
+            run.execute(
+                supplied,
+                AgentModelSelection {
+                    model: "test-model".into(),
+                    provider: "test".into(),
+                    registry_revision: 0,
+                },
+            )
+            .await
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while adapter
+            .owned_process_group_is_empty(&packet.run_id())
+            .is_none()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the process child never owned a process group"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            adapter.owned_process_group_is_empty(&packet.run_id()),
+            Some(false),
+            "a live worker keeps its owned process group occupied"
+        );
+        let handle = crate::agent_run_handle::AgentRunHandle {
+            run_id: packet.run_id().to_string(),
+            agent_id: packet.agent_id().to_string(),
+            backend: AgentBackendKind::ProcessJsonl,
+            revision: 1,
+            status: AgentStatus::Running,
+        };
+        adapter
+            .command(
+                &handle,
+                &AgentCommandRequest {
+                    command_id: "cancel-owned-group".into(),
+                    agent_id: packet.agent_id().to_string(),
+                    expected_revision: 1,
+                    command: AgentCommand::Cancel,
+                    input: None,
+                },
+            )
+            .await
+            .expect("the cancellation must reach the live process");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while adapter.owned_process_group_is_empty(&packet.run_id()) != Some(true) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the cancelled worker never left its owned process group"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            adapter.owned_process_group_is_empty(&packet.run_id()),
+            Some(true),
+            "a reaped worker leaves an empty owned process group"
+        );
+        worker.abort();
+        let _ = worker.await;
     }
 
     #[cfg(unix)]
@@ -4222,7 +4630,7 @@ mod tests {
         let (evidence, _) = confirmed_run_exit(&runtime.event_store, &packet)
             .unwrap()
             .unwrap();
-        assert_eq!(evidence.fact.phase, LocalRunPhase::LocalReturned);
+        assert_eq!(evidence.fact.phase, LocalRunPhase::Cancelled);
         let restarted = AgentRuntime::new(runtime.event_store.clone(), configured_registry());
         assert_eq!(
             confirmed_run_exit(&restarted.event_store, &packet)

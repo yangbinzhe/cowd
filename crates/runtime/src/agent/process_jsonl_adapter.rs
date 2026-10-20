@@ -292,6 +292,11 @@ struct ActiveProcess {
     // tree, nor may Runtime hold a process lifecycle lock while writing.
     child: Mutex<Child>,
     stdin: Mutex<ChildStdin>,
+    /// The owned process group of this launch. The adapter creates the child
+    /// as the leader of a fresh group, so this id addresses only the tree this
+    /// adapter owns. A cancelled child stays inside its own group until the
+    /// OS reaps it, so the group id is what proves the tree is empty.
+    process_group: i32,
     /// Runtime-to-child stream has its own sequence independent from the
     /// child-to-Runtime stream. Only protocol-ready runs may receive normal
     /// input; cancellation remains available before readiness.
@@ -763,6 +768,17 @@ impl ProcessJsonlAdapter {
         self.registry.prepare_count.load(Ordering::SeqCst)
     }
     #[cfg(test)]
+    pub(crate) fn fixture_active_runs(&self) -> Vec<String> {
+        self.registry
+            .lifecycle
+            .lock()
+            .unwrap()
+            .active
+            .keys()
+            .cloned()
+            .collect()
+    }
+    #[cfg(test)]
     pub(crate) fn fixture_exit_gate(&self, unknown: bool) -> Arc<ProcessExitGate> {
         let gate = Arc::new(ProcessExitGate::default());
         *self.registry.exit_gate.lock().unwrap() = Some(gate.clone());
@@ -772,6 +788,46 @@ impl ProcessJsonlAdapter {
         }
         gate
     }
+    /// Whether the owned process group of this run is empty.
+    ///
+    /// A cancelled worker is physically gone only when the process group this
+    /// adapter created holds no member: the killed leader stays inside its own
+    /// group until the OS reaps it, and a survivor that escaped the group can
+    /// still hold the worker's pipes open and keep producing effects. The
+    /// observation is deliberately conservative — `None` means the group is
+    /// unknown, and only an observed empty group proves the exit.
+    pub(crate) fn owned_process_group_is_empty(&self, run_id: &str) -> Option<bool> {
+        #[cfg(unix)]
+        {
+            let lifecycle = self
+                .registry
+                .lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let active = lifecycle.active.get(run_id)?;
+            let process_group = active.process_group;
+            if process_group <= 0 {
+                return None;
+            }
+            // SAFETY: the adapter created this child as the leader of its own
+            // process group, so a negative pid addresses only the tree this
+            // adapter owns. Signal 0 probes liveness and delivers nothing.
+            let probe = unsafe { libc::kill(-process_group, 0) };
+            if probe == 0 {
+                return Some(false);
+            }
+            return match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::ESRCH) => Some(true),
+                _ => Some(false),
+            };
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = run_id;
+            None
+        }
+    }
+
     pub(crate) fn take_local_exit_evidence(
         &self,
         packet: &AgentTaskPacket,
@@ -1379,12 +1435,26 @@ impl AgentRuntimeBackend for ProcessJsonlAdapter {
             }
             AgentCommand::Cancel | AgentCommand::Shutdown => {
                 active.close_commands();
-                let mut child = active
-                    .child
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                terminate_process_tree(&mut child)
-                    .map_err(|_| AgentCommandRejectReason::UnsupportedByBackend)
+                let cancelled = Arc::clone(&active);
+                // The signal alone leaves the killed leader inside its own
+                // process group until the OS reaps it, so an owned group can
+                // never look empty. Reap the leader here: the Runtime proves
+                // the cancelled exit from that empty group, and the run owner
+                // observes the same cached exit status when it waits.
+                tokio::task::spawn_blocking(move || {
+                    let mut child = cancelled
+                        .child
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let killed = terminate_process_tree(&mut child);
+                    if killed.is_ok() {
+                        reap_cancelled_child(&mut child);
+                    }
+                    killed
+                })
+                .await
+                .unwrap_or_else(|_| Err(std::io::Error::other("ProcessJsonl cancel join failed")))
+                .map_err(|_| AgentCommandRejectReason::UnsupportedByBackend)
             }
             AgentCommand::SendInput | AgentCommand::Interrupt => {
                 let queued_at = std::time::Instant::now();
@@ -1569,9 +1639,11 @@ fn execute_prepared_child(
             cleanup,
         );
     };
+    let process_group = child.id() as i32;
     let active = Arc::new(ActiveProcess {
         child: Mutex::new(child),
         stdin: Mutex::new(stdin),
+        process_group,
         next_runtime_sequence: Mutex::new(1),
         protocol_ready: AtomicBool::new(false),
         terminal_received: AtomicBool::new(false),
@@ -1860,6 +1932,31 @@ fn execute_prepared_child(
     }
     outcome
 }
+
+/// Reap a cancelled child without blocking the caller forever.
+///
+/// `try_wait` caches the exit status, so a later `wait` on the same handle
+/// observes the same status instead of losing it. The bounded loop keeps a
+/// child that cannot be reaped from holding the process lifecycle lock.
+fn reap_cancelled_child(child: &mut Child) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + CANCELLED_REAP_BOUND;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// The bounded time a cancelled child may hold the process lifecycle lock
+/// while the Runtime waits for the OS to reap it.
+const CANCELLED_REAP_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[cfg(unix)]
 fn terminate_process_tree(child: &mut Child) -> std::io::Result<()> {
@@ -2882,6 +2979,103 @@ print(json.dumps(dict(identity, sequence=2, kind='result', result=json.loads({te
         (temporary, services, adapter, packet)
     }
 
+    /// The original driver fixture, but the worker survives its own group kill
+    /// and keeps the Runtime's stdout pipe open.
+    ///
+    /// A cancellation kills the worker, yet the Runtime's reader thread still
+    /// waits for a pipe that a detached descendant holds open, so the run owner
+    /// can no longer reach its own exit publication. This is the shape of the
+    /// native lane failure: the run is cancelled, the child is gone, and the
+    /// lifecycle would stay unclosed forever.
+    #[cfg(unix)]
+    pub(crate) fn driver_cancel_fixture() -> (
+        tempfile::TempDir,
+        Arc<RuntimeServices>,
+        ProcessJsonlAdapter,
+        AgentTaskPacket,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (temporary, _services, _adapter, packet) = driver_exit_fixture();
+        let workspace = temporary.path().join("workspace");
+        std::fs::write(workspace.join("source.txt"), "fixture source").unwrap();
+        let host = Arc::new(TopicBridgeReadHost {
+            catalog: tools::ToolHost::builtin("process-cancel-fixture", &workspace),
+            source: workspace.join("source.txt"),
+            publication: Mutex::new(None),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let services = RuntimeServices::test_builder(temporary.path().join("home"), &workspace)
+            .tool_execution_host(host)
+            .build()
+            .unwrap();
+        // A real launch owns its Session policy. Binding the adapter to the
+        // Runtime owner is what makes the physical envelope a host-only
+        // launch, the closure witness' precondition for a Process Agent.
+        services.publish_session_execution_policy(
+            packet.session_id(),
+            crate::permissions::SessionExecutionPolicyControl::from_policy(
+                harness_contract::policy::SessionExecutionPolicy::from_profile(
+                    harness_contract::policy::AutonomyProfileId::Autonomous,
+                    packet.policy_revision,
+                    harness_contract::policy::SessionExecutionPolicyOrigin::ConfigDefault,
+                ),
+            ),
+        );
+        // The Runtime bridge of a Process Agent is bound to the parent graph
+        // of its node, exactly like a dispatched Agent Task.
+        let mut graph =
+            harness_contract::execution_graph::ExecutionGraph::new("Process driver fixture");
+        graph.id = packet.graph_id().to_string();
+        graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id: packet.session_id().to_string(),
+            turn_id: format!("test-turn:{}", packet.graph_id()),
+            root_task_id: packet.assignment.root_task_id.clone(),
+            task_id: packet.task_id().to_string(),
+            generation: 1,
+        });
+        crate::ExecutionCommitService::new(services.event_store().clone())
+            .register_graph(graph)
+            .expect("the Process driver fixture registers its parent graph");
+        let adapter = ProcessJsonlAdapter::for_runtime(Arc::downgrade(&services), &workspace);
+        let mut spec = ProcessJsonlSpec::new("command:driver-exit", "driver-exit.py", Vec::new());
+        spec.sandbox_profile = crate::config::AgentExecutorSandboxProfile::IsolatedReadOnly;
+        spec.command_digest = ProcessJsonlSpec::digest_for(
+            &spec.command_ref,
+            &spec.executable,
+            &spec.args,
+            spec.working_directory.as_deref(),
+            &spec.environment_refs,
+            spec.sandbox_profile,
+            &spec.transport_limits,
+        );
+        adapter.register_command(spec.clone()).unwrap();
+        let worker = workspace.join(&spec.executable);
+        std::fs::write(
+            &worker,
+            r#"#!/usr/bin/env python3
+import json, os, subprocess, sys, time
+hello = json.loads(sys.stdin.readline())
+identity = {'protocol_version': 3, 'run_id': hello['run_id'], 'agent_id': hello['agent_id']}
+ready = dict(identity, sequence=1, kind='ready', manifest_digest=hello['manifest_digest'],
+    focus=hello['focus'], model_control='external_configured', capabilities={
+        'features': ['step_binding_v1'], 'commands': ['result', 'error'],
+        'supports_recovery': False, 'evidence_mode': 'runtime_receipts',
+        'model_control': 'external_configured'})
+print(json.dumps(ready), flush=True)
+start = json.loads(sys.stdin.readline())
+assert start['kind'] == 'start'
+# A detached descendant outlives the group kill and keeps the Runtime's
+# stdout pipe open, so the run owner never observes the pipe close.
+subprocess.Popen(['setsid', 'sleep', '20'])
+time.sleep(300)
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (temporary, services, adapter, packet)
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn r1_optional_unknown_process_driver_join_errors_cannot_mint_reaped() {
@@ -3241,9 +3435,11 @@ print(json.dumps(dict(identity, sequence=2, kind='result', result=json.loads({te
                 .spawn()
                 .unwrap();
             let stdin = child.stdin.take().unwrap();
+            let process_group = child.id() as i32;
             let active = Arc::new(ActiveProcess {
                 child: Mutex::new(child),
                 stdin: Mutex::new(stdin),
+                process_group: process_group,
                 next_runtime_sequence: Mutex::new(1),
                 protocol_ready: AtomicBool::new(true),
                 terminal_received: AtomicBool::new(false),
@@ -3387,9 +3583,11 @@ print(json.dumps(dict(identity, sequence=2, kind='result', result=json.loads({te
             .spawn()
             .expect("test process");
         let stdin = child.stdin.take().expect("test process stdin");
+        let process_group = child.id() as i32;
         let active = Arc::new(ActiveProcess {
             child: Mutex::new(child),
             stdin: Mutex::new(stdin),
+            process_group: process_group,
             next_runtime_sequence: Mutex::new(1),
             protocol_ready: AtomicBool::new(false),
             terminal_received: AtomicBool::new(false),
@@ -3462,9 +3660,11 @@ print(json.dumps(dict(identity, sequence=2, kind='result', result=json.loads({te
             .spawn()
             .unwrap();
         let stdin = child.stdin.take().unwrap();
+        let process_group = child.id() as i32;
         let active = Arc::new(ActiveProcess {
             child: Mutex::new(child),
             stdin: Mutex::new(stdin),
+            process_group: process_group,
             next_runtime_sequence: Mutex::new(1),
             protocol_ready: AtomicBool::new(true),
             terminal_received: AtomicBool::new(false),

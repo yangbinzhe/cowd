@@ -1436,12 +1436,23 @@ impl ExecutionGraphRunner {
                 })
                 .await
                 .map_err(|_| {
+                    // A physical closure that cannot be proven must name its own
+                    // missing proof in production, not only inside the test
+                    // harness: an unproven closure otherwise surfaces as one
+                    // opaque terminal and every operator has to reconstruct the
+                    // cause from the event store after the fact.
+                    let diagnostic = self.commit_service.physical_closure_diagnostic(
+                        &graph, &ticket.node_id, &binding,
+                    );
                     #[cfg(test)]
-                    eprintln!(
-                        "OWN834_PHYSICAL_CLOSURE_UNPROVED {}",
-                        self.commit_service.physical_closure_diagnostic(
-                            &graph, &ticket.node_id, &binding,
-                        ),
+                    eprintln!("OWN834_PHYSICAL_CLOSURE_UNPROVED {diagnostic}");
+                    tracing::warn!(
+                        OWN834_PHYSICAL_CLOSURE_UNPROVED = %diagnostic,
+                        graph_id = %graph_id,
+                        node_id = %ticket.node_id,
+                        attempt = binding.attempt,
+                        budget_seconds = PHYSICAL_CLOSURE_BUDGET.as_secs(),
+                        "physical closure unconfirmed within original cancellation budget"
                     );
                     ExecutionRunnerError::Driver(
                         "physical closure unconfirmed within original cancellation budget".into(),

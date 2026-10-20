@@ -473,17 +473,12 @@ pub(crate) fn process_closed(
                 closure,
                 ..
             } => {
+                // Same criterion as the physical closure witness: physical
+                // closure is quiescence only. Security posture is enforced at
+                // the evidence producer, not here.
                 exit_code.is_some() != signal.is_some()
                     && closure.all_children_reaped
                     && closure.init_reaped
-                    && closure.kernel_hardening_applied
-                    && closure.network_disabled
-                    && closure.status_channel_protected
-                    && closure.project_read_only
-                    && closure.backend == "bubblewrap+landlock+seccomp+pid1"
-                    && closure.namespace_inode != 0
-                    && closure.init_host_pid != 0
-                    && closure.init_start_ticks != 0
             }
             _ => false,
         }

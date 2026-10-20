@@ -208,6 +208,8 @@ pub use agentic::{
 pub use definition_registry::AgentDefinitionDraftReceipt;
 #[path = "tooling/bound_tool_batch.rs"]
 pub(crate) mod bound_tool_batch;
+#[path = "tooling/host_process_closure.rs"]
+pub(crate) mod host_process_closure;
 #[path = "infrastructure/eval_gate.rs"]
 pub mod eval_gate;
 #[path = "context/evidence_planner.rs"]

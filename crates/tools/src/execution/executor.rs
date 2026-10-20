@@ -406,6 +406,9 @@ fn branch_divergence_output(
         sandbox_status: None,
         return_truncated: false,
         progress: Vec::new(),
+        // A preflight refusal never spawned a command, so there is no process
+        // closure to prove.
+        process_closure: None,
     }
 }
 

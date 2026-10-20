@@ -660,6 +660,146 @@ pub(crate) mod scope_admission_tests {
         }
     }
 
+    /// A host that answers like the host shell executor: it returns the
+    /// executor's own structured result, including the quiescence report.
+    struct HostProcessHost {
+        lease: tools::ToolHostLease,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeExecutionHost for HostProcessHost {
+        fn pin_step_catalog(&self) -> Option<tools::ToolHostLease> {
+            Some(self.lease.clone())
+        }
+
+        async fn execute_runtime_tool(
+            &self,
+            request: &RuntimeToolExecutionRequest,
+        ) -> RuntimeToolExecutionOutcome {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            RuntimeToolExecutionOutcome {
+                tool_use_id: request.tool_use_id.clone(),
+                tool_name: request.tool_name.clone(),
+                status: RuntimeToolExecutionStatus::Executed,
+                category: request.category,
+                output: Some(
+                    json!({
+                        "stdout": "890",
+                        "stderr": "",
+                        "returnTruncated": false,
+                        "processClosure": {
+                            "exitCode": 0, "signal": null,
+                            "initReaped": true, "allChildrenReaped": true,
+                        },
+                    })
+                    .to_string(),
+                ),
+                error: None,
+                evidence_ref: format!("tool-effect:{}", request.idempotency_key),
+                observed_evidence: vec![],
+            }
+        }
+    }
+
+    /// F2: a host process effect publishes its quiescence fact into the
+    /// durable receipt, and the historical replay keeps that evidence.
+    #[tokio::test]
+    async fn host_process_effect_publishes_durable_closure_evidence_890() {
+        use harness_contract::context::EvidenceTargetIdentity;
+        let workspace = tempfile::tempdir().unwrap();
+        let tools = tools::ToolHost::builtin("r1-890-host-process", workspace.path());
+        let resolver =
+            crate::path_identity::WorkspacePathIdentityResolver::discover(workspace.path())
+                .unwrap();
+        let store = Arc::new(crate::RuntimeEventStore::for_test());
+        let artifacts = Arc::new(crate::ArtifactStore::for_test_default(
+            workspace.path().join("artifacts"),
+        ));
+        let service =
+            ExecutionCommitService::new(Arc::clone(&store)).with_artifact_store(artifacts.clone());
+        let mut request = bound_request(&tools, "bash", json!({"command": "printf 890"}));
+        request.parent_execution = Some(harness_contract::execution_graph::ExecutionParentBinding {
+            execution_id: "scope2-graph".into(),
+            node_id: "scope2-node".into(),
+        });
+        request.parent_execution_attempt = Some(1);
+        let effect = request.compiled_invocation.as_ref().unwrap().effect.clone();
+        assert!(effect.spawns_process);
+        let host = HostProcessHost {
+            lease: tools.pin_snapshot(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let outcome = execute_bound_agent_tool(
+            &host,
+            Some(&service),
+            &resolver,
+            &ScopeLockManager::new(),
+            &request,
+            &effect,
+        )
+        .await
+        .expect("host process effect");
+        let facts = outcome
+            .observed_evidence
+            .iter()
+            .filter_map(|observed| match &observed.target {
+                EvidenceTargetIdentity::ToolExecution { execution } => Some(execution),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(facts.len(), 1, "the fresh outcome must carry one process terminal");
+        assert!(
+            matches!(
+                &facts[0].terminal,
+                harness_contract::context::ToolExecutionTerminal::Settled {
+                    exit_code: Some(0),
+                    signal: None,
+                    ..
+                }
+            ),
+            "{:?}",
+            facts[0].terminal
+        );
+        assert_eq!(host.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // The durable receipt keeps the same process terminal.
+        let stored = service
+            .completed_tool_effect(&request, &effect)
+            .unwrap()
+            .expect("durable host process receipt");
+        assert!(
+            stored.observed_evidence.iter().any(|observed| matches!(
+                observed.target,
+                EvidenceTargetIdentity::ToolExecution { .. }
+            )),
+            "the durable receipt must carry the process terminal"
+        );
+        assert!(crate::execution_projection::settlement::process_closed(
+            &stored, &effect
+        ));
+        // The historical replay returns the same evidence without running the
+        // host again.
+        let replay = execute_bound_agent_tool(
+            &host,
+            Some(&service),
+            &resolver,
+            &ScopeLockManager::new(),
+            &request,
+            &effect,
+        )
+        .await
+        .expect("retained host process replay");
+        assert_eq!(host.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            replay.observed_evidence.iter().any(|observed| matches!(
+                &observed.target,
+                EvidenceTargetIdentity::ToolExecution { .. }
+            )),
+            "the retained replay must keep the process terminal"
+        );
+    }
+
     #[test]
     fn shared_scope_builder_authenticates_full_purpose_and_original_step() {
         let workspace = tempfile::tempdir().unwrap();
@@ -1395,16 +1535,130 @@ pub(crate) async fn execute_bound_agent_tool_observed(
             );
         }
     }
+    // A process-class effect owns a physical process tree, so its durable
+    // receipt must carry an honest process terminal. The host shell is not a
+    // sandbox process: it can prove quiescence only, and it proves it by
+    // reporting it in its own structured result. The Runtime kernel turns
+    // that report into the durable evidence the physical closure witness
+    // reads, and never into a security posture the host path cannot prove.
+    let mut host_process_terminal = false;
+    if fresh_execution && descriptor.spawns_process {
+        if outcome.observed_evidence.iter().any(|observed| {
+            matches!(
+                observed.target,
+                harness_contract::context::EvidenceTargetIdentity::ToolExecution { .. }
+            )
+        }) {
+            return Err(ToolError::new(
+                "tool host adapter may not publish a process terminal fact",
+            ));
+        }
+        if let Some(service) = commit_service {
+            if let Some(artifacts) = service.bounded_process_artifacts().ok() {
+                let report = crate::host_process_closure::read_host_process_report(
+                    outcome.output.as_deref(),
+                );
+                let source_bytes =
+                    crate::host_process_closure::source_bundle_bytes(request).map_err(|error| {
+                        ToolError::new(format!(
+                            "tool `{tool_name}` host process source bundle failed: {error}"
+                        ))
+                    })?;
+                let body_bytes =
+                    crate::host_process_closure::body_bytes(request, &report).map_err(|error| {
+                        ToolError::new(format!(
+                            "tool `{tool_name}` host process closure document failed: {error}"
+                        ))
+                    })?;
+                let scope = format!(
+                    "session:{}",
+                    request
+                        .session_id
+                        .as_deref()
+                        .ok_or_else(|| ToolError::new("host process Session missing"))?
+                );
+                let descriptor_write =
+                    harness_contract::context::ArtifactWriteDescriptor {
+                        media_type: "application/octet-stream".into(),
+                        visibility_scope: scope.clone(),
+                        expected_bytes: Some(source_bytes.len() as u64),
+                        original_name: None,
+                    };
+                let source_bundle = artifacts
+                    .write_bytes(descriptor_write, &source_bytes)
+                    .await
+                    .map_err(|error| {
+                        ToolError::new(format!(
+                            "tool `{tool_name}` host process source archive failed: {error}"
+                        ))
+                    })?;
+                let body = artifacts
+                    .write_bytes(
+                        harness_contract::context::ArtifactWriteDescriptor {
+                            media_type: "application/json".into(),
+                            visibility_scope: scope,
+                            expected_bytes: Some(body_bytes.len() as u64),
+                            original_name: None,
+                        },
+                        &body_bytes,
+                    )
+                    .await
+                    .map_err(|error| {
+                        ToolError::new(format!(
+                            "tool `{tool_name}` host process closure archive failed: {error}"
+                        ))
+                    })?;
+                artifacts
+                    .pin(
+                        &body,
+                        &format!("execution-effect:{}", request.idempotency_key),
+                        i64::MAX as u64,
+                    )
+                    .map_err(|error| {
+                        ToolError::new(format!(
+                            "tool `{tool_name}` host process closure pin failed: {error}"
+                        ))
+                    })?;
+                let fact = crate::host_process_closure::build_host_process_fact(
+                    request,
+                    descriptor,
+                    &report,
+                    body,
+                    source_bundle,
+                )
+                .map_err(|error| {
+                    ToolError::new(format!(
+                        "tool `{tool_name}` host process terminal failed: {error}"
+                    ))
+                })?;
+                outcome
+                    .observed_evidence
+                    .push(crate::host_process_closure::host_process_observation(request, fact));
+                host_process_terminal = true;
+            }
+        }
+    }
     if fresh_execution {
         if let Some(commit_service) = commit_service {
             let committed =
                 if descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Read {
-                    commit_service.commit_bound_readonly_tool_receipt(
-                        request,
-                        &outcome,
-                        descriptor,
-                        &resolved_scope,
-                    )
+                    if host_process_terminal {
+                        commit_service.commit_bound_readonly_tool_receipt_with_host_process(
+                            request,
+                            &outcome,
+                            descriptor,
+                            &resolved_scope,
+                        )
+                    } else {
+                        commit_service.commit_bound_readonly_tool_receipt(
+                            request,
+                            &outcome,
+                            descriptor,
+                            &resolved_scope,
+                        )
+                    }
+                } else if host_process_terminal {
+                    commit_service.commit_tool_effect_with_host_process(request, &descriptor, &outcome)
                 } else {
                     commit_service.commit_tool_effect(&request, &descriptor, &outcome)
                 };

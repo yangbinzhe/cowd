@@ -2,7 +2,7 @@
 use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -23,6 +23,12 @@ pub const BASH_PERSIST_THRESHOLD_BYTES: u64 = 128 * 1024;
 pub const BASH_IO_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Minimum interval between progress samples.
 const BASH_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+/// Bounded deadline for proving that a foreground command's process group
+/// holds no live member anymore. The proof is allowed to fail (honestly)
+/// when a descendant refuses to die within the deadline.
+pub const BASH_PROCESS_QUIESCENCE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Interval between two process-group quiescence polls.
+const BASH_QUIESCENCE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Effective head/tail/persist limits (P11). Defaults stay the documented
 /// contract; operators may override per deployment via environment variables.
@@ -153,6 +159,55 @@ pub struct BashCommandInput {
 
 const MAX_TOOL_TIMEOUT_MS: u64 = 300_000;
 
+/// Physical quiescence proof for one foreground host-shell command.
+///
+/// The proof states only whether the physical resources owned by the command
+/// were reclaimed: the command process itself was waited for and reaped, and
+/// the process group it led holds no live descendant anymore. It deliberately
+/// says nothing about sandbox hardening or network isolation - those are
+/// separate security postures and are reported through `sandbox_status`.
+///
+/// `None` (the `process_closure` field on [`BashCommandOutput`]) means no
+/// proof was obtained at all, for example for background jobs that are owned
+/// by the background-job registry. Unknown is never reported as closed.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BashProcessClosure {
+    /// Exit code of the command; absent when the command was terminated by a
+    /// signal.
+    pub exit_code: Option<i32>,
+    /// Signal that terminated the command; absent on a normal exit.
+    pub signal: Option<i32>,
+    /// True when the command process itself was waited for and reaped.
+    pub init_reaped: bool,
+    /// True when the command's process group was proven to hold no live
+    /// member. Members that already exited and are only waiting for the
+    /// init reaper do not count as live descendants.
+    pub all_children_reaped: bool,
+}
+
+impl BashProcessClosure {
+    fn from_exit(status: &ExitStatus, init_reaped: bool, all_children_reaped: bool) -> Self {
+        Self {
+            exit_code: status.code(),
+            signal: exit_signal(status),
+            init_reaped,
+            all_children_reaped,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn exit_signal(status: &ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_status: &ExitStatus) -> Option<i32> {
+    None
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BashCommandOutput {
     pub stdout: String,
@@ -188,6 +243,10 @@ pub struct BashCommandOutput {
     /// Bounded progress observations captured while the command ran.
     #[serde(default)]
     pub progress: Vec<BashProgressSample>,
+    /// Physical quiescence proof for a foreground command. Absent when no
+    /// proof was obtained (background jobs and other unproven paths).
+    #[serde(default, rename = "processClosure")]
+    pub process_closure: Option<BashProcessClosure>,
 }
 
 impl BashCommandOutput {
@@ -233,6 +292,7 @@ impl BashCommandOutput {
             sandbox_status: Some(Self::structured_sandbox_status(input)),
             return_truncated: false,
             progress: Vec::new(),
+            process_closure: None,
         }
     }
 }
@@ -360,57 +420,112 @@ fn execute_bash_sync(
     let prepared = prepare_command(&input, &workspace_root, &cwd, false)?;
     let mut command = prepared.command;
     let sandbox_status = prepared.sandbox_status;
-    let (output, interrupted) = if let Some(timeout_ms) = input.timeout_ms {
-        command.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = command.spawn()?;
-        let started = Instant::now();
-        loop {
-            if child.try_wait()?.is_some() {
-                break (child.wait_with_output()?, false);
-            }
-            if started.elapsed() >= Duration::from_millis(timeout_ms) {
-                if !kill_process_group(Some(child.id())) {
-                    let _ = child.kill();
-                }
-                let output = child.wait_with_output()?;
-                return Ok(BashCommandOutput {
-                    stderr: if output.stderr.is_empty() {
-                        format!("Command exceeded timeout of {timeout_ms} ms")
-                    } else {
-                        format!(
-                            "{}\nCommand exceeded timeout of {timeout_ms} ms",
-                            String::from_utf8_lossy(&output.stderr).trim_end()
-                        )
-                    },
-                    interrupted: true,
-                    return_code_interpretation: Some(String::from("timeout")),
-                    no_output_expected: Some(true),
-                    sandbox_status: Some(complete_sandbox_status(
-                        sandbox_status,
-                        output.status.code(),
-                        true,
-                    )),
-                    ..BashCommandOutput::blank(&input, true, None)
-                });
-            }
-            std::thread::sleep(Duration::from_millis(10));
+    // `Command::output()` semantics: no stdin, both output streams captured.
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // The command leads its own process group, so the executor owns the
+        // group and can reclaim (and prove) every descendant it left behind.
+        command.process_group(0);
+    }
+    let mut child = command.spawn()?;
+    let pgid = child.id();
+    // The pipes are drained on dedicated threads: the executor must be able to
+    // reclaim the process group before it waits for end-of-stream, because a
+    // descendant that outlived the command keeps the pipe open.
+    let stdout_reader = spawn_output_reader(child.stdout.take());
+    let stderr_reader = spawn_output_reader(child.stderr.take());
+
+    let timeout_ms = input.timeout_ms;
+    let started = Instant::now();
+    let mut interrupted = false;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
         }
-    } else {
-        (command.output()?, false)
+        if let Some(timeout_ms) = timeout_ms {
+            if started.elapsed() >= Duration::from_millis(timeout_ms) {
+                interrupted = true;
+                signal_process_group(pgid);
+                break child.wait()?;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
     };
 
-    let captured = CapturedOutput::from_bytes(&output.stdout, &output.stderr, None);
+    // The command itself is reaped. Reclaim the descendants that outlived it
+    // and prove the process group is physically quiet before reporting.
+    let all_children_reaped = prove_process_group_quiesced(pgid, BASH_PROCESS_QUIESCENCE_TIMEOUT);
+    let closure = Some(BashProcessClosure::from_exit(&status, true, all_children_reaped));
+    let stdout = collect_output(stdout_reader, BASH_IO_DRAIN_TIMEOUT);
+    let stderr = collect_output(stderr_reader, BASH_IO_DRAIN_TIMEOUT);
+
+    if interrupted {
+        let timeout_ms = timeout_ms.unwrap_or_default();
+        return Ok(BashCommandOutput {
+            stderr: if stderr.is_empty() {
+                format!("Command exceeded timeout of {timeout_ms} ms")
+            } else {
+                format!(
+                    "{}\nCommand exceeded timeout of {timeout_ms} ms",
+                    String::from_utf8_lossy(&stderr).trim_end()
+                )
+            },
+            interrupted: true,
+            return_code_interpretation: Some(String::from("timeout")),
+            no_output_expected: Some(true),
+            sandbox_status: Some(complete_sandbox_status(sandbox_status, status.code(), true)),
+            process_closure: closure,
+            ..BashCommandOutput::blank(&input, true, None)
+        });
+    }
+
+    let captured = CapturedOutput::from_bytes(&stdout, &stderr, None);
     Ok(build_output(
         &input,
         captured,
         interrupted,
-        complete_sandbox_status(sandbox_status, output.status.code(), interrupted),
-        output
-            .status
+        complete_sandbox_status(sandbox_status, status.code(), interrupted),
+        status
             .code()
             .filter(|code| *code != 0)
             .map(|code| format!("exit_code:{code}")),
+        closure,
     ))
+}
+
+/// Reads a captured pipe to end-of-stream on a dedicated thread so the
+/// executor can bound how long it waits for the output.
+fn spawn_output_reader<R: io::Read + Send + 'static>(
+    reader: Option<R>,
+) -> std::sync::mpsc::Receiver<io::Result<Vec<u8>>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        if let Some(mut reader) = reader {
+            if let Err(error) = reader.read_to_end(&mut buffer) {
+                let _ = sender.send(Err(error));
+                return;
+            }
+        }
+        let _ = sender.send(Ok(buffer));
+    });
+    receiver
+}
+
+/// Collects a pipe read with a bounded wait.
+fn collect_output(
+    receiver: std::sync::mpsc::Receiver<io::Result<Vec<u8>>>,
+    timeout: Duration,
+) -> Vec<u8> {
+    match receiver.recv_timeout(timeout) {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(_)) | Err(_) => Vec::new(),
+    }
 }
 
 /// Tokio-native bash execution (T4). This path shares validation and lease
@@ -437,6 +552,7 @@ pub async fn execute_bash_async_in_workspace(
         command.process_group(0);
     }
     let mut child = command.spawn()?;
+    let pgid = child.id();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let shared = Arc::new(Mutex::new(BashProgressState::new()));
@@ -455,19 +571,38 @@ pub async fn execute_bash_async_in_workspace(
         progress_stderr,
     ));
 
-    let (status, interrupted) = if let Some(timeout_ms) = input.timeout_ms {
-        match tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait()).await {
-            Ok(status) => (status?, false),
-            Err(_) => {
-                if !kill_process_group(child.id()) {
-                    let _ = child.kill().await;
-                }
-                (child.wait().await?, true)
+    let started = Instant::now();
+    let mut interrupted = false;
+    let status = match input.timeout_ms {
+        // A bounded wait has to poll, because the child must be killed while it
+        // is still running.
+        Some(timeout_ms) => loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
             }
-        }
-    } else {
-        (child.wait().await?, false)
+            if started.elapsed() >= Duration::from_millis(timeout_ms) {
+                interrupted = true;
+                if let Some(pgid) = pgid {
+                    signal_process_group(pgid);
+                }
+                break child.wait().await?;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        },
+        // Without a timeout the executor waits for the child event-driven.
+        None => child.wait().await?,
     };
+
+    // The command itself is reaped. Reclaim the descendants that outlived it
+    // and prove the process group is physically quiet before the pipes are
+    // drained: a descendant that outlived the command keeps the pipe open.
+    let all_children_reaped = match pgid {
+        Some(pgid) => {
+            prove_process_group_quiesced_async(pgid, BASH_PROCESS_QUIESCENCE_TIMEOUT).await
+        }
+        None => false,
+    };
+    let closure = Some(BashProcessClosure::from_exit(&status, true, all_children_reaped));
 
     // Drain pipes for at most 2s after exit; a descendant holding a pipe open
     // must not stall the turn forever.
@@ -502,6 +637,7 @@ pub async fn execute_bash_async_in_workspace(
             .code()
             .filter(|code| *code != 0)
             .map(|code| format!("exit_code:{code}")),
+        closure,
     );
     if interrupted {
         // The timeout path still returns structured output; preserve it while
@@ -796,26 +932,150 @@ where
     Ok(captured)
 }
 
-fn kill_process_group(child_pid: Option<u32>) -> bool {
-    let Some(child_pid) = child_pid else {
+/// Sends `SIGKILL` to the process group led by `pgid` so descendants that
+/// outlived the foreground command are reclaimed.
+///
+/// The group id is the pid of the command process itself: the executor spawns
+/// every foreground command with `process_group(0)`, so the command leads its
+/// own group.
+#[cfg(target_os = "linux")]
+fn signal_process_group(pgid: u32) -> bool {
+    use rustix::process::{kill_process_group, Signal};
+    match process_group_pid(pgid) {
+        Some(pid) => kill_process_group(pid, Signal::KILL).is_ok(),
+        None => false,
+    }
+}
+
+/// Translates a process-group id into the pid handle used by the group
+/// syscalls. An out-of-range id is rejected instead of being turned into the
+/// "own process group" signal, which would hit unrelated processes.
+#[cfg(target_os = "linux")]
+fn process_group_pid(pgid: u32) -> Option<rustix::process::Pid> {
+    let raw = i32::try_from(pgid).ok()?;
+    rustix::process::Pid::from_raw(raw)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn signal_process_group(pgid: u32) -> bool {
+    Command::new("kill")
+        .args(["-KILL", "--", &format!("-{pgid}")])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(not(unix))]
+fn signal_process_group(_pgid: u32) -> bool {
+    false
+}
+
+/// True when the process group still holds at least one live member.
+///
+/// A group that holds only members which already exited (and are merely
+/// waiting for the init reaper) counts as quiet: those processes own no
+/// physical resource anymore. When the liveness of the group cannot be
+/// established the answer is `true`, so an unproven group is never reported
+/// as closed.
+#[cfg(target_os = "linux")]
+fn process_group_has_live_member(pgid: u32) -> bool {
+    use rustix::io::Errno;
+    use rustix::process::test_kill_process_group;
+    let Some(pid) = process_group_pid(pgid) else {
         return false;
     };
-    #[cfg(unix)]
-    {
-        let group = format!("-{child_pid}");
-        return Command::new("kill")
-            .args(["-KILL", "--", &group])
-            .status()
-            .is_ok_and(|status| status.success())
-            || Command::new("kill")
-                .args(["-KILL", &child_pid.to_string()])
-                .status()
-                .is_ok_and(|status| status.success());
+    match test_kill_process_group(pid) {
+        // The group still exists: only members that are still running count.
+        Ok(()) => live_group_member_count(pgid).is_none_or(|count| count > 0),
+        // The group exists but is not ours to signal.
+        Err(Errno::PERM) | Err(Errno::INTR) => true,
+        // ESRCH: the group is gone.
+        Err(_) => false,
     }
-    #[cfg(not(unix))]
-    {
-        let _ = child_pid;
-        false
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_group_has_live_member(pgid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", "--", &format!("-{pgid}")])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(not(unix))]
+fn process_group_has_live_member(_pgid: u32) -> bool {
+    false
+}
+
+/// Counts the members of `pgid` that are still running.
+///
+/// Returns `None` when `/proc` is unavailable, in which case the caller has
+/// to treat the group as unproven.
+#[cfg(target_os = "linux")]
+fn live_group_member_count(pgid: u32) -> Option<usize> {
+    let entries = std::fs::read_dir("/proc").ok()?;
+    let mut live = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.is_empty() || !name.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // `pid (comm) state ppid pgrp ...`; `comm` may contain spaces and
+        // parentheses, so the fields are located after the last `)`.
+        let Some(close) = stat.rfind(')') else {
+            continue;
+        };
+        let mut fields = stat[close + 1..].split_whitespace();
+        let Some(state) = fields.next() else {
+            continue;
+        };
+        let _parent = fields.next();
+        let Some(group) = fields.next() else {
+            continue;
+        };
+        if group.parse::<u32>().ok() == Some(pgid) && state != "Z" && state != "X" {
+            live += 1;
+        }
+    }
+    Some(live)
+}
+
+/// Terminates the leftovers of a foreground command and proves that its
+/// process group became physically quiet.
+///
+/// The proof is bounded: when the deadline expires the group is reported as
+/// not closed, so an unproven command is never presented as closed.
+fn prove_process_group_quiesced(pgid: u32, deadline: Duration) -> bool {
+    signal_process_group(pgid);
+    let started = Instant::now();
+    loop {
+        if !process_group_has_live_member(pgid) {
+            return true;
+        }
+        if started.elapsed() >= deadline {
+            return false;
+        }
+        std::thread::sleep(BASH_QUIESCENCE_POLL_INTERVAL);
+    }
+}
+
+/// Tokio-native variant of [`prove_process_group_quiesced`].
+async fn prove_process_group_quiesced_async(pgid: u32, deadline: Duration) -> bool {
+    signal_process_group(pgid);
+    let started = Instant::now();
+    loop {
+        if !process_group_has_live_member(pgid) {
+            return true;
+        }
+        if started.elapsed() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(BASH_QUIESCENCE_POLL_INTERVAL).await;
     }
 }
 
@@ -1035,6 +1295,7 @@ fn build_output(
     interrupted: bool,
     sandbox_status: serde_json::Value,
     return_code_interpretation: Option<String>,
+    process_closure: Option<BashProcessClosure>,
 ) -> BashCommandOutput {
     let stdout = String::from_utf8_lossy(&captured.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&captured.stderr).into_owned();
@@ -1071,6 +1332,7 @@ fn build_output(
         sandbox_status: Some(sandbox_status),
         return_truncated: truncated,
         progress: captured.samples,
+        process_closure,
     }
 }
 
@@ -1357,10 +1619,248 @@ mod tests {
             false,
             BashCommandOutput::structured_sandbox_status(&input),
             None,
+            None,
         );
         let status = output.sandbox_status.expect("sandbox status");
         assert_eq!(status["kernel_hardening_required"], false);
         assert_eq!(status["network_enabled"], false);
+    }
+
+    /// Physical-closure proofs (F1): a foreground command must state whether
+    /// the physical resources it owned were reclaimed, and a background job
+    /// must never claim a closure it cannot prove.
+    mod process_closure {
+        use super::*;
+        use std::path::Path;
+
+        fn host_input(command: &str) -> BashCommandInput {
+            BashCommandInput {
+                command: command.to_string(),
+                cwd: None,
+                timeout_ms: None,
+                description: None,
+                run_in_background: None,
+                dangerously_disable_sandbox: Some(true),
+                isolate_network: Some(false),
+                workspace_access: Some(BashWorkspaceAccess::ReadWrite),
+                allowed_mounts: None,
+                env: None,
+            }
+        }
+
+        fn workspace(tag: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "cowd-closure-{tag}-{}-{}",
+                std::process::id(),
+                now_ms()
+            ));
+            std::fs::create_dir_all(&dir).expect("closure test workspace");
+            dir
+        }
+
+        fn cleanup(dir: &Path) {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        /// True when the pid is gone, or only a zombie that the init reaper has
+        /// not collected yet (a zombie owns no physical resource).
+        fn descendant_is_dead(pid: u32) -> bool {
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                return true;
+            };
+            let Some(close) = stat.rfind(')') else {
+                return false;
+            };
+            let state = stat[close + 1..].split_whitespace().next().unwrap_or("");
+            state == "Z" || state == "X"
+        }
+
+        fn wait_until_dead(pid: u32) -> bool {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                if descendant_is_dead(pid) {
+                    return true;
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        #[test]
+        fn normal_exit_proves_a_closed_process_group() {
+            let dir = workspace("normal");
+            let output = execute_bash_in_workspace(host_input("printf ok"), &dir).expect("bash");
+            assert_eq!(output.stdout.trim(), "ok");
+            let closure = output.process_closure.expect("closure proof");
+            assert_eq!(closure.exit_code, Some(0));
+            assert_eq!(closure.signal, None);
+            assert!(closure.init_reaped);
+            assert!(closure.all_children_reaped);
+            cleanup(&dir);
+        }
+
+        #[tokio::test]
+        async fn normal_exit_proves_a_closed_process_group_on_the_async_path() {
+            let dir = workspace("normal-async");
+            let output = execute_bash_async_in_workspace(host_input("printf ok"), &dir, None)
+                .await
+                .expect("async bash");
+            assert_eq!(output.stdout.trim(), "ok");
+            let closure = output.process_closure.expect("closure proof");
+            assert_eq!(closure.exit_code, Some(0));
+            assert_eq!(closure.signal, None);
+            assert!(closure.init_reaped);
+            assert!(closure.all_children_reaped);
+            cleanup(&dir);
+        }
+
+        #[test]
+        fn non_zero_exit_reports_the_real_exit_code() {
+            let dir = workspace("exit-code");
+            let output = execute_bash_in_workspace(host_input("exit 7"), &dir).expect("bash");
+            let closure = output.process_closure.expect("closure proof");
+            assert_eq!(closure.exit_code, Some(7));
+            assert_eq!(closure.signal, None);
+            assert!(closure.init_reaped);
+            assert!(closure.all_children_reaped);
+            cleanup(&dir);
+        }
+
+        #[test]
+        fn signal_termination_reports_the_signal_and_a_reaped_child() {
+            let dir = workspace("signal");
+            let output = execute_bash_in_workspace(host_input("kill -9 $$"), &dir).expect("bash");
+            let closure = output.process_closure.expect("closure proof");
+            assert_eq!(closure.exit_code, None);
+            assert_eq!(closure.signal, Some(9));
+            assert!(closure.init_reaped);
+            assert!(closure.all_children_reaped);
+            cleanup(&dir);
+        }
+
+        #[test]
+        fn surviving_descendant_is_reclaimed_before_the_proof_is_reported() {
+            let dir = workspace("descendant");
+            let output = execute_bash_in_workspace(
+                host_input("sh -c 'sleep 30 & echo started $!'"),
+                &dir,
+            )
+            .expect("bash");
+            let stdout = output.stdout.trim().to_string();
+            let pid = stdout
+                .split_whitespace()
+                .last()
+                .and_then(|value| value.parse::<u32>().ok())
+                .expect("descendant pid");
+            assert!(stdout.starts_with("started"), "{stdout}");
+            let closure = output.process_closure.expect("closure proof");
+            assert_eq!(closure.exit_code, Some(0));
+            assert!(closure.init_reaped);
+            assert!(closure.all_children_reaped);
+            assert!(
+                wait_until_dead(pid),
+                "descendant {pid} outlived the command"
+            );
+            cleanup(&dir);
+        }
+
+        #[tokio::test]
+        async fn surviving_descendant_is_reclaimed_on_the_async_path() {
+            let dir = workspace("descendant-async");
+            let output = execute_bash_async_in_workspace(
+                host_input("sh -c 'sleep 30 & echo started $!'"),
+                &dir,
+                None,
+            )
+            .await
+            .expect("async bash");
+            let stdout = output.stdout.trim().to_string();
+            let pid = stdout
+                .split_whitespace()
+                .last()
+                .and_then(|value| value.parse::<u32>().ok())
+                .expect("descendant pid");
+            let closure = output.process_closure.expect("closure proof");
+            assert!(closure.all_children_reaped);
+            assert!(wait_until_dead(pid), "descendant {pid} outlived the command");
+            cleanup(&dir);
+        }
+
+        #[test]
+        fn background_job_never_claims_a_process_closure() {
+            let dir = workspace("background");
+            let mut input = host_input("sleep 30");
+            input.run_in_background = Some(true);
+            let output = execute_bash_in_workspace(input, &dir).expect("background bash");
+            assert!(
+                output.process_closure.is_none(),
+                "a background job is owned by the job registry, it cannot prove closure"
+            );
+            let job_id = output.background_task_id.clone().expect("background job id");
+            let _ = crate::background_jobs::kill_job(&dir, &job_id);
+            cleanup(&dir);
+        }
+
+        #[test]
+        fn timeout_path_reports_an_honest_closure() {
+            let dir = workspace("timeout");
+            let mut input = host_input("sleep 30");
+            input.timeout_ms = Some(300);
+            let output = execute_bash_in_workspace(input, &dir).expect("bash");
+            assert!(output.interrupted);
+            let closure = output
+                .process_closure
+                .expect("a timed out command still owns a closure proof");
+            assert!(closure.init_reaped);
+            assert!(closure.all_children_reaped);
+            assert_eq!(closure.exit_code, None);
+            assert_eq!(closure.signal, Some(9));
+            cleanup(&dir);
+        }
+
+        #[tokio::test]
+        async fn timeout_path_reports_an_honest_closure_on_the_async_path() {
+            let dir = workspace("timeout-async");
+            let mut input = host_input("sleep 30");
+            input.timeout_ms = Some(300);
+            let output = execute_bash_async_in_workspace(input, &dir, None)
+                .await
+                .expect("async bash");
+            assert!(output.interrupted);
+            let closure = output
+                .process_closure
+                .expect("a timed out command still owns a closure proof");
+            assert!(closure.init_reaped);
+            assert!(closure.all_children_reaped);
+            assert_eq!(closure.exit_code, None);
+            assert_eq!(closure.signal, Some(9));
+            cleanup(&dir);
+        }
+
+        #[test]
+        fn closure_is_serialized_as_a_camel_case_object() {
+            let closure = BashProcessClosure {
+                exit_code: Some(0),
+                signal: None,
+                init_reaped: true,
+                all_children_reaped: true,
+            };
+            let value = serde_json::to_value(closure).expect("serialize closure");
+            assert_eq!(
+                value,
+                serde_json::json!({
+                    "exitCode": 0,
+                    "signal": null,
+                    "initReaped": true,
+                    "allChildrenReaped": true,
+                })
+            );
+            let decoded: BashProcessClosure =
+                serde_json::from_value(value).expect("deserialize closure");
+            assert_eq!(decoded, closure);
+        }
     }
 
     #[test]

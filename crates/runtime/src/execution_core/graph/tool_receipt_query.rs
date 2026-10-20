@@ -5,6 +5,10 @@ use crate::step_snapshot::StepCallBinding;
 use harness_contract::execution_graph::ExecutionParentBinding;
 use serde_json::json;
 
+/// Bounded number of observations one stored tool receipt may carry. The
+/// Runtime-minted host process closure fact occupies one of these slots.
+const MAX_STORED_TOOL_OBSERVATIONS: usize = 9;
+
 fn bounded_hex_digest(value: &str) -> bool {
     value.len() == 64
         && value
@@ -388,7 +392,7 @@ impl ExecutionCommitService {
             .as_str()
             .ok_or_else(|| invalid("terminal call key missing".into()))?;
         let observations = primary.payload["outcome"]["observed_evidence"].as_array();
-        if observations.is_some_and(|items| items.len() > 8) {
+        if observations.is_some_and(|items| items.len() > MAX_STORED_TOOL_OBSERVATIONS) {
             return Err(invalid(
                 "stored tool observations exceed metadata bounds".into(),
             ));
@@ -428,6 +432,13 @@ impl ExecutionCommitService {
             ));
         }
         let fact = facts[0];
+        if stored.is_none() && primary.payload["process_admission_ref"].is_null() {
+            // No private process admission was ever published for this call,
+            // so this terminal can only be the Runtime-minted host process
+            // fact: a host shell proves quiescence, not a private capability.
+            crate::host_process_closure::validate_host_process_fact(fact).map_err(invalid)?;
+            return Ok(());
+        }
         let admission =
             stored.ok_or_else(|| invalid("process terminal admission missing".into()))?;
         let intent = self

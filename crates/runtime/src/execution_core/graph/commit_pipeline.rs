@@ -540,7 +540,7 @@ pub(super) fn validate_mutation_tool_fingerprint(
     Ok(())
 }
 
-pub(super) fn receipt_replay_contract(
+pub(crate) fn receipt_replay_contract(
     request: &crate::RuntimeToolExecutionRequest,
 ) -> Result<serde_json::Value, ExecutionCommitError> {
     let (Some(binding), Some(invocation)) = (&request.step_binding, &request.compiled_invocation)
